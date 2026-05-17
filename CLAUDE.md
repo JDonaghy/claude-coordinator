@@ -71,6 +71,18 @@ coord approve --dry-run 1,2
 - **coordinator.yml is the single source of truth** for repo topology, machine capabilities, and dependencies.
 - **User approves everything.** `coord plan` proposes, user reviews, `coord approve` dispatches. No autonomous dispatch in v1.
 - **Conflict rules are inferred, not configured.** The coordinator brain (Claude) reads issue bodies and infers which files will be touched. No DSL for conflict zones — optional `file_groups` and `exclusive_files` in config for power users.
+- **Adversarial reviews are rule-enforcing, not rubber-stamping.** The reviewer prompt is assembled from two sources: the repo's CLAUDE.md (project-specific rules) and the coordinator's review checklist in `coordinator.yml` (what to look for). Workers violate rules they're focused on following — the reviewer's sole job is enforcement.
+
+## Review Prompt Assembly
+
+The reviewer gets a prompt built from:
+1. **Repo's CLAUDE.md** — the project rules (source of truth, not duplicated)
+2. **Generic checklist** — "did you add tests?", "did you stay in file scope?", "any security issues?"
+3. **Repo overrides** — project-specific patterns from `coordinator.yml` `reviews.repo_overrides`
+4. **The diff** — `git diff` of the worker's branch vs base
+5. **The issue** — title and body for intent verification
+
+The reviewer reads the rules and enforces them against the diff. It does not have the worker's session context — genuinely independent.
 
 ## Conventions
 
