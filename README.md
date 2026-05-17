@@ -1,53 +1,98 @@
 # claude-coordinator
 
-Multi-agent coordinator that orchestrates Claude Code Managed Agent sessions as parallel workers on a GitHub repo.
+Coordinate Claude Code workers across multiple machines and repos over Tailscale. No API key needed — runs entirely on your Max/Pro subscription.
 
-## Setup
+## The Problem
+
+You have 3 machines and 2 repos. You want all 3 working in parallel without stepping on each other's files. Today you copy-paste assignments between terminal windows and track who's doing what in your head.
+
+## The Solution
+
+One config file describes your setup. A coordinator brain (Claude) proposes assignments. You approve from CLI or phone. Agent servers on each machine execute the work.
+
+```
+┌─ Phone / Browser ──────────────────────────┐
+│  Board view, approve assignments, live logs │
+└──────────────┬─────────────────────────────┘
+               │ Tailscale
+┌──────────────▼──────────────────────────────┐
+│  coord plan → approve → dispatch             │
+└──────┬──────────────┬──────────────┬────────┘
+       │              │              │
+  ┌────▼────┐   ┌─────▼─────┐  ┌────▼─────┐
+  │ Machine A│   │ Machine B │  │ Server C │
+  │ coord    │   │ coord     │  │ coord    │
+  │ agent    │   │ agent     │  │ agent    │
+  │ claude -p│   │ claude -p │  │ claude -p│
+  └─────────┘   └───────────┘  └──────────┘
+```
+
+## Quick Start
 
 ```bash
-pip install -r requirements.txt
-export ANTHROPIC_API_KEY="sk-ant-..."
-export GITHUB_TOKEN="ghp_..."  # Fine-grained PAT with Contents: Read and write
+pip install claude-coordinator
+
+# On each machine
+coord agent
+
+# On any machine (or phone via coord web)
+coord plan --config coordinator.yml
+coord approve 1,2,3
+coord status
 ```
 
-The `gh` CLI must be installed and authenticated.
+## Configuration
 
-## Usage
+```yaml
+# coordinator.yml
+repos:
+  - name: api-gateway
+    github: acme/api-gateway
+    depends_on: []
 
-```bash
-# Start a coordination session with 3 workers
-python coordinator.py --repo JDonaghy/vimcode \
-  --worker "desktop-a:gtk=yes" \
-  --worker "server:gtk=no:note=no GTK builds" \
-  --worker "cloud:gtk=yes:note=Managed Agent session"
+  - name: user-service
+    github: acme/user-service
+    depends_on: [shared-lib]
 
-# Resume a paused session
-python coordinator.py --repo JDonaghy/vimcode --resume
+  - name: shared-lib
+    github: acme/shared-lib
+    depends_on: []
+
+machines:
+  - name: macbook
+    host: macbook.tailnet
+    capabilities: [docker, node, python]
+    repos: [api-gateway, user-service]
+
+  - name: server
+    host: server.tailnet
+    capabilities: [docker, python]
+    repos: [user-service, shared-lib]
 ```
 
-## How it works
+## Features
 
-1. Coordinator reads CLAUDE.md, PROJECT_STATE.md, and open issues from the repo
-2. Claude (Opus) proposes assignments for each idle worker, respecting file-conflict rules and worker constraints
-3. You approve/modify each assignment interactively
-4. Coordinator posts the briefing as a GitHub issue comment and fires a Managed Agent session
-5. Workers clone the repo, read the briefing, do the work, push a branch
-6. Coordinator polls for completion, then proposes next assignments — loop
+- **No API key** — uses `claude -p` on your Max/Pro subscription
+- **Multi-repo** — tracks dependencies between repos (e.g. shared-lib → user-service)
+- **File conflict avoidance** — coordinator ensures two workers never touch the same files
+- **Machine constraints** — respects capabilities (GTK, Docker, GPU) and repo availability
+- **GitHub issues as work source** — reads open issues, posts briefings as comments
+- **Web dashboard** — approve assignments from your phone over Tailscale
+- **Crash recovery** — coordinator and agents persist state independently
 
-## Architecture
+## How It Works
 
-```
-coordinator.py  — Main CLI loop + coordinator brain (Claude API)
-board.py        — Board state (workers, assignments, persistence)
-workers.py      — Managed Agent session lifecycle (fire, poll, results)
-github_ops.py   — GitHub operations via gh CLI
-```
+1. `coord plan` reads open GitHub issues and your config
+2. The coordinator brain (Claude) proposes assignments — which machine, which issue, which files
+3. You approve from CLI (`coord approve 1,2`) or the web dashboard
+4. Coordinator dispatches to each machine's agent server over Tailscale
+5. Agent servers run `claude -p` locally — billing stays on your subscription
+6. Status updates posted as GitHub issue comments
+7. When a worker finishes, `coord plan` proposes the next round
 
-## File conflict rules
+## Requirements
 
-Encoded in the coordinator prompt (from vimcode's `docs/COORDINATOR.md`):
-- Two workers never touch the same file concurrently
-- `src/gtk/` files are treated as one unit
-- `src/tui_main/` files are treated as one unit
-- `src/render.rs` gets only one worker at a time
-- `src/core/engine/` sub-modules can be parallelized
+- Python 3.12+
+- Claude Code CLI with Max or Pro subscription
+- `gh` CLI (authenticated)
+- Tailscale (for multi-machine setups)
