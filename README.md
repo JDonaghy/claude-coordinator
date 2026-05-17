@@ -90,6 +90,22 @@ machines:
 6. Status updates posted as GitHub issue comments
 7. When a worker finishes, `coord plan` proposes the next round
 
+## Why This Works (Even With One Machine)
+
+This tool encodes a pattern discovered through real multi-agent coordination sessions: **separate the tech lead from the IC.**
+
+The coordinator thinks about *what to do next* — priority, dependencies, conflicts, which machine is idle. Workers think about *how to do this one thing* — read the issue, write the code, push the branch. Neither is distracted by the other's concern.
+
+This division of labor produces better results than a single long-running Claude Code session, for several reasons:
+
+- **Forced scoping.** One issue per worker session prevents scope creep. No "while I'm here, let me also refactor this." The worker does one thing and finishes.
+- **Structured handoffs.** Every assignment has a briefing posted as a GitHub issue comment. If a session dies, a new one picks up from the comment — zero context loss.
+- **Persistent record.** Every decision, briefing, and result lives on GitHub. You can review what happened a week later. Terminal scrollback is gone when the window closes.
+- **Fresh eyes.** Each worker starts with no prior context. This sounds like a weakness but it's a strength — the worker reads the code as-is, not as it was 2 hours ago. Adversarial reviews (#15) take this further: a different machine reviews the work with genuinely independent context.
+- **Human stays strategic.** You approve assignments and make judgment calls. You don't ferry messages between terminals or track who's touching which file in your head.
+
+Even with a single machine, the pattern gives you scoping discipline, handoff resilience, and an auditable trail of decisions that a raw terminal session doesn't.
+
 ## Requirements
 
 - Python 3.12+
