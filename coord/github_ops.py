@@ -44,6 +44,13 @@ def check_branch_exists(repo: str, branch: str) -> bool:
         return False
 
 
+def get_default_branch_head(repo: str, branch: str) -> str:
+    """Return the full commit SHA at the tip of `branch` on `repo` (owner/name)."""
+    raw = _gh("api", f"repos/{repo}/branches/{branch}")
+    data = json.loads(raw)
+    return data["commit"]["sha"]
+
+
 def list_open_prs(repo: str) -> list[dict]:
     raw = _gh(
         "pr", "list", "--repo", repo, "--state", "open",

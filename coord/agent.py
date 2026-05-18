@@ -42,6 +42,24 @@ class AssignmentSpec:
     files_allowed: list[str] = field(default_factory=list)
     files_forbidden: list[str] = field(default_factory=list)
     branch: str | None = None
+    pull_repos: list[str] = field(default_factory=list)
+
+
+class _GitError(RuntimeError):
+    pass
+
+
+def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise _GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
 @dataclass
@@ -101,10 +119,12 @@ class AgentServer:
         repos: Iterable[str] = (),
         state_dir: Path = DEFAULT_STATE_DIR,
         worker_command: WorkerCommandBuilder | None = None,
+        repo_paths: dict[str, str] | None = None,
     ) -> None:
         self.machine_name = machine_name
         self.capabilities = list(capabilities)
         self.repos = list(repos)
+        self.repo_paths = dict(repo_paths or {})
         self.state_dir = Path(state_dir)
         self.log_dir = self.state_dir / "logs"
         self.state_path = self.state_dir / "agent_state.json"
@@ -153,6 +173,38 @@ class AgentServer:
                 completed.append(d)
         return {"active": active, "completed": completed}
 
+    def list_repos(self) -> dict[str, dict]:
+        """Return local HEAD / branch / dirty flag for each configured repo.
+
+        Per-repo errors (missing path, not a git repo, etc.) come back as an
+        `error` field rather than failing the whole call — the coordinator
+        wants a complete picture across machines even when one is broken.
+        """
+        result: dict[str, dict] = {}
+        for repo_name in self.repos:
+            path_str = self.repo_paths.get(repo_name)
+            if not path_str:
+                result[repo_name] = {"error": "no repo_path configured for this machine"}
+                continue
+            path = Path(path_str).expanduser()
+            if not path.exists():
+                result[repo_name] = {"error": f"path does not exist: {path}"}
+                continue
+            try:
+                sha = _git(path, "rev-parse", "HEAD")
+                branch = _git(path, "rev-parse", "--abbrev-ref", "HEAD")
+                porcelain = _git(path, "status", "--porcelain")
+            except _GitError as e:
+                result[repo_name] = {"error": str(e), "path": str(path)}
+                continue
+            result[repo_name] = {
+                "sha": sha,
+                "branch": branch,
+                "dirty": bool(porcelain.strip()),
+                "path": str(path),
+            }
+        return result
+
     def assign(self, spec: AssignmentSpec) -> AgentAssignment:
         """Accept an assignment and spawn the worker. Returns immediately."""
         if self.repos and spec.repo_name not in self.repos:
@@ -165,6 +217,13 @@ class AgentServer:
         if not repo_path.exists():
             raise ValueError(f"repo path does not exist: {repo_path}")
 
+        if spec.pull_repos:
+            unknown = [r for r in spec.pull_repos if r not in self.repo_paths]
+            if unknown:
+                raise ValueError(
+                    f"pull_repos references repos with no repo_path on this agent: {unknown}"
+                )
+
         assignment = AgentAssignment(
             id=uuid.uuid4().hex[:12],
             spec=spec,
@@ -176,7 +235,16 @@ class AgentServer:
             self._assignments[assignment.id] = assignment
         self._persist()
 
-        self._spawn(assignment, repo_path)
+        if spec.pull_repos:
+            thread = threading.Thread(
+                target=self._pull_then_spawn,
+                args=(assignment, repo_path),
+                daemon=True,
+                name=f"agent-pull-{assignment.id}",
+            )
+            thread.start()
+        else:
+            self._spawn(assignment, repo_path)
         return assignment
 
     def cancel(self, assignment_id: str) -> AgentAssignment:
@@ -235,9 +303,46 @@ class AgentServer:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
+    def _pull_then_spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
+        """Pull each dep before spawning the worker. Logs to the assignment log.
+
+        On any failure: mark the assignment FAILED and skip spawn. The HTTP
+        client polls status to discover this.
+        """
+        with open(assignment.log_path, "w") as log_fh:
+            log_fh.write(
+                f"# pulling dependencies: {assignment.spec.pull_repos}\n"
+            )
+            for dep_name in assignment.spec.pull_repos:
+                dep_path_str = self.repo_paths.get(dep_name)
+                if not dep_path_str:
+                    msg = f"no repo_path configured for dependency {dep_name!r}"
+                    log_fh.write(f"# pull failed: {msg}\n")
+                    self._fail(assignment, msg)
+                    return
+                dep_path = Path(dep_path_str).expanduser()
+                log_fh.write(f"# git -C {dep_path} pull --ff-only\n")
+                log_fh.flush()
+                try:
+                    output = _git(dep_path, "pull", "--ff-only")
+                except _GitError as e:
+                    log_fh.write(f"# pull failed for {dep_name}: {e}\n")
+                    self._fail(assignment, f"pull failed for {dep_name}: {e}")
+                    return
+                log_fh.write(output + "\n")
+            log_fh.write("# all pulls succeeded; starting worker\n")
+        self._spawn(assignment, repo_path)
+
+    def _fail(self, assignment: AgentAssignment, error: str) -> None:
+        with self._lock:
+            assignment.status = FAILED
+            assignment.error = error
+            assignment.finished_at = time.time()
+        self._persist()
+
     def _spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
         argv = self.worker_command(assignment.spec)
-        log_fh = open(assignment.log_path, "w")  # noqa: SIM115 — handle closed in _reap
+        log_fh = open(assignment.log_path, "a")  # noqa: SIM115 — handle closed in _reap
 
         header = (
             f"# agent={self.machine_name} repo={assignment.spec.repo_name} "
