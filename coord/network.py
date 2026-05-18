@@ -123,6 +123,18 @@ def fetch_status(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> dict | N
         return None
 
 
+def fetch_repos(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> dict | None:
+    """GET /repos. Returns None on network error (per-repo errors come back inside the dict)."""
+    try:
+        resp = httpx.get(
+            f"http://{machine.host}:{AGENT_PORT}/repos", timeout=timeout
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
 def fetch_log(
     machine: Machine,
     assignment_id: str,

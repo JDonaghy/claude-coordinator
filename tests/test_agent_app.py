@@ -10,13 +10,19 @@ from coord.agent import AgentServer
 from coord.agent_app import build_app
 
 
-def _client(tmp_path: Path, *, argv: list[str] | None = None) -> tuple[TestClient, AgentServer]:
+def _client(
+    tmp_path: Path,
+    *,
+    argv: list[str] | None = None,
+    repo_paths: dict[str, str] | None = None,
+) -> tuple[TestClient, AgentServer]:
     server = AgentServer(
         machine_name="test",
         capabilities=["python"],
         repos=["api"],
         state_dir=tmp_path / "state",
         worker_command=lambda spec: argv or ["/bin/sh", "-c", "echo ok"],
+        repo_paths=repo_paths,
     )
     app = build_app(server)
     return TestClient(app), server
@@ -138,6 +144,18 @@ def test_logs_endpoint_unknown_id_returns_404(tmp_path: Path) -> None:
     client, _ = _client(tmp_path)
     r = client.get("/logs/missing")
     assert r.status_code == 404
+
+
+def test_repos_endpoint_reports_per_repo_state(tmp_path: Path) -> None:
+    not_a_repo = tmp_path / "fakerepo"
+    not_a_repo.mkdir()
+    client, _ = _client(tmp_path, repo_paths={"api": str(not_a_repo)})
+    r = client.get("/repos")
+    assert r.status_code == 200
+    body = r.json()
+    # api exists but isn't a git repo → returns an error field, not a 500
+    assert "api" in body
+    assert "error" in body["api"]
 
 
 def test_logs_endpoint_bad_since_returns_400(tmp_path: Path) -> None:

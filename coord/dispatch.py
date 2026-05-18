@@ -18,7 +18,12 @@ from coord.models import Proposal
 AGENT_PORT = 7433
 
 
-def dispatch(proposal: Proposal, config: Config) -> dict:
+def dispatch(
+    proposal: Proposal,
+    config: Config,
+    *,
+    pull_repos: Iterable[str] = (),
+) -> dict:
     """POST an assignment to the agent server on the target machine.
 
     Returns the response JSON from the agent server (which includes the
@@ -46,6 +51,7 @@ def dispatch(proposal: Proposal, config: Config) -> dict:
         "briefing": proposal.briefing,
         "files_allowed": proposal.files_likely,
         "files_forbidden": [],
+        "pull_repos": list(pull_repos),
     }
 
     resp = httpx.post(url, json=payload, timeout=15)

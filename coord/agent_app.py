@@ -21,6 +21,9 @@ def build_app(server: AgentServer) -> Starlette:
     async def status(request: Request) -> JSONResponse:
         return JSONResponse(server.list_assignments())
 
+    async def repos(request: Request) -> JSONResponse:
+        return JSONResponse(server.list_repos())
+
     async def assign(request: Request) -> JSONResponse:
         try:
             body = await request.json()
@@ -80,6 +83,7 @@ def build_app(server: AgentServer) -> Starlette:
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/status", status, methods=["GET"]),
+        Route("/repos", repos, methods=["GET"]),
         Route("/assign", assign, methods=["POST"]),
         Route("/cancel/{id}", cancel, methods=["POST"]),
         Route("/logs/{id}", logs, methods=["GET"]),

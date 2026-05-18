@@ -9,7 +9,7 @@ from pathlib import Path
 import click
 import httpx
 
-from coord import __version__
+from coord import __version__, github_ops
 from coord.config import Config, ConfigError, DEFAULT_CONFIG_PATH, load
 from coord.brain import AGENT_PORT
 
@@ -99,6 +99,7 @@ def agent(config_path: Path, machine_name: str | None, bind_host: str, bind_port
         machine_name=machine.name,
         capabilities=machine.capabilities,
         repos=machine.repos,
+        repo_paths=machine.repo_paths,
     )
     app = build_app(server)
     click.echo(
@@ -147,9 +148,15 @@ def _resolve_machine(cfg: Config, explicit_name: str | None):
 @_CONFIG_OPTION
 @click.option("--machine", "machine_filter", default=None, help="Only show this machine.")
 @click.option("--timeout", default=3.0, show_default=True, type=float, help="Per-machine health-check timeout (seconds).")
-def status(config_path: Path, machine_filter: str | None, timeout: float) -> None:
+@click.option(
+    "--freshness",
+    is_flag=True,
+    help="Also report per-machine repo freshness vs GitHub HEADs.",
+)
+def status(config_path: Path, machine_filter: str | None, timeout: float, freshness: bool) -> None:
+    from coord import freshness as fresh
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph
-    from coord.network import check_all, fetch_status
+    from coord.network import check_all, fetch_repos, fetch_status
     from coord.state import build_board, load_dispatched, load_notified
 
     cfg = _load_config(config_path)
@@ -210,6 +217,36 @@ def status(config_path: Path, machine_filter: str | None, timeout: float) -> Non
             for reason in reasons:
                 click.echo(f"    - {reason}")
 
+    if freshness:
+        click.echo("")
+        click.echo("Repo freshness:")
+        github_heads: dict[str, str | None] = {}
+        for repo_cfg in cfg.repos:
+            try:
+                github_heads[repo_cfg.name] = github_ops.get_default_branch_head(
+                    repo_cfg.github, repo_cfg.default_branch
+                )
+            except RuntimeError as e:
+                github_heads[repo_cfg.name] = None
+                click.echo(f"  (github HEAD lookup failed for {repo_cfg.name}: {e})", err=True)
+        for s in statuses:
+            if not s.is_online:
+                click.echo(f"  {s.machine.name}: (offline, skipping)")
+                continue
+            agent_repos = fetch_repos(s.machine, timeout=timeout) or {}
+            click.echo(f"  {s.machine.name}:")
+            for repo_name in s.machine.repos:
+                rf = fresh.compare(repo_name, agent_repos.get(repo_name), github_heads.get(repo_name))
+                local = (rf.local_sha or "?")[:7]
+                remote = (rf.remote_sha or "?")[:7]
+                tag = f"[{rf.state}]"
+                detail = f"local {local} remote {remote}"
+                if rf.dirty:
+                    detail += " (dirty)"
+                if rf.error:
+                    detail += f" — {rf.error}"
+                click.echo(f"    {repo_name:20s} {tag:10s} {detail}")
+
     notified = load_notified()
     if not notified:
         return
@@ -265,9 +302,23 @@ def plan(config_path: Path, dry_run: bool) -> None:
 @click.argument("ids")
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Show what would be dispatched.")
-def approve(ids: str, config_path: Path, dry_run: bool) -> None:
-    from coord.deps import blocked_repos as compute_blocked
+@click.option(
+    "--auto-pull",
+    is_flag=True,
+    help="Tell the agent to `git pull --ff-only` stale dependency repos before starting.",
+)
+@click.option(
+    "--skip-freshness",
+    is_flag=True,
+    help="Skip the dependency freshness check (faster, no network for GH HEADs).",
+)
+def approve(
+    ids: str, config_path: Path, dry_run: bool, auto_pull: bool, skip_freshness: bool
+) -> None:
+    from coord import freshness as fresh
+    from coord.deps import blocked_repos as compute_blocked, build_dep_graph, transitive_deps
     from coord.dispatch import compute_do_not_touch, dispatch, post_briefing
+    from coord.network import classify_error, fetch_repos
     from coord.state import (
         build_board,
         clear_proposals,
@@ -306,15 +357,61 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
 
     in_flight = load_dispatched()
 
-    from coord.network import classify_error
+    # ── Freshness pre-check ──────────────────────────────────────────
+    machine_repos: dict[str, dict | None] = {}
+    github_heads: dict[str, str | None] = {}
+    if not skip_freshness and not dry_run:
+        graph = build_dep_graph(cfg.repos)
+        machines_needed = {p.machine_name for p in selected}
+        for mname in machines_needed:
+            machine = next((m for m in cfg.machines if m.name == mname), None)
+            machine_repos[mname] = fetch_repos(machine) if machine else None
+
+        repos_needed: set[str] = set()
+        for p in selected:
+            repos_needed.update(transitive_deps(p.repo_name, graph))
+        for repo_name in repos_needed:
+            repo_cfg = cfg.repo(repo_name)
+            if repo_cfg is None:
+                github_heads[repo_name] = None
+                continue
+            try:
+                github_heads[repo_name] = github_ops.get_default_branch_head(
+                    repo_cfg.github, repo_cfg.default_branch
+                )
+            except RuntimeError as e:
+                click.echo(f"  warning: could not get HEAD of {repo_cfg.github}: {e}", err=True)
+                github_heads[repo_name] = None
 
     for p in selected:
         click.echo(f"[{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
         if dry_run:
             click.echo("     (dry run — not dispatched)")
             continue
+
+        pull_repos: list[str] = []
+        if not skip_freshness:
+            agent_repos = machine_repos.get(p.machine_name) or {}
+            freshness = fresh.dependency_freshness(p, cfg, agent_repos, github_heads)
+            needs = fresh.stale_or_dirty(freshness)
+            if needs:
+                for f in needs:
+                    click.echo(
+                        f"     dependency {f.repo_name}: {f.state}"
+                        + (f" ({f.error})" if f.error else ""),
+                        err=True,
+                    )
+                if auto_pull:
+                    pull_repos = [f.repo_name for f in needs if f.state == fresh.STALE]
+                    if pull_repos:
+                        click.echo(f"     will pull on agent before worker: {pull_repos}")
+                else:
+                    addendum = fresh.format_briefing_addendum(freshness)
+                    if addendum:
+                        p.briefing = (p.briefing or "") + addendum
+
         try:
-            response = dispatch(p, cfg)
+            response = dispatch(p, cfg, pull_repos=pull_repos)
         except httpx.HTTPError as e:
             state, reason = classify_error(e)
             click.echo(
@@ -330,8 +427,7 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
 
         repo = cfg.repo(p.repo_name)
         if repo is not None:
-            from coord.state import record_dispatched as _record
-            _record(assignment_id=assignment_id, proposal=p, repo_github=repo.github)
+            record_dispatched(assignment_id=assignment_id, proposal=p, repo_github=repo.github)
 
         try:
             do_not_touch = compute_do_not_touch(p, peers=selected, in_flight=in_flight)
