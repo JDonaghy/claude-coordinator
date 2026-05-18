@@ -90,7 +90,11 @@ Rules:
 (issues, PRs, comments). Use regular git commands only.
 - Stay within the files listed in your briefing. If you need to touch \
 other files, do so only if strictly necessary and note it.
-- Commit your work to a feature branch, not the default branch.
+- BEFORE making any changes, create a feature branch: \
+`git checkout -b issue-<number>-<short-description>`. \
+Commit all work to that branch. Push with `git push origin <branch-name>`. \
+NEVER commit or push to main or develop directly. \
+Do NOT open a PR — the coordinator handles that.
 
 Progress reporting:
 - After each significant step (first build, test run, approach change), \
