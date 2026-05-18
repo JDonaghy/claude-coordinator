@@ -146,9 +146,24 @@ def _resolve_machine(cfg: Config, explicit_name: str | None):
 @main.command(help="Show all machines, assignments, and connectivity.")
 @_CONFIG_OPTION
 def status(config_path: Path) -> None:
-    from coord.state import load_dispatched, load_notified
+    from coord.deps import blocked_repos as compute_blocked, build_dep_graph
+    from coord.state import build_board, load_dispatched, load_notified
 
     cfg = _load_config(config_path)
+
+    # Dependency graph
+    graph = build_dep_graph(cfg.repos)
+    has_deps = any(deps for deps in graph.values())
+    if has_deps:
+        click.echo("Dependency graph:")
+        for repo in cfg.repos:
+            deps = graph.get(repo.name, [])
+            if deps:
+                click.echo(f"  {repo.name} → {', '.join(deps)}")
+            else:
+                click.echo(f"  {repo.name} (no dependencies)")
+        click.echo()
+
     click.echo("Machines:")
     for machine in cfg.machines:
         try:
@@ -166,6 +181,17 @@ def status(config_path: Path) -> None:
         repos = ", ".join(machine.repos) if machine.repos else "(none)"
         click.echo(f"  {machine.name:15s} [{state}]")
         click.echo(f"    host: {machine.host}  repos: {repos}")
+
+    # Blocked repos
+    board = build_board()
+    blocked = compute_blocked(cfg.repos, board.active)
+    if blocked:
+        click.echo("")
+        click.echo("Blocked repos:")
+        for repo_name, reasons in blocked.items():
+            click.echo(f"  {repo_name}:")
+            for reason in reasons:
+                click.echo(f"    - {reason}")
 
     notified = load_notified()
     if not notified:
@@ -223,6 +249,7 @@ def plan(config_path: Path, dry_run: bool) -> None:
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Show what would be dispatched.")
 def approve(ids: str, config_path: Path, dry_run: bool) -> None:
+    from coord.deps import blocked_repos as compute_blocked
     from coord.dispatch import compute_do_not_touch, dispatch, post_briefing
     from coord.state import (
         build_board,
@@ -250,6 +277,15 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
     if missing:
         click.echo(f"error: unknown proposal IDs: {missing}", err=True)
         sys.exit(2)
+
+    # Warn about dependency-blocked repos
+    board = build_board()
+    blocked = compute_blocked(cfg.repos, board.active)
+    for p in selected:
+        if p.repo_name in blocked:
+            click.echo(f"  warning: {p.repo_name} is blocked by upstream work:", err=True)
+            for reason in blocked[p.repo_name]:
+                click.echo(f"    - {reason}", err=True)
 
     in_flight = load_dispatched()
 
