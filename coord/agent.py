@@ -75,6 +75,7 @@ class AgentAssignment:
     exit_code: int | None = None
     log_path: str | None = None
     error: str | None = None
+    branch: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -392,12 +393,34 @@ class AgentServer:
         exit_code = proc.wait()
         log_fh.close()
 
+        # Capture the branch the worker left the repo on. Authoritative — we
+        # report what actually happened, not what was hoped. If it equals the
+        # repo's default branch, the worker likely forgot to switch; leave it
+        # None so the coordinator can flag it.
+        captured_branch: str | None = None
+        with self._lock:
+            assignment = self._assignments.get(assignment_id)
+        if assignment is not None:
+            repo_path = Path(assignment.spec.repo_path).expanduser()
+            if repo_path.exists():
+                try:
+                    head = _git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
+                except _GitError:
+                    head = ""
+                if head and head != "HEAD":
+                    # `HEAD` here means detached; ignore.
+                    spec_default = assignment.spec.branch
+                    if spec_default is None or head != spec_default:
+                        captured_branch = head
+
         with self._lock:
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
                 return
             assignment.exit_code = exit_code
             assignment.finished_at = time.time()
+            if captured_branch is not None:
+                assignment.branch = captured_branch
             # Cancel sets status before this runs; respect it.
             if assignment.status == RUNNING:
                 assignment.status = DONE if exit_code == 0 else FAILED

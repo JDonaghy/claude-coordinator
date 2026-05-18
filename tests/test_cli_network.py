@@ -90,14 +90,20 @@ class TestStatus:
     def test_machine_filter_limits_output(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json.return_value = _online_health()
-        with patch.object(network.httpx, "get", return_value=resp):
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            if "/status" in url:
+                r.json.return_value = {"active": [], "completed": []}
+            else:
+                r.json.return_value = _online_health()
+            return r
+
+        with patch.object(network.httpx, "get", side_effect=fake_get):
             result = CliRunner().invoke(
                 main, ["status", "--config", str(config_file), "--machine", "laptop"]
             )
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "laptop" in result.output
         assert "server" not in result.output
 
