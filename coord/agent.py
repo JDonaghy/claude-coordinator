@@ -110,7 +110,13 @@ WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment."""
-    return [binary, "-p", "--system-prompt", WORKER_SYSTEM_PROMPT, spec.briefing]
+    return [
+        binary, "-p",
+        "--system-prompt", WORKER_SYSTEM_PROMPT,
+        "--allowedTools", "Read,Edit,Write,Bash",
+        "--permission-mode", "acceptEdits",
+        spec.briefing,
+    ]
 
 
 class AgentServer:
