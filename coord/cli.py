@@ -145,42 +145,59 @@ def _resolve_machine(cfg: Config, explicit_name: str | None):
 
 @main.command(help="Show all machines, assignments, and connectivity.")
 @_CONFIG_OPTION
-def status(config_path: Path) -> None:
+@click.option("--machine", "machine_filter", default=None, help="Only show this machine.")
+@click.option("--timeout", default=3.0, show_default=True, type=float, help="Per-machine health-check timeout (seconds).")
+def status(config_path: Path, machine_filter: str | None, timeout: float) -> None:
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph
+    from coord.network import check_all, fetch_status
     from coord.state import build_board, load_dispatched, load_notified
 
     cfg = _load_config(config_path)
 
-    # Dependency graph
-    graph = build_dep_graph(cfg.repos)
-    has_deps = any(deps for deps in graph.values())
-    if has_deps:
-        click.echo("Dependency graph:")
-        for repo in cfg.repos:
-            deps = graph.get(repo.name, [])
-            if deps:
-                click.echo(f"  {repo.name} → {', '.join(deps)}")
-            else:
-                click.echo(f"  {repo.name} (no dependencies)")
-        click.echo()
+    # Dependency graph (only when --machine isn't narrowing the view).
+    if not machine_filter:
+        graph = build_dep_graph(cfg.repos)
+        if any(deps for deps in graph.values()):
+            click.echo("Dependency graph:")
+            for repo in cfg.repos:
+                deps = graph.get(repo.name, [])
+                if deps:
+                    click.echo(f"  {repo.name} → {', '.join(deps)}")
+                else:
+                    click.echo(f"  {repo.name} (no dependencies)")
+            click.echo()
 
-    click.echo("Machines:")
-    for machine in cfg.machines:
-        try:
-            resp = httpx.get(
-                f"http://{machine.host}:{AGENT_PORT}/status", timeout=5,
+    machines = cfg.machines
+    if machine_filter:
+        machines = [m for m in machines if m.name == machine_filter]
+        if not machines:
+            click.echo(
+                f"error: machine {machine_filter!r} not in coordinator.yml "
+                f"(have: {[m.name for m in cfg.machines]})",
+                err=True,
             )
-            data = resp.json()
-            assignment = data.get("assignment")
-            if assignment:
-                state = f"busy — #{assignment['issue_number']}: {assignment.get('issue_title', '?')}"
+            sys.exit(2)
+
+    statuses = check_all(machines, timeout=timeout)
+    click.echo("Machines:")
+    for s in statuses:
+        m = s.machine
+        latency = f" ({s.latency_ms:.0f}ms)" if s.latency_ms is not None else ""
+        if s.is_online:
+            assignments = fetch_status(m, timeout=timeout)
+            active = (assignments or {}).get("active", [])
+            if active:
+                a = active[0]
+                spec = a.get("spec", {})
+                detail = f"busy — #{spec.get('issue_number', '?')}: {spec.get('issue_title', '?')}"
             else:
-                state = "idle"
-        except (httpx.HTTPError, httpx.TimeoutException):
-            state = "offline"
-        repos = ", ".join(machine.repos) if machine.repos else "(none)"
-        click.echo(f"  {machine.name:15s} [{state}]")
-        click.echo(f"    host: {machine.host}  repos: {repos}")
+                detail = "idle"
+            label = f"{s.state} • {detail}{latency}"
+        else:
+            label = f"{s.state} — {s.reason}{latency}"
+        repos = ", ".join(m.repos) if m.repos else "(none)"
+        click.echo(f"  {m.name:15s} [{label}]")
+        click.echo(f"    host: {m.host}  repos: {repos}")
 
     # Blocked repos
     board = build_board()
@@ -289,6 +306,8 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
 
     in_flight = load_dispatched()
 
+    from coord.network import classify_error
+
     for p in selected:
         click.echo(f"[{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
         if dry_run:
@@ -296,7 +315,14 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
             continue
         try:
             response = dispatch(p, cfg)
-        except Exception as e:
+        except httpx.HTTPError as e:
+            state, reason = classify_error(e)
+            click.echo(
+                f"     dispatch failed: {p.machine_name} {state} — {reason}",
+                err=True,
+            )
+            continue
+        except ValueError as e:
             click.echo(f"     dispatch failed: {e}", err=True)
             continue
         assignment_id = response.get("id", "pending")
@@ -324,27 +350,119 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
 
 @main.command(help="View claude -p output for a specific assignment.")
 @click.argument("assignment_id")
+@_CONFIG_OPTION
 @click.option("--follow", "-f", is_flag=True, help="Follow output (like tail -f).")
-def log(assignment_id: str, follow: bool) -> None:
+@click.option(
+    "--machine",
+    "machine_filter",
+    default=None,
+    help="Fetch from this machine over the network (otherwise auto-resolved).",
+)
+@click.option("--local", "force_local", is_flag=True, help="Read from local ~/.coord/logs only.")
+def log(
+    assignment_id: str,
+    config_path: Path,
+    follow: bool,
+    machine_filter: str | None,
+    force_local: bool,
+) -> None:
+    from coord.state import load_dispatched
+
+    target_machine = None
+    if not force_local:
+        if machine_filter:
+            cfg_loaded = _load_config(config_path)
+            target_machine = next(
+                (m for m in cfg_loaded.machines if m.name == machine_filter), None
+            )
+            if target_machine is None:
+                click.echo(
+                    f"error: machine {machine_filter!r} not in coordinator.yml",
+                    err=True,
+                )
+                sys.exit(2)
+        else:
+            record = next(
+                (r for r in load_dispatched() if r.get("assignment_id") == assignment_id),
+                None,
+            )
+            if record is not None:
+                cfg_loaded = _load_config(config_path)
+                target_machine = next(
+                    (m for m in cfg_loaded.machines if m.name == record["machine_name"]),
+                    None,
+                )
+
+    if target_machine is None:
+        _log_local(assignment_id, follow)
+        return
+
+    _log_remote(target_machine, assignment_id, follow)
+
+
+def _log_local(assignment_id: str, follow: bool) -> None:
     from coord.agent import DEFAULT_STATE_DIR
+    import time as _time
 
     log_path = DEFAULT_STATE_DIR / "logs" / f"{assignment_id}.log"
     if not log_path.exists():
         click.echo(f"error: no log found for assignment {assignment_id!r}", err=True)
         click.echo(f"  looked in: {log_path}", err=True)
+        click.echo(
+            "  hint: pass --machine NAME to fetch a remote log, or check `coord status`",
+            err=True,
+        )
         sys.exit(1)
 
     if follow:
-        import time
         with open(log_path) as f:
             while True:
                 line = f.readline()
                 if line:
                     click.echo(line, nl=False)
                 else:
-                    time.sleep(0.3)
+                    _time.sleep(0.3)
     else:
         click.echo(log_path.read_text(), nl=False)
+
+
+def _log_remote(machine, assignment_id: str, follow: bool) -> None:
+    from coord.network import fetch_log
+    import time as _time
+
+    since = 0
+    status_code, body = fetch_log(machine, assignment_id, since=since)
+    if status_code == 404:
+        click.echo(
+            f"error: no log for assignment {assignment_id!r} on machine {machine.name!r}",
+            err=True,
+        )
+        sys.exit(1)
+    if status_code != 200:
+        click.echo(
+            f"error: fetching log from {machine.name} returned HTTP {status_code}",
+            err=True,
+        )
+        sys.exit(1)
+    click.echo(body.decode("utf-8", errors="replace"), nl=False)
+    since = len(body)
+
+    if not follow:
+        return
+
+    while True:
+        _time.sleep(0.5)
+        try:
+            status_code, body = fetch_log(machine, assignment_id, since=since)
+        except Exception as e:  # noqa: BLE001 — surface network errors
+            click.echo(f"\n(stream interrupted: {e})", err=True)
+            return
+        if status_code != 200:
+            click.echo(f"\n(stream interrupted: HTTP {status_code})", err=True)
+            return
+        if body:
+            click.echo(body.decode("utf-8", errors="replace"), nl=False)
+            since += len(body)
 
 
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")

@@ -104,3 +104,48 @@ def test_cancel_unknown_id_returns_404(tmp_path: Path) -> None:
     client, _ = _client(tmp_path)
     r = client.post("/cancel/missing")
     assert r.status_code == 404
+
+
+def test_logs_endpoint_returns_log_content(tmp_path: Path) -> None:
+    client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo hello-from-worker"])
+    r = client.post("/assign", json=_payload(tmp_path))
+    aid = r.json()["id"]
+    server.wait_for(aid)
+
+    r = client.get(f"/logs/{aid}")
+    assert r.status_code == 200
+    assert "hello-from-worker" in r.text
+    assert "X-Coord-Log-Total" in r.headers
+    assert r.headers["X-Coord-Log-Status"] == "done"
+    server.shutdown()
+
+
+def test_logs_endpoint_supports_since(tmp_path: Path) -> None:
+    client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo line"])
+    r = client.post("/assign", json=_payload(tmp_path))
+    aid = r.json()["id"]
+    server.wait_for(aid)
+
+    full = client.get(f"/logs/{aid}").text
+    head = client.get(f"/logs/{aid}", params={"since": 0}).text
+    tail = client.get(f"/logs/{aid}", params={"since": len(full) - 5}).text
+    assert head == full
+    assert len(tail) == 5
+    server.shutdown()
+
+
+def test_logs_endpoint_unknown_id_returns_404(tmp_path: Path) -> None:
+    client, _ = _client(tmp_path)
+    r = client.get("/logs/missing")
+    assert r.status_code == 404
+
+
+def test_logs_endpoint_bad_since_returns_400(tmp_path: Path) -> None:
+    client, server = _client(tmp_path)
+    r = client.post("/assign", json=_payload(tmp_path))
+    aid = r.json()["id"]
+    server.wait_for(aid)
+
+    r = client.get(f"/logs/{aid}", params={"since": "not-an-int"})
+    assert r.status_code == 400
+    server.shutdown()

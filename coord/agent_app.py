@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 from coord.agent import AgentServer, AssignmentSpec
@@ -44,10 +46,42 @@ def build_app(server: AgentServer) -> Starlette:
             return JSONResponse({"error": f"unknown assignment {assignment_id}"}, status_code=404)
         return JSONResponse(assignment.to_dict())
 
+    async def logs(request: Request) -> Response:
+        assignment_id = request.path_params["id"]
+        assignment = server.get(assignment_id)
+        if assignment is None or assignment.log_path is None:
+            return JSONResponse(
+                {"error": f"unknown assignment {assignment_id}"}, status_code=404
+            )
+        log_path = Path(assignment.log_path)
+        if not log_path.exists():
+            return JSONResponse(
+                {"error": f"no log file for assignment {assignment_id}"}, status_code=404
+            )
+
+        since_raw = request.query_params.get("since", "0")
+        try:
+            since = max(0, int(since_raw))
+        except ValueError:
+            return JSONResponse(
+                {"error": f"invalid since value: {since_raw!r}"}, status_code=400
+            )
+
+        with open(log_path, "rb") as f:
+            f.seek(since)
+            body = f.read()
+        total_size = log_path.stat().st_size
+        headers = {
+            "X-Coord-Log-Total": str(total_size),
+            "X-Coord-Log-Status": assignment.status,
+        }
+        return PlainTextResponse(body.decode("utf-8", errors="replace"), headers=headers)
+
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/status", status, methods=["GET"]),
         Route("/assign", assign, methods=["POST"]),
         Route("/cancel/{id}", cancel, methods=["POST"]),
+        Route("/logs/{id}", logs, methods=["GET"]),
     ]
     return Starlette(routes=routes)
