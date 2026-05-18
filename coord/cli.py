@@ -1045,8 +1045,17 @@ def done(config_path: Path) -> None:
 
 
 @main.command(help="Start the web dashboard (port 7434).")
-def web() -> None:
-    _not_implemented("web")
+@_CONFIG_OPTION
+@click.option("--host", "bind_host", default="0.0.0.0", show_default=True)
+@click.option("--port", "bind_port", default=7434, show_default=True, type=int)
+def web(config_path: Path, bind_host: str, bind_port: int) -> None:
+    import uvicorn
+    from coord.dashboard.server import build_app
+
+    cfg = _load_config(config_path)
+    app = build_app(cfg)
+    click.echo(f"coord web: dashboard at http://{bind_host}:{bind_port}")
+    uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
 
 
 if __name__ == "__main__":
