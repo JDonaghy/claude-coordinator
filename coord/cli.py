@@ -124,9 +124,9 @@ def _resolve_machine(cfg: Config, explicit_name: str | None):
             sys.exit(2)
         return m
 
-    hostname = socket.gethostname()
+    hostname = socket.gethostname().lower()
     short = hostname.split(".")[0]
-    candidates = [m for m in cfg.machines if m.name == short or m.host == hostname or m.host.split(".")[0] == short]
+    candidates = [m for m in cfg.machines if m.name.lower() == short or m.host.lower() == hostname or m.host.lower().split(".")[0] == short]
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:
