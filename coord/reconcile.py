@@ -46,10 +46,14 @@ def reconcile(board: Board, config: Config) -> list[str]:
             entry = completed_by_id.get(a.assignment_id)
             if entry is None:
                 continue
+            branch = entry.get("branch")
+            if branch:
+                a.branch = branch
             if entry.get("status") == "done":
                 board.mark_done_by_id(
                     a.assignment_id,
                     finished_at=entry.get("finished_at"),
+                    branch=branch,
                 )
             else:
                 board.mark_failed_by_id(

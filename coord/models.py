@@ -132,8 +132,10 @@ class Board:
         for a in self.active:
             if a.assignment_id == assignment_id:
                 a.status = "done"
-                a.branch = branch
-                a.pr_url = pr_url
+                if branch is not None:
+                    a.branch = branch
+                if pr_url is not None:
+                    a.pr_url = pr_url
                 a.finished_at = finished_at
                 self.completed.append(a)
                 self.active.remove(a)

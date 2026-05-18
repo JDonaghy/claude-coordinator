@@ -261,6 +261,25 @@ def status(config_path: Path, machine_filter: str | None, timeout: float, freshn
                     detail += f" — {rf.error}"
                 click.echo(f"    {repo_name:20s} {tag:10s} {detail}")
 
+    # Merge queue
+    from coord import merge_queue as mq
+
+    queue = mq.load_queue()
+    by_repo = mq.pending_summary(queue)
+    if by_repo:
+        click.echo("")
+        click.echo("Merge queue:")
+        for repo_name, entries in sorted(by_repo.items()):
+            click.echo(f"  {repo_name}:")
+            for e in entries:
+                size = f"+{e.size}" if e.size is not None else "?"
+                pr = f"PR #{e.pr_number}" if e.pr_number else "no PR yet"
+                tag = f"[{e.state}]"
+                line = f"    {tag:11s} #{e.issue_number} ({e.branch} → {e.target_branch}) {pr} size={size}"
+                click.echo(line)
+                if e.error:
+                    click.echo(f"      error: {e.error}")
+
     notified = load_notified()
     if not notified:
         return
@@ -640,6 +659,81 @@ def notify(config_path: Path) -> None:
     save_board(board)
 
 
+@main.command(help="Process the merge queue: open PRs and merge in sequence.")
+@_CONFIG_OPTION
+@click.option("--dry-run", is_flag=True, help="Show the plan without opening or merging PRs.")
+@click.option(
+    "--order",
+    default=None,
+    help="Comma-separated assignment IDs to merge first (overrides size-based sequencing).",
+)
+@click.option("--repo", "repo_filter", default=None, help="Only process this repo's queue.")
+@click.option(
+    "--method",
+    type=click.Choice(["rebase", "squash", "merge"]),
+    default="rebase",
+    show_default=True,
+)
+def merge(
+    config_path: Path,
+    dry_run: bool,
+    order: str | None,
+    repo_filter: str | None,
+    method: str,
+) -> None:
+    from coord import github_ops as gh_ops
+    from coord import merge_queue as mq
+    from coord.merge_queue import CONFLICT, MERGED, PENDING
+
+    _load_config(config_path)  # validate
+    items = mq.load_queue()
+    if repo_filter:
+        items = [x for x in items if x.repo_name == repo_filter]
+    if not items:
+        click.echo("Merge queue is empty.")
+        return
+
+    presorted = False
+    if order:
+        ids = [s.strip() for s in order.split(",") if s.strip()]
+        items = mq.reorder(items, ids)
+        presorted = True
+
+    pending = [x for x in items if x.state == PENDING]
+    if not pending:
+        # Still surface terminal states so the user knows what happened.
+        for x in items:
+            click.echo(f"  [{x.state}] {x.repo_name} #{x.issue_number} ({x.branch})")
+        return
+
+    events = mq.process(items, gh_ops, method=method, dry_run=dry_run, presorted=presorted)
+
+    for ev in events:
+        e = ev.entry
+        prefix = f"  {e.repo_name} #{e.issue_number} ({e.branch})"
+        click.echo(f"{prefix}: {ev.kind} — {ev.message}")
+
+    # Save state only when we actually moved
+    if not dry_run:
+        # Persist the updated entries by merging back over the on-disk queue.
+        all_items = mq.load_queue()
+        by_id = {x.assignment_id: x for x in items}
+        merged = [by_id.get(x.assignment_id, x) for x in all_items]
+        mq.save_queue(merged)
+
+    # Summary
+    states: dict[str, int] = {}
+    for x in items:
+        states[x.state] = states.get(x.state, 0) + 1
+    click.echo("")
+    click.echo(
+        "Summary: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(states.items()))
+    )
+    if states.get(CONFLICT):
+        click.echo("note: at least one PR has a conflict — resolve manually, then re-run.")
+
+
 @main.command(help="Recover board state after a crash or restart.")
 @_CONFIG_OPTION
 def resume(config_path: Path) -> None:
@@ -661,10 +755,27 @@ def resume(config_path: Path) -> None:
         changed = reconcile(board, cfg)
         if changed:
             click.echo(f"  {len(changed)} assignment(s) finished since last check:")
+            from coord.merge_queue import enqueue as _mq_enqueue
             for aid in changed:
                 a = board.find_by_id(aid)
                 if a:
                     click.echo(f"    {a.machine_name} → {a.repo_name} #{a.issue_number}: [{a.status}]")
+                    if a.status == "done":
+                        repo_cfg = cfg.repo(a.repo_name)
+                        if repo_cfg is not None and a.branch:
+                            entry = _mq_enqueue(
+                                a,
+                                repo_github=repo_cfg.github,
+                                target_branch=repo_cfg.default_branch,
+                            )
+                            if entry is not None:
+                                click.echo(
+                                    f"      → enqueued for merge ({entry.branch} → {entry.target_branch})"
+                                )
+                        elif a.status == "done" and not a.branch:
+                            click.echo(
+                                "      → no branch captured; skip merge enqueue"
+                            )
         else:
             click.echo("  all active assignments still running")
 

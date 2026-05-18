@@ -51,6 +51,71 @@ def get_default_branch_head(repo: str, branch: str) -> str:
     return data["commit"]["sha"]
 
 
+# ── PR operations (used by the merge queue) ──────────────────────────────
+
+def find_pr_for_branch(repo: str, branch: str) -> dict | None:
+    """Return the first open PR whose head ref matches `branch`, or None."""
+    raw = _gh(
+        "pr", "list", "--repo", repo, "--state", "open",
+        "--head", branch,
+        "--json", "number,title,url,headRefName,baseRefName,additions,deletions,mergeable",
+        "--limit", "1",
+    )
+    items = json.loads(raw)
+    return items[0] if items else None
+
+
+def create_pr(
+    repo: str,
+    *,
+    base: str,
+    head: str,
+    title: str,
+    body: str,
+) -> dict:
+    """Open a PR. Returns {number, url}. If one already exists for `head`, returns it."""
+    existing = find_pr_for_branch(repo, head)
+    if existing is not None:
+        return {"number": existing["number"], "url": existing["url"], "existed": True}
+    url = _gh(
+        "pr", "create", "--repo", repo,
+        "--base", base, "--head", head,
+        "--title", title, "--body", body,
+    )
+    # gh pr create returns the URL on the last line of stdout.
+    pr_url = url.strip().splitlines()[-1] if url.strip() else ""
+    number = int(pr_url.rsplit("/", 1)[-1]) if pr_url else 0
+    return {"number": number, "url": pr_url, "existed": False}
+
+
+def get_pr_size(repo: str, number: int) -> int:
+    """Return additions+deletions for sequencing. 0 on lookup failure."""
+    try:
+        raw = _gh(
+            "pr", "view", str(number), "--repo", repo,
+            "--json", "additions,deletions",
+        )
+    except RuntimeError:
+        return 0
+    data = json.loads(raw)
+    return int(data.get("additions", 0)) + int(data.get("deletions", 0))
+
+
+def merge_pr(repo: str, number: int, method: str = "rebase") -> tuple[bool, str]:
+    """Merge a PR. Returns (success, message).
+
+    Conflict / not-rebaseable cases come back as (False, <gh stderr>). Caller
+    decides whether to retry or surface to the user — we never resolve conflicts
+    here.
+    """
+    flag = {"rebase": "--rebase", "squash": "--squash", "merge": "--merge"}.get(method, "--rebase")
+    try:
+        out = _gh("pr", "merge", str(number), "--repo", repo, flag, "--delete-branch=false")
+    except RuntimeError as e:
+        return False, str(e)
+    return True, out
+
+
 def list_open_prs(repo: str) -> list[dict]:
     raw = _gh(
         "pr", "list", "--repo", repo, "--state", "open",
