@@ -25,8 +25,14 @@ machines:
     host: macbook.tailnet
     capabilities: [docker, node, python]
     repos: [api-gateway, user-service]
+    repo_paths:
+      api-gateway: ~/src/api-gateway
+      user-service: ~/src/user-service
 
   - name: server
     host: server.tailnet
     capabilities: [docker, python, gpu]
     repos: [user-service, shared-lib]
+    repo_paths:
+      user-service: ~/src/user-service
+      shared-lib: ~/src/shared-lib

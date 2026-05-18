@@ -18,7 +18,10 @@ def config() -> Config:
             Repo(name="api", github="acme/api"),
         ],
         machines=[
-            Machine(name="laptop", host="laptop.tailnet", repos=["api"]),
+            Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            ),
         ],
     )
 
@@ -51,7 +54,11 @@ class TestDispatch:
         mock_post.assert_called_once()
         call_args = mock_post.call_args
         assert "laptop.tailnet" in call_args.args[0]
-        assert call_args.kwargs["json"]["issue_number"] == 10
+        payload = call_args.kwargs["json"]
+        assert payload["issue_number"] == 10
+        assert payload["repo_path"] == "/home/user/src/api"
+        assert payload["files_allowed"] == ["auth.py"]
+        assert "files_likely" not in payload
 
     def test_unknown_machine_raises(self, config: Config) -> None:
         bad = Proposal(
@@ -60,6 +67,18 @@ class TestDispatch:
         )
         with pytest.raises(ValueError, match="Unknown machine"):
             dispatch(bad, config)
+
+    def test_missing_repo_path_raises(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="h", repos=["api"])],
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="x", rationale="",
+        )
+        with pytest.raises(ValueError, match="repo_path"):
+            dispatch(p, cfg)
 
 
 class TestPostBriefing:

@@ -281,6 +281,31 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
         click.echo("\nPending proposals cleared.")
 
 
+@main.command(help="View claude -p output for a specific assignment.")
+@click.argument("assignment_id")
+@click.option("--follow", "-f", is_flag=True, help="Follow output (like tail -f).")
+def log(assignment_id: str, follow: bool) -> None:
+    from coord.agent import DEFAULT_STATE_DIR
+
+    log_path = DEFAULT_STATE_DIR / "logs" / f"{assignment_id}.log"
+    if not log_path.exists():
+        click.echo(f"error: no log found for assignment {assignment_id!r}", err=True)
+        click.echo(f"  looked in: {log_path}", err=True)
+        sys.exit(1)
+
+    if follow:
+        import time
+        with open(log_path) as f:
+            while True:
+                line = f.readline()
+                if line:
+                    click.echo(line, nl=False)
+                else:
+                    time.sleep(0.3)
+    else:
+        click.echo(log_path.read_text(), nl=False)
+
+
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")
 @_CONFIG_OPTION
 def notify(config_path: Path) -> None:

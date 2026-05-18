@@ -19,9 +19,13 @@ class Machine:
     host: str
     capabilities: list[str] = field(default_factory=list)
     repos: list[str] = field(default_factory=list)
+    repo_paths: dict[str, str] = field(default_factory=dict)
 
     def can_work_on(self, repo_name: str) -> bool:
         return repo_name in self.repos
+
+    def repo_path(self, repo_name: str) -> str | None:
+        return self.repo_paths.get(repo_name)
 
 
 @dataclass
