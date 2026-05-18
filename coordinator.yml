@@ -1,47 +1,63 @@
-# Example coordinator config.
-#
-# Describes the repos this coordinator manages and the machines that can work
-# on them. The brain reads this to propose assignments; agent servers on each
-# machine spawn `claude -p` to execute the work.
-
 repos:
-  - name: api-gateway
-    github: acme/api-gateway
-    default_branch: main
-    depends_on: []
-    build_command: "npm install && npm run build"
-    test_command: "npm test"
+  - name: vimcode
+    github: JDonaghy/vimcode
+    depends_on: [quadraui]
+    default_branch: develop
+    build_command: "cargo build"
+    test_command: "cargo test --no-default-features"
 
-  - name: user-service
-    github: acme/user-service
-    default_branch: main
-    depends_on: [shared-lib]
-    build_command: "pip install -e .[dev]"
-    test_command: "pytest"
-
-  - name: shared-lib
-    github: acme/shared-lib
-    default_branch: main
+  - name: quadraui
+    github: JDonaghy/quadraui
     depends_on: []
-    build_command: "pip install -e .[dev]"
+    default_branch: main
+    build_command: "cargo build --features tui --features gtk"
+    test_command: "cargo test --features tui"
+
+  - name: claude-coordinator
+    github: JDonaghy/claude-coordinator
+    depends_on: []
+    default_branch: main
+    build_command: "pip install -e ."
     test_command: "pytest"
 
 machines:
-  - name: macbook
-    host: macbook.tailnet
-    capabilities: [docker, node, python]
-    repos: [api-gateway, user-service]
+  # Desktop A — Dell Precision, full GTK builds
+  - name: precision
+    host: john-precision-3571
+    capabilities: [gtk, rust, python]
+    repos: [vimcode, quadraui, claude-coordinator]
     repo_paths:
-      api-gateway: ~/src/api-gateway
-      user-service: ~/src/user-service
+      vimcode: ~/src/vimcode
+      quadraui: ~/src/quadraui
+      claude-coordinator: ~/src/claude-coordinator
 
-  - name: server
-    host: server.tailnet
-    capabilities: [docker, python, gpu]
-    repos: [user-service, shared-lib]
+  # Desktop B — HP EliteBook, full GTK builds
+  - name: elitebook
+    host: john-hp-elitebook-830-g7-notebook-pc
+    capabilities: [gtk, rust, python]
+    repos: [vimcode, quadraui, claude-coordinator]
     repo_paths:
-      user-service: ~/src/user-service
-      shared-lib: ~/src/shared-lib
+      vimcode: ~/src/vimcode
+      quadraui: ~/src/quadraui
+      claude-coordinator: ~/src/claude-coordinator
+
+  # Server — Dell server, no display (no GTK builds)
+  - name: dellserver
+    host: dellserver
+    capabilities: [rust, python]
+    repos: [vimcode, quadraui, claude-coordinator]
+    repo_paths:
+      vimcode: ~/src/vimcode
+      quadraui: ~/src/quadraui
+      claude-coordinator: ~/src/claude-coordinator
+
+  # Azure VM — lightweight, small tasks only (needs Claude CLI setup)
+  - name: azure-vm
+    host: vm-acme-dev-platform
+    capabilities: [python]
+    repos: [claude-coordinator]
+    repo_paths:
+      claude-coordinator: ~/src/claude-coordinator
 
 hooks:
   on_round_complete:
