@@ -86,12 +86,21 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if not isinstance(default_branch, str):
             raise ConfigError(f"repos[{i}].default_branch must be a string")
 
+        build_command = entry.get("build_command")
+        if build_command is not None and not isinstance(build_command, str):
+            raise ConfigError(f"repos[{i}].build_command must be a string")
+        test_command = entry.get("test_command")
+        if test_command is not None and not isinstance(test_command, str):
+            raise ConfigError(f"repos[{i}].test_command must be a string")
+
         repos.append(
             Repo(
                 name=name,
                 github=github,
                 depends_on=depends_on,
                 default_branch=default_branch,
+                build_command=build_command,
+                test_command=test_command,
             )
         )
     return repos
