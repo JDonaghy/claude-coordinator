@@ -1,0 +1,32 @@
+# Example coordinator config.
+#
+# Describes the repos this coordinator manages and the machines that can work
+# on them. The brain reads this to propose assignments; agent servers on each
+# machine spawn `claude -p` to execute the work.
+
+repos:
+  - name: api-gateway
+    github: acme/api-gateway
+    default_branch: main
+    depends_on: []
+
+  - name: user-service
+    github: acme/user-service
+    default_branch: main
+    depends_on: [shared-lib]
+
+  - name: shared-lib
+    github: acme/shared-lib
+    default_branch: main
+    depends_on: []
+
+machines:
+  - name: macbook
+    host: macbook.tailnet
+    capabilities: [docker, node, python]
+    repos: [api-gateway, user-service]
+
+  - name: server
+    host: server.tailnet
+    capabilities: [docker, python, gpu]
+    repos: [user-service, shared-lib]
