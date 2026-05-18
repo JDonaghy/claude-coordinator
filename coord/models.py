@@ -37,10 +37,12 @@ class Assignment:
     files_allowed: list[str] = field(default_factory=list)
     files_forbidden: list[str] = field(default_factory=list)
     briefing: str = ""
-    session_id: str | None = None
+    assignment_id: str | None = None
     status: str = "pending"  # pending | running | done | failed
     branch: str | None = None
     pr_url: str | None = None
+    dispatched_at: float | None = None
+    finished_at: float | None = None
 
 
 @dataclass
@@ -106,3 +108,53 @@ class Board:
                 self.active.remove(a)
                 return a
         return None
+
+    def find_by_id(self, assignment_id: str) -> Assignment | None:
+        for a in self.active:
+            if a.assignment_id == assignment_id:
+                return a
+        for a in self.completed:
+            if a.assignment_id == assignment_id:
+                return a
+        return None
+
+    def mark_done_by_id(
+        self,
+        assignment_id: str,
+        branch: str | None = None,
+        pr_url: str | None = None,
+        finished_at: float | None = None,
+    ) -> Assignment | None:
+        for a in self.active:
+            if a.assignment_id == assignment_id:
+                a.status = "done"
+                a.branch = branch
+                a.pr_url = pr_url
+                a.finished_at = finished_at
+                self.completed.append(a)
+                self.active.remove(a)
+                return a
+        return None
+
+    def mark_failed_by_id(
+        self,
+        assignment_id: str,
+        finished_at: float | None = None,
+    ) -> Assignment | None:
+        for a in self.active:
+            if a.assignment_id == assignment_id:
+                a.status = "failed"
+                a.finished_at = finished_at
+                self.completed.append(a)
+                self.active.remove(a)
+                return a
+        return None
+
+    def gc(self, keep: int = 50) -> int:
+        """Remove oldest completed assignments beyond *keep*. Returns count removed."""
+        if len(self.completed) <= keep:
+            return 0
+        by_time = sorted(self.completed, key=lambda a: a.finished_at or 0)
+        to_remove = len(self.completed) - keep
+        self.completed = by_time[to_remove:]
+        return to_remove

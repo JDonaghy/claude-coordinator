@@ -1,18 +1,20 @@
-"""Persistence for coordinator state (proposals, dispatched assignments, notifications)."""
+"""Persistence for coordinator state (proposals, board, dispatched assignments, notifications)."""
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import asdict
 from pathlib import Path
 
-from coord.models import Proposal
+from coord.models import Assignment, Board, Proposal
 
 COORD_DIR = Path.home() / ".coord"
 PROPOSALS_FILE = COORD_DIR / "pending_proposals.json"
 DISPATCHED_FILE = COORD_DIR / "dispatched.json"
 NOTIFIED_FILE = COORD_DIR / "notified.json"
+BOARD_FILE = COORD_DIR / "board.json"
 
 
 def save_proposals(proposals: list[Proposal]) -> Path:
@@ -96,3 +98,80 @@ def mark_notified(
     data[assignment_id] = {"event": event, "posted_at": time.time()}
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2) + "\n")
+
+
+# ── Board persistence ───────────────────────────────────────────────────
+
+
+def save_board(board: Board, path: Path | None = None) -> Path:
+    """Atomically persist the board to disk."""
+    p = path or BOARD_FILE
+    data = {
+        "round_number": board.round_number,
+        "active": [asdict(a) for a in board.active],
+        "completed": [asdict(a) for a in board.completed],
+        "saved_at": time.time(),
+    }
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, p)
+    return p
+
+
+def load_board(path: Path | None = None) -> Board | None:
+    """Load a previously saved board, or None if no state exists."""
+    p = path or BOARD_FILE
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    active = [Assignment(**a) for a in data.get("active", [])]
+    completed = [Assignment(**a) for a in data.get("completed", [])]
+    return Board(
+        active=active,
+        completed=completed,
+        round_number=data.get("round_number", 0),
+    )
+
+
+def build_board(
+    dispatched_path: Path | None = None,
+    notified_path: Path | None = None,
+) -> Board:
+    """Reconstruct a Board from the dispatched ledger and notification state.
+
+    This is the ground-truth builder: it reads the append-only dispatched
+    log and the notified ledger to determine which assignments are active
+    vs completed. Use this when the board file is missing or suspect.
+    """
+    from coord.comments import EVENT_COMPLETION
+
+    dispatched = load_dispatched(dispatched_path)
+    notified = load_notified(notified_path)
+
+    board = Board()
+    for record in dispatched:
+        aid = record["assignment_id"]
+        a = Assignment(
+            machine_name=record["machine_name"],
+            repo_name=record["repo_name"],
+            issue_number=record["issue_number"],
+            issue_title=record["issue_title"],
+            files_allowed=record.get("files_likely", []),
+            briefing=record.get("briefing", ""),
+            assignment_id=aid,
+            status="running",
+            dispatched_at=record.get("dispatched_at"),
+        )
+        n = notified.get(aid)
+        if n:
+            a.status = "done" if n["event"] == EVENT_COMPLETION else "failed"
+            a.finished_at = n.get("posted_at")
+            board.completed.append(a)
+        else:
+            board.active.append(a)
+
+    return board
