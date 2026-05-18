@@ -194,10 +194,24 @@ def status(config_path: Path, machine_filter: str | None, timeout: float) -> Non
                 detail = "idle"
             label = f"{s.state} • {detail}{latency}"
         else:
+            assignments = None
             label = f"{s.state} — {s.reason}{latency}"
         repos = ", ".join(m.repos) if m.repos else "(none)"
         click.echo(f"  {m.name:15s} [{label}]")
         click.echo(f"    host: {m.host}  repos: {repos}")
+
+        if assignments:
+            for entry in assignments.get("active", []):
+                progress = entry.get("progress")
+                if not progress:
+                    continue
+                if progress.get("stuck"):
+                    click.echo(f"    !! STUCK: {progress['stuck']}")
+                for w in progress.get("warnings", []):
+                    click.echo(f"    !! {w}")
+                updates = progress.get("updates", [])
+                if updates:
+                    click.echo(f"    latest: {updates[-1]}")
 
     # Blocked repos
     board = build_board()
@@ -463,6 +477,42 @@ def _log_remote(machine, assignment_id: str, follow: bool) -> None:
         if body:
             click.echo(body.decode("utf-8", errors="replace"), nl=False)
             since += len(body)
+
+
+@main.command(help="Cancel a running assignment.")
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+def stop(assignment_id: str, config_path: Path) -> None:
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    machine = next(
+        (m for m in cfg.machines if m.name == assignment.machine_name), None
+    )
+    if machine is None:
+        click.echo(f"error: machine {assignment.machine_name!r} not in config", err=True)
+        sys.exit(1)
+
+    try:
+        resp = httpx.post(
+            f"http://{machine.host}:{AGENT_PORT}/cancel/{assignment_id}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        click.echo(f"Assignment {assignment_id} cancelled on {machine.name}")
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        click.echo(f"warning: could not reach agent on {machine.name}: {e}", err=True)
+
+    board.mark_failed_by_id(assignment_id)
+    save_board(board)
+    click.echo(f"Board updated: {assignment.repo_name} #{assignment.issue_number} marked failed")
 
 
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")

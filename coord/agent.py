@@ -71,7 +71,15 @@ Rules:
 (issues, PRs, comments). Use regular git commands only.
 - Stay within the files listed in your briefing. If you need to touch \
 other files, do so only if strictly necessary and note it.
-- Commit your work to a feature branch, not the default branch.\
+- Commit your work to a feature branch, not the default branch.
+
+Progress reporting:
+- After each significant step (first build, test run, approach change), \
+output a status line in exactly this format:
+  STATUS: [what you just did] → [what you're about to do] → [confidence: high/medium/low]
+- If you've tried 2 approaches and neither worked, STOP and output:
+  STUCK: [what you tried] [why it failed] [what you think the blocker is]
+  Then wait for guidance rather than trying a third approach.\
 """
 
 WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
@@ -131,9 +139,18 @@ class AgentServer:
 
     def list_assignments(self) -> dict:
         with self._lock:
-            items = [a.to_dict() for a in self._assignments.values()]
-        active = [a for a in items if a["status"] == RUNNING]
-        completed = [a for a in items if a["status"] != RUNNING]
+            assignments = list(self._assignments.values())
+        active = []
+        completed = []
+        for a in assignments:
+            d = a.to_dict()
+            if a.status == RUNNING:
+                prog = self.progress(a.id)
+                if prog:
+                    d["progress"] = prog
+                active.append(d)
+            else:
+                completed.append(d)
         return {"active": active, "completed": completed}
 
     def assign(self, spec: AssignmentSpec) -> AgentAssignment:
@@ -193,6 +210,15 @@ class AgentServer:
     def get(self, assignment_id: str) -> AgentAssignment | None:
         with self._lock:
             return self._assignments.get(assignment_id)
+
+    def progress(self, assignment_id: str) -> dict | None:
+        """Parse progress signals from the worker's log file."""
+        from coord.progress import parse_progress
+
+        a = self.get(assignment_id)
+        if a is None or a.log_path is None:
+            return None
+        return parse_progress(a.log_path).to_dict()
 
     def wait_for(self, assignment_id: str, timeout: float = 10.0) -> AgentAssignment:
         """Block until an assignment leaves RUNNING. Test helper."""
