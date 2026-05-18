@@ -6,10 +6,11 @@ from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from coord.agent import AgentServer, AssignmentSpec
+from coord.agent import RUNNING, PENDING, AgentServer, AssignmentSpec
+from coord.events import stream_assignment_log
 
 
 def build_app(server: AgentServer) -> Starlette:
@@ -80,6 +81,47 @@ def build_app(server: AgentServer) -> Starlette:
         }
         return PlainTextResponse(body.decode("utf-8", errors="replace"), headers=headers)
 
+    async def stream(request: Request) -> Response:
+        assignment_id = request.path_params["id"]
+        assignment = server.get(assignment_id)
+        if assignment is None or assignment.log_path is None:
+            return JSONResponse(
+                {"error": f"unknown assignment {assignment_id}"}, status_code=404
+            )
+        log_path = Path(assignment.log_path)
+
+        last_event_id = request.headers.get("last-event-id")
+        if last_event_id is not None:
+            try:
+                start_offset = max(0, int(last_event_id))
+            except ValueError:
+                start_offset = 0
+        else:
+            try:
+                start_offset = max(0, int(request.query_params.get("since", "0")))
+            except ValueError:
+                start_offset = 0
+
+        def is_active() -> bool:
+            current = server.get(assignment_id)
+            return current is not None and current.status in (PENDING, RUNNING)
+
+        gen = stream_assignment_log(
+            log_path,
+            is_active=is_active,
+            request=request,
+            start_offset=start_offset,
+        )
+        return StreamingResponse(
+            gen,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/status", status, methods=["GET"]),
@@ -87,5 +129,6 @@ def build_app(server: AgentServer) -> Starlette:
         Route("/assign", assign, methods=["POST"]),
         Route("/cancel/{id}", cancel, methods=["POST"]),
         Route("/logs/{id}", logs, methods=["GET"]),
+        Route("/stream/{id}", stream, methods=["GET"]),
     ]
     return Starlette(routes=routes)
