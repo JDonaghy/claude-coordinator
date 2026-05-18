@@ -225,10 +225,12 @@ def plan(config_path: Path, dry_run: bool) -> None:
 def approve(ids: str, config_path: Path, dry_run: bool) -> None:
     from coord.dispatch import compute_do_not_touch, dispatch, post_briefing
     from coord.state import (
+        build_board,
         clear_proposals,
         load_dispatched,
         load_proposals,
         record_dispatched,
+        save_board,
     )
 
     cfg = _load_config(config_path)
@@ -278,7 +280,10 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
 
     if not dry_run:
         clear_proposals()
-        click.echo("\nPending proposals cleared.")
+        board = build_board()
+        board.round_number += 1
+        save_board(board)
+        click.echo("\nPending proposals cleared. Board saved.")
 
 
 @main.command(help="View claude -p output for a specific assignment.")
@@ -310,6 +315,7 @@ def log(assignment_id: str, follow: bool) -> None:
 @_CONFIG_OPTION
 def notify(config_path: Path) -> None:
     from coord.notify import run as run_notify
+    from coord.state import build_board, save_board
 
     cfg = _load_config(config_path)
     posted = run_notify(cfg)
@@ -322,6 +328,49 @@ def notify(config_path: Path) -> None:
             f"  [{t.event}] {t.machine_name} → {t.repo_name} "
             f"#{t.issue_number} (assignment {t.assignment_id}, exit {t.exit_code})"
         )
+    board = build_board()
+    save_board(board)
+
+
+@main.command(help="Recover board state after a crash or restart.")
+@_CONFIG_OPTION
+def resume(config_path: Path) -> None:
+    from coord.reconcile import reconcile
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board()
+    if board is None:
+        click.echo("No saved board found. Rebuilding from dispatched ledger...")
+        board = build_board()
+
+    click.echo(f"Board round: {board.round_number}")
+    click.echo(f"  active:    {len(board.active)} assignment(s)")
+    click.echo(f"  completed: {len(board.completed)} assignment(s)")
+
+    if board.active:
+        click.echo("\nReconciling with agent servers...")
+        changed = reconcile(board, cfg)
+        if changed:
+            click.echo(f"  {len(changed)} assignment(s) finished since last check:")
+            for aid in changed:
+                a = board.find_by_id(aid)
+                if a:
+                    click.echo(f"    {a.machine_name} → {a.repo_name} #{a.issue_number}: [{a.status}]")
+        else:
+            click.echo("  all active assignments still running")
+
+    removed = board.gc()
+    if removed:
+        click.echo(f"\nGC: pruned {removed} old completed assignment(s)")
+
+    save_board(board)
+    click.echo(f"\nBoard saved ({len(board.active)} active, {len(board.completed)} completed)")
+
+    if board.active:
+        click.echo("\nActive assignments:")
+        for a in board.active:
+            click.echo(f"  {a.machine_name} → {a.repo_name} #{a.issue_number}: {a.issue_title}")
 
 
 @main.command(help="Start the web dashboard (port 7434).")
