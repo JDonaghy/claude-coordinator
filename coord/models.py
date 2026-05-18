@@ -40,6 +40,18 @@ class Assignment:
 
 
 @dataclass
+class Proposal:
+    id: int
+    machine_name: str
+    repo_name: str
+    issue_number: int
+    issue_title: str
+    rationale: str
+    files_likely: list[str] = field(default_factory=list)
+    briefing: str = ""
+
+
+@dataclass
 class Board:
     repos: list[Repo] = field(default_factory=list)
     machines: list[Machine] = field(default_factory=list)
