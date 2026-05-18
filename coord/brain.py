@@ -8,7 +8,7 @@ import subprocess
 import httpx
 
 from coord.config import Config
-from coord.models import Proposal
+from coord.models import Proposal, SplitChunk, SplitProposal
 from coord import github_ops
 
 AGENT_PORT = 7433
@@ -30,8 +30,16 @@ Rules:
 - Write a concise briefing for each assignment: what the worker should do, which
   files are likely involved, and any constraints.
 
-Respond with a JSON array of proposed assignments. Each element:
+Split detection — if an issue is too large for a single worker session, propose
+a split instead of an assignment. Signs an issue is too large:
+- Issue body has a numbered/bulleted list with 5+ independent items
+- Multiple independent files/surfaces/endpoints to change
+- Title contains "migrate all", "replace remaining", "deduplicate all", etc.
+Do NOT split issues that are naturally sequential or tightly coupled.
+
+Respond with a JSON array. Each element is EITHER an assignment:
 {
+  "type": "assignment",
   "machine_name": "...",
   "repo_name": "...",
   "issue_number": 123,
@@ -39,6 +47,19 @@ Respond with a JSON array of proposed assignments. Each element:
   "rationale": "why this machine for this issue",
   "files_likely": ["path/to/file.py", ...],
   "briefing": "worker instructions"
+}
+
+OR a split proposal:
+{
+  "type": "split",
+  "repo_name": "...",
+  "issue_number": 123,
+  "issue_title": "...",
+  "rationale": "why this issue should be split",
+  "chunks": [
+    {"title": "chunk title", "scope": "what this chunk covers", "files_likely": [...]},
+    ...
+  ]
 }
 
 If there is nothing to assign (no idle machines, no open issues, or all issues
@@ -161,19 +182,22 @@ def call_claude(system: str, user: str) -> str:
     return outer.get("result", result.stdout)
 
 
-def parse_proposals(text: str) -> list[Proposal]:
-    """Parse the JSON response from Claude into Proposal objects."""
+def _strip_fences(text: str) -> str:
     cleaned = text.strip()
     fence = re.match(r"^```(?:json)?\s*\n(.*?)```\s*$", cleaned, re.DOTALL)
-    if fence:
-        cleaned = fence.group(1).strip()
+    return fence.group(1).strip() if fence else cleaned
 
-    data = json.loads(cleaned)
+
+def parse_proposals(text: str) -> list[Proposal]:
+    """Parse the JSON response from Claude into Proposal objects."""
+    data = json.loads(_strip_fences(text))
     if not isinstance(data, list):
         raise ValueError(f"Expected JSON array of proposals, got {type(data).__name__}")
 
     proposals = []
     for i, item in enumerate(data):
+        if item.get("type") == "split":
+            continue
         proposals.append(Proposal(
             id=i + 1,
             machine_name=item["machine_name"],
@@ -187,9 +211,38 @@ def parse_proposals(text: str) -> list[Proposal]:
     return proposals
 
 
-def propose(config: Config) -> list[Proposal]:
-    """Full brain cycle: gather context, call Claude, return proposals."""
+def parse_split_proposals(text: str) -> list[SplitProposal]:
+    """Parse split proposals from the brain's JSON response."""
+    data = json.loads(_strip_fences(text))
+    if not isinstance(data, list):
+        return []
+
+    splits = []
+    for i, item in enumerate(data):
+        if item.get("type") != "split":
+            continue
+        chunks = [
+            SplitChunk(
+                title=c["title"],
+                scope=c.get("scope", ""),
+                files_likely=c.get("files_likely", []),
+            )
+            for c in item.get("chunks", [])
+        ]
+        splits.append(SplitProposal(
+            id=i + 1,
+            repo_name=item["repo_name"],
+            issue_number=item["issue_number"],
+            issue_title=item["issue_title"],
+            rationale=item.get("rationale", ""),
+            chunks=chunks,
+        ))
+    return splits
+
+
+def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
+    """Full brain cycle: gather context, call Claude, return proposals and splits."""
     context = gather_context(config)
     prompt = build_prompt(config, context)
     response = call_claude(SYSTEM_PROMPT, prompt)
-    return parse_proposals(response)
+    return parse_proposals(response), parse_split_proposals(response)

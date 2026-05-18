@@ -281,35 +281,53 @@ def status(config_path: Path, machine_filter: str | None, timeout: float, freshn
 @click.option("--dry-run", is_flag=True, help="Plan without saving proposals.")
 def plan(config_path: Path, dry_run: bool) -> None:
     from coord.brain import propose
-    from coord.state import save_proposals
+    from coord.state import save_proposals, save_split_proposals
 
     cfg = _load_config(config_path)
     click.echo("Gathering context and calling Claude...\n")
 
     try:
-        proposals = propose(cfg)
+        proposals, splits = propose(cfg)
     except RuntimeError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
 
-    if not proposals:
+    if splits:
+        click.echo(f"{len(splits)} split proposal(s):\n")
+        for s in splits:
+            click.echo(f"  [S{s.id}] {s.repo_name} #{s.issue_number}: {s.issue_title}")
+            click.echo(f"      {s.rationale}")
+            click.echo(f"      chunks ({len(s.chunks)}):")
+            for j, chunk in enumerate(s.chunks, 1):
+                click.echo(f"        {j}. {chunk.title}")
+                click.echo(f"           {chunk.scope}")
+            click.echo()
+
+    if proposals:
+        click.echo(f"{len(proposals)} assignment proposal(s):\n")
+        for p in proposals:
+            click.echo(f"  [{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
+            click.echo(f"      {p.rationale}")
+            if p.files_likely:
+                click.echo(f"      files: {', '.join(p.files_likely)}")
+            click.echo()
+
+    if not proposals and not splits:
         click.echo("No assignments to propose.")
         return
-
-    click.echo(f"{len(proposals)} proposal(s):\n")
-    for p in proposals:
-        click.echo(f"  [{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
-        click.echo(f"      {p.rationale}")
-        if p.files_likely:
-            click.echo(f"      files: {', '.join(p.files_likely)}")
-        click.echo()
 
     if dry_run:
         click.echo("(dry run — proposals not saved)")
     else:
-        path = save_proposals(proposals)
-        click.echo(f"Proposals saved to {path}")
-        click.echo("Run `coord approve <ids>` to dispatch (e.g. coord approve 1,2)")
+        if proposals:
+            save_proposals(proposals)
+        if splits:
+            save_split_proposals(splits)
+        click.echo("Proposals saved.")
+        if proposals:
+            click.echo("Run `coord approve <ids>` to dispatch (e.g. coord approve 1,2)")
+        if splits:
+            click.echo("Run `coord split <ids>` to create sub-issues (e.g. coord split S1)")
 
 
 @main.command(help="Dispatch approved assignments (comma-separated IDs).")
@@ -793,6 +811,85 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
         f"  coord test --passed {assignment_id}   # if it looks good\n"
         f"  coord test --fail {assignment_id} --reason \"description\"   # if not"
     )
+
+
+@main.command(help="Create sub-issues from a split proposal (e.g. coord split S1).")
+@click.argument("ids")
+@_CONFIG_OPTION
+@click.option("--dry-run", is_flag=True, help="Show what would be created.")
+def split(ids: str, config_path: Path, dry_run: bool) -> None:
+    from coord import github_ops
+    from coord.state import load_split_proposals, clear_split_proposals
+
+    cfg = _load_config(config_path)
+    splits = load_split_proposals()
+    if not splits:
+        click.echo("No pending split proposals. Run `coord plan` first.", err=True)
+        sys.exit(1)
+
+    try:
+        selected_ids = [int(x.strip().lstrip("Ss")) for x in ids.split(",")]
+    except ValueError:
+        click.echo("error: IDs must be comma-separated (e.g. S1,S2 or 1,2)", err=True)
+        sys.exit(2)
+
+    selected = [s for s in splits if s.id in selected_ids]
+    missing = set(selected_ids) - {s.id for s in selected}
+    if missing:
+        click.echo(f"error: unknown split proposal IDs: {missing}", err=True)
+        sys.exit(2)
+
+    for s in selected:
+        repo = cfg.repo(s.repo_name)
+        if repo is None:
+            click.echo(f"error: unknown repo {s.repo_name!r}", err=True)
+            continue
+
+        click.echo(f"\nSplitting #{s.issue_number}: {s.issue_title} into {len(s.chunks)} sub-issues:")
+
+        child_numbers: list[int] = []
+        for j, chunk in enumerate(s.chunks, 1):
+            title = f"{chunk.title} (sub-task {j}/{len(s.chunks)} of #{s.issue_number})"
+            body = (
+                f"## Sub-task of #{s.issue_number} — {s.issue_title}\n\n"
+                f"### Scope (chunk {j} of {len(s.chunks)}): {chunk.title}\n\n"
+                f"{chunk.scope}\n\n"
+                f"### Files likely touched\n\n"
+                + "\n".join(f"- `{f}`" for f in chunk.files_likely)
+                + f"\n\n### Context\n\n- Parent issue: #{s.issue_number}\n"
+            )
+
+            if dry_run:
+                click.echo(f"  [{j}] would create: {title}")
+                continue
+
+            try:
+                result = github_ops.create_issue(
+                    repo.github, title, body, labels=["sub-task"],
+                )
+                child_numbers.append(result["number"])
+                click.echo(f"  [{j}] created #{result['number']}: {chunk.title}")
+            except RuntimeError as e:
+                click.echo(f"  [{j}] failed to create: {e}", err=True)
+
+        if dry_run or not child_numbers:
+            continue
+
+        task_list = "\n".join(
+            f"- [ ] #{n}" for n in child_numbers
+        )
+        try:
+            github_ops.update_issue_body(
+                repo.github, s.issue_number,
+                f"Split into sub-tasks:\n\n{task_list}\n",
+            )
+            click.echo(f"  Parent #{s.issue_number} updated with task list")
+        except RuntimeError as e:
+            click.echo(f"  Failed to update parent: {e}", err=True)
+
+    if not dry_run:
+        clear_split_proposals()
+        click.echo("\nSplit proposals cleared. Run `coord plan` to assign the new sub-issues.")
 
 
 @main.command(help="End the session — run housekeeping hooks and show summary.")

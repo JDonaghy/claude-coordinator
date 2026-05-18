@@ -218,7 +218,8 @@ class TestPropose:
             "briefing": "do the thing",
         }])
 
-        proposals = propose(config)
+        proposals, splits = propose(config)
         assert len(proposals) == 1
         assert proposals[0].machine_name == "laptop"
+        assert splits == []
         mock_claude.assert_called_once()
