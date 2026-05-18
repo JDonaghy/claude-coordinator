@@ -135,12 +135,24 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
                 f"machines[{i}] ({name!r}) references unknown repos: {unknown}"
             )
 
+        repo_paths = entry.get("repo_paths", {}) or {}
+        if not isinstance(repo_paths, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in repo_paths.items()
+        ):
+            raise ConfigError(f"machines[{i}].repo_paths must be a mapping of repo name → local path")
+        unknown_paths = [r for r in repo_paths if r not in repo_names]
+        if unknown_paths:
+            raise ConfigError(
+                f"machines[{i}] ({name!r}) repo_paths references unknown repos: {unknown_paths}"
+            )
+
         machines.append(
             Machine(
                 name=name,
                 host=host,
                 capabilities=capabilities,
                 repos=machine_repos,
+                repo_paths=repo_paths,
             )
         )
     return machines

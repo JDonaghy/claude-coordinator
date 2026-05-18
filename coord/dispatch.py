@@ -30,13 +30,22 @@ def dispatch(proposal: Proposal, config: Config) -> dict:
     if machine is None:
         raise ValueError(f"Unknown machine: {proposal.machine_name!r}")
 
+    repo_path = machine.repo_path(proposal.repo_name)
+    if repo_path is None:
+        raise ValueError(
+            f"No repo_path configured for {proposal.repo_name!r} on machine {machine.name!r}. "
+            f"Add it to coordinator.yml under machines[].repo_paths."
+        )
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload = {
         "repo_name": proposal.repo_name,
+        "repo_path": repo_path,
         "issue_number": proposal.issue_number,
         "issue_title": proposal.issue_title,
         "briefing": proposal.briefing,
-        "files_likely": proposal.files_likely,
+        "files_allowed": proposal.files_likely,
+        "files_forbidden": [],
     }
 
     resp = httpx.post(url, json=payload, timeout=15)
