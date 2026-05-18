@@ -29,16 +29,50 @@ One config file describes your setup. A coordinator brain (Claude) proposes assi
 
 ## Quick Start
 
+### 1. Set up each machine
+
+SSH into each machine and run:
+
 ```bash
-pip install claude-coordinator
+git clone https://github.com/YourOrg/claude-coordinator.git ~/src/claude-coordinator
+cd ~/src/claude-coordinator
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
 
-# On each machine
+### 2. Create your coordinator.yml
+
+Copy `coordinator.yml` to the repo root and edit it with your repos, machines, and Tailscale hostnames. Run `coord config` to verify it parses cleanly.
+
+### 3. Start agent servers
+
+On each machine:
+
+```bash
+cd ~/src/claude-coordinator
+source .venv/bin/activate
 coord agent
+```
 
-# On any machine (or phone via coord web)
-coord plan --config coordinator.yml
-coord approve 1,2,3
-coord status
+The agent auto-detects which machine it is from the hostname (case-insensitive match against `coordinator.yml`). Use `--machine NAME` if auto-detection fails.
+
+Verify with `curl http://localhost:7433/health` on each machine.
+
+### 4. Coordinate
+
+From any machine:
+
+```bash
+source ~/src/claude-coordinator/.venv/bin/activate
+coord status                    # verify all machines are online
+coord plan                      # brain proposes assignments
+coord approve 1,2,3             # dispatch to machines
+coord status                    # monitor progress
+coord notify                    # post completions to GitHub
+coord test <id>                 # pull branch for smoke testing
+coord test --passed <id>        # record result
+coord done                      # end session, run hooks
 ```
 
 ## Configuration
