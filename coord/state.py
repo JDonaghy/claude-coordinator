@@ -8,10 +8,11 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from coord.models import Assignment, Board, Proposal
+from coord.models import Assignment, Board, Proposal, SplitProposal, SplitChunk
 
 COORD_DIR = Path.home() / ".coord"
 PROPOSALS_FILE = COORD_DIR / "pending_proposals.json"
+SPLITS_FILE = COORD_DIR / "pending_splits.json"
 DISPATCHED_FILE = COORD_DIR / "dispatched.json"
 NOTIFIED_FILE = COORD_DIR / "notified.json"
 BOARD_FILE = COORD_DIR / "board.json"
@@ -33,6 +34,34 @@ def load_proposals() -> list[Proposal]:
 
 def clear_proposals() -> None:
     PROPOSALS_FILE.unlink(missing_ok=True)
+
+
+def save_split_proposals(splits: list[SplitProposal]) -> Path:
+    COORD_DIR.mkdir(parents=True, exist_ok=True)
+    data = [asdict(s) for s in splits]
+    SPLITS_FILE.write_text(json.dumps(data, indent=2) + "\n")
+    return SPLITS_FILE
+
+
+def load_split_proposals() -> list[SplitProposal]:
+    if not SPLITS_FILE.exists():
+        return []
+    data = json.loads(SPLITS_FILE.read_text())
+    return [
+        SplitProposal(
+            id=d["id"],
+            repo_name=d["repo_name"],
+            issue_number=d["issue_number"],
+            issue_title=d["issue_title"],
+            rationale=d.get("rationale", ""),
+            chunks=[SplitChunk(**c) for c in d.get("chunks", [])],
+        )
+        for d in data
+    ]
+
+
+def clear_split_proposals() -> None:
+    SPLITS_FILE.unlink(missing_ok=True)
 
 
 # ── Dispatched-assignment ledger ─────────────────────────────────────────

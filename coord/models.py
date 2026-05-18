@@ -62,6 +62,23 @@ class Proposal:
 
 
 @dataclass
+class SplitChunk:
+    title: str
+    scope: str
+    files_likely: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SplitProposal:
+    id: int
+    repo_name: str
+    issue_number: int
+    issue_title: str
+    rationale: str
+    chunks: list[SplitChunk] = field(default_factory=list)
+
+
+@dataclass
 class Board:
     repos: list[Repo] = field(default_factory=list)
     machines: list[Machine] = field(default_factory=list)

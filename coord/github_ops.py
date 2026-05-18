@@ -61,3 +61,30 @@ def get_recent_develop_commits(repo: str, count: int = 10) -> list[dict]:
         {"sha": c["sha"][:7], "message": c["commit"]["message"].split("\n")[0]}
         for c in commits
     ]
+
+
+def create_issue(
+    repo: str,
+    title: str,
+    body: str,
+    labels: list[str] | None = None,
+    milestone: str | None = None,
+) -> dict:
+    args = ["issue", "create", "--repo", repo, "--title", title, "--body", body]
+    if labels:
+        for label in labels:
+            args.extend(["--label", label])
+    if milestone:
+        args.extend(["--milestone", milestone])
+    raw = _gh(*args)
+    url = raw.strip()
+    number = int(url.rstrip("/").rsplit("/", 1)[-1])
+    return {"number": number, "url": url}
+
+
+def update_issue_body(repo: str, issue_number: int, body: str) -> None:
+    _gh(
+        "api", "-X", "PATCH",
+        f"repos/{repo}/issues/{issue_number}",
+        "-f", f"body={body}",
+    )
