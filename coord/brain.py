@@ -136,8 +136,8 @@ def build_prompt(config: Config, context: dict) -> str:
             lines.append(f"- #{issue['number']}: {issue['title']}{label_str}")
             body = (issue.get("body") or "").strip()
             if body:
-                preview = body[:300]
-                if len(body) > 300:
+                preview = body[:150]
+                if len(body) > 150:
                     preview += "..."
                 lines.append(f"  {preview}")
 
@@ -173,7 +173,7 @@ def call_claude(system: str, user: str) -> str:
         input=user,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=300,
     )
     if result.returncode != 0:
         raise RuntimeError(f"claude -p failed (exit {result.returncode}): {result.stderr.strip()}")
