@@ -146,6 +146,8 @@ def _resolve_machine(cfg: Config, explicit_name: str | None):
 @main.command(help="Show all machines, assignments, and connectivity.")
 @_CONFIG_OPTION
 def status(config_path: Path) -> None:
+    from coord.state import load_dispatched, load_notified
+
     cfg = _load_config(config_path)
     click.echo("Machines:")
     for machine in cfg.machines:
@@ -164,6 +166,20 @@ def status(config_path: Path) -> None:
         repos = ", ".join(machine.repos) if machine.repos else "(none)"
         click.echo(f"  {machine.name:15s} [{state}]")
         click.echo(f"    host: {machine.host}  repos: {repos}")
+
+    notified = load_notified()
+    if not notified:
+        return
+
+    dispatched_by_id = {r["assignment_id"]: r for r in load_dispatched()}
+    items = sorted(notified.items(), key=lambda kv: kv[1].get("posted_at", 0), reverse=True)[:5]
+    click.echo("")
+    click.echo("Recent issue comment activity:")
+    for aid, info in items:
+        record = dispatched_by_id.get(aid, {})
+        repo = record.get("repo_github", "?")
+        issue = record.get("issue_number", "?")
+        click.echo(f"  [{info['event']}] {repo}#{issue} (assignment {aid})")
 
 
 @main.command(help="Brain proposes assignments for idle machines.")
@@ -207,8 +223,13 @@ def plan(config_path: Path, dry_run: bool) -> None:
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Show what would be dispatched.")
 def approve(ids: str, config_path: Path, dry_run: bool) -> None:
-    from coord.dispatch import dispatch, post_briefing
-    from coord.state import load_proposals, clear_proposals
+    from coord.dispatch import compute_do_not_touch, dispatch, post_briefing
+    from coord.state import (
+        clear_proposals,
+        load_dispatched,
+        load_proposals,
+        record_dispatched,
+    )
 
     cfg = _load_config(config_path)
     proposals = load_proposals()
@@ -228,19 +249,29 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
         click.echo(f"error: unknown proposal IDs: {missing}", err=True)
         sys.exit(2)
 
+    in_flight = load_dispatched()
+
     for p in selected:
         click.echo(f"[{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
         if dry_run:
             click.echo("     (dry run — not dispatched)")
             continue
         try:
-            dispatch(p, cfg)
-            click.echo("     dispatched to agent server")
+            response = dispatch(p, cfg)
         except Exception as e:
             click.echo(f"     dispatch failed: {e}", err=True)
             continue
+        assignment_id = response.get("id", "pending")
+        click.echo(f"     dispatched to agent server (assignment {assignment_id})")
+
+        repo = cfg.repo(p.repo_name)
+        if repo is not None:
+            from coord.state import record_dispatched as _record
+            _record(assignment_id=assignment_id, proposal=p, repo_github=repo.github)
+
         try:
-            post_briefing(p, cfg)
+            do_not_touch = compute_do_not_touch(p, peers=selected, in_flight=in_flight)
+            post_briefing(p, cfg, assignment_id=assignment_id, do_not_touch=do_not_touch)
             click.echo("     briefing posted to GitHub")
         except Exception as e:
             click.echo(f"     briefing post failed: {e}", err=True)
@@ -248,6 +279,24 @@ def approve(ids: str, config_path: Path, dry_run: bool) -> None:
     if not dry_run:
         clear_proposals()
         click.echo("\nPending proposals cleared.")
+
+
+@main.command(help="Poll agents and post completion/failure comments on GitHub.")
+@_CONFIG_OPTION
+def notify(config_path: Path) -> None:
+    from coord.notify import run as run_notify
+
+    cfg = _load_config(config_path)
+    posted = run_notify(cfg)
+    if not posted:
+        click.echo("No new transitions to notify.")
+        return
+    click.echo(f"Posted {len(posted)} comment(s):")
+    for t in posted:
+        click.echo(
+            f"  [{t.event}] {t.machine_name} → {t.repo_name} "
+            f"#{t.issue_number} (assignment {t.assignment_id}, exit {t.exit_code})"
+        )
 
 
 @main.command(help="Start the web dashboard (port 7434).")
