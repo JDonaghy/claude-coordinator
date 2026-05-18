@@ -323,6 +323,71 @@ class TestReconcile:
         assert changed == []
         assert len(board_with_active.active) == 2
 
+    @patch("coord.reconcile._query_agent")
+    def test_backfills_branch_on_completed_assignments(
+        self, mock_query: MagicMock, config,
+    ) -> None:
+        """Assignments already in completed (from build_board) get branch backfilled."""
+        from coord.reconcile import reconcile
+
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop",
+                    repo_name="api",
+                    issue_number=10,
+                    issue_title="Fix auth",
+                    assignment_id="aaa",
+                    status="done",
+                    branch=None,
+                ),
+            ],
+            machines=[Machine(name="laptop", host="laptop.tailnet")],
+        )
+
+        mock_query.return_value = {
+            "active": [],
+            "completed": [
+                {"id": "aaa", "status": "done", "branch": "issue-10-fix-auth", "finished_at": 999.0},
+            ],
+        }
+
+        changed = reconcile(board, config)
+        assert "aaa" in changed
+        assert board.completed[0].branch == "issue-10-fix-auth"
+
+    @patch("coord.reconcile._query_agent")
+    def test_skips_backfill_when_branch_already_set(
+        self, mock_query: MagicMock, config,
+    ) -> None:
+        from coord.reconcile import reconcile
+
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop",
+                    repo_name="api",
+                    issue_number=10,
+                    issue_title="Fix auth",
+                    assignment_id="aaa",
+                    status="done",
+                    branch="already-set",
+                ),
+            ],
+            machines=[Machine(name="laptop", host="laptop.tailnet")],
+        )
+
+        mock_query.return_value = {
+            "active": [],
+            "completed": [
+                {"id": "aaa", "status": "done", "branch": "different-branch"},
+            ],
+        }
+
+        changed = reconcile(board, config)
+        assert changed == []
+        assert board.completed[0].branch == "already-set"
+
 
 # ── Board GC ───────────────────────────────────────────────────────────────
 
