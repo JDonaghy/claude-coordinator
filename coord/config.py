@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,9 +19,16 @@ class ConfigError(Exception):
 
 
 @dataclass
+class HooksConfig:
+    on_round_complete: list[str] = field(default_factory=list)
+    on_session_end: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
+    hooks: HooksConfig = field(default_factory=HooksConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -47,8 +54,9 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     repos = _parse_repos(raw.get("repos"))
     machines = _parse_machines(raw.get("machines"), repos)
     _validate_dependencies(repos)
+    hooks = _parse_hooks(raw.get("hooks"))
 
-    return Config(repos=repos, machines=machines, path=p)
+    return Config(repos=repos, machines=machines, hooks=hooks, path=p)
 
 
 def _parse_repos(raw: Any) -> list[Repo]:
@@ -165,6 +173,31 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
             )
         )
     return machines
+
+
+KNOWN_HOOKS = {"close_merged_issues", "summary_report"}
+
+
+def _parse_hooks(raw: Any) -> HooksConfig:
+    if raw is None:
+        return HooksConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'hooks' must be a mapping")
+    hooks = HooksConfig()
+    for event_name in ("on_round_complete", "on_session_end"):
+        entries = raw.get(event_name)
+        if entries is None:
+            continue
+        if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
+            raise ConfigError(f"hooks.{event_name} must be a list of hook names")
+        unknown = [e for e in entries if e not in KNOWN_HOOKS]
+        if unknown:
+            raise ConfigError(
+                f"hooks.{event_name} references unknown hooks: {unknown}. "
+                f"Known: {sorted(KNOWN_HOOKS)}"
+            )
+        setattr(hooks, event_name, entries)
+    return hooks
 
 
 def _validate_dependencies(repos: list[Repo]) -> None:
