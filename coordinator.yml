@@ -42,3 +42,10 @@ machines:
     repo_paths:
       user-service: ~/src/user-service
       shared-lib: ~/src/shared-lib
+
+hooks:
+  on_round_complete:
+    - close_merged_issues
+    - summary_report
+  on_session_end:
+    - summary_report

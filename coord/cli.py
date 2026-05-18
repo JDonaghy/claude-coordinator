@@ -518,6 +518,7 @@ def stop(assignment_id: str, config_path: Path) -> None:
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")
 @_CONFIG_OPTION
 def notify(config_path: Path) -> None:
+    from coord.hooks import is_round_complete, run_hooks
     from coord.notify import run as run_notify
     from coord.state import build_board, save_board
 
@@ -533,6 +534,13 @@ def notify(config_path: Path) -> None:
             f"#{t.issue_number} (assignment {t.assignment_id}, exit {t.exit_code})"
         )
     board = build_board()
+
+    if is_round_complete(board) and cfg.hooks.on_round_complete:
+        click.echo("\nRound complete — running hooks:")
+        for result in run_hooks("on_round_complete", cfg, board):
+            status = "ok" if result.ok else "FAILED"
+            click.echo(f"  [{status}] {result.hook}: {result.message}")
+
     save_board(board)
 
 
@@ -689,6 +697,35 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
         f"  coord test --passed {assignment_id}   # if it looks good\n"
         f"  coord test --fail {assignment_id} --reason \"description\"   # if not"
     )
+
+
+@main.command(help="End the session — run housekeeping hooks and show summary.")
+@_CONFIG_OPTION
+def done(config_path: Path) -> None:
+    from coord.hooks import run_hooks
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    if board.active:
+        click.echo(
+            f"warning: {len(board.active)} assignment(s) still active. "
+            f"They will continue running on their agent servers.",
+            err=True,
+        )
+
+    if cfg.hooks.on_session_end:
+        click.echo("Running session-end hooks:")
+        for result in run_hooks("on_session_end", cfg, board):
+            status = "ok" if result.ok else "FAILED"
+            click.echo(f"  [{status}] {result.hook}: {result.message}")
+    else:
+        from coord.hooks import _summary_report
+        click.echo(_summary_report(cfg, board))
+
+    save_board(board)
+    click.echo("\nSession ended. Board saved.")
 
 
 @main.command(help="Start the web dashboard (port 7434).")
