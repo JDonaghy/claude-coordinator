@@ -1,0 +1,92 @@
+"""Dataclasses for the coordinator: repos, machines, assignments, board."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Repo:
+    name: str
+    github: str
+    depends_on: list[str] = field(default_factory=list)
+    default_branch: str = "main"
+
+
+@dataclass
+class Machine:
+    name: str
+    host: str
+    capabilities: list[str] = field(default_factory=list)
+    repos: list[str] = field(default_factory=list)
+
+    def can_work_on(self, repo_name: str) -> bool:
+        return repo_name in self.repos
+
+
+@dataclass
+class Assignment:
+    machine_name: str
+    repo_name: str
+    issue_number: int
+    issue_title: str
+    files_allowed: list[str] = field(default_factory=list)
+    files_forbidden: list[str] = field(default_factory=list)
+    briefing: str = ""
+    session_id: str | None = None
+    status: str = "pending"  # pending | running | done | failed
+    branch: str | None = None
+    pr_url: str | None = None
+
+
+@dataclass
+class Board:
+    repos: list[Repo] = field(default_factory=list)
+    machines: list[Machine] = field(default_factory=list)
+    active: list[Assignment] = field(default_factory=list)
+    completed: list[Assignment] = field(default_factory=list)
+    round_number: int = 0
+
+    def repo(self, name: str) -> Repo | None:
+        return next((r for r in self.repos if r.name == name), None)
+
+    def machine(self, name: str) -> Machine | None:
+        return next((m for m in self.machines if m.name == name), None)
+
+    def idle_machines(self) -> list[Machine]:
+        busy = {a.machine_name for a in self.active if a.status == "running"}
+        return [m for m in self.machines if m.name not in busy]
+
+    def active_files_by_repo(self) -> dict[str, list[str]]:
+        """Map of repo_name -> files currently being touched by running assignments."""
+        result: dict[str, list[str]] = {}
+        for a in self.active:
+            if a.status != "running":
+                continue
+            result.setdefault(a.repo_name, []).extend(a.files_allowed)
+        return result
+
+    def mark_done(
+        self,
+        machine_name: str,
+        branch: str | None = None,
+        pr_url: str | None = None,
+    ) -> Assignment | None:
+        for a in self.active:
+            if a.machine_name == machine_name and a.status == "running":
+                a.status = "done"
+                a.branch = branch
+                a.pr_url = pr_url
+                self.completed.append(a)
+                self.active.remove(a)
+                return a
+        return None
+
+    def mark_failed(self, machine_name: str) -> Assignment | None:
+        for a in self.active:
+            if a.machine_name == machine_name and a.status == "running":
+                a.status = "failed"
+                self.completed.append(a)
+                self.active.remove(a)
+                return a
+        return None

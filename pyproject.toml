@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-coordinator"
+version = "0.1.0"
+description = "Coordinate Claude Code workers across multiple machines and repos."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "John Donaghy", email = "johnfdonaghy@gmail.com" }]
+dependencies = [
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+coord = "coord.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["coord*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
