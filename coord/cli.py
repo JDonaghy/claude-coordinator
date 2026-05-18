@@ -303,10 +303,22 @@ def plan(config_path: Path, dry_run: bool) -> None:
     from coord.state import save_proposals, save_split_proposals
 
     cfg = _load_config(config_path)
-    click.echo("Gathering context and calling Claude...\n")
+    click.echo("Gathering context...", nl=False)
+    sys.stdout.flush()
+
+    from coord.brain import gather_context, build_prompt, call_claude, parse_proposals, parse_split_proposals, SYSTEM_PROMPT
+    context = gather_context(cfg)
+    issue_count = sum(len(v) for v in context["issues_by_repo"].values())
+    online = sum(1 for v in context["machine_status"].values() if v.get("status") != "offline" and "error" not in str(v))
+    click.echo(f" {issue_count} issues across {len(cfg.repos)} repos, {online} machines online.")
+    click.echo("Calling Claude (this may take 1-2 minutes)...", nl=False)
+    sys.stdout.flush()
 
     try:
-        proposals, splits = propose(cfg)
+        prompt = build_prompt(cfg, context)
+        response = call_claude(SYSTEM_PROMPT, prompt)
+        proposals = parse_proposals(response)
+        splits = parse_split_proposals(response)
     except RuntimeError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
