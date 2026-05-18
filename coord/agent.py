@@ -63,12 +63,23 @@ class AgentAssignment:
         return d
 
 
+WORKER_SYSTEM_PROMPT = """\
+You are a Claude Code worker executing an assignment from the coordinator.
+
+Rules:
+- Do NOT run gh commands. The coordinator owns all GitHub interactions \
+(issues, PRs, comments). Use regular git commands only.
+- Stay within the files listed in your briefing. If you need to touch \
+other files, do so only if strictly necessary and note it.
+- Commit your work to a feature branch, not the default branch.\
+"""
+
 WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment."""
-    return [binary, "-p", spec.briefing]
+    return [binary, "-p", "--system-prompt", WORKER_SYSTEM_PROMPT, spec.briefing]
 
 
 class AgentServer:

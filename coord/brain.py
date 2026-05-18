@@ -76,6 +76,9 @@ def gather_context(config: Config) -> dict:
 
 def build_prompt(config: Config, context: dict) -> str:
     """Assemble the user prompt from config and gathered context."""
+    from coord.deps import blocked_repos
+    from coord.models import Assignment
+
     lines: list[str] = []
 
     lines.append("## Repos")
@@ -116,6 +119,28 @@ def build_prompt(config: Config, context: dict) -> str:
                 if len(body) > 300:
                     preview += "..."
                 lines.append(f"  {preview}")
+
+    # Build active assignments from machine status to compute blocked repos
+    active_assignments: list[Assignment] = []
+    for machine_name, status in context["machine_status"].items():
+        for entry in status.get("active", []):
+            spec = entry.get("spec", {})
+            active_assignments.append(Assignment(
+                machine_name=machine_name,
+                repo_name=spec.get("repo_name", ""),
+                issue_number=spec.get("issue_number", 0),
+                issue_title=spec.get("issue_title", ""),
+                status="running",
+            ))
+
+    blocked = blocked_repos(config.repos, active_assignments)
+    if blocked:
+        lines.append("")
+        lines.append("## Blocked Repos (DO NOT assign work here)")
+        for repo_name, reasons in blocked.items():
+            lines.append(f"### {repo_name} — BLOCKED")
+            for reason in reasons:
+                lines.append(f"  - {reason}")
 
     return "\n".join(lines)
 

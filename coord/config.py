@@ -159,6 +159,8 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
 
 
 def _validate_dependencies(repos: list[Repo]) -> None:
+    from coord.deps import detect_cycles
+
     repo_names = {r.name for r in repos}
     for r in repos:
         unknown = [d for d in r.depends_on if d not in repo_names]
@@ -168,3 +170,8 @@ def _validate_dependencies(repos: list[Repo]) -> None:
             )
         if r.name in r.depends_on:
             raise ConfigError(f"repo {r.name!r} cannot depend on itself")
+
+    cycles = detect_cycles(repos)
+    if cycles:
+        cycle_str = " → ".join(cycles[0])
+        raise ConfigError(f"circular dependency detected: {cycle_str}")
