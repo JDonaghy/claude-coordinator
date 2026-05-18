@@ -409,6 +409,120 @@ def resume(config_path: Path) -> None:
             click.echo(f"  {a.machine_name} → {a.repo_name} #{a.issue_number}: {a.issue_title}")
 
 
+@main.command(help="Pull a worker's branch locally for smoke testing.")
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+@click.option("--passed", "verdict", flag_value="pass", help="Mark smoke test as passed.")
+@click.option("--fail", "verdict", flag_value="fail", help="Mark smoke test as failed.")
+@click.option("--reason", default="", help="Reason for failure (used with --fail).")
+def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str) -> None:
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    repo = cfg.repo(assignment.repo_name)
+
+    # ── Record verdict ──────────────────────────────────────────────────
+    if verdict:
+        assignment.smoke_test = verdict
+        assignment.smoke_test_reason = reason if verdict == "fail" else None
+        save_board(board)
+        if verdict == "pass":
+            click.echo(f"Smoke test PASSED for {assignment.repo_name} #{assignment.issue_number}")
+        else:
+            click.echo(f"Smoke test FAILED for {assignment.repo_name} #{assignment.issue_number}")
+            if reason:
+                click.echo(f"  reason: {reason}")
+        return
+
+    # ── Checkout and build ──────────────────────────────────────────────
+    if not assignment.branch:
+        click.echo(
+            f"error: assignment {assignment_id} has no branch recorded. "
+            f"The worker may not have pushed yet, or the branch wasn't captured during reconciliation.",
+            err=True,
+        )
+        sys.exit(1)
+
+    import socket
+    import subprocess
+
+    hostname = socket.gethostname().split(".")[0]
+    local_machine = next(
+        (m for m in cfg.machines if m.name == hostname or m.host.split(".")[0] == hostname),
+        None,
+    )
+    repo_path = None
+    if local_machine:
+        repo_path = local_machine.repo_path(assignment.repo_name)
+    if repo_path is None:
+        for m in cfg.machines:
+            repo_path = m.repo_path(assignment.repo_name)
+            if repo_path:
+                break
+    if repo_path is None:
+        click.echo(
+            f"error: no repo_path configured for {assignment.repo_name!r}. "
+            f"Add it to coordinator.yml under machines[].repo_paths.",
+            err=True,
+        )
+        sys.exit(1)
+
+    from pathlib import Path as P
+    repo_dir = P(repo_path).expanduser()
+    if not repo_dir.exists():
+        click.echo(f"error: repo path does not exist: {repo_dir}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Fetching and checking out branch {assignment.branch!r} in {repo_dir}...")
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin"], cwd=str(repo_dir),
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "checkout", assignment.branch], cwd=str(repo_dir),
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        click.echo(f"error: git command failed: {e.stderr.strip()}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Branch {assignment.branch!r} checked out.")
+
+    if repo and repo.build_command:
+        click.echo(f"Running build: {repo.build_command}")
+        result = subprocess.run(
+            repo.build_command, shell=True, cwd=str(repo_dir),
+        )
+        if result.returncode != 0:
+            click.echo(f"Build failed (exit {result.returncode})", err=True)
+            sys.exit(1)
+        click.echo("Build succeeded.")
+
+    if repo and repo.test_command:
+        click.echo(f"Running tests: {repo.test_command}")
+        result = subprocess.run(
+            repo.test_command, shell=True, cwd=str(repo_dir),
+        )
+        if result.returncode != 0:
+            click.echo(f"Tests failed (exit {result.returncode})", err=True)
+            sys.exit(1)
+        click.echo("Tests passed.")
+
+    click.echo(
+        f"\nReady for smoke test. Run:\n"
+        f"  coord test --passed {assignment_id}   # if it looks good\n"
+        f"  coord test --fail {assignment_id} --reason \"description\"   # if not"
+    )
+
+
 @main.command(help="Start the web dashboard (port 7434).")
 def web() -> None:
     _not_implemented("web")

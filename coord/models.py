@@ -11,6 +11,8 @@ class Repo:
     github: str
     depends_on: list[str] = field(default_factory=list)
     default_branch: str = "main"
+    build_command: str | None = None
+    test_command: str | None = None
 
 
 @dataclass
@@ -43,6 +45,8 @@ class Assignment:
     pr_url: str | None = None
     dispatched_at: float | None = None
     finished_at: float | None = None
+    smoke_test: str | None = None  # None | pass | fail
+    smoke_test_reason: str | None = None
 
 
 @dataclass

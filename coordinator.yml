@@ -9,16 +9,22 @@ repos:
     github: acme/api-gateway
     default_branch: main
     depends_on: []
+    build_command: "npm install && npm run build"
+    test_command: "npm test"
 
   - name: user-service
     github: acme/user-service
     default_branch: main
     depends_on: [shared-lib]
+    build_command: "pip install -e .[dev]"
+    test_command: "pytest"
 
   - name: shared-lib
     github: acme/shared-lib
     default_branch: main
     depends_on: []
+    build_command: "pip install -e .[dev]"
+    test_command: "pytest"
 
 machines:
   - name: macbook
