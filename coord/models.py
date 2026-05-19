@@ -53,6 +53,7 @@ class Assignment:
     type: str = "work"
     review_target: str | None = None
     review_of_assignment_id: str | None = None
+    unreachable_count: int = 0
 
 
 @dataclass
