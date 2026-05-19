@@ -21,28 +21,37 @@ h2 { font-size: 1em; color: #8b949e; margin: 16px 0 8px; text-transform: upperca
 .badge-failed { background: #da3633; color: #fff; }
 .badge-running { background: #1f6feb; color: #fff; }
 .meta { color: #8b949e; font-size: 0.85em; }
+a { color: #58a6ff; }
 
-.tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+.tabs { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
 .tab { padding: 8px 16px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; cursor: pointer; color: #c9d1d9; font-size: 0.9em; min-height: 44px; }
 .tab.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 
 .pane { display: none; }
 .pane.active { display: block; }
 
-/* Chat */
 .chat-container { display: flex; flex-direction: column; height: 50vh; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; margin-bottom: 8px; }
-.chat-msg { margin-bottom: 8px; padding: 8px; border-radius: 6px; }
+.chat-msg { margin-bottom: 8px; padding: 8px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
 .chat-msg.user { background: #1f6feb; color: #fff; margin-left: 20%; }
 .chat-msg.assistant { background: #161b22; margin-right: 20%; }
 .chat-input { display: flex; gap: 8px; }
 .chat-input input { flex: 1; padding: 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 16px; min-height: 44px; }
 .chat-input button { padding: 10px 20px; background: #238636; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 16px; min-height: 44px; }
 
-/* Proposals */
-.proposal { border-left: 3px solid #1f6feb; padding-left: 10px; margin-bottom: 10px; }
-.approve-btn { padding: 8px 16px; background: #238636; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 14px; min-height: 44px; margin-top: 8px; }
-.approve-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.proposal { border-left: 3px solid #1f6feb; padding-left: 10px; margin-bottom: 12px; padding-bottom: 8px; }
+.btn { padding: 8px 16px; border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 14px; min-height: 44px; margin-right: 6px; margin-top: 6px; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-approve { background: #238636; }
+.btn-reject { background: #da3633; }
+.btn-all { background: #1f6feb; }
+.btn-small { padding: 4px 10px; min-height: 32px; font-size: 0.8em; }
+
+.briefing-edit { width: 100%; min-height: 60px; margin-top: 6px; padding: 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-family: monospace; font-size: 13px; resize: vertical; }
+
+.diff-toggle { cursor: pointer; color: #58a6ff; font-size: 0.85em; margin-top: 4px; }
+.diff-content { display: none; margin-top: 6px; padding: 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; overflow-x: auto; max-height: 400px; overflow-y: auto; }
+.diff-content.open { display: block; }
 
 .refresh-btn { float: right; padding: 4px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #8b949e; cursor: pointer; font-size: 0.85em; }
 
@@ -63,7 +72,6 @@ h2 { font-size: 1em; color: #8b949e; margin: 16px 0 8px; text-transform: upperca
     <div class="tab" data-pane="chat">Chat</div>
   </div>
 
-  <!-- Board -->
   <div class="pane active" id="pane-board">
     <button class="refresh-btn" onclick="loadBoard()">refresh</button>
     <h2>Active</h2>
@@ -72,19 +80,16 @@ h2 { font-size: 1em; color: #8b949e; margin: 16px 0 8px; text-transform: upperca
     <div id="completed-list"></div>
   </div>
 
-  <!-- Machines -->
   <div class="pane" id="pane-machines">
     <button class="refresh-btn" onclick="loadMachines()">refresh</button>
     <div id="machines-list"></div>
   </div>
 
-  <!-- Proposals -->
   <div class="pane" id="pane-proposals">
     <button class="refresh-btn" onclick="loadProposals()">refresh</button>
     <div id="proposals-list"></div>
   </div>
 
-  <!-- Chat -->
   <div class="pane" id="pane-chat">
     <div class="chat-container">
       <div class="chat-messages" id="chat-messages"></div>
@@ -97,7 +102,8 @@ h2 { font-size: 1em; color: #8b949e; margin: 16px 0 8px; text-transform: upperca
 </div>
 
 <script>
-// Tabs
+const E = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -108,10 +114,10 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 function badge(cls, text) {
-  return `<span class="badge badge-${cls}">${text}</span>`;
+  return `<span class="badge badge-${E(cls)}">${E(text)}</span>`;
 }
 
-// Board
+// ── Board ──────────────────────────────────────────────────────────────
 async function loadBoard() {
   const r = await fetch('/api/board');
   const data = await r.json();
@@ -123,8 +129,8 @@ async function loadBoard() {
   } else {
     activeEl.innerHTML = data.active.map(a => `
       <div class="card">
-        <div class="card-header">${a.repo_name} #${a.issue_number}: ${a.issue_title}</div>
-        <div class="meta">${badge('running', a.status)} on ${a.machine_name}</div>
+        <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}</div>
+        <div class="meta">${badge('running', a.status)} on ${E(a.machine_name)}</div>
       </div>
     `).join('');
   }
@@ -134,16 +140,43 @@ async function loadBoard() {
   if (!recent.length) {
     compEl.innerHTML = '<div class="meta">No completed assignments yet</div>';
   } else {
-    compEl.innerHTML = recent.map(a => `
-      <div class="card">
-        <div class="card-header">${a.repo_name} #${a.issue_number}: ${a.issue_title}</div>
-        <div class="meta">${badge(a.status === 'done' ? 'done' : 'failed', a.status)} on ${a.machine_name}${a.branch ? ` — branch: ${a.branch}` : ''}</div>
-      </div>
-    `).join('');
+    compEl.innerHTML = recent.map(a => {
+      const cls = a.status === 'done' ? 'done' : 'failed';
+      const branchInfo = a.branch ? ` — branch: ${E(a.branch)}` : '';
+      const prLink = a.pr_url ? ` — <a href="${E(a.pr_url)}" target="_blank">PR</a>` : '';
+      const diffId = a.assignment_id ? `diff-${E(a.assignment_id)}` : '';
+      const diffToggle = a.branch && a.assignment_id
+        ? `<div class="diff-toggle" onclick="toggleDiff('${E(a.assignment_id)}')">show diff</div>
+           <div class="diff-content" id="${diffId}"></div>`
+        : '';
+      return `
+        <div class="card">
+          <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}</div>
+          <div class="meta">${badge(cls, a.status)} on ${E(a.machine_name)}${branchInfo}${prLink}</div>
+          ${diffToggle}
+        </div>
+      `;
+    }).join('');
   }
 }
 
-// Machines
+async function toggleDiff(aid) {
+  const el = document.getElementById('diff-' + aid);
+  if (!el) return;
+  if (el.classList.contains('open')) { el.classList.remove('open'); return; }
+  if (el.dataset.loaded) { el.classList.add('open'); return; }
+  el.textContent = 'Loading diff...';
+  el.classList.add('open');
+  try {
+    const r = await fetch('/api/diff/' + encodeURIComponent(aid));
+    const data = await r.json();
+    if (data.error) { el.textContent = 'Error: ' + data.error; }
+    else { el.textContent = data.diff || '(empty diff)'; }
+  } catch(e) { el.textContent = 'Error: ' + e.message; }
+  el.dataset.loaded = '1';
+}
+
+// ── Machines ───────────────────────────────────────────────────────────
 async function loadMachines() {
   const r = await fetch('/api/machines');
   const data = await r.json();
@@ -155,25 +188,25 @@ async function loadMachines() {
     if (m.assignments && m.assignments.active && m.assignments.active.length) {
       const a = m.assignments.active[0];
       const spec = a.spec || {};
-      detail = `<div class="meta">${badge('busy', 'busy')} #${spec.issue_number}: ${spec.issue_title}</div>`;
+      detail = `<div class="meta">${badge('busy', 'busy')} #${spec.issue_number}: ${E(spec.issue_title || '')}</div>`;
       if (a.progress && a.progress.updates && a.progress.updates.length) {
-        detail += `<div class="meta">latest: ${a.progress.updates[a.progress.updates.length-1]}</div>`;
+        detail += `<div class="meta">latest: ${E(a.progress.updates[a.progress.updates.length-1])}</div>`;
       }
       if (a.progress && a.progress.stuck) {
-        detail += `<div class="meta" style="color:#da3633">STUCK: ${a.progress.stuck}</div>`;
+        detail += `<div class="meta" style="color:#da3633">STUCK: ${E(a.progress.stuck)}</div>`;
       }
     }
     return `
       <div class="card">
-        <div class="card-header">${m.name} ${badge(state, state)}${latency}</div>
-        <div class="meta">host: ${m.host} — repos: ${m.repos.join(', ') || 'none'}</div>
+        <div class="card-header">${E(m.name)} ${badge(state, state)}${latency}</div>
+        <div class="meta">host: ${E(m.host)} — repos: ${E((m.repos || []).join(', ') || 'none')}</div>
         ${detail}
       </div>
     `;
   }).join('');
 }
 
-// Proposals
+// ── Proposals ──────────────────────────────────────────────────────────
 async function loadProposals() {
   const r = await fetch('/api/proposals');
   const data = await r.json();
@@ -183,33 +216,65 @@ async function loadProposals() {
     return;
   }
   el.innerHTML = data.map(p => `
-    <div class="proposal">
-      <div class="card-header">[${p.id}] ${p.machine_name} → ${p.repo_name} #${p.issue_number}: ${p.issue_title}</div>
-      <div class="meta">${p.rationale}</div>
-      ${p.files_likely.length ? `<div class="meta">files: ${p.files_likely.join(', ')}</div>` : ''}
+    <div class="proposal" id="proposal-${p.id}">
+      <div class="card-header">[${p.id}] ${E(p.machine_name)} → ${E(p.repo_name)} #${p.issue_number}: ${E(p.issue_title)}</div>
+      <div class="meta">${E(p.rationale)}</div>
+      ${p.files_likely.length ? `<div class="meta">files: ${E(p.files_likely.join(', '))}</div>` : ''}
+      <textarea class="briefing-edit" id="briefing-${p.id}">${E(p.briefing || '')}</textarea>
+      <div>
+        <button class="btn btn-approve" onclick="approveOne(${p.id})">Approve</button>
+        <button class="btn btn-reject" onclick="rejectOne(${p.id})">Reject</button>
+      </div>
     </div>
-  `).join('') + `<button class="approve-btn" id="approve-all-btn" onclick="approveAll()">Approve All</button>`;
+  `).join('') + `<button class="btn btn-all" onclick="approveAll()">Approve All</button>`;
 }
 
-async function approveAll() {
-  const btn = document.getElementById('approve-all-btn');
-  btn.disabled = true;
-  btn.textContent = 'Approving...';
-  const r = await fetch('/api/proposals');
-  const proposals = await r.json();
-  const ids = proposals.map(p => p.id);
+async function approveOne(id) {
+  const briefing = document.getElementById('briefing-' + id)?.value;
+  const briefings = {};
+  if (briefing !== undefined) briefings[String(id)] = briefing;
   const resp = await fetch('/api/approve', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ids}),
+    body: JSON.stringify({ids: [id], briefings}),
   });
   const data = await resp.json();
-  btn.textContent = 'Done';
+  const el = document.getElementById('proposal-' + id);
+  if (el && data.results && data.results[0]?.ok) {
+    el.style.opacity = '0.4';
+    el.querySelector('.btn-approve').disabled = true;
+  }
+  loadBoard();
+}
+
+async function rejectOne(id) {
+  await fetch('/api/reject', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids: [id]}),
+  });
+  loadProposals();
+}
+
+async function approveAll() {
+  const r = await fetch('/api/proposals');
+  const proposals = await r.json();
+  const ids = proposals.map(p => p.id);
+  const briefings = {};
+  for (const p of proposals) {
+    const el = document.getElementById('briefing-' + p.id);
+    if (el) briefings[String(p.id)] = el.value;
+  }
+  await fetch('/api/approve', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ids, briefings}),
+  });
   loadProposals();
   loadBoard();
 }
 
-// Chat
+// ── Chat ───────────────────────────────────────────────────────────────
 async function sendChat() {
   const input = document.getElementById('chat-input');
   const msg = input.value.trim();
@@ -217,7 +282,10 @@ async function sendChat() {
   input.value = '';
 
   const messages = document.getElementById('chat-messages');
-  messages.innerHTML += `<div class="chat-msg user">${escapeHtml(msg)}</div>`;
+  const userDiv = document.createElement('div');
+  userDiv.className = 'chat-msg user';
+  userDiv.textContent = msg;
+  messages.appendChild(userDiv);
 
   const responseDiv = document.createElement('div');
   responseDiv.className = 'chat-msg assistant';
@@ -231,43 +299,26 @@ async function sendChat() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({message: msg}),
     });
-
     const reader = r.body.getReader();
     const decoder = new TextDecoder();
     let text = '';
-
     while (true) {
       const {done, value} = await reader.read();
       if (done) break;
       const chunk = decoder.decode(value);
       for (const line of chunk.split('\n')) {
         if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-          try {
-            const data = JSON.parse(line.slice(6));
-            text += data.text;
-            responseDiv.textContent = text;
-          } catch(e) {}
+          try { const d = JSON.parse(line.slice(6)); text += d.text; responseDiv.textContent = text; } catch(e) {}
         }
       }
       messages.scrollTop = messages.scrollHeight;
     }
     if (!text) responseDiv.textContent = '(no response)';
-  } catch(e) {
-    responseDiv.textContent = `Error: ${e.message}`;
-  }
+  } catch(e) { responseDiv.textContent = 'Error: ' + e.message; }
 }
 
-document.getElementById('chat-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') sendChat();
-});
+document.getElementById('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
 
-function escapeHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-// Initial load
 loadBoard();
 </script>
 </body>

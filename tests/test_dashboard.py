@@ -171,6 +171,109 @@ class TestApproveAPI:
         assert r.status_code == 400
 
 
+class TestRejectAPI:
+    def test_reject_removes_proposals(self) -> None:
+        proposals = [
+            Proposal(id=1, machine_name="m", repo_name="api",
+                     issue_number=1, issue_title="A", rationale=""),
+            Proposal(id=2, machine_name="m", repo_name="api",
+                     issue_number=2, issue_title="B", rationale=""),
+        ]
+        client = _client()
+        with (
+            patch("coord.state.load_proposals", return_value=proposals),
+            patch("coord.state.save_proposals") as mock_save,
+        ):
+            r = client.post("/api/reject", json={"ids": [1]})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["removed"] == 1
+        assert data["remaining"] == 1
+        saved = mock_save.call_args.args[0]
+        assert len(saved) == 1
+        assert saved[0].id == 2
+
+    def test_reject_invalid_json(self) -> None:
+        client = _client()
+        r = client.post("/api/reject", content="bad", headers={"content-type": "application/json"})
+        assert r.status_code == 400
+
+    def test_reject_empty_ids(self) -> None:
+        client = _client()
+        r = client.post("/api/reject", json={"ids": []})
+        assert r.status_code == 400
+
+
+class TestDiffAPI:
+    def test_diff_not_found(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=Board()),
+            patch("coord.dashboard.server.build_board", return_value=Board()),
+        ):
+            r = client.get("/api/diff/nonexistent")
+        assert r.status_code == 404
+
+    def test_diff_no_branch(self) -> None:
+        board = Board(completed=[
+            Assignment(machine_name="m", repo_name="api", issue_number=1,
+                       issue_title="t", assignment_id="abc", status="done",
+                       branch=None),
+        ])
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=board):
+            r = client.get("/api/diff/abc")
+        assert r.status_code == 404
+        assert "no branch" in r.json()["error"]
+
+    @patch("coord.github_ops._gh")
+    def test_diff_from_pr(self, mock_gh: MagicMock) -> None:
+        board = Board(completed=[
+            Assignment(machine_name="m", repo_name="api", issue_number=1,
+                       issue_title="t", assignment_id="abc", status="done",
+                       branch="feat/x"),
+        ])
+        mock_gh.return_value = "diff --git a/f.py b/f.py\n+new line"
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=board):
+            r = client.get("/api/diff/abc")
+        assert r.status_code == 200
+        assert "new line" in r.json()["diff"]
+
+
+class TestBriefingOverride:
+    @patch("coord.state.build_board", return_value=Board())
+    @patch("coord.state.save_board")
+    @patch("coord.state.clear_proposals")
+    @patch("coord.state.record_dispatched")
+    @patch("coord.state.load_dispatched", return_value=[])
+    @patch("coord.state.load_proposals")
+    @patch("coord.dispatch.post_briefing")
+    @patch("coord.dispatch.httpx.post")
+    def test_briefing_override_applied(
+        self, mock_post, mock_briefing, mock_load_p, *_mocks,
+    ) -> None:
+        mock_load_p.return_value = [
+            Proposal(id=1, machine_name="laptop", repo_name="api",
+                     issue_number=42, issue_title="Fix",
+                     rationale="test", briefing="original"),
+        ]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "xyz"}
+        mock_resp.raise_for_status = lambda: None
+        mock_post.return_value = mock_resp
+
+        client = _client()
+        r = client.post("/api/approve", json={
+            "ids": [1],
+            "briefings": {"1": "edited briefing"},
+        })
+        assert r.status_code == 200
+        call_args = mock_post.call_args
+        payload = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert payload["briefing"] == "edited briefing"
+
+
 class TestChatAPI:
     def test_chat_requires_message(self) -> None:
         client = _client()
@@ -181,6 +284,19 @@ class TestChatAPI:
         client = _client()
         r = client.post("/api/chat", content="bad", headers={"content-type": "application/json"})
         assert r.status_code == 400
+
+
+class TestXSSSafety:
+    def test_html_served_has_escape_function(self) -> None:
+        client = _client()
+        r = client.get("/")
+        assert "const E = " in r.text
+
+    def test_board_data_does_not_appear_unescaped_in_source(self) -> None:
+        client = _client()
+        r = client.get("/")
+        assert "${a.issue_title}" not in r.text
+        assert "E(a.issue_title)" in r.text
 
 
 class TestCLI:
