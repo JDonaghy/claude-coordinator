@@ -6,6 +6,20 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class WorkerPermissionsConfig:
+    """Per-repo allow/deny lists for worker commands.
+
+    When ``deny`` is non-empty the coordinator injects a "forbidden commands"
+    section into the worker system prompt so that ``claude -p`` refuses to run
+    the listed patterns.  An empty ``deny`` list (``deny: []``) means no
+    restrictions.
+    """
+
+    allow: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Repo:
     name: str
     github: str
@@ -13,6 +27,7 @@ class Repo:
     default_branch: str = "main"
     build_command: str | None = None
     test_command: str | None = None
+    worker_permissions: WorkerPermissionsConfig | None = None
 
 
 @dataclass

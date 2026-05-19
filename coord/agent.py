@@ -52,6 +52,8 @@ class AssignmentSpec:
     system_prompt: str | None = None
     # PR number being reviewed (only set for type="review").
     review_target: str | None = None
+    # Command patterns the worker must not run (prompt-level enforcement).
+    deny_commands: list[str] = field(default_factory=list)
 
 
 class _GitError(RuntimeError):
@@ -117,9 +119,38 @@ output a status line in exactly this format:
 WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 
+def build_deny_prompt(deny_commands: list[str]) -> str:
+    """Format a deny-list into a system prompt section.
+
+    Returns an empty string when *deny_commands* is empty so callers can
+    unconditionally append the result.
+    """
+    if not deny_commands:
+        return ""
+
+    # Strip the "Bash(...)" wrapper for readability in the prompt while
+    # keeping the original pattern for reference.
+    lines: list[str] = []
+    for pattern in deny_commands:
+        # Show the human-friendly command inside Bash(...)
+        inner = pattern
+        if inner.startswith("Bash(") and inner.endswith(")"):
+            inner = inner[5:-1]
+        lines.append(f"- {inner}")
+
+    return (
+        "\n\nFORBIDDEN COMMANDS — you must NEVER run these:\n"
+        + "\n".join(lines)
+        + "\n"
+        + "If you need to do something that resembles a forbidden command, STOP and output:\n"
+        + "  STUCK: need to run [command] but it's on the deny-list"
+    )
+
+
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment."""
     system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
+    system_prompt += build_deny_prompt(spec.deny_commands)
     return [
         binary, "-p",
         "--system-prompt", system_prompt,

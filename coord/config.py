@@ -8,10 +8,21 @@ from typing import Any
 
 import yaml
 
-from coord.models import Machine, Repo
+from coord.models import Machine, Repo, WorkerPermissionsConfig
 
 
 DEFAULT_CONFIG_PATH = Path("coordinator.yml")
+
+# Safety-by-default: repos without explicit worker_permissions get this deny-list.
+DEFAULT_DENY_COMMANDS: list[str] = [
+    "Bash(git push --force *)",
+    "Bash(git push -f *)",
+    "Bash(git reset --hard *)",
+    "Bash(git branch -D *)",
+    "Bash(git checkout -- .)",
+    "Bash(git clean -f *)",
+    "Bash(rm -rf *)",
+]
 
 
 class ConfigError(Exception):
@@ -173,6 +184,8 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if test_command is not None and not isinstance(test_command, str):
             raise ConfigError(f"repos[{i}].test_command must be a string")
 
+        worker_permissions = _parse_worker_permissions(entry.get("worker_permissions"), i)
+
         repos.append(
             Repo(
                 name=name,
@@ -181,9 +194,39 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 default_branch=default_branch,
                 build_command=build_command,
                 test_command=test_command,
+                worker_permissions=worker_permissions,
             )
         )
     return repos
+
+
+def _parse_worker_permissions(raw: Any, repo_index: int) -> WorkerPermissionsConfig:
+    """Parse the ``worker_permissions`` block for a single repo.
+
+    When *raw* is ``None`` (key absent from YAML), the default deny-list is
+    applied — safety by default.  An explicit ``deny: []`` clears restrictions.
+    """
+    if raw is None:
+        return WorkerPermissionsConfig(deny=list(DEFAULT_DENY_COMMANDS))
+
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"repos[{repo_index}].worker_permissions must be a mapping"
+        )
+
+    allow = raw.get("allow", []) or []
+    if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
+        raise ConfigError(
+            f"repos[{repo_index}].worker_permissions.allow must be a list of strings"
+        )
+
+    deny = raw.get("deny", []) or []
+    if not isinstance(deny, list) or not all(isinstance(d, str) for d in deny):
+        raise ConfigError(
+            f"repos[{repo_index}].worker_permissions.deny must be a list of strings"
+        )
+
+    return WorkerPermissionsConfig(allow=allow, deny=deny)
 
 
 def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
