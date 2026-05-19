@@ -47,6 +47,12 @@ class Assignment:
     finished_at: float | None = None
     smoke_test: str | None = None  # None | pass | fail
     smoke_test_reason: str | None = None
+    # "work" (default) or "review". Review assignments target an existing PR
+    # rather than implementing a fresh issue, so `review_target` carries the
+    # PR number or branch the reviewer is reading.
+    type: str = "work"
+    review_target: str | None = None
+    review_of_assignment_id: str | None = None
 
 
 @dataclass

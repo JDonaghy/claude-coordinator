@@ -47,6 +47,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
             agent_completed[e["id"]] = e
 
     changed: list[str] = []
+    newly_done_work: list = []  # assignments that just transitioned work → done
 
     # Pass 1: transition active assignments that have finished.
     for a in board.active[:]:
@@ -57,17 +58,28 @@ def reconcile(board: Board, config: Config) -> list[str]:
             continue
         branch = entry.get("branch")
         if entry.get("status") == "done":
-            board.mark_done_by_id(
+            done = board.mark_done_by_id(
                 a.assignment_id,
                 finished_at=entry.get("finished_at"),
                 branch=branch,
             )
+            if done is not None and getattr(done, "type", "work") == "work":
+                newly_done_work.append(done)
         else:
             board.mark_failed_by_id(
                 a.assignment_id,
                 finished_at=entry.get("finished_at"),
             )
         changed.append(a.assignment_id)
+
+    # Auto-dispatch reviews for any work assignments that just finished.
+    if getattr(config, "reviews", None) and config.reviews.enabled and config.reviews.auto_dispatch:
+        from coord.review import dispatch_review
+
+        for completed in newly_done_work:
+            review = dispatch_review(completed, board, config)
+            if review is not None and review.assignment_id is not None:
+                changed.append(review.assignment_id)
 
     # Pass 2: backfill branch on completed assignments that are missing it.
     for a in board.completed:

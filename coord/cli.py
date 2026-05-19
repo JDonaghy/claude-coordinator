@@ -196,7 +196,13 @@ def status(config_path: Path, machine_filter: str | None, timeout: float, freshn
             if active:
                 a = active[0]
                 spec = a.get("spec", {})
-                detail = f"busy — #{spec.get('issue_number', '?')}: {spec.get('issue_title', '?')}"
+                badge = "[review] " if spec.get("type") == "review" else ""
+                target = spec.get("review_target")
+                target_str = f" reviewing PR #{target}" if target else ""
+                detail = (
+                    f"busy — {badge}#{spec.get('issue_number', '?')}: "
+                    f"{spec.get('issue_title', '?')}{target_str}"
+                )
             else:
                 detail = "idle"
             label = f"{s.state} • {detail}{latency}"

@@ -43,6 +43,15 @@ class AssignmentSpec:
     files_forbidden: list[str] = field(default_factory=list)
     branch: str | None = None
     pull_repos: list[str] = field(default_factory=list)
+    # "work" (default) or "review". The agent treats both the same — what
+    # differs is the briefing and (for reviewers) the system prompt.
+    type: str = "work"
+    # Optional override of WORKER_SYSTEM_PROMPT. Reviewers need a different
+    # system prompt because they're allowed to run `gh pr review` while
+    # workers are not.
+    system_prompt: str | None = None
+    # PR number being reviewed (only set for type="review").
+    review_target: str | None = None
 
 
 class _GitError(RuntimeError):
@@ -110,9 +119,10 @@ WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment."""
+    system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
     return [
         binary, "-p",
-        "--system-prompt", WORKER_SYSTEM_PROMPT,
+        "--system-prompt", system_prompt,
         "--allowedTools", "Read,Edit,Write,Bash",
         "--permission-mode", "acceptEdits",
         spec.briefing,
