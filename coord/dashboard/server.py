@@ -74,10 +74,17 @@ def build_app(config: Config) -> Starlette:
         if not ids or not isinstance(ids, list):
             return JSONResponse({"error": "ids must be a non-empty list"}, status_code=400)
 
+        briefing_overrides = body.get("briefings", {})
+
         proposals = load_p()
         selected = [p for p in proposals if p.id in ids]
         if not selected:
             return JSONResponse({"error": "no matching proposals"}, status_code=404)
+
+        for p in selected:
+            override = briefing_overrides.get(str(p.id))
+            if override is not None:
+                p.briefing = override
 
         in_flight = load_dispatched()
         results = []
@@ -149,12 +156,69 @@ def build_app(config: Config) -> Starlette:
 
         return StreamingResponse(stream(), media_type="text/event-stream")
 
+    async def api_reject(request: Request) -> JSONResponse:
+        from coord.state import load_proposals as load_p, save_proposals as save_p
+
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+        ids = body.get("ids", [])
+        if not ids or not isinstance(ids, list):
+            return JSONResponse({"error": "ids must be a non-empty list"}, status_code=400)
+
+        proposals = load_p()
+        remaining = [p for p in proposals if p.id not in ids]
+        removed = len(proposals) - len(remaining)
+        if remaining:
+            save_p(remaining)
+        else:
+            from coord.state import clear_proposals
+            clear_proposals()
+        return JSONResponse({"removed": removed, "remaining": len(remaining)})
+
+    async def api_diff(request: Request) -> JSONResponse:
+        assignment_id = request.path_params["id"]
+        board = load_board() or build_board()
+        assignment = board.find_by_id(assignment_id)
+        if assignment is None:
+            return JSONResponse({"error": "assignment not found"}, status_code=404)
+        if not assignment.branch:
+            return JSONResponse({"error": "no branch recorded"}, status_code=404)
+
+        repo = config.repo(assignment.repo_name)
+        if repo is None:
+            return JSONResponse({"error": "unknown repo"}, status_code=404)
+
+        try:
+            from coord.github_ops import _gh
+            raw = _gh(
+                "pr", "diff", "--repo", repo.github,
+                assignment.branch,
+            )
+            return JSONResponse({"diff": raw, "source": "pr"})
+        except RuntimeError:
+            pass
+
+        try:
+            from coord.github_ops import _gh
+            raw = _gh(
+                "api", f"repos/{repo.github}/compare/{repo.default_branch}...{assignment.branch}",
+                "--jq", ".files[].patch // empty",
+            )
+            return JSONResponse({"diff": raw, "source": "compare"})
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     routes = [
         Route("/", index, methods=["GET"]),
         Route("/api/board", api_board, methods=["GET"]),
         Route("/api/machines", api_machines, methods=["GET"]),
         Route("/api/proposals", api_proposals, methods=["GET"]),
         Route("/api/approve", api_approve, methods=["POST"]),
+        Route("/api/reject", api_reject, methods=["POST"]),
+        Route("/api/diff/{id}", api_diff, methods=["GET"]),
         Route("/api/chat", api_chat, methods=["POST"]),
     ]
     return Starlette(routes=routes)
