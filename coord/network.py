@@ -27,6 +27,7 @@ OFFLINE = "offline"
 TIMEOUT = "timeout"
 DNS_ERROR = "dns_error"
 HTTP_ERROR = "http_error"
+RATE_LIMITED = "rate_limited"
 UNKNOWN = "unknown"
 
 
@@ -56,9 +57,16 @@ def classify_error(exc: Exception) -> tuple[str, str]:
         return OFFLINE, f"connection failed ({exc})"
     if isinstance(exc, socket.gaierror):
         return DNS_ERROR, "hostname not resolvable (Tailscale up?)"
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        return RATE_LIMITED, "rate limited (429 Too Many Requests)"
     if isinstance(exc, httpx.HTTPError):
         return HTTP_ERROR, f"http error: {exc}"
     return UNKNOWN, f"{type(exc).__name__}: {exc}"
+
+
+def is_retryable(state: str) -> bool:
+    """Whether a classified error state should trigger a retry."""
+    return state in (TIMEOUT, RATE_LIMITED, HTTP_ERROR)
 
 
 def check_machine(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> MachineStatus:

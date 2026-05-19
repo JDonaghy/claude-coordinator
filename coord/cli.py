@@ -386,7 +386,7 @@ def approve(
 ) -> None:
     from coord import freshness as fresh
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph, transitive_deps
-    from coord.dispatch import compute_do_not_touch, dispatch, post_briefing
+    from coord.dispatch import compute_do_not_touch, dispatch, dispatch_with_retry, post_briefing
     from coord.network import classify_error, fetch_repos
     from coord.state import (
         build_board,
@@ -479,12 +479,26 @@ def approve(
                     if addendum:
                         p.briefing = (p.briefing or "") + addendum
 
+        def _on_retry(attempt, max_r, state, reason, wait):
+            click.echo(
+                f"     retry {attempt}/{max_r} after {state} ({reason}), "
+                f"waiting {wait:.0f}s...",
+                err=True,
+            )
+
         try:
-            response = dispatch(p, cfg, pull_repos=pull_repos)
+            response = dispatch_with_retry(
+                p, cfg,
+                max_retries=cfg.concurrency.max_retries,
+                backoff_base=cfg.concurrency.backoff_base,
+                pull_repos=pull_repos,
+                on_retry=_on_retry,
+            )
         except httpx.HTTPError as e:
             state, reason = classify_error(e)
             click.echo(
-                f"     dispatch failed: {p.machine_name} {state} — {reason}",
+                f"     dispatch failed after {cfg.concurrency.max_retries} retries: "
+                f"{p.machine_name} {state} — {reason}",
                 err=True,
             )
             continue
@@ -504,6 +518,11 @@ def approve(
             click.echo("     briefing posted to GitHub")
         except Exception as e:
             click.echo(f"     briefing post failed: {e}", err=True)
+
+        if not dry_run and p is not selected[-1] and cfg.concurrency.stagger_seconds > 0:
+            import time as _time
+            click.echo(f"     staggering {cfg.concurrency.stagger_seconds:.0f}s before next dispatch...")
+            _time.sleep(cfg.concurrency.stagger_seconds)
 
     if not dry_run:
         clear_proposals()

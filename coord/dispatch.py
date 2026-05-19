@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Iterable
 
 import httpx
@@ -57,6 +58,36 @@ def dispatch(
     resp = httpx.post(url, json=payload, timeout=15)
     resp.raise_for_status()
     return resp.json()
+
+
+def dispatch_with_retry(
+    proposal: Proposal,
+    config: Config,
+    *,
+    max_retries: int = 3,
+    backoff_base: float = 60.0,
+    pull_repos: Iterable[str] = (),
+    on_retry: callable | None = None,
+) -> dict:
+    """Dispatch with exponential backoff on transient failures."""
+    from coord.network import classify_error, is_retryable
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return dispatch(proposal, config, pull_repos=pull_repos)
+        except httpx.HTTPError as exc:
+            state, reason = classify_error(exc)
+            if not is_retryable(state) or attempt == max_retries:
+                raise
+            wait = backoff_base * (2 ** attempt)
+            if on_retry:
+                on_retry(attempt + 1, max_retries, state, reason, wait)
+            time.sleep(wait)
+            last_exc = exc
+        except ValueError:
+            raise
+    raise last_exc  # unreachable, but satisfies type checker
 
 
 def compute_do_not_touch(

@@ -59,6 +59,12 @@ machines:
     repo_paths:
       claude-coordinator: ~/src/claude-coordinator
 
+concurrency:
+  max_workers: 2          # max simultaneous claude -p sessions across all machines
+  stagger_seconds: 30     # delay between starting workers
+  backoff_base: 60        # seconds to wait on rate limit before retry
+  max_retries: 3          # retries per dispatch on transient failures
+
 hooks:
   on_round_complete:
     - summary_report
