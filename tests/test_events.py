@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -329,21 +330,36 @@ async def test_events_endpoint_respects_last_event_id_header() -> None:
 # ── /stream/{id} live-log endpoint ──────────────────────────────────────────
 
 
+def _init_repo(path: Path) -> Path:
+    """Create a minimal git repo with one commit so worktrees can be created."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(path), check=True, capture_output=True)
+    (path / "README").write_text("init\n")
+    subprocess.run(["git", "add", "README"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=str(path), check=True, capture_output=True)
+    return path
+
+
 def _agent_app(tmp_path: Path, *, argv: list[str]) -> tuple[Starlette, AgentServer]:
+    repo = _init_repo(tmp_path / "repo")
     server = AgentServer(
         machine_name="test",
         capabilities=["python"],
         repos=["api"],
         state_dir=tmp_path / "state",
+        repo_paths={"api": str(repo)},
         worker_command=lambda spec: argv,
     )
     return build_app(server), server
 
 
 def _payload(tmp_path: Path) -> dict:
+    repo_path = tmp_path / "repo"
     return {
         "repo_name": "api",
-        "repo_path": str(tmp_path),
+        "repo_path": str(repo_path),
         "issue_number": 1,
         "issue_title": "stream test",
         "briefing": "stream",

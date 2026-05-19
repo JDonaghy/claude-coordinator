@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -73,6 +75,12 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     return result.stdout.strip()
 
 
+def _slugify(text: str, max_len: int = 40) -> str:
+    """Convert *text* to a URL/branch-safe slug."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_len].rstrip("-")
+
+
 @dataclass
 class AgentAssignment:
     """Server-side record. Carries the spec plus runtime metadata."""
@@ -87,6 +95,7 @@ class AgentAssignment:
     log_path: str | None = None
     error: str | None = None
     branch: str | None = None
+    worktree_path: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -101,9 +110,8 @@ Rules:
 (issues, PRs, comments). Use regular git commands only.
 - Stay within the files listed in your briefing. If you need to touch \
 other files, do so only if strictly necessary and note it.
-- BEFORE making any changes, create a feature branch: \
-`git checkout -b issue-<number>-<short-description>`. \
-Commit all work to that branch. Push with `git push origin <branch-name>`. \
+- You are already on a feature branch. Commit your work to this branch. \
+Push with `git push origin HEAD`. \
 NEVER commit or push to main or develop directly. \
 Do NOT open a PR — the coordinator handles that.
 
@@ -283,6 +291,20 @@ class AgentServer:
         )
         assignment.log_path = str(self.log_dir / f"{assignment.id}.log")
 
+        # Create worktree for isolation
+        try:
+            worktree_path = self._setup_worktree(assignment, repo_path)
+        except (_GitError, OSError) as e:
+            assignment.status = FAILED
+            assignment.error = f"worktree setup failed: {e}"
+            assignment.finished_at = time.time()
+            with self._lock:
+                self._assignments[assignment.id] = assignment
+            self._persist()
+            return assignment  # Don't raise — let coordinator see the failure
+
+        assignment.worktree_path = str(worktree_path)
+
         with self._lock:
             self._assignments[assignment.id] = assignment
         self._persist()
@@ -290,13 +312,13 @@ class AgentServer:
         if spec.pull_repos:
             thread = threading.Thread(
                 target=self._pull_then_spawn,
-                args=(assignment, repo_path),
+                args=(assignment, worktree_path),
                 daemon=True,
                 name=f"agent-pull-{assignment.id}",
             )
             thread.start()
         else:
-            self._spawn(assignment, repo_path)
+            self._spawn(assignment, worktree_path)
         return assignment
 
     def cancel(self, assignment_id: str) -> AgentAssignment:
@@ -325,6 +347,10 @@ class AgentServer:
             assignment.status = CANCELLED
             assignment.finished_at = time.time()
         self._persist()
+
+        # Clean up worktree after cancellation
+        self._cleanup_worktree(assignment)
+
         return assignment
 
     def get(self, assignment_id: str) -> AgentAssignment | None:
@@ -354,6 +380,76 @@ class AgentServer:
         raise TimeoutError(f"assignment {assignment_id} still {a.status} after {timeout}s")
 
     # ── Internals ──────────────────────────────────────────────────────────
+
+    def _setup_worktree(self, assignment: AgentAssignment, repo_path: Path) -> Path:
+        """Create a git worktree for this assignment. Returns the worktree path."""
+        worktree_base = self.state_dir / "worktrees"
+        worktree_path = worktree_base / assignment.id
+
+        # Clean up stale worktree if it exists
+        if worktree_path.exists():
+            try:
+                _git(repo_path, "worktree", "remove", str(worktree_path), "--force")
+            except _GitError:
+                shutil.rmtree(worktree_path, ignore_errors=True)
+
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Fetch latest
+        try:
+            _git(repo_path, "fetch", "origin")
+        except _GitError:
+            pass  # offline is OK, work from local state
+
+        # Determine start point — prefer origin/<branch>, fall back to local
+        default_branch = assignment.spec.branch or "main"
+        start_point = f"origin/{default_branch}"
+        try:
+            _git(repo_path, "rev-parse", "--verify", start_point)
+        except _GitError:
+            # No remote tracking branch — use local branch as start point
+            start_point = default_branch
+
+        # Branch name for this assignment
+        branch_name = f"issue-{assignment.spec.issue_number}-{_slugify(assignment.spec.issue_title)}"
+
+        # Check if branch already exists (locally or on remote — retry scenario)
+        branch_exists = False
+        for ref in (f"origin/{branch_name}", branch_name):
+            try:
+                _git(repo_path, "rev-parse", "--verify", ref)
+                branch_exists = True
+                break
+            except _GitError:
+                continue
+
+        if branch_exists:
+            # Branch exists — check it out in the worktree
+            _git(repo_path, "worktree", "add", str(worktree_path), branch_name)
+        else:
+            # Branch doesn't exist — create new worktree with new branch
+            _git(
+                repo_path, "worktree", "add", "-b", branch_name,
+                str(worktree_path), start_point,
+            )
+
+        return worktree_path
+
+    def _cleanup_worktree(self, assignment: AgentAssignment) -> None:
+        """Remove the worktree for a finished assignment. Best-effort."""
+        if not assignment.worktree_path:
+            return
+        wt_path = Path(assignment.worktree_path)
+        repo_path = Path(assignment.spec.repo_path).expanduser()
+        try:
+            if wt_path.exists():
+                _git(repo_path, "worktree", "remove", str(wt_path), "--force")
+        except _GitError:
+            try:
+                shutil.rmtree(wt_path, ignore_errors=True)
+                _git(repo_path, "worktree", "prune")
+            except _GitError:
+                pass
 
     def _pull_then_spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
         """Pull each dep before spawning the worker. Logs to the assignment log.
@@ -444,18 +540,22 @@ class AgentServer:
         exit_code = proc.wait()
         log_fh.close()
 
-        # Capture the branch the worker left the repo on. Authoritative — we
-        # report what actually happened, not what was hoped. If it equals the
-        # repo's default branch, the worker likely forgot to switch; leave it
-        # None so the coordinator can flag it.
+        # Capture the branch the worker left the repo on. For worktree-based
+        # assignments we read from the worktree; for legacy assignments (no
+        # worktree_path) we fall back to the main repo clone.
         captured_branch: str | None = None
         with self._lock:
             assignment = self._assignments.get(assignment_id)
         if assignment is not None:
-            repo_path = Path(assignment.spec.repo_path).expanduser()
-            if repo_path.exists():
+            # Determine where to read branch info from
+            if assignment.worktree_path:
+                check_path = Path(assignment.worktree_path)
+            else:
+                check_path = Path(assignment.spec.repo_path).expanduser()
+
+            if check_path.exists():
                 try:
-                    head = _git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
+                    head = _git(check_path, "rev-parse", "--abbrev-ref", "HEAD")
                 except _GitError:
                     head = ""
                 if head and head != "HEAD":
@@ -463,6 +563,19 @@ class AgentServer:
                     spec_default = assignment.spec.branch
                     if spec_default is None or head != spec_default:
                         captured_branch = head
+
+            # Push the branch from worktree before cleanup
+            if assignment.worktree_path:
+                wt_path = Path(assignment.worktree_path)
+                if wt_path.exists() and exit_code == 0:
+                    try:
+                        _git(wt_path, "push", "-u", "origin", "HEAD")
+                    except _GitError as e:
+                        try:
+                            with open(assignment.log_path, "a") as reopen:
+                                reopen.write(f"\n# push failed: {e}\n")
+                        except OSError:
+                            pass
 
         with self._lock:
             assignment = self._assignments.get(assignment_id)
@@ -477,6 +590,10 @@ class AgentServer:
                 assignment.status = DONE if exit_code == 0 else FAILED
             self._processes.pop(assignment_id, None)
         self._persist()
+
+        # Clean up worktree AFTER updating status
+        if assignment is not None:
+            self._cleanup_worktree(assignment)
 
     def _persist(self) -> None:
         with self._lock:
@@ -513,6 +630,21 @@ class AgentServer:
                 if a.finished_at is None:
                     a.finished_at = time.time()
             self._assignments[a.id] = a
+
+        # Prune stale worktrees on startup
+        self._prune_worktrees()
+
+    def _prune_worktrees(self) -> None:
+        """Ask git to prune stale worktree bookkeeping for each known repo."""
+        seen_paths: set[str] = set()
+        for path_str in self.repo_paths.values():
+            if path_str in seen_paths:
+                continue
+            seen_paths.add(path_str)
+            try:
+                _git(Path(path_str).expanduser(), "worktree", "prune")
+            except _GitError:
+                pass
 
     def shutdown(self, *, kill_running: bool = False) -> None:
         """Best-effort cleanup. Used by tests and graceful shutdown."""

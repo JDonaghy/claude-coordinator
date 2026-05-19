@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -16,6 +17,18 @@ from coord.agent import (
     AgentServer,
     AssignmentSpec,
 )
+
+
+def _init_repo(path: Path) -> Path:
+    """Create a minimal git repo with one commit so worktrees can be created."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(path), check=True, capture_output=True)
+    (path / "README").write_text("init\n")
+    subprocess.run(["git", "add", "README"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=str(path), check=True, capture_output=True)
+    return path
 
 
 def _spec(repo_path: Path, **overrides) -> AssignmentSpec:
@@ -33,15 +46,18 @@ def _spec(repo_path: Path, **overrides) -> AssignmentSpec:
     return AssignmentSpec(**base)
 
 
-def _server(tmp_path: Path, *, argv: list[str] | None = None, **kwargs) -> AgentServer:
+def _server(tmp_path: Path, *, argv: list[str] | None = None, repo_path: Path | None = None, **kwargs) -> AgentServer:
     if argv is None:
         argv = ["/bin/sh", "-c", "echo worker-output"]
+    # Ensure we have a git repo for worktree support
+    rp = repo_path or _init_repo(tmp_path / "repo")
     return AgentServer(
         machine_name="test",
         capabilities=["python"],
         repos=["api"],
         state_dir=tmp_path / "state",
         worker_command=lambda spec: argv,
+        repo_paths={"api": str(rp)},
         **kwargs,
     )
 
@@ -56,19 +72,22 @@ def test_health_reports_machine(tmp_path: Path) -> None:
 
 
 def test_assign_success(tmp_path: Path) -> None:
-    server = _server(tmp_path)
-    a = server.assign(_spec(tmp_path))
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+    a = server.assign(_spec(repo))
     final = server.wait_for(a.id)
     assert final.status == DONE
     assert final.exit_code == 0
+    assert final.worktree_path is not None
     log = Path(final.log_path).read_text()
     assert "worker-output" in log
     server.shutdown()
 
 
 def test_assign_failure_marks_failed(tmp_path: Path) -> None:
-    server = _server(tmp_path, argv=["/bin/sh", "-c", "echo nope; exit 7"])
-    a = server.assign(_spec(tmp_path))
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, argv=["/bin/sh", "-c", "echo nope; exit 7"], repo_path=repo)
+    a = server.assign(_spec(repo))
     final = server.wait_for(a.id)
     assert final.status == FAILED
     assert final.exit_code == 7
@@ -76,16 +95,18 @@ def test_assign_failure_marks_failed(tmp_path: Path) -> None:
 
 
 def test_assign_unknown_binary_marks_failed(tmp_path: Path) -> None:
-    server = _server(tmp_path, argv=["/no/such/binary"])
-    a = server.assign(_spec(tmp_path))
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, argv=["/no/such/binary"], repo_path=repo)
+    a = server.assign(_spec(repo))
     final = server.wait_for(a.id)
     assert final.status == FAILED
     assert final.error is not None
 
 
 def test_cancel_running_assignment(tmp_path: Path) -> None:
-    server = _server(tmp_path, argv=["/bin/sh", "-c", "sleep 30"])
-    a = server.assign(_spec(tmp_path))
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, argv=["/bin/sh", "-c", "sleep 30"], repo_path=repo)
+    a = server.assign(_spec(repo))
     # Wait until it's actually running so cancel has something to terminate.
     for _ in range(50):
         if server.get(a.id).status == RUNNING:
@@ -104,9 +125,10 @@ def test_cancel_unknown_id_raises(tmp_path: Path) -> None:
 
 
 def test_rejects_unhandled_repo(tmp_path: Path) -> None:
-    server = _server(tmp_path)
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
     with pytest.raises(ValueError, match="does not handle repo"):
-        server.assign(_spec(tmp_path, repo_name="other"))
+        server.assign(_spec(repo, repo_name="other"))
 
 
 def test_rejects_missing_repo_path(tmp_path: Path) -> None:
@@ -116,12 +138,16 @@ def test_rejects_missing_repo_path(tmp_path: Path) -> None:
 
 
 def test_state_persists_to_disk(tmp_path: Path) -> None:
-    server = _server(tmp_path)
-    a = server.assign(_spec(tmp_path))
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+    a = server.assign(_spec(repo))
     server.wait_for(a.id)
     state = json.loads((tmp_path / "state" / "agent_state.json").read_text())
     ids = [entry["id"] for entry in state["assignments"]]
     assert a.id in ids
+    # worktree_path should be persisted
+    entry = next(e for e in state["assignments"] if e["id"] == a.id)
+    assert entry["worktree_path"] is not None
     server.shutdown()
 
 
@@ -144,6 +170,8 @@ def test_orphaned_running_assignments_marked_failed_on_load(tmp_path: Path) -> N
                         "exit_code": None,
                         "log_path": str(tmp_path / "abc123.log"),
                         "error": None,
+                        "branch": None,
+                        "worktree_path": None,
                         "spec": {
                             "repo_name": "api",
                             "repo_path": str(tmp_path),
