@@ -42,11 +42,20 @@ class ReviewsConfig:
 
 
 @dataclass
+class ConcurrencyConfig:
+    max_workers: int = 2
+    stagger_seconds: float = 30.0
+    backoff_base: float = 60.0
+    max_retries: int = 3
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
     hooks: HooksConfig = field(default_factory=HooksConfig)
     reviews: ReviewsConfig = field(default_factory=ReviewsConfig)
+    concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -74,8 +83,9 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     _validate_dependencies(repos)
     hooks = _parse_hooks(raw.get("hooks"))
     reviews = _parse_reviews(raw.get("reviews"), {r.name for r in repos})
+    concurrency = _parse_concurrency(raw.get("concurrency"))
 
-    return Config(repos=repos, machines=machines, hooks=hooks, reviews=reviews, path=p)
+    return Config(repos=repos, machines=machines, hooks=hooks, reviews=reviews, concurrency=concurrency, path=p)
 
 
 def _parse_repos(raw: Any) -> list[Repo]:
@@ -259,6 +269,26 @@ def _parse_reviews(raw: Any, repo_names: set[str]) -> ReviewsConfig:
                 f"reviews.repo_overrides[{repo_name}] must be a list of strings"
             )
     cfg.repo_overrides = overrides
+    return cfg
+
+
+def _parse_concurrency(raw: Any) -> ConcurrencyConfig:
+    if raw is None:
+        return ConcurrencyConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'concurrency' must be a mapping")
+    cfg = ConcurrencyConfig()
+    for key in ("max_workers", "stagger_seconds", "backoff_base", "max_retries"):
+        val = raw.get(key)
+        if val is None:
+            continue
+        if key == "max_retries" or key == "max_workers":
+            if not isinstance(val, int) or val < 0:
+                raise ConfigError(f"concurrency.{key} must be a non-negative integer")
+        else:
+            if not isinstance(val, (int, float)) or val < 0:
+                raise ConfigError(f"concurrency.{key} must be a non-negative number")
+        setattr(cfg, key, val)
     return cfg
 
 
