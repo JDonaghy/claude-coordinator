@@ -196,9 +196,16 @@ def status(config_path: Path, machine_filter: str | None, timeout: float, freshn
             if active:
                 a = active[0]
                 spec = a.get("spec", {})
-                badge = "[review] " if spec.get("type") == "review" else ""
+                spec_type = spec.get("type", "work")
+                badge_map = {"review": "[review] ", "smoke": "[smoke] "}
+                badge = badge_map.get(spec_type, "")
                 target = spec.get("review_target")
-                target_str = f" reviewing PR #{target}" if target else ""
+                if spec_type == "review" and target:
+                    target_str = f" reviewing PR #{target}"
+                elif spec_type == "smoke" and target:
+                    target_str = f" smoking branch `{target}`"
+                else:
+                    target_str = ""
                 detail = (
                     f"busy — {badge}#{spec.get('issue_number', '?')}: "
                     f"{spec.get('issue_title', '?')}{target_str}"
@@ -683,6 +690,55 @@ def stop(assignment_id: str, config_path: Path) -> None:
     board.mark_failed_by_id(assignment_id)
     save_board(board)
     click.echo(f"Board updated: {assignment.repo_name} #{assignment.issue_number} marked failed")
+
+
+@main.command("test", help="Queue a smoke test for a completed assignment.")
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+def test_cmd(assignment_id: str, config_path: Path) -> None:
+    from coord.smoke import dispatch_smoke
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+    if assignment.status != "done":
+        click.echo(
+            f"error: assignment {assignment_id} is {assignment.status!r}, "
+            "smoke can only run on done work assignments",
+            err=True,
+        )
+        sys.exit(1)
+    if assignment.type != "work":
+        click.echo(
+            f"error: assignment {assignment_id} is type {assignment.type!r}; "
+            "only 'work' assignments get smoke tests",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Force-enable for the manual command: the user explicitly asked for it,
+    # so we bypass `auto_queue=False`.
+    cfg.smoke_tests.auto_queue = True
+    smoke = dispatch_smoke(assignment, board, cfg)
+    if smoke is None:
+        click.echo(
+            "No smoke test was queued. Possible reasons: no matching "
+            "capability_rules, no capable machine, or HTTP failure reaching "
+            "the agent.",
+            err=True,
+        )
+        sys.exit(1)
+
+    save_board(board)
+    click.echo(
+        f"Smoke test {smoke.assignment_id} queued on {smoke.machine_name} "
+        f"for branch {smoke.branch}"
+    )
 
 
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")
