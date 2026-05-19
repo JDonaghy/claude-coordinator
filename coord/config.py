@@ -25,10 +25,28 @@ class HooksConfig:
 
 
 @dataclass
+class ReviewsConfig:
+    """Adversarial code review settings.
+
+    `enabled=False` by default — opt-in per project. When enabled, completion
+    of a "work" assignment triggers an automatic review dispatch to a
+    different machine (see coord/review.py).
+    """
+
+    enabled: bool = False
+    auto_dispatch: bool = True
+    require_approval: bool = False
+    reviewer_prompt: str = ""
+    checklist: list[str] = field(default_factory=list)
+    repo_overrides: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
     hooks: HooksConfig = field(default_factory=HooksConfig)
+    reviews: ReviewsConfig = field(default_factory=ReviewsConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -55,8 +73,9 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     machines = _parse_machines(raw.get("machines"), repos)
     _validate_dependencies(repos)
     hooks = _parse_hooks(raw.get("hooks"))
+    reviews = _parse_reviews(raw.get("reviews"), {r.name for r in repos})
 
-    return Config(repos=repos, machines=machines, hooks=hooks, path=p)
+    return Config(repos=repos, machines=machines, hooks=hooks, reviews=reviews, path=p)
 
 
 def _parse_repos(raw: Any) -> list[Repo]:
@@ -198,6 +217,49 @@ def _parse_hooks(raw: Any) -> HooksConfig:
             )
         setattr(hooks, event_name, entries)
     return hooks
+
+
+def _parse_reviews(raw: Any, repo_names: set[str]) -> ReviewsConfig:
+    if raw is None:
+        return ReviewsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'reviews' must be a mapping")
+
+    cfg = ReviewsConfig()
+    for bool_field in ("enabled", "auto_dispatch", "require_approval"):
+        if bool_field in raw:
+            value = raw[bool_field]
+            if not isinstance(value, bool):
+                raise ConfigError(f"reviews.{bool_field} must be a boolean")
+            setattr(cfg, bool_field, value)
+
+    if "reviewer_prompt" in raw:
+        value = raw["reviewer_prompt"]
+        if not isinstance(value, str):
+            raise ConfigError("reviews.reviewer_prompt must be a string")
+        cfg.reviewer_prompt = value
+
+    checklist = raw.get("checklist", []) or []
+    if not isinstance(checklist, list) or not all(isinstance(c, str) for c in checklist):
+        raise ConfigError("reviews.checklist must be a list of strings")
+    cfg.checklist = checklist
+
+    overrides = raw.get("repo_overrides", {}) or {}
+    if not isinstance(overrides, dict):
+        raise ConfigError("reviews.repo_overrides must be a mapping of repo → list of strings")
+    for repo_name, items in overrides.items():
+        if not isinstance(repo_name, str):
+            raise ConfigError("reviews.repo_overrides keys must be repo names")
+        if repo_name not in repo_names:
+            raise ConfigError(
+                f"reviews.repo_overrides references unknown repo: {repo_name!r}"
+            )
+        if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
+            raise ConfigError(
+                f"reviews.repo_overrides[{repo_name}] must be a list of strings"
+            )
+    cfg.repo_overrides = overrides
+    return cfg
 
 
 def _validate_dependencies(repos: list[Repo]) -> None:
