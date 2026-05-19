@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -13,6 +14,18 @@ from coord.cli import main
 from coord.models import Assignment, Board
 from coord.progress import parse_progress, WorkerProgress
 from coord.state import save_board
+
+
+def _init_repo(path: Path) -> Path:
+    """Create a minimal git repo with one commit so worktrees can be created."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(path), check=True, capture_output=True)
+    (path / "README").write_text("init\n")
+    subprocess.run(["git", "add", "README"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=str(path), check=True, capture_output=True)
+    return path
 
 
 # ── Progress parsing ───────────────────────────────────────────────────────
@@ -102,15 +115,15 @@ class TestParseProgress:
 
 class TestAgentProgress:
     def test_progress_returned_for_running_assignment(self, tmp_path: Path) -> None:
+        repo_dir = _init_repo(tmp_path / "repo")
         server = AgentServer(
             machine_name="test",
             repos=["api"],
             state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo_dir)},
             worker_command=lambda spec: ["/bin/sh", "-c",
                 "echo 'STATUS: started → building → confidence: high'; sleep 30"],
         )
-        repo_dir = tmp_path / "repo"
-        repo_dir.mkdir()
         spec = AssignmentSpec(
             repo_name="api", repo_path=str(repo_dir),
             issue_number=1, issue_title="t", briefing="b",
@@ -131,15 +144,15 @@ class TestAgentProgress:
         server.shutdown(kill_running=True)
 
     def test_progress_included_in_list_assignments(self, tmp_path: Path) -> None:
+        repo_dir = _init_repo(tmp_path / "repo")
         server = AgentServer(
             machine_name="test",
             repos=["api"],
             state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo_dir)},
             worker_command=lambda spec: ["/bin/sh", "-c",
                 "echo 'STATUS: working → confidence: high'; sleep 30"],
         )
-        repo_dir = tmp_path / "repo"
-        repo_dir.mkdir()
         spec = AssignmentSpec(
             repo_name="api", repo_path=str(repo_dir),
             issue_number=1, issue_title="t", briefing="b",

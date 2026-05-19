@@ -7,6 +7,7 @@ Real: agent server (HTTP via TestClient), dispatch, brain prompt/parse logic.
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -23,14 +24,24 @@ from coord.models import Machine, Proposal, Repo
 from coord.state import save_proposals, load_proposals
 
 
+def _init_repo(path: Path) -> Path:
+    """Create a minimal git repo with one commit so worktrees can be created."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(path), check=True, capture_output=True)
+    (path / "README").write_text("init\n")
+    subprocess.run(["git", "add", "README"], cwd=str(path), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=str(path), check=True, capture_output=True)
+    return path
+
+
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
 def repo_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "repo"
-    d.mkdir()
-    return d
+    return _init_repo(tmp_path / "repo")
 
 
 @pytest.fixture
@@ -40,6 +51,7 @@ def agent_server(tmp_path: Path, repo_dir: Path) -> AgentServer:
         capabilities=["python"],
         repos=["myapp"],
         state_dir=tmp_path / "agent_state",
+        repo_paths={"myapp": str(repo_dir)},
         worker_command=lambda spec: ["/bin/sh", "-c", "echo 'worker done'; exit 0"],
     )
     yield server
@@ -262,6 +274,7 @@ class TestBrainAgentIntegration:
             capabilities=["python"],
             repos=["myapp"],
             state_dir=agent_server.state_dir.parent / "state2",
+            repo_paths={"myapp": str(repo_dir)},
             worker_command=lambda spec: ["/bin/sh", "-c", "sleep 30"],
         )
         try:
@@ -299,6 +312,7 @@ class TestWorkerFailure:
             machine_name="testbox",
             repos=["myapp"],
             state_dir=tmp_path / "state",
+            repo_paths={"myapp": str(repo_dir)},
             worker_command=lambda spec: ["/bin/sh", "-c", "echo 'error: something broke'; exit 1"],
         )
         try:

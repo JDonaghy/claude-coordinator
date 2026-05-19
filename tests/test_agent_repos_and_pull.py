@@ -52,6 +52,12 @@ def two_repos(tmp_path: Path) -> tuple[Path, Path, Path]:
 
     work = tmp_path / "work"
     work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "t@t.com")
+    _git(work, "config", "user.name", "Test")
+    (work / "README.md").write_text("work repo\n")
+    _git(work, "add", "README.md")
+    _git(work, "commit", "-m", "initial")
     return remote, local, work
 
 
