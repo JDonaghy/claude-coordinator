@@ -86,13 +86,27 @@ def build_app(config: Config) -> Starlette:
             if override is not None:
                 p.briefing = override
 
+        from coord.claim import claim_message, find_work_claim
+
         in_flight = load_dispatched()
+        board_for_claim = build_b()
         results = []
         for p in selected:
+            repo = config.repo(p.repo_name)
+            if repo is not None:
+                claim = find_work_claim(
+                    p.issue_number, p.repo_name, repo.github, board_for_claim
+                )
+                if claim is not None:
+                    results.append({
+                        "id": p.id, "ok": False,
+                        "error": claim_message(claim),
+                        "claimed": True,
+                    })
+                    continue
             try:
                 response = dispatch(p, config)
                 assignment_id = response.get("id", "pending")
-                repo = config.repo(p.repo_name)
                 if repo:
                     record_dispatched(
                         assignment_id=assignment_id, proposal=p, repo_github=repo.github,
