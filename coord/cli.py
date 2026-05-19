@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -1333,6 +1334,84 @@ def web(config_path: Path, bind_host: str, bind_port: int) -> None:
     app = build_app(cfg)
     click.echo(f"coord web: dashboard at http://{bind_host}:{bind_port}")
     uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
+
+
+@main.command(help="Block until an assignment completes (poll the agent server).")
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+@click.option("--interval", default=30, show_default=True, type=int, help="Seconds between polls.")
+@click.option("--timeout", default=1800, show_default=True, type=int, help="Max seconds to wait.")
+def wait(assignment_id: str, config_path: Path, interval: int, timeout: int) -> None:
+    from coord.state import load_dispatched
+
+    cfg = _load_config(config_path)
+
+    # Find which machine this assignment was dispatched to
+    record = next(
+        (r for r in load_dispatched() if r.get("assignment_id") == assignment_id),
+        None,
+    )
+    if record is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in dispatched records", err=True)
+        sys.exit(2)
+
+    machine_name = record["machine_name"]
+    machine = next((m for m in cfg.machines if m.name == machine_name), None)
+    if machine is None:
+        click.echo(
+            f"error: machine {machine_name!r} (from dispatched record) not in coordinator.yml",
+            err=True,
+        )
+        sys.exit(2)
+
+    url = f"http://{machine.host}:{AGENT_PORT}/status"
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(url, timeout=10)
+            data = resp.json()
+        except (httpx.HTTPError, httpx.TimeoutException, OSError) as e:
+            click.echo(f"warning: could not reach agent on {machine.name}: {e}", err=True)
+            time.sleep(interval)
+            continue
+
+        # Check completed list
+        for c in data.get("completed", []):
+            if c.get("id") == assignment_id:
+                exit_code = c.get("exit_code", -1)
+                branch = c.get("branch", "unknown")
+                started = c.get("started_at", 0)
+                finished = c.get("finished_at", 0)
+                duration = finished - started if finished and started else 0
+                mins, secs = divmod(int(duration), 60)
+
+                if exit_code == 0:
+                    click.echo(f"Assignment {assignment_id} completed (exit 0, {mins}m {secs}s)")
+                    click.echo(f"  branch: {branch}")
+                    sys.exit(0)
+                else:
+                    click.echo(f"Assignment {assignment_id} failed (exit {exit_code}, {mins}m {secs}s)")
+                    error = c.get("error", "")
+                    if error:
+                        click.echo(f"  error: {error}")
+                    click.echo(f"  branch: {branch}")
+                    sys.exit(1)
+
+        # Check active list — if not there either, it vanished
+        active_ids = [a.get("id") for a in data.get("active", [])]
+        if assignment_id not in active_ids:
+            click.echo(
+                f"Assignment {assignment_id} not found on agent (not active or completed)",
+                err=True,
+            )
+            sys.exit(2)
+
+        time.sleep(interval)
+
+    # Timeout
+    click.echo(f"Timed out after {timeout}s waiting for {assignment_id}", err=True)
+    sys.exit(3)
 
 
 if __name__ == "__main__":
