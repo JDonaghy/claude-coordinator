@@ -50,12 +50,44 @@ class ConcurrencyConfig:
 
 
 @dataclass
+class SmokeRule:
+    """When a worker's diff touches any of `files`, the smoke machine must
+    have all capabilities in `requires`.
+
+    `files` patterns match by prefix against the relative paths returned by
+    `gh pr view --json files`. A trailing `/` makes the prefix explicit; bare
+    paths match if the touched path starts with the rule path (so `src/gtk`
+    catches `src/gtk/foo.c` and `src/gtk_helpers.c`). Use `src/gtk/` to scope
+    strictly to the directory.
+    """
+
+    files: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SmokeTestsConfig:
+    """Smoke-test orchestration. Off by default — opt-in per project.
+
+    `default_command` is the shell command the smoke agent runs (e.g.
+    `make smoke` or `pytest tests/smoke`). Per-repo overrides flow through
+    `Repo.test_command` already; this is the fallback when none is set.
+    """
+
+    auto_queue: bool = False
+    default_command: str | None = None
+    timeout_seconds: int = 600
+    capability_rules: list[SmokeRule] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
     hooks: HooksConfig = field(default_factory=HooksConfig)
     reviews: ReviewsConfig = field(default_factory=ReviewsConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
+    smoke_tests: SmokeTestsConfig = field(default_factory=SmokeTestsConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -84,8 +116,17 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     hooks = _parse_hooks(raw.get("hooks"))
     reviews = _parse_reviews(raw.get("reviews"), {r.name for r in repos})
     concurrency = _parse_concurrency(raw.get("concurrency"))
+    smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
 
-    return Config(repos=repos, machines=machines, hooks=hooks, reviews=reviews, concurrency=concurrency, path=p)
+    return Config(
+        repos=repos,
+        machines=machines,
+        hooks=hooks,
+        reviews=reviews,
+        concurrency=concurrency,
+        smoke_tests=smoke_tests,
+        path=p,
+    )
 
 
 def _parse_repos(raw: Any) -> list[Repo]:
@@ -289,6 +330,63 @@ def _parse_concurrency(raw: Any) -> ConcurrencyConfig:
             if not isinstance(val, (int, float)) or val < 0:
                 raise ConfigError(f"concurrency.{key} must be a non-negative number")
         setattr(cfg, key, val)
+    return cfg
+
+
+def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
+    if raw is None:
+        return SmokeTestsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'smoke_tests' must be a mapping")
+
+    cfg = SmokeTestsConfig()
+    if "auto_queue" in raw:
+        value = raw["auto_queue"]
+        if not isinstance(value, bool):
+            raise ConfigError("smoke_tests.auto_queue must be a boolean")
+        cfg.auto_queue = value
+
+    if "default_command" in raw:
+        value = raw["default_command"]
+        if value is not None and not isinstance(value, str):
+            raise ConfigError("smoke_tests.default_command must be a string")
+        cfg.default_command = value
+
+    if "timeout_seconds" in raw:
+        value = raw["timeout_seconds"]
+        if not isinstance(value, int) or value <= 0:
+            raise ConfigError("smoke_tests.timeout_seconds must be a positive integer")
+        cfg.timeout_seconds = value
+
+    rules_raw = raw.get("capability_rules", []) or []
+    if not isinstance(rules_raw, list):
+        raise ConfigError("smoke_tests.capability_rules must be a list")
+    rules: list[SmokeRule] = []
+    for i, entry in enumerate(rules_raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"smoke_tests.capability_rules[{i}] must be a mapping"
+            )
+        files = entry.get("files", []) or []
+        requires = entry.get("requires", []) or []
+        if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
+            raise ConfigError(
+                f"smoke_tests.capability_rules[{i}].files must be a list of strings"
+            )
+        if not isinstance(requires, list) or not all(isinstance(r, str) for r in requires):
+            raise ConfigError(
+                f"smoke_tests.capability_rules[{i}].requires must be a list of strings"
+            )
+        if not files:
+            raise ConfigError(
+                f"smoke_tests.capability_rules[{i}].files must be non-empty"
+            )
+        if not requires:
+            raise ConfigError(
+                f"smoke_tests.capability_rules[{i}].requires must be non-empty"
+            )
+        rules.append(SmokeRule(files=files, requires=requires))
+    cfg.capability_rules = rules
     return cfg
 
 

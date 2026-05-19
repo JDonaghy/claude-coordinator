@@ -81,6 +81,17 @@ def reconcile(board: Board, config: Config) -> list[str]:
             if review is not None and review.assignment_id is not None:
                 changed.append(review.assignment_id)
 
+    # Auto-queue smoke tests for any work assignments that just finished.
+    # Independent of review dispatch — both can fire for the same completion.
+    smoke_cfg = getattr(config, "smoke_tests", None)
+    if smoke_cfg is not None and smoke_cfg.auto_queue:
+        from coord.smoke import dispatch_smoke
+
+        for completed in newly_done_work:
+            smoke = dispatch_smoke(completed, board, config)
+            if smoke is not None and smoke.assignment_id is not None:
+                changed.append(smoke.assignment_id)
+
     # Pass 2: backfill branch on completed assignments that are missing it.
     for a in board.completed:
         if a.branch is not None or a.assignment_id is None:
