@@ -25,6 +25,15 @@ def get_open_issues(repo: str) -> list[dict]:
     return json.loads(raw)
 
 
+def get_issue(repo: str, issue_number: int) -> dict:
+    """Fetch a single issue by number. Returns {number, title, body, state, ...}."""
+    raw = _gh(
+        "issue", "view", str(issue_number), "--repo", repo,
+        "--json", "number,title,body,state",
+    )
+    return json.loads(raw)
+
+
 def post_issue_comment(repo: str, issue_number: int, body: str):
     _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
 
