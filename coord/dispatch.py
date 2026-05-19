@@ -43,8 +43,14 @@ def dispatch(
             f"Add it to coordinator.yml under machines[].repo_paths."
         )
 
+    # Resolve deny-list from the repo's worker_permissions config.
+    repo = config.repo(proposal.repo_name)
+    deny_commands: list[str] = []
+    if repo is not None and repo.worker_permissions is not None:
+        deny_commands = repo.worker_permissions.deny
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
-    payload = {
+    payload: dict = {
         "repo_name": proposal.repo_name,
         "repo_path": repo_path,
         "issue_number": proposal.issue_number,
@@ -53,6 +59,7 @@ def dispatch(
         "files_allowed": proposal.files_likely,
         "files_forbidden": [],
         "pull_repos": list(pull_repos),
+        "deny_commands": deny_commands,
     }
 
     resp = httpx.post(url, json=payload, timeout=15)
