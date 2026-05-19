@@ -49,6 +49,9 @@ def dispatch(
     if repo is not None and repo.worker_permissions is not None:
         deny_commands = repo.worker_permissions.deny
 
+    # Resolve model: proposal override → config default → None (let claude pick).
+    model = proposal.model if proposal.model else config.models.default
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
         "repo_name": proposal.repo_name,
@@ -60,6 +63,7 @@ def dispatch(
         "files_forbidden": [],
         "pull_repos": list(pull_repos),
         "deny_commands": deny_commands,
+        "model": model,
     }
 
     resp = httpx.post(url, json=payload, timeout=15)

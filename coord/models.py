@@ -69,6 +69,11 @@ class Assignment:
     review_target: str | None = None
     review_of_assignment_id: str | None = None
     unreachable_count: int = 0
+    # Model tier the worker was dispatched with (e.g. "haiku", "sonnet",
+    # "opus"). None means the worker used claude's default. Tracked on the
+    # board so escalation in `coord fix` / `coord retry` / `coord resume-stuck`
+    # can step up the ladder.
+    model: str | None = None
 
 
 @dataclass
@@ -81,6 +86,9 @@ class Proposal:
     rationale: str
     files_likely: list[str] = field(default_factory=list)
     briefing: str = ""
+    # Optional model override. When None, the dispatcher falls back to
+    # config.models.default.
+    model: str | None = None
 
 
 @dataclass
