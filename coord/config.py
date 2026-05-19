@@ -42,6 +42,13 @@ class ReviewsConfig:
 
 
 @dataclass
+class SmokeTestsConfig:
+    enabled: bool = False
+    auto_dispatch: bool = True
+    timeout: int = 600
+
+
+@dataclass
 class ConcurrencyConfig:
     max_workers: int = 2
     stagger_seconds: float = 30.0
@@ -55,6 +62,7 @@ class Config:
     machines: list[Machine]
     hooks: HooksConfig = field(default_factory=HooksConfig)
     reviews: ReviewsConfig = field(default_factory=ReviewsConfig)
+    smoke_tests: SmokeTestsConfig = field(default_factory=SmokeTestsConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     path: Path | None = None
 
@@ -83,9 +91,10 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     _validate_dependencies(repos)
     hooks = _parse_hooks(raw.get("hooks"))
     reviews = _parse_reviews(raw.get("reviews"), {r.name for r in repos})
+    smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
     concurrency = _parse_concurrency(raw.get("concurrency"))
 
-    return Config(repos=repos, machines=machines, hooks=hooks, reviews=reviews, concurrency=concurrency, path=p)
+    return Config(repos=repos, machines=machines, hooks=hooks, reviews=reviews, smoke_tests=smoke_tests, concurrency=concurrency, path=p)
 
 
 def _parse_repos(raw: Any) -> list[Repo]:
@@ -269,6 +278,26 @@ def _parse_reviews(raw: Any, repo_names: set[str]) -> ReviewsConfig:
                 f"reviews.repo_overrides[{repo_name}] must be a list of strings"
             )
     cfg.repo_overrides = overrides
+    return cfg
+
+
+def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
+    if raw is None:
+        return SmokeTestsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'smoke_tests' must be a mapping")
+    cfg = SmokeTestsConfig()
+    for bool_field in ("enabled", "auto_dispatch"):
+        if bool_field in raw:
+            value = raw[bool_field]
+            if not isinstance(value, bool):
+                raise ConfigError(f"smoke_tests.{bool_field} must be a boolean")
+            setattr(cfg, bool_field, value)
+    if "timeout" in raw:
+        value = raw["timeout"]
+        if not isinstance(value, int) or value < 0:
+            raise ConfigError("smoke_tests.timeout must be a non-negative integer")
+        cfg.timeout = value
     return cfg
 
 
