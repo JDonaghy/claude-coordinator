@@ -47,6 +47,8 @@ class ConcurrencyConfig:
     stagger_seconds: float = 30.0
     backoff_base: float = 60.0
     max_retries: int = 3
+    auto_reassign: bool = False
+    stale_threshold: int = 3
 
 
 @dataclass
@@ -319,17 +321,22 @@ def _parse_concurrency(raw: Any) -> ConcurrencyConfig:
     if not isinstance(raw, dict):
         raise ConfigError("'concurrency' must be a mapping")
     cfg = ConcurrencyConfig()
-    for key in ("max_workers", "stagger_seconds", "backoff_base", "max_retries"):
+    for key in ("max_workers", "stagger_seconds", "backoff_base", "max_retries", "stale_threshold"):
         val = raw.get(key)
         if val is None:
             continue
-        if key == "max_retries" or key == "max_workers":
+        if key in ("max_retries", "max_workers", "stale_threshold"):
             if not isinstance(val, int) or val < 0:
                 raise ConfigError(f"concurrency.{key} must be a non-negative integer")
         else:
             if not isinstance(val, (int, float)) or val < 0:
                 raise ConfigError(f"concurrency.{key} must be a non-negative number")
         setattr(cfg, key, val)
+    if "auto_reassign" in raw:
+        val = raw["auto_reassign"]
+        if not isinstance(val, bool):
+            raise ConfigError("concurrency.auto_reassign must be a boolean")
+        cfg.auto_reassign = val
     return cfg
 
 

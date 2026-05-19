@@ -749,8 +749,6 @@ def test_cmd(assignment_id: str, config_path: Path) -> None:
         )
         sys.exit(1)
 
-    # Refuse if a smoke for this work assignment is already in flight — the
-    # user clearly didn't realize one was already running.
     from coord.claim import has_active_followup
 
     if has_active_followup(
@@ -763,8 +761,6 @@ def test_cmd(assignment_id: str, config_path: Path) -> None:
         )
         sys.exit(1)
 
-    # Force-enable for the manual command: the user explicitly asked for it,
-    # so we bypass `auto_queue=False`.
     cfg.smoke_tests.auto_queue = True
     smoke = dispatch_smoke(assignment, board, cfg)
     if smoke is None:
@@ -780,6 +776,40 @@ def test_cmd(assignment_id: str, config_path: Path) -> None:
     click.echo(
         f"Smoke test {smoke.assignment_id} queued on {smoke.machine_name} "
         f"for branch {smoke.branch}"
+    )
+
+
+@main.command(help="Re-dispatch a failed assignment to a different machine.")
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+def retry(assignment_id: str, config_path: Path) -> None:
+    from coord.reconcile import _reassign
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+    if assignment.status != "failed":
+        click.echo(
+            f"error: assignment {assignment_id} is {assignment.status!r}, not failed. "
+            f"Only failed assignments can be retried.",
+            err=True,
+        )
+        sys.exit(1)
+
+    result = _reassign(assignment, board, cfg)
+    if result is None:
+        click.echo("error: no available machine to retry on", err=True)
+        sys.exit(1)
+
+    save_board(board)
+    click.echo(
+        f"Retried: {result.machine_name} → {result.repo_name} "
+        f"#{result.issue_number} (assignment {result.assignment_id})"
     )
 
 

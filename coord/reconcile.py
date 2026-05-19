@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import time
+import uuid
+
 import httpx
 
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
-from coord.models import Board
+from coord.models import Assignment, Board
 
 
 def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
@@ -16,6 +19,68 @@ def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dic
         return resp.json()
     except (httpx.HTTPError, httpx.TimeoutException):
         return None
+
+
+def _reassign(
+    failed: Assignment, board: Board, config: Config,
+) -> Assignment | None:
+    """Re-dispatch a failed assignment to an idle different machine."""
+    busy = {a.machine_name for a in board.active if a.status == "running"}
+    candidates = [
+        m for m in config.machines
+        if m.can_work_on(failed.repo_name)
+        and m.repo_path(failed.repo_name) is not None
+        and m.name not in busy
+        and m.name != failed.machine_name
+    ]
+    if not candidates:
+        candidates = [
+            m for m in config.machines
+            if m.can_work_on(failed.repo_name)
+            and m.repo_path(failed.repo_name) is not None
+            and m.name not in busy
+        ]
+    if not candidates:
+        return None
+
+    machine = candidates[0]
+    repo_path = machine.repo_path(failed.repo_name)
+
+    payload = {
+        "repo_name": failed.repo_name,
+        "repo_path": repo_path,
+        "issue_number": failed.issue_number,
+        "issue_title": f"[retry] {failed.issue_title}",
+        "briefing": failed.briefing,
+        "files_allowed": failed.files_allowed,
+        "files_forbidden": failed.files_forbidden,
+        "pull_repos": [],
+        "type": "work",
+    }
+
+    url = f"http://{machine.host}:{AGENT_PORT}/assign"
+    try:
+        resp = httpx.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        agent_response = resp.json()
+    except (httpx.HTTPError, httpx.TimeoutException):
+        return None
+
+    retry_assignment = Assignment(
+        machine_name=machine.name,
+        repo_name=failed.repo_name,
+        issue_number=failed.issue_number,
+        issue_title=f"[retry] {failed.issue_title}",
+        files_allowed=failed.files_allowed,
+        files_forbidden=failed.files_forbidden,
+        briefing=failed.briefing,
+        assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
+        status="running",
+        dispatched_at=time.time(),
+        type="work",
+    )
+    board.active.append(retry_assignment)
+    return retry_assignment
 
 
 def reconcile(board: Board, config: Config) -> list[str]:
@@ -36,6 +101,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
 
     # Query each machine once and cache the result.
     agent_completed: dict[str, dict] = {}
+    reachable_machines: set[str] = set()
     for machine_name in machines_to_query:
         machine = machines_by_name.get(machine_name)
         if machine is None:
@@ -43,16 +109,31 @@ def reconcile(board: Board, config: Config) -> list[str]:
         status = _query_agent(machine.host)
         if status is None:
             continue
+        reachable_machines.add(machine_name)
         for e in status.get("completed", []):
             agent_completed[e["id"]] = e
 
     changed: list[str] = []
     newly_done_work: list = []  # assignments that just transitioned work → done
+    newly_failed: list = []  # assignments that just transitioned to failed
 
     # Pass 1: transition active assignments that have finished.
     for a in board.active[:]:
         if a.assignment_id is None:
             continue
+
+        # Track unreachable agents for stale detection
+        if a.machine_name in machines_to_query and a.machine_name not in reachable_machines:
+            a.unreachable_count = getattr(a, "unreachable_count", 0) + 1
+            stale_threshold = getattr(config.concurrency, "stale_threshold", 3)
+            if a.unreachable_count >= stale_threshold:
+                board.mark_failed_by_id(a.assignment_id)
+                newly_failed.append(a)
+                changed.append(a.assignment_id)
+            continue
+        elif a.machine_name in reachable_machines:
+            a.unreachable_count = 0
+
         entry = agent_completed.get(a.assignment_id)
         if entry is None:
             continue
@@ -66,10 +147,12 @@ def reconcile(board: Board, config: Config) -> list[str]:
             if done is not None and getattr(done, "type", "work") == "work":
                 newly_done_work.append(done)
         else:
-            board.mark_failed_by_id(
+            failed = board.mark_failed_by_id(
                 a.assignment_id,
                 finished_at=entry.get("finished_at"),
             )
+            if failed is not None:
+                newly_failed.append(failed)
         changed.append(a.assignment_id)
 
     # Auto-dispatch reviews for any work assignments that just finished.
@@ -91,6 +174,15 @@ def reconcile(board: Board, config: Config) -> list[str]:
             smoke = dispatch_smoke(completed, board, config)
             if smoke is not None and smoke.assignment_id is not None:
                 changed.append(smoke.assignment_id)
+
+    # Auto-reassign failed work assignments to a different machine.
+    if newly_failed and getattr(config.concurrency, "auto_reassign", False):
+        for failed_a in newly_failed:
+            if getattr(failed_a, "type", "work") != "work":
+                continue
+            reassigned = _reassign(failed_a, board, config)
+            if reassigned is not None and reassigned.assignment_id is not None:
+                changed.append(reassigned.assignment_id)
 
     # Pass 2: backfill branch on completed assignments that are missing it.
     for a in board.completed:
