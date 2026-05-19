@@ -433,6 +433,34 @@ def approve(
 
     in_flight = load_dispatched()
 
+    # ── Claim pre-check ──────────────────────────────────────────────
+    # Refuse any proposal whose issue is already being worked on (board
+    # has an active assignment, or remote has an `issue-{N}-*` branch).
+    from coord.claim import claim_message, find_work_claim
+
+    unclaimed: list = []
+    for p in selected:
+        repo_cfg = cfg.repo(p.repo_name)
+        if repo_cfg is None:
+            unclaimed.append(p)
+            continue
+        claim = find_work_claim(
+            p.issue_number, p.repo_name, repo_cfg.github, board
+        )
+        if claim is not None:
+            click.echo(
+                f"[{p.id}] skipping {p.repo_name} #{p.issue_number}: "
+                f"{claim_message(claim)}",
+                err=True,
+            )
+            continue
+        unclaimed.append(p)
+
+    if not unclaimed:
+        click.echo("No proposals remain after claim check.", err=True)
+        sys.exit(1)
+    selected = unclaimed
+
     # ── Freshness pre-check ──────────────────────────────────────────
     machine_repos: dict[str, dict | None] = {}
     github_heads: dict[str, str | None] = {}
@@ -717,6 +745,20 @@ def test_cmd(assignment_id: str, config_path: Path) -> None:
         click.echo(
             f"error: assignment {assignment_id} is type {assignment.type!r}; "
             "only 'work' assignments get smoke tests",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Refuse if a smoke for this work assignment is already in flight — the
+    # user clearly didn't realize one was already running.
+    from coord.claim import has_active_followup
+
+    if has_active_followup(
+        board, of_assignment_id=assignment_id, assignment_type="smoke"
+    ):
+        click.echo(
+            f"error: a smoke test for assignment {assignment_id} is already "
+            "running. Use `coord status` to see it.",
             err=True,
         )
         sys.exit(1)

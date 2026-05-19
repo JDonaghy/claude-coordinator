@@ -315,6 +315,15 @@ def dispatch_review(
         # branch-capture code in agent._reap will have left as None.
         return None
 
+    # Dedupe: don't fire a second review if one's already in flight for this
+    # completed work assignment.
+    from coord.claim import has_active_followup
+
+    if has_active_followup(
+        board, of_assignment_id=completed.assignment_id, assignment_type="review"
+    ):
+        return None
+
     repo = config.repo(completed.repo_name)
     if repo is None:
         return None

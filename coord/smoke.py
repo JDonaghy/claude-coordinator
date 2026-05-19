@@ -282,6 +282,14 @@ def dispatch_smoke(
     if not completed.branch:
         return None
 
+    # Dedupe: don't fire a second smoke if one's already in flight.
+    from coord.claim import has_active_followup
+
+    if has_active_followup(
+        board, of_assignment_id=completed.assignment_id, assignment_type="smoke"
+    ):
+        return None
+
     repo = config.repo(completed.repo_name)
     if repo is None:
         return None
