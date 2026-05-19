@@ -93,8 +93,8 @@ class TestBuildPrompt:
         }
         prompt = build_prompt(config, context)
         assert "..." in prompt
-        assert "A" * 300 in prompt
-        assert "A" * 301 not in prompt
+        assert "A" * 150 in prompt
+        assert "A" * 151 not in prompt
 
 
 class TestParseProposals:

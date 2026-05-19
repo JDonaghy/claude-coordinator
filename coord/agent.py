@@ -486,9 +486,12 @@ class AgentServer:
                 "repos": self.repos,
                 "assignments": [a.to_dict() for a in self._assignments.values()],
             }
-        tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        os.replace(tmp, self.state_path)
+        try:
+            tmp = self.state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            os.replace(tmp, self.state_path)
+        except (FileNotFoundError, OSError):
+            pass
 
     def _load_state(self) -> None:
         if not self.state_path.exists():
