@@ -1327,16 +1327,25 @@ def notify(config_path: Path) -> None:
     from coord.state import build_board, save_board
 
     cfg = _load_config(config_path)
-    posted = run_notify(cfg)
-    if not posted:
+    posted, stuck = run_notify(cfg)
+    if not posted and not stuck:
         click.echo("No new transitions to notify.")
         return
-    click.echo(f"Posted {len(posted)} comment(s):")
-    for t in posted:
-        click.echo(
-            f"  [{t.event}] {t.machine_name} → {t.repo_name} "
-            f"#{t.issue_number} (assignment {t.assignment_id}, exit {t.exit_code})"
-        )
+    if posted:
+        click.echo(f"Posted {len(posted)} completion/failure comment(s):")
+        for t in posted:
+            click.echo(
+                f"  [{t.event}] {t.machine_name} → {t.repo_name} "
+                f"#{t.issue_number} (assignment {t.assignment_id}, exit {t.exit_code})"
+            )
+    if stuck:
+        click.echo(f"Posted {len(stuck)} stuck detection(s):")
+        for s in stuck:
+            click.echo(
+                f"  [stuck] {s.machine_name} → {s.repo_name} "
+                f"#{s.issue_number} (assignment {s.assignment_id})"
+            )
+            click.echo(f"    {s.stuck_message}")
     board = build_board()
 
     if is_round_complete(board) and cfg.hooks.on_round_complete:
@@ -1989,6 +1998,119 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
     click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
     if test_output:
         click.echo(f"  test output included in briefing ({len(test_output)} chars)")
+
+
+@main.command(
+    "resume-stuck",
+    help="Stop a stuck worker and dispatch a continuation with guidance.",
+)
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+@click.option("--guidance", required=True, help="Guidance for the continuation worker.")
+def resume_stuck(assignment_id: str, config_path: Path, guidance: str) -> None:
+    from coord.state import build_board, load_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    if assignment.status != "running":
+        click.echo(
+            f"error: assignment {assignment_id} is {assignment.status!r}, "
+            "can only resume-stuck a running assignment",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Find the machine this assignment is running on
+    machine = next(
+        (m for m in cfg.machines if m.name == assignment.machine_name), None
+    )
+    if machine is None:
+        click.echo(
+            f"error: machine {assignment.machine_name!r} not in config", err=True
+        )
+        sys.exit(1)
+
+    # Stop the current worker
+    try:
+        resp = httpx.post(
+            f"http://{machine.host}:{AGENT_PORT}/cancel/{assignment_id}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        click.echo(f"Cancelled stuck worker on {machine.name}")
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        click.echo(
+            f"warning: could not cancel worker on {machine.name}: {e} "
+            "(may have already stopped)",
+            err=True,
+        )
+
+    # Brief pause for cancellation to take effect
+    time.sleep(2)
+
+    # Retrieve the stuck message from the agent's progress data
+    stuck_message = ""
+    try:
+        status_resp = httpx.get(
+            f"http://{machine.host}:{AGENT_PORT}/status", timeout=5
+        )
+        if status_resp.status_code == 200:
+            status_data = status_resp.json()
+            # Check active and completed for progress info
+            for entry in status_data.get("active", []) + status_data.get("completed", []):
+                if entry.get("id") == assignment_id:
+                    progress = entry.get("progress", {})
+                    if progress and progress.get("stuck"):
+                        stuck_message = progress["stuck"]
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+    repo = cfg.repo(assignment.repo_name)
+    if repo is None:
+        click.echo(f"error: unknown repo {assignment.repo_name!r}", err=True)
+        sys.exit(1)
+
+    default_branch = repo.default_branch
+
+    stuck_section = stuck_message if stuck_message else "(no stuck message captured)"
+
+    briefing = (
+        f"You are continuing work on issue #{assignment.issue_number}: {assignment.issue_title}\n\n"
+        f"The previous worker got stuck on branch {assignment.branch or 'unknown'}. "
+        f"You are already on that branch.\n"
+        f"Do NOT start over — continue from where they left off.\n\n"
+        f"## What was done\n"
+        f"Run `git log --oneline {default_branch}..HEAD` to see previous work.\n"
+        f"Run `git diff {default_branch}...HEAD` to see the full diff.\n\n"
+        f"## What the previous worker was stuck on\n"
+        f"{stuck_section}\n\n"
+        f"## Guidance\n"
+        f"{guidance}\n\n"
+        f"## Rules\n"
+        f"- Continue from the existing branch, do not start over\n"
+        f"- Commit your work and push with git push origin HEAD"
+    )
+
+    try:
+        new_id = _dispatch_followup(cfg, assignment, briefing)
+    except httpx.HTTPError as e:
+        click.echo(f"error: dispatch failed: {e}", err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Continuation dispatched (assignment {new_id})")
+    click.echo(f"  branch: {assignment.branch or 'unknown'}")
+    click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
+    click.echo(f"  guidance: {guidance}")
 
 
 if __name__ == "__main__":
