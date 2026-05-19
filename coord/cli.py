@@ -1487,7 +1487,9 @@ def resume(config_path: Path) -> None:
 @click.option("--passed", "verdict", flag_value="pass", help="Mark smoke test as passed.")
 @click.option("--fail", "verdict", flag_value="fail", help="Mark smoke test as failed.")
 @click.option("--reason", default="", help="Reason for failure (used with --fail).")
-def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str) -> None:
+@click.option("--output", "output_file", type=click.Path(), default=None,
+              help="File with test output to store (used with --fail).")
+def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str, output_file: str | None) -> None:
     from coord.state import build_board, load_board, save_board
 
     cfg = _load_config(config_path)
@@ -1504,9 +1506,29 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
     if verdict:
         assignment.smoke_test = verdict
         assignment.smoke_test_reason = reason if verdict == "fail" else None
+
+        # Store test output when --fail --output is provided
+        if verdict == "fail" and output_file:
+            output_path = Path(output_file)
+            if output_path.exists():
+                from coord.state import COORD_DIR
+
+                test_output_dir = COORD_DIR / "test_output"
+                test_output_dir.mkdir(parents=True, exist_ok=True)
+                stored = test_output_dir / f"{assignment_id}.txt"
+                stored.write_text(output_path.read_text())
+                # Record the stored path so coord fix can find it
+                assignment.smoke_test_reason = (
+                    f"{reason} [output: {stored}]" if reason else f"[output: {stored}]"
+                )
+                click.echo(f"  test output stored: {stored}")
+            else:
+                click.echo(f"  warning: output file not found: {output_file}", err=True)
+
         save_board(board)
         if verdict == "pass":
             click.echo(f"Smoke test PASSED for {assignment.repo_name} #{assignment.issue_number}")
+            click.echo(f"  Run: coord pr {assignment_id} to create the PR")
         else:
             click.echo(f"Smoke test FAILED for {assignment.repo_name} #{assignment.issue_number}")
             if reason:
@@ -1793,6 +1815,180 @@ def wait(assignment_id: str, config_path: Path, interval: int, timeout: int) -> 
     # Timeout
     click.echo(f"Timed out after {timeout}s waiting for {assignment_id}", err=True)
     sys.exit(3)
+
+
+def _dispatch_followup(
+    cfg: Config,
+    original: Assignment,
+    briefing: str,
+    *,
+    issue_suffix: str = "",
+) -> str:
+    """Dispatch a follow-up assignment for an existing assignment. Returns assignment ID."""
+    from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
+    from coord.state import build_board, record_dispatched, save_board, load_dispatched
+    from coord.models import Proposal
+
+    repo = cfg.repo(original.repo_name)
+    if repo is None:
+        raise ValueError(f"Unknown repo: {original.repo_name!r}")
+
+    proposal = Proposal(
+        id=0,
+        machine_name=original.machine_name,
+        repo_name=original.repo_name,
+        issue_number=original.issue_number,
+        issue_title=original.issue_title,
+        rationale=f"follow-up for assignment {original.assignment_id}",
+        briefing=briefing,
+    )
+
+    response = dispatch(proposal, cfg)
+    assignment_id = response.get("id", "pending")
+    record_dispatched(assignment_id=assignment_id, proposal=proposal, repo_github=repo.github)
+
+    in_flight = load_dispatched()
+    do_not_touch = compute_do_not_touch(proposal, peers=[], in_flight=in_flight)
+    post_briefing(proposal, cfg, assignment_id=assignment_id, do_not_touch=do_not_touch)
+
+    # Update board
+    board = build_board()
+    save_board(board)
+
+    return assignment_id
+
+
+@main.command(help="Dispatch a worker to create a PR for a completed assignment.")
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+def pr(assignment_id: str, config_path: Path) -> None:
+    from coord.state import build_board, load_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    if assignment.status != "done":
+        click.echo(
+            f"error: assignment {assignment_id} is {assignment.status!r}, "
+            "can only create a PR for done assignments",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not assignment.branch:
+        click.echo(
+            f"error: assignment {assignment_id} has no branch recorded. "
+            "The worker may not have pushed yet.",
+            err=True,
+        )
+        sys.exit(1)
+
+    repo = cfg.repo(assignment.repo_name)
+    if repo is None:
+        click.echo(f"error: unknown repo {assignment.repo_name!r}", err=True)
+        sys.exit(1)
+
+    default_branch = repo.default_branch
+    briefing = (
+        f"You are on branch {assignment.branch}. The code is complete and tests pass.\n"
+        f"Create a PR from {assignment.branch} to {default_branch} for issue #{assignment.issue_number}.\n"
+        f"Title: {assignment.issue_title}\n\n"
+        f"Use gh pr create. Read the diff (git diff {default_branch}...HEAD) and write a clear\n"
+        f"summary of what changed. Reference the issue with \"Closes #{assignment.issue_number}\".\n"
+        f"Do NOT modify any code — only create the PR."
+    )
+
+    try:
+        new_id = _dispatch_followup(cfg, assignment, briefing)
+    except httpx.HTTPError as e:
+        click.echo(f"error: dispatch failed: {e}", err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"PR worker dispatched (assignment {new_id})")
+    click.echo(f"  branch: {assignment.branch} → {default_branch}")
+    click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
+
+
+@main.command(help="Dispatch a fix-up worker for a failed smoke test.")
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+@click.option("--guidance", default="", help="Additional guidance for the fix-up worker.")
+def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
+    from coord.state import build_board, load_board, COORD_DIR
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    if assignment.smoke_test != "fail":
+        click.echo(
+            f"error: assignment {assignment_id} smoke_test is "
+            f"{assignment.smoke_test!r}, expected 'fail'",
+            err=True,
+        )
+        sys.exit(1)
+
+    repo = cfg.repo(assignment.repo_name)
+    if repo is None:
+        click.echo(f"error: unknown repo {assignment.repo_name!r}", err=True)
+        sys.exit(1)
+
+    default_branch = repo.default_branch
+
+    # Load stored test output if available
+    test_output = ""
+    test_output_file = COORD_DIR / "test_output" / f"{assignment_id}.txt"
+    if test_output_file.exists():
+        test_output = test_output_file.read_text()
+    elif assignment.smoke_test_reason:
+        test_output = assignment.smoke_test_reason
+
+    guidance_text = guidance or "Fix the failing tests and push."
+
+    briefing = (
+        f"You are fixing a failed smoke test for issue #{assignment.issue_number}: {assignment.issue_title}\n\n"
+        f"The previous worker created branch {assignment.branch}. You are already on that branch.\n"
+        f"Do NOT start over — work from the existing code.\n\n"
+        f"## What was done\n"
+        f"The previous worker's changes are already committed on this branch.\n"
+        f"Run `git log --oneline {default_branch}..HEAD` to see what was done.\n"
+        f"Run `git diff {default_branch}...HEAD` to see the full diff.\n\n"
+        f"## Test failure\n"
+        f"{test_output}\n\n"
+        f"## Guidance\n"
+        f"{guidance_text}\n\n"
+        f"## Rules\n"
+        f"- Do NOT start over or rewrite from scratch\n"
+        f"- Fix the specific test failures\n"
+        f"- Commit your fixes and push with git push origin HEAD"
+    )
+
+    try:
+        new_id = _dispatch_followup(cfg, assignment, briefing)
+    except httpx.HTTPError as e:
+        click.echo(f"error: dispatch failed: {e}", err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Fix-up worker dispatched (assignment {new_id})")
+    click.echo(f"  branch: {assignment.branch}")
+    click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
+    if test_output:
+        click.echo(f"  test output included in briefing ({len(test_output)} chars)")
 
 
 if __name__ == "__main__":
