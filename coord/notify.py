@@ -6,9 +6,11 @@ from dataclasses import dataclass
 
 import httpx
 
-from coord.comments import EVENT_COMPLETION, EVENT_FAILURE
+from coord import github_ops
+from coord.comments import EVENT_COMPLETION, EVENT_FAILURE, EVENT_STUCK, format_stuck
 from coord.config import Config
 from coord.dispatch import AGENT_PORT, post_completion, post_failure
+from coord.progress import parse_progress
 from coord.state import load_dispatched, load_notified, mark_notified
 
 
@@ -20,6 +22,25 @@ class Transition:
     issue_number: int
     event: str  # completion | failure
     exit_code: int | None
+
+
+@dataclass
+class StuckDetection:
+    assignment_id: str
+    machine_name: str
+    repo_name: str
+    issue_number: int
+    stuck_message: str
+    log_path: str | None
+
+
+def _stuck_notified_key(assignment_id: str) -> str:
+    """Notified ledger key for stuck events.
+
+    Uses a composite key so that a stuck notification does not block later
+    completion/failure notifications (which key on bare assignment_id).
+    """
+    return f"{assignment_id}:stuck"
 
 
 def _agent_status(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
@@ -85,6 +106,110 @@ def detect_transitions(config: Config) -> list[tuple[Transition, dict, dict]]:
     return transitions
 
 
+def detect_stuck(config: Config) -> list[tuple[StuckDetection, dict]]:
+    """Scan active worker logs for STUCK signals.
+
+    Returns (StuckDetection, dispatch_record) for each stuck worker that
+    hasn't already been notified as stuck.
+    """
+    dispatched = load_dispatched()
+    if not dispatched:
+        return []
+    notified = load_notified()
+    by_id = {r["assignment_id"]: r for r in dispatched}
+
+    machines_by_name = {m.name: m for m in config.machines}
+
+    # Only look at assignments that haven't been notified at all (still active)
+    # and haven't already been notified as stuck.
+    active_records = [
+        r for r in dispatched
+        if r["assignment_id"] not in notified
+        and _stuck_notified_key(r["assignment_id"]) not in notified
+    ]
+    if not active_records:
+        return []
+
+    # Group by machine
+    by_machine: dict[str, list[dict]] = {}
+    for r in active_records:
+        by_machine.setdefault(r["machine_name"], []).append(r)
+
+    results: list[tuple[StuckDetection, dict]] = []
+    for machine_name, records in by_machine.items():
+        machine = machines_by_name.get(machine_name)
+        if machine is None:
+            continue
+        status = _agent_status(machine.host)
+        if status is None:
+            continue
+
+        # Build lookup of active entries by id
+        active_by_id: dict[str, dict] = {}
+        for entry in status.get("active", []):
+            eid = entry.get("id")
+            if eid:
+                active_by_id[eid] = entry
+
+        for record in records:
+            aid = record["assignment_id"]
+            entry = active_by_id.get(aid)
+            if entry is None:
+                continue
+
+            stuck_message: str | None = None
+            log_path: str | None = None
+
+            # Check progress data from agent status
+            progress = entry.get("progress")
+            if progress and progress.get("stuck"):
+                stuck_message = progress["stuck"]
+                log_path = entry.get("log_path")
+
+            # Also try parsing the log file directly
+            entry_log = entry.get("log_path")
+            if entry_log and not stuck_message:
+                try:
+                    parsed = parse_progress(entry_log)
+                    if parsed.stuck:
+                        stuck_message = parsed.stuck
+                        log_path = entry_log
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if stuck_message:
+                results.append(
+                    (
+                        StuckDetection(
+                            assignment_id=aid,
+                            machine_name=record["machine_name"],
+                            repo_name=record["repo_name"],
+                            issue_number=record["issue_number"],
+                            stuck_message=stuck_message,
+                            log_path=log_path,
+                        ),
+                        record,
+                    )
+                )
+
+    return results
+
+
+def post_stuck(detection: StuckDetection, record: dict) -> None:
+    """Post a stuck comment to GitHub and mark notified."""
+    body = format_stuck(
+        assignment_id=detection.assignment_id,
+        machine_name=detection.machine_name,
+        repo_name=detection.repo_name,
+        issue_number=detection.issue_number,
+        stuck_message=detection.stuck_message,
+    )
+    github_ops.post_issue_comment(
+        record["repo_github"], detection.issue_number, body
+    )
+    mark_notified(_stuck_notified_key(detection.assignment_id), EVENT_STUCK)
+
+
 def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     """Post the GitHub comment for one transition and mark it notified."""
     started = entry.get("started_at")
@@ -110,8 +235,11 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     mark_notified(transition.assignment_id, transition.event)
 
 
-def run(config: Config) -> list[Transition]:
-    """Detect and post all pending transitions. Returns what was posted."""
+def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
+    """Detect and post all pending transitions and stuck signals.
+
+    Returns (posted_transitions, posted_stuck).
+    """
     posted: list[Transition] = []
     for transition, record, entry in detect_transitions(config):
         try:
@@ -119,4 +247,14 @@ def run(config: Config) -> list[Transition]:
         except Exception:  # noqa: BLE001 — surface to caller; continue with rest
             continue
         posted.append(transition)
-    return posted
+
+    # Also detect and post stuck signals
+    stuck_posted: list[StuckDetection] = []
+    for detection, record in detect_stuck(config):
+        try:
+            post_stuck(detection, record)
+        except Exception:  # noqa: BLE001
+            continue
+        stuck_posted.append(detection)
+
+    return posted, stuck_posted

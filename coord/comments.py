@@ -16,6 +16,7 @@ from typing import Iterable
 EVENT_BRIEFING = "briefing"
 EVENT_COMPLETION = "completion"
 EVENT_FAILURE = "failure"
+EVENT_STUCK = "stuck"
 
 
 @dataclass
@@ -144,6 +145,35 @@ def format_completion(
         lines.append("")
         lines.append("### Summary")
         lines.append(summary.strip())
+    return "\n".join(lines)
+
+
+def format_stuck(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    stuck_message: str,
+) -> str:
+    marker = _marker(
+        EVENT_STUCK,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+    )
+    lines = [
+        marker,
+        f"## ⚠️ Worker STUCK",
+        f"**Machine:** {machine_name}",
+        f"**Assignment:** {assignment_id}",
+        f"**Issue:** #{issue_number}",
+        "",
+        stuck_message.strip(),
+        "",
+        "The worker has stopped and is waiting for guidance. Use:",
+        f"`coord resume-stuck {assignment_id} --guidance \"your answer here\"`",
+    ]
     return "\n".join(lines)
 
 

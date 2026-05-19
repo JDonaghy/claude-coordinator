@@ -105,7 +105,7 @@ class TestRun:
         agent_status = {"active": [], "completed": [_agent_completed("abc", "done")]}
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
-            posted = notify_mod.run(config)
+            posted, _stuck = notify_mod.run(config)
         assert len(posted) == 1
         mock_post.assert_called_once()
         # Comment body includes the completion marker
@@ -120,7 +120,7 @@ class TestRun:
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
             notify_mod.run(config)
-            posted_again = notify_mod.run(config)
+            posted_again, _stuck = notify_mod.run(config)
         # Comment posted exactly once across both runs
         assert mock_post.call_count == 1
         assert posted_again == []
