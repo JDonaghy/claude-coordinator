@@ -567,6 +567,130 @@ def approve(
         click.echo("\nPending proposals cleared. Board saved.")
 
 
+@main.command(help="Directly assign an issue to a machine, bypassing coord plan.")
+@click.argument("machine")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+@click.option("--briefing", default="", help="Optional briefing text for the worker.")
+@click.option("--dry-run", is_flag=True, help="Show what would be dispatched.")
+def assign(
+    machine: str,
+    repo: str,
+    issue: int,
+    config_path: Path,
+    briefing: str,
+    dry_run: bool,
+) -> None:
+    from coord.dispatch import dispatch, post_briefing
+    from coord.state import build_board, load_dispatched, record_dispatched, save_board
+
+    cfg = _load_config(config_path)
+
+    # Validate machine exists in config
+    machine_obj = next((m for m in cfg.machines if m.name == machine), None)
+    if machine_obj is None:
+        click.echo(
+            f"error: machine {machine!r} not in coordinator.yml "
+            f"(have: {[m.name for m in cfg.machines]})",
+            err=True,
+        )
+        sys.exit(2)
+
+    # Validate repo exists in config
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.echo(
+            f"error: repo {repo!r} not in coordinator.yml "
+            f"(have: {[r.name for r in cfg.repos]})",
+            err=True,
+        )
+        sys.exit(2)
+
+    # Validate machine can work on this repo
+    if not machine_obj.can_work_on(repo):
+        click.echo(
+            f"error: machine {machine!r} does not list repo {repo!r} "
+            f"(has: {machine_obj.repos})",
+            err=True,
+        )
+        sys.exit(2)
+
+    # Fetch the issue title from GitHub
+    try:
+        issue_data = github_ops.get_issue(repo_cfg.github, issue)
+    except RuntimeError as e:
+        click.echo(f"error: could not fetch issue #{issue}: {e}", err=True)
+        sys.exit(1)
+    issue_title = issue_data.get("title", f"Issue #{issue}")
+
+    # Build a Proposal inline
+    from coord.models import Proposal
+
+    proposal = Proposal(
+        id=0,
+        machine_name=machine,
+        repo_name=repo,
+        issue_number=issue,
+        issue_title=issue_title,
+        rationale="manual assignment via coord assign",
+        briefing=briefing,
+    )
+
+    click.echo(f"{machine} → {repo} #{issue}: {issue_title}")
+
+    if dry_run:
+        click.echo("  (dry run — not dispatched)")
+        return
+
+    # Claim check
+    from coord.claim import claim_message, find_work_claim
+
+    board = build_board()
+    claim = find_work_claim(issue, repo, repo_cfg.github, board)
+    if claim is not None:
+        click.echo(
+            f"  skipping: {claim_message(claim)}",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Dispatch to agent server
+    try:
+        response = dispatch(proposal, cfg)
+    except httpx.HTTPError as e:
+        click.echo(f"  dispatch failed: {e}", err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(f"  dispatch failed: {e}", err=True)
+        sys.exit(1)
+
+    assignment_id = response.get("id", "pending")
+    click.echo(f"  dispatched (assignment {assignment_id})")
+
+    # Record the dispatch
+    record_dispatched(
+        assignment_id=assignment_id,
+        proposal=proposal,
+        repo_github=repo_cfg.github,
+    )
+
+    # Post briefing to GitHub
+    in_flight = load_dispatched()
+    try:
+        from coord.dispatch import compute_do_not_touch
+
+        do_not_touch = compute_do_not_touch(proposal, peers=[], in_flight=in_flight)
+        post_briefing(proposal, cfg, assignment_id=assignment_id, do_not_touch=do_not_touch)
+        click.echo("  briefing posted to GitHub")
+    except Exception as e:
+        click.echo(f"  briefing post failed: {e}", err=True)
+
+    # Update board
+    board = build_board()
+    save_board(board)
+
+
 @main.command(help="View claude -p output for a specific assignment.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION
