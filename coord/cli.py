@@ -2062,6 +2062,97 @@ def _tail_log(log_path: Path, interval: float = 1.0):
                 time.sleep(interval)
 
 
+def _watch_remote(
+    machine,
+    assignment_id: str,
+    *,
+    show_all: bool,
+    interval: float,
+    timeout: int,
+) -> None:
+    """Watch a remote assignment by polling the agent's /logs/{id} endpoint.
+
+    Streams log bytes from the remote agent and routes them through the same
+    worker_events rendering pipeline used by local watch.  Never returns —
+    exits via sys.exit().
+    """
+    from coord.network import fetch_log
+    from coord.worker_events import format_important_event, parse_event, render_event
+
+    deadline = time.monotonic() + timeout
+    turn_counter: list[int] = [0]
+    since = 0
+    is_error = False
+
+    while True:
+        if time.monotonic() > deadline:
+            click.echo(
+                f"error: timed out after {timeout}s waiting for result", err=True
+            )
+            sys.exit(3)
+
+        try:
+            status_code, body = fetch_log(machine, assignment_id, since=since)
+        except Exception as e:  # noqa: BLE001
+            click.echo(
+                f"warning: could not reach agent on {machine.name}: {e}", err=True
+            )
+            time.sleep(interval)
+            continue
+
+        if status_code == 404:
+            # Assignment not started yet or log unavailable — keep waiting.
+            time.sleep(interval)
+            continue
+
+        if status_code != 200:
+            click.echo(
+                f"error: fetching log from {machine.name} returned HTTP {status_code}",
+                err=True,
+            )
+            sys.exit(1)
+
+        done = False
+        if body:
+            for raw_line in body.decode("utf-8", errors="replace").splitlines():
+                stripped = raw_line.lstrip()
+                if not stripped:
+                    continue
+                if stripped.startswith("#"):
+                    if show_all:
+                        click.echo(raw_line)
+                    continue
+
+                event = parse_event(raw_line)
+                if event is None:
+                    if show_all:
+                        click.echo(raw_line)
+                    continue
+
+                if show_all:
+                    rendered = render_event(event, turn_counter=turn_counter)
+                    if rendered is not None:
+                        click.echo(rendered)
+                else:
+                    important = format_important_event(event)
+                    if important is not None:
+                        click.echo(important)
+
+                if event.type == "result":
+                    is_error = bool(event.raw.get("is_error", False))
+                    done = True
+                    break
+
+            since += len(body)
+
+        if done:
+            break
+
+        time.sleep(interval)
+
+    sys.exit(1 if is_error else 0)
+
+
 @main.command(help="Watch a running assignment — filtered live log output.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION
@@ -2101,29 +2192,29 @@ def watch(
         click.echo(f"error: assignment {assignment_id!r} not found", err=True)
         sys.exit(2)
 
+    # ── Detect whether the assignment lives on a remote agent ────────────
+    machine_name = record.get("machine_name", "")
+    machine = next((m for m in cfg.machines if m.name == machine_name), None)
+    hostname = socket.gethostname().split(".")[0]
+    is_remote = machine is not None and (
+        machine.name != hostname
+        and machine.host.split(".")[0] != hostname
+    )
+
+    if is_remote:
+        _watch_remote(
+            machine,
+            assignment_id,
+            show_all=show_all,
+            interval=interval,
+            timeout=timeout,
+        )
+        return  # _watch_remote exits via sys.exit
+
     # ── Locate the log file ──────────────────────────────────────────────
     from coord.agent import DEFAULT_STATE_DIR
 
     log_path = DEFAULT_STATE_DIR / "logs" / f"{assignment_id}.log"
-
-    if not log_path.exists():
-        # Try querying the agent for its log_path
-        machine_name = record.get("machine_name", "")
-        machine = next((m for m in cfg.machines if m.name == machine_name), None)
-        if machine:
-            try:
-                resp = httpx.get(
-                    f"http://{machine.host}:{AGENT_PORT}/status", timeout=5
-                )
-                data = resp.json()
-                for a in data.get("active", []) + data.get("completed", []):
-                    if a.get("id") == assignment_id:
-                        remote_log = a.get("log_path")
-                        if remote_log:
-                            log_path = Path(remote_log)
-                        break
-            except Exception:  # noqa: BLE001
-                pass
 
     if not log_path.exists():
         click.echo(f"Waiting for log file: {log_path}")
