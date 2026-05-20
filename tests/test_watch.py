@@ -229,10 +229,13 @@ class TestWatchCommand:
         # Patch DEFAULT_STATE_DIR in coord.agent so that the local import
         # inside watch() picks up the tmp_path-based directory.
         # Also patch _tail_log so we don't actually block waiting for new lines.
+        # Patch socket.gethostname to match the machine name in MINIMAL_CONFIG
+        # so that remote-detection treats this as a local assignment.
         with (
             patch("coord.state.DISPATCHED_FILE", dispatched_file),
             patch("coord.agent.DEFAULT_STATE_DIR", tmp_path),
             patch.object(_cli_mod, "_tail_log", new=_non_blocking_tail),
+            patch("socket.gethostname", return_value="laptop"),
         ):
             result = runner.invoke(main, args)
 
@@ -423,3 +426,205 @@ class TestWatchCommand:
         )
         assert result.exit_code == 0
         assert "# agent" in result.output
+
+
+# ── coord watch remote tests ──────────────────────────────────────────────────
+
+
+class TestWatchRemote:
+    """Tests for `coord watch` when the assignment is on a remote machine.
+
+    Uses a machine name/host that cannot match the test runner's hostname
+    so that remote-detection kicks in and `_watch_remote` is called.
+    The agent HTTP endpoint is mocked via ``coord.network.fetch_log``.
+    """
+
+    REMOTE_CONFIG = """\
+repos:
+  - name: api
+    github: acme/api
+machines:
+  - name: remotehost
+    host: remotehost.tailnet
+    repos: [api]
+"""
+    ASSIGNMENT_ID = "watch-remote-001"
+
+    def _setup(self, tmp_path: Path) -> tuple[Path, Path]:
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(self.REMOTE_CONFIG)
+
+        dispatched_file = tmp_path / "dispatched.json"
+        dispatched_file.write_text(
+            json.dumps([{
+                "assignment_id": self.ASSIGNMENT_ID,
+                "machine_name": "remotehost",
+                "repo_name": "api",
+                "repo_github": "acme/api",
+                "issue_number": 1,
+            }])
+        )
+        return config_file, dispatched_file
+
+    def _log_bytes(self, events: list[dict]) -> bytes:
+        return _ndjson(events).encode("utf-8")
+
+    def _invoke(
+        self,
+        config_file: Path,
+        dispatched_file: Path,
+        fetch_side_effect,
+        extra_args: list[str] | None = None,
+    ):
+        runner = CliRunner()
+        args = [
+            "watch", self.ASSIGNMENT_ID,
+            "--config", str(config_file),
+            "--interval", "0",  # no real sleeping in tests
+        ]
+        if extra_args:
+            args += extra_args
+
+        with (
+            patch("coord.state.DISPATCHED_FILE", dispatched_file),
+            # Make the test runner look like a different machine so remote
+            # detection is triggered.
+            patch("socket.gethostname", return_value="localbox"),
+            patch("coord.network.fetch_log", side_effect=fetch_side_effect),
+        ):
+            result = runner.invoke(main, args)
+
+        return result
+
+    def test_remote_happy_path_shows_important_events(self, tmp_path: Path) -> None:
+        config_file, dispatched_file = self._setup(tmp_path)
+        log_bytes = self._log_bytes([
+            {"type": "system", "subtype": "init", "model": "claude-sonnet-4-6",
+             "session_id": "remotesess1234"},
+            {"type": "result", "is_error": False, "duration_ms": 30000,
+             "num_turns": 3, "total_cost_usd": 0.05, "stop_reason": "end_turn"},
+        ])
+
+        def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
+            return (200, log_bytes[since:])
+
+        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        assert result.exit_code == 0, result.output
+        assert "[init]" in result.output
+        assert "claude-sonnet-4-6" in result.output
+        assert "[result]" in result.output
+        assert "completed" in result.output
+
+    def test_remote_failure_exits_1(self, tmp_path: Path) -> None:
+        config_file, dispatched_file = self._setup(tmp_path)
+        log_bytes = self._log_bytes([
+            {"type": "result", "is_error": True, "duration_ms": 5000,
+             "num_turns": 2, "total_cost_usd": 0.02, "stop_reason": "error"},
+        ])
+
+        def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
+            return (200, log_bytes[since:])
+
+        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        assert result.exit_code == 1
+        assert "failed" in result.output
+
+    def test_remote_404_then_200_waits_and_succeeds(self, tmp_path: Path) -> None:
+        """404 on first poll (log not ready yet) should retry until 200."""
+        config_file, dispatched_file = self._setup(tmp_path)
+        log_bytes = self._log_bytes([
+            {"type": "result", "is_error": False, "duration_ms": 1000,
+             "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn"},
+        ])
+        calls: list[int] = []
+
+        def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                return (404, b"not found")
+            return (200, log_bytes[since:])
+
+        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        assert result.exit_code == 0
+        assert len(calls) >= 2  # polled at least twice
+
+    def test_remote_incremental_polling_across_chunks(self, tmp_path: Path) -> None:
+        """since= offset is advanced correctly so we don't re-emit old lines.
+
+        Simulate two poll cycles: first returns only the init event (no result
+        yet); second returns the result event.  The code must advance `since`
+        between polls so each event is emitted exactly once.
+        """
+        config_file, dispatched_file = self._setup(tmp_path)
+        part1 = self._log_bytes([
+            {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
+        ])
+        part2 = self._log_bytes([
+            {"type": "result", "is_error": False, "duration_ms": 1000,
+             "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn"},
+        ])
+        calls: list[int] = []
+
+        def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
+            calls.append(since)
+            # First poll: only part1 is available (result not written yet).
+            if since == 0:
+                return (200, part1)
+            # Second poll: part2 is now available.
+            return (200, part2)
+
+        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        assert result.exit_code == 0
+        assert "[init]" in result.output
+        assert "[result]" in result.output
+        # Second call must use the offset advanced by len(part1)
+        assert len(calls) == 2
+        assert calls[0] == 0
+        assert calls[1] == len(part1)
+
+    def test_remote_show_all_renders_every_event(self, tmp_path: Path) -> None:
+        config_file, dispatched_file = self._setup(tmp_path)
+        log_bytes = self._log_bytes([
+            {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "result", "is_error": False, "duration_ms": 1000,
+             "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn"},
+        ])
+
+        def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
+            return (200, log_bytes[since:])
+
+        result = self._invoke(
+            config_file, dispatched_file, fetch_side_effect,
+            extra_args=["--all"],
+        )
+        assert result.exit_code == 0
+        # --all should render tool_use too
+        assert "[tool]" in result.output or "Bash" in result.output
+
+    def test_remote_header_comment_skipped_in_filtered_mode(self, tmp_path: Path) -> None:
+        config_file, dispatched_file = self._setup(tmp_path)
+        raw = (
+            b"# agent=coord argv=claude -p\n"
+            + self._log_bytes([
+                {"type": "result", "is_error": False, "duration_ms": 1000,
+                 "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn"},
+            ])
+        )
+
+        def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
+            return (200, raw[since:])
+
+        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        assert result.exit_code == 0
+        assert "# agent" not in result.output
+
+    def test_remote_http_error_exits_1(self, tmp_path: Path) -> None:
+        config_file, dispatched_file = self._setup(tmp_path)
+
+        def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
+            return (500, b"internal error")
+
+        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        assert result.exit_code == 1
+        assert "500" in result.output
