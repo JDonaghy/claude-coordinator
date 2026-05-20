@@ -404,6 +404,13 @@ def dispatch_review(
         review_of_assignment_id=completed.assignment_id,
     )
     board.active.append(review_assignment)
+
+    from coord.state import record_dispatched_assignment
+    record_dispatched_assignment(
+        assignment=review_assignment,
+        repo_github=repo.github,
+    )
+
     return review_assignment
 
 

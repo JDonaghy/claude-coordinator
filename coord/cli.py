@@ -1049,6 +1049,11 @@ def approve(
         "No worktree or feature branch is created."
     ),
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Bypass claim detection (use when retrying after infra failures).",
+)
 def assign(
     machine: str,
     repo: str,
@@ -1058,6 +1063,7 @@ def assign(
     model: str | None,
     dry_run: bool,
     plan_only: bool,
+    force: bool,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -1133,13 +1139,14 @@ def assign(
     from coord.claim import claim_message, find_work_claim
 
     board = build_board()
-    claim = find_work_claim(issue, repo, repo_cfg.github, board)
-    if claim is not None:
-        click.echo(
-            f"  skipping: {claim_message(claim)}",
-            err=True,
-        )
-        sys.exit(1)
+    if not force:
+        claim = find_work_claim(issue, repo, repo_cfg.github, board)
+        if claim is not None:
+            click.echo(
+                f"  skipping: {claim_message(claim)}",
+                err=True,
+            )
+            sys.exit(1)
 
     # Dispatch to agent server
     try:

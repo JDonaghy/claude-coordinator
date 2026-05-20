@@ -57,6 +57,10 @@ def find_work_claim(
     """
     for a in board.active:
         if a.issue_number == issue_number and a.repo_name == repo_name:
+            if a.status == "failed":
+                continue
+            if a.type in ("plan", "review", "smoke"):
+                continue
             return Claim(
                 issue_number=issue_number,
                 repo_name=repo_name,

@@ -370,4 +370,13 @@ def dispatch_smoke(
         review_of_assignment_id=completed.assignment_id,
     )
     board.active.append(smoke_assignment)
+
+    from coord.state import record_dispatched_assignment
+    repo = config.repo(completed.repo_name)
+    if repo is not None:
+        record_dispatched_assignment(
+            assignment=smoke_assignment,
+            repo_github=repo.github,
+        )
+
     return smoke_assignment

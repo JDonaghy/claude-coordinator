@@ -91,6 +91,15 @@ def _reassign(
         model=retry_model,
     )
     board.active.append(retry_assignment)
+
+    from coord.state import record_dispatched_assignment
+    repo = config.repo(failed.repo_name)
+    if repo is not None:
+        record_dispatched_assignment(
+            assignment=retry_assignment,
+            repo_github=repo.github,
+        )
+
     return retry_assignment
 
 

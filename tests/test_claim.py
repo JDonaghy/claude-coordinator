@@ -276,3 +276,43 @@ def test_dispatch_smoke_skipped_when_followup_already_active() -> None:
         diff_lookup=lambda repo, branch: ["src/main.c"],
     )
     assert result is None
+
+
+# ── Claim filtering by status and type ────────────────────────────────────
+
+
+def test_failed_assignment_does_not_block_claim() -> None:
+    failed = _active(issue=42, aid="old-fail")
+    failed.status = "failed"
+    board = Board(active=[failed])
+    claim = find_work_claim(42, "api", "acme/api", board, branch_lookup=lambda *a: [])
+    assert claim is None
+
+
+def test_plan_assignment_does_not_block_claim() -> None:
+    plan = _active(issue=42, type_="plan", aid="plan-1")
+    board = Board(active=[plan])
+    claim = find_work_claim(42, "api", "acme/api", board, branch_lookup=lambda *a: [])
+    assert claim is None
+
+
+def test_review_assignment_does_not_block_claim() -> None:
+    review = _active(issue=42, type_="review", aid="rev-1", review_of="work-1")
+    board = Board(active=[review])
+    claim = find_work_claim(42, "api", "acme/api", board, branch_lookup=lambda *a: [])
+    assert claim is None
+
+
+def test_smoke_assignment_does_not_block_claim() -> None:
+    smoke = _active(issue=42, type_="smoke", aid="smoke-1", review_of="work-1")
+    board = Board(active=[smoke])
+    claim = find_work_claim(42, "api", "acme/api", board, branch_lookup=lambda *a: [])
+    assert claim is None
+
+
+def test_running_work_assignment_still_blocks_claim() -> None:
+    work = _active(issue=42, type_="work", aid="work-1")
+    board = Board(active=[work])
+    claim = find_work_claim(42, "api", "acme/api", board, branch_lookup=lambda *a: [])
+    assert claim is not None
+    assert claim.source == "board"

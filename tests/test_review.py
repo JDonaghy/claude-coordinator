@@ -442,3 +442,31 @@ def test_dispatch_review_falls_back_when_no_pr_can_be_opened(
     # With no PR, the review_target is the branch name.
     assert result.review_target == "issue-1-fix"
     assert result.pr_url is None
+
+
+def test_dispatch_review_records_to_dispatched_ledger(
+    two_machine_config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from coord import state as state_mod
+
+    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", tmp_path / "dispatched.json")
+
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "review-ledger-1"}),
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 99, "url": "https://github.com/acme/api/pull/99", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+    )
+
+    assert result is not None
+    records = state_mod.load_dispatched(tmp_path / "dispatched.json")
+    assert len(records) == 1
+    assert records[0]["assignment_id"] == "review-ledger-1"
+    assert records[0]["repo_github"] == "acme/api"
+    assert records[0]["machine_name"] == "server"

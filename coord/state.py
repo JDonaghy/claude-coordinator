@@ -146,6 +146,37 @@ def record_dispatched(
     p.write_text(json.dumps(records, indent=2) + "\n")
 
 
+def record_dispatched_assignment(
+    *,
+    assignment: Assignment,
+    repo_github: str,
+    path: Path | None = None,
+) -> None:
+    """Record a dispatched assignment (review, smoke, retry) in the ledger.
+
+    Same ledger as record_dispatched() but accepts an Assignment directly
+    instead of a Proposal.
+    """
+    p = path or DISPATCHED_FILE
+    records = load_dispatched(p)
+    records.append(
+        {
+            "assignment_id": assignment.assignment_id,
+            "machine_name": assignment.machine_name,
+            "repo_name": assignment.repo_name,
+            "repo_github": repo_github,
+            "issue_number": assignment.issue_number,
+            "issue_title": assignment.issue_title,
+            "files_likely": list(assignment.files_allowed),
+            "briefing": assignment.briefing,
+            "model": assignment.model,
+            "dispatched_at": assignment.dispatched_at or time.time(),
+        }
+    )
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(records, indent=2) + "\n")
+
+
 # ── Notification ledger ──────────────────────────────────────────────────
 
 def load_notified(path: Path | None = None) -> dict[str, dict]:
