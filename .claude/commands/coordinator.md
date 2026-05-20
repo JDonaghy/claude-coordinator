@@ -36,13 +36,23 @@ coord config
 
 If it errors, show the output and stop. Ask the user to fix the YAML before continuing.
 
-### 4. Check machine state
+### 4. Check for previous session
+
+```bash
+coord session
+```
+
+- **"clean_shutdown: false" or "Session in progress":** Say "Previous session didn't end cleanly. Reconciling..." then run `coord resume` to sync board with agents. Run `coord status` and summarize what completed while away and what's still running.
+- **Clean last session:** Briefly note "Last session: N assignments, $X.XX cost" and continue.
+- **"No session state found":** First time — continue normally.
+
+### 5. Check machine state
 
 ```bash
 coord status
 ```
 
-### 5. Load open issues for each repo
+### 6. Load open issues for each repo
 
 Read `coordinator.yml` to discover the repos. For each repo with a `github:` field, run:
 
@@ -50,7 +60,7 @@ Read `coordinator.yml` to discover the repos. For each repo with a `github:` fie
 gh issue list --state open --repo <github>
 ```
 
-### 6. Ask the user
+### 7. Ask the user
 
 - **Which machines are available today?** (list names from the config)
 - **Any constraints?** (shared clone paths, no GTK builds, rate-limit concerns, etc.)
