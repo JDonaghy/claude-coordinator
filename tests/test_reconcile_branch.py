@@ -34,7 +34,9 @@ def test_done_with_branch_sets_assignment_branch(config: Config) -> None:
         "active": [],
         "completed": [{"id": "abc", "status": "done", "finished_at": 1.0, "branch": "worker/feat"}],
     }
-    with patch("coord.reconcile._query_agent", return_value=fake_status):
+    # Mock dispatch_review so the review-dispatch loop doesn't try real gh calls.
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.review.dispatch_review", return_value=None):
         changed = reconcile(board, config)
     assert changed == ["abc"]
     done = board.completed[0]

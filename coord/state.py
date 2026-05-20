@@ -174,6 +174,10 @@ def record_dispatched_assignment(
             "model": assignment.model,
             "type": assignment.type,
             "dispatched_at": assignment.dispatched_at or time.time(),
+            # For review/smoke assignments: links back to the work assignment
+            # that triggered this follow-up. Used by build_board to infer
+            # review_state without loading the in-memory board.
+            "review_of_assignment_id": assignment.review_of_assignment_id,
         }
     )
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -311,6 +315,7 @@ def build_board(
             model=record.get("model"),
             type=record.get("type", "work"),
             plan=plans.get(aid),
+            review_of_assignment_id=record.get("review_of_assignment_id"),
         )
         n = notified.get(aid)
         if n:
@@ -321,5 +326,30 @@ def build_board(
             board.completed.append(a)
         else:
             board.active.append(a)
+
+    # Infer review_state for completed work assignments from the dispatched and
+    # notified ledgers.  This keeps review_state correct after a crash/resume
+    # without relying on the in-memory board file alone.
+    #
+    # Build an index: work_assignment_id → review_assignment_id
+    review_aid_for: dict[str, str] = {}
+    for record in dispatched:
+        if record.get("type") == "review":
+            work_id = record.get("review_of_assignment_id")
+            if work_id and record.get("assignment_id"):
+                review_aid_for[work_id] = record["assignment_id"]
+
+    for a in board.completed:
+        if a.type != "work":
+            continue
+        if a.assignment_id is None:
+            continue
+        review_aid = review_aid_for.get(a.assignment_id)
+        if review_aid is None:
+            continue  # no review dispatched yet — leave review_state as None
+        if review_aid in notified:
+            a.review_state = "done"
+        else:
+            a.review_state = "dispatched"
 
     return board

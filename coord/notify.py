@@ -313,8 +313,40 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         )
 
 
+def _dispatch_board_pending_reviews(config: Config) -> None:
+    """Load the board, dispatch any pending reviews, and save.
+
+    Mirrors the review-dispatch loop in reconcile() so that ``coord notify``
+    also triggers review dispatch — not just ``coord status --reconcile``.
+    Safe to call even when the board file doesn't exist.
+    """
+    from coord.review import dispatch_review
+    from coord.state import load_board, save_board
+
+    board = load_board()
+    if board is None:
+        return
+
+    changed = False
+    for completed in board.completed:
+        if completed.review_state != "pending":
+            continue
+        review = dispatch_review(completed, board, config)
+        if review is not None:
+            completed.review_state = "dispatched"
+            changed = True
+        # On failure leave as "pending" so the next notify call retries.
+
+    if changed:
+        save_board(board)
+
+
 def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
     """Detect and post all pending transitions and stuck signals.
+
+    Also dispatches any pending reviews found on the saved board so that
+    ``coord notify`` acts as a reliable review-dispatch trigger in addition
+    to ``coord status --reconcile``.
 
     Returns (posted_transitions, posted_stuck).
     """
@@ -334,5 +366,11 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
         except Exception:  # noqa: BLE001
             continue
         stuck_posted.append(detection)
+
+    # Dispatch pending reviews from the saved board (best-effort, non-fatal).
+    try:
+        _dispatch_board_pending_reviews(config)
+    except Exception:  # noqa: BLE001
+        pass
 
     return posted, stuck_posted
