@@ -1,4 +1,14 @@
-"""Parse worker progress signals from log output."""
+"""Parse worker progress signals from log output.
+
+Two paths are supported:
+
+* **stream-json**: when the worker was launched with
+  ``--output-format stream-json --verbose`` (the new default), each log line
+  is a structured event. We delegate to :mod:`coord.worker_events`.
+* **plain text** (legacy): we fall back to the old ``STATUS:``/``STUCK:``
+  regex scan for backwards compatibility with logs from older agents and
+  for non-claude worker commands used in tests.
+"""
 
 from __future__ import annotations
 
@@ -29,14 +39,36 @@ class WorkerProgress:
 
 
 def parse_progress(log_path: str | Path, tail_bytes: int = 32_768) -> WorkerProgress:
-    """Parse STATUS and STUCK lines from a worker log.
+    """Parse progress from a worker log.
 
-    Reads only the tail of the log to stay cheap on large files.
+    Detects stream-json automatically and switches parsing strategies. Reads
+    only the tail of the log to stay cheap on large files.
     """
+    from coord.worker_events import detect_anomalies, is_stream_json, parse_log
+
     p = Path(log_path)
     if not p.exists():
         return WorkerProgress()
 
+    if is_stream_json(p):
+        summary = parse_log(p, tail_bytes=tail_bytes)
+        progress = WorkerProgress()
+        # Synthesise a single rolling "update" line so coord status keeps
+        # showing recent activity for stream-json workers.
+        if summary.num_turns or summary.last_tool:
+            tool_part = summary.last_tool or "thinking"
+            progress.updates.append(f"Turn {summary.num_turns}: {tool_part}")
+        # Surface anomaly patterns as warnings.
+        progress.warnings.extend(detect_anomalies(p, tail_bytes=tail_bytes))
+        if summary.stop_reason and summary.stop_reason not in (
+            "end_turn",
+            "stop_sequence",
+            None,
+        ):
+            progress.warnings.append(f"unusual stop: {summary.stop_reason}")
+        return progress
+
+    # ── Plain-text fallback ───────────────────────────────────────────────
     size = p.stat().st_size
     with open(p) as f:
         if size > tail_bytes:

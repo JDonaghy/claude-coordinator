@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -108,6 +109,54 @@ class TestParseProgress:
         assert "warnings" in d
         assert "latest_confidence" in d
         assert d["latest_confidence"] == "medium"
+
+
+# ── stream-json path ───────────────────────────────────────────────────────
+
+
+def _ndjson_log(log: Path, events: list[dict]) -> None:
+    log.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+
+class TestParseProgressStreamJson:
+    def test_stream_json_log_yields_rolling_update(self, tmp_path: Path) -> None:
+        log = tmp_path / "test.log"
+        _ndjson_log(
+            log,
+            [
+                {"type": "system", "subtype": "init", "model": "claude-sonnet-4-6",
+                 "session_id": "s1"},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}},
+            ],
+        )
+        p = parse_progress(str(log))
+        assert p.updates  # synthesised "Turn N: tool" line
+        assert "Turn" in p.updates[-1]
+
+    def test_stream_json_rate_limit_surfaces_warning(self, tmp_path: Path) -> None:
+        log = tmp_path / "test.log"
+        _ndjson_log(
+            log,
+            [
+                {"type": "system", "subtype": "init", "model": "x", "session_id": "s"},
+                {"type": "rate_limit_event", "resets_at": 1716160000.0},
+            ],
+        )
+        p = parse_progress(str(log))
+        assert any("rate limited" in w for w in p.warnings)
+
+    def test_plain_text_still_uses_regex_parser(self, tmp_path: Path) -> None:
+        """Backward compat: non-stream-json logs still parsed by old STATUS regex."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "STATUS: doing stuff → confidence: high\n"
+            "STUCK: missing system dep\n"
+        )
+        p = parse_progress(str(log))
+        assert p.stuck is not None
+        assert "missing system dep" in p.stuck
+        assert any("STUCK" in w for w in p.warnings)
 
 
 # ── Agent server progress integration ──────────────────────────────────────
