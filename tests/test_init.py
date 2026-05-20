@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -83,6 +84,7 @@ class TestInitHappyPath:
                 "N",             # Add another machine? No
                 "2",             # Max workers
                 "30",            # Stagger seconds
+                "Y",             # Permissions prompt
             ]
         )
 
@@ -129,6 +131,7 @@ class TestInitHappyPath:
                 "N",                   # Add another machine?
                 "2",                   # Max workers
                 "30",                  # Stagger seconds
+                "Y",                    # Permissions prompt
             ]
         )
 
@@ -185,6 +188,7 @@ class TestExistingConfig:
                 "N",             # Add another machine?
                 "2",             # Max workers
                 "30",            # Stagger seconds
+                "Y",             # Permissions prompt
             ]
         )
 
@@ -223,6 +227,7 @@ class TestCapabilityDetection:
                 "N",                            # Add another machine?
                 "2",                            # Max workers
                 "30",                           # Stagger seconds
+                "Y",                             # Permissions prompt
             ]
         )
 
@@ -260,6 +265,7 @@ class TestCapabilityDetection:
                 "N",                  # Add another machine?
                 "2",                  # Max workers
                 "30",                 # Stagger seconds
+                "Y",                   # Permissions prompt
             ]
         )
 
@@ -293,6 +299,7 @@ class TestCapabilityDetection:
                 "N",               # Add another machine?
                 "2",               # Max workers
                 "30",              # Stagger seconds
+                "Y",                # Permissions prompt
             ]
         )
 
@@ -320,6 +327,7 @@ class TestNoReposFound:
             [
                 "testbox",       # Machine name
                 "python",        # Capabilities
+                "Y",             # Permissions prompt
             ]
         )
 
@@ -359,6 +367,7 @@ class TestGeneratedConfigValidates:
                 "N",
                 "3",
                 "15",
+                "Y",  # Permissions prompt
             ]
         )
 
@@ -432,6 +441,7 @@ class TestGeneratedConfigValidates:
                 "N",             # Add another machine?
                 "2",             # Max workers
                 "30",            # Stagger seconds
+                "Y",             # Permissions prompt
             ]
         )
 
@@ -485,6 +495,7 @@ class TestMultipleMachines:
                 "N",                 # Add another machine? No
                 "2",                 # Max workers
                 "30",                # Stagger seconds
+                "Y",                  # Permissions prompt
             ]
         )
 
@@ -533,6 +544,7 @@ class TestMultipleMachines:
                 "N",                 # Add another machine?
                 "2",                 # Max workers
                 "30",                # Stagger seconds
+                "Y",                  # Permissions prompt
             ]
         )
 
@@ -606,6 +618,7 @@ class TestHttpsRemoteDiscovery:
                 "N",
                 "2",
                 "30",
+                "Y",  # Permissions prompt
             ]
         )
 
@@ -646,6 +659,7 @@ class TestDevelopBranch:
                 "N",
                 "2",
                 "30",
+                "Y",  # Permissions prompt
             ]
         )
 
@@ -663,3 +677,290 @@ class TestDevelopBranch:
         assert result.exit_code == 0, f"Output:\n{result.output}"
         cfg = load_config(tmp_path / "coordinator.yml")
         assert cfg.repos[0].default_branch == "develop"
+
+
+# ---------------------------------------------------------------------------
+# Shared helper: run a minimal init that succeeds past the repo-discovery step
+# ---------------------------------------------------------------------------
+
+def _run_minimal_init(runner: CliRunner, tmp_path: Path, extra_input_prefix: str = "") -> None:
+    """Run the full init wizard for a single repo, appending *extra_input_prefix* BEFORE
+    the standard answers so tests can inject 'Y' / 'N' answers for the permissions prompt."""
+    repo_dir = tmp_path / "src" / "my-project"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / ".git").mkdir(exist_ok=True)
+
+    standard_answers = "\n".join(
+        [
+            "testbox",   # Machine name
+            "python",    # Capabilities
+            "all",       # Which repos
+            "main",      # Default branch
+            "",          # Build command (skip)
+            "",          # Test command (skip)
+            "N",         # Add another machine?
+            "2",         # Max workers
+            "30",        # Stagger seconds
+        ]
+    )
+    # extra_input_prefix is appended AFTER the standard wizard answers (permissions prompt)
+    input_lines = standard_answers + ("\n" + extra_input_prefix if extra_input_prefix else "")
+
+    with patch("coord.cli.socket.gethostname", return_value="testbox"):
+        with patch("coord.cli.shutil.which") as mock_which:
+            mock_which.side_effect = lambda x: "/usr/bin/python3" if x == "python3" else None
+            with patch("coord.cli.subprocess.run") as mock_run:
+                mock_run.side_effect = _mock_subprocess_run()
+                with patch("coord.cli.os.getcwd", return_value=str(tmp_path)):
+                    with patch("coord.cli.Path.home", return_value=tmp_path):
+                        return runner.invoke(main, ["init"], input=input_lines)
+
+
+class TestClaudePermissions:
+    """Tests for .claude/settings.local.json Bash(coord *) / Bash(coord) injection."""
+
+    # ------------------------------------------------------------------
+    # _ensure_coord_permissions unit tests
+    # ------------------------------------------------------------------
+
+    def test_unit_creates_file_on_yes(self, tmp_path: Path):
+        """Directly call _ensure_coord_permissions with Y answer; file is created."""
+        from click.testing import CliRunner as _Runner
+        from coord.cli import _ensure_coord_permissions
+
+        runner = _Runner()
+        # Click function — call with mix_stderr=False to capture output cleanly.
+        # _ensure_coord_permissions is not a Click command; call it via a thin wrapper.
+        import click
+
+        @click.command()
+        def _cmd():
+            _ensure_coord_permissions(tmp_path)
+
+        result = runner.invoke(_cmd, input="Y\n")
+        assert result.exit_code == 0, result.output
+        settings = tmp_path / ".claude" / "settings.local.json"
+        assert settings.exists()
+        data = json.loads(settings.read_text())
+        assert "Bash(coord *)" in data["permissions"]["allow"]
+        assert "Bash(coord)" in data["permissions"]["allow"]
+
+    def test_unit_skips_on_no(self, tmp_path: Path):
+        """User says N — file is NOT created."""
+        import click
+        from click.testing import CliRunner as _Runner
+        from coord.cli import _ensure_coord_permissions
+
+        @click.command()
+        def _cmd():
+            _ensure_coord_permissions(tmp_path)
+
+        result = _Runner().invoke(_cmd, input="N\n")
+        assert result.exit_code == 0
+        assert not (tmp_path / ".claude" / "settings.local.json").exists()
+
+    def test_unit_already_configured_no_prompt(self, tmp_path: Path):
+        """When both entries are already present, no prompt is shown."""
+        import click
+        from click.testing import CliRunner as _Runner
+        from coord.cli import _ensure_coord_permissions
+
+        settings_dir = tmp_path / ".claude"
+        settings_dir.mkdir()
+        (settings_dir / "settings.local.json").write_text(
+            json.dumps({
+                "permissions": {
+                    "allow": ["Bash(coord *)", "Bash(coord)", "Bash(git *)"]
+                }
+            })
+        )
+
+        @click.command()
+        def _cmd():
+            _ensure_coord_permissions(tmp_path)
+
+        result = _Runner().invoke(_cmd, input="")
+        assert result.exit_code == 0
+        # No prompt should have appeared
+        assert "Add Bash" not in result.output
+        # File should be unchanged
+        data = json.loads((settings_dir / "settings.local.json").read_text())
+        assert len(data["permissions"]["allow"]) == 3  # No new entries added
+
+    def test_unit_preserves_existing_entries(self, tmp_path: Path):
+        """Existing allow entries are kept when new ones are appended."""
+        import click
+        from click.testing import CliRunner as _Runner
+        from coord.cli import _ensure_coord_permissions
+
+        settings_dir = tmp_path / ".claude"
+        settings_dir.mkdir()
+        existing = {"permissions": {"allow": ["Bash(git *)", "Bash(pip *)"]}}
+        (settings_dir / "settings.local.json").write_text(json.dumps(existing))
+
+        @click.command()
+        def _cmd():
+            _ensure_coord_permissions(tmp_path)
+
+        result = _Runner().invoke(_cmd, input="Y\n")
+        assert result.exit_code == 0
+        data = json.loads((settings_dir / "settings.local.json").read_text())
+        allow = data["permissions"]["allow"]
+        assert "Bash(git *)" in allow
+        assert "Bash(pip *)" in allow
+        assert "Bash(coord *)" in allow
+        assert "Bash(coord)" in allow
+
+    def test_unit_partial_config_adds_missing(self, tmp_path: Path):
+        """If only one of the two entries is present, the missing one is added."""
+        import click
+        from click.testing import CliRunner as _Runner
+        from coord.cli import _ensure_coord_permissions
+
+        settings_dir = tmp_path / ".claude"
+        settings_dir.mkdir()
+        existing = {"permissions": {"allow": ["Bash(coord *)"]}}
+        (settings_dir / "settings.local.json").write_text(json.dumps(existing))
+
+        @click.command()
+        def _cmd():
+            _ensure_coord_permissions(tmp_path)
+
+        result = _Runner().invoke(_cmd, input="Y\n")
+        assert result.exit_code == 0
+        data = json.loads((settings_dir / "settings.local.json").read_text())
+        allow = data["permissions"]["allow"]
+        assert "Bash(coord *)" in allow
+        assert "Bash(coord)" in allow
+
+    def test_unit_creates_dot_claude_dir_if_missing(self, tmp_path: Path):
+        """The .claude/ directory is created if it doesn't exist."""
+        import click
+        from click.testing import CliRunner as _Runner
+        from coord.cli import _ensure_coord_permissions
+
+        @click.command()
+        def _cmd():
+            _ensure_coord_permissions(tmp_path)
+
+        assert not (tmp_path / ".claude").exists()
+        _Runner().invoke(_cmd, input="Y\n")
+        assert (tmp_path / ".claude").exists()
+
+    # ------------------------------------------------------------------
+    # Integration: coord init wizard triggers the permissions prompt
+    # ------------------------------------------------------------------
+
+    def test_init_prompts_for_permissions_when_missing(
+        self, runner: CliRunner, tmp_path: Path
+    ):
+        """Full init shows the permissions prompt when .claude/settings.local.json is absent."""
+        repo_dir = tmp_path / "src" / "my-project"
+        repo_dir.mkdir(parents=True)
+        (repo_dir / ".git").mkdir()
+
+        # Standard wizard answers + "Y" to permissions prompt
+        input_lines = "\n".join(
+            [
+                "testbox",
+                "python",
+                "all",
+                "main",
+                "",
+                "",
+                "N",
+                "2",
+                "30",
+                "Y",   # Permissions prompt
+            ]
+        )
+
+        with patch("coord.cli.socket.gethostname", return_value="testbox"):
+            with patch("coord.cli.shutil.which") as mock_which:
+                mock_which.side_effect = lambda x: "/usr/bin/python3" if x == "python3" else None
+                with patch("coord.cli.subprocess.run") as mock_run:
+                    mock_run.side_effect = _mock_subprocess_run()
+                    with patch("coord.cli.os.getcwd", return_value=str(tmp_path)):
+                        with patch("coord.cli.Path.home", return_value=tmp_path):
+                            result = runner.invoke(main, ["init"], input=input_lines)
+
+        assert result.exit_code == 0, f"Output:\n{result.output}"
+        assert "Claude Code permissions" in result.output
+        settings = tmp_path / ".claude" / "settings.local.json"
+        assert settings.exists()
+        data = json.loads(settings.read_text())
+        assert "Bash(coord *)" in data["permissions"]["allow"]
+        assert "Bash(coord)" in data["permissions"]["allow"]
+
+    def test_init_skips_prompt_when_already_configured(
+        self, runner: CliRunner, tmp_path: Path
+    ):
+        """Full init does NOT show the permissions prompt when entries are already present."""
+        # Pre-create the settings file with both entries
+        settings_dir = tmp_path / ".claude"
+        settings_dir.mkdir()
+        (settings_dir / "settings.local.json").write_text(
+            json.dumps({"permissions": {"allow": ["Bash(coord *)", "Bash(coord)"]}})
+        )
+
+        repo_dir = tmp_path / "src" / "my-project"
+        repo_dir.mkdir(parents=True)
+        (repo_dir / ".git").mkdir()
+
+        input_lines = "\n".join(
+            [
+                "testbox",
+                "python",
+                "all",
+                "main",
+                "",
+                "",
+                "N",
+                "2",
+                "30",
+                # No permissions prompt expected
+            ]
+        )
+
+        with patch("coord.cli.socket.gethostname", return_value="testbox"):
+            with patch("coord.cli.shutil.which") as mock_which:
+                mock_which.side_effect = lambda x: "/usr/bin/python3" if x == "python3" else None
+                with patch("coord.cli.subprocess.run") as mock_run:
+                    mock_run.side_effect = _mock_subprocess_run()
+                    with patch("coord.cli.os.getcwd", return_value=str(tmp_path)):
+                        with patch("coord.cli.Path.home", return_value=tmp_path):
+                            result = runner.invoke(main, ["init"], input=input_lines)
+
+        assert result.exit_code == 0, f"Output:\n{result.output}"
+        assert "Claude Code permissions" not in result.output
+
+    def test_init_no_repos_still_prompts_for_permissions(
+        self, runner: CliRunner, tmp_path: Path
+    ):
+        """When no repos are found, the permissions prompt still appears."""
+        # No .git in cwd, no ~/src/ — triggers early return path
+        input_lines = "\n".join(
+            [
+                "testbox",
+                "python",
+                "Y",   # Permissions prompt
+            ]
+        )
+
+        with patch("coord.cli.socket.gethostname", return_value="testbox"):
+            with patch("coord.cli.shutil.which") as mock_which:
+                mock_which.side_effect = lambda x: "/usr/bin/python3" if x == "python3" else None
+                with patch("coord.cli.subprocess.run") as mock_run:
+                    mock_run.side_effect = _mock_subprocess_run()
+                    with patch("coord.cli.os.getcwd", return_value=str(tmp_path)):
+                        with patch("coord.cli.Path.home", return_value=tmp_path):
+                            result = runner.invoke(main, ["init"], input=input_lines)
+
+        assert result.exit_code == 0, f"Output:\n{result.output}"
+        assert "No git repos" in result.output
+        assert "Claude Code permissions" in result.output
+        settings = tmp_path / ".claude" / "settings.local.json"
+        assert settings.exists()
+        data = json.loads(settings.read_text())
+        assert "Bash(coord *)" in data["permissions"]["allow"]
+        assert "Bash(coord)" in data["permissions"]["allow"]
