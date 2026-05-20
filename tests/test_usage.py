@@ -476,27 +476,19 @@ class TestFormatUsageReport:
 
 class TestUsageCommand:
     @pytest.fixture
-    def coord_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-        """Redirect all state paths to a temp directory."""
-        monkeypatch.setattr(state_mod, "COORD_DIR", tmp_path)
-        monkeypatch.setattr(state_mod, "BOARD_FILE", tmp_path / "board.json")
-        monkeypatch.setattr(state_mod, "DISPATCHED_FILE", tmp_path / "dispatched.json")
-        monkeypatch.setattr(state_mod, "SESSION_FILE", tmp_path / "session.json")
-        monkeypatch.setattr(state_mod, "NOTIFIED_FILE", tmp_path / "notified.json")
+    def coord_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path:
+        """Provide isolated DB + redirect logs dir."""
         import coord.usage as usage_mod
         monkeypatch.setattr(usage_mod, "COORD_DIR", tmp_path)
         monkeypatch.setattr(usage_mod, "LOGS_DIR", tmp_path / "logs")
         return tmp_path
 
-    def _write_board(self, coord_dir: Path, assignments: list[Assignment]) -> None:
-        from dataclasses import asdict
-        from coord.state import BOARD_FILE
-        data = {
-            "round_number": 1,
-            "active": [asdict(a) for a in assignments if a.status in ("running", "pending")],
-            "completed": [asdict(a) for a in assignments if a.status in ("done", "failed")],
-        }
-        (coord_dir / "board.json").write_text(json.dumps(data, indent=2))
+    def _write_board(self, assignments: list[Assignment]) -> None:
+        from coord.models import Board
+        from coord.state import save_board
+        active = [a for a in assignments if a.status in ("running", "pending")]
+        completed = [a for a in assignments if a.status in ("done", "failed")]
+        save_board(Board(round_number=1, active=active, completed=completed))
 
     def test_no_board_shows_no_assignments(self, coord_dir: Path) -> None:
         runner = CliRunner()
@@ -514,7 +506,7 @@ class TestUsageCommand:
             ],
         )
         a = _assignment(assignment_id="myid001", repo_name="cool-repo", issue_number=99, status="done")
-        self._write_board(coord_dir, [a])
+        self._write_board([a])
 
         runner = CliRunner()
         result = runner.invoke(main, ["usage"])
@@ -525,7 +517,7 @@ class TestUsageCommand:
 
     def test_shows_zero_cost_when_no_log(self, coord_dir: Path) -> None:
         a = _assignment(assignment_id="noLog99", repo_name="r", status="done")
-        self._write_board(coord_dir, [a])
+        self._write_board([a])
 
         runner = CliRunner()
         result = runner.invoke(main, ["usage"])
@@ -539,7 +531,7 @@ class TestUsageCommand:
             [_init_event("claude-haiku-4-5"), _result_event(total_cost_usd=0.10)],
         )
         a = _assignment(assignment_id="id001", status="done")
-        self._write_board(coord_dir, [a])
+        self._write_board([a])
 
         runner = CliRunner()
         result = runner.invoke(main, ["usage"])

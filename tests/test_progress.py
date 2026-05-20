@@ -233,7 +233,7 @@ class TestAgentProgress:
 
 
 class TestCoordStop:
-    def test_stop_updates_board(self, tmp_path: Path) -> None:
+    def test_stop_updates_board(self, tmp_path: Path, coord_db) -> None:
         board = Board(active=[
             Assignment(
                 machine_name="laptop", repo_name="api",
@@ -241,8 +241,7 @@ class TestCoordStop:
                 assignment_id="abc123", status="running",
             ),
         ])
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
+        save_board(board)
 
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
@@ -250,18 +249,8 @@ class TestCoordStop:
             "machines:\n  - name: laptop\n    host: laptop.tailnet\n    repos: [api]\n"
         )
 
-        dispatched_file = tmp_path / "dispatched.json"
-        dispatched_file.write_text("[]")
-        notified_file = tmp_path / "notified.json"
-        notified_file.write_text("{}")
-
         runner = CliRunner()
-        with (
-            patch("coord.state.BOARD_FILE", board_file),
-            patch("coord.state.DISPATCHED_FILE", dispatched_file),
-            patch("coord.state.NOTIFIED_FILE", notified_file),
-            patch("coord.cli.httpx.post") as mock_post,
-        ):
+        with patch("coord.cli.httpx.post") as mock_post:
             mock_post.return_value = MagicMock(status_code=200, raise_for_status=lambda: None)
             result = runner.invoke(main, [
                 "stop", "abc123", "--config", str(config_file),
@@ -271,9 +260,8 @@ class TestCoordStop:
         assert "cancelled" in result.output
         assert "marked failed" in result.output
 
-    def test_stop_unknown_assignment(self, tmp_path: Path) -> None:
-        board_file = tmp_path / "board.json"
-        save_board(Board(), path=board_file)
+    def test_stop_unknown_assignment(self, tmp_path: Path, coord_db) -> None:
+        save_board(Board())
 
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
@@ -281,20 +269,10 @@ class TestCoordStop:
             "machines:\n  - name: m\n    host: h\n    repos: [api]\n"
         )
 
-        dispatched_file = tmp_path / "dispatched.json"
-        dispatched_file.write_text("[]")
-        notified_file = tmp_path / "notified.json"
-        notified_file.write_text("{}")
-
         runner = CliRunner()
-        with (
-            patch("coord.state.BOARD_FILE", board_file),
-            patch("coord.state.DISPATCHED_FILE", dispatched_file),
-            patch("coord.state.NOTIFIED_FILE", notified_file),
-        ):
-            result = runner.invoke(main, [
-                "stop", "nonexistent", "--config", str(config_file),
-            ])
+        result = runner.invoke(main, [
+            "stop", "nonexistent", "--config", str(config_file),
+        ])
         assert result.exit_code != 0
         assert "not found" in result.output
 

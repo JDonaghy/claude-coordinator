@@ -23,16 +23,12 @@ def config() -> Config:
 
 
 @pytest.fixture
-def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect ~/.coord state files to tmp_path."""
-    monkeypatch.setattr(state_mod, "COORD_DIR", tmp_path)
-    monkeypatch.setattr(state_mod, "PROPOSALS_FILE", tmp_path / "pending_proposals.json")
-    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", tmp_path / "dispatched.json")
-    monkeypatch.setattr(state_mod, "NOTIFIED_FILE", tmp_path / "notified.json")
+def coord_dir(tmp_path: Path, coord_db):
+    """Provide an isolated in-memory DB for state."""
     return tmp_path
 
 
-def _record(coord_dir: Path, assignment_id: str) -> None:
+def _record(assignment_id: str) -> None:
     proposal = Proposal(
         id=1, machine_name="laptop", repo_name="api",
         issue_number=42, issue_title="t", rationale="r",
@@ -64,7 +60,7 @@ class TestDetectTransitions:
         assert notify_mod.detect_transitions(config) == []
 
     def test_done_transition_detected(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "abc123")
+        _record("abc123")
         agent_status = {
             "active": [],
             "completed": [_agent_completed("abc123", "done")],
@@ -77,7 +73,7 @@ class TestDetectTransitions:
         assert t.assignment_id == "abc123"
 
     def test_failed_transition_detected(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "xyz789")
+        _record("xyz789")
         agent_status = {
             "active": [],
             "completed": [_agent_completed("xyz789", "failed", error="boom")],
@@ -87,21 +83,21 @@ class TestDetectTransitions:
         assert transitions[0][0].event == "failure"
 
     def test_already_notified_skipped(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "abc")
+        _record("abc")
         state_mod.mark_notified("abc", "completion")
         agent_status = {"active": [], "completed": [_agent_completed("abc", "done")]}
         with patch.object(notify_mod, "_agent_status", return_value=agent_status):
             assert notify_mod.detect_transitions(config) == []
 
     def test_offline_machine_yields_no_transitions(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "abc")
+        _record("abc")
         with patch.object(notify_mod, "_agent_status", return_value=None):
             assert notify_mod.detect_transitions(config) == []
 
 
 class TestRun:
     def test_posts_completion_and_marks_notified(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "abc")
+        _record("abc")
         agent_status = {"active": [], "completed": [_agent_completed("abc", "done")]}
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
@@ -115,7 +111,7 @@ class TestRun:
         assert "abc" in state_mod.load_notified()
 
     def test_idempotent_second_run_posts_nothing(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "abc")
+        _record("abc")
         agent_status = {"active": [], "completed": [_agent_completed("abc", "done")]}
         with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
              patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
@@ -126,7 +122,7 @@ class TestRun:
         assert posted_again == []
 
     def test_failure_posts_failure_comment(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "xyz")
+        _record("xyz")
         agent_status = {
             "active": [],
             "completed": [_agent_completed("xyz", "failed", error="bad config")],
@@ -141,7 +137,7 @@ class TestRun:
 
 class TestBranchCapture:
     def test_branch_stored_in_notified_ledger(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "abc")
+        _record("abc")
         agent_status = {
             "active": [],
             "completed": [_agent_completed("abc", "done", branch="issue-42-fix")],
@@ -153,7 +149,7 @@ class TestBranchCapture:
         assert notified["abc"]["branch"] == "issue-42-fix"
 
     def test_branch_propagates_to_build_board(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "abc")
+        _record("abc")
         agent_status = {
             "active": [],
             "completed": [_agent_completed("abc", "done", branch="issue-42-fix")],
@@ -166,7 +162,7 @@ class TestBranchCapture:
         assert board.completed[0].branch == "issue-42-fix"
 
     def test_no_branch_still_works(self, coord_dir: Path, config: Config) -> None:
-        _record(coord_dir, "abc")
+        _record("abc")
         agent_status = {
             "active": [],
             "completed": [_agent_completed("abc", "done")],
@@ -181,7 +177,7 @@ class TestBranchCapture:
 
 class TestDispatchedLedger:
     def test_record_and_load_roundtrip(self, coord_dir: Path) -> None:
-        _record(coord_dir, "abc")
+        _record("abc")
         records = state_mod.load_dispatched()
         assert len(records) == 1
         assert records[0]["assignment_id"] == "abc"

@@ -198,7 +198,7 @@ class TestSummaryReport:
 
 
 class TestCoordDone:
-    def test_done_shows_summary(self, tmp_path: Path) -> None:
+    def test_done_shows_summary(self, tmp_path: Path, coord_db) -> None:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
             "repos:\n  - name: api\n    github: a/a\n"
@@ -211,18 +211,16 @@ class TestCoordDone:
                            issue_title="Fix auth", status="done", finished_at=1.0),
             ],
         )
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
+        save_board(board)
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, ["done", "--config", str(config_file)])
+        result = runner.invoke(main, ["done", "--config", str(config_file)])
 
         assert result.exit_code == 0
         assert "Round 2" in result.output
         assert "Session ended" in result.output
 
-    def test_done_with_hooks(self, tmp_path: Path) -> None:
+    def test_done_with_hooks(self, tmp_path: Path, coord_db) -> None:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
             "repos:\n  - name: api\n    github: a/a\n"
@@ -230,18 +228,16 @@ class TestCoordDone:
             "hooks:\n  on_session_end:\n    - summary_report\n"
         )
         board = Board(round_number=1)
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
+        save_board(board)
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, ["done", "--config", str(config_file)])
+        result = runner.invoke(main, ["done", "--config", str(config_file)])
 
         assert result.exit_code == 0
         assert "session-end hooks" in result.output
         assert "summary_report" in result.output
 
-    def test_done_warns_about_active(self, tmp_path: Path) -> None:
+    def test_done_warns_about_active(self, tmp_path: Path, coord_db) -> None:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
             "repos:\n  - name: api\n    github: a/a\n"
@@ -251,12 +247,10 @@ class TestCoordDone:
             Assignment(machine_name="m", repo_name="api", issue_number=1,
                        issue_title="Still going", status="running"),
         ])
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
+        save_board(board)
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, ["done", "--config", str(config_file)])
+        result = runner.invoke(main, ["done", "--config", str(config_file)])
 
         assert result.exit_code == 0
         assert "still active" in result.output

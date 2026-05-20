@@ -35,13 +35,10 @@ def config_file(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def coord_dir(tmp_path: Path, coord_db):
+    """Provide an isolated in-memory DB and return a temp dir for logs."""
     d = tmp_path / "state"
-    monkeypatch.setattr(state_mod, "COORD_DIR", d)
-    monkeypatch.setattr(state_mod, "PROPOSALS_FILE", d / "proposals.json")
-    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", d / "dispatched.json")
-    monkeypatch.setattr(state_mod, "NOTIFIED_FILE", d / "notified.json")
-    monkeypatch.setattr(mq, "QUEUE_FILE", d / "merge_queue.json")
+    d.mkdir(parents=True, exist_ok=True)
     return d
 
 

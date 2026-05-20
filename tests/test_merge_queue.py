@@ -51,7 +51,7 @@ def _q(
     )
 
 
-# ── Pure logic ───────────────────────────────────────────────────────────
+# ── Pure logic ───────────────────────────────────────────────────────────────
 
 class TestSequence:
     def test_sorts_by_size_ascending(self) -> None:
@@ -85,19 +85,24 @@ class TestReorder:
         assert [x.assignment_id for x in out] == ["a", "b"]
 
 
-# ── Persistence ──────────────────────────────────────────────────────────
+# ── Persistence (SQLite-based) ────────────────────────────────────────────────
 
 class TestPersistence:
-    def test_roundtrip(self, tmp_path: Path) -> None:
-        path = tmp_path / "queue.json"
+    def test_roundtrip(self, coord_db) -> None:
         items = [_q("a", size=10), _q("b", size=20)]
-        save_queue(items, path)
-        again = load_queue(path)
+        save_queue(items)
+        again = load_queue()
         assert [x.assignment_id for x in again] == ["a", "b"]
         assert again[0].size == 10
 
-    def test_load_missing_returns_empty(self, tmp_path: Path) -> None:
-        assert load_queue(tmp_path / "missing.json") == []
+    def test_load_empty_returns_empty(self, coord_db) -> None:
+        assert load_queue() == []
+
+    def test_save_replaces_all(self, coord_db) -> None:
+        save_queue([_q("old")])
+        save_queue([_q("new1"), _q("new2")])
+        items = load_queue()
+        assert [x.assignment_id for x in items] == ["new1", "new2"]
 
 
 class TestEnqueue:
@@ -107,27 +112,24 @@ class TestEnqueue:
             assignment_id="abc", branch=branch, status="done",
         )
 
-    def test_enqueue_appends(self, tmp_path: Path) -> None:
-        path = tmp_path / "queue.json"
-        entry = enqueue(self._assignment(), repo_github="acme/api", target_branch="main", path=path)
+    def test_enqueue_appends(self, coord_db) -> None:
+        entry = enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
         assert entry is not None
-        assert load_queue(path)[0].assignment_id == "abc"
+        assert load_queue()[0].assignment_id == "abc"
 
-    def test_idempotent(self, tmp_path: Path) -> None:
-        path = tmp_path / "queue.json"
-        enqueue(self._assignment(), repo_github="acme/api", target_branch="main", path=path)
-        second = enqueue(self._assignment(), repo_github="acme/api", target_branch="main", path=path)
+    def test_idempotent(self, coord_db) -> None:
+        enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
+        second = enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
         assert second is None
-        assert len(load_queue(path)) == 1
+        assert len(load_queue()) == 1
 
-    def test_skipped_when_no_branch(self, tmp_path: Path) -> None:
-        path = tmp_path / "queue.json"
+    def test_skipped_when_no_branch(self, coord_db) -> None:
         a = self._assignment(branch=None)
-        assert enqueue(a, repo_github="acme/api", target_branch="main", path=path) is None
-        assert load_queue(path) == []
+        assert enqueue(a, repo_github="acme/api", target_branch="main") is None
+        assert load_queue() == []
 
 
-# ── Processing with a stub gh ops ────────────────────────────────────────
+# ── Processing with a stub gh ops ────────────────────────────────────────────
 
 @dataclass
 class FakeGh:

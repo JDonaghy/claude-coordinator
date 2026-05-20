@@ -41,7 +41,7 @@ def config_file(tmp_path: Path, repo_dir: Path) -> Path:
 
 
 @pytest.fixture
-def board_with_done(tmp_path: Path) -> tuple[Board, Path]:
+def board_with_done(coord_db) -> Board:
     board = Board(completed=[
         Assignment(
             machine_name="testbox",
@@ -54,9 +54,8 @@ def board_with_done(tmp_path: Path) -> tuple[Board, Path]:
             finished_at=1000.0,
         ),
     ])
-    board_file = tmp_path / "board.json"
-    save_board(board, path=board_file)
-    return board, board_file
+    save_board(board)
+    return board
 
 
 # ── Config parsing ──────────────────────────────────────────────────────────
@@ -93,52 +92,44 @@ class TestRepoConfig:
 
 class TestSmokeVerdict:
     def test_pass_records_on_board(
-        self, config_file: Path, board_with_done: tuple, tmp_path: Path,
+        self, config_file: Path, board_with_done: Board,
     ) -> None:
-        _, board_file = board_with_done
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, [
-                "test", "abc123", "--passed",
-                "--config", str(config_file),
-            ])
+        result = runner.invoke(main, [
+            "test", "abc123", "--passed",
+            "--config", str(config_file),
+        ])
         assert result.exit_code == 0
         assert "PASSED" in result.output
 
         from coord.state import load_board
-        with patch("coord.state.BOARD_FILE", board_file):
-            board = load_board()
+        board = load_board()
         assert board.completed[0].smoke_test == "pass"
 
     def test_fail_records_reason(
-        self, config_file: Path, board_with_done: tuple, tmp_path: Path,
+        self, config_file: Path, board_with_done: Board,
     ) -> None:
-        _, board_file = board_with_done
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, [
-                "test", "abc123", "--fail", "--reason", "UI is broken",
-                "--config", str(config_file),
-            ])
+        result = runner.invoke(main, [
+            "test", "abc123", "--fail", "--reason", "UI is broken",
+            "--config", str(config_file),
+        ])
         assert result.exit_code == 0
         assert "FAILED" in result.output
         assert "UI is broken" in result.output
 
         from coord.state import load_board
-        with patch("coord.state.BOARD_FILE", board_file):
-            board = load_board()
+        board = load_board()
         assert board.completed[0].smoke_test == "fail"
         assert board.completed[0].smoke_test_reason == "UI is broken"
 
-    def test_unknown_assignment_errors(self, config_file: Path, tmp_path: Path) -> None:
-        board_file = tmp_path / "board.json"
-        save_board(Board(), path=board_file)
+    def test_unknown_assignment_errors(self, config_file: Path, coord_db) -> None:
+        save_board(Board())
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, [
-                "test", "nonexistent", "--passed",
-                "--config", str(config_file),
-            ])
+        result = runner.invoke(main, [
+            "test", "nonexistent", "--passed",
+            "--config", str(config_file),
+        ])
         assert result.exit_code != 0
         assert "not found" in result.output
 
@@ -150,16 +141,14 @@ class TestBranchCheckout:
     @patch("subprocess.run")
     def test_fetches_and_checks_out_branch(
         self, mock_run: MagicMock,
-        config_file: Path, board_with_done: tuple, repo_dir: Path,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
     ) -> None:
-        _, board_file = board_with_done
         mock_run.return_value = MagicMock(returncode=0)
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, [
-                "test", "abc123", "--config", str(config_file),
-            ])
+        result = runner.invoke(main, [
+            "test", "abc123", "--config", str(config_file),
+        ])
 
         assert result.exit_code == 0
         assert "checked out" in result.output
@@ -170,7 +159,7 @@ class TestBranchCheckout:
         assert git_calls[0].args[0] == ["git", "fetch", "origin"]
         assert git_calls[1].args[0] == ["git", "checkout", "issue-42-fix-auth"]
 
-    def test_no_branch_errors(self, config_file: Path, tmp_path: Path) -> None:
+    def test_no_branch_errors(self, config_file: Path, coord_db) -> None:
         board = Board(completed=[
             Assignment(
                 machine_name="testbox", repo_name="api",
@@ -179,32 +168,28 @@ class TestBranchCheckout:
                 branch=None,
             ),
         ])
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
+        save_board(board)
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, [
-                "test", "nobranch", "--config", str(config_file),
-            ])
+        result = runner.invoke(main, [
+            "test", "nobranch", "--config", str(config_file),
+        ])
         assert result.exit_code != 0
         assert "no branch" in result.output
 
     @patch("subprocess.run")
     def test_git_failure_reported(
         self, mock_run: MagicMock,
-        config_file: Path, board_with_done: tuple, repo_dir: Path,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
     ) -> None:
-        _, board_file = board_with_done
         mock_run.side_effect = subprocess.CalledProcessError(
             1, "git fetch", stderr="fatal: not a git repository"
         )
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, [
-                "test", "abc123", "--config", str(config_file),
-            ])
+        result = runner.invoke(main, [
+            "test", "abc123", "--config", str(config_file),
+        ])
         assert result.exit_code != 0
         assert "git command failed" in result.output
 

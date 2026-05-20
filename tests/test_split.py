@@ -108,7 +108,7 @@ class TestParseSplitProposals:
 
 
 class TestSplitState:
-    def test_save_and_load_roundtrip(self, tmp_path: Path) -> None:
+    def test_save_and_load_roundtrip(self, coord_db) -> None:
         splits = [
             SplitProposal(
                 id=1, repo_name="api", issue_number=42,
@@ -119,10 +119,8 @@ class TestSplitState:
                 ],
             ),
         ]
-        splits_file = tmp_path / "splits.json"
-        with patch("coord.state.SPLITS_FILE", splits_file):
-            save_split_proposals(splits)
-            loaded = load_split_proposals()
+        save_split_proposals(splits)
+        loaded = load_split_proposals()
 
         assert len(loaded) == 1
         assert loaded[0].issue_number == 42
@@ -130,16 +128,16 @@ class TestSplitState:
         assert loaded[0].chunks[0].title == "A"
         assert loaded[0].chunks[0].files_likely == ["a.py"]
 
-    def test_load_empty_returns_empty(self, tmp_path: Path) -> None:
-        with patch("coord.state.SPLITS_FILE", tmp_path / "nope.json"):
-            assert load_split_proposals() == []
+    def test_load_empty_returns_empty(self, coord_db) -> None:
+        assert load_split_proposals() == []
 
-    def test_clear_removes_file(self, tmp_path: Path) -> None:
-        splits_file = tmp_path / "splits.json"
-        splits_file.write_text("[]")
-        with patch("coord.state.SPLITS_FILE", splits_file):
-            clear_split_proposals()
-        assert not splits_file.exists()
+    def test_clear_removes_splits(self, coord_db) -> None:
+        save_split_proposals([SplitProposal(
+            id=1, repo_name="api", issue_number=1, issue_title="t", rationale="",
+        )])
+        assert len(load_split_proposals()) == 1
+        clear_split_proposals()
+        assert load_split_proposals() == []
 
 
 # ── GitHub ops ──────────────────────────────────────────────────────────────
@@ -183,7 +181,7 @@ class TestCoordSplit:
         )
         return p
 
-    def test_split_dry_run(self, config_file: Path, tmp_path: Path) -> None:
+    def test_split_dry_run(self, config_file: Path, coord_db) -> None:
         splits = [SplitProposal(
             id=1, repo_name="api", issue_number=42,
             issue_title="Big task", rationale="too large",
@@ -192,14 +190,12 @@ class TestCoordSplit:
                 SplitChunk(title="B", scope="second"),
             ],
         )]
-        splits_file = tmp_path / "splits.json"
-        with patch("coord.state.SPLITS_FILE", splits_file):
-            save_split_proposals(splits)
+        save_split_proposals(splits)
 
-            runner = CliRunner()
-            result = runner.invoke(main, [
-                "split", "S1", "--dry-run", "--config", str(config_file),
-            ])
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "split", "S1", "--dry-run", "--config", str(config_file),
+        ])
 
         assert result.exit_code == 0
         assert "would create" in result.output
@@ -210,7 +206,7 @@ class TestCoordSplit:
     @patch("coord.github_ops.create_issue")
     def test_split_creates_child_issues(
         self, mock_create: MagicMock, mock_update: MagicMock,
-        config_file: Path, tmp_path: Path,
+        config_file: Path, coord_db,
     ) -> None:
         mock_create.side_effect = [
             {"number": 100, "url": "https://github.com/acme/api/issues/100"},
@@ -225,14 +221,12 @@ class TestCoordSplit:
                 SplitChunk(title="B", scope="second"),
             ],
         )]
-        splits_file = tmp_path / "splits.json"
-        with patch("coord.state.SPLITS_FILE", splits_file):
-            save_split_proposals(splits)
+        save_split_proposals(splits)
 
-            runner = CliRunner()
-            result = runner.invoke(main, [
-                "split", "1", "--config", str(config_file),
-            ])
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "split", "1", "--config", str(config_file),
+        ])
 
         assert result.exit_code == 0
         assert "#100" in result.output
@@ -243,26 +237,23 @@ class TestCoordSplit:
         assert "#100" in update_body
         assert "#101" in update_body
 
-    def test_split_no_pending(self, config_file: Path, tmp_path: Path) -> None:
-        with patch("coord.state.SPLITS_FILE", tmp_path / "nope.json"):
-            runner = CliRunner()
-            result = runner.invoke(main, [
-                "split", "S1", "--config", str(config_file),
-            ])
+    def test_split_no_pending(self, config_file: Path, coord_db) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "split", "S1", "--config", str(config_file),
+        ])
         assert result.exit_code != 0
         assert "No pending split" in result.output
 
-    def test_split_unknown_id(self, config_file: Path, tmp_path: Path) -> None:
-        splits_file = tmp_path / "splits.json"
-        with patch("coord.state.SPLITS_FILE", splits_file):
-            save_split_proposals([SplitProposal(
-                id=1, repo_name="api", issue_number=42,
-                issue_title="x", rationale="",
-            )])
-            runner = CliRunner()
-            result = runner.invoke(main, [
-                "split", "S99", "--config", str(config_file),
-            ])
+    def test_split_unknown_id(self, config_file: Path, coord_db) -> None:
+        save_split_proposals([SplitProposal(
+            id=1, repo_name="api", issue_number=42,
+            issue_title="x", rationale="",
+        )])
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "split", "S99", "--config", str(config_file),
+        ])
         assert result.exit_code != 0
         assert "unknown" in result.output
 
