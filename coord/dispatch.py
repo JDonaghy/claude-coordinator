@@ -49,6 +49,11 @@ def dispatch(
     if repo is not None and repo.worker_permissions is not None:
         deny_commands = repo.worker_permissions.deny
 
+    # Resolve coordinator-only files (workers must not read or modify these).
+    files_forbidden: list[str] = []
+    if repo is not None and repo.coordinator_only_files:
+        files_forbidden = list(repo.coordinator_only_files)
+
     # Resolve model: proposal override → config default → None (let claude pick).
     model = proposal.model if proposal.model else config.models.default
 
@@ -60,7 +65,7 @@ def dispatch(
         "issue_title": proposal.issue_title,
         "briefing": proposal.briefing,
         "files_allowed": proposal.files_likely,
-        "files_forbidden": [],
+        "files_forbidden": files_forbidden,
         "pull_repos": list(pull_repos),
         "deny_commands": deny_commands,
         "model": model,

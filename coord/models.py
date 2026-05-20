@@ -29,6 +29,7 @@ class Repo:
     test_command: str | None = None
     worker_permissions: WorkerPermissionsConfig | None = None
     housekeeping: list[str] = field(default_factory=list)
+    coordinator_only_files: list[str] = field(default_factory=list)
 
 
 @dataclass

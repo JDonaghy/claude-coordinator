@@ -88,7 +88,7 @@ def test_reviews_config_defaults_to_disabled(tmp_path: Path) -> None:
     cfg = load(p)
     assert cfg.reviews.enabled is False
     assert cfg.reviews.auto_dispatch is True  # default-on, but gated by enabled
-    assert cfg.reviews.checklist == []
+    assert cfg.reviews.checklist == ["Check for platform-specific code in shared/cross-platform paths"]
     assert cfg.reviews.repo_overrides == {}
 
 
@@ -255,7 +255,7 @@ def test_briefing_uses_generic_checklist_when_none_configured() -> None:
         pr_number=1, pr_url=None, repo_github="acme/api", repo_name="api",
         issue_number=7, issue_title="X", issue_body="",
         branch="b", worker_machine="laptop", same_as_worker=False,
-        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        reviews_cfg=ReviewsConfig(enabled=True, checklist=[]), repo_claude_md=None,
     )
     assert "Do tests pass?" in briefing
     assert "Did the worker stay within the assigned file scope?" in briefing
