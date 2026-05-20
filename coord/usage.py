@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from coord.models import Assignment, Machine
+from coord.models import Assignment
 
 # Re-export COORD_DIR so callers don't need to import state directly.
 from coord.state import COORD_DIR
@@ -311,6 +311,15 @@ def format_usage_report(session: SessionUsage) -> str:
 
     total_str = _fmt_cost(session.total_cost_usd)
     lines.append(f"Session usage:  {total_str}  •  {counts_str}  •  burn rate: {burn_str}{high_flag}")
+
+    # Budget remaining estimate: max(0, 5hr - elapsed) * burn_rate
+    elapsed_hours = session.elapsed_hours
+    if elapsed_hours is not None and burn is not None and burn > 0:
+        budget_remaining_usd = max(0.0, 5.0 - elapsed_hours) * burn
+        lines.append(
+            f"Est. 5hr budget remaining: ~{_fmt_cost(budget_remaining_usd)} (based on current rate)"
+        )
+
     lines.append("")
 
     # ── Per-assignment table ──────────────────────────────────────────────

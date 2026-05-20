@@ -779,7 +779,7 @@ def status(config_path: Path, machine_filter: str | None, timeout: float, freshn
         if burn_line:
             click.echo("")
             click.echo(burn_line)
-    except Exception:
+    except (ImportError, OSError, ValueError, KeyError):
         pass  # Never let usage tracking break the status command.
 
 
@@ -2008,20 +2008,31 @@ def done(config_path: Path) -> None:
 
     save_board(board)
 
-    # Write session end summary
-    from coord.state import write_session_end, COORD_DIR as _COORD_DIR
-    from coord.worker_events import parse_log, is_stream_json
+    # Write session end summary — use the usage module so the output matches `coord usage`.
+    import datetime
+    from coord.state import write_session_end, load_session
+    from coord.usage import build_session_usage, format_usage_report
+
+    sess = load_session()
+    started_at: float | None = None
+    if sess and sess.get("started_at"):
+        try:
+            dt = datetime.datetime.fromisoformat(
+                sess["started_at"].rstrip("Z").replace("Z", "+00:00")
+            )
+            started_at = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+        except (ValueError, AttributeError):
+            pass
+
+    all_assignments = list(board.active) + list(board.completed)
+    session_usage = build_session_usage(all_assignments, started_at=started_at)
+    total_cost = session_usage.total_cost_usd
+
+    click.echo("")
+    click.echo(format_usage_report(session_usage))
 
     completed_ids = [a.assignment_id for a in board.completed if a.assignment_id]
     issues_closed = list(set(a.issue_number for a in board.completed))
-    total_cost = 0.0
-    for a in board.completed:
-        if a.assignment_id:
-            log_path = _COORD_DIR / "logs" / f"{a.assignment_id}.log"
-            if log_path.exists() and is_stream_json(log_path):
-                summary = parse_log(log_path)
-                total_cost += summary.total_cost_usd
-
     write_session_end(
         completed_ids=completed_ids,
         issues_closed=issues_closed,
