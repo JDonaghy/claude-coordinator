@@ -91,6 +91,23 @@ coord pr <id>                             # dispatch PR-creation worker
 coord merge                               # open PRs and merge in sequence
 ```
 
+## Worker Node Setup
+
+To add a worker machine (no repo checkout needed):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash
+```
+
+Or with options:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash -s -- --machine myserver --port 7433
+```
+
+This installs coord, sets up a systemd service with auto-restart, and starts the agent.
+Then add the machine to your coordinator.yml and run `coord status` to verify connectivity.
+
 ## Command Reference
 
 ### Core Workflow
