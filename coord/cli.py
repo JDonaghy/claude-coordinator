@@ -474,8 +474,21 @@ def agent(config_path: Path, machine_name: str | None, bind_host: str, bind_port
     from coord.agent import AgentServer
     from coord.agent_app import build_app
 
-    cfg = _load_config(config_path)
-    machine = _resolve_machine(cfg, machine_name)
+    # Config-free mode: when --machine is supplied and coordinator.yml doesn't
+    # exist (typical on a dedicated worker node), run with empty capabilities
+    # and repos. The coordinator sends repo details at dispatch time.
+    if not config_path.exists() and machine_name:
+        from coord.models import Machine as _Machine
+        machine = _Machine(
+            name=machine_name,
+            host="localhost",
+            capabilities=[],
+            repos=[],
+            repo_paths={},
+        )
+    else:
+        cfg = _load_config(config_path)
+        machine = _resolve_machine(cfg, machine_name)
 
     server = AgentServer(
         machine_name=machine.name,
