@@ -531,10 +531,11 @@ class AgentServer:
         argv = self.worker_command(assignment.spec)
         log_fh = open(assignment.log_path, "a")  # noqa: SIM115 — handle closed in _reap
 
+        argv_oneline = shlex.join(argv).replace("\n", "\\n")
         header = (
             f"# agent={self.machine_name} repo={assignment.spec.repo_name} "
             f"issue=#{assignment.spec.issue_number} "
-            f"argv={shlex.join(argv)}\n"
+            f"argv={argv_oneline}\n"
         )
         log_fh.write(header)
         log_fh.flush()

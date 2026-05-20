@@ -1926,6 +1926,138 @@ def wait(assignment_id: str, config_path: Path, interval: int, timeout: int) -> 
     sys.exit(3)
 
 
+def _tail_log(log_path: Path, interval: float = 1.0):
+    """Yield new lines from *log_path* as they are written. Like tail -f.
+
+    Stops yielding when the generator is closed by the caller.
+    """
+    with open(log_path) as f:
+        while True:
+            line = f.readline()
+            if line:
+                yield line.rstrip("\n")
+            else:
+                time.sleep(interval)
+
+
+@main.command(help="Watch a running assignment — filtered live log output.")
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+@click.option("--all", "show_all", is_flag=True, help="Show all events, not just important ones.")
+@click.option(
+    "--interval",
+    default=1.0,
+    type=float,
+    show_default=True,
+    help="Poll interval in seconds.",
+)
+@click.option(
+    "--timeout",
+    default=1800,
+    type=int,
+    show_default=True,
+    help="Max seconds to wait for the assignment to finish.",
+)
+def watch(
+    assignment_id: str,
+    config_path: Path,
+    show_all: bool,
+    interval: float,
+    timeout: int,
+) -> None:
+    from coord.state import load_dispatched
+    from coord.worker_events import format_important_event, parse_event, render_event
+
+    cfg = _load_config(config_path)
+
+    # ── Find the dispatched record ───────────────────────────────────────
+    record = next(
+        (r for r in load_dispatched() if r.get("assignment_id") == assignment_id),
+        None,
+    )
+    if record is None:
+        click.echo(f"error: assignment {assignment_id!r} not found", err=True)
+        sys.exit(2)
+
+    # ── Locate the log file ──────────────────────────────────────────────
+    from coord.agent import DEFAULT_STATE_DIR
+
+    log_path = DEFAULT_STATE_DIR / "logs" / f"{assignment_id}.log"
+
+    if not log_path.exists():
+        # Try querying the agent for its log_path
+        machine_name = record.get("machine_name", "")
+        machine = next((m for m in cfg.machines if m.name == machine_name), None)
+        if machine:
+            try:
+                resp = httpx.get(
+                    f"http://{machine.host}:{AGENT_PORT}/status", timeout=5
+                )
+                data = resp.json()
+                for a in data.get("active", []) + data.get("completed", []):
+                    if a.get("id") == assignment_id:
+                        remote_log = a.get("log_path")
+                        if remote_log:
+                            log_path = Path(remote_log)
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+
+    if not log_path.exists():
+        click.echo(f"Waiting for log file: {log_path}")
+        deadline_appear = time.monotonic() + 60
+        while not log_path.exists() and time.monotonic() < deadline_appear:
+            time.sleep(1)
+        if not log_path.exists():
+            click.echo(
+                f"error: log file never appeared: {log_path}", err=True
+            )
+            sys.exit(2)
+
+    # ── Tail and filter ──────────────────────────────────────────────────
+    deadline = time.monotonic() + timeout
+    turn_counter = [0]
+    is_error = False
+
+    for raw_line in _tail_log(log_path, interval=interval):
+        if time.monotonic() > deadline:
+            click.echo(
+                f"error: timed out after {timeout}s waiting for result", err=True
+            )
+            sys.exit(3)
+
+        stripped = raw_line.lstrip()
+        if not stripped:
+            continue
+        # Pass through comment/header lines always
+        if stripped.startswith("#"):
+            if show_all:
+                click.echo(raw_line)
+            continue
+
+        event = parse_event(raw_line)
+        if event is None:
+            if show_all:
+                click.echo(raw_line)
+            continue
+
+        if show_all:
+            rendered = render_event(event, turn_counter=turn_counter)
+            if rendered is not None:
+                click.echo(rendered)
+        else:
+            important = format_important_event(event)
+            if important is not None:
+                click.echo(important)
+
+        # Detect terminal result event and exit
+        if event.type == "result":
+            is_error = bool(event.raw.get("is_error", False))
+            break
+
+    sys.exit(1 if is_error else 0)
+
+
 def _dispatch_followup(
     cfg: Config,
     original: Assignment,

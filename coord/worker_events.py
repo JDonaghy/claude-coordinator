@@ -476,6 +476,84 @@ def render_log(log_path: str | Path) -> Iterable[str]:
             yield line
 
 
+def format_important_event(event: WorkerEvent) -> str | None:
+    """Format an event for ``coord watch`` output.
+
+    Returns a human-readable string if the event is *important* (i.e. worth
+    showing in filtered live output), or ``None`` to skip it.
+    """
+    raw = event.raw
+
+    if event.type == "system" and event.subtype == "init":
+        model = raw.get("model") or (raw.get("config") or {}).get("model") or "unknown"
+        session = str(raw.get("session_id") or raw.get("id") or "?")[:8]
+        return f"[init] {model} session {session}"
+
+    if event.type == "rate_limit_event":
+        info = raw.get("rate_limit_info") or {}
+        status = info.get("status") or raw.get("status")
+        # Only surface throttled events (status != "allowed")
+        if status and status != "allowed":
+            resets = info.get("resetsAt") or info.get("resets_at") or raw.get("resets_at") or 0
+            return f"[rate_limit] {status}, resets at {resets}"
+        # No rate_limit_info sub-object — treat any rate_limit_event as notable
+        if not info:
+            resets = raw.get("resets_at") or raw.get("reset_at") or "?"
+            return f"[rate_limit] resets_at={resets}"
+        return None
+
+    if event.type == "result":
+        dur = (raw.get("duration_ms") or 0) / 1000
+        turns = raw.get("num_turns") or 0
+        cost = raw.get("total_cost_usd") or raw.get("cost_usd") or 0
+        stop = raw.get("stop_reason") or raw.get("subtype") or "?"
+        is_err = raw.get("is_error", False)
+        mins, secs = divmod(int(dur), 60)
+        result_status = "failed" if is_err else "completed"
+        base = f"[result] {result_status} in {mins}m {secs}s, {turns} turns, ${float(cost):.2f}, stop={stop}"
+        # Surface permission denials attached to the result event
+        denials = raw.get("permission_denials") or []
+        denial_lines: list[str] = []
+        if isinstance(denials, list):
+            for d in denials:
+                if isinstance(d, str):
+                    denial_lines.append(f"[denied] {d}")
+                elif isinstance(d, dict):
+                    label = (
+                        d.get("tool_name")
+                        or d.get("tool")
+                        or d.get("name")
+                        or d.get("reason")
+                        or str(d)
+                    )
+                    reason = d.get("reason") or d.get("message") or ""
+                    if reason:
+                        denial_lines.append(f"[denied] {label}: {reason}")
+                    else:
+                        denial_lines.append(f"[denied] {label}")
+        if denial_lines:
+            return base + "\n" + "\n".join(denial_lines)
+        return base
+
+    if event.type == "assistant":
+        # Scan text blocks for STUCK: signal
+        message = raw.get("message") or {}
+        content = message.get("content") or []
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text") or ""
+                    if "STUCK:" in text:
+                        stuck_line = next(
+                            (ln for ln in text.split("\n") if "STUCK:" in ln),
+                            text[:200],
+                        )
+                        return f"[stuck] {stuck_line.strip()}"
+        return None
+
+    return None
+
+
 # ── Anomaly detection ──────────────────────────────────────────────────────
 
 
