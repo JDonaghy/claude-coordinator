@@ -115,10 +115,10 @@ class TestComputePipeline:
         a = _work(status="done")
         pv = compute_pipeline(a, _board(a), [], _config())
         assert pv.current_stage == "done"
-        # Gates should include all three dispatch options
+        # default_gates=["review", "merge"] — review offered, smoke not offered
         gate_actions = {g.action for g in pv.available_gates}
         assert "dispatch_review" in gate_actions
-        assert "dispatch_smoke" in gate_actions
+        assert "dispatch_smoke" not in gate_actions  # "smoke" not in default_gates
         assert "enqueue" in gate_actions
 
     def test_done_with_active_review_gives_review_running(self) -> None:
@@ -258,6 +258,76 @@ class TestComputePipeline:
         for gate in pv.available_gates:
             assert gate.endpoint == "/api/pipeline/action"
 
+    # ── Issue #1: failed review → review_failed ──────────────────────────────
+
+    def test_failed_review_gives_review_failed_stage(self) -> None:
+        """A review assignment with status='failed' must yield review_failed,
+        not review_done (which would incorrectly show 'Queue for Merge')."""
+        a = _work(status="done")
+        rev = _review(of_aid="work-1", status="failed")
+        board = Board(active=[], completed=[a, rev])
+        pv = compute_pipeline(a, board, [], _config())
+        assert pv.current_stage == "review_failed"
+        review = next(s for s in pv.stages if s.name == "review")
+        assert review.status == "active"
+        assert review.is_current
+        # Gate: re-dispatch review (not enqueue)
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "dispatch_review" in gate_actions
+        assert "enqueue" not in gate_actions
+
+    # ── Issue #3: failed smoke assignment → smoke_failed ─────────────────────
+
+    def test_failed_smoke_assignment_gives_smoke_failed(self) -> None:
+        """A smoke assignment with status='failed' (infra failure) must yield
+        smoke_failed, not silently fall through to check review_assignment."""
+        a = _work(status="done")
+        smk = _smoke(of_aid="work-1", status="failed")
+        board = Board(active=[], completed=[a, smk])
+        pv = compute_pipeline(a, board, [], _config())
+        assert pv.current_stage == "smoke_failed"
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "dispatch_fix" in gate_actions
+
+    def test_failed_smoke_assignment_does_not_fall_through_to_review(self) -> None:
+        """Ensure a failed smoke assignment isn't confused with no smoke at all."""
+        a = _work(status="done")
+        rev = _review(of_aid="work-1", status="done")
+        smk = _smoke(of_aid="work-1", status="failed")
+        board = Board(active=[], completed=[a, rev, smk])
+        pv = compute_pipeline(a, board, [], _config())
+        # smoke_failed takes priority over review state
+        assert pv.current_stage == "smoke_failed"
+
+    # ── Issue #5: available_gates filtered by required_gates ─────────────────
+
+    def test_done_with_all_gates_shows_review_and_smoke(self) -> None:
+        """required_gates=["review","smoke","merge"] → both review and smoke gates."""
+        a = _work(status="done", required_gates=["review", "smoke", "merge"])
+        pv = compute_pipeline(a, _board(a), [], _config())
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "dispatch_review" in gate_actions
+        assert "dispatch_smoke" in gate_actions
+        assert "enqueue" in gate_actions
+
+    def test_done_merge_only_shows_enqueue_not_review_or_smoke(self) -> None:
+        """required_gates=["merge"] → only enqueue, no review or smoke gates."""
+        a = _work(status="done", required_gates=["merge"])
+        pv = compute_pipeline(a, _board(a), [], _config())
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "dispatch_review" not in gate_actions
+        assert "dispatch_smoke" not in gate_actions
+        assert "enqueue" in gate_actions
+
+    def test_done_review_only_gates_shows_only_review_and_enqueue(self) -> None:
+        """required_gates=["review","merge"] → review + enqueue, no smoke."""
+        a = _work(status="done", required_gates=["review", "merge"])
+        pv = compute_pipeline(a, _board(a), [], _config())
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "dispatch_review" in gate_actions
+        assert "dispatch_smoke" not in gate_actions
+        assert "enqueue" in gate_actions
+
 
 # ── Required-gates persistence ──────────────────────────────────────────────
 
@@ -291,6 +361,7 @@ class TestRequiredGatesPersistence:
         from coord.state import build_board, record_dispatched
 
         dispatched_file = tmp_path / "dispatched.json"
+        notified_file = tmp_path / "notified.json"  # doesn't exist → empty
         p = Proposal(
             id=1,
             machine_name="laptop",
@@ -306,7 +377,10 @@ class TestRequiredGatesPersistence:
             repo_github="acme/api",
             path=dispatched_file,
         )
-        board = build_board(dispatched_path=dispatched_file)
+        board = build_board(
+            dispatched_path=dispatched_file,
+            notified_path=notified_file,
+        )
         assert board.active[0].required_gates == ["merge"]
 
 

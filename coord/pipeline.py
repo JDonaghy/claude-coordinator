@@ -71,6 +71,7 @@ _STAGE_GROUP: dict[str, str | None] = {
     "done": None,          # between steps, nothing highlighted
     "review_running": "review",
     "review_done": "review",
+    "review_failed": "review",
     "smoke_running": "smoke",
     "smoke_passed": "smoke",
     "smoke_failed": "smoke",
@@ -86,6 +87,7 @@ _PROGRESS: dict[str, int] = {
     "done": 20,
     "review_running": 35,
     "review_done": 50,
+    "review_failed": 35,
     "smoke_running": 60,
     "smoke_passed": 70,
     "smoke_failed": 60,
@@ -165,12 +167,18 @@ def compute_pipeline(
             current_stage = "smoke_failed"
         elif smoke_assignment is not None and smoke_assignment.status in ("running", "pending"):
             current_stage = "smoke_running"
+        elif smoke_assignment is not None and smoke_assignment.status == "failed":
+            # Smoke assignment itself failed (infra failure) — not the same as
+            # the smoke *test* failing, but still unblocks the work assignment.
+            current_stage = "smoke_failed"
         elif smoke_assignment is not None and smoke_assignment.status in ("done",):
             # Smoke assignment completed but smoke_test not yet set — treat as passed.
             current_stage = "smoke_passed"
         elif review_assignment is not None:
             if review_assignment.status in ("running", "pending"):
                 current_stage = "review_running"
+            elif review_assignment.status == "failed":
+                current_stage = "review_failed"
             else:
                 current_stage = "review_done"
         else:
@@ -192,10 +200,6 @@ def compute_pipeline(
     )
 
     for i, stage_name in enumerate(stage_order):
-        if stage_name not in ("review", "smoke", "merge") or stage_name == "coding":
-            # coding is always present
-            pass
-
         if stage_name in ("review", "smoke") and stage_name not in required_gates:
             stages.append(PipelineStage(name=stage_name, status="skipped", is_current=False))
             continue
@@ -229,9 +233,14 @@ def compute_pipeline(
     available_gates: list[PipelineGate] = []
 
     if current_stage == "done":
-        available_gates.append(PipelineGate("dispatch_review", "Dispatch Review", _EP))
-        available_gates.append(PipelineGate("dispatch_smoke", "Dispatch Smoke", _EP))
+        # Only offer review/smoke gates if those stages are actually required.
+        if "review" in required_gates:
+            available_gates.append(PipelineGate("dispatch_review", "Dispatch Review", _EP))
+        if "smoke" in required_gates:
+            available_gates.append(PipelineGate("dispatch_smoke", "Dispatch Smoke", _EP))
         available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
+    elif current_stage == "review_failed":
+        available_gates.append(PipelineGate("dispatch_review", "Dispatch Review", _EP))
     elif current_stage == "review_done":
         available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
     elif current_stage == "smoke_passed":

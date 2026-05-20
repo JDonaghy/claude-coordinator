@@ -848,7 +848,7 @@ def plan(config_path: Path, dry_run: bool) -> None:
     click.echo("Gathering context...", nl=False)
     sys.stdout.flush()
 
-    from coord.brain import gather_context, build_prompt, call_claude, parse_proposals, parse_split_proposals, SYSTEM_PROMPT
+    from coord.brain import gather_context, build_prompt, call_claude, parse_proposals, parse_split_proposals, resolve_required_gates, SYSTEM_PROMPT
     context = gather_context(cfg)
     issue_count = sum(len(v) for v in context["issues_by_repo"].values())
     online = sum(1 for v in context["machine_status"].values() if v.get("status") != "offline" and "error" not in str(v))
@@ -860,6 +860,7 @@ def plan(config_path: Path, dry_run: bool) -> None:
         prompt = build_prompt(cfg, context)
         response = call_claude(SYSTEM_PROMPT, prompt)
         proposals = parse_proposals(response)
+        resolve_required_gates(proposals, cfg, context["issues_by_repo"])
         splits = parse_split_proposals(response)
     except RuntimeError as e:
         click.echo(f"error: {e}", err=True)
@@ -1021,6 +1022,10 @@ def approve(
         # Resolve model so the dispatched record and board reflect what ran.
         if not p.model:
             p.model = cfg.models.default
+        # Resolve required_gates: fall back to config default for proposals
+        # that were saved before label-based gate resolution was wired in.
+        if not p.required_gates:
+            p.required_gates = list(cfg.pipeline.default_gates)
         if dry_run:
             click.echo("     (dry run — not dispatched)")
             continue

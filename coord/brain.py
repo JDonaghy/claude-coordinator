@@ -211,6 +211,39 @@ def parse_proposals(text: str) -> list[Proposal]:
     return proposals
 
 
+def resolve_required_gates(
+    proposals: list[Proposal],
+    config: Config,
+    issues_by_repo: dict[str, list[dict]],
+) -> None:
+    """Resolve required_gates for each proposal from config.pipeline.labels.
+
+    Mutates proposals in place: for each proposal, looks up the issue in
+    ``issues_by_repo`` to get its GitHub labels, then checks each label against
+    ``config.pipeline.labels``.  The first matching label wins.  If no label
+    matches, ``required_gates`` is left unchanged (empty → caller falls back to
+    ``config.pipeline.default_gates`` at dispatch/pipeline-view time).
+    """
+    if not config.pipeline.labels:
+        return  # no label overrides configured, nothing to do
+
+    for proposal in proposals:
+        repo_issues = issues_by_repo.get(proposal.repo_name, [])
+        issue = next(
+            (iss for iss in repo_issues if iss.get("number") == proposal.issue_number),
+            None,
+        )
+        if issue is None:
+            continue
+        issue_labels: list[str] = [
+            lbl.get("name", "") for lbl in (issue.get("labels") or [])
+        ]
+        for lbl in issue_labels:
+            if lbl in config.pipeline.labels:
+                proposal.required_gates = list(config.pipeline.labels[lbl])
+                break
+
+
 def parse_split_proposals(text: str) -> list[SplitProposal]:
     """Parse split proposals from the brain's JSON response."""
     data = json.loads(_strip_fences(text))
@@ -245,4 +278,6 @@ def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
     context = gather_context(config)
     prompt = build_prompt(config, context)
     response = call_claude(SYSTEM_PROMPT, prompt)
-    return parse_proposals(response), parse_split_proposals(response)
+    proposals = parse_proposals(response)
+    resolve_required_gates(proposals, config, context["issues_by_repo"])
+    return proposals, parse_split_proposals(response)
