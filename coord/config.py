@@ -131,6 +131,20 @@ class ModelsConfig:
 
 
 @dataclass
+class PipelineConfig:
+    """Assignment lifecycle gate configuration.
+
+    ``default_gates`` is the list of approval steps required for every work
+    assignment unless overridden by an issue label.  ``labels`` maps GitHub
+    issue label names to gate lists, allowing per-label overrides — e.g.
+    a ``hotfix`` label could bypass review with ``hotfix: [merge]``.
+    """
+
+    default_gates: list[str] = field(default_factory=lambda: ["review", "merge"])
+    labels: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
@@ -139,6 +153,7 @@ class Config:
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     smoke_tests: SmokeTestsConfig = field(default_factory=SmokeTestsConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -169,6 +184,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     concurrency = _parse_concurrency(raw.get("concurrency"))
     smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
     models = _parse_models(raw.get("models"))
+    pipeline = _parse_pipeline(raw.get("pipeline"))
 
     return Config(
         repos=repos,
@@ -178,6 +194,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
         concurrency=concurrency,
         smoke_tests=smoke_tests,
         models=models,
+        pipeline=pipeline,
         path=p,
     )
 
@@ -518,6 +535,36 @@ def _parse_models(raw: Any) -> ModelsConfig:
                 "models.labels must be a mapping of label name → model alias"
             )
         cfg.labels = dict(value)
+
+    return cfg
+
+
+def _parse_pipeline(raw: Any) -> PipelineConfig:
+    if raw is None:
+        return PipelineConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'pipeline' must be a mapping")
+
+    cfg = PipelineConfig()
+
+    if "default_gates" in raw:
+        value = raw["default_gates"]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ConfigError("pipeline.default_gates must be a list of strings")
+        cfg.default_gates = list(value)
+
+    if "labels" in raw:
+        value = raw["labels"]
+        if not isinstance(value, dict):
+            raise ConfigError("pipeline.labels must be a mapping of label → list of strings")
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ConfigError("pipeline.labels keys must be strings")
+            if not isinstance(v, list) or not all(isinstance(g, str) for g in v):
+                raise ConfigError(
+                    f"pipeline.labels[{k!r}] must be a list of gate name strings"
+                )
+        cfg.labels = {k: list(v) for k, v in value.items()}
 
     return cfg
 

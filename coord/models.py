@@ -87,6 +87,10 @@ class Assignment:
     # "dispatched" — review assignment is in flight
     # "done"       — review assignment completed
     review_state: str | None = None
+    # Pipeline gate requirements — controls which approval steps are enforced.
+    # Empty list means "use config.pipeline.default_gates".
+    # Examples: ["review", "merge"], ["merge"], ["review", "smoke", "merge"]
+    required_gates: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -106,6 +110,9 @@ class Proposal:
     # workers that analyse the codebase and produce a structured plan without
     # writing any code.
     type: str = "work"
+    # Pipeline gate requirements — mirrors Assignment.required_gates.
+    # Set by the coordinator before dispatch so the ledger records intent.
+    required_gates: list[str] = field(default_factory=list)
 
 
 @dataclass

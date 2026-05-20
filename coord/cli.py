@@ -1197,6 +1197,17 @@ def assign(
     # Resolve model: --model flag → config default → None (let claude pick).
     resolved_model = model if model else cfg.models.default
 
+    # Resolve required_gates: check issue labels against pipeline.labels config,
+    # fall back to pipeline.default_gates.
+    issue_labels: list[str] = [
+        lbl.get("name", "") for lbl in (issue_data.get("labels") or [])
+    ]
+    resolved_gates: list[str] = list(cfg.pipeline.default_gates)
+    for lbl in issue_labels:
+        if lbl in cfg.pipeline.labels:
+            resolved_gates = list(cfg.pipeline.labels[lbl])
+            break
+
     proposal = Proposal(
         id=0,
         machine_name=machine,
@@ -1207,6 +1218,7 @@ def assign(
         briefing=briefing,
         model=resolved_model,
         type="plan" if plan_only else "work",
+        required_gates=resolved_gates,
     )
 
     click.echo(f"{machine} → {repo} #{issue}: {issue_title}")

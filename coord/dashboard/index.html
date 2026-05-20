@@ -55,6 +55,21 @@ a { color: #58a6ff; }
 
 .refresh-btn { float: right; padding: 4px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #8b949e; cursor: pointer; font-size: 0.85em; }
 
+.pipeline-bar { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; align-items: center; }
+.pipeline-pill { padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; }
+.pill-completed { background: #238636; color: #fff; }
+.pill-active { background: #1f6feb; color: #fff; }
+.pill-waiting { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
+.pill-skipped { background: transparent; color: #484f58; font-size: 0.7em; text-decoration: line-through; }
+.pipeline-arrow { color: #484f58; font-size: 0.8em; padding: 0 1px; }
+.pipeline-progress { height: 3px; background: #30363d; border-radius: 2px; margin-top: 4px; overflow: hidden; }
+.pipeline-progress-fill { height: 100%; background: #1f6feb; border-radius: 2px; transition: width 0.3s; }
+.gate-row { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
+.btn-gate { padding: 4px 10px; min-height: 28px; font-size: 0.78em; border-radius: 4px; border: none; color: #fff; cursor: pointer; background: #1f6feb; }
+.btn-gate:hover { opacity: 0.85; }
+.btn-gate-danger { background: #da3633; }
+.btn-gate-green { background: #238636; }
+
 @media (max-width: 600px) {
   .chat-msg.user { margin-left: 10%; }
   .chat-msg.assistant { margin-right: 10%; }
@@ -117,8 +132,61 @@ function badge(cls, text) {
   return `<span class="badge badge-${E(cls)}">${E(text)}</span>`;
 }
 
+// ── Pipeline ───────────────────────────────────────────────────────────
+let pipelineCache = {};  // assignment_id → PipelineView
+
+async function loadPipeline() {
+  try {
+    const r = await fetch('/api/pipeline');
+    if (r.ok) {
+      const data = await r.json();
+      pipelineCache = {};
+      for (const pv of data) pipelineCache[pv.assignment_id] = pv;
+    }
+  } catch(e) { /* fail silently — board still renders without pipeline data */ }
+}
+
+function renderPipelineBar(pv) {
+  if (!pv) return '';
+  const pills = pv.stages.map(s => {
+    let cls = 'pill-waiting';
+    if (s.status === 'completed') cls = 'pill-completed';
+    else if (s.status === 'active') cls = 'pill-active';
+    else if (s.status === 'skipped') cls = 'pill-skipped';
+    return `<span class="pipeline-pill ${cls}">${E(s.name)}</span>`;
+  }).join('<span class="pipeline-arrow">›</span>');
+
+  const gates = pv.available_gates.map(g => {
+    let extra = '';
+    if (g.action === 'retry' || g.action === 'dispatch_fix') extra = 'btn-gate-danger';
+    else if (g.action === 'merge') extra = 'btn-gate-green';
+    return `<button class="btn-gate ${extra}" onclick="doPipelineAction(${JSON.stringify(pv.assignment_id)},${JSON.stringify(g.action)})">${E(g.label)}</button>`;
+  }).join('');
+
+  const pct = Math.max(0, Math.min(100, pv.progress_pct || 0));
+  const progress = `<div class="pipeline-progress"><div class="pipeline-progress-fill" style="width:${pct}%"></div></div>`;
+
+  return `<div class="pipeline-bar">${pills}</div>${gates ? `<div class="gate-row">${gates}</div>` : ''}${progress}`;
+}
+
+async function doPipelineAction(assignmentId, action) {
+  try {
+    const r = await fetch('/api/pipeline/action', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({assignment_id: assignmentId, action}),
+    });
+    const data = await r.json();
+    if (!r.ok || data.ok === false) {
+      alert('Action failed: ' + (data.error || JSON.stringify(data)));
+    }
+    loadBoard();
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
 // ── Board ──────────────────────────────────────────────────────────────
 async function loadBoard() {
+  await loadPipeline();
   const r = await fetch('/api/board');
   const data = await r.json();
   document.getElementById('round-info').textContent = `round ${data.round_number}`;
@@ -127,12 +195,18 @@ async function loadBoard() {
   if (!data.active.length) {
     activeEl.innerHTML = '<div class="meta">No active assignments</div>';
   } else {
-    activeEl.innerHTML = data.active.map(a => `
-      <div class="card">
-        <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}</div>
-        <div class="meta">${badge('running', a.status)} on ${E(a.machine_name)}</div>
-      </div>
-    `).join('');
+    activeEl.innerHTML = data.active.map(a => {
+      const isWork = !a.type || a.type === 'work';
+      const typeTag = (a.type && a.type !== 'work') ? ` <span class="meta">[${E(a.type)}]</span>` : '';
+      const pv = isWork ? pipelineCache[a.assignment_id] : null;
+      return `
+        <div class="card">
+          <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}${typeTag}</div>
+          <div class="meta">${badge('running', a.status)} on ${E(a.machine_name)}</div>
+          ${renderPipelineBar(pv)}
+        </div>
+      `;
+    }).join('');
   }
 
   const compEl = document.getElementById('completed-list');
@@ -149,10 +223,14 @@ async function loadBoard() {
         ? `<div class="diff-toggle" onclick="toggleDiff('${E(a.assignment_id)}')">show diff</div>
            <div class="diff-content" id="${diffId}"></div>`
         : '';
+      const isWork = !a.type || a.type === 'work';
+      const typeTag = (a.type && a.type !== 'work') ? ` <span class="meta">[${E(a.type)}]</span>` : '';
+      const pv = isWork ? pipelineCache[a.assignment_id] : null;
       return `
         <div class="card">
-          <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}</div>
+          <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}${typeTag}</div>
           <div class="meta">${badge(cls, a.status)} on ${E(a.machine_name)}${branchInfo}${prLink}</div>
+          ${renderPipelineBar(pv)}
           ${diffToggle}
         </div>
       `;

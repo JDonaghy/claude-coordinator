@@ -229,6 +229,117 @@ def build_app(config: Config) -> Starlette:
         except RuntimeError as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    async def api_pipeline(request: Request) -> JSONResponse:
+        """GET /api/pipeline — return PipelineView for every type='work' assignment."""
+        from dataclasses import asdict
+
+        from coord.pipeline import compute_pipeline
+        from coord.merge_queue import load_queue
+
+        board = load_board() or build_board()
+        mq_items = load_queue()
+
+        pipelines = []
+        for a in list(board.active) + list(board.completed):
+            if a.type not in ("work", None, ""):
+                continue
+            # Exclude assignments with no id (shouldn't normally happen).
+            if not a.assignment_id:
+                continue
+            pv = compute_pipeline(a, board, mq_items, config)
+            pipelines.append(asdict(pv))
+
+        return JSONResponse(pipelines)
+
+    async def api_pipeline_action(request: Request) -> JSONResponse:
+        """POST /api/pipeline/action — advance an assignment through a gate.
+
+        Body: {"assignment_id": "...", "action": "..."}
+
+        Supported actions: dispatch_review, dispatch_smoke, enqueue, merge,
+        retry (501), dispatch_fix (501).
+        """
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+        assignment_id = body.get("assignment_id")
+        action = body.get("action")
+        if not assignment_id or not action:
+            return JSONResponse(
+                {"error": "assignment_id and action are required"}, status_code=400
+            )
+
+        board = load_board() or build_board()
+        assignment = board.find_by_id(assignment_id)
+        if assignment is None:
+            return JSONResponse({"error": "assignment not found"}, status_code=404)
+
+        if action == "dispatch_review":
+            from coord.review import dispatch_review
+
+            result = dispatch_review(assignment, board, config)
+            if result:
+                save_board(board)
+            return JSONResponse({"ok": result is not None})
+
+        elif action == "dispatch_smoke":
+            from coord.smoke import dispatch_smoke
+
+            result = dispatch_smoke(assignment, board, config)
+            if result:
+                save_board(board)
+            return JSONResponse({"ok": result is not None})
+
+        elif action == "enqueue":
+            repo = config.repo(assignment.repo_name)
+            if repo is None:
+                return JSONResponse({"error": "unknown repo"}, status_code=404)
+            from coord.merge_queue import enqueue
+
+            entry = enqueue(assignment, repo.github, repo.default_branch)
+            return JSONResponse({"ok": entry is not None})
+
+        elif action == "merge":
+            from coord import github_ops as _gh_ops
+            from coord.merge_queue import PENDING, load_queue, process, save_queue
+
+            items = load_queue()
+            target = next(
+                (x for x in items if x.assignment_id == assignment_id), None
+            )
+            if target is None:
+                return JSONResponse({"error": "not in merge queue"}, status_code=404)
+            if target.state != PENDING:
+                return JSONResponse(
+                    {"error": f"queue entry state is {target.state!r}, expected 'pending'"},
+                    status_code=400,
+                )
+            # Process only the single entry (target is in `items` by reference;
+            # process() mutates it in place, then we save the full queue).
+            events = process([target], _gh_ops)
+            save_queue(items)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "events": [
+                        {"kind": e.kind, "message": e.message} for e in events
+                    ],
+                }
+            )
+
+        elif action in ("retry", "dispatch_fix"):
+            return JSONResponse(
+                {"ok": False, "error": f"{action!r} is not yet implemented in the dashboard"},
+                status_code=501,
+            )
+
+        else:
+            return JSONResponse(
+                {"error": f"unknown action: {action!r}"}, status_code=400
+            )
+
     routes = [
         Route("/", index, methods=["GET"]),
         Route("/api/board", api_board, methods=["GET"]),
@@ -238,5 +349,7 @@ def build_app(config: Config) -> Starlette:
         Route("/api/reject", api_reject, methods=["POST"]),
         Route("/api/diff/{id}", api_diff, methods=["GET"]),
         Route("/api/chat", api_chat, methods=["POST"]),
+        Route("/api/pipeline", api_pipeline, methods=["GET"]),
+        Route("/api/pipeline/action", api_pipeline_action, methods=["POST"]),
     ]
     return Starlette(routes=routes)
