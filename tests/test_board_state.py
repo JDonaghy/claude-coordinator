@@ -454,6 +454,30 @@ class TestBoardGC:
         ])
         assert board.gc(keep=50) == 0
 
+    def test_gc_pruned_rows_deleted_from_db(self, coord_db) -> None:
+        """Regression: after gc() prunes completed assignments, save+load must
+        reflect the pruned count — not the original count."""
+        board = Board(completed=[
+            Assignment(
+                machine_name="m", repo_name="r", issue_number=i,
+                issue_title=f"t{i}", status="done", finished_at=float(i),
+                assignment_id=f"a{i:03d}",
+            )
+            for i in range(60)
+        ])
+        save_board(board)
+
+        removed = board.gc(keep=50)
+        assert removed == 10
+        assert len(board.completed) == 50
+
+        save_board(board)
+        loaded = load_board()
+        assert loaded is not None
+        assert len(loaded.completed) == 50, (
+            f"Expected 50 completed after gc+save, got {len(loaded.completed)}"
+        )
+
 
 # ── Board model id-based methods ───────────────────────────────────────────────
 
@@ -556,3 +580,63 @@ class TestResumeCommand:
         assert result.exit_code == 0
         assert "Board round: 5" in result.output
         assert "completed: 1" in result.output
+
+
+# ── _save_config_snapshot ──────────────────────────────────────────────────────
+
+
+class TestSaveConfigSnapshot:
+    """_save_config_snapshot() populates the machines table in the DB."""
+
+    def test_populates_machines_table(self, coord_db) -> None:
+        from coord.cli import _save_config_snapshot
+        from coord.config import Config
+        from coord.models import Machine, Repo
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="laptop.tailnet",
+                        capabilities=["python"], repos=["api"]),
+                Machine(name="server", host="server.tailnet",
+                        capabilities=["python", "docker"], repos=["api"]),
+            ],
+        )
+        _save_config_snapshot(cfg)
+
+        import json as _json
+        rows = coord_db.execute("SELECT * FROM machines ORDER BY name").fetchall()
+        assert len(rows) == 2
+        names = [r["name"] for r in rows]
+        assert "laptop" in names
+        assert "server" in names
+
+        laptop = next(r for r in rows if r["name"] == "laptop")
+        assert laptop["host"] == "laptop.tailnet"
+        assert _json.loads(laptop["capabilities"]) == ["python"]
+        assert _json.loads(laptop["repos"]) == ["api"]
+
+        server = next(r for r in rows if r["name"] == "server")
+        assert _json.loads(server["capabilities"]) == ["python", "docker"]
+
+    def test_replaces_existing_machines(self, coord_db) -> None:
+        """Calling _save_config_snapshot twice overwrites the first set."""
+        from coord.cli import _save_config_snapshot
+        from coord.config import Config
+        from coord.models import Machine, Repo
+
+        cfg1 = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="old", host="old.tailnet", repos=["api"])],
+        )
+        _save_config_snapshot(cfg1)
+
+        cfg2 = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="new", host="new.tailnet", repos=["api"])],
+        )
+        _save_config_snapshot(cfg2)
+
+        rows = coord_db.execute("SELECT name FROM machines ORDER BY name").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["name"] == "new"

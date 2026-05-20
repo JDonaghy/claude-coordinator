@@ -70,7 +70,7 @@ def _write_config(tmp_path: Path, yaml_text: str) -> Path:
 class TestDoneHousekeeping:
     """coord done runs housekeeping commands for repos with local paths."""
 
-    def test_runs_housekeeping_commands(self, tmp_path: Path) -> None:
+    def test_runs_housekeeping_commands(self, tmp_path: Path, coord_db) -> None:
         repo_path = tmp_path / "myrepo"
         repo_path.mkdir()
 
@@ -113,7 +113,7 @@ class TestDoneHousekeeping:
         assert calls[1][0][0] == "echo hello"
         assert calls[2][0][0] == "echo world"
 
-    def test_skips_repos_without_housekeeping(self, tmp_path: Path) -> None:
+    def test_skips_repos_without_housekeeping(self, tmp_path: Path, coord_db) -> None:
         repo_path = tmp_path / "myrepo"
         repo_path.mkdir()
 
@@ -147,7 +147,7 @@ class TestDoneHousekeeping:
         assert result.exit_code == 0, result.output
         mock_run.assert_not_called()
 
-    def test_skips_repos_without_local_path(self, tmp_path: Path) -> None:
+    def test_skips_repos_without_local_path(self, tmp_path: Path, coord_db) -> None:
         cfg_path = _write_config(
             tmp_path,
             "repos:\n"
@@ -180,7 +180,7 @@ class TestDoneHousekeeping:
         assert "no local path configured" in result.output
         mock_run.assert_not_called()
 
-    def test_failed_housekeeping_does_not_block_other_repos(self, tmp_path: Path) -> None:
+    def test_failed_housekeeping_does_not_block_other_repos(self, tmp_path: Path, coord_db) -> None:
         repo_a = tmp_path / "repo_a"
         repo_b = tmp_path / "repo_b"
         repo_a.mkdir()
@@ -239,7 +239,7 @@ class TestDoneHousekeeping:
         assert mock_run.call_count == 4
         assert "Session ended" in result.output
 
-    def test_git_pull_attempted_before_housekeeping(self, tmp_path: Path) -> None:
+    def test_git_pull_attempted_before_housekeeping(self, tmp_path: Path, coord_db) -> None:
         repo_path = tmp_path / "myrepo"
         repo_path.mkdir()
 
@@ -283,7 +283,7 @@ class TestDoneHousekeeping:
         assert call_order[0] == "git_pull", "git pull must be called before housekeeping commands"
         assert len(call_order) == 2
 
-    def test_git_pull_failure_continues_to_housekeeping(self, tmp_path: Path) -> None:
+    def test_git_pull_failure_continues_to_housekeeping(self, tmp_path: Path, coord_db) -> None:
         repo_path = tmp_path / "myrepo"
         repo_path.mkdir()
 
@@ -326,7 +326,7 @@ class TestDoneHousekeeping:
         assert mock_run.call_count == 2
         assert "git pull failed" in result.output
 
-    def test_unknown_machine_skips_housekeeping(self, tmp_path: Path) -> None:
+    def test_unknown_machine_skips_housekeeping(self, tmp_path: Path, coord_db) -> None:
         cfg_path = _write_config(
             tmp_path,
             "repos:\n"
@@ -358,7 +358,7 @@ class TestDoneHousekeeping:
         assert "Could not determine local machine" in result.output
         mock_run.assert_not_called()
 
-    def test_nonexistent_repo_path_skipped(self, tmp_path: Path) -> None:
+    def test_nonexistent_repo_path_skipped(self, tmp_path: Path, coord_db) -> None:
         cfg_path = _write_config(
             tmp_path,
             f"repos:\n"

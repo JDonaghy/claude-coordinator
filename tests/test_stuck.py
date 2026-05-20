@@ -66,9 +66,8 @@ def config_file(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path:
+def coord_dir(tmp_path: Path, coord_db) -> Path:
     d = tmp_path / "state"
-    monkeypatch.setattr(state_mod, "COORD_DIR", d)
     return d
 
 

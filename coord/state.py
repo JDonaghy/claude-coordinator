@@ -11,6 +11,7 @@ isolate tests with an in-memory database.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -482,7 +483,6 @@ def mark_notified(
     )
     # Keep assignments table in sync so build_board() is always accurate.
     if event in (EVENT_COMPLETION, EVENT_PLAN):
-        update_params: list = ["done", now]
         if branch is not None:
             conn.execute(
                 "UPDATE assignments SET status=?, finished_at=?, branch=? WHERE assignment_id=?",
@@ -529,7 +529,12 @@ def load_plans() -> dict[str, dict]:
 # ── Board persistence ──────────────────────────────────────────────────────────
 
 def save_board(board: Board) -> Path:
-    """Persist the board to the database."""
+    """Persist the board to the database.
+
+    Note: this function mutates assignments that lack an ``assignment_id``,
+    generating a deterministic fallback ID and writing it back to the
+    assignment object in-place.
+    """
     conn = get_connection()
     with conn:
         for a in board.active + board.completed:
@@ -540,6 +545,18 @@ def save_board(board: Board) -> Path:
                     f"anon-{a.machine_name}-{a.repo_name}-{a.issue_number}"
                 )
             conn.execute(_UPSERT_SQL, _assignment_upsert_params(a))
+        # Delete DB rows that were pruned from the board (e.g. by Board.gc()).
+        # Without this, pruned assignments survive in the DB and reappear on the
+        # next load_board().
+        current_ids = [a.assignment_id for a in board.active + board.completed]
+        if current_ids:
+            placeholders = ",".join("?" * len(current_ids))
+            conn.execute(
+                f"DELETE FROM assignments WHERE assignment_id NOT IN ({placeholders})",
+                current_ids,
+            )
+        else:
+            conn.execute("DELETE FROM assignments")
         # Save round_number and mark that the board has been initialised
         conn.execute(
             "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', ?)",
@@ -566,7 +583,7 @@ def load_board() -> Board | None:
     return _query_board(conn)
 
 
-def _query_board(conn: object) -> Board:
+def _query_board(conn: sqlite3.Connection) -> Board:
     """Build a Board from the current assignments table (no review_state inference)."""
     # Load all plans keyed by assignment_id
     plan_rows = conn.execute("SELECT assignment_id, plan_data FROM plans").fetchall()
@@ -606,7 +623,7 @@ def build_board() -> Board:
     return board
 
 
-def _infer_review_state(board: Board, conn: object) -> None:
+def _infer_review_state(board: Board, conn: sqlite3.Connection) -> None:
     """Set review_state on completed work assignments from their linked reviews."""
     # Build index: work_assignment_id → (review_status, review_assignment_id)
     review_rows = conn.execute(

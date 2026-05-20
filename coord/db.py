@@ -195,8 +195,9 @@ def _maybe_migrate_json(conn: sqlite3.Connection) -> None:
         return
     try:
         _migrate_json(conn)
-    except Exception:  # noqa: BLE001 — migration is best-effort
-        pass
+    except Exception as exc:  # noqa: BLE001 — migration is best-effort
+        import sys
+        print(f"coord: warning: JSON→SQLite migration failed: {exc}", file=sys.stderr)
 
 
 def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptable complexity
