@@ -17,6 +17,7 @@ EVENT_BRIEFING = "briefing"
 EVENT_COMPLETION = "completion"
 EVENT_FAILURE = "failure"
 EVENT_STUCK = "stuck"
+EVENT_PLAN = "plan"
 
 
 @dataclass
@@ -210,4 +211,73 @@ def format_failure(
         lines.append("")
         lines.append("### Error")
         lines.append(error.strip())
+    return "\n".join(lines)
+
+
+def format_plan(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    plan: object,  # coord.plan_parser.WorkerPlan (untyped to avoid circular import)
+    duration_seconds: float | None = None,
+) -> str:
+    """Build the issue comment posted when a plan-only assignment completes.
+
+    *plan* should be a :class:`coord.plan_parser.WorkerPlan` instance, but the
+    parameter is typed as ``object`` to avoid a circular import — callers that
+    already have the dataclass can pass it directly.
+    """
+    marker = _marker(
+        EVENT_PLAN,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        issue=issue_number,
+    )
+    lines = [
+        "## Coordinator: Implementation Plan",
+        marker,
+        f"**Machine:** {machine_name}",
+        f"**Duration:** {_fmt_duration(duration_seconds)}",
+        "",
+    ]
+
+    plan_text: str = getattr(plan, "plan", "") or ""
+    files_read: list[str] = getattr(plan, "files_read", []) or []
+    files_modify: list[str] = getattr(plan, "files_modify", []) or []
+    approach: str = getattr(plan, "approach", "") or ""
+    risks: str = getattr(plan, "risks", "") or ""
+    estimate: str = getattr(plan, "estimate", "") or ""
+
+    if plan_text.strip():
+        lines.append("### Summary")
+        lines.append(plan_text.strip())
+        lines.append("")
+
+    if files_read:
+        lines.append("### Files Read")
+        lines.append(", ".join(f"`{f}`" for f in files_read))
+        lines.append("")
+
+    if files_modify:
+        lines.append("### Files to Modify")
+        lines.append(", ".join(f"`{f}`" for f in files_modify))
+        lines.append("")
+
+    if approach.strip():
+        lines.append("### Approach")
+        lines.append(approach.strip())
+        lines.append("")
+
+    if risks.strip():
+        lines.append("### Risks")
+        lines.append(risks.strip())
+        lines.append("")
+
+    if estimate.strip():
+        lines.append("### Estimate")
+        lines.append(estimate.strip())
+
     return "\n".join(lines)

@@ -18,6 +18,7 @@ DISPATCHED_FILE = COORD_DIR / "dispatched.json"
 NOTIFIED_FILE = COORD_DIR / "notified.json"
 BOARD_FILE = COORD_DIR / "board.json"
 SESSION_FILE = COORD_DIR / "session.json"
+PLANS_FILE = COORD_DIR / "plans.json"
 
 
 def write_session_start() -> None:
@@ -139,6 +140,7 @@ def record_dispatched(
             "files_likely": list(proposal.files_likely),
             "briefing": proposal.briefing,
             "model": proposal.model,
+            "type": proposal.type,
             "dispatched_at": time.time(),
         }
     )
@@ -170,6 +172,7 @@ def record_dispatched_assignment(
             "files_likely": list(assignment.files_allowed),
             "briefing": assignment.briefing,
             "model": assignment.model,
+            "type": assignment.type,
             "dispatched_at": assignment.dispatched_at or time.time(),
         }
     )
@@ -206,6 +209,36 @@ def mark_notified(
     data[assignment_id] = entry
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2) + "\n")
+
+
+# ── Plan persistence ────────────────────────────────────────────────────
+
+
+def save_plan(
+    assignment_id: str,
+    plan_dict: dict,
+    path: Path | None = None,
+) -> None:
+    """Persist a parsed WorkerPlan (as a plain dict) for *assignment_id*.
+
+    Successive calls for the same id overwrite the previous entry.
+    """
+    p = path or PLANS_FILE
+    plans = load_plans(p)
+    plans[assignment_id] = plan_dict
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(plans, indent=2) + "\n")
+
+
+def load_plans(path: Path | None = None) -> dict[str, dict]:
+    """Return all saved plans: ``{assignment_id: plan_dict}``."""
+    p = path or PLANS_FILE
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 # ── Board persistence ───────────────────────────────────────────────────
@@ -248,6 +281,7 @@ def load_board(path: Path | None = None) -> Board | None:
 def build_board(
     dispatched_path: Path | None = None,
     notified_path: Path | None = None,
+    plans_path: Path | None = None,
 ) -> Board:
     """Reconstruct a Board from the dispatched ledger and notification state.
 
@@ -259,6 +293,7 @@ def build_board(
 
     dispatched = load_dispatched(dispatched_path)
     notified = load_notified(notified_path)
+    plans = load_plans(plans_path)
 
     board = Board()
     for record in dispatched:
@@ -274,6 +309,8 @@ def build_board(
             status="running",
             dispatched_at=record.get("dispatched_at"),
             model=record.get("model"),
+            type=record.get("type", "work"),
+            plan=plans.get(aid),
         )
         n = notified.get(aid)
         if n:

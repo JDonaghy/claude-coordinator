@@ -77,6 +77,10 @@ class Assignment:
     # board so escalation in `coord fix` / `coord retry` / `coord resume-stuck`
     # can step up the ladder.
     model: str | None = None
+    # Parsed structured plan from a plan-only worker (type="plan"). Stored as
+    # a plain dict (the serialised form of WorkerPlan.to_dict()) so it round-
+    # trips cleanly through JSON without a custom encoder.
+    plan: dict | None = None
 
 
 @dataclass
