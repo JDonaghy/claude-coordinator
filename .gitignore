@@ -8,3 +8,6 @@ dist/
 board_state.json
 agent_setup.json
 coordinator.yml
+
+# Rust build artifacts (coord-tui)
+tui/target/
