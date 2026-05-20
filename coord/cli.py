@@ -651,7 +651,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     a = active[0]
                     spec = a.get("spec", {})
                     spec_type = spec.get("type", "work")
-                    badge_map = {"review": "[review] ", "smoke": "[smoke] "}
+                    badge_map = {"review": "[review] ", "smoke": "[smoke] ", "plan": "[plan] "}
                     badge = badge_map.get(spec_type, "")
                     target = spec.get("review_target")
                     if spec_type == "review" and target:
@@ -1444,6 +1444,104 @@ def _log_remote(machine, assignment_id: str, follow: bool, *, raw: bool = False)
         if body:
             _emit_log_text(body.decode("utf-8", errors="replace"), raw=raw)
             since += len(body)
+
+
+@main.command("show-plan", help="Pretty-print the structured plan for a plan-only assignment.")
+@click.argument("assignment_id")
+def show_plan(assignment_id: str) -> None:
+    from coord.plan_parser import WorkerPlan, parse_plan_from_log
+    from coord.state import COORD_DIR, build_board, load_board, load_plans
+
+    board = load_board() or build_board()
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    if assignment.type != "plan":
+        atype = assignment.type
+        click.echo(
+            f"error: assignment {assignment_id} is type {atype!r}, not 'plan'",
+            err=True,
+        )
+        sys.exit(1)
+
+    # 1. Try the plan cached on the board/assignment record.
+    plan_dict = assignment.plan
+    if plan_dict is None:
+        plans = load_plans()
+        plan_dict = plans.get(assignment_id)
+
+    # 2. Fall back to parsing the log directly (works when agent is local).
+    if plan_dict is None:
+        local_log = COORD_DIR / "logs" / f"{assignment_id}.log"
+        try:
+            worker_plan = parse_plan_from_log(local_log)
+        except Exception:  # noqa: BLE001
+            worker_plan = None
+        if worker_plan is not None:
+            plan_dict = worker_plan.to_dict()
+
+    if plan_dict is None:
+        click.echo(
+            f"No structured plan found for assignment {assignment_id}.\n"
+            "Possible reasons: the worker has not completed yet, the log is on "
+            "a remote machine, or the worker did not output plan sections.\n"
+            "Run 'coord notify' after the worker finishes to parse and cache the plan."
+        )
+        return
+
+    _display_plan(WorkerPlan.from_dict(plan_dict), assignment)
+
+
+def _display_plan(plan: object, assignment: object) -> None:
+    """Pretty-print a WorkerPlan to stdout."""
+    from coord.plan_parser import WorkerPlan  # noqa: PLC0415
+
+    assert isinstance(plan, WorkerPlan)
+
+    repo_name = getattr(assignment, "repo_name", "?")
+    issue_number = getattr(assignment, "issue_number", "?")
+    issue_title = getattr(assignment, "issue_title", "")
+    machine_name = getattr(assignment, "machine_name", "?")
+    assignment_id = getattr(assignment, "assignment_id", "?")
+
+    click.echo(
+        f"## Plan — {repo_name} #{issue_number}: {issue_title}"
+    )
+    click.echo(f"Assignment: {assignment_id}  Machine: {machine_name}")
+
+    if plan.plan:
+        click.echo("")
+        click.echo("### Summary")
+        click.echo(plan.plan)
+
+    if plan.files_read:
+        click.echo("")
+        click.echo("### Files Read")
+        for f in plan.files_read:
+            click.echo(f"  {f}")
+
+    if plan.files_modify:
+        click.echo("")
+        click.echo("### Files to Modify")
+        for f in plan.files_modify:
+            click.echo(f"  {f}")
+
+    if plan.approach:
+        click.echo("")
+        click.echo("### Approach")
+        click.echo(plan.approach)
+
+    if plan.risks:
+        click.echo("")
+        click.echo("### Risks")
+        click.echo(plan.risks)
+
+    if plan.estimate:
+        click.echo("")
+        click.echo("### Estimate")
+        click.echo(plan.estimate)
 
 
 @main.command(help="Cancel a running assignment.")

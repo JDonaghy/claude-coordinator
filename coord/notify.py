@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import httpx
 
+log = logging.getLogger(__name__)
+
 from coord import github_ops
-from coord.comments import EVENT_COMPLETION, EVENT_FAILURE, EVENT_STUCK, format_stuck
+from coord.comments import (
+    EVENT_COMPLETION,
+    EVENT_FAILURE,
+    EVENT_PLAN,
+    EVENT_STUCK,
+    format_plan,
+    format_stuck,
+)
 from coord.config import Config
 from coord.dispatch import AGENT_PORT, post_completion, post_failure
 from coord.progress import parse_progress
-from coord.state import load_dispatched, load_notified, mark_notified
+from coord.state import load_dispatched, load_notified, mark_notified, save_plan
 
 
 @dataclass
@@ -210,6 +220,53 @@ def post_stuck(detection: StuckDetection, record: dict) -> None:
     mark_notified(_stuck_notified_key(detection.assignment_id), EVENT_STUCK)
 
 
+def _try_parse_and_post_plan(
+    transition: Transition,
+    record: dict,
+    entry: dict,
+    duration: float | None,
+) -> bool:
+    """Try to parse a WorkerPlan from the worker log and post it to GitHub.
+
+    Returns True if a plan comment was successfully posted, False otherwise.
+    Silently swallows all errors so callers can fall back gracefully.
+    """
+    from coord.plan_parser import parse_plan_from_log  # noqa: PLC0415
+
+    log_path = entry.get("log_path")
+    if not log_path:
+        return False
+
+    try:
+        worker_plan = parse_plan_from_log(log_path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to parse plan log for %s: %s", transition.assignment_id, exc)
+        return False
+
+    if worker_plan is None or worker_plan.is_empty():
+        return False
+
+    try:
+        body = format_plan(
+            assignment_id=transition.assignment_id,
+            machine_name=transition.machine_name,
+            repo_name=transition.repo_name,
+            issue_number=transition.issue_number,
+            plan=worker_plan,
+            duration_seconds=duration,
+        )
+        github_ops.post_issue_comment(
+            record["repo_github"], transition.issue_number, body
+        )
+        # Cache the parsed plan in the state directory.
+        save_plan(transition.assignment_id, worker_plan.to_dict())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to post plan comment for %s: %s", transition.assignment_id, exc)
+        return False
+
+    return True
+
+
 def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     """Post the GitHub comment for one transition and mark it notified."""
     started = entry.get("started_at")
@@ -224,19 +281,36 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         duration_seconds=duration,
         log_path=entry.get("log_path"),
     )
-    if transition.event == EVENT_COMPLETION:
+    assignment_type = record.get("type", "work")
+    if transition.event == EVENT_COMPLETION and assignment_type == "plan":
+        # For plan assignments, post the structured plan comment.  Fall back
+        # to a standard completion comment if the log can't be parsed.
+        posted = _try_parse_and_post_plan(transition, record, entry, duration)
+        if not posted:
+            post_completion(exit_code=transition.exit_code or 0, **common)
+        mark_notified(
+            transition.assignment_id,
+            EVENT_PLAN if posted else EVENT_COMPLETION,
+            branch=entry.get("branch"),
+        )
+    elif transition.event == EVENT_COMPLETION:
         post_completion(exit_code=transition.exit_code or 0, **common)
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
     else:
         post_failure(
             exit_code=transition.exit_code,
             error=entry.get("error") or "",
             **common,
         )
-    mark_notified(
-        transition.assignment_id,
-        transition.event,
-        branch=entry.get("branch"),
-    )
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
 
 
 def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:

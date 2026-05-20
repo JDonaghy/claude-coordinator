@@ -162,6 +162,34 @@ class TestBuildBoard:
         assert board.active == []
         assert board.completed[0].status == "failed"
 
+    def test_plan_event_marks_assignment_done(self, tmp_path: Path) -> None:
+        """Regression: a notified plan event must yield status='done', not 'failed'."""
+        dispatched_file = tmp_path / "dispatched.json"
+        notified_file = tmp_path / "notified.json"
+        dispatched_file.write_text(json.dumps([
+            {
+                "assignment_id": "ppp",
+                "machine_name": "laptop",
+                "repo_name": "api",
+                "repo_github": "acme/api",
+                "issue_number": 11,
+                "issue_title": "Plan feature",
+                "files_likely": [],
+                "briefing": "",
+                "dispatched_at": 1000.0,
+                "type": "plan",
+            },
+        ]))
+        notified_file.write_text(json.dumps({
+            "ppp": {"event": "plan", "posted_at": 1100.0},
+        }))
+
+        board = build_board(dispatched_path=dispatched_file, notified_path=notified_file)
+        assert board.active == []
+        assert len(board.completed) == 1
+        assert board.completed[0].assignment_id == "ppp"
+        assert board.completed[0].status == "done"
+
     def test_empty_ledger_gives_empty_board(self, tmp_path: Path) -> None:
         dispatched_file = tmp_path / "dispatched.json"
         notified_file = tmp_path / "notified.json"
