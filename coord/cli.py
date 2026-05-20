@@ -1185,6 +1185,12 @@ def assign(
         sys.exit(1)
     issue_title = issue_data.get("title", f"Issue #{issue}")
 
+    # Auto-generate briefing from issue body when none provided.
+    if not briefing:
+        issue_body = issue_data.get("body", "")
+        if issue_body:
+            briefing = f"Issue #{issue}: {issue_title}\n\n{issue_body}"
+
     # Build a Proposal inline
     from coord.models import Proposal
 
