@@ -159,11 +159,18 @@ def build_deny_prompt(deny_commands: list[str]) -> str:
 
 
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
-    """Build the argv for invoking the worker on this assignment."""
+    """Build the argv for invoking the worker on this assignment.
+
+    Uses ``--output-format stream-json --verbose`` so the agent log captures
+    one structured JSON event per line. Downstream tooling
+    (:mod:`coord.worker_events`) parses these for real-time observability.
+    """
     system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
     system_prompt += build_deny_prompt(spec.deny_commands)
     argv = [
         binary, "-p",
+        "--output-format", "stream-json",
+        "--verbose",
         "--system-prompt", system_prompt,
         "--allowedTools", "Read,Edit,Write,Bash",
         "--permission-mode", "acceptEdits",
@@ -224,6 +231,8 @@ class AgentServer:
         }
 
     def list_assignments(self) -> dict:
+        from coord.worker_events import is_stream_json, parse_log
+
         with self._lock:
             assignments = list(self._assignments.values())
         active = []
@@ -234,8 +243,32 @@ class AgentServer:
                 prog = self.progress(a.id)
                 if prog:
                     d["progress"] = prog
+                # Tail-read stream-json log for live summary fields.
+                if a.log_path and is_stream_json(a.log_path):
+                    try:
+                        summary = parse_log(a.log_path)
+                    except OSError:
+                        summary = None
+                    if summary is not None:
+                        d["model_used"] = summary.model_used
+                        d["turns"] = summary.num_turns
+                        d["cost_so_far"] = summary.total_cost_usd
+                        d["last_tool"] = summary.last_tool
+                        d["rate_limited"] = summary.rate_limited
                 active.append(d)
             else:
+                # For terminal assignments, parse the whole log (tail_bytes=0)
+                # so we can report final totals reliably.
+                if a.log_path and is_stream_json(a.log_path):
+                    try:
+                        summary = parse_log(a.log_path, tail_bytes=0)
+                    except OSError:
+                        summary = None
+                    if summary is not None:
+                        d["model_used"] = summary.model_used
+                        d["total_cost_usd"] = summary.total_cost_usd
+                        d["num_turns"] = summary.num_turns
+                        d["stop_reason"] = summary.stop_reason
                 completed.append(d)
         return {"active": active, "completed": completed}
 

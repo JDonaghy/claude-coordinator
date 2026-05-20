@@ -82,6 +82,15 @@ class TestDefaultWorkerCommand:
         system_prompt = argv[idx + 1]
         assert WORKER_SYSTEM_PROMPT in system_prompt
 
+    def test_stream_json_flags_present(self) -> None:
+        """Workers must launch with stream-json output for observability."""
+        spec = _spec()
+        argv = default_worker_command(spec)
+        assert "--output-format" in argv
+        idx = argv.index("--output-format")
+        assert argv[idx + 1] == "stream-json"
+        assert "--verbose" in argv
+
 
 # ── Config parsing ───────────────────────────────────────────────────────────
 

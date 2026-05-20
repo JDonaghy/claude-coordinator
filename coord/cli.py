@@ -1099,12 +1099,18 @@ def assign(
     help="Fetch from this machine over the network (otherwise auto-resolved).",
 )
 @click.option("--local", "force_local", is_flag=True, help="Read from local ~/.coord/logs only.")
+@click.option(
+    "--raw",
+    is_flag=True,
+    help="Dump the raw log (NDJSON for stream-json workers) instead of the human-readable rendering.",
+)
 def log(
     assignment_id: str,
     config_path: Path,
     follow: bool,
     machine_filter: str | None,
     force_local: bool,
+    raw: bool,
 ) -> None:
     from coord.state import load_dispatched
 
@@ -1134,13 +1140,58 @@ def log(
                 )
 
     if target_machine is None:
-        _log_local(assignment_id, follow)
+        _log_local(assignment_id, follow, raw=raw)
         return
 
-    _log_remote(target_machine, assignment_id, follow)
+    _log_remote(target_machine, assignment_id, follow, raw=raw)
 
 
-def _log_local(assignment_id: str, follow: bool) -> None:
+def _emit_log_text(text: str, *, raw: bool) -> None:
+    """Print *text* either as-is (raw mode or plain-text log) or rendered."""
+    if not text:
+        return
+    if raw:
+        click.echo(text, nl=False)
+        return
+
+    from coord.worker_events import parse_event, render_event
+
+    # Detect format heuristically: if the first non-blank, non-comment line
+    # looks like JSON, treat the whole chunk as stream-json. Otherwise pass
+    # through unchanged (plain-text fallback for legacy workers).
+    is_json = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        is_json = stripped.startswith("{")
+        break
+
+    if not is_json:
+        click.echo(text, nl=False)
+        return
+
+    turn_counter = [0]
+    for raw_line in text.splitlines():
+        stripped = raw_line.lstrip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            # Pass through the agent's header comment lines unchanged so the
+            # user can still see argv and any pull-dep notes.
+            click.echo(raw_line)
+            continue
+        event = parse_event(raw_line)
+        if event is None:
+            # Couldn't parse — show verbatim so nothing is silently dropped.
+            click.echo(raw_line)
+            continue
+        rendered = render_event(event, turn_counter=turn_counter)
+        if rendered is not None:
+            click.echo(rendered)
+
+
+def _log_local(assignment_id: str, follow: bool, *, raw: bool = False) -> None:
     from coord.agent import DEFAULT_STATE_DIR
     import time as _time
 
@@ -1155,18 +1206,46 @@ def _log_local(assignment_id: str, follow: bool) -> None:
         sys.exit(1)
 
     if follow:
+        from coord.worker_events import parse_event, render_event
+
+        is_json: bool | None = None
+        turn_counter = [0]
+
         with open(log_path) as f:
             while True:
                 line = f.readline()
-                if line:
-                    click.echo(line, nl=False)
-                else:
+                if not line:
                     _time.sleep(0.3)
+                    continue
+                if raw:
+                    click.echo(line, nl=False)
+                    continue
+                stripped = line.lstrip()
+                if is_json is None:
+                    if not stripped:
+                        continue
+                    if stripped.startswith("#"):
+                        click.echo(line, nl=False)
+                        continue
+                    is_json = stripped.startswith("{")
+                if not is_json:
+                    click.echo(line, nl=False)
+                    continue
+                if stripped.startswith("#"):
+                    click.echo(line, nl=False)
+                    continue
+                event = parse_event(line)
+                if event is None:
+                    click.echo(line, nl=False)
+                    continue
+                rendered = render_event(event, turn_counter=turn_counter)
+                if rendered is not None:
+                    click.echo(rendered)
     else:
-        click.echo(log_path.read_text(), nl=False)
+        _emit_log_text(log_path.read_text(), raw=raw)
 
 
-def _log_remote(machine, assignment_id: str, follow: bool) -> None:
+def _log_remote(machine, assignment_id: str, follow: bool, *, raw: bool = False) -> None:
     from coord.network import fetch_log
     import time as _time
 
@@ -1184,7 +1263,7 @@ def _log_remote(machine, assignment_id: str, follow: bool) -> None:
             err=True,
         )
         sys.exit(1)
-    click.echo(body.decode("utf-8", errors="replace"), nl=False)
+    _emit_log_text(body.decode("utf-8", errors="replace"), raw=raw)
     since = len(body)
 
     if not follow:
@@ -1201,7 +1280,7 @@ def _log_remote(machine, assignment_id: str, follow: bool) -> None:
             click.echo(f"\n(stream interrupted: HTTP {status_code})", err=True)
             return
         if body:
-            click.echo(body.decode("utf-8", errors="replace"), nl=False)
+            _emit_log_text(body.decode("utf-8", errors="replace"), raw=raw)
             since += len(body)
 
 
