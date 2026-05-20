@@ -79,6 +79,10 @@ class TestRepoConfig:
         assert cfg.repo("api").build_command is None
         assert cfg.repo("api").test_command is None
 
+    @pytest.mark.skipif(
+        not (Path(__file__).resolve().parents[1] / "coordinator.yml").exists(),
+        reason="coordinator.yml is gitignored",
+    )
     def test_example_config_parses(self) -> None:
         cfg = load(Path(__file__).resolve().parents[1] / "coordinator.yml")
         assert any(r.build_command for r in cfg.repos)

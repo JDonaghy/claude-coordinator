@@ -125,7 +125,8 @@ class TestAssignDispatch:
         with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
              patch("coord.dispatch.dispatch", return_value={"id": "abc-123"}) as disp, \
              patch("coord.github_ops.post_issue_comment") as post_comment, \
-             patch("coord.github_ops.check_branch_exists", return_value=False):
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
             result = CliRunner().invoke(
                 main,
                 ["assign", "laptop", "api", "7", "--config", str(config_file)],
@@ -146,7 +147,8 @@ class TestAssignDispatch:
         with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
              patch("coord.dispatch.dispatch", return_value={"id": "rec-1"}), \
              patch("coord.github_ops.post_issue_comment"), \
-             patch("coord.github_ops.check_branch_exists", return_value=False):
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
             result = CliRunner().invoke(
                 main,
                 ["assign", "laptop", "api", "7", "--config", str(config_file)],
@@ -164,7 +166,8 @@ class TestAssignDispatch:
         with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
              patch("coord.dispatch.dispatch", return_value={"id": "b-1"}) as disp, \
              patch("coord.github_ops.post_issue_comment"), \
-             patch("coord.github_ops.check_branch_exists", return_value=False):
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
             result = CliRunner().invoke(
                 main,
                 [
@@ -230,6 +233,7 @@ class TestAssignDispatch:
         with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
              patch("coord.dispatch.dispatch", return_value={"id": "ok-1"}), \
              patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None), \
              patch(
                  "coord.github_ops.post_issue_comment",
                  side_effect=RuntimeError("rate limited"),

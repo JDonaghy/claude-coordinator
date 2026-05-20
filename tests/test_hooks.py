@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from click.testing import CliRunner
 
 from coord.cli import main
@@ -57,6 +59,10 @@ class TestHooksConfig:
         with pytest.raises(ConfigError, match="unknown hooks"):
             load(p)
 
+    @pytest.mark.skipif(
+        not (Path(__file__).resolve().parents[1] / "coordinator.yml").exists(),
+        reason="coordinator.yml is gitignored",
+    )
     def test_example_config_parses_hooks(self) -> None:
         cfg = load(Path(__file__).resolve().parents[1] / "coordinator.yml")
         assert "summary_report" in cfg.hooks.on_round_complete

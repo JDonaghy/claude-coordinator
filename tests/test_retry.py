@@ -57,6 +57,10 @@ class TestConcurrencyConfig:
         with pytest.raises(ConfigError, match="non-negative"):
             load(p)
 
+    @pytest.mark.skipif(
+        not (Path(__file__).resolve().parents[1] / "coordinator.yml").exists(),
+        reason="coordinator.yml is gitignored",
+    )
     def test_example_config_parses(self) -> None:
         cfg = load(Path(__file__).resolve().parents[1] / "coordinator.yml")
         assert cfg.concurrency.max_workers >= 1
