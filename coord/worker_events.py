@@ -60,6 +60,12 @@ class WorkerSummary:
     files_edited: list[str] = field(default_factory=list)
     bash_commands: list[str] = field(default_factory=list)
     duration_ms: int | None = None
+    # Token counts from the result event (may be zero if the log predates
+    # token reporting or the worker didn't emit usage data).
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -76,6 +82,10 @@ class WorkerSummary:
             "files_edited": list(self.files_edited),
             "bash_commands": list(self.bash_commands),
             "duration_ms": self.duration_ms,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
         }
 
 
@@ -325,6 +335,28 @@ def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
                         or json.dumps(d, sort_keys=True)
                     )
                     summary.permission_denials.append(str(label))
+        # Extract token counts. Claude may report them under a nested
+        # ``usage`` object or at the top level — try both forms.
+        usage_obj = raw.get("usage") or {}
+        if not isinstance(usage_obj, dict):
+            usage_obj = {}
+
+        def _tok(key: str, *alt_keys: str) -> int:
+            """Return first non-zero int found across key variants."""
+            for k in (key, *alt_keys):
+                v = usage_obj.get(k) or raw.get(k)
+                if isinstance(v, int) and v > 0:
+                    return v
+            return 0
+
+        summary.input_tokens = _tok("input_tokens")
+        summary.output_tokens = _tok("output_tokens")
+        summary.cache_creation_tokens = _tok(
+            "cache_creation_input_tokens", "cache_creation_tokens"
+        )
+        summary.cache_read_tokens = _tok(
+            "cache_read_input_tokens", "cache_read_tokens"
+        )
         return
 
 

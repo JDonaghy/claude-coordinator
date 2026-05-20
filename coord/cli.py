@@ -781,18 +781,42 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     click.echo(f"      error: {e.error}")
 
     notified = load_notified()
-    if not notified:
-        return
+    if notified:
+        dispatched_by_id = {r["assignment_id"]: r for r in load_dispatched()}
+        items = sorted(notified.items(), key=lambda kv: kv[1].get("posted_at", 0), reverse=True)[:5]
+        click.echo("")
+        click.echo("Recent issue comment activity:")
+        for aid, info in items:
+            record = dispatched_by_id.get(aid, {})
+            repo = record.get("repo_github", "?")
+            issue = record.get("issue_number", "?")
+            click.echo(f"  [{info['event']}] {repo}#{issue} (assignment {aid})")
 
-    dispatched_by_id = {r["assignment_id"]: r for r in load_dispatched()}
-    items = sorted(notified.items(), key=lambda kv: kv[1].get("posted_at", 0), reverse=True)[:5]
-    click.echo("")
-    click.echo("Recent issue comment activity:")
-    for aid, info in items:
-        record = dispatched_by_id.get(aid, {})
-        repo = record.get("repo_github", "?")
-        issue = record.get("issue_number", "?")
-        click.echo(f"  [{info['event']}] {repo}#{issue} (assignment {aid})")
+    # Burn-rate warning: show a one-liner when spend rate is high.
+    try:
+        from coord.state import load_session
+        from coord.usage import build_session_usage, format_burn_rate_line
+        import datetime
+
+        sess = load_session()
+        started_at: float | None = None
+        if sess and sess.get("started_at"):
+            try:
+                dt = datetime.datetime.fromisoformat(
+                    sess["started_at"].rstrip("Z").replace("Z", "+00:00")
+                )
+                started_at = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+            except (ValueError, AttributeError):
+                pass
+
+        all_assignments = list(board.active) + list(board.completed)
+        session_usage = build_session_usage(all_assignments, started_at=started_at)
+        burn_line = format_burn_rate_line(session_usage)
+        if burn_line:
+            click.echo("")
+            click.echo(burn_line)
+    except (ImportError, OSError, ValueError, KeyError):
+        pass  # Never let usage tracking break the status command.
 
 
 @main.command(help="Brain proposes assignments for idle machines.")
@@ -2020,20 +2044,31 @@ def done(config_path: Path) -> None:
 
     save_board(board)
 
-    # Write session end summary
-    from coord.state import write_session_end, COORD_DIR as _COORD_DIR
-    from coord.worker_events import parse_log, is_stream_json
+    # Write session end summary — use the usage module so the output matches `coord usage`.
+    import datetime
+    from coord.state import write_session_end, load_session
+    from coord.usage import build_session_usage, format_usage_report
+
+    sess = load_session()
+    started_at: float | None = None
+    if sess and sess.get("started_at"):
+        try:
+            dt = datetime.datetime.fromisoformat(
+                sess["started_at"].rstrip("Z").replace("Z", "+00:00")
+            )
+            started_at = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+        except (ValueError, AttributeError):
+            pass
+
+    all_assignments = list(board.active) + list(board.completed)
+    session_usage = build_session_usage(all_assignments, started_at=started_at)
+    total_cost = session_usage.total_cost_usd
+
+    click.echo("")
+    click.echo(format_usage_report(session_usage))
 
     completed_ids = [a.assignment_id for a in board.completed if a.assignment_id]
     issues_closed = list(set(a.issue_number for a in board.completed))
-    total_cost = 0.0
-    for a in board.completed:
-        if a.assignment_id:
-            log_path = _COORD_DIR / "logs" / f"{a.assignment_id}.log"
-            if log_path.exists() and is_stream_json(log_path):
-                summary = parse_log(log_path)
-                total_cost += summary.total_cost_usd
-
     write_session_end(
         completed_ids=completed_ids,
         issues_closed=issues_closed,
@@ -2067,6 +2102,74 @@ def session() -> None:
         click.echo(f"Session in progress (started {started})")
         click.echo(f"  clean_shutdown: false (crash recovery may be needed)")
         click.echo(f"  Run: coord resume")
+
+
+@main.command(help="Show per-assignment and per-model cost breakdown with burn rate.")
+@_CONFIG_OPTION
+@click.option(
+    "--remote",
+    is_flag=True,
+    help="Fetch cost data from agent servers for assignments without local logs.",
+)
+@click.option(
+    "--timeout",
+    default=3.0,
+    show_default=True,
+    type=float,
+    help="Per-machine HTTP timeout for --remote lookups (seconds).",
+)
+def usage(config_path: Path, remote: bool, timeout: float) -> None:
+    from coord.state import build_board, load_board, load_session
+    from coord.usage import build_session_usage, format_usage_report
+
+    board = load_board() or build_board()
+    all_assignments = list(board.active) + list(board.completed)
+
+    # Resolve session start time from session.json
+    started_at: float | None = None
+    sess = load_session()
+    if sess and sess.get("started_at"):
+        import datetime
+        try:
+            dt = datetime.datetime.fromisoformat(
+                sess["started_at"].rstrip("Z").replace("Z", "+00:00")
+            )
+            started_at = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+        except (ValueError, AttributeError):
+            pass
+
+    # Optionally fetch remote cost data for assignments without local logs.
+    remote_by_id: dict[str, dict] = {}
+    if remote and all_assignments:
+        cfg = _load_config(config_path)
+        from coord.network import fetch_status
+
+        # Build a map from machine_name → assignments on that machine.
+        by_machine: dict[str, list] = {}
+        for a in all_assignments:
+            if a.assignment_id:
+                by_machine.setdefault(a.machine_name, []).append(a)
+
+        for machine in cfg.machines:
+            if machine.name not in by_machine:
+                continue
+            try:
+                data = fetch_status(machine, timeout=timeout)
+            except Exception:
+                continue
+            if not data:
+                continue
+            for entry in (data.get("active") or []) + (data.get("completed") or []):
+                aid = entry.get("id") or entry.get("assignment_id")
+                if aid:
+                    remote_by_id[aid] = entry
+
+    session = build_session_usage(
+        all_assignments,
+        remote_by_id=remote_by_id if remote_by_id else None,
+        started_at=started_at,
+    )
+    click.echo(format_usage_report(session))
 
 
 @main.command(help="Start the web dashboard (port 7434).")
