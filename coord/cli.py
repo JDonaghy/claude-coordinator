@@ -1039,6 +1039,16 @@ def approve(
     help="Claude model tier (haiku, sonnet, opus). Defaults to models.default.",
 )
 @click.option("--dry-run", is_flag=True, help="Show what would be dispatched.")
+@click.option(
+    "--plan-only",
+    is_flag=True,
+    help=(
+        "Dispatch a read-only planning worker. The worker reads the codebase "
+        "and outputs a structured plan (FILES_READ, FILES_MODIFY, APPROACH, "
+        "RISKS, ESTIMATE) without writing code or modifying files. "
+        "No worktree or feature branch is created."
+    ),
+)
 def assign(
     machine: str,
     repo: str,
@@ -1047,6 +1057,7 @@ def assign(
     briefing: str,
     model: str | None,
     dry_run: bool,
+    plan_only: bool,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -1105,9 +1116,12 @@ def assign(
         rationale="manual assignment via coord assign",
         briefing=briefing,
         model=resolved_model,
+        type="plan" if plan_only else "work",
     )
 
     click.echo(f"{machine} → {repo} #{issue}: {issue_title}")
+    if plan_only:
+        click.echo("  mode: plan-only (read-only, no worktree)")
     if resolved_model:
         click.echo(f"  model: {resolved_model}")
 

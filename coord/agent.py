@@ -133,6 +133,27 @@ output a status line in exactly this format:
   Then wait for guidance rather than trying a third approach.\
 """
 
+WORKER_PLAN_PROMPT = """\
+You are a Claude Code planning worker. Read the codebase and produce a \
+structured implementation plan. Do NOT write code, create files, or modify \
+anything — read and analyse only.
+
+Output your plan using exactly these headings:
+
+FILES_READ: <comma-separated list of every file you examined>
+FILES_MODIFY: <comma-separated list of files that would need to change>
+APPROACH: <concise description of the implementation approach (3-5 sentences)>
+RISKS: <potential blockers, conflicts, or tricky areas>
+ESTIMATE: <rough complexity: trivial | small | medium | large>
+
+Rules:
+- Do NOT run gh commands.
+- Do NOT write, edit, or create any files.
+- Do NOT commit or push anything.
+- Use Read and Bash (read-only commands like grep, find, cat) only.
+- After reading the issue body and relevant code, output the plan and stop.\
+"""
+
 WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 
@@ -170,15 +191,25 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     Uses ``--output-format stream-json --verbose`` so the agent log captures
     one structured JSON event per line. Downstream tooling
     (:mod:`coord.worker_events`) parses these for real-time observability.
+
+    For ``type="plan"`` specs the worker gets :data:`WORKER_PLAN_PROMPT` as
+    its system prompt and only ``Read,Bash`` in ``--allowedTools`` — no
+    Edit/Write tools so it cannot modify the repository.
     """
-    system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
-    system_prompt += build_deny_prompt(spec.deny_commands)
+    if spec.type == "plan":
+        system_prompt = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
+        allowed_tools = "Read,Bash"
+    else:
+        system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
+        system_prompt += build_deny_prompt(spec.deny_commands)
+        allowed_tools = "Read,Edit,Write,Bash"
+
     argv = [
         binary, "-p",
         "--output-format", "stream-json",
         "--verbose",
         "--system-prompt", system_prompt,
-        "--allowedTools", "Read,Edit,Write,Bash",
+        "--allowedTools", allowed_tools,
         "--permission-mode", "acceptEdits",
     ]
     if spec.model:
@@ -335,6 +366,25 @@ class AgentServer:
             status=PENDING,
         )
         assignment.log_path = str(self.log_dir / f"{assignment.id}.log")
+
+        if spec.type == "plan":
+            # Read-only planning run — skip worktree creation, run directly in
+            # the main repo checkout so no branch is created or modified.
+            with self._lock:
+                self._assignments[assignment.id] = assignment
+            self._persist()
+
+            if spec.pull_repos:
+                thread = threading.Thread(
+                    target=self._pull_then_spawn,
+                    args=(assignment, repo_path),
+                    daemon=True,
+                    name=f"agent-pull-{assignment.id}",
+                )
+                thread.start()
+            else:
+                self._spawn(assignment, repo_path)
+            return assignment
 
         # Create worktree for isolation
         try:
