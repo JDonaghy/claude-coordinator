@@ -81,6 +81,12 @@ class Assignment:
     # a plain dict (the serialised form of WorkerPlan.to_dict()) so it round-
     # trips cleanly through JSON without a custom encoder.
     plan: dict | None = None
+    # Review lifecycle state for type="work" assignments.
+    # None  — not applicable (review/smoke/plan assignments, or pre-feature boards)
+    # "pending"    — work done, review not yet dispatched
+    # "dispatched" — review assignment is in flight
+    # "done"       — review assignment completed
+    review_state: str | None = None
 
 
 @dataclass

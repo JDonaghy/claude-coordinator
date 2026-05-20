@@ -164,8 +164,20 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 finished_at=entry.get("finished_at"),
                 branch=branch,
             )
-            if done is not None and getattr(done, "type", "work") == "work":
-                newly_done_work.append(done)
+            if done is not None:
+                if done.type == "work":
+                    # Always mark work completions as pending review so the
+                    # dispatch loop below (and future reconcile passes) can
+                    # pick them up reliably.
+                    done.review_state = "pending"
+                    newly_done_work.append(done)
+                elif done.type == "review":
+                    # A review finished — update the original work assignment.
+                    orig_id = done.review_of_assignment_id
+                    if orig_id:
+                        orig = board.find_by_id(orig_id)
+                        if orig is not None:
+                            orig.review_state = "done"
         else:
             failed = board.mark_failed_by_id(
                 a.assignment_id,
@@ -175,14 +187,21 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 newly_failed.append(failed)
         changed.append(a.assignment_id)
 
-    # Auto-dispatch reviews for any work assignments that just finished.
-    if getattr(config, "reviews", None) and config.reviews.enabled and config.reviews.auto_dispatch:
-        from coord.review import dispatch_review
+    # Dispatch pending reviews for all completed work assignments.
+    # We iterate board.completed (not just newly-done) so that a failed
+    # dispatch on a previous reconcile pass is retried here automatically.
+    from coord.review import dispatch_review
 
-        for completed in newly_done_work:
-            review = dispatch_review(completed, board, config)
-            if review is not None and review.assignment_id is not None:
+    for completed in board.completed:
+        if completed.review_state != "pending":
+            continue
+        review = dispatch_review(completed, board, config)
+        if review is not None:
+            completed.review_state = "dispatched"
+            if review.assignment_id is not None:
                 changed.append(review.assignment_id)
+        # If review is None (auto_dispatch off, machine unreachable, no branch,
+        # etc.) leave review_state as "pending" so the next reconcile retries.
 
     # Auto-queue smoke tests for any work assignments that just finished.
     # Independent of review dispatch — both can fire for the same completion.

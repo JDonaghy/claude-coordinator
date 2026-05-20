@@ -780,6 +780,24 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 if e.error:
                     click.echo(f"      error: {e.error}")
 
+    # Show completed work assignments with review lifecycle state.
+    _REVIEW_STATE_TAGS = {
+        "pending": "[awaiting review]",
+        "dispatched": "[review dispatched]",
+        "done": "[review done]",
+    }
+    work_completed = [a for a in board.completed if a.type == "work"]
+    if work_completed:
+        by_time = sorted(work_completed, key=lambda a: a.finished_at or 0, reverse=True)[:10]
+        click.echo("")
+        click.echo("Completed work assignments:")
+        for a in by_time:
+            rs_tag = _REVIEW_STATE_TAGS.get(a.review_state or "", "")
+            rs_suffix = f"  {rs_tag}" if rs_tag else ""
+            click.echo(
+                f"  #{a.issue_number}: {a.issue_title} ({a.repo_name}){rs_suffix}"
+            )
+
     notified = load_notified()
     if notified:
         dispatched_by_id = {r["assignment_id"]: r for r in load_dispatched()}
