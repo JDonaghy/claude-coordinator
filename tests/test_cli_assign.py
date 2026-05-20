@@ -47,6 +47,7 @@ def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(state_mod, "DISPATCHED_FILE", d / "dispatched.json")
     monkeypatch.setattr(state_mod, "NOTIFIED_FILE", d / "notified.json")
     monkeypatch.setattr(state_mod, "BOARD_FILE", d / "board.json")
+    monkeypatch.setattr(state_mod, "SESSION_FILE", d / "session.json")
     monkeypatch.setattr(mq, "QUEUE_FILE", d / "merge_queue.json")
     return d
 

@@ -22,7 +22,7 @@ SESSION_FILE = COORD_DIR / "session.json"
 
 def write_session_start() -> None:
     """Write session.json with clean_shutdown=False. Called on first dispatch."""
-    COORD_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "started_at": datetime.utcnow().isoformat() + "Z",
         "clean_shutdown": False,
@@ -46,7 +46,7 @@ def write_session_end(
         "issues_closed": issues_closed,
         "total_cost_usd": total_cost_usd,
     }
-    COORD_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
     SESSION_FILE.write_text(json.dumps(data, indent=2) + "\n")
 
 
