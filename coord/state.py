@@ -141,6 +141,7 @@ def record_dispatched(
             "briefing": proposal.briefing,
             "model": proposal.model,
             "type": proposal.type,
+            "required_gates": list(proposal.required_gates),
             "dispatched_at": time.time(),
         }
     )
@@ -178,6 +179,7 @@ def record_dispatched_assignment(
             # that triggered this follow-up. Used by build_board to infer
             # review_state without loading the in-memory board.
             "review_of_assignment_id": assignment.review_of_assignment_id,
+            "required_gates": list(assignment.required_gates),
         }
     )
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -316,6 +318,7 @@ def build_board(
             type=record.get("type", "work"),
             plan=plans.get(aid),
             review_of_assignment_id=record.get("review_of_assignment_id"),
+            required_gates=record.get("required_gates", []),
         )
         n = notified.get(aid)
         if n:

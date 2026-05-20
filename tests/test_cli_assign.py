@@ -31,6 +31,26 @@ machines:
       api: /tmp/api
 """
 
+# Config with pipeline.labels defined to test label→gate resolution.
+CONFIG_YAML_WITH_PIPELINE = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+pipeline:
+  default_gates: [review, merge]
+  labels:
+    documentation: [merge]
+    hotfix: [merge]
+    needs-smoke: [review, smoke, merge]
+"""
+
 
 @pytest.fixture
 def config_file(tmp_path: Path) -> Path:
@@ -246,3 +266,118 @@ class TestAssignDispatch:
         assert result.exit_code == 0
         assert "dispatched" in result.output
         assert "briefing post failed" in result.output
+
+
+class TestAssignLabelGateResolution:
+    """Tests for label→required_gates resolution in coord assign (cli.py:1200-1207)."""
+
+    @pytest.fixture
+    def pipeline_config_file(self, tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(CONFIG_YAML_WITH_PIPELINE)
+        return p
+
+    def test_documentation_label_resolves_to_merge_only(
+        self, pipeline_config_file: Path, coord_dir: Path
+    ) -> None:
+        """Issue with 'documentation' label → required_gates=["merge"] (skip review)."""
+        issue_payload = {
+            "title": "Update docs",
+            "body": "Documentation update",
+            "labels": [{"name": "documentation"}],
+        }
+        with patch("coord.github_ops.get_issue", return_value=issue_payload), \
+             patch("coord.dispatch.dispatch", return_value={"id": "doc-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "20", "--config", str(pipeline_config_file)],
+            )
+        assert result.exit_code == 0
+        proposal = disp.call_args[0][0]
+        assert proposal.required_gates == ["merge"]
+
+    def test_hotfix_label_resolves_to_merge_only(
+        self, pipeline_config_file: Path, coord_dir: Path
+    ) -> None:
+        issue_payload = {
+            "title": "Hotfix auth",
+            "body": "",
+            "labels": [{"name": "hotfix"}],
+        }
+        with patch("coord.github_ops.get_issue", return_value=issue_payload), \
+             patch("coord.dispatch.dispatch", return_value={"id": "hf-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "21", "--config", str(pipeline_config_file)],
+            )
+        assert result.exit_code == 0
+        proposal = disp.call_args[0][0]
+        assert proposal.required_gates == ["merge"]
+
+    def test_needs_smoke_label_resolves_to_full_pipeline(
+        self, pipeline_config_file: Path, coord_dir: Path
+    ) -> None:
+        issue_payload = {
+            "title": "Big feature",
+            "body": "",
+            "labels": [{"name": "needs-smoke"}],
+        }
+        with patch("coord.github_ops.get_issue", return_value=issue_payload), \
+             patch("coord.dispatch.dispatch", return_value={"id": "ns-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "22", "--config", str(pipeline_config_file)],
+            )
+        assert result.exit_code == 0
+        proposal = disp.call_args[0][0]
+        assert proposal.required_gates == ["review", "smoke", "merge"]
+
+    def test_unrecognized_label_falls_back_to_default_gates(
+        self, pipeline_config_file: Path, coord_dir: Path
+    ) -> None:
+        """Labels not in pipeline.labels fall back to pipeline.default_gates."""
+        issue_payload = {
+            "title": "Fix bug",
+            "body": "",
+            "labels": [{"name": "bug"}],
+        }
+        with patch("coord.github_ops.get_issue", return_value=issue_payload), \
+             patch("coord.dispatch.dispatch", return_value={"id": "bug-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "23", "--config", str(pipeline_config_file)],
+            )
+        assert result.exit_code == 0
+        proposal = disp.call_args[0][0]
+        # No matching label → default_gates from config
+        assert proposal.required_gates == ["review", "merge"]
+
+    def test_no_labels_falls_back_to_default_gates(
+        self, pipeline_config_file: Path, coord_dir: Path
+    ) -> None:
+        """Issue with no labels falls back to pipeline.default_gates."""
+        issue_payload = {"title": "Unlabeled issue", "body": "", "labels": []}
+        with patch("coord.github_ops.get_issue", return_value=issue_payload), \
+             patch("coord.dispatch.dispatch", return_value={"id": "nolabel-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "24", "--config", str(pipeline_config_file)],
+            )
+        assert result.exit_code == 0
+        proposal = disp.call_args[0][0]
+        assert proposal.required_gates == ["review", "merge"]
