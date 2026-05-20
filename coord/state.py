@@ -164,10 +164,15 @@ def mark_notified(
     assignment_id: str,
     event: str,
     path: Path | None = None,
+    *,
+    branch: str | None = None,
 ) -> None:
     p = path or NOTIFIED_FILE
     data = load_notified(p)
-    data[assignment_id] = {"event": event, "posted_at": time.time()}
+    entry: dict = {"event": event, "posted_at": time.time()}
+    if branch:
+        entry["branch"] = branch
+    data[assignment_id] = entry
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2) + "\n")
 
@@ -243,6 +248,8 @@ def build_board(
         if n:
             a.status = "done" if n["event"] == EVENT_COMPLETION else "failed"
             a.finished_at = n.get("posted_at")
+            if n.get("branch"):
+                a.branch = n["branch"]
             board.completed.append(a)
         else:
             board.active.append(a)

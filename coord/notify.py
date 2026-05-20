@@ -232,7 +232,11 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             error=entry.get("error") or "",
             **common,
         )
-    mark_notified(transition.assignment_id, transition.event)
+    mark_notified(
+        transition.assignment_id,
+        transition.event,
+        branch=entry.get("branch"),
+    )
 
 
 def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:

@@ -139,6 +139,46 @@ class TestRun:
         assert "bad config" in body
 
 
+class TestBranchCapture:
+    def test_branch_stored_in_notified_ledger(self, coord_dir: Path, config: Config) -> None:
+        _record(coord_dir, "abc")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("abc", "done", branch="issue-42-fix")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        notified = state_mod.load_notified()
+        assert notified["abc"]["branch"] == "issue-42-fix"
+
+    def test_branch_propagates_to_build_board(self, coord_dir: Path, config: Config) -> None:
+        _record(coord_dir, "abc")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("abc", "done", branch="issue-42-fix")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        board = state_mod.build_board()
+        assert len(board.completed) == 1
+        assert board.completed[0].branch == "issue-42-fix"
+
+    def test_no_branch_still_works(self, coord_dir: Path, config: Config) -> None:
+        _record(coord_dir, "abc")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("abc", "done")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        board = state_mod.build_board()
+        assert len(board.completed) == 1
+        assert board.completed[0].branch is None
+
+
 class TestDispatchedLedger:
     def test_record_and_load_roundtrip(self, coord_dir: Path) -> None:
         _record(coord_dir, "abc")
