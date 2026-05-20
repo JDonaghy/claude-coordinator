@@ -23,8 +23,15 @@ def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dic
 
 def _reassign(
     failed: Assignment, board: Board, config: Config,
+    *,
+    model: str | None = None,
 ) -> Assignment | None:
-    """Re-dispatch a failed assignment to an idle different machine."""
+    """Re-dispatch a failed assignment to an idle different machine.
+
+    *model* overrides the model tier on the retry. When None, the
+    original assignment's model is reused (escalation happens at the call
+    site).
+    """
     busy = {a.machine_name for a in board.active if a.status == "running"}
     candidates = [
         m for m in config.machines
@@ -46,6 +53,8 @@ def _reassign(
     machine = candidates[0]
     repo_path = machine.repo_path(failed.repo_name)
 
+    retry_model = model if model is not None else failed.model
+
     payload = {
         "repo_name": failed.repo_name,
         "repo_path": repo_path,
@@ -56,6 +65,7 @@ def _reassign(
         "files_forbidden": failed.files_forbidden,
         "pull_repos": [],
         "type": "work",
+        "model": retry_model,
     }
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
@@ -78,6 +88,7 @@ def _reassign(
         status="running",
         dispatched_at=time.time(),
         type="work",
+        model=retry_model,
     )
     board.active.append(retry_assignment)
     return retry_assignment

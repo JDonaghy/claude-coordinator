@@ -96,6 +96,7 @@ def record_dispatched(
             "issue_title": proposal.issue_title,
             "files_likely": list(proposal.files_likely),
             "briefing": proposal.briefing,
+            "model": proposal.model,
             "dispatched_at": time.time(),
         }
     )
@@ -194,6 +195,7 @@ def build_board(
             assignment_id=aid,
             status="running",
             dispatched_at=record.get("dispatched_at"),
+            model=record.get("model"),
         )
         n = notified.get(aid)
         if n:

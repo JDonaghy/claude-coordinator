@@ -871,6 +871,9 @@ def approve(
 
     for p in selected:
         click.echo(f"[{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
+        # Resolve model so the dispatched record and board reflect what ran.
+        if not p.model:
+            p.model = cfg.models.default
         if dry_run:
             click.echo("     (dry run — not dispatched)")
             continue
@@ -955,6 +958,11 @@ def approve(
 @click.argument("issue", type=int)
 @_CONFIG_OPTION
 @click.option("--briefing", default="", help="Optional briefing text for the worker.")
+@click.option(
+    "--model",
+    default=None,
+    help="Claude model tier (haiku, sonnet, opus). Defaults to models.default.",
+)
 @click.option("--dry-run", is_flag=True, help="Show what would be dispatched.")
 def assign(
     machine: str,
@@ -962,6 +970,7 @@ def assign(
     issue: int,
     config_path: Path,
     briefing: str,
+    model: str | None,
     dry_run: bool,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
@@ -1009,6 +1018,9 @@ def assign(
     # Build a Proposal inline
     from coord.models import Proposal
 
+    # Resolve model: --model flag → config default → None (let claude pick).
+    resolved_model = model if model else cfg.models.default
+
     proposal = Proposal(
         id=0,
         machine_name=machine,
@@ -1017,9 +1029,12 @@ def assign(
         issue_title=issue_title,
         rationale="manual assignment via coord assign",
         briefing=briefing,
+        model=resolved_model,
     )
 
     click.echo(f"{machine} → {repo} #{issue}: {issue_title}")
+    if resolved_model:
+        click.echo(f"  model: {resolved_model}")
 
     if dry_run:
         click.echo("  (dry run — not dispatched)")
@@ -1307,7 +1322,13 @@ def retry(assignment_id: str, config_path: Path) -> None:
         )
         sys.exit(1)
 
-    result = _reassign(assignment, board, cfg)
+    # Determine escalated model for the retry.
+    original_model = assignment.model or cfg.models.default
+    escalated = cfg.models.next_model(original_model)
+    if escalated != original_model:
+        click.echo(f"  escalating model: {original_model} → {escalated}")
+
+    result = _reassign(assignment, board, cfg, model=escalated)
     if result is None:
         click.echo("error: no available machine to retry on", err=True)
         sys.exit(1)
@@ -1832,8 +1853,13 @@ def _dispatch_followup(
     briefing: str,
     *,
     issue_suffix: str = "",
+    model: str | None = None,
 ) -> str:
-    """Dispatch a follow-up assignment for an existing assignment. Returns assignment ID."""
+    """Dispatch a follow-up assignment for an existing assignment. Returns assignment ID.
+
+    *model* overrides the model tier for the follow-up. When None, the
+    dispatcher falls back to ``cfg.models.default``.
+    """
     from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
     from coord.state import build_board, record_dispatched, save_board, load_dispatched
     from coord.models import Proposal
@@ -1850,6 +1876,7 @@ def _dispatch_followup(
         issue_title=original.issue_title,
         rationale=f"follow-up for assignment {original.assignment_id}",
         briefing=briefing,
+        model=model if model else cfg.models.default,
     )
 
     response = dispatch(proposal, cfg)
@@ -1984,8 +2011,14 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
         f"- Commit your fixes and push with git push origin HEAD"
     )
 
+    # Determine escalated model for the fix-up.
+    original_model = assignment.model or cfg.models.default
+    escalated = cfg.models.next_model(original_model)
+    if escalated != original_model:
+        click.echo(f"  escalating model: {original_model} → {escalated}")
+
     try:
-        new_id = _dispatch_followup(cfg, assignment, briefing)
+        new_id = _dispatch_followup(cfg, assignment, briefing, model=escalated)
     except httpx.HTTPError as e:
         click.echo(f"error: dispatch failed: {e}", err=True)
         sys.exit(1)
@@ -2098,8 +2131,14 @@ def resume_stuck(assignment_id: str, config_path: Path, guidance: str) -> None:
         f"- Commit your work and push with git push origin HEAD"
     )
 
+    # Determine escalated model for the continuation worker.
+    original_model = assignment.model or cfg.models.default
+    escalated = cfg.models.next_model(original_model)
+    if escalated != original_model:
+        click.echo(f"  escalating model: {original_model} → {escalated}")
+
     try:
-        new_id = _dispatch_followup(cfg, assignment, briefing)
+        new_id = _dispatch_followup(cfg, assignment, briefing, model=escalated)
     except httpx.HTTPError as e:
         click.echo(f"error: dispatch failed: {e}", err=True)
         sys.exit(1)

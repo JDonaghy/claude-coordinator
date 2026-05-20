@@ -94,6 +94,38 @@ class SmokeTestsConfig:
 
 
 @dataclass
+class ModelsConfig:
+    """Model tier selection and escalation ladder for workers.
+
+    `default` is the model passed to ``claude -p`` when an assignment doesn't
+    specify one.  `escalation` is an ordered list of model aliases (low →
+    high); when a worker fails or gets stuck, the coordinator escalates to
+    the next entry via `next_model`.  `labels` is a per-issue-label override
+    (e.g. ``documentation: haiku``) consumed by the brain / planner.
+    """
+
+    default: str = "sonnet"
+    escalation: list[str] = field(
+        default_factory=lambda: ["haiku", "sonnet", "opus"]
+    )
+    labels: dict[str, str] = field(default_factory=dict)
+
+    def next_model(self, current: str) -> str:
+        """Return the next model in the escalation ladder.
+
+        If *current* is already at the top of the ladder, or isn't on the
+        ladder at all, return *current* unchanged.
+        """
+        try:
+            idx = self.escalation.index(current)
+        except ValueError:
+            return current
+        if idx + 1 < len(self.escalation):
+            return self.escalation[idx + 1]
+        return current
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
@@ -101,6 +133,7 @@ class Config:
     reviews: ReviewsConfig = field(default_factory=ReviewsConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     smoke_tests: SmokeTestsConfig = field(default_factory=SmokeTestsConfig)
+    models: ModelsConfig = field(default_factory=ModelsConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -130,6 +163,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     reviews = _parse_reviews(raw.get("reviews"), {r.name for r in repos})
     concurrency = _parse_concurrency(raw.get("concurrency"))
     smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
+    models = _parse_models(raw.get("models"))
 
     return Config(
         repos=repos,
@@ -138,6 +172,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
         reviews=reviews,
         concurrency=concurrency,
         smoke_tests=smoke_tests,
+        models=models,
         path=p,
     )
 
@@ -437,6 +472,38 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
             )
         rules.append(SmokeRule(files=files, requires=requires))
     cfg.capability_rules = rules
+    return cfg
+
+
+def _parse_models(raw: Any) -> ModelsConfig:
+    if raw is None:
+        return ModelsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'models' must be a mapping")
+
+    cfg = ModelsConfig()
+    if "default" in raw:
+        value = raw["default"]
+        if not isinstance(value, str) or not value:
+            raise ConfigError("models.default must be a non-empty string")
+        cfg.default = value
+
+    if "escalation" in raw:
+        value = raw["escalation"]
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            raise ConfigError("models.escalation must be a list of non-empty strings")
+        cfg.escalation = list(value)
+
+    if "labels" in raw:
+        value = raw["labels"]
+        if not isinstance(value, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+        ):
+            raise ConfigError(
+                "models.labels must be a mapping of label name → model alias"
+            )
+        cfg.labels = dict(value)
+
     return cfg
 
 

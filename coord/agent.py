@@ -56,6 +56,9 @@ class AssignmentSpec:
     review_target: str | None = None
     # Command patterns the worker must not run (prompt-level enforcement).
     deny_commands: list[str] = field(default_factory=list)
+    # Claude model tier alias (e.g. "haiku", "sonnet", "opus"). When None,
+    # the worker command omits --model so claude -p picks its default.
+    model: str | None = None
 
 
 class _GitError(RuntimeError):
@@ -159,13 +162,16 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     """Build the argv for invoking the worker on this assignment."""
     system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
     system_prompt += build_deny_prompt(spec.deny_commands)
-    return [
+    argv = [
         binary, "-p",
         "--system-prompt", system_prompt,
         "--allowedTools", "Read,Edit,Write,Bash",
         "--permission-mode", "acceptEdits",
-        spec.briefing,
     ]
+    if spec.model:
+        argv.extend(["--model", spec.model])
+    argv.append(spec.briefing)
+    return argv
 
 
 class AgentServer:
