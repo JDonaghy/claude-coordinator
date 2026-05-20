@@ -40,12 +40,14 @@ class HooksConfig:
 class ReviewsConfig:
     """Adversarial code review settings.
 
-    `enabled=False` by default — opt-in per project. When enabled, completion
-    of a "work" assignment triggers an automatic review dispatch to a
-    different machine (see coord/review.py).
+    `enabled=True` by default. When enabled, `coord pr` auto-dispatches an
+    adversarial review to a different machine after the PR worker is sent.
+    Completion of a "work" assignment via reconciliation also triggers review
+    dispatch automatically (see coord/review.py). Set `enabled: false` in
+    coordinator.yml to opt out.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     auto_dispatch: bool = True
     require_approval: bool = False
     reviewer_prompt: str = ""
