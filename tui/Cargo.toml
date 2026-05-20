@@ -1,0 +1,17 @@
+[package]
+name = "coord-tui"
+version = "0.1.0"
+edition = "2021"
+description = "TUI dashboard for claude-coordinator (quadraui-powered)"
+
+[[bin]]
+name = "coord-tui"
+path = "src/main.rs"
+
+[dependencies]
+# Path matches ~/src/claude-coordinator/tui/ → ~/src/quadraui/quadraui
+quadraui = { path = "../../quadraui/quadraui", features = ["tui"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# ratatui re-exports crossterm; we use ratatui::crossterm::* for terminal setup
+ratatui = "0.29"
