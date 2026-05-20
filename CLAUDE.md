@@ -134,6 +134,15 @@ The reviewer gets a prompt built from:
 
 The reviewer reads the rules and enforces them against the diff. It does not have the worker's session context — genuinely independent.
 
+## Cost Discipline
+
+The coordinator session (typically Opus) costs ~10x more per token than Sonnet workers. Minimize direct code work in the coordinator — instead, write a good briefing and dispatch it.
+
+- **Dispatch, don't do.** If a task can be described in a briefing, send it to a worker. Reserve the coordinator session for triage, review, and decisions.
+- **Workers are cheap.** Sonnet workers typically cost $0.30-0.90 per task. An hour of Opus coordinator time costs $40+.
+- **Compact aggressively.** Long coordinator sessions balloon cache reads. Use `/compact` when switching topics or after completing a batch of work.
+- **Parallel workers, serial coordinator.** Dispatch multiple workers in parallel, then review results. Don't do two things at once in the coordinator session.
+
 ## Conventions
 
 - Python 3.12+, type hints everywhere
