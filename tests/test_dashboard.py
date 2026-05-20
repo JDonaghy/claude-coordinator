@@ -93,7 +93,8 @@ class TestMachinesAPI:
         mock_status.latency_ms = 5.0
         mock_status.is_online = True
         mock_check.return_value = [mock_status]
-        mock_fetch.return_value = {"active": [], "completed": []}
+        from coord.network import StatusResult
+        mock_fetch.return_value = StatusResult(data={"active": [], "completed": []})
 
         client = _client()
         r = client.get("/api/machines")

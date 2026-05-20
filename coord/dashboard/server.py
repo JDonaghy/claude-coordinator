@@ -48,8 +48,12 @@ def build_app(config: Config) -> Starlette:
                 "latency_ms": s.latency_ms,
             }
             if s.is_online:
-                assignments = fetch_status(s.machine, timeout=3.0)
-                machine_data["assignments"] = assignments
+                status_result = fetch_status(s.machine, timeout=3.0)
+                if status_result.ok:
+                    machine_data["assignments"] = status_result.data
+                else:
+                    machine_data["assignments"] = None
+                    machine_data["status_error"] = status_result.error
             result.append(machine_data)
         return JSONResponse(result)
 

@@ -66,13 +66,52 @@ class TestStatus:
         statuses[1].machine.repos = ["api"]
 
         with patch("coord.network.check_all", return_value=statuses), \
-             patch("coord.network.fetch_status", return_value={"active": [], "completed": []}):
+             patch("coord.network.fetch_status", return_value=network.StatusResult(data={"active": [], "completed": []})):
             result = CliRunner().invoke(main, ["status", "--config", str(config_file)])
         assert result.exit_code == 0, result.output
         assert "laptop" in result.output
         assert "server" in result.output
         assert "online" in result.output
         assert "idle" in result.output
+
+    def test_status_unavailable_when_fetch_fails(self, config_file: Path, coord_dir: Path) -> None:
+        """When /health passes but /status returns 500, show 'status unavailable' not 'idle'."""
+        statuses = [
+            network.MachineStatus(
+                machine=MagicMock(name="laptop", host="laptop.tailnet", repos=["api"]),
+                state=network.ONLINE, latency_ms=12.0, health=_online_health(),
+            ),
+        ]
+        statuses[0].machine.name = "laptop"
+        statuses[0].machine.host = "laptop.tailnet"
+        statuses[0].machine.repos = ["api"]
+
+        with patch("coord.network.check_all", return_value=statuses), \
+             patch("coord.network.fetch_status", return_value=network.StatusResult(error="HTTP 500")):
+            result = CliRunner().invoke(main, ["status", "--config", str(config_file)])
+        assert result.exit_code == 0, result.output
+        assert "status unavailable" in result.output
+        assert "500" in result.output
+        assert "idle" not in result.output
+
+    def test_status_unavailable_on_timeout(self, config_file: Path, coord_dir: Path) -> None:
+        statuses = [
+            network.MachineStatus(
+                machine=MagicMock(name="laptop", host="laptop.tailnet", repos=["api"]),
+                state=network.ONLINE, latency_ms=3000.0, health=_online_health(),
+            ),
+        ]
+        statuses[0].machine.name = "laptop"
+        statuses[0].machine.host = "laptop.tailnet"
+        statuses[0].machine.repos = ["api"]
+
+        with patch("coord.network.check_all", return_value=statuses), \
+             patch("coord.network.fetch_status", return_value=network.StatusResult(error="timeout")):
+            result = CliRunner().invoke(main, ["status", "--config", str(config_file)])
+        assert result.exit_code == 0, result.output
+        assert "status unavailable" in result.output
+        assert "timeout" in result.output
+        assert "idle" not in result.output
 
     def test_offline_machine_reported_with_reason(
         self, config_file: Path, coord_dir: Path
@@ -115,6 +154,99 @@ class TestStatus:
         )
         assert result.exit_code != 0
         assert "ghost" in result.output
+
+
+    def test_auto_reconcile_updates_board(self, config_file: Path, coord_dir: Path) -> None:
+        """When an agent reports an assignment complete, coord status should reconcile the board."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board, load_board
+
+        # Set up a board with one active assignment
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=42, issue_title="Fix auth",
+                assignment_id="abc123", status="running",
+            ),
+        ])
+        board_file = coord_dir / "board.json"
+        coord_dir.mkdir(parents=True, exist_ok=True)
+        with patch("coord.state.BOARD_FILE", board_file):
+            save_board(board, path=board_file)
+
+        # Agent reports the assignment as completed
+        agent_status = network.StatusResult(data={
+            "active": [],
+            "completed": [{"id": "abc123", "status": "done", "branch": "issue-42-fix-auth", "finished_at": 1000.0}],
+        })
+        statuses = [
+            network.MachineStatus(
+                machine=MagicMock(name="laptop", host="laptop.tailnet", repos=["api"]),
+                state=network.ONLINE, latency_ms=12.0, health=_online_health(),
+            ),
+        ]
+        statuses[0].machine.name = "laptop"
+        statuses[0].machine.host = "laptop.tailnet"
+        statuses[0].machine.repos = ["api"]
+
+        with patch("coord.network.check_all", return_value=statuses), \
+             patch("coord.network.fetch_status", return_value=agent_status), \
+             patch("coord.state.BOARD_FILE", board_file):
+            result = CliRunner().invoke(main, ["status", "--config", str(config_file)])
+
+        assert result.exit_code == 0, f"output={result.output!r} exc={result.exception!r}"
+        assert "reconciled 1" in result.output
+
+        # Verify the board was actually updated
+        with patch("coord.state.BOARD_FILE", board_file):
+            updated_board = load_board()
+        assert len(updated_board.active) == 0
+        assert len(updated_board.completed) == 1
+        assert updated_board.completed[0].branch == "issue-42-fix-auth"
+
+    def test_no_reconcile_flag_skips_reconcile(self, config_file: Path, coord_dir: Path) -> None:
+        """--no-reconcile should skip board updates even when agent reports completions."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board, load_board
+
+        board = Board(active=[
+            Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=42, issue_title="Fix auth",
+                assignment_id="abc123", status="running",
+            ),
+        ])
+        board_file = coord_dir / "board.json"
+        coord_dir.mkdir(parents=True, exist_ok=True)
+        with patch("coord.state.BOARD_FILE", board_file):
+            save_board(board, path=board_file)
+
+        agent_status = network.StatusResult(data={
+            "active": [],
+            "completed": [{"id": "abc123", "status": "done", "branch": "issue-42-fix-auth"}],
+        })
+        statuses = [
+            network.MachineStatus(
+                machine=MagicMock(name="laptop", host="laptop.tailnet", repos=["api"]),
+                state=network.ONLINE, latency_ms=12.0, health=_online_health(),
+            ),
+        ]
+        statuses[0].machine.name = "laptop"
+        statuses[0].machine.host = "laptop.tailnet"
+        statuses[0].machine.repos = ["api"]
+
+        with patch("coord.network.check_all", return_value=statuses), \
+             patch("coord.network.fetch_status", return_value=agent_status), \
+             patch("coord.state.BOARD_FILE", board_file):
+            result = CliRunner().invoke(main, ["status", "--no-reconcile", "--config", str(config_file)])
+
+        assert result.exit_code == 0, f"output={result.output!r} exc={result.exception!r}"
+        assert "reconciled" not in result.output
+
+        # Board should still have the assignment as active
+        with patch("coord.state.BOARD_FILE", board_file):
+            unchanged_board = load_board()
+        assert len(unchanged_board.active) == 1
 
 
 class TestLog:

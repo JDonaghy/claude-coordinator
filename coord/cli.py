@@ -599,16 +599,17 @@ def _resolve_machine(cfg: Config, explicit_name: str | None):
 @_CONFIG_OPTION
 @click.option("--machine", "machine_filter", default=None, help="Only show this machine.")
 @click.option("--timeout", default=3.0, show_default=True, type=float, help="Per-machine health-check timeout (seconds).")
+@click.option("--no-reconcile", is_flag=True, help="Skip auto-reconciliation of the board with live agent state.")
 @click.option(
     "--freshness",
     is_flag=True,
     help="Also report per-machine repo freshness vs GitHub HEADs.",
 )
-def status(config_path: Path, machine_filter: str | None, timeout: float, freshness: bool) -> None:
+def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, timeout: float, freshness: bool) -> None:
     from coord import freshness as fresh
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph
     from coord.network import check_all, fetch_repos, fetch_status
-    from coord.state import build_board, load_dispatched, load_notified
+    from coord.state import build_board, load_board, load_dispatched, load_notified, save_board
 
     cfg = _load_config(config_path)
 
@@ -637,42 +638,52 @@ def status(config_path: Path, machine_filter: str | None, timeout: float, freshn
             sys.exit(2)
 
     statuses = check_all(machines, timeout=timeout)
+    agent_completed: dict[str, dict] = {}
     click.echo("Machines:")
     for s in statuses:
         m = s.machine
         latency = f" ({s.latency_ms:.0f}ms)" if s.latency_ms is not None else ""
         if s.is_online:
-            assignments = fetch_status(m, timeout=timeout)
-            active = (assignments or {}).get("active", [])
-            if active:
-                a = active[0]
-                spec = a.get("spec", {})
-                spec_type = spec.get("type", "work")
-                badge_map = {"review": "[review] ", "smoke": "[smoke] "}
-                badge = badge_map.get(spec_type, "")
-                target = spec.get("review_target")
-                if spec_type == "review" and target:
-                    target_str = f" reviewing PR #{target}"
-                elif spec_type == "smoke" and target:
-                    target_str = f" smoking branch `{target}`"
+            status_result = fetch_status(m, timeout=timeout)
+            if status_result.ok:
+                active = (status_result.data or {}).get("active", [])
+                if active:
+                    a = active[0]
+                    spec = a.get("spec", {})
+                    spec_type = spec.get("type", "work")
+                    badge_map = {"review": "[review] ", "smoke": "[smoke] "}
+                    badge = badge_map.get(spec_type, "")
+                    target = spec.get("review_target")
+                    if spec_type == "review" and target:
+                        target_str = f" reviewing PR #{target}"
+                    elif spec_type == "smoke" and target:
+                        target_str = f" smoking branch `{target}`"
+                    else:
+                        target_str = ""
+                    detail = (
+                        f"busy — {badge}#{spec.get('issue_number', '?')}: "
+                        f"{spec.get('issue_title', '?')}{target_str}"
+                    )
                 else:
-                    target_str = ""
-                detail = (
-                    f"busy — {badge}#{spec.get('issue_number', '?')}: "
-                    f"{spec.get('issue_title', '?')}{target_str}"
-                )
+                    detail = "idle"
             else:
-                detail = "idle"
+                active = []
+                detail = f"status unavailable ({status_result.error})"
+            if status_result.ok and status_result.data:
+                for entry in status_result.data.get("completed", []):
+                    eid = entry.get("id") or entry.get("assignment_id")
+                    if eid:
+                        agent_completed[eid] = entry
             label = f"{s.state} • {detail}{latency}"
         else:
-            assignments = None
+            status_result = None
             label = f"{s.state} — {s.reason}{latency}"
         repos = ", ".join(m.repos) if m.repos else "(none)"
         click.echo(f"  {m.name:15s} [{label}]")
         click.echo(f"    host: {m.host}  repos: {repos}")
 
-        if assignments:
-            for entry in assignments.get("active", []):
+        if status_result and status_result.ok and status_result.data:
+            for entry in status_result.data.get("active", []):
                 progress = entry.get("progress")
                 if not progress:
                     continue
@@ -684,8 +695,33 @@ def status(config_path: Path, machine_filter: str | None, timeout: float, freshn
                 if updates:
                     click.echo(f"    latest: {updates[-1]}")
 
-    # Blocked repos
-    board = build_board()
+    # Reconcile board with live agent data
+    board = load_board() or build_board()
+    if not no_reconcile and agent_completed:
+        reconciled = 0
+        for a in board.active[:]:
+            if a.assignment_id is None:
+                continue
+            entry = agent_completed.get(a.assignment_id)
+            if entry is None:
+                continue
+            branch = entry.get("branch")
+            if entry.get("status") == "done":
+                board.mark_done_by_id(
+                    a.assignment_id,
+                    finished_at=entry.get("finished_at"),
+                    branch=branch,
+                )
+            else:
+                board.mark_failed_by_id(
+                    a.assignment_id,
+                    finished_at=entry.get("finished_at"),
+                )
+            reconciled += 1
+        if reconciled:
+            save_board(board)
+            click.echo(f"\n  (reconciled {reconciled} assignment(s) from live agent data)")
+
     blocked = compute_blocked(cfg.repos, board.active)
     if blocked:
         click.echo("")

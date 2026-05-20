@@ -119,16 +119,38 @@ def check_all(
         return list(pool.map(lambda m: check_machine(m, timeout=timeout), machines))
 
 
-def fetch_status(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> dict | None:
-    """GET /status from a machine. Returns None on error (caller already checked health)."""
+@dataclass
+class StatusResult:
+    """Result of fetching /status from an agent.
+
+    On success, ``data`` holds the parsed response and ``error`` is None.
+    On failure, ``data`` is None and ``error`` describes what went wrong.
+    """
+
+    data: dict | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.data is not None
+
+
+def fetch_status(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> StatusResult:
+    """GET /status from a machine. Returns a StatusResult (never None)."""
     try:
         resp = httpx.get(
             f"http://{machine.host}:{AGENT_PORT}/status", timeout=timeout
         )
         resp.raise_for_status()
-        return resp.json()
-    except (httpx.HTTPError, ValueError):
-        return None
+        return StatusResult(data=resp.json())
+    except httpx.HTTPStatusError as exc:
+        return StatusResult(error=f"HTTP {exc.response.status_code}")
+    except (httpx.ConnectTimeout, httpx.ReadTimeout):
+        return StatusResult(error="timeout")
+    except httpx.ConnectError as exc:
+        return StatusResult(error=f"connection error: {exc}")
+    except (httpx.HTTPError, ValueError) as exc:
+        return StatusResult(error=str(exc))
 
 
 def fetch_repos(machine: Machine, timeout: float = DEFAULT_TIMEOUT) -> dict | None:
