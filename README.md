@@ -46,6 +46,8 @@ coord watch a1b2c3            # filtered live output (stream-json events)
 coord pr a1b2c3               # dispatch a worker to create the PR
 # → PR worker dispatched (assignment d4e5f6)
 # →   branch: issue-42-fix-auth-middleware → main
+# → Review dispatched (assignment g7h8i9)
+# →   reviewer: laptop
 ```
 
 ## Quick Start
@@ -129,7 +131,7 @@ Then add the machine to your coordinator.yml and run `coord status` to verify co
 | `coord test <id>` | Pull worker's branch locally, run build + tests |
 | `coord test --passed <id>` | Record smoke test as passed |
 | `coord test --fail <id> --reason "..."` | Record smoke test as failed |
-| `coord pr <id>` | Dispatch a worker to create a PR for a completed assignment |
+| `coord pr <id> [--no-review]` | Dispatch a worker to create a PR (auto-dispatches adversarial review unless --no-review) |
 | `coord fix <id> [--guidance "..."]` | Dispatch a fix-up worker for a failed smoke test (auto-escalates model) |
 | `coord notify` | Poll agents, post completion/failure comments to GitHub |
 | `coord merge [--dry-run] [--repo NAME] [--method rebase\|squash\|merge] [--order IDs]` | Process merge queue |
@@ -289,7 +291,7 @@ smoke_tests:
 - **Multi-repo** — tracks dependency chains between repos; upstream work blocks downstream dispatch
 - **File conflict avoidance** — coordinator ensures no two workers touch the same files simultaneously
 - **Claim detection** — checks board and remote `issue-{N}-*` branches before dispatching; refuses duplicates
-- **Adversarial reviews** — optional: independent `claude -p` session on a different machine reviews the diff against CLAUDE.md
+- **Adversarial reviews** — enabled by default: `coord pr` auto-dispatches an independent `claude -p` session that reviews the diff with zero shared context. Works on a single machine — independence comes from a fresh session, not separate hardware
 - **Smoke testing** — capability-aware routing (GTK changes → machine with GTK)
 - **Merge queue** — sequences completed PRs with conflict detection and dependency-aware ordering
 - **Progress streaming** — workers emit `STATUS:`/`STUCK:` lines; `coord status` shows real-time progress
@@ -308,7 +310,7 @@ This division of labor produces better results than a single long-running Claude
 - **Forced scoping.** One issue per worker session prevents scope creep. No "while I'm here, let me also refactor this." The worker does one thing and finishes.
 - **Structured handoffs.** Every assignment has a briefing posted as a GitHub issue comment. If a session dies, a new one picks up from the comment — zero context loss.
 - **Persistent record.** Every decision, briefing, and result lives on GitHub. You can review what happened a week later. Terminal scrollback is gone when the window closes.
-- **Fresh eyes.** Each worker starts with no prior context. Adversarial reviews take this further: a different machine reviews the work with genuinely independent context.
+- **Fresh eyes.** Each worker starts with no prior context. Adversarial reviews take this further: a separate session reviews the work with zero shared context — even on the same machine.
 - **Human stays strategic.** You approve assignments and make judgment calls. You don't ferry messages between terminals or track who's touching which file in your head.
 - **Cost savings.** Model tiering means you're not paying opus prices for documentation fixes. Auto-escalation on failure means you start cheap and only pay more when needed.
 
