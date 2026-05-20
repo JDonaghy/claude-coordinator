@@ -72,3 +72,12 @@ hooks:
     - summary_report
   # close_merged_issues: disabled until adversarial review (#15) + smoke test
   # flow is in place. Issues should close on PR merge, not worker completion.
+
+models:
+  default: sonnet
+  escalation: [haiku, sonnet, opus]
+  labels:
+    documentation: haiku
+    bug: sonnet
+    enhancement: sonnet
+    infrastructure: opus
