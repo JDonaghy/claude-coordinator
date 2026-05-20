@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import patch
-
 import pytest
 
 from coord.models import Proposal
@@ -36,14 +33,9 @@ def proposals() -> list[Proposal]:
 
 
 class TestStatePersistence:
-    def test_save_and_load_roundtrip(self, tmp_path: Path, proposals: list[Proposal]) -> None:
-        proposals_file = tmp_path / "pending_proposals.json"
-        with (
-            patch("coord.state.COORD_DIR", tmp_path),
-            patch("coord.state.PROPOSALS_FILE", proposals_file),
-        ):
-            save_proposals(proposals)
-            loaded = load_proposals()
+    def test_save_and_load_roundtrip(self, coord_db, proposals: list[Proposal]) -> None:
+        save_proposals(proposals)
+        loaded = load_proposals()
 
         assert len(loaded) == 2
         assert loaded[0].id == 1
@@ -52,23 +44,22 @@ class TestStatePersistence:
         assert loaded[1].id == 2
         assert loaded[1].briefing == ""
 
-    def test_load_empty_returns_empty(self, tmp_path: Path) -> None:
-        proposals_file = tmp_path / "pending_proposals.json"
-        with patch("coord.state.PROPOSALS_FILE", proposals_file):
-            assert load_proposals() == []
+    def test_load_empty_returns_empty(self, coord_db) -> None:
+        assert load_proposals() == []
 
-    def test_clear_removes_file(self, tmp_path: Path, proposals: list[Proposal]) -> None:
-        proposals_file = tmp_path / "pending_proposals.json"
-        with (
-            patch("coord.state.COORD_DIR", tmp_path),
-            patch("coord.state.PROPOSALS_FILE", proposals_file),
-        ):
-            save_proposals(proposals)
-            assert proposals_file.exists()
-            clear_proposals()
-            assert not proposals_file.exists()
+    def test_clear_removes_proposals(self, coord_db, proposals: list[Proposal]) -> None:
+        save_proposals(proposals)
+        assert len(load_proposals()) == 2
+        clear_proposals()
+        assert load_proposals() == []
 
-    def test_clear_no_file_is_noop(self, tmp_path: Path) -> None:
-        proposals_file = tmp_path / "pending_proposals.json"
-        with patch("coord.state.PROPOSALS_FILE", proposals_file):
-            clear_proposals()  # should not raise
+    def test_clear_when_empty_is_noop(self, coord_db) -> None:
+        clear_proposals()  # should not raise
+        assert load_proposals() == []
+
+    def test_save_replaces_previous(self, coord_db, proposals: list[Proposal]) -> None:
+        save_proposals(proposals)
+        save_proposals([proposals[0]])  # save only first
+        loaded = load_proposals()
+        assert len(loaded) == 1
+        assert loaded[0].id == 1

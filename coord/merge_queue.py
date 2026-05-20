@@ -9,15 +9,16 @@ Two-layer design so the logic is testable without hitting `gh`:
 
 from __future__ import annotations
 
-import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Protocol
+from typing import Iterable, Protocol
 
+from coord.db import get_connection
 from coord.models import Assignment
 from coord.state import COORD_DIR
 
+# Legacy path constant — kept for backward compat with monkeypatch calls in tests.
 QUEUE_FILE = COORD_DIR / "merge_queue.json"
 
 # States
@@ -59,21 +60,51 @@ class GhOps(Protocol):
 
 # ── Persistence ──────────────────────────────────────────────────────────
 
-def load_queue(path: Path | None = None) -> list[QueuedMerge]:
-    p = path or QUEUE_FILE
-    if not p.exists():
-        return []
-    try:
-        data = json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
-        return []
-    return [QueuedMerge(**entry) for entry in data]
+def load_queue() -> list[QueuedMerge]:
+    """Load all merge queue entries from the database."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM merge_queue ORDER BY id"
+    ).fetchall()
+    return [
+        QueuedMerge(
+            assignment_id=row["assignment_id"],
+            repo_name=row["repo_name"],
+            repo_github=row["repo_github"],
+            branch=row["branch"],
+            target_branch=row["target_branch"],
+            issue_number=row["issue_number"],
+            issue_title=row["issue_title"],
+            state=row["state"],
+            pr_number=row["pr_number"],
+            pr_url=row["pr_url"],
+            size=row["size"],
+            last_attempt=row["last_attempt"],
+            error=row["error"],
+        )
+        for row in rows
+    ]
 
 
-def save_queue(items: list[QueuedMerge], path: Path | None = None) -> None:
-    p = path or QUEUE_FILE
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps([asdict(x) for x in items], indent=2) + "\n")
+def save_queue(items: list[QueuedMerge]) -> None:
+    """Replace the entire merge queue in the database."""
+    conn = get_connection()
+    with conn:
+        conn.execute("DELETE FROM merge_queue")
+        for item in items:
+            conn.execute(
+                """INSERT INTO merge_queue (
+                    assignment_id, repo_name, repo_github, branch,
+                    target_branch, issue_number, issue_title, state,
+                    pr_number, pr_url, size, last_attempt, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item.assignment_id, item.repo_name, item.repo_github,
+                    item.branch, item.target_branch, item.issue_number,
+                    item.issue_title, item.state, item.pr_number, item.pr_url,
+                    item.size, item.last_attempt, item.error,
+                ),
+            )
 
 
 # ── Enqueue ──────────────────────────────────────────────────────────────
@@ -82,7 +113,6 @@ def enqueue(
     assignment: Assignment,
     repo_github: str,
     target_branch: str,
-    path: Path | None = None,
 ) -> QueuedMerge | None:
     """Add a completed assignment to the queue if it isn't already there.
 
@@ -90,7 +120,7 @@ def enqueue(
     """
     if not assignment.branch:
         return None
-    items = load_queue(path)
+    items = load_queue()
     if any(x.assignment_id == assignment.assignment_id for x in items):
         return None
     entry = QueuedMerge(
@@ -103,7 +133,7 @@ def enqueue(
         issue_title=assignment.issue_title,
     )
     items.append(entry)
-    save_queue(items, path)
+    save_queue(items)
     return entry
 
 

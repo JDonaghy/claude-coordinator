@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -17,38 +16,32 @@ from coord.state import load_session, write_session_end, write_session_start
 
 
 @pytest.fixture
-def session_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect all state paths to a temp directory."""
-    monkeypatch.setattr(state_mod, "COORD_DIR", tmp_path)
-    monkeypatch.setattr(state_mod, "SESSION_FILE", tmp_path / "session.json")
-    return tmp_path
+def session_dir(coord_db):
+    """Provide an isolated in-memory DB for session tests."""
+    return None
 
 
 # ── Unit tests for state helpers ──────────────────────────────────────────────
 
 
 class TestLoadSession:
-    def test_returns_none_when_no_file(self, session_dir: Path) -> None:
+    def test_returns_none_when_no_session(self, session_dir) -> None:
         assert load_session() is None
 
-    def test_returns_data_when_file_exists(self, session_dir: Path) -> None:
-        session_file = session_dir / "session.json"
-        session_file.write_text(
-            json.dumps({"started_at": "2026-01-01T00:00:00Z", "clean_shutdown": False})
-        )
+    def test_returns_data_after_write_start(self, session_dir) -> None:
+        write_session_start()
         data = load_session()
         assert data is not None
         assert data["clean_shutdown"] is False
-        assert data["started_at"] == "2026-01-01T00:00:00Z"
+        assert "started_at" in data
 
-    def test_returns_none_on_corrupt_file(self, session_dir: Path) -> None:
-        session_file = session_dir / "session.json"
-        session_file.write_text("not valid json {{{{")
+    def test_returns_none_on_empty_db(self, session_dir) -> None:
+        # No sessions inserted — should return None
         assert load_session() is None
 
 
 class TestWriteSessionStart:
-    def test_creates_file_with_clean_shutdown_false(self, session_dir: Path) -> None:
+    def test_creates_session_with_clean_shutdown_false(self, session_dir) -> None:
         write_session_start()
         data = load_session()
         assert data is not None
@@ -56,16 +49,16 @@ class TestWriteSessionStart:
         assert "started_at" in data
         assert data["started_at"].endswith("Z")
 
-    def test_creates_dir_if_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        nested = tmp_path / "nested" / "coord"
-        monkeypatch.setattr(state_mod, "COORD_DIR", nested)
-        monkeypatch.setattr(state_mod, "SESSION_FILE", nested / "session.json")
+    def test_write_session_start_works(self, session_dir) -> None:
+        """write_session_start should work without crashing."""
         write_session_start()
-        assert (nested / "session.json").exists()
+        data = load_session()
+        assert data is not None
+        assert data["clean_shutdown"] is False
 
 
 class TestWriteSessionEnd:
-    def test_creates_file_with_clean_shutdown_true(self, session_dir: Path) -> None:
+    def test_creates_session_with_clean_shutdown_true(self, session_dir) -> None:
         write_session_start()
         write_session_end(
             completed_ids=["abc-1", "abc-2"],
@@ -81,7 +74,7 @@ class TestWriteSessionEnd:
         assert "ended_at" in data
         assert data["ended_at"].endswith("Z")
 
-    def test_preserves_started_at(self, session_dir: Path) -> None:
+    def test_preserves_started_at(self, session_dir) -> None:
         write_session_start()
         original_started = load_session()["started_at"]  # type: ignore[index]
         write_session_end(
@@ -93,8 +86,8 @@ class TestWriteSessionEnd:
         assert data is not None
         assert data["started_at"] == original_started
 
-    def test_works_without_prior_session_start(self, session_dir: Path) -> None:
-        """write_session_end should not crash even if session.json doesn't exist yet."""
+    def test_works_without_prior_session_start(self, session_dir) -> None:
+        """write_session_end should not crash even if no session was started."""
         write_session_end(
             completed_ids=["x1"],
             issues_closed=[5],
@@ -105,7 +98,7 @@ class TestWriteSessionEnd:
         assert data["clean_shutdown"] is True
         assert data["started_at"] is None
 
-    def test_empty_stats(self, session_dir: Path) -> None:
+    def test_empty_stats(self, session_dir) -> None:
         write_session_start()
         write_session_end(completed_ids=[], issues_closed=[], total_cost_usd=0.0)
         data = load_session()
@@ -116,13 +109,8 @@ class TestWriteSessionEnd:
 
 
 class TestSessionStartIdempotency:
-    def test_does_not_overwrite_in_progress_session(self, session_dir: Path) -> None:
-        """The CLI pattern prevents overwriting an in-progress session.
-
-        write_session_start is only called when session is None or clean_shutdown is True.
-        This test verifies that pattern: after the first write_session_start, a second
-        conditional call should be skipped, leaving started_at unchanged.
-        """
+    def test_does_not_overwrite_in_progress_session(self, session_dir) -> None:
+        """The CLI pattern prevents overwriting an in-progress session."""
         write_session_start()
         data_after_first = load_session()
         assert data_after_first is not None
@@ -138,7 +126,7 @@ class TestSessionStartIdempotency:
         # started_at must be unchanged since the second call was skipped
         assert data_after_second["started_at"] == started_at_first
 
-    def test_overwrites_after_clean_shutdown(self, session_dir: Path) -> None:
+    def test_overwrites_after_clean_shutdown(self, session_dir) -> None:
         """After a clean shutdown, the next dispatch starts a fresh session."""
         write_session_start()
         write_session_end(completed_ids=[], issues_closed=[], total_cost_usd=0.0)
@@ -155,7 +143,7 @@ class TestSessionStartIdempotency:
         data_new = load_session()
         assert data_new is not None
         assert data_new["clean_shutdown"] is False
-        # A new session file was written — no ended_at
+        # A new session was started — no ended_at
         assert "ended_at" not in data_new
 
 
@@ -163,32 +151,32 @@ class TestSessionStartIdempotency:
 
 
 class TestSessionCommand:
-    def _invoke(self, session_dir: Path) -> str:
-        """Invoke `coord session` with state redirected to session_dir."""
+    def _invoke(self) -> str:
+        """Invoke `coord session`."""
         runner = CliRunner()
         result = runner.invoke(main, ["session"])
         return result.output
 
-    def test_no_session_shows_not_found(self, session_dir: Path) -> None:
-        output = self._invoke(session_dir)
+    def test_no_session_shows_not_found(self, session_dir) -> None:
+        output = self._invoke()
         assert "No session state found" in output
         assert "coord assign" in output
 
-    def test_active_session_shows_in_progress(self, session_dir: Path) -> None:
+    def test_active_session_shows_in_progress(self, session_dir) -> None:
         write_session_start()
-        output = self._invoke(session_dir)
+        output = self._invoke()
         assert "in progress" in output
         assert "clean_shutdown: false" in output
         assert "coord resume" in output
 
-    def test_clean_session_shows_summary(self, session_dir: Path) -> None:
+    def test_clean_session_shows_summary(self, session_dir) -> None:
         write_session_start()
         write_session_end(
             completed_ids=["a1", "a2", "a3"],
             issues_closed=[1, 2],
             total_cost_usd=4.56,
         )
-        output = self._invoke(session_dir)
+        output = self._invoke()
         assert "Last session:" in output
         assert "3 assignments" in output
         assert "2 issues" in output

@@ -181,7 +181,7 @@ class TestAutoReassign:
 class TestCoordRetry:
     @patch("coord.reconcile.httpx.post")
     def test_retry_dispatches_to_different_machine(
-        self, mock_post: MagicMock, tmp_path: Path,
+        self, mock_post: MagicMock, tmp_path: Path, coord_db,
     ) -> None:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
@@ -195,8 +195,7 @@ class TestCoordRetry:
                        issue_title="Fix auth", assignment_id="a1", status="failed",
                        briefing="do it", finished_at=1.0),
         ])
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
+        save_board(board)
 
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"id": "retry1"}
@@ -204,14 +203,13 @@ class TestCoordRetry:
         mock_post.return_value = mock_resp
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
+        result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
 
         assert result.exit_code == 0
         assert "Retried" in result.output
         assert "server" in result.output
 
-    def test_retry_rejects_non_failed(self, tmp_path: Path) -> None:
+    def test_retry_rejects_non_failed(self, tmp_path: Path, coord_db) -> None:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
             "repos:\n  - name: api\n    github: a/a\n"
@@ -221,27 +219,23 @@ class TestCoordRetry:
             Assignment(machine_name="m", repo_name="api", issue_number=1,
                        issue_title="x", assignment_id="a1", status="running"),
         ])
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
+        save_board(board)
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
+        result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
         assert result.exit_code != 0
         assert "not failed" in result.output
 
-    def test_retry_unknown_assignment(self, tmp_path: Path) -> None:
+    def test_retry_unknown_assignment(self, tmp_path: Path, coord_db) -> None:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(
             "repos:\n  - name: api\n    github: a/a\n"
             "machines:\n  - name: m\n    host: h\n    repos: [api]\n"
         )
-        board_file = tmp_path / "board.json"
-        save_board(Board(), path=board_file)
+        save_board(Board())
 
         runner = CliRunner()
-        with patch("coord.state.BOARD_FILE", board_file):
-            result = runner.invoke(main, ["retry", "nope", "--config", str(config_file)])
+        result = runner.invoke(main, ["retry", "nope", "--config", str(config_file)])
         assert result.exit_code != 0
         assert "not found" in result.output
 

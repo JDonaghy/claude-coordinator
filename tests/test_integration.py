@@ -133,6 +133,7 @@ class TestFullLoop:
         sample_issues: list[dict],
         claude_response: str,
         repo_dir: Path,
+        coord_db,
     ) -> None:
         # 1. Brain gathers context — mock GitHub, route agent HTTP through TestClient
         with (
@@ -161,16 +162,11 @@ class TestFullLoop:
         assert proposals[0].machine_name == "testbox"
         assert proposals[0].issue_number == 42
 
-        # 4. Save and reload proposals
-        proposals_file = tmp_path / "proposals.json"
-        with (
-            patch("coord.state.COORD_DIR", tmp_path),
-            patch("coord.state.PROPOSALS_FILE", proposals_file),
-        ):
-            save_proposals(proposals)
-            loaded = load_proposals()
-            assert len(loaded) == 1
-            assert loaded[0].issue_number == 42
+        # 4. Save and reload proposals (uses in-memory DB from coord_db fixture)
+        save_proposals(proposals)
+        loaded = load_proposals()
+        assert len(loaded) == 1
+        assert loaded[0].issue_number == 42
 
         # 5. Dispatch to real agent server via TestClient
         with patch("coord.dispatch.httpx.post") as mock_post:

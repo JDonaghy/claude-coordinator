@@ -63,14 +63,16 @@ def config_file(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path:
+    """Provide an isolated in-memory DB for state and return a temp dir.
+
+    Also redirects state.COORD_DIR to the temp dir so that CLI commands that
+    use COORD_DIR for file I/O (e.g. test-output storage) don't touch the
+    real ~/.coord directory.
+    """
     d = tmp_path / "state"
+    d.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(state_mod, "COORD_DIR", d)
-    monkeypatch.setattr(state_mod, "PROPOSALS_FILE", d / "proposals.json")
-    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", d / "dispatched.json")
-    monkeypatch.setattr(state_mod, "NOTIFIED_FILE", d / "notified.json")
-    monkeypatch.setattr(state_mod, "BOARD_FILE", d / "board.json")
-    monkeypatch.setattr(mq, "QUEUE_FILE", d / "merge_queue.json")
     return d
 
 

@@ -55,8 +55,6 @@ class TestBoardAPI:
                 ),
             ],
         )
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
 
         client = _client()
         with patch("coord.dashboard.server.load_board") as mock_load:

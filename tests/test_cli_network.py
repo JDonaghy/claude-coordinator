@@ -39,12 +39,9 @@ def config_file(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setattr(state_mod, "COORD_DIR", tmp_path / "state")
-    monkeypatch.setattr(state_mod, "PROPOSALS_FILE", tmp_path / "state" / "proposals.json")
-    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", tmp_path / "state" / "dispatched.json")
-    monkeypatch.setattr(state_mod, "NOTIFIED_FILE", tmp_path / "state" / "notified.json")
-    return tmp_path / "state"
+def coord_dir(tmp_path: Path, coord_db) -> Path:
+    """Provide an isolated in-memory DB for state and return a temp dir."""
+    return tmp_path
 
 
 def _online_health(machine_name: str = "laptop") -> dict:
@@ -155,7 +152,6 @@ class TestStatus:
         assert result.exit_code != 0
         assert "ghost" in result.output
 
-
     def test_auto_reconcile_updates_board(self, config_file: Path, coord_dir: Path) -> None:
         """When an agent reports an assignment complete, coord status should reconcile the board."""
         from coord.models import Assignment, Board
@@ -169,10 +165,7 @@ class TestStatus:
                 assignment_id="abc123", status="running",
             ),
         ])
-        board_file = coord_dir / "board.json"
-        coord_dir.mkdir(parents=True, exist_ok=True)
-        with patch("coord.state.BOARD_FILE", board_file):
-            save_board(board, path=board_file)
+        save_board(board)
 
         # Agent reports the assignment as completed
         agent_status = network.StatusResult(data={
@@ -190,16 +183,14 @@ class TestStatus:
         statuses[0].machine.repos = ["api"]
 
         with patch("coord.network.check_all", return_value=statuses), \
-             patch("coord.network.fetch_status", return_value=agent_status), \
-             patch("coord.state.BOARD_FILE", board_file):
+             patch("coord.network.fetch_status", return_value=agent_status):
             result = CliRunner().invoke(main, ["status", "--config", str(config_file)])
 
         assert result.exit_code == 0, f"output={result.output!r} exc={result.exception!r}"
         assert "reconciled 1" in result.output
 
         # Verify the board was actually updated
-        with patch("coord.state.BOARD_FILE", board_file):
-            updated_board = load_board()
+        updated_board = load_board()
         assert len(updated_board.active) == 0
         assert len(updated_board.completed) == 1
         assert updated_board.completed[0].branch == "issue-42-fix-auth"
@@ -216,10 +207,7 @@ class TestStatus:
                 assignment_id="abc123", status="running",
             ),
         ])
-        board_file = coord_dir / "board.json"
-        coord_dir.mkdir(parents=True, exist_ok=True)
-        with patch("coord.state.BOARD_FILE", board_file):
-            save_board(board, path=board_file)
+        save_board(board)
 
         agent_status = network.StatusResult(data={
             "active": [],
@@ -236,16 +224,14 @@ class TestStatus:
         statuses[0].machine.repos = ["api"]
 
         with patch("coord.network.check_all", return_value=statuses), \
-             patch("coord.network.fetch_status", return_value=agent_status), \
-             patch("coord.state.BOARD_FILE", board_file):
+             patch("coord.network.fetch_status", return_value=agent_status):
             result = CliRunner().invoke(main, ["status", "--no-reconcile", "--config", str(config_file)])
 
         assert result.exit_code == 0, f"output={result.output!r} exc={result.exception!r}"
         assert "reconciled" not in result.output
 
         # Board should still have the assignment as active
-        with patch("coord.state.BOARD_FILE", board_file):
-            unchanged_board = load_board()
+        unchanged_board = load_board()
         assert len(unchanged_board.active) == 1
 
 

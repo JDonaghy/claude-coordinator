@@ -184,32 +184,38 @@ class TestWatchCommand:
     CliRunner (synchronous) sees all events in one pass and exits on the
     result event without actually blocking."""
 
-    def _setup(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+    def _setup(self, tmp_path: Path) -> tuple[Path, Path]:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(MINIMAL_CONFIG)
-
-        dispatched_file = tmp_path / "dispatched.json"
-        dispatched_file.write_text(
-            json.dumps([{
-                "assignment_id": ASSIGNMENT_ID,
-                "machine_name": "laptop",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 1,
-            }])
-        )
 
         # watch looks for: DEFAULT_STATE_DIR / "logs" / f"{assignment_id}.log"
         # We set DEFAULT_STATE_DIR = tmp_path, so logs live at tmp_path/logs/
         logs_dir = tmp_path / "logs"
         log_file = logs_dir / f"{ASSIGNMENT_ID}.log"
-        return config_file, dispatched_file, log_file
+        return config_file, log_file
+
+    def _seed_dispatched(self) -> None:
+        """Insert a dispatched record for ASSIGNMENT_ID into the in-memory DB."""
+        from coord.models import Proposal
+        from coord.state import record_dispatched
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="Test issue",
+            rationale="",
+        )
+        record_dispatched(
+            assignment_id=ASSIGNMENT_ID,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
 
     def _invoke(
         self,
         tmp_path: Path,
         config_file: Path,
-        dispatched_file: Path,
         log_file: Path,
         extra_args: list[str] | None = None,
     ):
@@ -232,7 +238,6 @@ class TestWatchCommand:
         # Patch socket.gethostname to match the machine name in MINIMAL_CONFIG
         # so that remote-detection treats this as a local assignment.
         with (
-            patch("coord.state.DISPATCHED_FILE", dispatched_file),
             patch("coord.agent.DEFAULT_STATE_DIR", tmp_path),
             patch.object(_cli_mod, "_tail_log", new=_non_blocking_tail),
             patch("socket.gethostname", return_value="laptop"),
@@ -247,22 +252,21 @@ class TestWatchCommand:
         assert result.exit_code == 0
         assert "Watch" in result.output or "watch" in result.output.lower()
 
-    def test_missing_assignment_exits_2(self, tmp_path: Path) -> None:
+    def test_missing_assignment_exits_2(self, tmp_path: Path, coord_db) -> None:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(MINIMAL_CONFIG)
-        dispatched_file = tmp_path / "dispatched.json"
-        dispatched_file.write_text("[]")
+        # Don't seed any dispatched record → should fail with "not found"
 
         runner = CliRunner()
-        with patch("coord.state.DISPATCHED_FILE", dispatched_file):
-            result = runner.invoke(
-                main, ["watch", "nonexistent-id", "--config", str(config_file)]
-            )
+        result = runner.invoke(
+            main, ["watch", "nonexistent-id", "--config", str(config_file)]
+        )
         assert result.exit_code == 2
         assert "not found" in result.output
 
-    def test_happy_path_shows_important_events(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_happy_path_shows_important_events(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         _write_log(log_file, [
             {"type": "system", "subtype": "init", "model": "claude-sonnet-4-6",
              "session_id": "sess1234abcd"},
@@ -274,7 +278,7 @@ class TestWatchCommand:
              "num_turns": 5, "total_cost_usd": 0.10, "stop_reason": "end_turn"},
         ])
 
-        result = self._invoke(tmp_path, config_file, dispatched_file, log_file)
+        result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 0
         assert "[init]" in result.output
         assert "claude-sonnet-4-6" in result.output
@@ -285,8 +289,9 @@ class TestWatchCommand:
         # Non-STUCK assistant text is NOT important
         assert "Starting work" not in result.output
 
-    def test_result_event_exits_command(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_result_event_exits_command(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         _write_log(log_file, [
             {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
             {"type": "result", "is_error": False, "duration_ms": 1000,
@@ -297,23 +302,25 @@ class TestWatchCommand:
             ]}},
         ])
 
-        result = self._invoke(tmp_path, config_file, dispatched_file, log_file)
+        result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 0
         assert "PHANTOM" not in result.output
 
-    def test_exit_code_1_on_failure(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_exit_code_1_on_failure(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         _write_log(log_file, [
             {"type": "result", "is_error": True, "duration_ms": 2000,
              "num_turns": 2, "total_cost_usd": 0.02, "stop_reason": "error"},
         ])
 
-        result = self._invoke(tmp_path, config_file, dispatched_file, log_file)
+        result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 1
         assert "failed" in result.output
 
-    def test_show_all_shows_every_event(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_show_all_shows_every_event(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         _write_log(log_file, [
             {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
             {"type": "assistant", "message": {"content": [
@@ -325,7 +332,7 @@ class TestWatchCommand:
         ])
 
         result = self._invoke(
-            tmp_path, config_file, dispatched_file, log_file,
+            tmp_path, config_file, log_file,
             extra_args=["--all"],
         )
         assert result.exit_code == 0
@@ -333,8 +340,9 @@ class TestWatchCommand:
         assert "[assistant]" in result.output
         assert "[tool]" in result.output or "Bash" in result.output
 
-    def test_rate_limit_event_surfaced(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_rate_limit_event_surfaced(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         _write_log(log_file, [
             {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
             {"type": "rate_limit_event",
@@ -343,13 +351,14 @@ class TestWatchCommand:
              "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn"},
         ])
 
-        result = self._invoke(tmp_path, config_file, dispatched_file, log_file)
+        result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 0
         assert "[rate_limit]" in result.output
         assert "throttled" in result.output
 
-    def test_stuck_in_assistant_surfaced(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_stuck_in_assistant_surfaced(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         _write_log(log_file, [
             {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
             {"type": "assistant", "message": {"content": [
@@ -360,26 +369,28 @@ class TestWatchCommand:
              "num_turns": 3, "total_cost_usd": 0.05, "stop_reason": "error"},
         ])
 
-        result = self._invoke(tmp_path, config_file, dispatched_file, log_file)
+        result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 1
         assert "[stuck]" in result.output
         assert "cannot find the config file" in result.output
 
-    def test_permission_denials_in_result_surfaced(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_permission_denials_in_result_surfaced(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         _write_log(log_file, [
             {"type": "result", "is_error": False, "duration_ms": 1000,
              "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn",
              "permission_denials": ["Bash: execution not allowed"]},
         ])
 
-        result = self._invoke(tmp_path, config_file, dispatched_file, log_file)
+        result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 0
         assert "[denied]" in result.output
         assert "Bash" in result.output
 
-    def test_init_event_model_and_session(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_init_event_model_and_session(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         _write_log(log_file, [
             {"type": "system", "subtype": "init",
              "model": "claude-opus-4-5",
@@ -388,13 +399,14 @@ class TestWatchCommand:
              "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn"},
         ])
 
-        result = self._invoke(tmp_path, config_file, dispatched_file, log_file)
+        result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 0
         assert "claude-opus-4-5" in result.output
         assert "XYZXYZXY" in result.output  # first 8 chars
 
-    def test_header_comment_line_skipped_in_filtered_mode(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_header_comment_line_skipped_in_filtered_mode(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_file.write_text(
             "# agent=coord argv=claude -p\n"
@@ -404,13 +416,14 @@ class TestWatchCommand:
             ])
         )
 
-        result = self._invoke(tmp_path, config_file, dispatched_file, log_file)
+        result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 0, result.output
         # Header comment should NOT appear in filtered mode
         assert "# agent" not in result.output
 
-    def test_header_comment_shown_in_all_mode(self, tmp_path: Path) -> None:
-        config_file, dispatched_file, log_file = self._setup(tmp_path)
+    def test_header_comment_shown_in_all_mode(self, tmp_path: Path, coord_db) -> None:
+        config_file, log_file = self._setup(tmp_path)
+        self._seed_dispatched()
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_file.write_text(
             "# agent=coord argv=claude -p\n"
@@ -421,7 +434,7 @@ class TestWatchCommand:
         )
 
         result = self._invoke(
-            tmp_path, config_file, dispatched_file, log_file,
+            tmp_path, config_file, log_file,
             extra_args=["--all"],
         )
         assert result.exit_code == 0
@@ -450,21 +463,28 @@ machines:
 """
     ASSIGNMENT_ID = "watch-remote-001"
 
-    def _setup(self, tmp_path: Path) -> tuple[Path, Path]:
+    def _setup(self, tmp_path: Path) -> Path:
         config_file = tmp_path / "coordinator.yml"
         config_file.write_text(self.REMOTE_CONFIG)
+        return config_file
 
-        dispatched_file = tmp_path / "dispatched.json"
-        dispatched_file.write_text(
-            json.dumps([{
-                "assignment_id": self.ASSIGNMENT_ID,
-                "machine_name": "remotehost",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 1,
-            }])
+    def _seed_dispatched(self) -> None:
+        """Insert a dispatched record for ASSIGNMENT_ID into the in-memory DB."""
+        from coord.models import Proposal
+        from coord.state import record_dispatched
+        proposal = Proposal(
+            id=1,
+            machine_name="remotehost",
+            repo_name="api",
+            issue_number=1,
+            issue_title="Remote issue",
+            rationale="",
         )
-        return config_file, dispatched_file
+        record_dispatched(
+            assignment_id=self.ASSIGNMENT_ID,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
 
     def _log_bytes(self, events: list[dict]) -> bytes:
         return _ndjson(events).encode("utf-8")
@@ -472,7 +492,6 @@ machines:
     def _invoke(
         self,
         config_file: Path,
-        dispatched_file: Path,
         fetch_side_effect,
         extra_args: list[str] | None = None,
     ):
@@ -486,7 +505,6 @@ machines:
             args += extra_args
 
         with (
-            patch("coord.state.DISPATCHED_FILE", dispatched_file),
             # Make the test runner look like a different machine so remote
             # detection is triggered.
             patch("socket.gethostname", return_value="localbox"),
@@ -496,8 +514,9 @@ machines:
 
         return result
 
-    def test_remote_happy_path_shows_important_events(self, tmp_path: Path) -> None:
-        config_file, dispatched_file = self._setup(tmp_path)
+    def test_remote_happy_path_shows_important_events(self, tmp_path: Path, coord_db) -> None:
+        config_file = self._setup(tmp_path)
+        self._seed_dispatched()
         log_bytes = self._log_bytes([
             {"type": "system", "subtype": "init", "model": "claude-sonnet-4-6",
              "session_id": "remotesess1234"},
@@ -508,15 +527,16 @@ machines:
         def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
             return (200, log_bytes[since:])
 
-        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        result = self._invoke(config_file, fetch_side_effect)
         assert result.exit_code == 0, result.output
         assert "[init]" in result.output
         assert "claude-sonnet-4-6" in result.output
         assert "[result]" in result.output
         assert "completed" in result.output
 
-    def test_remote_failure_exits_1(self, tmp_path: Path) -> None:
-        config_file, dispatched_file = self._setup(tmp_path)
+    def test_remote_failure_exits_1(self, tmp_path: Path, coord_db) -> None:
+        config_file = self._setup(tmp_path)
+        self._seed_dispatched()
         log_bytes = self._log_bytes([
             {"type": "result", "is_error": True, "duration_ms": 5000,
              "num_turns": 2, "total_cost_usd": 0.02, "stop_reason": "error"},
@@ -525,13 +545,14 @@ machines:
         def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
             return (200, log_bytes[since:])
 
-        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        result = self._invoke(config_file, fetch_side_effect)
         assert result.exit_code == 1
         assert "failed" in result.output
 
-    def test_remote_404_then_200_waits_and_succeeds(self, tmp_path: Path) -> None:
+    def test_remote_404_then_200_waits_and_succeeds(self, tmp_path: Path, coord_db) -> None:
         """404 on first poll (log not ready yet) should retry until 200."""
-        config_file, dispatched_file = self._setup(tmp_path)
+        config_file = self._setup(tmp_path)
+        self._seed_dispatched()
         log_bytes = self._log_bytes([
             {"type": "result", "is_error": False, "duration_ms": 1000,
              "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn"},
@@ -544,18 +565,19 @@ machines:
                 return (404, b"not found")
             return (200, log_bytes[since:])
 
-        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        result = self._invoke(config_file, fetch_side_effect)
         assert result.exit_code == 0
         assert len(calls) >= 2  # polled at least twice
 
-    def test_remote_incremental_polling_across_chunks(self, tmp_path: Path) -> None:
+    def test_remote_incremental_polling_across_chunks(self, tmp_path: Path, coord_db) -> None:
         """since= offset is advanced correctly so we don't re-emit old lines.
 
         Simulate two poll cycles: first returns only the init event (no result
         yet); second returns the result event.  The code must advance `since`
         between polls so each event is emitted exactly once.
         """
-        config_file, dispatched_file = self._setup(tmp_path)
+        config_file = self._setup(tmp_path)
+        self._seed_dispatched()
         part1 = self._log_bytes([
             {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
         ])
@@ -573,7 +595,7 @@ machines:
             # Second poll: part2 is now available.
             return (200, part2)
 
-        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        result = self._invoke(config_file, fetch_side_effect)
         assert result.exit_code == 0
         assert "[init]" in result.output
         assert "[result]" in result.output
@@ -582,8 +604,9 @@ machines:
         assert calls[0] == 0
         assert calls[1] == len(part1)
 
-    def test_remote_show_all_renders_every_event(self, tmp_path: Path) -> None:
-        config_file, dispatched_file = self._setup(tmp_path)
+    def test_remote_show_all_renders_every_event(self, tmp_path: Path, coord_db) -> None:
+        config_file = self._setup(tmp_path)
+        self._seed_dispatched()
         log_bytes = self._log_bytes([
             {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
             {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
@@ -595,15 +618,16 @@ machines:
             return (200, log_bytes[since:])
 
         result = self._invoke(
-            config_file, dispatched_file, fetch_side_effect,
+            config_file, fetch_side_effect,
             extra_args=["--all"],
         )
         assert result.exit_code == 0
         # --all should render tool_use too
         assert "[tool]" in result.output or "Bash" in result.output
 
-    def test_remote_header_comment_skipped_in_filtered_mode(self, tmp_path: Path) -> None:
-        config_file, dispatched_file = self._setup(tmp_path)
+    def test_remote_header_comment_skipped_in_filtered_mode(self, tmp_path: Path, coord_db) -> None:
+        config_file = self._setup(tmp_path)
+        self._seed_dispatched()
         raw = (
             b"# agent=coord argv=claude -p\n"
             + self._log_bytes([
@@ -615,16 +639,17 @@ machines:
         def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
             return (200, raw[since:])
 
-        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        result = self._invoke(config_file, fetch_side_effect)
         assert result.exit_code == 0
         assert "# agent" not in result.output
 
-    def test_remote_http_error_exits_1(self, tmp_path: Path) -> None:
-        config_file, dispatched_file = self._setup(tmp_path)
+    def test_remote_http_error_exits_1(self, tmp_path: Path, coord_db) -> None:
+        config_file = self._setup(tmp_path)
+        self._seed_dispatched()
 
         def fetch_side_effect(machine, assignment_id, *, since=0, **kwargs):
             return (500, b"internal error")
 
-        result = self._invoke(config_file, dispatched_file, fetch_side_effect)
+        result = self._invoke(config_file, fetch_side_effect)
         assert result.exit_code == 1
         assert "500" in result.output

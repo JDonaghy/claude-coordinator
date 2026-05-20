@@ -333,7 +333,7 @@ class TestComputePipeline:
 
 
 class TestRequiredGatesPersistence:
-    def test_save_and_load_board_preserves_required_gates(self, tmp_path: Path) -> None:
+    def test_save_and_load_board_preserves_required_gates(self, coord_db) -> None:
         from coord.state import load_board, save_board
 
         a = Assignment(
@@ -347,21 +347,18 @@ class TestRequiredGatesPersistence:
             required_gates=["merge"],
         )
         board = Board(completed=[a])
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
+        save_board(board)
 
-        loaded = load_board(path=board_file)
+        loaded = load_board()
         assert loaded is not None
         assert loaded.completed[0].required_gates == ["merge"]
 
     def test_build_board_from_ledger_preserves_required_gates(
-        self, tmp_path: Path
+        self, coord_db
     ) -> None:
         from coord.models import Proposal
         from coord.state import build_board, record_dispatched
 
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"  # doesn't exist → empty
         p = Proposal(
             id=1,
             machine_name="laptop",
@@ -375,12 +372,8 @@ class TestRequiredGatesPersistence:
             assignment_id="xyz",
             proposal=p,
             repo_github="acme/api",
-            path=dispatched_file,
         )
-        board = build_board(
-            dispatched_path=dispatched_file,
-            notified_path=notified_file,
-        )
+        board = build_board()
         assert board.active[0].required_gates == ["merge"]
 
 

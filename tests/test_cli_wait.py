@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -42,35 +41,28 @@ def config_file(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def coord_dir(tmp_path: Path, coord_db) -> Path:
     d = tmp_path / "state"
-    monkeypatch.setattr(state_mod, "COORD_DIR", d)
-    monkeypatch.setattr(state_mod, "PROPOSALS_FILE", d / "proposals.json")
-    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", d / "dispatched.json")
-    monkeypatch.setattr(state_mod, "NOTIFIED_FILE", d / "notified.json")
-    monkeypatch.setattr(state_mod, "BOARD_FILE", d / "board.json")
-    monkeypatch.setattr(mq, "QUEUE_FILE", d / "merge_queue.json")
     return d
 
 
-def _seed_dispatched(coord_dir: Path, assignment_id: str = "abc-1", machine_name: str = "laptop") -> None:
-    """Write a dispatched record so load_dispatched() can find it."""
-    d = coord_dir
-    d.mkdir(parents=True, exist_ok=True)
-    records = [
-        {
-            "assignment_id": assignment_id,
-            "machine_name": machine_name,
-            "repo_name": "api",
-            "repo_github": "acme/api",
-            "issue_number": 42,
-            "issue_title": "Add feature X",
-            "files_likely": [],
-            "briefing": "",
-            "dispatched_at": 1000.0,
-        }
-    ]
-    (d / "dispatched.json").write_text(json.dumps(records))
+def _seed_dispatched(assignment_id: str = "abc-1", machine_name: str = "laptop") -> None:
+    """Insert a dispatched record into SQLite so load_dispatched() can find it."""
+    from coord.models import Proposal
+    from coord.state import record_dispatched
+    proposal = Proposal(
+        id=1,
+        machine_name=machine_name,
+        repo_name="api",
+        issue_number=42,
+        issue_title="Add feature X",
+        rationale="",
+    )
+    record_dispatched(
+        assignment_id=assignment_id,
+        proposal=proposal,
+        repo_github="acme/api",
+    )
 
 
 def _mock_response(data: dict, status_code: int = 200) -> httpx.Response:
@@ -85,7 +77,7 @@ class TestWaitHappyPath:
     """Assignment completes with exit 0."""
 
     def test_completed_exit_zero(self, config_file: Path, coord_dir: Path) -> None:
-        _seed_dispatched(coord_dir)
+        _seed_dispatched()
         agent_data = {
             "active": [],
             "completed": [
@@ -112,7 +104,7 @@ class TestWaitWorkerFailure:
     """Assignment completes with non-zero exit code."""
 
     def test_completed_exit_nonzero(self, config_file: Path, coord_dir: Path) -> None:
-        _seed_dispatched(coord_dir)
+        _seed_dispatched()
         agent_data = {
             "active": [],
             "completed": [
@@ -141,7 +133,7 @@ class TestWaitAlreadyDone:
     """Assignment is already completed on first poll — exits immediately."""
 
     def test_already_completed(self, config_file: Path, coord_dir: Path) -> None:
-        _seed_dispatched(coord_dir)
+        _seed_dispatched()
         agent_data = {
             "active": [],
             "completed": [
@@ -182,7 +174,7 @@ class TestWaitTimeout:
     """Assignment stays active past the deadline — exits 3."""
 
     def test_timeout_while_active(self, config_file: Path, coord_dir: Path) -> None:
-        _seed_dispatched(coord_dir)
+        _seed_dispatched()
         agent_data = {
             "active": [{"id": "abc-1"}],
             "completed": [],
@@ -208,7 +200,7 @@ class TestWaitAgentUnreachable:
     """Connection error during poll — warns but keeps polling."""
 
     def test_agent_unreachable_then_completes(self, config_file: Path, coord_dir: Path) -> None:
-        _seed_dispatched(coord_dir)
+        _seed_dispatched()
         completed_data = {
             "active": [],
             "completed": [
@@ -247,7 +239,7 @@ class TestWaitVanished:
     """Assignment not found in active or completed on the agent."""
 
     def test_assignment_vanished(self, config_file: Path, coord_dir: Path) -> None:
-        _seed_dispatched(coord_dir)
+        _seed_dispatched()
         agent_data = {
             "active": [{"id": "other-1"}],
             "completed": [],

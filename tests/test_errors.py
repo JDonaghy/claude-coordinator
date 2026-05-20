@@ -154,7 +154,7 @@ class TestCLIErrors:
         assert result.exit_code != 0
         assert "No pending proposals" in result.output
 
-    def test_approve_bad_ids(self, tmp_path: Path) -> None:
+    def test_approve_bad_ids(self, tmp_path: Path, coord_db) -> None:
         from coord.cli import main
         from coord.models import Proposal
 
@@ -164,19 +164,14 @@ class TestCLIErrors:
             "machines:\n  - name: m\n    host: h\n    repos: [api]\n"
         )
 
-        proposals_file = tmp_path / "pending_proposals.json"
-        with (
-            patch("coord.state.COORD_DIR", tmp_path),
-            patch("coord.state.PROPOSALS_FILE", proposals_file),
-        ):
-            from coord.state import save_proposals
-            save_proposals([Proposal(
-                id=1, machine_name="m", repo_name="api",
-                issue_number=1, issue_title="x", rationale="",
-            )])
+        from coord.state import save_proposals
+        save_proposals([Proposal(
+            id=1, machine_name="m", repo_name="api",
+            issue_number=1, issue_title="x", rationale="",
+        )])
 
-            runner = CliRunner()
-            result = runner.invoke(main, ["approve", "abc", "--config", str(config_file)])
+        runner = CliRunner()
+        result = runner.invoke(main, ["approve", "abc", "--config", str(config_file)])
         assert result.exit_code != 0
         assert "comma-separated integers" in result.output
 

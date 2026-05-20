@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -13,11 +12,11 @@ from coord.models import Assignment, Board, Machine, Repo
 from coord.state import save_board, load_board, build_board
 
 
-# ── Board save/load roundtrip ──────────────────────────────────────────────
+# ── Board save/load roundtrip ──────────────────────────────────────────────────
 
 
 class TestBoardPersistence:
-    def test_save_and_load_roundtrip(self, tmp_path: Path) -> None:
+    def test_save_and_load_roundtrip(self, coord_db) -> None:
         board = Board(
             active=[
                 Assignment(
@@ -44,9 +43,8 @@ class TestBoardPersistence:
             ],
             round_number=3,
         )
-        board_file = tmp_path / "board.json"
-        save_board(board, path=board_file)
-        loaded = load_board(path=board_file)
+        save_board(board)
+        loaded = load_board()
 
         assert loaded is not None
         assert loaded.round_number == 3
@@ -59,185 +57,186 @@ class TestBoardPersistence:
         assert loaded.completed[0].status == "done"
         assert loaded.completed[0].finished_at == 950.0
 
-    def test_load_missing_file_returns_none(self, tmp_path: Path) -> None:
-        assert load_board(path=tmp_path / "nope.json") is None
+    def test_load_empty_db_returns_none(self, coord_db) -> None:
+        assert load_board() is None
 
-    def test_load_corrupt_file_returns_none(self, tmp_path: Path) -> None:
-        bad = tmp_path / "board.json"
-        bad.write_text("not json {{{")
-        assert load_board(path=bad) is None
+    def test_save_empty_board_and_reload(self, coord_db) -> None:
+        save_board(Board())
+        loaded = load_board()
+        assert loaded is not None
+        assert loaded.active == []
+        assert loaded.completed == []
+        assert loaded.round_number == 0
 
-    def test_save_is_atomic(self, tmp_path: Path) -> None:
-        board_file = tmp_path / "board.json"
-        save_board(Board(round_number=1), path=board_file)
-        assert board_file.exists()
-        assert not board_file.with_suffix(".json.tmp").exists()
+    def test_save_updates_status(self, coord_db) -> None:
+        """After saving a board where an assignment moved to done, load reflects that."""
+        a = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Fix auth",
+            assignment_id="abc123",
+            status="running",
+        )
+        board = Board(active=[a])
+        save_board(board)
 
-    def test_empty_board_roundtrip(self, tmp_path: Path) -> None:
-        board_file = tmp_path / "board.json"
-        save_board(Board(), path=board_file)
-        loaded = load_board(path=board_file)
+        a.status = "done"
+        a.branch = "issue-10-fix-auth"
+        board.completed.append(a)
+        board.active.remove(a)
+        save_board(board)
+
+        loaded = load_board()
+        assert loaded is not None
+        assert len(loaded.active) == 0
+        assert len(loaded.completed) == 1
+        assert loaded.completed[0].branch == "issue-10-fix-auth"
+        assert loaded.completed[0].status == "done"
+
+    def test_empty_board_roundtrip(self, coord_db) -> None:
+        save_board(Board())
+        loaded = load_board()
         assert loaded is not None
         assert loaded.active == []
         assert loaded.completed == []
         assert loaded.round_number == 0
 
 
-# ── Build board from dispatched ledger ─────────────────────────────────────
+# ── Build board from DB ─────────────────────────────────────────────────────────
 
 
 class TestBuildBoard:
-    def test_running_assignments_from_dispatched(self, tmp_path: Path) -> None:
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        dispatched_file.write_text(json.dumps([
-            {
-                "assignment_id": "aaa",
-                "machine_name": "laptop",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 10,
-                "issue_title": "Fix auth",
-                "files_likely": ["auth.py"],
-                "briefing": "fix it",
-                "dispatched_at": 1000.0,
-            },
-        ]))
-        notified_file.write_text("{}")
+    def test_running_assignments_from_db(self, coord_db) -> None:
+        from coord.state import record_dispatched
+        from coord.models import Proposal
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth",
+            rationale="", files_likely=["auth.py"], briefing="fix it",
+        )
+        record_dispatched(assignment_id="aaa", proposal=p, repo_github="acme/api")
 
-        board = build_board(dispatched_path=dispatched_file, notified_path=notified_file)
+        board = build_board()
         assert len(board.active) == 1
         assert board.active[0].assignment_id == "aaa"
         assert board.active[0].status == "running"
         assert board.active[0].files_allowed == ["auth.py"]
         assert board.completed == []
 
-    def test_completed_assignments_from_notified(self, tmp_path: Path) -> None:
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        dispatched_file.write_text(json.dumps([
-            {
-                "assignment_id": "bbb",
-                "machine_name": "server",
-                "repo_name": "shared",
-                "repo_github": "acme/shared",
-                "issue_number": 5,
-                "issue_title": "Add logging",
-                "files_likely": [],
-                "briefing": "add logs",
-                "dispatched_at": 900.0,
-            },
-        ]))
-        notified_file.write_text(json.dumps({
-            "bbb": {"event": "completion", "posted_at": 950.0},
-        }))
+    def test_completed_assignments_from_db(self, coord_db) -> None:
+        from coord.state import record_dispatched, mark_notified
+        from coord.models import Proposal
+        p = Proposal(
+            id=1, machine_name="server", repo_name="shared",
+            issue_number=5, issue_title="Add logging",
+            rationale="", files_likely=[], briefing="add logs",
+        )
+        record_dispatched(assignment_id="bbb", proposal=p, repo_github="acme/shared")
 
-        board = build_board(dispatched_path=dispatched_file, notified_path=notified_file)
-        assert board.active == []
-        assert len(board.completed) == 1
-        assert board.completed[0].assignment_id == "bbb"
-        assert board.completed[0].status == "done"
+        # Simulate save_board marking it done
+        from coord.models import Board
+        board = build_board()
+        a = board.find_by_id("bbb")
+        assert a is not None
+        a.status = "done"
+        board.completed.append(a)
+        board.active.remove(a)
+        save_board(board)
 
-    def test_failed_assignment_from_notified(self, tmp_path: Path) -> None:
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        dispatched_file.write_text(json.dumps([
-            {
-                "assignment_id": "ccc",
-                "machine_name": "laptop",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 7,
-                "issue_title": "Broken",
-                "files_likely": [],
-                "briefing": "try",
-                "dispatched_at": 800.0,
-            },
-        ]))
-        notified_file.write_text(json.dumps({
-            "ccc": {"event": "failure", "posted_at": 850.0},
-        }))
+        board2 = build_board()
+        assert board2.active == []
+        assert len(board2.completed) == 1
+        assert board2.completed[0].assignment_id == "bbb"
+        assert board2.completed[0].status == "done"
 
-        board = build_board(dispatched_path=dispatched_file, notified_path=notified_file)
-        assert board.active == []
-        assert board.completed[0].status == "failed"
+    def test_failed_assignment(self, coord_db) -> None:
+        from coord.state import record_dispatched
+        from coord.models import Proposal, Board
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=7, issue_title="Broken",
+            rationale="", files_likely=[], briefing="try",
+        )
+        record_dispatched(assignment_id="ccc", proposal=p, repo_github="acme/api")
 
-    def test_plan_event_marks_assignment_done(self, tmp_path: Path) -> None:
-        """Regression: a notified plan event must yield status='done', not 'failed'."""
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        dispatched_file.write_text(json.dumps([
-            {
-                "assignment_id": "ppp",
-                "machine_name": "laptop",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 11,
-                "issue_title": "Plan feature",
-                "files_likely": [],
-                "briefing": "",
-                "dispatched_at": 1000.0,
-                "type": "plan",
-            },
-        ]))
-        notified_file.write_text(json.dumps({
-            "ppp": {"event": "plan", "posted_at": 1100.0},
-        }))
+        board = build_board()
+        a = board.find_by_id("ccc")
+        assert a is not None
+        a.status = "failed"
+        board.completed.append(a)
+        board.active.remove(a)
+        save_board(board)
 
-        board = build_board(dispatched_path=dispatched_file, notified_path=notified_file)
-        assert board.active == []
-        assert len(board.completed) == 1
-        assert board.completed[0].assignment_id == "ppp"
-        assert board.completed[0].status == "done"
+        board2 = build_board()
+        assert board2.active == []
+        assert board2.completed[0].status == "failed"
 
-    def test_empty_ledger_gives_empty_board(self, tmp_path: Path) -> None:
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        dispatched_file.write_text("[]")
-        notified_file.write_text("{}")
-        board = build_board(dispatched_path=dispatched_file, notified_path=notified_file)
+    def test_plan_event_marks_assignment_done(self, coord_db) -> None:
+        """Plan type assignment should end up done."""
+        from coord.state import record_dispatched
+        from coord.models import Proposal, Board
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=11, issue_title="Plan feature",
+            rationale="", files_likely=[], briefing="",
+            type="plan",
+        )
+        record_dispatched(assignment_id="ppp", proposal=p, repo_github="acme/api")
+
+        board = build_board()
+        a = board.find_by_id("ppp")
+        assert a is not None
+        a.status = "done"
+        board.completed.append(a)
+        board.active.remove(a)
+        save_board(board)
+
+        board2 = build_board()
+        assert board2.active == []
+        assert len(board2.completed) == 1
+        assert board2.completed[0].assignment_id == "ppp"
+        assert board2.completed[0].status == "done"
+
+    def test_empty_db_gives_empty_board(self, coord_db) -> None:
+        board = build_board()
         assert board.active == []
         assert board.completed == []
 
-    def test_mixed_active_and_completed(self, tmp_path: Path) -> None:
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        dispatched_file.write_text(json.dumps([
-            {
-                "assignment_id": "x1",
-                "machine_name": "laptop",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 1,
-                "issue_title": "A",
-                "files_likely": [],
-                "briefing": "",
-                "dispatched_at": 100.0,
-            },
-            {
-                "assignment_id": "x2",
-                "machine_name": "server",
-                "repo_name": "shared",
-                "repo_github": "acme/shared",
-                "issue_number": 2,
-                "issue_title": "B",
-                "files_likely": [],
-                "briefing": "",
-                "dispatched_at": 200.0,
-            },
-        ]))
-        notified_file.write_text(json.dumps({
-            "x1": {"event": "completion", "posted_at": 300.0},
-        }))
+    def test_mixed_active_and_completed(self, coord_db) -> None:
+        from coord.state import record_dispatched
+        from coord.models import Proposal, Board
+        for i, (aid, machine, repo) in enumerate([
+            ("x1", "laptop", "api"),
+            ("x2", "server", "shared"),
+        ]):
+            p = Proposal(
+                id=i + 1, machine_name=machine, repo_name=repo,
+                issue_number=i + 1, issue_title=chr(65 + i),
+                rationale="", files_likely=[], briefing="",
+            )
+            record_dispatched(
+                assignment_id=aid, proposal=p,
+                repo_github=f"acme/{repo}",
+            )
 
-        board = build_board(dispatched_path=dispatched_file, notified_path=notified_file)
-        assert len(board.active) == 1
-        assert board.active[0].assignment_id == "x2"
-        assert len(board.completed) == 1
-        assert board.completed[0].assignment_id == "x1"
+        # Mark x1 as done
+        board = build_board()
+        a = board.find_by_id("x1")
+        assert a is not None
+        a.status = "done"
+        board.completed.append(a)
+        board.active.remove(a)
+        save_board(board)
+
+        board2 = build_board()
+        assert len(board2.active) == 1
+        assert board2.active[0].assignment_id == "x2"
+        assert len(board2.completed) == 1
+        assert board2.completed[0].assignment_id == "x1"
 
 
-# ── Reconciliation ─────────────────────────────────────────────────────────
+# ── Reconciliation ─────────────────────────────────────────────────────────────
 
 
 class TestReconcile:
@@ -417,7 +416,7 @@ class TestReconcile:
         assert board.completed[0].branch == "already-set"
 
 
-# ── Board GC ───────────────────────────────────────────────────────────────
+# ── Board GC ───────────────────────────────────────────────────────────────────
 
 
 class TestBoardGC:
@@ -455,8 +454,32 @@ class TestBoardGC:
         ])
         assert board.gc(keep=50) == 0
 
+    def test_gc_pruned_rows_deleted_from_db(self, coord_db) -> None:
+        """Regression: after gc() prunes completed assignments, save+load must
+        reflect the pruned count — not the original count."""
+        board = Board(completed=[
+            Assignment(
+                machine_name="m", repo_name="r", issue_number=i,
+                issue_title=f"t{i}", status="done", finished_at=float(i),
+                assignment_id=f"a{i:03d}",
+            )
+            for i in range(60)
+        ])
+        save_board(board)
 
-# ── Board model id-based methods ───────────────────────────────────────────
+        removed = board.gc(keep=50)
+        assert removed == 10
+        assert len(board.completed) == 50
+
+        save_board(board)
+        loaded = load_board()
+        assert loaded is not None
+        assert len(loaded.completed) == 50, (
+            f"Expected 50 completed after gc+save, got {len(loaded.completed)}"
+        )
+
+
+# ── Board model id-based methods ───────────────────────────────────────────────
 
 
 class TestBoardIdMethods:
@@ -501,56 +524,119 @@ class TestBoardIdMethods:
         assert board.completed == [a]
 
 
-# ── CLI resume command ─────────────────────────────────────────────────────
+# ── CLI resume command ─────────────────────────────────────────────────────────
 
 
 class TestResumeCommand:
-    def test_resume_no_board_rebuilds(self, tmp_path: Path) -> None:
+    def test_resume_no_board_rebuilds(self, coord_db) -> None:
         from coord.cli import main
 
-        config_file = tmp_path / "coordinator.yml"
-        config_file.write_text(
+        config_file_content = (
             "repos:\n  - name: api\n    github: a/a\n"
             "machines:\n  - name: m\n    host: h\n    repos: [api]\n"
         )
-        dispatched_file = tmp_path / "dispatched.json"
-        dispatched_file.write_text("[]")
-        notified_file = tmp_path / "notified.json"
-        notified_file.write_text("{}")
-        board_file = tmp_path / "board.json"
-
-        with (
-            patch("coord.state.BOARD_FILE", board_file),
-            patch("coord.state.DISPATCHED_FILE", dispatched_file),
-            patch("coord.state.NOTIFIED_FILE", notified_file),
-        ):
-            runner = CliRunner()
-            result = runner.invoke(main, ["resume", "--config", str(config_file)])
+        runner = CliRunner()
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yml", delete=False
+        ) as f:
+            f.write(config_file_content)
+            config_file = f.name
+        try:
+            result = runner.invoke(main, ["resume", "--config", config_file])
+        finally:
+            os.unlink(config_file)
 
         assert result.exit_code == 0
         assert "Rebuilding from dispatched ledger" in result.output
         assert "Board saved" in result.output
 
-    def test_resume_loads_existing_board(self, tmp_path: Path) -> None:
+    def test_resume_loads_existing_board(self, coord_db) -> None:
         from coord.cli import main
 
-        config_file = tmp_path / "coordinator.yml"
-        config_file.write_text(
+        config_file_content = (
             "repos:\n  - name: api\n    github: a/a\n"
             "machines:\n  - name: m\n    host: h\n    repos: [api]\n"
         )
-        board_file = tmp_path / "board.json"
         board = Board(round_number=5, completed=[
             Assignment(machine_name="m", repo_name="api", issue_number=1,
                        issue_title="t", assignment_id="old", status="done",
                        finished_at=1.0),
         ])
-        save_board(board, path=board_file)
+        save_board(board)
 
-        with patch("coord.state.BOARD_FILE", board_file):
-            runner = CliRunner()
-            result = runner.invoke(main, ["resume", "--config", str(config_file)])
+        runner = CliRunner()
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yml", delete=False
+        ) as f:
+            f.write(config_file_content)
+            config_file = f.name
+        try:
+            result = runner.invoke(main, ["resume", "--config", config_file])
+        finally:
+            os.unlink(config_file)
 
         assert result.exit_code == 0
         assert "Board round: 5" in result.output
         assert "completed: 1" in result.output
+
+
+# ── _save_config_snapshot ──────────────────────────────────────────────────────
+
+
+class TestSaveConfigSnapshot:
+    """_save_config_snapshot() populates the machines table in the DB."""
+
+    def test_populates_machines_table(self, coord_db) -> None:
+        from coord.cli import _save_config_snapshot
+        from coord.config import Config
+        from coord.models import Machine, Repo
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="laptop.tailnet",
+                        capabilities=["python"], repos=["api"]),
+                Machine(name="server", host="server.tailnet",
+                        capabilities=["python", "docker"], repos=["api"]),
+            ],
+        )
+        _save_config_snapshot(cfg)
+
+        import json as _json
+        rows = coord_db.execute("SELECT * FROM machines ORDER BY name").fetchall()
+        assert len(rows) == 2
+        names = [r["name"] for r in rows]
+        assert "laptop" in names
+        assert "server" in names
+
+        laptop = next(r for r in rows if r["name"] == "laptop")
+        assert laptop["host"] == "laptop.tailnet"
+        assert _json.loads(laptop["capabilities"]) == ["python"]
+        assert _json.loads(laptop["repos"]) == ["api"]
+
+        server = next(r for r in rows if r["name"] == "server")
+        assert _json.loads(server["capabilities"]) == ["python", "docker"]
+
+    def test_replaces_existing_machines(self, coord_db) -> None:
+        """Calling _save_config_snapshot twice overwrites the first set."""
+        from coord.cli import _save_config_snapshot
+        from coord.config import Config
+        from coord.models import Machine, Repo
+
+        cfg1 = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="old", host="old.tailnet", repos=["api"])],
+        )
+        _save_config_snapshot(cfg1)
+
+        cfg2 = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="new", host="new.tailnet", repos=["api"])],
+        )
+        _save_config_snapshot(cfg2)
+
+        rows = coord_db.execute("SELECT name FROM machines ORDER BY name").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["name"] == "new"

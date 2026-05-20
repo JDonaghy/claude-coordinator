@@ -371,50 +371,47 @@ class TestFormatPlanComment:
 
 
 class TestPlanPersistence:
-    def test_save_and_load(self, tmp_path: Path) -> None:
+    def test_save_and_load(self, coord_db) -> None:
         from coord.state import load_plans, save_plan
 
-        plans_file = tmp_path / "plans.json"
         wp = WorkerPlan(
             plan="p",
             files_read=["x.py"],
             estimate="large",
         )
-        save_plan("aid1", wp.to_dict(), path=plans_file)
+        save_plan("aid1", wp.to_dict())
 
-        loaded = load_plans(path=plans_file)
+        loaded = load_plans()
         assert "aid1" in loaded
         restored = WorkerPlan.from_dict(loaded["aid1"])
         assert restored.plan == "p"
         assert restored.files_read == ["x.py"]
         assert restored.estimate == "large"
 
-    def test_multiple_plans(self, tmp_path: Path) -> None:
+    def test_multiple_plans(self, coord_db) -> None:
         from coord.state import load_plans, save_plan
 
-        plans_file = tmp_path / "plans.json"
-        save_plan("a1", WorkerPlan(estimate="small").to_dict(), path=plans_file)
-        save_plan("a2", WorkerPlan(estimate="large").to_dict(), path=plans_file)
+        save_plan("a1", WorkerPlan(estimate="small").to_dict())
+        save_plan("a2", WorkerPlan(estimate="large").to_dict())
 
-        loaded = load_plans(path=plans_file)
+        loaded = load_plans()
         assert set(loaded) == {"a1", "a2"}
         assert loaded["a1"]["estimate"] == "small"
         assert loaded["a2"]["estimate"] == "large"
 
-    def test_overwrite_existing(self, tmp_path: Path) -> None:
+    def test_overwrite_existing(self, coord_db) -> None:
         from coord.state import load_plans, save_plan
 
-        plans_file = tmp_path / "plans.json"
-        save_plan("a1", WorkerPlan(estimate="small").to_dict(), path=plans_file)
-        save_plan("a1", WorkerPlan(estimate="large").to_dict(), path=plans_file)
+        save_plan("a1", WorkerPlan(estimate="small").to_dict())
+        save_plan("a1", WorkerPlan(estimate="large").to_dict())
 
-        loaded = load_plans(path=plans_file)
+        loaded = load_plans()
         assert loaded["a1"]["estimate"] == "large"
 
-    def test_load_missing_file_returns_empty(self, tmp_path: Path) -> None:
+    def test_load_empty_db_returns_empty(self, coord_db) -> None:
         from coord.state import load_plans
 
-        result = load_plans(path=tmp_path / "nonexistent.json")
+        result = load_plans()
         assert result == {}
 
 
@@ -425,47 +422,26 @@ class TestPlanPersistence:
 
 class TestBuildBoardPlan:
     def test_build_board_includes_type_and_plan(
-        self, tmp_path: Path, monkeypatch
+        self, coord_db,
     ) -> None:
         import time
-
-        from coord import state as state_mod
-        from coord.state import build_board, load_plans, save_plan
-
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        plans_file = tmp_path / "plans.json"
-
-        monkeypatch.setattr(state_mod, "PLANS_FILE", plans_file)
+        from coord.models import Proposal
+        from coord.state import build_board, save_plan, record_dispatched
 
         aid = "plan-abc"
-        dispatched_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "assignment_id": aid,
-                        "machine_name": "laptop",
-                        "repo_name": "api",
-                        "repo_github": "acme/api",
-                        "issue_number": 5,
-                        "issue_title": "Plan feat",
-                        "files_likely": [],
-                        "briefing": "",
-                        "model": None,
-                        "type": "plan",
-                        "dispatched_at": time.time(),
-                    }
-                ]
-            )
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=5,
+            issue_title="Plan feat",
+            rationale="",
+            type="plan",
         )
-        notified_file.write_text("{}")
-        save_plan(aid, WorkerPlan(estimate="small").to_dict(), path=plans_file)
+        record_dispatched(assignment_id=aid, proposal=proposal, repo_github="acme/api")
+        save_plan(aid, WorkerPlan(estimate="small").to_dict())
 
-        board = build_board(
-            dispatched_path=dispatched_file,
-            notified_path=notified_file,
-            plans_path=plans_file,
-        )
+        board = build_board()
         assert len(board.active) == 1
         a = board.active[0]
         assert a.type == "plan"
@@ -473,46 +449,23 @@ class TestBuildBoardPlan:
         assert a.plan["estimate"] == "small"
 
     def test_build_board_defaults_type_work_for_old_records(
-        self, tmp_path: Path, monkeypatch
+        self, coord_db,
     ) -> None:
-        import time
+        from coord.models import Proposal
+        from coord.state import build_board, record_dispatched
 
-        from coord import state as state_mod
-        from coord.state import build_board
-
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        plans_file = tmp_path / "plans.json"
-
-        monkeypatch.setattr(state_mod, "PLANS_FILE", plans_file)
-
-        # Old record without "type" key
-        dispatched_file.write_text(
-            json.dumps(
-                [
-                    {
-                        "assignment_id": "old-1",
-                        "machine_name": "laptop",
-                        "repo_name": "api",
-                        "repo_github": "acme/api",
-                        "issue_number": 1,
-                        "issue_title": "Fix bug",
-                        "files_likely": [],
-                        "briefing": "",
-                        "model": None,
-                        "dispatched_at": time.time(),
-                    }
-                ]
-            )
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="Fix bug",
+            rationale="",
+            # type defaults to "work"
         )
-        notified_file.write_text("{}")
-        plans_file.write_text("{}")
+        record_dispatched(assignment_id="old-1", proposal=proposal, repo_github="acme/api")
 
-        board = build_board(
-            dispatched_path=dispatched_file,
-            notified_path=notified_file,
-            plans_path=plans_file,
-        )
+        board = build_board()
         assert board.active[0].type == "work"
         assert board.active[0].plan is None
 
@@ -523,72 +476,40 @@ class TestBuildBoardPlan:
 
 
 class TestShowPlanCommand:
-    def _make_board(self, tmp_path: Path, state_mod, assignment_type: str = "plan") -> None:
+    def _make_board(self, coord_db, assignment_type: str = "plan") -> str:
         import time
+        from coord.models import Assignment, Board
+        from coord.state import save_board, save_plan
 
-        from coord.state import save_plan
-
-        plans_file = tmp_path / "plans.json"
-        dispatched_file = tmp_path / "dispatched.json"
-        notified_file = tmp_path / "notified.json"
-        board_file = tmp_path / "board.json"
-
-        # Write board.json directly so load_board() picks it up.
         aid = "plan-show-1"
-        board_data = {
-            "round_number": 0,
-            "active": [],
-            "completed": [
-                {
-                    "machine_name": "laptop",
-                    "repo_name": "api",
-                    "issue_number": 9,
-                    "issue_title": "Plan the feature",
-                    "files_allowed": [],
-                    "files_forbidden": [],
-                    "briefing": "",
-                    "assignment_id": aid,
-                    "status": "done",
-                    "branch": None,
-                    "pr_url": None,
-                    "dispatched_at": time.time(),
-                    "finished_at": time.time(),
-                    "smoke_test": None,
-                    "smoke_test_reason": None,
-                    "type": assignment_type,
-                    "review_target": None,
-                    "review_of_assignment_id": None,
-                    "unreachable_count": 0,
-                    "model": None,
-                    "plan": WorkerPlan(
+        board = Board(
+            round_number=0,
+            completed=[
+                Assignment(
+                    machine_name="laptop",
+                    repo_name="api",
+                    issue_number=9,
+                    issue_title="Plan the feature",
+                    assignment_id=aid,
+                    status="done",
+                    finished_at=time.time(),
+                    type=assignment_type,
+                    plan=WorkerPlan(
                         files_read=["coord/cli.py"],
                         approach="Add command.",
                         estimate="small",
                     ).to_dict(),
-                }
+                )
             ],
-        }
-        board_file.write_text(json.dumps(board_data))
-
-        import coord.state as s
-
-        state_mod.setattr(s, "BOARD_FILE", board_file)
-        state_mod.setattr(s, "PLANS_FILE", plans_file)
-        state_mod.setattr(s, "DISPATCHED_FILE", dispatched_file)
-        state_mod.setattr(s, "NOTIFIED_FILE", notified_file)
-
+        )
+        save_board(board)
         return aid
 
-    def test_show_plan_displays_sections(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_show_plan_displays_sections(self, coord_db) -> None:
         from click.testing import CliRunner
-
         from coord.cli import main
 
-        import coord.state as s
-
-        aid = self._make_board(tmp_path, monkeypatch)
+        aid = self._make_board(coord_db)
 
         runner = CliRunner()
         result = runner.invoke(main, ["show-plan", aid])
@@ -597,28 +518,22 @@ class TestShowPlanCommand:
         assert "Add command." in result.output
         assert "small" in result.output
 
-    def test_show_plan_wrong_type_fails(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_show_plan_wrong_type_fails(self, coord_db) -> None:
         from click.testing import CliRunner
-
         from coord.cli import main
 
-        aid = self._make_board(tmp_path, monkeypatch, assignment_type="work")
+        aid = self._make_board(coord_db, assignment_type="work")
 
         runner = CliRunner()
         result = runner.invoke(main, ["show-plan", aid])
         assert result.exit_code != 0
         assert "not 'plan'" in result.output
 
-    def test_show_plan_missing_assignment_fails(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
+    def test_show_plan_missing_assignment_fails(self, coord_db) -> None:
         from click.testing import CliRunner
-
         from coord.cli import main
 
-        self._make_board(tmp_path, monkeypatch)
+        self._make_board(coord_db)
 
         runner = CliRunner()
         result = runner.invoke(main, ["show-plan", "does-not-exist"])

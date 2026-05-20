@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -75,11 +74,7 @@ def no_review_config(repo: Repo) -> Config:
 
 
 @pytest.fixture
-def coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setattr(state_mod, "COORD_DIR", tmp_path)
-    monkeypatch.setattr(state_mod, "BOARD_FILE", tmp_path / "board.json")
-    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", tmp_path / "dispatched.json")
-    monkeypatch.setattr(state_mod, "NOTIFIED_FILE", tmp_path / "notified.json")
+def coord_dir(tmp_path: Path, coord_db) -> Path:
     return tmp_path
 
 
@@ -346,7 +341,7 @@ class TestReviewStatePersistence:
         assert loaded.completed[0].review_state == "dispatched"
 
     def test_all_review_states_survive_round_trip(self, coord_dir: Path) -> None:
-        """All three non-null review states round-trip through JSON."""
+        """All three non-null review states round-trip through SQLite."""
         for rs in ("pending", "dispatched", "done"):
             board = Board(
                 completed=[
@@ -361,45 +356,29 @@ class TestReviewStatePersistence:
             save_board(board)
             loaded = load_board()
             assert loaded is not None
-            assert loaded.completed[0].review_state == rs, f"Failed for review_state={rs!r}"
+            a = loaded.find_by_id(f"work-{rs}")
+            assert a is not None, f"Assignment work-{rs} not found after save"
+            assert a.review_state == rs, f"Failed for review_state={rs!r}"
 
     def test_old_board_without_review_state_loads_as_none(
         self, coord_dir: Path
     ) -> None:
-        """Boards saved before this feature (no review_state key) load cleanly."""
-        # Simulate an old-format board JSON without review_state.
-        old_data = {
-            "round_number": 0,
-            "active": [],
-            "completed": [
-                {
-                    "machine_name": "laptop",
-                    "repo_name": "api",
-                    "issue_number": 1,
-                    "issue_title": "Old assignment",
-                    "files_allowed": [],
-                    "files_forbidden": [],
-                    "briefing": "",
-                    "assignment_id": "old-001",
-                    "status": "done",
-                    "branch": None,
-                    "pr_url": None,
-                    "dispatched_at": None,
-                    "finished_at": None,
-                    "smoke_test": None,
-                    "smoke_test_reason": None,
-                    "type": "work",
-                    "review_target": None,
-                    "review_of_assignment_id": None,
-                    "unreachable_count": 0,
-                    "model": None,
-                    "plan": None,
-                    # NOTE: no review_state key — old format
-                },
-            ],
-            "saved_at": 0.0,
-        }
-        (coord_dir / "board.json").write_text(json.dumps(old_data))
+        """Assignments saved without review_state load as None."""
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop",
+                    repo_name="api",
+                    issue_number=1,
+                    issue_title="Old assignment",
+                    assignment_id="old-001",
+                    status="done",
+                    type="work",
+                    review_state=None,
+                )
+            ]
+        )
+        save_board(board)
         loaded = load_board()
         assert loaded is not None
         assert loaded.completed[0].review_state is None
@@ -413,42 +392,25 @@ class TestBuildBoardReviewState:
         self, coord_dir: Path
     ) -> None:
         """build_board sets review_state='dispatched' when a review is in the dispatched ledger but not notified."""
-        # Write dispatched ledger: work assignment + review assignment
-        dispatched = [
-            {
-                "assignment_id": "work-001",
-                "machine_name": "laptop",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 1,
-                "issue_title": "Fix",
-                "files_likely": [],
-                "briefing": "",
-                "model": None,
-                "type": "work",
-                "dispatched_at": 1.0,
-                "review_of_assignment_id": None,
-            },
-            {
-                "assignment_id": "rev-001",
-                "machine_name": "server",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 1,
-                "issue_title": "[review] Fix",
-                "files_likely": [],
-                "briefing": "",
-                "model": None,
-                "type": "review",
-                "dispatched_at": 2.0,
-                "review_of_assignment_id": "work-001",  # links back
-            },
-        ]
-        (coord_dir / "dispatched.json").write_text(json.dumps(dispatched))
+        from coord.models import Proposal
+        from coord.state import mark_notified, record_dispatched
 
-        # Notified ledger: only the work assignment is done; review is still running.
-        notified = {"work-001": {"event": "completion", "posted_at": 3.0}}
-        (coord_dir / "notified.json").write_text(json.dumps(notified))
+        work_proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Fix", rationale="",
+        )
+        record_dispatched(assignment_id="work-001", proposal=work_proposal, repo_github="acme/api")
+        mark_notified("work-001", "completion")
+
+        # Review assignment dispatched but not notified
+        review_a = Assignment(
+            machine_name="server", repo_name="api", issue_number=1,
+            issue_title="[review] Fix", assignment_id="rev-001",
+            status="running", type="review", review_of_assignment_id="work-001",
+            dispatched_at=2.0,
+        )
+        from coord.state import record_dispatched_assignment
+        record_dispatched_assignment(assignment=review_a, repo_github="acme/api")
 
         board = build_board()
         work = board.find_by_id("work-001")
@@ -460,44 +422,24 @@ class TestBuildBoardReviewState:
         self, coord_dir: Path
     ) -> None:
         """build_board sets review_state='done' when both work and review are in notified."""
-        dispatched = [
-            {
-                "assignment_id": "work-001",
-                "machine_name": "laptop",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 1,
-                "issue_title": "Fix",
-                "files_likely": [],
-                "briefing": "",
-                "model": None,
-                "type": "work",
-                "dispatched_at": 1.0,
-                "review_of_assignment_id": None,
-            },
-            {
-                "assignment_id": "rev-001",
-                "machine_name": "server",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 1,
-                "issue_title": "[review] Fix",
-                "files_likely": [],
-                "briefing": "",
-                "model": None,
-                "type": "review",
-                "dispatched_at": 2.0,
-                "review_of_assignment_id": "work-001",
-            },
-        ]
-        (coord_dir / "dispatched.json").write_text(json.dumps(dispatched))
+        from coord.models import Proposal
+        from coord.state import mark_notified, record_dispatched, record_dispatched_assignment
 
-        # Both done.
-        notified = {
-            "work-001": {"event": "completion", "posted_at": 3.0},
-            "rev-001": {"event": "completion", "posted_at": 5.0},
-        }
-        (coord_dir / "notified.json").write_text(json.dumps(notified))
+        work_proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Fix", rationale="",
+        )
+        record_dispatched(assignment_id="work-001", proposal=work_proposal, repo_github="acme/api")
+        mark_notified("work-001", "completion")
+
+        review_a = Assignment(
+            machine_name="server", repo_name="api", issue_number=1,
+            issue_title="[review] Fix", assignment_id="rev-001",
+            status="running", type="review", review_of_assignment_id="work-001",
+            dispatched_at=2.0,
+        )
+        record_dispatched_assignment(assignment=review_a, repo_github="acme/api")
+        mark_notified("rev-001", "completion")
 
         board = build_board()
         work = board.find_by_id("work-001")
@@ -508,25 +450,15 @@ class TestBuildBoardReviewState:
         self, coord_dir: Path
     ) -> None:
         """build_board leaves review_state=None when no review exists in the ledger."""
-        dispatched = [
-            {
-                "assignment_id": "work-001",
-                "machine_name": "laptop",
-                "repo_name": "api",
-                "repo_github": "acme/api",
-                "issue_number": 1,
-                "issue_title": "Fix",
-                "files_likely": [],
-                "briefing": "",
-                "model": None,
-                "type": "work",
-                "dispatched_at": 1.0,
-                "review_of_assignment_id": None,
-            },
-        ]
-        (coord_dir / "dispatched.json").write_text(json.dumps(dispatched))
-        notified = {"work-001": {"event": "completion", "posted_at": 2.0}}
-        (coord_dir / "notified.json").write_text(json.dumps(notified))
+        from coord.models import Proposal
+        from coord.state import mark_notified, record_dispatched
+
+        work_proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Fix", rationale="",
+        )
+        record_dispatched(assignment_id="work-001", proposal=work_proposal, repo_github="acme/api")
+        mark_notified("work-001", "completion")
 
         board = build_board()
         work = board.find_by_id("work-001")
@@ -650,17 +582,8 @@ class TestStatusReviewStateDisplay:
         return p
 
     @pytest.fixture
-    def cli_coord_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-        import coord.merge_queue as mq
-
+    def cli_coord_dir(self, tmp_path: Path, coord_db) -> Path:
         d = tmp_path / "state"
-        monkeypatch.setattr(state_mod, "COORD_DIR", d)
-        monkeypatch.setattr(state_mod, "BOARD_FILE", d / "board.json")
-        monkeypatch.setattr(state_mod, "DISPATCHED_FILE", d / "dispatched.json")
-        monkeypatch.setattr(state_mod, "NOTIFIED_FILE", d / "notified.json")
-        monkeypatch.setattr(state_mod, "PROPOSALS_FILE", d / "proposals.json")
-        monkeypatch.setattr(state_mod, "SESSION_FILE", d / "session.json")
-        monkeypatch.setattr(mq, "QUEUE_FILE", d / "queue.json")
         return d
 
     def _run_status(self, config_file: Path) -> str:

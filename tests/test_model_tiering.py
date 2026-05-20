@@ -305,17 +305,9 @@ def cli_config_file(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def cli_coord_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    from coord import state as state_mod
-    from coord import merge_queue as mq
-
+def cli_coord_dir(tmp_path: Path, coord_db) -> Path:
+    """Provide an isolated in-memory DB for state and return a temp dir."""
     d = tmp_path / "state"
-    monkeypatch.setattr(state_mod, "COORD_DIR", d)
-    monkeypatch.setattr(state_mod, "PROPOSALS_FILE", d / "proposals.json")
-    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", d / "dispatched.json")
-    monkeypatch.setattr(state_mod, "NOTIFIED_FILE", d / "notified.json")
-    monkeypatch.setattr(state_mod, "BOARD_FILE", d / "board.json")
-    monkeypatch.setattr(mq, "QUEUE_FILE", d / "merge_queue.json")
     return d
 
 

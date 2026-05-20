@@ -32,12 +32,30 @@ _CONFIG_OPTION = click.option(
 )
 
 
+def _save_config_snapshot(config: Config) -> None:
+    """Persist machine metadata to the DB so the dashboard can read it."""
+    try:
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute("DELETE FROM machines")
+        for m in config.machines:
+            conn.execute(
+                "INSERT INTO machines (name, host, capabilities, repos) VALUES (?, ?, ?, ?)",
+                (m.name, m.host, json.dumps(m.capabilities), json.dumps(m.repos)),
+            )
+        conn.commit()
+    except Exception:  # noqa: BLE001 — non-critical, don't abort CLI
+        pass
+
+
 def _load_config(path: Path) -> Config:
     try:
-        return load(path)
+        cfg = load(path)
     except ConfigError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(2)
+    _save_config_snapshot(cfg)
+    return cfg
 
 
 @click.group(help="Multi-agent coordinator for Claude Code workers.")

@@ -445,11 +445,9 @@ def test_dispatch_review_falls_back_when_no_pr_can_be_opened(
 
 
 def test_dispatch_review_records_to_dispatched_ledger(
-    two_machine_config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    two_machine_config: Config, coord_db,
 ) -> None:
     from coord import state as state_mod
-
-    monkeypatch.setattr(state_mod, "DISPATCHED_FILE", tmp_path / "dispatched.json")
 
     board = Board()
     completed = _completed_assignment(machine="laptop")
@@ -465,7 +463,7 @@ def test_dispatch_review_records_to_dispatched_ledger(
     )
 
     assert result is not None
-    records = state_mod.load_dispatched(tmp_path / "dispatched.json")
+    records = state_mod.load_dispatched()
     assert len(records) == 1
     assert records[0]["assignment_id"] == "review-ledger-1"
     assert records[0]["repo_github"] == "acme/api"
