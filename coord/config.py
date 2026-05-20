@@ -222,6 +222,10 @@ def _parse_repos(raw: Any) -> list[Repo]:
 
         worker_permissions = _parse_worker_permissions(entry.get("worker_permissions"), i)
 
+        housekeeping = entry.get("housekeeping", []) or []
+        if not isinstance(housekeeping, list) or not all(isinstance(h, str) for h in housekeeping):
+            raise ConfigError(f"repos[{i}].housekeeping must be a list of strings")
+
         repos.append(
             Repo(
                 name=name,
@@ -231,6 +235,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 build_command=build_command,
                 test_command=test_command,
                 worker_permissions=worker_permissions,
+                housekeeping=housekeeping,
             )
         )
     return repos

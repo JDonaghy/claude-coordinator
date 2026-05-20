@@ -1843,6 +1843,56 @@ def done(config_path: Path) -> None:
         from coord.hooks import _summary_report
         click.echo(_summary_report(cfg, board))
 
+    # Repo housekeeping: pull latest and run configured commands
+    hostname = socket.gethostname().split(".")[0]
+    local_machine = next(
+        (m for m in cfg.machines if m.name == hostname or m.host.split(".")[0] == hostname),
+        None,
+    )
+
+    if local_machine:
+        for repo in cfg.repos:
+            if not repo.housekeeping:
+                continue
+            repo_path_str = local_machine.repo_path(repo.name)
+            if not repo_path_str:
+                click.echo(f"  {repo.name}: no local path configured, skipping housekeeping")
+                continue
+            repo_path = Path(repo_path_str).expanduser()
+            if not repo_path.exists():
+                click.echo(f"  {repo.name}: path {repo_path} does not exist, skipping")
+                continue
+
+            # Pull latest
+            click.echo(f"\n{repo.name}: pulling latest...")
+            try:
+                subprocess.run(
+                    ["git", "pull", "--ff-only"],
+                    cwd=str(repo_path), check=True, capture_output=True, text=True,
+                )
+            except subprocess.CalledProcessError as e:
+                click.echo(f"  git pull failed: {e.stderr.strip()}", err=True)
+                # Continue with housekeeping anyway — might still work
+
+            # Run housekeeping commands
+            for cmd in repo.housekeeping:
+                click.echo(f"  running: {cmd}")
+                try:
+                    result = subprocess.run(
+                        cmd, shell=True, cwd=str(repo_path),
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    if result.returncode != 0:
+                        click.echo(f"  failed (exit {result.returncode}): {result.stderr.strip()}", err=True)
+                    else:
+                        click.echo(f"  done")
+                except subprocess.TimeoutExpired:
+                    click.echo(f"  timed out after 300s", err=True)
+                except Exception as e:
+                    click.echo(f"  error: {e}", err=True)
+    else:
+        click.echo("\nCould not determine local machine — skipping repo housekeeping")
+
     save_board(board)
     click.echo("\nSession ended. Board saved.")
 

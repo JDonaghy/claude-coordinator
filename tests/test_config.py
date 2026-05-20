@@ -129,3 +129,60 @@ def test_example_config_at_repo_root() -> None:
     cfg = load(Path(__file__).resolve().parents[1] / "coordinator.yml")
     assert len(cfg.repos) > 0
     assert len(cfg.machines) > 0
+
+
+def test_repo_housekeeping_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    housekeeping:\n"
+        "      - pip install -e .\n"
+        "      - make build\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").housekeeping == ["pip install -e .", "make build"]
+
+
+def test_repo_housekeeping_default_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").housekeeping == []
+
+
+def test_repo_housekeeping_invalid_type(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    housekeeping: not-a-list\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="housekeeping must be a list of strings"):
+        load(p)
+
+
+def test_repo_housekeeping_invalid_element(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    housekeeping:\n"
+        "      - 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="housekeeping must be a list of strings"):
+        load(p)
