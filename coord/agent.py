@@ -284,7 +284,7 @@ class AgentServer:
                 if a.log_path and is_stream_json(a.log_path):
                     try:
                         summary = parse_log(a.log_path)
-                    except OSError:
+                    except Exception:
                         summary = None
                     if summary is not None:
                         d["model_used"] = summary.model_used
@@ -299,7 +299,7 @@ class AgentServer:
                 if a.log_path and is_stream_json(a.log_path):
                     try:
                         summary = parse_log(a.log_path, tail_bytes=0)
-                    except OSError:
+                    except Exception:
                         summary = None
                     if summary is not None:
                         d["model_used"] = summary.model_used
