@@ -964,6 +964,12 @@ def approve(
         save_board(board)
         click.echo("\nPending proposals cleared. Board saved.")
 
+        # Mark session start on first dispatch of the session
+        from coord.state import load_session, write_session_start
+        session = load_session()
+        if session is None or session.get("clean_shutdown", True):
+            write_session_start()
+
 
 @main.command(help="Directly assign an issue to a machine, bypassing coord plan.")
 @click.argument("machine")
@@ -1099,6 +1105,12 @@ def assign(
     # Update board
     board = build_board()
     save_board(board)
+
+    # Mark session start on first dispatch of the session
+    from coord.state import load_session, write_session_start
+    session = load_session()
+    if session is None or session.get("clean_shutdown", True):
+        write_session_start()
 
 
 @main.command(help="View claude -p output for a specific assignment.")
@@ -1894,7 +1906,54 @@ def done(config_path: Path) -> None:
         click.echo("\nCould not determine local machine — skipping repo housekeeping")
 
     save_board(board)
+
+    # Write session end summary
+    from coord.state import write_session_end, COORD_DIR as _COORD_DIR
+    from coord.worker_events import parse_log, is_stream_json
+
+    completed_ids = [a.assignment_id for a in board.completed if a.assignment_id]
+    issues_closed = list(set(a.issue_number for a in board.completed))
+    total_cost = 0.0
+    for a in board.completed:
+        if a.assignment_id:
+            log_path = _COORD_DIR / "logs" / f"{a.assignment_id}.log"
+            if log_path.exists() and is_stream_json(log_path):
+                summary = parse_log(log_path)
+                total_cost += summary.total_cost_usd
+
+    write_session_end(
+        completed_ids=completed_ids,
+        issues_closed=issues_closed,
+        total_cost_usd=total_cost,
+    )
+    click.echo(f"\nSession saved (${total_cost:.2f} total cost)")
+
     click.echo("\nSession ended. Board saved.")
+
+
+@main.command(help="Show current session state.")
+def session() -> None:
+    from coord.state import load_session
+
+    data = load_session()
+    if data is None:
+        click.echo("No session state found. Start one with coord assign.")
+        return
+
+    clean = data.get("clean_shutdown", True)
+    started = data.get("started_at", "?")
+
+    if clean:
+        ended = data.get("ended_at", "?")
+        completed = len(data.get("completed_this_session", []))
+        issues = len(data.get("issues_closed", []))
+        cost = data.get("total_cost_usd", 0)
+        click.echo(f"Last session: {started} → {ended}")
+        click.echo(f"  {completed} assignments, {issues} issues, ${cost:.2f}")
+    else:
+        click.echo(f"Session in progress (started {started})")
+        click.echo(f"  clean_shutdown: false (crash recovery may be needed)")
+        click.echo(f"  Run: coord resume")
 
 
 @main.command(help="Start the web dashboard (port 7434).")
