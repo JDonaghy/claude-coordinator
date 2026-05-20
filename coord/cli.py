@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -74,6 +75,57 @@ def config_cmd(config_path: Path) -> None:
 def _not_implemented(name: str) -> None:
     click.echo(f"coord {name}: not implemented yet (stub)", err=True)
     sys.exit(1)
+
+
+def _ensure_coord_permissions(cwd: Path) -> None:
+    """Check .claude/settings.local.json for Bash(coord *) / Bash(coord) entries.
+
+    If either is absent, prompt the user and add both.  Skips silently when
+    both entries are already present.
+    """
+    settings_dir = cwd / ".claude"
+    settings_path = settings_dir / "settings.local.json"
+
+    COORD_PERMS = ["Bash(coord *)", "Bash(coord)"]
+
+    # Read existing settings or start fresh.
+    data: dict = {}
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = {}
+
+    existing_allow: list = data.get("permissions", {}).get("allow", [])
+    missing = [p for p in COORD_PERMS if p not in existing_allow]
+
+    if not missing:
+        return  # Already configured — nothing to do.
+
+    click.echo("\n── Claude Code permissions ──")
+    click.echo(
+        "  .claude/settings.local.json is missing: "
+        + ", ".join(missing)
+    )
+    if click.confirm(
+        "  Add Bash(coord *) and Bash(coord) to allow list?",
+        default=True,
+    ):
+        if "permissions" not in data:
+            data["permissions"] = {}
+        if "allow" not in data["permissions"]:
+            data["permissions"]["allow"] = []
+        for perm in missing:
+            if perm not in data["permissions"]["allow"]:
+                data["permissions"]["allow"].append(perm)
+
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(data, indent=2) + "\n")
+        click.echo(f"  Updated: {settings_path}")
+    else:
+        click.echo(
+            "  Skipped. Add them manually to .claude/settings.local.json."
+        )
 
 
 @main.command(help="Interactive setup; generates coordinator.yml.")
@@ -183,6 +235,7 @@ def init() -> None:
         config_file.write_text(yaml_str)
         click.echo(f"\nCreated coordinator.yml with 0 repos and 1 machine.")
         click.echo("Next: edit coordinator.yml to add repos, then run 'coord agent'.")
+        _ensure_coord_permissions(cwd)
         return
 
     click.echo("Found repos:")
@@ -348,6 +401,9 @@ def init() -> None:
         f"and {len(machines_config)} machine(s)."
     )
     click.echo("Next: start the agent with 'coord agent', then run 'coord plan'.")
+
+    # ── Step 9: Ensure Claude Code permissions are configured ────────────
+    _ensure_coord_permissions(cwd)
 
 
 def _parse_github_remote(url: str) -> str | None:
