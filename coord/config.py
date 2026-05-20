@@ -49,7 +49,9 @@ class ReviewsConfig:
     auto_dispatch: bool = True
     require_approval: bool = False
     reviewer_prompt: str = ""
-    checklist: list[str] = field(default_factory=list)
+    checklist: list[str] = field(default_factory=lambda: [
+        "Check for platform-specific code in shared/cross-platform paths",
+    ])
     repo_overrides: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -226,6 +228,10 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if not isinstance(housekeeping, list) or not all(isinstance(h, str) for h in housekeeping):
             raise ConfigError(f"repos[{i}].housekeeping must be a list of strings")
 
+        coordinator_only_files = entry.get("coordinator_only_files", []) or []
+        if not isinstance(coordinator_only_files, list) or not all(isinstance(f, str) for f in coordinator_only_files):
+            raise ConfigError(f"repos[{i}].coordinator_only_files must be a list of strings")
+
         repos.append(
             Repo(
                 name=name,
@@ -236,6 +242,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 test_command=test_command,
                 worker_permissions=worker_permissions,
                 housekeeping=housekeeping,
+                coordinator_only_files=coordinator_only_files,
             )
         )
     return repos

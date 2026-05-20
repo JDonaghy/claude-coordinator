@@ -113,10 +113,16 @@ Rules:
 (issues, PRs, comments). Use regular git commands only.
 - Stay within the files listed in your briefing. If you need to touch \
 other files, do so only if strictly necessary and note it.
+- If the briefing lists forbidden files, do NOT read or modify them. \
+They are managed by the coordinator.
 - You are already on a feature branch. Commit your work to this branch. \
 Push with `git push origin HEAD`. \
 NEVER commit or push to main or develop directly. \
 Do NOT open a PR — the coordinator handles that.
+
+Before writing any code, verify the feature or fix isn't already implemented. \
+Grep for relevant function names, check existing modules, and read related files. \
+If it already exists, report back instead of reimplementing.
 
 Progress reporting:
 - After each significant step (first build, test run, approach change), \
