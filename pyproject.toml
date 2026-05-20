@@ -8,14 +8,13 @@ version = "0.1.0"
 description = "Coordinate Claude Code workers across multiple machines and repos."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "John Donaghy", email = "johnfdonaghy@gmail.com" }]
 keywords = ["claude", "claude-code", "multi-agent", "coordinator", "automation"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Build Tools",
 ]
