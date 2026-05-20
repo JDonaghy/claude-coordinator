@@ -137,6 +137,43 @@ class TestParseSections:
         assert sections["PLAN"] == "implement auth"
         assert sections["FILES_READ"] == "auth.py"
 
+    # -- markdown-formatted heading tolerance ---------------------------------
+
+    def test_hash_heading_parsed(self) -> None:
+        """### FILES_READ: should be recognised the same as bare FILES_READ:"""
+        text = "### FILES_READ: coord/cli.py\n### ESTIMATE: small\n"
+        sections = _parse_sections(text)
+        assert sections["FILES_READ"] == "coord/cli.py"
+        assert sections["ESTIMATE"] == "small"
+
+    def test_bold_heading_parsed(self) -> None:
+        """**FILES_READ:** should be recognised as a section header."""
+        text = "**FILES_READ:** coord/cli.py\n**ESTIMATE:** small\n"
+        sections = _parse_sections(text)
+        assert sections["FILES_READ"] == "coord/cli.py"
+        assert sections["ESTIMATE"] == "small"
+
+    def test_single_hash_heading_parsed(self) -> None:
+        """# PLAN: ... should match."""
+        text = "# PLAN: implement auth\n# FILES_READ: auth.py\n"
+        sections = _parse_sections(text)
+        assert sections["PLAN"] == "implement auth"
+        assert sections["FILES_READ"] == "auth.py"
+
+    def test_mixed_plain_and_markdown_headings(self) -> None:
+        """A log mixing bare and markdown-prefixed headings is fully parsed."""
+        text = (
+            "### PLAN: add caching\n"
+            "FILES_READ: cache.py, main.py\n"
+            "**FILES_MODIFY:** cache.py\n"
+            "APPROACH: wrap function\n"
+        )
+        sections = _parse_sections(text)
+        assert sections["PLAN"] == "add caching"
+        assert "cache.py" in sections["FILES_READ"]
+        assert sections["FILES_MODIFY"] == "cache.py"
+        assert sections["APPROACH"] == "wrap function"
+
 
 # ---------------------------------------------------------------------------
 # parse_plan_text

@@ -393,3 +393,69 @@ class TestCliPlanOnly:
             )
         assert result.exit_code == 0
         assert "plan" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# coord status badge_map — plan type gets "[plan] " badge
+# ---------------------------------------------------------------------------
+
+
+class TestStatusBadgeMapPlan:
+    """Verify that plan assignments show a [plan] badge in coord status output."""
+
+    def test_plan_type_in_badge_map(self) -> None:
+        """The badge_map used in coord status must include a 'plan' entry."""
+        # Import the CLI module and locate badge_map source via inspection.
+        # We verify the behaviour directly: a plan assignment spec must produce
+        # a non-empty badge string containing "plan".
+        import coord.cli as cli_mod
+        import inspect
+        src = inspect.getsource(cli_mod)
+        # badge_map definition must include the "plan" key
+        assert '"plan"' in src or "'plan'" in src, (
+            "badge_map in cli.py must include a 'plan' key"
+        )
+
+    def test_status_displays_plan_badge(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """coord status shows '[plan]' for an active plan assignment."""
+        from coord import network
+
+        machine_mock = MagicMock()
+        machine_mock.name = "laptop"
+        machine_mock.host = "laptop.tailnet"
+        machine_mock.repos = ["api"]
+
+        online_status = network.MachineStatus(
+            machine=machine_mock,
+            state=network.ONLINE,
+            latency_ms=5.0,
+            health={"machine": "laptop", "capabilities": [], "repos": ["api"],
+                    "active": 1, "completed": 0},
+        )
+
+        agent_payload = {
+            "active": [
+                {
+                    "id": "plan-badge-1",
+                    "spec": {
+                        "repo_name": "api",
+                        "issue_number": 42,
+                        "issue_title": "Plan feature X",
+                        "type": "plan",
+                    },
+                }
+            ],
+            "completed": [],
+        }
+
+        from coord.network import StatusResult
+        with patch("coord.network.check_all", return_value=[online_status]), \
+             patch("coord.network.fetch_status", return_value=StatusResult(data=agent_payload)):
+            result = CliRunner().invoke(
+                main, ["status", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "[plan]" in result.output

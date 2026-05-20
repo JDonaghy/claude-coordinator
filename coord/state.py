@@ -289,7 +289,7 @@ def build_board(
     log and the notified ledger to determine which assignments are active
     vs completed. Use this when the board file is missing or suspect.
     """
-    from coord.comments import EVENT_COMPLETION
+    from coord.comments import EVENT_COMPLETION, EVENT_PLAN
 
     dispatched = load_dispatched(dispatched_path)
     notified = load_notified(notified_path)
@@ -314,7 +314,7 @@ def build_board(
         )
         n = notified.get(aid)
         if n:
-            a.status = "done" if n["event"] == EVENT_COMPLETION else "failed"
+            a.status = "done" if n["event"] in (EVENT_COMPLETION, EVENT_PLAN) else "failed"
             a.finished_at = n.get("posted_at")
             if n.get("branch"):
                 a.branch = n["branch"]

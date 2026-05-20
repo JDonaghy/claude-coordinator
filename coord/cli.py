@@ -651,7 +651,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     a = active[0]
                     spec = a.get("spec", {})
                     spec_type = spec.get("type", "work")
-                    badge_map = {"review": "[review] ", "smoke": "[smoke] "}
+                    badge_map = {"review": "[review] ", "smoke": "[smoke] ", "plan": "[plan] "}
                     badge = badge_map.get(spec_type, "")
                     target = spec.get("review_target")
                     if spec_type == "review" and target:
@@ -1448,8 +1448,7 @@ def _log_remote(machine, assignment_id: str, follow: bool, *, raw: bool = False)
 
 @main.command("show-plan", help="Pretty-print the structured plan for a plan-only assignment.")
 @click.argument("assignment_id")
-@_CONFIG_OPTION
-def show_plan(assignment_id: str, config_path: Path) -> None:  # noqa: ARG001
+def show_plan(assignment_id: str) -> None:
     from coord.plan_parser import WorkerPlan, parse_plan_from_log
     from coord.state import COORD_DIR, build_board, load_board, load_plans
 

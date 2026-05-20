@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 from coord import github_ops
 from coord.comments import (
@@ -236,7 +239,8 @@ def _try_parse_and_post_plan(
 
     try:
         worker_plan = parse_plan_from_log(log_path)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to parse plan log for %s: %s", transition.assignment_id, exc)
         return False
 
     if worker_plan is None or worker_plan.is_empty():
@@ -256,7 +260,8 @@ def _try_parse_and_post_plan(
         )
         # Cache the parsed plan in the state directory.
         save_plan(transition.assignment_id, worker_plan.to_dict())
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to post plan comment for %s: %s", transition.assignment_id, exc)
         return False
 
     return True

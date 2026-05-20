@@ -27,8 +27,10 @@ from pathlib import Path
 SECTION_KEYWORDS = ["PLAN", "FILES_READ", "FILES_MODIFY", "APPROACH", "RISKS", "ESTIMATE"]
 
 # Match a section header at the start of a line, capturing the keyword.
+# Tolerates optional leading markdown (e.g. "### FILES_READ:" or "**FILES_READ:**").
+# The trailing optional \*{1,2} handles bold-close after the colon: **KEYWORD:**
 _SECTION_RE = re.compile(
-    r"^(" + "|".join(SECTION_KEYWORDS) + r"):\s*",
+    r"^(?:[#*]+\s+|\*{1,2})?(" + "|".join(SECTION_KEYWORDS) + r"):(?:\*{1,2})?\s*",
     re.MULTILINE,
 )
 
