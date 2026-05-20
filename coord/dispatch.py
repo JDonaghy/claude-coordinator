@@ -69,6 +69,7 @@ def dispatch(
         "pull_repos": list(pull_repos),
         "deny_commands": deny_commands,
         "model": model,
+        "type": proposal.type,
     }
 
     resp = httpx.post(url, json=payload, timeout=15)
