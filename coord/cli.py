@@ -2230,8 +2230,14 @@ def _dispatch_followup(
 @main.command(help="Dispatch a worker to create a PR for a completed assignment.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION
-def pr(assignment_id: str, config_path: Path) -> None:
-    from coord.state import build_board, load_board
+@click.option(
+    "--no-review",
+    is_flag=True,
+    default=False,
+    help="Skip auto-dispatching an adversarial review after the PR worker.",
+)
+def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
+    from coord.state import build_board, load_board, save_board
 
     cfg = _load_config(config_path)
     board = load_board() or build_board()
@@ -2284,6 +2290,18 @@ def pr(assignment_id: str, config_path: Path) -> None:
     click.echo(f"PR worker dispatched (assignment {new_id})")
     click.echo(f"  branch: {assignment.branch} → {default_branch}")
     click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
+
+    if not no_review and cfg.reviews.enabled:
+        from coord.review import dispatch_review
+
+        fresh_board = load_board() or build_board()
+        review = dispatch_review(assignment, fresh_board, cfg)
+        if review is not None:
+            save_board(fresh_board)
+            click.echo(f"Review dispatched (assignment {review.assignment_id})")
+            click.echo(f"  reviewer: {review.machine_name}")
+        else:
+            click.echo("  review not dispatched (no eligible machine or reviews disabled)")
 
 
 @main.command(help="Dispatch a fix-up worker for a failed smoke test.")

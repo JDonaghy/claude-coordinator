@@ -32,6 +32,8 @@ machines:
       api: /tmp/api
 """
 
+CONFIG_YAML_REVIEWS_DISABLED = CONFIG_YAML + "reviews:\n  enabled: false\n"
+
 
 def _make_board(assignment: Assignment) -> Board:
     """Build a board with a single completed assignment."""
@@ -199,7 +201,8 @@ class TestPr:
             return {"id": "pr-001"}
 
         with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
-             patch("coord.github_ops.post_issue_comment"):
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.review.dispatch_review", return_value=None):
             result = CliRunner().invoke(
                 main,
                 ["pr", "abc-123", "--config", str(config_file)],
@@ -263,7 +266,8 @@ class TestPr:
             return {"id": "pr-002"}
 
         with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
-             patch("coord.github_ops.post_issue_comment"):
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.review.dispatch_review", return_value=None):
             result = CliRunner().invoke(
                 main,
                 ["pr", "abc-123", "--config", str(config_file)],
@@ -295,7 +299,8 @@ class TestPr:
         state_mod.save_board(board)
 
         with patch("coord.dispatch.dispatch", return_value={"id": "pr-003"}), \
-             patch("coord.github_ops.post_issue_comment"):
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.review.dispatch_review", return_value=None):
             result = CliRunner().invoke(
                 main,
                 ["pr", "abc-123", "--config", str(config_file)],
@@ -308,6 +313,101 @@ class TestPr:
         assert records[0]["assignment_id"] == "pr-003"
         assert records[0]["machine_name"] == "laptop"
         assert records[0]["repo_name"] == "api"
+
+    def test_pr_dispatches_review_when_reviews_enabled(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """coord pr auto-dispatches a review when reviews are enabled."""
+        assignment = _done_assignment()
+        board = _make_board(assignment)
+        state_mod.save_board(board)
+
+        fake_review = _done_assignment(
+            assignment_id="rev-001",
+            machine_name="server",
+            issue_title="[review] Add feature X",
+            status="running",
+        )
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "pr-004"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.review.dispatch_review", return_value=fake_review) as mock_review:
+            result = CliRunner().invoke(
+                main,
+                ["pr", "abc-123", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Review dispatched" in result.output
+        assert "rev-001" in result.output
+        assert "server" in result.output
+
+        mock_review.assert_called_once()
+        # Verify the original completed assignment was passed, not the PR worker
+        passed_assignment = mock_review.call_args[0][0]
+        assert passed_assignment.assignment_id == "abc-123"
+
+    def test_pr_no_review_flag_skips_review(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--no-review skips the review dispatch even when reviews are enabled."""
+        assignment = _done_assignment()
+        board = _make_board(assignment)
+        state_mod.save_board(board)
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "pr-005"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.review.dispatch_review") as mock_review:
+            result = CliRunner().invoke(
+                main,
+                ["pr", "abc-123", "--no-review", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_review.assert_not_called()
+        assert "Review dispatched" not in result.output
+
+    def test_pr_reviews_disabled_skips_review(
+        self, coord_dir: Path, tmp_path: Path
+    ) -> None:
+        """reviews disabled in config skips the review dispatch."""
+        config_no_reviews = tmp_path / "coordinator_no_reviews.yml"
+        config_no_reviews.write_text(CONFIG_YAML_REVIEWS_DISABLED)
+
+        assignment = _done_assignment()
+        board = _make_board(assignment)
+        state_mod.save_board(board)
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "pr-006"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.review.dispatch_review") as mock_review:
+            result = CliRunner().invoke(
+                main,
+                ["pr", "abc-123", "--config", str(config_no_reviews)],
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_review.assert_not_called()
+        assert "Review dispatched" not in result.output
+
+    def test_pr_review_returns_none_prints_note(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """When dispatch_review returns None, coord pr prints a note and exits cleanly."""
+        assignment = _done_assignment()
+        board = _make_board(assignment)
+        state_mod.save_board(board)
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "pr-007"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.review.dispatch_review", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                ["pr", "abc-123", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "review not dispatched" in result.output
 
 
 # ── coord fix ────────────────────────────────────────────────────────────

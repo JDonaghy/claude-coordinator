@@ -79,17 +79,28 @@ def _completed_assignment(machine: str = "laptop", branch: str = "issue-1-fix") 
 # ── Config parsing ──────────────────────────────────────────────────────────
 
 
-def test_reviews_config_defaults_to_disabled(tmp_path: Path) -> None:
+def test_reviews_config_defaults_to_enabled(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(
         "repos:\n  - name: api\n    github: acme/api\n"
         "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
     )
     cfg = load(p)
-    assert cfg.reviews.enabled is False
-    assert cfg.reviews.auto_dispatch is True  # default-on, but gated by enabled
+    assert cfg.reviews.enabled is True   # enabled by default; set enabled: false to opt out
+    assert cfg.reviews.auto_dispatch is True
     assert cfg.reviews.checklist == ["Check for platform-specific code in shared/cross-platform paths"]
     assert cfg.reviews.repo_overrides == {}
+
+
+def test_reviews_config_can_be_disabled(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "reviews:\n  enabled: false\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.enabled is False
 
 
 def test_reviews_config_parses_all_fields(tmp_path: Path) -> None:
