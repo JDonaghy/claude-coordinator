@@ -15,6 +15,7 @@ DEFAULT_CONFIG_PATH = Path("coordinator.yml")
 
 # Safety-by-default: repos without explicit worker_permissions get this deny-list.
 DEFAULT_DENY_COMMANDS: list[str] = [
+    "Bash(gh *)",
     "Bash(git push --force *)",
     "Bash(git push -f *)",
     "Bash(git reset --hard *)",

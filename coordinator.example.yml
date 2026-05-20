@@ -1,3 +1,6 @@
+# Example coordinator.yml — copy to coordinator.yml and edit for your setup.
+# Generate one interactively with: coord init
+
 repos:
   - name: vimcode
     github: JDonaghy/vimcode
