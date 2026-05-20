@@ -1,85 +1,94 @@
 # claude-coordinator
 
-Coordinate Claude Code workers across multiple machines and repos over Tailscale. No API key needed — runs entirely on your Max/Pro subscription.
+Coordinate multiple Claude Code workers from a single terminal.
+
+Claude Code is great for one task at a time. But real projects have dozens of issues. This tool lets you run multiple Claude Code workers in parallel — even on a single machine — with a coordinator that picks the right model, avoids file conflicts, and handles the full issue-to-PR pipeline.
 
 ## The Problem
 
-You have 3 machines and 2 repos. You want all 3 working in parallel without stepping on each other's files. Today you copy-paste assignments between terminal windows and track who's doing what in your head.
+Running one Claude Code session at a time is a bottleneck. You context-switch between issues, lose session state, and can't parallelize. Complex issues get one shot; if the session dies mid-flight, you start over. There's no audit trail, no conflict detection, and no way to see what happened last Thursday.
 
 ## The Solution
 
-One config file describes your setup. A coordinator brain (Claude) proposes assignments. You approve from CLI or phone. Agent servers on each machine execute the work.
+One config file describes your repos and machines. Workers run in isolated git worktrees so they never step on each other. The coordinator tracks what's in flight, prevents conflicts, routes by capability, and sequences PRs.
+
+Works on **one machine** with multiple worktrees. Add more machines over Tailscale when you need true parallelism.
 
 ```
-┌─ Phone / Browser ──────────────────────────┐
-│  Board view, approve assignments, live logs │
-└──────────────┬─────────────────────────────┘
-               │ Tailscale
-┌──────────────▼──────────────────────────────┐
-│  coord plan → approve → dispatch             │
-└──────┬──────────────┬──────────────┬────────┘
-       │              │              │
-  ┌────▼────┐   ┌─────▼─────┐  ┌────▼─────┐
-  │ Machine A│   │ Machine B │  │ Server C │
-  │ coord    │   │ coord     │  │ coord    │
-  │ agent    │   │ agent     │  │ agent    │
-  │ claude -p│   │ claude -p │  │ claude -p│
-  └─────────┘   └───────────┘  └──────────┘
+You (coordinator)
+  │
+  ├── coord assign → Agent Server (localhost:7433)
+  │                    ├── Worker 1 (worktree A) → claude -p --model sonnet
+  │                    ├── Worker 2 (worktree B) → claude -p --model haiku
+  │                    └── Worker 3 (worktree C) → claude -p --model opus
+  │
+  └── coord watch/test/pr/fix
+```
+
+## Quick Demo
+
+```bash
+pip install -e .
+coord init                    # interactive setup: detects repos, writes coordinator.yml
+coord agent &                 # start the agent server (port 7433)
+
+coord assign laptop myrepo 42 --model sonnet --briefing "Fix the auth bug"
+# → laptop → myrepo #42: Fix the auth middleware timeout
+# →   model: claude-sonnet-4-6
+# →   dispatched (assignment a1b2c3)
+
+coord watch a1b2c3            # filtered live output (stream-json events)
+# → [init] claude-sonnet-4-6 session a1b2
+# → [tool] Read auth/middleware.py
+# → [tool] Edit auth/middleware.py
+# → [result] completed in 3m, 6 turns, $0.45
+
+coord pr a1b2c3               # dispatch a worker to create the PR
+# → PR worker dispatched (assignment d4e5f6)
+# →   branch: issue-42-fix-auth-middleware → main
 ```
 
 ## Quick Start
 
-### 1. Set up each machine
-
-SSH into each machine and run:
+### 1. Install
 
 ```bash
-git clone https://github.com/YourOrg/claude-coordinator.git ~/src/claude-coordinator
+git clone https://github.com/JDonaghy/claude-coordinator.git ~/src/claude-coordinator
 cd ~/src/claude-coordinator
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -e .
 ```
 
-### 2. Create your coordinator.yml
-
-Copy `coordinator.yml` to the repo root and edit it with your repos, machines, and Tailscale hostnames. Run `coord config` to verify it parses cleanly.
-
-### 3. Start agent servers
-
-On each machine:
+### 2. Configure
 
 ```bash
-cd ~/src/claude-coordinator
-source .venv/bin/activate
-coord agent
+coord init        # interactive wizard: detects repos in cwd and ~/src/, writes coordinator.yml
+coord config      # verify it parsed cleanly
 ```
 
-The agent auto-detects which machine it is from the hostname (case-insensitive match against `coordinator.yml`). Use `--machine NAME` if auto-detection fails.
+Or copy `coordinator.example.yml` and edit it by hand. `coordinator.yml` is gitignored — keep secrets out of version control.
 
-Verify with `curl http://localhost:7433/health` on each machine.
+### 3. Start the agent server
+
+```bash
+coord agent &     # runs on port 7433; auto-detects machine from hostname
+```
 
 ### 4. Coordinate
 
-From any machine:
+**Option A — Use the /coordinator slash command in Claude Code:**
+
+Open Claude Code in the repo, type `/coordinator`. It handles first-time setup, issue triage, dispatch, monitoring, smoke tests, and PR creation. The slash command is at `.claude/commands/coordinator.md`.
+
+**Option B — Use the CLI directly:**
 
 ```bash
-source ~/src/claude-coordinator/.venv/bin/activate
-coord status                    # verify all machines are online
-coord plan                      # brain proposes assignments
-coord approve 1,2,3             # dispatch to machines
-coord status                    # monitor progress
-coord notify                    # post completions to GitHub
-coord test <id>                 # pull branch for smoke testing
-coord test --passed <id>        # record result
-coord merge                     # open PRs and merge completed branches
-coord done                      # end session, run hooks
-```
-
-Or bypass the brain and dispatch directly:
-
-```bash
-coord assign macbook api-gateway 42 --briefing "Fix the auth middleware timeout"
+coord status                              # verify agent is reachable
+coord assign laptop myrepo 42 --model sonnet --briefing "Fix the auth bug"
+coord watch <id>                          # live filtered output
+coord test <id>                           # pull branch, run build + tests
+coord test --passed <id>                  # record result
+coord pr <id>                             # dispatch PR-creation worker
+coord merge                               # open PRs and merge in sequence
 ```
 
 ## Command Reference
@@ -90,18 +99,22 @@ coord assign macbook api-gateway 42 --briefing "Fix the auth middleware timeout"
 |---------|-------------|
 | `coord plan [--dry-run]` | Brain proposes assignments for idle machines |
 | `coord approve <IDs> [--dry-run] [--auto-pull] [--skip-freshness]` | Dispatch approved assignments (comma-separated IDs) |
-| `coord assign <machine> <repo> <issue> [--briefing TEXT] [--dry-run]` | Direct dispatch, bypasses the brain |
+| `coord assign <machine> <repo> <issue> [--model haiku\|sonnet\|opus] [--briefing TEXT] [--dry-run]` | Direct dispatch, bypasses the brain |
 | `coord status [--machine NAME] [--freshness]` | Show all machines, assignments, connectivity |
-| `coord log <id> [-f] [--machine NAME] [--local]` | View claude -p output for an assignment |
+| `coord watch <id> [--all]` | Filtered live log output (stream-json events) |
+| `coord wait <id>` | Block until assignment completes |
+| `coord log <id> [-f] [--machine NAME] [--local]` | Raw `claude -p` output for an assignment |
 
 ### Post-Completion
 
 | Command | Description |
 |---------|-------------|
-| `coord notify` | Poll agents, post completion/failure comments to GitHub |
 | `coord test <id>` | Pull worker's branch locally, run build + tests |
 | `coord test --passed <id>` | Record smoke test as passed |
 | `coord test --fail <id> --reason "..."` | Record smoke test as failed |
+| `coord pr <id>` | Dispatch a worker to create a PR for a completed assignment |
+| `coord fix <id> [--guidance "..."]` | Dispatch a fix-up worker for a failed smoke test (auto-escalates model) |
+| `coord notify` | Poll agents, post completion/failure comments to GitHub |
 | `coord merge [--dry-run] [--repo NAME] [--method rebase\|squash\|merge] [--order IDs]` | Process merge queue |
 | `coord split <IDs>` | Create sub-issues from split proposals |
 
@@ -109,54 +122,94 @@ coord assign macbook api-gateway 42 --briefing "Fix the auth middleware timeout"
 
 | Command | Description |
 |---------|-------------|
+| `coord resume-stuck <id> --guidance "..."` | Cancel a stuck worker, dispatch a continuation with guidance |
 | `coord retry <id>` | Re-dispatch a failed assignment to a different machine |
 | `coord stop <id>` | Cancel a running assignment |
 | `coord resume` | Recover board state after crash, reconcile with agents |
-| `coord done` | End session, run housekeeping hooks |
+| `coord done` | End session, run housekeeping hooks, show summary |
 
 ### Setup and Diagnostics
 
 | Command | Description |
 |---------|-------------|
-| `coord agent [--machine NAME] [--host HOST] [--port PORT]` | Start agent server on this machine (default port 7433) |
+| `coord init` | Interactive setup: detects repos, writes coordinator.yml |
+| `coord agent [--machine NAME] [--host HOST] [--port PORT]` | Start agent server (default port 7433) |
 | `coord web [--host HOST] [--port PORT]` | Start web dashboard (default port 7434) |
 | `coord config` | Pretty-print parsed coordinator.yml |
 | `coord version` | Print version |
 
+### Model Tiers
+
+| Flag | Use for |
+|------|---------|
+| `--model haiku` | Docs, config, trivial single-file changes |
+| `--model sonnet` | Standard features, bug fixes (default) |
+| `--model opus` | Complex multi-file or architectural work |
+
+`coord fix` automatically escalates to the next tier on failure. Configure the ladder in `models.escalation`.
+
 ## Configuration
+
+### Minimal single-machine config
 
 ```yaml
 # coordinator.yml
 
 repos:
+  - name: my-project
+    github: owner/my-project
+    default_branch: main
+    build_command: "pytest"
+    test_command: "pytest"
+
+machines:
+  - name: laptop
+    host: localhost              # single machine: localhost works fine
+    capabilities: [python]
+    repos: [my-project]
+    repo_paths:
+      my-project: ~/src/my-project
+
+concurrency:
+  max_workers: 3                 # how many claude -p sessions can run at once
+  stagger_seconds: 30            # delay between dispatches (avoids rate limits)
+
+models:
+  default: sonnet                # model used when --model not specified
+  escalation: [haiku, sonnet, opus]  # coord fix escalates through this list
+  labels:                        # assign model by GitHub issue label
+    documentation: haiku
+    architecture: opus
+```
+
+### Full reference
+
+```yaml
+repos:
   - name: api-gateway
-    github: acme/api-gateway       # owner/repo on GitHub
-    depends_on: []                  # list of repo names this depends on
-    default_branch: main            # branch to merge into (default: main)
-    build_command: "npm run build"  # optional: used by coord test for smoke testing
-    test_command: "npm test"        # optional: used by coord test for smoke testing
+    github: acme/api-gateway
+    depends_on: []               # blocks dispatch if listed repos have active work
+    default_branch: main
+    build_command: "npm run build"
+    test_command: "npm test"
 
   - name: user-service
     github: acme/user-service
-    depends_on: [shared-lib]        # won't dispatch if shared-lib has active work
-    default_branch: main
-    build_command: "cargo build"
-    test_command: "cargo test"
+    depends_on: [shared-lib]     # won't dispatch if shared-lib has active work
 
   - name: shared-lib
     github: acme/shared-lib
-    depends_on: []
 
 machines:
-  - name: macbook
-    host: macbook.tailnet           # Tailscale hostname (or any reachable hostname)
-    capabilities: [docker, node, python]  # used for smoke-test routing
-    repos: [api-gateway, user-service]    # which repos this machine can work on
-    repo_paths:                     # local paths on this machine
+  - name: laptop
+    host: localhost              # single machine
+    capabilities: [python, node]
+    repos: [api-gateway, user-service]
+    repo_paths:
       api-gateway: ~/src/api-gateway
       user-service: ~/src/user-service
 
-  - name: server
+  - name: server                 # second machine (Tailscale hostname)
     host: server.tailnet
     capabilities: [docker, python]
     repos: [user-service, shared-lib]
@@ -165,70 +218,67 @@ machines:
       shared-lib: ~/src/shared-lib
 
 concurrency:
-  max_workers: 2          # max simultaneous claude -p sessions across all machines
-  stagger_seconds: 30     # delay between starting workers (avoids rate limits)
-  backoff_base: 60        # seconds to wait on rate limit before retry
-  max_retries: 3          # retries per dispatch on transient failures
-  auto_reassign: false    # auto-retry failed assignments on a different machine
-  stale_threshold: 3      # unreachable poll count before marking assignment stale
+  max_workers: 2
+  stagger_seconds: 30
+  backoff_base: 60
+  max_retries: 3
+  auto_reassign: false           # auto-retry failed assignments on a different machine
+  stale_threshold: 3             # unreachable poll count before marking stale
+
+models:
+  default: sonnet
+  escalation: [haiku, sonnet, opus]
+  labels:
+    documentation: haiku
+    architecture: opus
 
 hooks:
-  on_round_complete:      # run when all active assignments finish
+  on_round_complete:
     - summary_report
-  on_session_end:         # run on `coord done`
+  on_session_end:
     - summary_report
-    # - close_merged_issues  # available but disabled by default
 
 reviews:
-  enabled: false          # opt-in: auto-dispatch adversarial reviews on completion
-  auto_dispatch: true     # dispatch review automatically (vs manual trigger)
-  require_approval: false # require human approval before merging reviewed PR
-  reviewer_prompt: ""     # additional instructions for the reviewer
-  checklist:              # items the reviewer checks against
+  enabled: false                 # opt-in: adversarial review on completion
+  auto_dispatch: true
+  require_approval: false
+  checklist:
     - "Did the worker add tests?"
     - "Did the worker stay within file scope?"
-  repo_overrides:         # per-repo additional checklist items
+  repo_overrides:
     api-gateway:
       - "Check rate limiting on new endpoints"
 
 smoke_tests:
-  auto_queue: false                 # opt-in: auto-queue smoke tests on completion
-  default_command: "make smoke"     # fallback if repo has no test_command
-  timeout_seconds: 600              # max time for smoke test
-  capability_rules:                 # route smoke tests to capable machines
-    - files: [src/gtk/]             # if these files changed...
-      requires: [gtk]               # ...smoke test needs a machine with gtk
+  auto_queue: false
+  default_command: "make smoke"
+  timeout_seconds: 600
+  capability_rules:
+    - files: [src/gtk/]
+      requires: [gtk]
 ```
+
+`coordinator.yml` is gitignored. Use `coordinator.example.yml` as the checked-in reference.
 
 ## Features
 
-- **No API key** — uses `claude -p` on your Max/Pro subscription
-- **Multi-repo** — tracks dependencies between repos (e.g. shared-lib blocks user-service)
-- **File conflict avoidance** — coordinator ensures two workers never touch the same files
-- **Machine constraints** — respects capabilities (GTK, Docker, GPU) and repo availability
-- **Claim detection** — prevents duplicate work by checking the board and remote branches
-- **GitHub issues as work source** — reads open issues, posts briefings and status as comments
-- **Adversarial reviews** — independent code review on a different machine with zero shared context
-- **Smoke testing** — capability-aware routing ensures tests run on hardware that can validate them
+- **No API key** — uses `claude -p` on your Max/Pro subscription; billing stays per-seat
+- **Single-machine first** — one agent server, multiple workers in isolated git worktrees; no Tailscale needed
+- **Model tiering** — docs get haiku ($0.08/task), standard work gets sonnet, complex work gets opus; `coord fix` auto-escalates on failure
+- **Worktree isolation** — workers operate in separate git worktrees; no shared working-tree state between sessions
+- **Stream-json observability** — `coord watch` parses `claude -p` stream-json events and shows a clean filtered log
+- **Full issue-to-PR pipeline** — `coord assign` → `coord watch` → `coord test` → `coord pr` → `coord merge`
+- **`/coordinator` slash command** — open Claude Code, type `/coordinator` for guided operation: setup, triage, dispatch, monitoring
+- **Multi-repo** — tracks dependency chains between repos; upstream work blocks downstream dispatch
+- **File conflict avoidance** — coordinator ensures no two workers touch the same files simultaneously
+- **Claim detection** — checks board and remote `issue-{N}-*` branches before dispatching; refuses duplicates
+- **Adversarial reviews** — optional: independent `claude -p` session on a different machine reviews the diff against CLAUDE.md
+- **Smoke testing** — capability-aware routing (GTK changes → machine with GTK)
 - **Merge queue** — sequences completed PRs with conflict detection and dependency-aware ordering
-- **Dependency freshness** — warns when upstream repos are stale on the target machine
-- **Progress streaming** — workers emit STATUS/STUCK lines; `coord status` shows real-time progress
-- **Failure reassignment** — re-dispatch failed work to a different machine automatically or manually
-- **Split proposals** — the brain can propose splitting large issues into sub-tasks
-- **Web dashboard** — approve assignments from your phone over Tailscale
-- **Crash recovery** — `coord resume` reconciles board state with live agent servers
-
-## How It Works
-
-1. `coord plan` reads open GitHub issues and your config
-2. The coordinator brain (Claude) proposes assignments — which machine, which issue, which files
-3. You approve from CLI (`coord approve 1,2`) or dispatch directly (`coord assign`)
-4. Coordinator dispatches to each machine's agent server over Tailscale
-5. Agent servers run `claude -p` locally — billing stays on your subscription
-6. Status updates posted as GitHub issue comments
-7. `coord notify` posts completion/failure comments; `coord resume` reconciles state
-8. Completed branches enter the merge queue; `coord merge` sequences PRs
-9. `coord plan` proposes the next round
+- **Progress streaming** — workers emit `STATUS:`/`STUCK:` lines; `coord status` shows real-time progress
+- **Failure reassignment** — `coord retry` re-dispatches to a different machine; `auto_reassign` does it automatically
+- **Crash recovery** — `coord resume` reconciles board with live agent state after restart
+- **Web dashboard** — lightweight board view at port 7434
 
 ## Why This Works (Even With One Machine)
 
@@ -236,50 +286,62 @@ This tool encodes a pattern discovered through real multi-agent coordination ses
 
 The coordinator thinks about *what to do next* — priority, dependencies, conflicts, which machine is idle. Workers think about *how to do this one thing* — read the issue, write the code, push the branch. Neither is distracted by the other's concern.
 
-This division of labor produces better results than a single long-running Claude Code session, for several reasons:
+This division of labor produces better results than a single long-running Claude Code session:
 
 - **Forced scoping.** One issue per worker session prevents scope creep. No "while I'm here, let me also refactor this." The worker does one thing and finishes.
 - **Structured handoffs.** Every assignment has a briefing posted as a GitHub issue comment. If a session dies, a new one picks up from the comment — zero context loss.
 - **Persistent record.** Every decision, briefing, and result lives on GitHub. You can review what happened a week later. Terminal scrollback is gone when the window closes.
-- **Fresh eyes.** Each worker starts with no prior context. This sounds like a weakness but it's a strength — the worker reads the code as-is, not as it was 2 hours ago. Adversarial reviews take this further: a different machine reviews the work with genuinely independent context.
+- **Fresh eyes.** Each worker starts with no prior context. Adversarial reviews take this further: a different machine reviews the work with genuinely independent context.
 - **Human stays strategic.** You approve assignments and make judgment calls. You don't ferry messages between terminals or track who's touching which file in your head.
+- **Cost savings.** Model tiering means you're not paying opus prices for documentation fixes. Auto-escalation on failure means you start cheap and only pay more when needed.
 
 Even with a single machine, the pattern gives you scoping discipline, handoff resilience, and an auditable trail of decisions that a raw terminal session doesn't.
+
+## Scaling Up
+
+Started on one machine? Add more by:
+
+1. Install `coord` on the new machine (`pip install -e .` from the cloned repo)
+2. Start the agent: `coord agent` (port 7433)
+3. Add it to `coordinator.yml` under `machines:` with its Tailscale hostname
+4. `coord status` shows all machines and their connectivity
+
+For Tailscale setup, see [tailscale.com/kb](https://tailscale.com/kb/). The agent server only needs port 7433 reachable on the tailnet.
 
 ## Troubleshooting
 
 ### Agent won't start
 
-- **Port already in use:** Another `coord agent` process is running, or another service is on port 7433. Check with `lsof -i :7433` or `ss -tlnp | grep 7433`. Kill the existing process or use `--port` to pick a different port.
-- **Hostname mismatch:** The agent auto-detects which machine it is by matching `socket.gethostname()` against `coordinator.yml` entries. If it fails, pass `--machine NAME` explicitly. The match is case-insensitive and checks both `name` and `host` fields.
+- **Port in use:** Another `coord agent` is running. Check `lsof -i :7433`, or use `--port` to pick a different one.
+- **Hostname mismatch:** The agent matches `socket.gethostname()` against `coordinator.yml`. If it fails, pass `--machine NAME` explicitly.
 
 ### "connection refused" in coord status
 
-- **Agent not running:** SSH into the machine and start `coord agent`.
-- **Tailscale not connected:** Run `tailscale status` on both machines. Ensure both are on the same tailnet and can ping each other.
-- **Firewall blocking port 7433:** Tailscale usually handles this, but check `ufw` or `iptables` if you have custom rules.
+- **Agent not running:** Start `coord agent` on the target machine.
+- **Tailscale not connected:** Run `tailscale status` on both machines.
+- **Firewall:** Tailscale usually handles this, but check `ufw`/`iptables` if you have custom rules.
 
 ### Worker fails immediately
 
-- **Repo path wrong:** The `repo_paths` in `coordinator.yml` must match the actual path on that machine. The agent expands `~` but the directory must exist. Check with `coord config` to see parsed paths.
-- **`gh` not authenticated:** Workers use `gh` for GitHub operations. Run `gh auth status` on the machine to verify. If it says "not logged in", run `gh auth login`.
+- **Repo path wrong:** `repo_paths` in `coordinator.yml` must match the actual path on that machine. Run `coord config` to see parsed paths.
+- **`gh` not authenticated:** The coordinator uses `gh` for GitHub operations (issues, PRs, comments). Workers do NOT use `gh` — only the coordinator does. Run `gh auth status` on the machine running `coord` commands.
 - **`claude` CLI not available:** The agent spawns `claude -p` as a subprocess. Ensure the Claude Code CLI is installed and on the PATH.
 
 ### Stale dependency warnings
 
-When `coord approve` warns about stale dependencies, it means an upstream repo on the target machine is behind GitHub's HEAD. Options:
-- Pass `--auto-pull` to have the agent `git pull --ff-only` stale repos before starting the worker.
-- Pass `--skip-freshness` to skip the check entirely (faster, but risks building against old code).
-- SSH into the machine and manually pull the repo.
+When `coord approve` warns about stale dependencies, an upstream repo on the target machine is behind GitHub's HEAD:
+- `--auto-pull` to `git pull --ff-only` stale repos before starting the worker
+- `--skip-freshness` to skip the check entirely
+- Or manually pull on the target machine
 
 ### Board state issues
 
-- **Stuck assignments after crash:** Run `coord resume` to reconcile the board with live agent state. It queries each agent server and updates assignments that finished while the coordinator was down.
+- **Stuck assignments after crash:** Run `coord resume` to reconcile board with live agent state.
 - **Stale completed entries:** `coord resume` runs garbage collection, keeping the 50 most recent completed assignments.
 
 ## Requirements
 
 - Python 3.12+
 - Claude Code CLI with Max or Pro subscription
-- `gh` CLI (authenticated)
-- Tailscale (for multi-machine setups)
+- `gh` CLI (authenticated, for coordinator-side GitHub operations)
+- Tailscale — optional, only needed for multi-machine setups
