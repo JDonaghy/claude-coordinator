@@ -167,13 +167,11 @@ fn fmt_dur(secs: u64) -> String {
     }
 }
 
-/// Truncate `s` to `max` bytes (ASCII-safe; won't split multi-byte chars
-/// because all our strings are ASCII identifiers and short titles).
-fn trunc(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
+/// Truncate `s` to at most `max_chars` Unicode scalar values.
+fn trunc(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
     }
 }
 
@@ -802,5 +800,183 @@ fn run_loop(
                 Reaction::Exit => return Ok(()),
             }
         }
+    }
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── fmt_dur ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_dur_zero_seconds() {
+        assert_eq!(fmt_dur(0), "0s");
+    }
+
+    #[test]
+    fn fmt_dur_fifty_nine_seconds() {
+        assert_eq!(fmt_dur(59), "59s");
+    }
+
+    #[test]
+    fn fmt_dur_exactly_one_minute() {
+        assert_eq!(fmt_dur(60), "1m");
+    }
+
+    #[test]
+    fn fmt_dur_exactly_one_hour() {
+        assert_eq!(fmt_dur(3600), "1h0m");
+    }
+
+    #[test]
+    fn fmt_dur_one_hour_one_minute_one_second() {
+        // 3661 = 1h 1m 1s → displayed as "1h1m" (seconds dropped)
+        assert_eq!(fmt_dur(3661), "1h1m");
+    }
+
+    // ── trunc ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn trunc_ascii_within_limit() {
+        assert_eq!(trunc("hello", 10), "hello");
+    }
+
+    #[test]
+    fn trunc_ascii_over_limit() {
+        assert_eq!(trunc("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn trunc_empty_string() {
+        assert_eq!(trunc("", 5), "");
+    }
+
+    #[test]
+    fn trunc_multibyte_no_panic() {
+        // "🎉" is 4 UTF-8 bytes.  The old `&s[..3]` would have panicked by
+        // splitting the emoji in the middle.  The new char-index implementation
+        // must return the correct 3-character prefix cleanly.
+        let s = "🎉 hello";
+        // chars: ['🎉', ' ', 'h', 'e', 'l', 'l', 'o']
+        // first 3 chars → "🎉 h"
+        assert_eq!(trunc(s, 3), "🎉 h");
+    }
+
+    // ── fix_scroll ─────────────────────────────────────────────────────────────
+
+    fn make_dashboard(sel: usize, scroll: usize) -> Dashboard {
+        Dashboard {
+            data: BoardData::default(),
+            board_sel: sel,
+            board_scroll: scroll,
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn fix_scroll_within_visible_window() {
+        let mut d = make_dashboard(2, 0);
+        d.fix_scroll(10);
+        // sel=2 is inside [0, 10) → scroll unchanged
+        assert_eq!(d.board_scroll, 0);
+    }
+
+    #[test]
+    fn fix_scroll_selection_past_end_of_window() {
+        let mut d = make_dashboard(15, 0);
+        d.fix_scroll(10);
+        // sel=15 >= scroll(0)+visible(10) → scroll = 15 + 1 - 10 = 6
+        assert_eq!(d.board_scroll, 6);
+    }
+
+    #[test]
+    fn fix_scroll_selection_before_scroll_offset() {
+        let mut d = make_dashboard(0, 5);
+        d.fix_scroll(10);
+        // sel=0 < scroll=5 → scroll snaps up to sel
+        assert_eq!(d.board_scroll, 0);
+    }
+
+    #[test]
+    fn fix_scroll_zero_visible_rows_is_noop() {
+        let mut d = make_dashboard(0, 0);
+        d.fix_scroll(0); // visible == 0 → early return
+        assert_eq!(d.board_scroll, 0);
+    }
+
+    // ── Assignment::status_label ───────────────────────────────────────────────
+
+    fn make_assignment(status: &str) -> Assignment {
+        Assignment {
+            id: "abc123def456".to_string(),
+            repo: "test-repo".to_string(),
+            issue_number: 1,
+            issue_title: "Test issue".to_string(),
+            machine: "testmachine".to_string(),
+            status: status.to_string(),
+            branch: None,
+            model: None,
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            assignment_type: None,
+        }
+    }
+
+    #[test]
+    fn status_label_running() {
+        assert_eq!(make_assignment("running").status_label(), "RUN ");
+    }
+
+    #[test]
+    fn status_label_done() {
+        assert_eq!(make_assignment("done").status_label(), "DONE");
+    }
+
+    #[test]
+    fn status_label_failed() {
+        assert_eq!(make_assignment("failed").status_label(), "FAIL");
+    }
+
+    #[test]
+    fn status_label_unknown_falls_back_to_pend() {
+        assert_eq!(make_assignment("pending").status_label(), "PEND");
+    }
+
+    // ── Assignment::status_color ───────────────────────────────────────────────
+
+    #[test]
+    fn status_color_running() {
+        assert_eq!(
+            make_assignment("running").status_color(),
+            Color::rgb(80, 220, 80)
+        );
+    }
+
+    #[test]
+    fn status_color_done() {
+        assert_eq!(
+            make_assignment("done").status_color(),
+            Color::rgb(120, 120, 120)
+        );
+    }
+
+    #[test]
+    fn status_color_failed() {
+        assert_eq!(
+            make_assignment("failed").status_color(),
+            Color::rgb(220, 70, 70)
+        );
+    }
+
+    #[test]
+    fn status_color_unknown_falls_back_to_yellow() {
+        assert_eq!(
+            make_assignment("pending").status_color(),
+            Color::rgb(200, 200, 70)
+        );
     }
 }
