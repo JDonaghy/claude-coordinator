@@ -6,6 +6,7 @@ import json
 import os
 import time
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 from coord.models import Assignment, Board, Proposal, SplitProposal, SplitChunk
@@ -16,6 +17,47 @@ SPLITS_FILE = COORD_DIR / "pending_splits.json"
 DISPATCHED_FILE = COORD_DIR / "dispatched.json"
 NOTIFIED_FILE = COORD_DIR / "notified.json"
 BOARD_FILE = COORD_DIR / "board.json"
+SESSION_FILE = COORD_DIR / "session.json"
+
+
+def write_session_start() -> None:
+    """Write session.json with clean_shutdown=False. Called on first dispatch."""
+    COORD_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "started_at": datetime.utcnow().isoformat() + "Z",
+        "clean_shutdown": False,
+    }
+    SESSION_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def write_session_end(
+    *,
+    completed_ids: list[str],
+    issues_closed: list[int],
+    total_cost_usd: float,
+) -> None:
+    """Write session.json with clean_shutdown=True and summary."""
+    existing = load_session()
+    data = {
+        "started_at": existing.get("started_at") if existing else None,
+        "ended_at": datetime.utcnow().isoformat() + "Z",
+        "clean_shutdown": True,
+        "completed_this_session": completed_ids,
+        "issues_closed": issues_closed,
+        "total_cost_usd": total_cost_usd,
+    }
+    COORD_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def load_session() -> dict | None:
+    """Load session.json. Returns None if missing."""
+    if not SESSION_FILE.exists():
+        return None
+    try:
+        return json.loads(SESSION_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def save_proposals(proposals: list[Proposal]) -> Path:
