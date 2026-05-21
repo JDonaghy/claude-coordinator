@@ -1165,6 +1165,14 @@ def approve(
     ),
 )
 @click.option(
+    "--no-plan",
+    is_flag=True,
+    help=(
+        "Force a direct work dispatch even when dispatch.require_plan is true "
+        "in coordinator.yml. Has no effect when require_plan is false."
+    ),
+)
+@click.option(
     "--force",
     is_flag=True,
     help="Bypass claim detection (use when retrying after infra failures).",
@@ -1178,6 +1186,7 @@ def assign(
     model: str | None,
     dry_run: bool,
     plan_only: bool,
+    no_plan: bool,
     force: bool,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
@@ -1245,6 +1254,11 @@ def assign(
             resolved_gates = list(cfg.pipeline.labels[lbl])
             break
 
+    # Determine effective plan-only mode.
+    # --plan-only always wins; --no-plan overrides dispatch.require_plan;
+    # otherwise dispatch.require_plan sets the default.
+    effective_plan_only = plan_only or (cfg.dispatch.require_plan and not no_plan)
+
     proposal = Proposal(
         id=0,
         machine_name=machine,
@@ -1254,13 +1268,16 @@ def assign(
         rationale="manual assignment via coord assign",
         briefing=briefing,
         model=resolved_model,
-        type="plan" if plan_only else "work",
+        type="plan" if effective_plan_only else "work",
         required_gates=resolved_gates,
     )
 
     click.echo(f"{machine} → {repo} #{issue}: {issue_title}")
-    if plan_only:
-        click.echo("  mode: plan-only (read-only, no worktree)")
+    if effective_plan_only:
+        if cfg.dispatch.require_plan and not plan_only:
+            click.echo("  mode: plan-only (dispatch.require_plan=true; use --no-plan to override)")
+        else:
+            click.echo("  mode: plan-only (read-only, no worktree)")
     if resolved_model:
         click.echo(f"  model: {resolved_model}")
 
@@ -2665,11 +2682,19 @@ def _dispatch_followup(
     *,
     issue_suffix: str = "",
     model: str | None = None,
+    type: str = "work",
+    files_likely: list[str] | None = None,
 ) -> str:
     """Dispatch a follow-up assignment for an existing assignment. Returns assignment ID.
 
     *model* overrides the model tier for the follow-up. When None, the
     dispatcher falls back to ``cfg.models.default``.
+
+    *type* sets the assignment type (``"work"`` or ``"plan"``).  Defaults to
+    ``"work"`` so existing callers are unaffected.
+
+    *files_likely* is the list of files the worker is expected to touch.
+    When None, an empty list is used (no file constraints).
     """
     from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
     from coord.state import build_board, record_dispatched, save_board, load_dispatched
@@ -2688,6 +2713,8 @@ def _dispatch_followup(
         rationale=f"follow-up for assignment {original.assignment_id}",
         briefing=briefing,
         model=model if model else cfg.models.default,
+        type=type,
+        files_likely=files_likely if files_likely is not None else [],
     )
 
     response = dispatch(proposal, cfg)
@@ -2703,6 +2730,56 @@ def _dispatch_followup(
     save_board(board)
 
     return assignment_id
+
+
+def _load_plan_for_assignment(assignment, assignment_id: str) -> dict | None:
+    """Retrieve the plan dict for a plan-type assignment.
+
+    Tries (in order):
+    1. The plan field cached on the assignment object.
+    2. The plans table in the DB (populated by `coord notify`).
+    3. Parsing the local log file directly (works when agent is local).
+
+    Returns the plan dict or None if not found.
+    """
+    from coord.state import COORD_DIR, load_plans
+
+    plan_dict = getattr(assignment, "plan", None)
+    if plan_dict is None:
+        plans = load_plans()
+        plan_dict = plans.get(assignment_id)
+    if plan_dict is None:
+        local_log = COORD_DIR / "logs" / f"{assignment_id}.log"
+        try:
+            from coord.plan_parser import parse_plan_from_log  # noqa: PLC0415
+            worker_plan = parse_plan_from_log(local_log)
+        except Exception:  # noqa: BLE001
+            worker_plan = None
+        if worker_plan is not None:
+            plan_dict = worker_plan.to_dict()
+    return plan_dict
+
+
+def _plan_dict_to_text(plan_dict: dict) -> str:
+    """Format a WorkerPlan dict into a human-readable text block for briefings."""
+    from coord.plan_parser import WorkerPlan  # noqa: PLC0415
+
+    plan = WorkerPlan.from_dict(plan_dict)
+    parts: list[str] = []
+    if plan.plan:
+        parts.append(f"Summary:\n{plan.plan}")
+    if plan.files_modify:
+        parts.append("Files to modify:\n" + "\n".join(f"  - {f}" for f in plan.files_modify))
+    if plan.approach:
+        parts.append(f"Approach:\n{plan.approach}")
+    if plan.risks:
+        parts.append(f"Risks:\n{plan.risks}")
+    if plan.estimate:
+        parts.append(f"Estimate:\n{plan.estimate}")
+    # Fall back to raw_text when no structured sections were found.
+    if not parts:
+        return plan.raw_text or "(no plan text)"
+    return "\n\n".join(parts)
 
 
 @main.command(help="Dispatch a worker to create a PR for a completed assignment.")
@@ -2860,6 +2937,188 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
     click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
     if test_output:
         click.echo(f"  test output included in briefing ({len(test_output)} chars)")
+
+
+@main.command(
+    "approve-plan",
+    help=(
+        "Approve a completed plan assignment and dispatch a work assignment "
+        "to implement it."
+    ),
+)
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+def approve_plan(assignment_id: str, config_path: Path) -> None:
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    if assignment.type != "plan":
+        click.echo(
+            f"error: assignment {assignment_id} is type {assignment.type!r}, not 'plan'. "
+            "Only plan assignments can be approved with approve-plan.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if assignment.status != "done":
+        click.echo(
+            f"error: assignment {assignment_id} is {assignment.status!r}, not 'done'. "
+            "The plan worker must finish before you can approve it.",
+            err=True,
+        )
+        sys.exit(1)
+
+    plan_dict = _load_plan_for_assignment(assignment, assignment_id)
+    if plan_dict is None:
+        click.echo(
+            f"error: no plan data found for assignment {assignment_id}.\n"
+            "Possible reasons: the log is on a remote machine, or the worker "
+            "did not output plan sections.\n"
+            "Run 'coord notify' after the worker finishes to parse and cache the plan.",
+            err=True,
+        )
+        sys.exit(1)
+
+    plan_text = _plan_dict_to_text(plan_dict)
+
+    # Build the enhanced briefing for the work assignment.
+    original_briefing = (assignment.briefing or "").strip()
+    separator = "\n\n" if original_briefing else ""
+    enhanced_briefing = (
+        original_briefing
+        + separator
+        + "Your plan was reviewed and approved. Implement exactly as described:\n\n"
+        + plan_text
+    ).strip()
+
+    # Use files_modify from the plan as the allowed-files hint for the worker.
+    from coord.plan_parser import WorkerPlan  # noqa: PLC0415
+    plan_obj = WorkerPlan.from_dict(plan_dict)
+    files_likely = plan_obj.files_modify or assignment.files_allowed or []
+
+    click.echo(
+        f"Approving plan {assignment_id}: "
+        f"{assignment.repo_name} #{assignment.issue_number} — {assignment.issue_title}"
+    )
+    click.echo(f"  Dispatching work assignment to {assignment.machine_name}...")
+
+    try:
+        new_id = _dispatch_followup(
+            cfg,
+            assignment,
+            enhanced_briefing,
+            type="work",
+            files_likely=files_likely,
+        )
+    except httpx.HTTPError as e:
+        click.echo(f"error: dispatch failed: {e}", err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"  Work assignment dispatched (assignment {new_id})")
+    click.echo(f"  repo: {assignment.repo_name}  issue: #{assignment.issue_number}")
+    click.echo(f"  Run: coord log {new_id} to follow progress")
+
+
+@main.command(
+    "reject-plan",
+    help=(
+        "Reject a completed plan assignment and re-dispatch for revision "
+        "with additional guidance."
+    ),
+)
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+@click.option(
+    "--guidance",
+    required=True,
+    help="Guidance text explaining what to revise in the plan.",
+)
+def reject_plan(assignment_id: str, config_path: Path, guidance: str) -> None:
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    if assignment.type != "plan":
+        click.echo(
+            f"error: assignment {assignment_id} is type {assignment.type!r}, not 'plan'. "
+            "Only plan assignments can be rejected with reject-plan.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if assignment.status != "done":
+        click.echo(
+            f"error: assignment {assignment_id} is {assignment.status!r}, not 'done'. "
+            "The plan worker must finish before you can reject it.",
+            err=True,
+        )
+        sys.exit(1)
+
+    plan_dict = _load_plan_for_assignment(assignment, assignment_id)
+    if plan_dict is None:
+        click.echo(
+            f"error: no plan data found for assignment {assignment_id}.\n"
+            "Possible reasons: the log is on a remote machine, or the worker "
+            "did not output plan sections.\n"
+            "Run 'coord notify' after the worker finishes to parse and cache the plan.",
+            err=True,
+        )
+        sys.exit(1)
+
+    plan_text = _plan_dict_to_text(plan_dict)
+
+    # Build the enhanced briefing for the revised plan assignment.
+    original_briefing = (assignment.briefing or "").strip()
+    separator = "\n\n" if original_briefing else ""
+    enhanced_briefing = (
+        original_briefing
+        + separator
+        + "Previous plan (rejected):\n\n"
+        + plan_text
+        + "\n\nGuidance:\n\n"
+        + guidance.strip()
+    ).strip()
+
+    click.echo(
+        f"Rejecting plan {assignment_id}: "
+        f"{assignment.repo_name} #{assignment.issue_number} — {assignment.issue_title}"
+    )
+    click.echo(f"  Re-dispatching revised plan to {assignment.machine_name}...")
+
+    try:
+        new_id = _dispatch_followup(
+            cfg,
+            assignment,
+            enhanced_briefing,
+            type="plan",
+            files_likely=list(assignment.files_allowed),
+        )
+    except httpx.HTTPError as e:
+        click.echo(f"error: dispatch failed: {e}", err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"  Revised plan assignment dispatched (assignment {new_id})")
+    click.echo(f"  repo: {assignment.repo_name}  issue: #{assignment.issue_number}")
+    click.echo(f"  Run: coord log {new_id} to follow progress")
 
 
 @main.command(
