@@ -212,3 +212,69 @@ class TestJsonMigration:
         db_mod._maybe_migrate_json(isolated_conn)
         rows = isolated_conn.execute("SELECT * FROM assignments").fetchall()
         assert rows == []
+
+    def test_migration_writes_marker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After migration, board_meta must contain a 'json_migrated' row."""
+        monkeypatch.setattr(db_mod, "COORD_DIR", tmp_path)
+        self._write_json(tmp_path / "dispatched.json", [])
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        db_mod._maybe_migrate_json(conn)
+
+        row = conn.execute(
+            "SELECT value FROM board_meta WHERE key='json_migrated'"
+        ).fetchone()
+        assert row is not None, "json_migrated marker must be written after migration"
+        # value should be a parseable float timestamp
+        assert float(row["value"]) > 0
+
+    def test_migration_does_not_retrigger_when_marker_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If json_migrated marker is present, migration must not run again — even when
+        dispatched.json reappears and the assignments table is empty."""
+        monkeypatch.setattr(db_mod, "COORD_DIR", tmp_path)
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+
+        # Plant the marker (simulates a prior successful migration)
+        conn.execute(
+            "INSERT INTO board_meta (key, value) VALUES ('json_migrated', '1000.0')"
+        )
+        conn.commit()
+
+        # Simulate stale JSON file reappearing with data
+        stale_dispatched = [
+            {
+                "assignment_id": "stale-001",
+                "machine_name": "ghost",
+                "repo_name": "api",
+                "repo_github": "acme/api",
+                "issue_number": 99,
+                "issue_title": "Stale entry",
+                "files_likely": [],
+                "briefing": "",
+                "dispatched_at": 9999.0,
+                "type": "work",
+                "required_gates": [],
+            }
+        ]
+        self._write_json(tmp_path / "dispatched.json", stale_dispatched)
+
+        # Assignments table is empty — the old guard would have triggered re-migration
+        count_before = conn.execute("SELECT COUNT(*) FROM assignments").fetchone()[0]
+        assert count_before == 0
+
+        db_mod._maybe_migrate_json(conn)
+
+        # Stale data must NOT have been imported
+        rows = conn.execute("SELECT * FROM assignments").fetchall()
+        assert len(rows) == 0, (
+            "Migration re-triggered after marker was set; stale data was imported"
+        )
