@@ -21,10 +21,6 @@ required-features = ["gtk"]
 gtk = ["quadraui/gtk"]
 
 [dependencies]
-# Path matches ~/src/claude-coordinator/tui/ → ~/src/quadraui/quadraui
 quadraui = { path = "../../quadraui/quadraui", features = ["tui"] }
-# Explicit ratatui dep so main.rs can construct Terminal/CrosstermBackend
-# directly in the custom event loop. Must match the version quadraui pulls in.
-ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
 gethostname = "1.1"

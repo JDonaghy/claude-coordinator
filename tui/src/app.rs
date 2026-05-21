@@ -26,11 +26,8 @@
 //! **Data sources:**
 //! - `~/.coord/coord.db` — SQLite database (WAL mode) written by the coordinator
 //!
-//! **Auto-refresh:** every 5 s, triggered at the start of the next
-//! [`AppLogic::handle`] call after the deadline. The TUI runner in
-//! `main.rs` injects a synthetic `UiEvent::WindowFocused` on every idle
-//! poll (16 ms) so the timer fires near the deadline even with no user
-//! input; for GTK the 33 ms idle drain keeps it near the deadline.
+//! **Auto-refresh:** every 5 s via [`AppLogic::tick`], which quadraui
+//! calls after every event batch (including empty timeout batches).
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -647,17 +644,17 @@ impl AppLogic for CoordApp {
         backend.draw_status_bar(sb_rect, &self.status_bar(), None, None);
     }
 
-    fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend) -> Reaction {
-        // Timer-based auto-refresh: check at the start of every event.
-        // For TUI this fires on the first user event after 5 s; for GTK
-        // the 33 ms idle drain keeps it close to the deadline.
-        let mut needs_redraw = if self.refreshed_at.elapsed() >= REFRESH_EVERY {
+    fn tick(&mut self, _backend: &mut dyn Backend) -> Reaction {
+        if self.refreshed_at.elapsed() >= REFRESH_EVERY {
             self.refresh();
-            true
+            Reaction::Redraw
         } else {
-            false
-        };
+            Reaction::Continue
+        }
+    }
 
+    fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend) -> Reaction {
+        let mut needs_redraw = false;
         let n = self.data.assignments.len();
 
         match event {
