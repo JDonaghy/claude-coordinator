@@ -1,7 +1,7 @@
 //! Backend-neutral app logic for coord-tui.
 //!
 //! [`CoordApp`] implements [`quadraui::AppLogic`] using only the
-//! backend-neutral trait surface (`draw_list`, `draw_split`,
+//! backend-neutral trait surface (`draw_list`, `draw_split`, `draw_tree`,
 //! `draw_status_bar`). No ratatui or crossterm symbols appear here —
 //! those live exclusively in the TUI and GTK shim entry points.
 //!
@@ -10,15 +10,16 @@
 //! ```text
 //! ┌────────────┬────────────────────────────┬──────────────────────────┐
 //! │ VIEWS      │ BOARD (Board view)          │ DETAIL                  │
-//! │ ▶ Board    │ #115  claude-coord  RUN     │ claude-coordinator #115  │
-//! │   Machines │ #110  claude-coord  DONE    │  ID     6b2670e…        │
-//! │            │ …                           │  Machine dellserver      │
+//! │ ▶ Board    │ ▼ Running (1)               │ claude-coordinator #115  │
+//! │   Machines │   #115  claude-coord  RUN   │  ID     6b2670e…        │
+//! │            │ ▼ Failed (0)                │  Machine dellserver      │
+//! │            │ ▶ Done (3)                  │                         │
 //! ├────────────┼────────────────────────────┼──────────────────────────┤
 //! │            │ MACHINES (Machines view)    │ DETAIL — dellserver     │
 //! │   Board    │ ● dellserver (local)  1     │  Status  reachable      │
 //! │ ▶ Machines │ ○ elitebook         idle    │  JOB HISTORY            │
 //! └────────────┴────────────────────────────┴──────────────────────────┘
-//! │ coord-tui  Board  ↻ 3s   1=Board  2=Machines  Tab=switch  j/k=nav │
+//! │ coord-tui  Board  ↻ 3s  1=Board 2=Machines Tab=switch j/k=nav Enter/Space=expand │
 //! ```
 //!
 //! **Data sources:**
@@ -34,8 +35,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags};
 
 use quadraui::{
-    AppLogic, Backend, Color, Decoration, Key, ListItem, ListView, NamedKey, Reaction, Rect,
-    Split, SplitDirection, StatusBar, StatusBarSegment, StyledSpan, StyledText, UiEvent, WidgetId,
+    AppLogic, Backend, Badge, Color, Decoration, Key, ListItem, ListView, NamedKey, Reaction, Rect,
+    Split, SplitDirection, StatusBar, StatusBarSegment, StyledSpan, StyledText, TreeController,
+    TreeRow, UiEvent, WidgetId,
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
@@ -364,10 +366,11 @@ pub struct CoordApp {
     data: BoardData,
     /// Which top-level view is currently shown in the content area.
     active_view: SidebarView,
-    /// Selected assignment index in the Board view.
-    board_sel: usize,
-    /// Scroll offset for the board list.
-    board_scroll: usize,
+    /// Tree controller for the Board view (selection, scroll, vim-keys).
+    board_tree: TreeController,
+    /// Expand/collapse state for each status group: [Running, Failed, Done].
+    /// Running and Failed are expanded by default; Done is collapsed.
+    board_groups_expanded: [bool; 3],
     /// Selected machine index in the Machines view.
     machine_sel: usize,
     /// Scroll offset for the machines list.
@@ -385,47 +388,186 @@ impl CoordApp {
     /// Create a new app, loading initial board data from the SQLite DB.
     pub fn new() -> Self {
         let data = load_data();
-        Self {
+        let mut app = Self {
             data,
             active_view: SidebarView::default(),
-            board_sel: 0,
-            board_scroll: 0,
+            board_tree: TreeController::new("board"),
+            board_groups_expanded: [true, true, false],
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
-        }
+        };
+        app.rebuild_board_tree_rows();
+        app
     }
 
     fn refresh(&mut self) {
         self.data = load_data();
         self.refreshed_at = Instant::now();
-        let n = self.data.assignments.len();
-        if n > 0 {
-            self.board_sel = self.board_sel.min(n - 1);
-        } else {
-            self.board_sel = 0;
-        }
         let m = self.data.machines.len();
         if m > 0 {
             self.machine_sel = self.machine_sel.min(m - 1);
         } else {
             self.machine_sel = 0;
         }
+        self.rebuild_board_tree_rows();
     }
 
-    fn selected(&self) -> Option<&Assignment> {
-        self.data.assignments.get(self.board_sel)
-    }
-
-    /// Clamp `board_scroll` so that `board_sel` is inside the visible window.
-    fn fix_scroll(&mut self, visible: usize) {
-        if visible == 0 {
-            return;
+    /// Rebuild the tree rows from current data + expansion state, then push
+    /// them into the `TreeController`. Clears the selection if it no longer
+    /// exists in the new row set (e.g. after collapsing a group).
+    fn rebuild_board_tree_rows(&mut self) {
+        let rows = self.build_board_rows();
+        // Clear selection if its path vanished (e.g. group was collapsed).
+        if let Some(path) = self.board_tree.selected_path().cloned() {
+            if !rows.iter().any(|r| r.path == path) {
+                self.board_tree.set_selected_path(None);
+            }
         }
-        if self.board_sel < self.board_scroll {
-            self.board_scroll = self.board_sel;
-        } else if self.board_sel >= self.board_scroll + visible {
-            self.board_scroll = self.board_sel + 1 - visible;
+        self.board_tree.set_rows(rows);
+    }
+
+    /// Build the flat-ordered [`TreeRow`] list from current assignments and
+    /// group expansion state.  The assignments vector is already sorted
+    /// running → failed → done, so group offsets are trivially computed.
+    fn build_board_rows(&self) -> Vec<TreeRow> {
+        let n_running = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.status == "running")
+            .count();
+        let n_failed = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.status == "failed")
+            .count();
+        let n_done = self.data.assignments.len() - n_running - n_failed;
+
+        // (label, count, color, start-index-into-assignments)
+        let groups: [(&str, usize, Color, usize); 3] = [
+            ("Running", n_running, Color::rgb(80, 220, 80), 0),
+            (
+                "Failed",
+                n_failed,
+                Color::rgb(220, 70, 70),
+                n_running,
+            ),
+            (
+                "Done",
+                n_done,
+                Color::rgb(120, 120, 120),
+                n_running + n_failed,
+            ),
+        ];
+
+        let mut rows = Vec::new();
+
+        for (g_idx, (label, count, color, start)) in groups.iter().enumerate() {
+            let expanded = self.board_groups_expanded[g_idx];
+
+            // ── Group header ──────────────────────────────────────────
+            let header_text = StyledText {
+                spans: vec![StyledSpan::with_fg(
+                    format!("{} ({})", label, count),
+                    *color,
+                )],
+            };
+            rows.push(TreeRow {
+                path: vec![g_idx as u16],
+                indent: 0,
+                icon: None,
+                text: header_text,
+                badge: None,
+                is_expanded: Some(expanded),
+                decoration: Decoration::Normal,
+                edit: None,
+            });
+
+            if !expanded {
+                continue;
+            }
+
+            // ── Assignment leaves ─────────────────────────────────────
+            for i in 0..*count {
+                let a = &self.data.assignments[start + i];
+                let sc = a.status_color();
+                let issue = format!("#{:<5}", a.issue_number);
+                let repo = format!("{:<18}", trunc(&a.repo, 18));
+                let st = a.status_label();
+                let text = StyledText {
+                    spans: vec![
+                        StyledSpan::with_fg(issue, Color::rgb(150, 150, 240)),
+                        StyledSpan::plain(repo),
+                        StyledSpan::with_fg(st, sc),
+                    ],
+                };
+                rows.push(TreeRow {
+                    path: vec![g_idx as u16, i as u16],
+                    indent: 1,
+                    icon: None,
+                    text,
+                    badge: Some(Badge::plain(a.age_str())),
+                    is_expanded: None, // leaf node
+                    decoration: if a.status == "failed" {
+                        Decoration::Error
+                    } else {
+                        Decoration::Normal
+                    },
+                    edit: None,
+                });
+            }
+        }
+
+        rows
+    }
+
+    /// Return the assignment currently selected in the Board tree, if any.
+    ///
+    /// Only leaf paths (length 2) map to assignments; group-header paths
+    /// (length 1) return `None`.
+    fn board_selected_assignment(&self) -> Option<&Assignment> {
+        let path = self.board_tree.selected_path()?;
+        if path.len() < 2 {
+            return None; // group header, not a leaf
+        }
+        let group = path[0] as usize;
+        let item = path[1] as usize;
+
+        let n_running = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.status == "running")
+            .count();
+        let n_failed = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.status == "failed")
+            .count();
+
+        let idx = match group {
+            0 => item,
+            1 => n_running + item,
+            2 => n_running + n_failed + item,
+            _ => return None,
+        };
+        self.data.assignments.get(idx)
+    }
+
+    /// Toggle expand/collapse for the group that is currently selected (if
+    /// the selection sits on a group header row).
+    fn toggle_selected_group(&mut self) {
+        if let Some(path) = self.board_tree.selected_path().cloned() {
+            if path.len() == 1 {
+                let g = path[0] as usize;
+                if g < 3 {
+                    self.board_groups_expanded[g] = !self.board_groups_expanded[g];
+                    self.rebuild_board_tree_rows();
+                }
+            }
         }
     }
 
@@ -441,7 +583,7 @@ impl CoordApp {
         }
     }
 
-    // ── ListView builders ────────────────────────────────────────────────
+    // ── Widget builders ──────────────────────────────────────────────────
 
     /// Left sidebar listing selectable views.
     fn sidebar_list(&self) -> ListView {
@@ -486,57 +628,6 @@ impl CoordApp {
             selected_idx: self.active_view.index(),
             scroll_offset: 0,
             has_focus: false,
-            bordered: false,
-        }
-    }
-
-    fn board_list(&self, has_focus: bool) -> ListView {
-        let items: Vec<ListItem> = self
-            .data
-            .assignments
-            .iter()
-            .map(|a| {
-                let sc = a.status_color();
-                // Columns: issue#  repo(left-padded)  STATUS  (age right-aligned via detail)
-                let issue = format!("#{:<5}", a.issue_number);
-                let repo = format!("{:<18}", trunc(&a.repo, 18));
-                let st = a.status_label();
-                let text = StyledText {
-                    spans: vec![
-                        StyledSpan::with_fg(&issue, Color::rgb(150, 150, 240)),
-                        StyledSpan::plain(&repo),
-                        StyledSpan::with_fg(st, sc),
-                    ],
-                };
-                let short_id = trunc(&a.id, 8);
-                let detail = Some(StyledText {
-                    spans: vec![
-                        StyledSpan::with_fg(short_id, Color::rgb(90, 90, 110)),
-                        StyledSpan::with_fg(" · ", Color::rgb(60, 60, 70)),
-                        StyledSpan::with_fg(a.age_str(), Color::rgb(100, 100, 100)),
-                    ],
-                });
-                ListItem {
-                    text,
-                    icon: None,
-                    detail,
-                    decoration: if a.status == "failed" {
-                        Decoration::Error
-                    } else {
-                        Decoration::Normal
-                    },
-                }
-            })
-            .collect();
-
-        let n = self.data.assignments.len();
-        ListView {
-            id: WidgetId::new("board"),
-            title: Some(StyledText::plain(format!(" BOARD ({} assignments) ", n))),
-            items,
-            selected_idx: if n > 0 { self.board_sel } else { 0 },
-            scroll_offset: self.board_scroll,
-            has_focus,
             bordered: false,
         }
     }
@@ -599,7 +690,7 @@ impl CoordApp {
     fn detail_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
 
-        match self.selected() {
+        match self.board_selected_assignment() {
             None => {
                 items.push(kv_item("", " No assignment selected", None));
             }
@@ -663,7 +754,7 @@ impl CoordApp {
             }
         }
 
-        let title = match self.selected() {
+        let title = match self.board_selected_assignment() {
             Some(a) => format!(" DETAIL — {} #{} ", a.repo, a.issue_number),
             None => " DETAIL ".to_string(),
         };
@@ -831,7 +922,7 @@ impl CoordApp {
                 },
             ],
             right_segments: vec![StatusBarSegment {
-                text: " 1=Board  2=Machines  Tab=switch  j/k=nav  r=refresh  q=quit ".to_string(),
+                text: " 1=Board  2=Machines  Tab=switch  j/k=nav  Enter/Space=expand  r=refresh  q=quit ".to_string(),
                 fg: Color::rgb(140, 140, 140),
                 bg: Color::rgb(30, 30, 40),
                 bold: false,
@@ -879,7 +970,9 @@ impl AppLogic for CoordApp {
         // Draw the active view's panels
         match self.active_view {
             SidebarView::Board => {
-                backend.draw_list(inner.first_bounds, &self.board_list(true));
+                // TreeController::render reads self.board_tree (immutable) and
+                // passes it to backend.draw_tree — no mutation needed here.
+                self.board_tree.render(backend, inner.first_bounds);
                 backend.draw_list(inner.second_bounds, &self.detail_list());
             }
             SidebarView::Machines => {
@@ -893,17 +986,15 @@ impl AppLogic for CoordApp {
         backend.draw_status_bar(sb_rect, &self.status_bar(), None, None);
     }
 
-    fn tick(&mut self, _backend: &mut dyn Backend) -> Reaction {
-        if self.refreshed_at.elapsed() >= REFRESH_EVERY {
-            self.refresh();
-            Reaction::Redraw
-        } else {
-            Reaction::Continue
-        }
-    }
-
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend) -> Reaction {
-        let mut needs_redraw = false;
+        // Auto-refresh: reload board data if the interval has elapsed.
+        // Checked on every event so we don't need a dedicated tick callback.
+        let mut needs_redraw = if self.refreshed_at.elapsed() >= REFRESH_EVERY {
+            self.refresh();
+            true
+        } else {
+            false
+        };
 
         match event {
             UiEvent::KeyPressed { key, .. } => {
@@ -924,15 +1015,12 @@ impl AppLogic for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── Navigate within the active panel ─────────────────
+                    // ── Down / j ─────────────────────────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down) => {
                         match self.active_view {
                             SidebarView::Board => {
-                                let n = self.data.assignments.len();
-                                if n > 0 && self.board_sel + 1 < n {
-                                    self.board_sel += 1;
-                                }
-                                self.fix_scroll(content_visible_rows(backend));
+                                let vr = board_visible_rows(backend);
+                                self.board_tree.move_selection_by(1, vr);
                             }
                             SidebarView::Machines => {
                                 let m = self.data.machines.len();
@@ -945,13 +1033,12 @@ impl AppLogic for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── Up / k ───────────────────────────────────────────
                     Key::Char('k') | Key::Named(NamedKey::Up) => {
                         match self.active_view {
                             SidebarView::Board => {
-                                if self.board_sel > 0 {
-                                    self.board_sel -= 1;
-                                }
-                                self.fix_scroll(content_visible_rows(backend));
+                                let vr = board_visible_rows(backend);
+                                self.board_tree.move_selection_by(-1, vr);
                             }
                             SidebarView::Machines => {
                                 if self.machine_sel > 0 {
@@ -963,11 +1050,12 @@ impl AppLogic for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── Home ─────────────────────────────────────────────
                     Key::Named(NamedKey::Home) => {
                         match self.active_view {
                             SidebarView::Board => {
-                                self.board_sel = 0;
-                                self.fix_scroll(content_visible_rows(backend));
+                                let vr = board_visible_rows(backend);
+                                self.board_tree.jump_to_edge(true, vr);
                             }
                             SidebarView::Machines => {
                                 self.machine_sel = 0;
@@ -977,14 +1065,12 @@ impl AppLogic for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── End ──────────────────────────────────────────────
                     Key::Named(NamedKey::End) => {
                         match self.active_view {
                             SidebarView::Board => {
-                                let n = self.data.assignments.len();
-                                if n > 0 {
-                                    self.board_sel = n - 1;
-                                }
-                                self.fix_scroll(content_visible_rows(backend));
+                                let vr = board_visible_rows(backend);
+                                self.board_tree.jump_to_edge(false, vr);
                             }
                             SidebarView::Machines => {
                                 let m = self.data.machines.len();
@@ -994,6 +1080,34 @@ impl AppLogic for CoordApp {
                                 self.fix_machine_scroll(content_visible_rows(backend));
                             }
                         }
+                        needs_redraw = true;
+                    }
+
+                    // ── PageDown (Board only) ─────────────────────────────
+                    Key::Named(NamedKey::PageDown)
+                        if self.active_view == SidebarView::Board =>
+                    {
+                        let vr = board_visible_rows(backend);
+                        let jump = (vr.max(1) - 1).max(1) as isize;
+                        self.board_tree.move_selection_by(jump, vr);
+                        needs_redraw = true;
+                    }
+
+                    // ── PageUp (Board only) ───────────────────────────────
+                    Key::Named(NamedKey::PageUp)
+                        if self.active_view == SidebarView::Board =>
+                    {
+                        let vr = board_visible_rows(backend);
+                        let jump = (vr.max(1) - 1).max(1) as isize;
+                        self.board_tree.move_selection_by(-jump, vr);
+                        needs_redraw = true;
+                    }
+
+                    // ── Enter / Space — expand/collapse group (Board only) ─
+                    Key::Named(NamedKey::Enter) | Key::Char(' ')
+                        if self.active_view == SidebarView::Board =>
+                    {
+                        self.toggle_selected_group();
                         needs_redraw = true;
                     }
 
@@ -1019,10 +1133,10 @@ impl AppLogic for CoordApp {
     }
 }
 
-/// Estimate the number of visible rows in the main content panel.
+/// Estimate the number of visible rows in the Machines list panel.
 ///
-/// The content panel occupies the full terminal height minus the status bar
-/// row and the list title row.
+/// The panel occupies the full terminal height minus the status bar row and
+/// the list title row.
 fn content_visible_rows(backend: &dyn Backend) -> usize {
     let vp = backend.viewport();
     let lh = backend.line_height();
@@ -1032,6 +1146,21 @@ fn content_visible_rows(backend: &dyn Backend) -> usize {
     let main_h = vp.height - lh; // minus status bar
     let content_h = (main_h - lh).max(0.0); // minus list title row
     (content_h / lh) as usize
+}
+
+/// Estimate the number of visible rows in the Board tree panel.
+///
+/// Used to provide a viewport-rows hint to [`TreeController`] navigation
+/// primitives. The Board tree has no separate title row (unlike `ListView`),
+/// so we deduct only the status bar row.
+fn board_visible_rows(backend: &dyn Backend) -> usize {
+    let vp = backend.viewport();
+    let lh = backend.line_height();
+    if lh <= 0.0 {
+        return 10;
+    }
+    let main_h = vp.height - lh; // minus status bar
+    (main_h / lh) as usize
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -1096,49 +1225,170 @@ mod tests {
         assert_eq!(trunc(s, 3), "🎉 h");
     }
 
-    // ── fix_scroll ─────────────────────────────────────────────────────────────
+    // ── Board tree helpers ────────────────────────────────────────────────────
 
-    fn make_app(sel: usize, scroll: usize) -> CoordApp {
+    fn make_app_default() -> CoordApp {
         CoordApp {
             data: BoardData::default(),
             active_view: SidebarView::default(),
-            board_sel: sel,
-            board_scroll: scroll,
+            board_tree: TreeController::new("board"),
+            board_groups_expanded: [true, true, false],
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
         }
     }
 
+    fn make_app_with_assignments(assignments: Vec<Assignment>) -> CoordApp {
+        let mut app = CoordApp {
+            data: BoardData {
+                assignments,
+                ..BoardData::default()
+            },
+            active_view: SidebarView::default(),
+            board_tree: TreeController::new("board"),
+            board_groups_expanded: [true, true, false],
+            machine_sel: 0,
+            machine_scroll: 0,
+            refreshed_at: Instant::now(),
+        };
+        app.rebuild_board_tree_rows();
+        app
+    }
+
+    // ── build_board_rows / board_selected_assignment ──────────────────────────
+
     #[test]
-    fn fix_scroll_within_visible_window() {
-        let mut d = make_app(2, 0);
-        d.fix_scroll(10);
-        // sel=2 is inside [0, 10) → scroll unchanged
-        assert_eq!(d.board_scroll, 0);
+    fn board_rows_empty_data_produces_three_group_headers() {
+        let app = make_app_default();
+        let rows = app.build_board_rows();
+        // Three group headers (Running, Failed, Done) — all expanded=true/true/false.
+        // Running(0) + Failed(0) both expanded → 0 leaves; Done collapsed → 0 leaves.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].path, vec![0]);
+        assert_eq!(rows[1].path, vec![1]);
+        assert_eq!(rows[2].path, vec![2]);
     }
 
     #[test]
-    fn fix_scroll_selection_past_end_of_window() {
-        let mut d = make_app(15, 0);
-        d.fix_scroll(10);
-        // sel=15 >= scroll(0)+visible(10) → scroll = 15 + 1 - 10 = 6
-        assert_eq!(d.board_scroll, 6);
+    fn board_rows_expanded_group_shows_leaves() {
+        let assignments = vec![
+            make_assignment("running"),
+            make_assignment("running"),
+            make_assignment("failed"),
+        ];
+        let app = make_app_with_assignments(assignments);
+        let rows = app.build_board_rows();
+        // Running(2 expanded) + 2 leaves + Failed(1 expanded) + 1 leaf + Done(0 collapsed)
+        assert_eq!(rows.len(), 3 + 2 + 1); // 3 headers + 3 leaves
+        // First header: Running group
+        assert_eq!(rows[0].path, vec![0]);
+        assert_eq!(rows[0].is_expanded, Some(true));
+        // Leaves for running
+        assert_eq!(rows[1].path, vec![0, 0]);
+        assert_eq!(rows[2].path, vec![0, 1]);
+        // Failed header
+        assert_eq!(rows[3].path, vec![1]);
+        assert_eq!(rows[3].is_expanded, Some(true));
+        // Leaf for failed
+        assert_eq!(rows[4].path, vec![1, 0]);
+        // Done header — collapsed by default
+        assert_eq!(rows[5].path, vec![2]);
+        assert_eq!(rows[5].is_expanded, Some(false));
     }
 
     #[test]
-    fn fix_scroll_selection_before_scroll_offset() {
-        let mut d = make_app(0, 5);
-        d.fix_scroll(10);
-        // sel=0 < scroll=5 → scroll snaps up to sel
-        assert_eq!(d.board_scroll, 0);
+    fn board_rows_collapsed_group_hides_leaves() {
+        let assignments = vec![make_assignment("done"), make_assignment("done")];
+        let app = make_app_with_assignments(assignments);
+        let rows = app.build_board_rows();
+        // Running(0) + Failed(0) expanded with 0 leaves; Done(2) collapsed → 0 leaves
+        assert_eq!(rows.len(), 3); // only the 3 headers
     }
 
     #[test]
-    fn fix_scroll_zero_visible_rows_is_noop() {
-        let mut d = make_app(0, 0);
-        d.fix_scroll(0); // visible == 0 → early return
-        assert_eq!(d.board_scroll, 0);
+    fn board_selected_assignment_on_leaf_returns_correct_assignment() {
+        let assignments = vec![
+            make_assignment("running"), // idx 0 → path [0, 0]
+            make_assignment("failed"),  // idx 1 → path [1, 0]
+            make_assignment("done"),    // idx 2 → path [2, 0]  (collapsed, won't be selectable)
+        ];
+        let mut app = make_app_with_assignments(assignments.clone());
+
+        // Select running leaf [0, 0]
+        app.board_tree.set_selected_path(Some(vec![0, 0]));
+        let sel = app.board_selected_assignment().unwrap();
+        assert_eq!(sel.status, "running");
+
+        // Select failed leaf [1, 0]
+        app.board_tree.set_selected_path(Some(vec![1, 0]));
+        let sel = app.board_selected_assignment().unwrap();
+        assert_eq!(sel.status, "failed");
+    }
+
+    #[test]
+    fn board_selected_assignment_on_group_header_returns_none() {
+        let assignments = vec![make_assignment("running")];
+        let mut app = make_app_with_assignments(assignments);
+
+        // Select the Running group header [0]
+        app.board_tree.set_selected_path(Some(vec![0]));
+        assert!(app.board_selected_assignment().is_none());
+    }
+
+    #[test]
+    fn board_selected_assignment_no_selection_returns_none() {
+        let app = make_app_default();
+        assert!(app.board_selected_assignment().is_none());
+    }
+
+    #[test]
+    fn toggle_selected_group_expands_collapsed_done_group() {
+        let assignments = vec![make_assignment("done")];
+        let mut app = make_app_with_assignments(assignments);
+        // Done is group index 2, collapsed by default
+        app.board_tree.set_selected_path(Some(vec![2]));
+        assert!(!app.board_groups_expanded[2]);
+
+        app.toggle_selected_group();
+        assert!(app.board_groups_expanded[2]);
+
+        let rows = app.build_board_rows();
+        // Now Done expanded → 1 leaf visible
+        let done_leaf = rows.iter().any(|r| r.path == vec![2, 0]);
+        assert!(done_leaf, "done leaf should be visible after expand");
+    }
+
+    #[test]
+    fn toggle_selected_group_collapses_expanded_running_group() {
+        let assignments = vec![make_assignment("running")];
+        let mut app = make_app_with_assignments(assignments);
+        app.board_tree.set_selected_path(Some(vec![0]));
+        assert!(app.board_groups_expanded[0]); // expanded by default
+
+        app.toggle_selected_group();
+        assert!(!app.board_groups_expanded[0]);
+
+        let rows = app.build_board_rows();
+        // After collapse, no running leaf
+        let has_leaf = rows.iter().any(|r| r.path.len() == 2 && r.path[0] == 0);
+        assert!(!has_leaf, "running leaves should be hidden after collapse");
+    }
+
+    #[test]
+    fn rebuild_clears_stale_selection_on_collapse() {
+        let assignments = vec![make_assignment("running")];
+        let mut app = make_app_with_assignments(assignments);
+        // Select the running leaf
+        app.board_tree.set_selected_path(Some(vec![0, 0]));
+        assert!(app.board_selected_assignment().is_some());
+
+        // Collapse running group — leaf path [0, 0] no longer exists
+        app.board_groups_expanded[0] = false;
+        app.rebuild_board_tree_rows();
+
+        // Selection should have been cleared
+        assert!(app.board_tree.selected_path().is_none());
     }
 
     // ── fix_machine_scroll ────────────────────────────────────────────────────
@@ -1147,8 +1397,8 @@ mod tests {
         CoordApp {
             data: BoardData::default(),
             active_view: SidebarView::Machines,
-            board_sel: 0,
-            board_scroll: 0,
+            board_tree: TreeController::new("board"),
+            board_groups_expanded: [true, true, false],
             machine_sel,
             machine_scroll,
             refreshed_at: Instant::now(),
