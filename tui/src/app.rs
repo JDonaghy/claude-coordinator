@@ -986,15 +986,17 @@ impl AppLogic for CoordApp {
         backend.draw_status_bar(sb_rect, &self.status_bar(), None, None);
     }
 
-    fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend) -> Reaction {
-        // Auto-refresh: reload board data if the interval has elapsed.
-        // Checked on every event so we don't need a dedicated tick callback.
-        let mut needs_redraw = if self.refreshed_at.elapsed() >= REFRESH_EVERY {
+    fn tick(&mut self, _backend: &mut dyn Backend) -> Reaction {
+        if self.refreshed_at.elapsed() >= REFRESH_EVERY {
             self.refresh();
-            true
+            Reaction::Redraw
         } else {
-            false
-        };
+            Reaction::Continue
+        }
+    }
+
+    fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend) -> Reaction {
+        let mut needs_redraw = false;
 
         match event {
             UiEvent::KeyPressed { key, .. } => {
