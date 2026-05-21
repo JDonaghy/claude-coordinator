@@ -8,10 +8,23 @@ description = "TUI dashboard for claude-coordinator (quadraui-powered)"
 name = "coord-tui"
 path = "src/main.rs"
 
+# GTK binary requires the `gtk` feature (builds a GTK4 desktop window).
+# Build with: cargo build --features gtk --bin coord-tui-gtk
+[[bin]]
+name = "coord-tui-gtk"
+path = "src/bin/gtk.rs"
+required-features = ["gtk"]
+
+[features]
+# Enables the GTK4 backend in quadraui and the coord-tui-gtk binary.
+# Requires GTK4 development libraries on the build host.
+gtk = ["quadraui/gtk"]
+
 [dependencies]
 # Path matches ~/src/claude-coordinator/tui/ → ~/src/quadraui/quadraui
 quadraui = { path = "../../quadraui/quadraui", features = ["tui"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-# ratatui re-exports crossterm; we use ratatui::crossterm::* for terminal setup
+# Explicit ratatui dep so main.rs can construct Terminal/CrosstermBackend
+# directly in the custom event loop. Must match the version quadraui pulls in.
 ratatui = "0.29"
+rusqlite = { version = "0.32", features = ["bundled"] }
 gethostname = "1.1"
