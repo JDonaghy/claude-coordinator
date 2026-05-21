@@ -19,10 +19,10 @@
 //! ```
 //!
 //! **Data sources:**
-//! - `~/.coord/agent_state.json` — assignments managed by the local agent
-//! - `~/.coord/dispatched.json`  — cross-machine dispatch history (machine names)
+//! - `~/.coord/coord.db` — SQLite database (WAL mode) written by the coordinator
 //!
-//! **Agent endpoint:** TCP probe on port 7433 to determine machine reachability.
+//! **Agent endpoint:** TCP probe on port 7433 using the `host` column from the
+//! `machines` table (Tailscale FQDN) rather than the machine nickname.
 //!
 //! **Keys:** `j`/`↓` down, `k`/`↑` up, `Home`/`End`, `r` force-refresh, `q`/`Esc` quit.
 
@@ -39,7 +39,7 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::Terminal;
 
-use serde::Deserialize;
+use rusqlite::{Connection, OpenFlags};
 
 use quadraui::tui::TuiBackend;
 use quadraui::{
@@ -47,48 +47,6 @@ use quadraui::{
     Split, SplitDirection, StatusBar, StatusBarSegment, StyledSpan, StyledText, UiEvent, Viewport,
     WidgetId,
 };
-
-// ─── JSON deserialization types ───────────────────────────────────────────────
-
-#[derive(Deserialize, Default)]
-struct AgentStateJson {
-    #[serde(default)]
-    machine: String,
-    #[serde(default)]
-    assignments: Vec<AgentAssignmentJson>,
-}
-
-#[derive(Deserialize)]
-struct AgentAssignmentJson {
-    id: String,
-    spec: AssignmentSpecJson,
-    status: String,
-    #[serde(default)]
-    branch: Option<String>,
-    #[serde(default)]
-    started_at: Option<f64>,
-    #[serde(default)]
-    finished_at: Option<f64>,
-    #[serde(default)]
-    exit_code: Option<i32>,
-}
-
-#[derive(Deserialize)]
-struct AssignmentSpecJson {
-    repo_name: String,
-    issue_number: u64,
-    issue_title: String,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(rename = "type", default)]
-    assignment_type: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct DispatchedEntryJson {
-    #[serde(default)]
-    machine_name: String,
-}
 
 // ─── App data model ───────────────────────────────────────────────────────────
 
@@ -186,7 +144,7 @@ fn kv_item(key: &str, val: &str, val_color: Option<Color>) -> ListItem {
     } else {
         StyledText {
             spans: vec![
-                StyledSpan::with_fg(&format!(" {:12} ", key), key_color),
+                StyledSpan::with_fg(format!(" {:12} ", key), key_color),
                 StyledSpan::with_fg(val, val_color.unwrap_or(Color::rgb(210, 210, 210))),
             ],
         }
@@ -232,37 +190,51 @@ fn tcp_probe(host: &str, port: u16) -> bool {
 
 fn load_data() -> BoardData {
     let dir = coord_dir();
+    let db_path = dir.join("coord.db");
 
-    // ── agent_state.json (local machine assignments) ──────────────────
-    let state: AgentStateJson = std::fs::read_to_string(dir.join("agent_state.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    // Open the DB read-only; return empty data if the DB doesn't exist yet.
+    let conn = match Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return BoardData::default(),
+    };
 
-    let local = state.machine.clone();
+    // ── Query assignments ──────────────────────────────────────────────────
+    // dispatched_at and finished_at are stored as REAL (Unix float seconds).
+    let mut assignments: Vec<Assignment> = {
+        let mut stmt = match conn.prepare(
+            "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
+             status, branch, model, type, dispatched_at, finished_at, exit_code \
+             FROM assignments ORDER BY dispatched_at DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return BoardData::default(),
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok(Assignment {
+                id: row.get::<_, String>(0)?,
+                machine: row.get::<_, String>(1)?,
+                repo: row.get::<_, String>(2)?,
+                issue_number: row.get::<_, i64>(3)? as u64,
+                issue_title: row.get::<_, String>(4)?,
+                status: row.get::<_, String>(5)?,
+                branch: row.get::<_, Option<String>>(6)?,
+                model: row.get::<_, Option<String>>(7)?,
+                assignment_type: row.get::<_, Option<String>>(8)?,
+                started_at: row.get::<_, Option<f64>>(9)?,
+                finished_at: row.get::<_, Option<f64>>(10)?,
+                exit_code: row.get::<_, Option<i32>>(11)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return BoardData::default(),
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    };
 
-    let mut assignments: Vec<Assignment> = state
-        .assignments
-        .into_iter()
-        .map(|a| {
-            Assignment {
-                id: a.id,
-                repo: a.spec.repo_name,
-                issue_number: a.spec.issue_number,
-                issue_title: a.spec.issue_title,
-                machine: local.clone(),
-                status: a.status,
-                branch: a.branch,
-                model: a.spec.model,
-                started_at: a.started_at,
-                finished_at: a.finished_at,
-                exit_code: a.exit_code,
-                assignment_type: a.spec.assignment_type,
-            }
-        })
-        .collect();
-
-    // Sort: running first, then failed, then done (most recent first within groups)
+    // Sort: running first, then failed, then done (most recent first within groups).
     assignments.sort_by(|a, b| {
         let rank = |s: &str| match s {
             "running" => 0u8,
@@ -277,37 +249,42 @@ fn load_data() -> BoardData {
         })
     });
 
-    // ── dispatched.json (extracts additional machine names) ───────────
-    let mut machine_names: Vec<String> = if local.is_empty() {
-        vec![]
-    } else {
-        vec![local.clone()]
-    };
-
-    if let Ok(s) = std::fs::read_to_string(dir.join("dispatched.json")) {
-        if let Ok(entries) = serde_json::from_str::<Vec<DispatchedEntryJson>>(&s) {
-            for e in entries {
-                if !e.machine_name.is_empty() && !machine_names.contains(&e.machine_name) {
-                    machine_names.push(e.machine_name);
+    // ── Query machines (name = nickname, host = Tailscale FQDN) ───────────
+    let machine_rows: Vec<(String, String)> = {
+        let mut stmt = match conn.prepare("SELECT name, host FROM machines") {
+            Ok(s) => s,
+            Err(_) => {
+                return BoardData {
+                    assignments,
+                    ..BoardData::default()
                 }
             }
-        }
-    }
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(r) => r,
+            Err(_) => {
+                return BoardData {
+                    assignments,
+                    ..BoardData::default()
+                }
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    };
 
-    if machine_names.is_empty() && !local.is_empty() {
-        machine_names.push(local.clone());
-    }
-
-    // ── Machine reachability probes ────────────────────────────────────
-    // Spawn probes concurrently; collect within a 250 ms budget.
-    let probes: Vec<(String, std::sync::mpsc::Receiver<bool>)> = machine_names
+    // ── Machine reachability probes ────────────────────────────────────────
+    // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
+    // Spawn all probes concurrently; collect within a 250 ms budget.
+    let probes: Vec<(String, std::sync::mpsc::Receiver<bool>)> = machine_rows
         .iter()
-        .map(|name| {
+        .map(|(name, host)| {
             use std::sync::mpsc;
-            let host = name.clone();
+            let h = host.clone();
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(tcp_probe(&host, 7433));
+                let _ = tx.send(tcp_probe(&h, 7433));
             });
             (name.clone(), rx)
         })
@@ -330,7 +307,7 @@ fn load_data() -> BoardData {
         .collect();
 
     BoardData {
-        local_machine: local,
+        local_machine: String::new(),
         assignments,
         machines,
     }
@@ -408,7 +385,7 @@ impl Dashboard {
                     spans: vec![
                         StyledSpan::with_fg(short_id, Color::rgb(90, 90, 110)),
                         StyledSpan::with_fg(" · ", Color::rgb(60, 60, 70)),
-                        StyledSpan::with_fg(&a.age_str(), Color::rgb(100, 100, 100)),
+                        StyledSpan::with_fg(a.age_str(), Color::rgb(100, 100, 100)),
                     ],
                 });
                 ListItem {
@@ -427,7 +404,7 @@ impl Dashboard {
         let n = self.data.assignments.len();
         ListView {
             id: WidgetId::new("board"),
-            title: Some(StyledText::plain(&format!(" BOARD ({} assignments) ", n))),
+            title: Some(StyledText::plain(format!(" BOARD ({} assignments) ", n))),
             items,
             selected_idx: if n > 0 { self.board_sel } else { 0 },
             scroll_offset: self.board_scroll,
@@ -482,7 +459,7 @@ impl Dashboard {
         let n = self.data.machines.len();
         ListView {
             id: WidgetId::new("machines"),
-            title: Some(StyledText::plain(&format!(" MACHINES ({}) ", n))),
+            title: Some(StyledText::plain(format!(" MACHINES ({}) ", n))),
             items,
             selected_idx: 0,
             scroll_offset: 0,
