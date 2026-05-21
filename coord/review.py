@@ -257,6 +257,7 @@ def build_review_briefing(
     same_as_worker: bool,
     reviews_cfg: ReviewsConfig,
     repo_claude_md: str | None,
+    default_branch: str = "main",
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test."""
 
@@ -321,7 +322,7 @@ def build_review_briefing(
     lines.append("")
     if pr_number is not None:
         lines.append(
-            f"1. Get the diff: `git fetch origin && git diff origin/{repo_github.split('/')[-1]} "
+            f"1. Get the diff: `git fetch origin && git diff origin/{default_branch}..."
             f"origin/{branch or 'HEAD'}` or ask the coordinator for the diff."
         )
         lines.append("2. Run the project's test suite.")
@@ -332,6 +333,7 @@ def build_review_briefing(
             "Inspect the diff with `git diff main..." + (branch or "<branch>") + "`."
         )
         lines.append("2. Run the project's test suite.")
+        lines.append("3. Review the diff against the checklist above.")
     lines.append("")
     lines.append(
         "4. At the END of your session, output your findings in this exact format "
@@ -463,6 +465,7 @@ def dispatch_review(
         same_as_worker=choice.same_as_worker,
         reviews_cfg=config.reviews,
         repo_claude_md=claude_md,
+        default_branch=repo.default_branch,
     )
 
     payload = {
