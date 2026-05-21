@@ -190,3 +190,51 @@ def test_logs_endpoint_bad_since_returns_400(tmp_path: Path) -> None:
     r = client.get(f"/logs/{aid}", params={"since": "not-an-int"})
     assert r.status_code == 400
     server.shutdown()
+
+
+def test_status_returns_200_with_truncated_log(tmp_path: Path) -> None:
+    """GET /status must return HTTP 200 even when the worker log ends mid-line.
+
+    Race condition: /status is polled while the worker is actively writing an
+    event to its stream-json log.  The last line is incomplete JSON.  The
+    endpoint must never 500.
+    """
+    import json as _json
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        repos=["api"],
+        state_dir=tmp_path / "state",
+        repo_paths={"api": str(repo)},
+        # Worker writes one complete stream-json event then sleeps so the
+        # assignment stays RUNNING while we poll /status.
+        worker_command=lambda spec: [
+            "/bin/sh", "-c",
+            "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"x\",\"session_id\":\"s\"}'; "
+            "printf '%s' '{\"type\":\"assistant\",\"partial'; "  # truncated last line
+            "sleep 30",
+        ],
+    )
+    app = build_app(server)
+    from coord.agent import AssignmentSpec
+    spec = AssignmentSpec(
+        repo_name="api", repo_path=str(repo),
+        issue_number=1, issue_title="t", briefing="b",
+    )
+    a = server.assign(spec)
+
+    import time
+    for _ in range(50):
+        if server.get(a.id).status == "running":
+            break
+        time.sleep(0.02)
+    time.sleep(0.15)  # let the worker write its partial line
+
+    from starlette.testclient import TestClient
+    client = TestClient(app)
+    r = client.get("/status")
+    assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text}"
+    body = r.json()
+    assert "active" in body
+
+    server.shutdown(kill_running=True)

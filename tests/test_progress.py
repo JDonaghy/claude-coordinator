@@ -146,6 +146,31 @@ class TestParseProgressStreamJson:
         p = parse_progress(str(log))
         assert any("rate limited" in w for w in p.warnings)
 
+    def test_truncated_json_line_silently_skipped(self, tmp_path: Path) -> None:
+        """A mid-write incomplete JSON line must be silently skipped, not raise.
+
+        This covers the race condition where /status is polled while the worker
+        is actively writing an event — the last line may be incomplete JSON.
+        The endpoint must return valid data, never HTTP 500.
+        """
+        log = tmp_path / "test.log"
+        _ndjson_log(
+            log,
+            [
+                {"type": "system", "subtype": "init", "model": "x", "session_id": "s"},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}
+                ]}},
+            ],
+        )
+        # Append a truncated/incomplete JSON line, simulating the worker being
+        # mid-write when we read the log file.
+        with open(log, "a") as f:
+            f.write('{"type": "assistant", "message": {')  # truncated — no closing braces
+        # Must not raise; incomplete line is silently discarded.
+        p = parse_progress(str(log))
+        assert p.updates  # rolling update from the complete events is still present
+
     def test_plain_text_still_uses_regex_parser(self, tmp_path: Path) -> None:
         """Backward compat: non-stream-json logs still parsed by old STATUS regex."""
         log = tmp_path / "test.log"
