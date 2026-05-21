@@ -220,6 +220,73 @@ def post_stuck(detection: StuckDetection, record: dict) -> None:
     mark_notified(_stuck_notified_key(detection.assignment_id), EVENT_STUCK)
 
 
+def _try_parse_and_post_review(
+    transition: Transition,
+    record: dict,
+    entry: dict,
+    duration: float | None,
+) -> bool:
+    """Parse reviewer findings from the log and post as a PR review or issue comment.
+
+    Returns True if a review was successfully posted (either as a ``gh pr review``
+    or as an issue comment when no PR number is available), False on any failure.
+    Silently swallows all errors so callers can fall back gracefully.
+    """
+    from coord.review import parse_review_from_log  # noqa: PLC0415
+
+    log_path = entry.get("log_path")
+    if not log_path:
+        return False
+
+    try:
+        findings = parse_review_from_log(log_path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to parse review log for %s: %s", transition.assignment_id, exc)
+        return False
+
+    if findings is None:
+        return False
+
+    review_target = record.get("review_target")
+    repo_github = record["repo_github"]
+
+    # Determine whether review_target is a PR number (integer string) or a branch.
+    pr_number: int | None = None
+    if review_target:
+        try:
+            pr_number = int(review_target)
+        except (ValueError, TypeError):
+            pr_number = None
+
+    if pr_number is not None:
+        try:
+            github_ops.post_pr_review(repo_github, pr_number, findings.verdict, findings.body)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to post PR review for %s PR#%s: %s",
+                transition.assignment_id, pr_number, exc,
+            )
+            return False
+    else:
+        # No PR number — post findings as an issue comment.
+        verdict_label = "✅ Approved" if findings.verdict == "approve" else "⚠️ Changes Requested"
+        body = (
+            f"## Review Complete — {verdict_label}\n\n"
+            f"*Reviewer could not post directly to a PR (no PR number available). "
+            f"Findings are reproduced here.*\n\n"
+            f"{findings.body}"
+        )
+        try:
+            github_ops.post_issue_comment(repo_github, transition.issue_number, body)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to post review comment for %s: %s", transition.assignment_id, exc
+            )
+            return False
+
+
 def _try_parse_and_post_plan(
     transition: Transition,
     record: dict,
@@ -291,6 +358,26 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         mark_notified(
             transition.assignment_id,
             EVENT_PLAN if posted else EVENT_COMPLETION,
+            branch=entry.get("branch"),
+        )
+    elif transition.event == EVENT_COMPLETION and assignment_type == "review":
+        # For review assignments, parse the structured findings and post as a
+        # PR review (or issue comment when no PR number is available).  Fall
+        # back to a plain completion comment noting the parse failure.
+        posted = _try_parse_and_post_review(transition, record, entry, duration)
+        if not posted:
+            post_completion(
+                exit_code=transition.exit_code or 0,
+                summary=(
+                    "Review assignment completed but findings could not be extracted "
+                    "from the worker log. The reviewer may not have produced the "
+                    "expected structured output (REVIEW_VERDICT / REVIEW_BODY / END_REVIEW)."
+                ),
+                **common,
+            )
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
             branch=entry.get("branch"),
         )
     elif transition.event == EVENT_COMPLETION:

@@ -169,3 +169,18 @@ def update_issue_body(repo: str, issue_number: int, body: str) -> None:
         f"repos/{repo}/issues/{issue_number}",
         "-f", f"body={body}",
     )
+
+
+def post_pr_review(repo: str, number: int, verdict: str, body: str) -> None:
+    """Post a PR review via the gh CLI.
+
+    *verdict* must be ``"approve"`` or ``"request-changes"``.  Any other value
+    raises :class:`ValueError` before invoking gh.
+    """
+    if verdict == "approve":
+        flag = "--approve"
+    elif verdict == "request-changes":
+        flag = "--request-changes"
+    else:
+        raise ValueError(f"Invalid review verdict: {verdict!r} (must be 'approve' or 'request-changes')")
+    _gh("pr", "review", str(number), "--repo", repo, flag, "--body", body)

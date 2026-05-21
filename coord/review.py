@@ -23,6 +23,7 @@ plumbing — keeping them apart avoids twisting both shapes.
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -36,6 +37,84 @@ from coord.dispatch import AGENT_PORT
 from coord.models import Assignment, Board, Machine
 
 
+# ── Review output parsing ────────────────────────────────────────────────────
+
+@dataclass
+class ReviewFindings:
+    """Structured review output extracted from a reviewer worker log."""
+    verdict: str  # "approve" or "request-changes"
+    body: str
+
+
+# Matches the structured block the reviewer is instructed to emit at end of session.
+# Allows optional leading/trailing whitespace and tolerates both LF and CRLF.
+_REVIEW_BLOCK_RE = re.compile(
+    r"REVIEW_VERDICT:\s*(approve|request-changes)\s*[\r\n]+"
+    r"REVIEW_BODY:\s*[\r\n]+(.*?)[\r\n]*END_REVIEW",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _parse_review_text(text: str) -> ReviewFindings | None:
+    """Extract the last ReviewFindings block from *text*, or None."""
+    matches = list(_REVIEW_BLOCK_RE.finditer(text))
+    if not matches:
+        return None
+    m = matches[-1]
+    verdict = m.group(1).lower().strip()
+    body = m.group(2).strip()
+    if verdict not in ("approve", "request-changes"):
+        return None
+    return ReviewFindings(verdict=verdict, body=body)
+
+
+def parse_review_from_log(log_path: str | Path) -> ReviewFindings | None:
+    """Parse review findings from a completed reviewer worker log.
+
+    Handles both stream-json (``--output-format stream-json``) and plain-text
+    log formats.  Searches the last assistant message first (most likely to
+    contain the final verdict), then falls back to scanning the full
+    concatenated text in case the block was split across turns.
+
+    Returns ``None`` if the file does not exist or contains no structured
+    review output.
+    """
+    from coord.worker_events import _assistant_text, is_stream_json, parse_event  # noqa: PLC0415
+
+    p = Path(log_path)
+    if not p.exists():
+        return None
+
+    if is_stream_json(p):
+        all_texts: list[str] = []
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    event = parse_event(line.rstrip("\n"))
+                    if event is None:
+                        continue
+                    if event.type == "assistant":
+                        text = _assistant_text(event)
+                        if text:
+                            all_texts.append(text)
+        except OSError:
+            return None
+        # Search from the end — the reviewer emits the verdict last.
+        for text in reversed(all_texts):
+            findings = _parse_review_text(text)
+            if findings is not None:
+                return findings
+        # Fallback: search the full concatenated text (handles multi-turn output).
+        return _parse_review_text("\n".join(all_texts))
+    else:
+        # Plain-text log (legacy workers or test fixtures).
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        return _parse_review_text(text)
+
+
 REVIEWER_SYSTEM_PROMPT = """\
 You are an independent code reviewer dispatched by the coordinator. \
 Your job is to find problems — do NOT rubber-stamp.
@@ -43,20 +122,31 @@ Your job is to find problems — do NOT rubber-stamp.
 Rules:
 - You have a fresh session. You have NO context from the worker who wrote \
 this code. Treat the diff as if you're reading it for the first time.
-- You ARE allowed to run `gh pr review` to post your final review (this is \
-the one gh command reviewers may use).
+- You are NOT allowed to run any `gh` commands. The coordinator posts the \
+review on your behalf after your session ends.
 - You ARE allowed to run the project's test suite and read project files.
 - You are NOT allowed to push commits or modify the PR's code. You only \
 review.
 
 How to review:
 1. Read the project's CLAUDE.md for project conventions.
-2. Read the PR diff (`gh pr diff <number>`).
+2. Read the PR diff using `git diff` or the briefing instructions.
 3. Run the test suite. Note any failures or regressions.
 4. Check the diff against the review checklist in your briefing.
 5. For each finding, cite the specific file:line and the rule it violates.
-6. Post your review using `gh pr review <number>` with --approve, \
---request-changes, or --comment.
+6. At the END of your session, output your verdict in this exact format:
+
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+<your full review text in markdown>
+END_REVIEW
+
+Or for requesting changes:
+
+REVIEW_VERDICT: request-changes
+REVIEW_BODY:
+<your full review text in markdown>
+END_REVIEW
 
 If the diff is clean and tests pass, approve — but be thorough first.\
 """
@@ -167,6 +257,7 @@ def build_review_briefing(
     same_as_worker: bool,
     reviews_cfg: ReviewsConfig,
     repo_claude_md: str | None,
+    default_branch: str = "main",
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test."""
 
@@ -230,21 +321,34 @@ def build_review_briefing(
     lines.append("## What to do")
     lines.append("")
     if pr_number is not None:
-        lines.append(f"1. Run `gh pr diff {pr_number} --repo {repo_github}` to see the changes.")
+        lines.append(
+            f"1. Get the diff: `git fetch origin && git diff origin/{default_branch}..."
+            f"origin/{branch or 'HEAD'}` or ask the coordinator for the diff."
+        )
         lines.append("2. Run the project's test suite.")
         lines.append("3. Review the diff against the checklist above.")
-        lines.append(
-            f"4. Post your review with `gh pr review {pr_number} --repo {repo_github}` "
-            "and one of `--approve`, `--request-changes`, or `--comment`. "
-            "Include findings inline in `--body`."
-        )
     else:
         lines.append(
             f"1. The worker pushed branch `{branch}` but no PR was opened. "
             "Inspect the diff with `git diff main..." + (branch or "<branch>") + "`."
         )
         lines.append("2. Run the project's test suite.")
-        lines.append("3. Report findings via `gh issue comment " + str(issue_number) + "`.")
+        lines.append("3. Review the diff against the checklist above.")
+    lines.append("")
+    lines.append(
+        "4. At the END of your session, output your findings in this exact format "
+        "(the coordinator will post the review to GitHub on your behalf — "
+        "do NOT run any `gh` commands):"
+    )
+    lines.append("")
+    lines.append("```")
+    lines.append("REVIEW_VERDICT: approve")
+    lines.append("REVIEW_BODY:")
+    lines.append("<your full review text in markdown>")
+    lines.append("END_REVIEW")
+    lines.append("```")
+    lines.append("")
+    lines.append("Use `REVIEW_VERDICT: request-changes` if changes are needed.")
 
     return "\n".join(lines)
 
@@ -361,6 +465,7 @@ def dispatch_review(
         same_as_worker=choice.same_as_worker,
         reviews_cfg=config.reviews,
         repo_claude_md=claude_md,
+        default_branch=repo.default_branch,
     )
 
     payload = {

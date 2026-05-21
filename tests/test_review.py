@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,8 +12,10 @@ from coord.config import Config, ReviewsConfig, load
 from coord.models import Assignment, Board, Machine, Repo
 from coord.review import (
     REVIEWER_SYSTEM_PROMPT,
+    ReviewFindings,
     build_review_briefing,
     dispatch_review,
+    parse_review_from_log,
     pick_reviewer_machine,
 )
 
@@ -246,7 +249,9 @@ def test_briefing_includes_claude_md_and_checklist() -> None:
     assert "Did tests get added?" in briefing
     assert "Any security issues?" in briefing
     assert "No SQL injection." in briefing
-    assert "gh pr review 42 --repo acme/api" in briefing
+    # Reviewer must output structured verdict; coordinator posts the PR review.
+    assert "REVIEW_VERDICT:" in briefing
+    assert "gh pr review" not in briefing
     # No same-machine warning when the reviewer is on a different machine.
     assert "running on the same machine as the worker" not in briefing
 
@@ -468,3 +473,215 @@ def test_dispatch_review_records_to_dispatched_ledger(
     assert records[0]["assignment_id"] == "review-ledger-1"
     assert records[0]["repo_github"] == "acme/api"
     assert records[0]["machine_name"] == "server"
+
+
+# ── Reviewer system prompt ──────────────────────────────────────────────────
+
+
+def test_reviewer_system_prompt_does_not_allow_gh_commands() -> None:
+    """Workers must not call gh — coordinator posts the review for them."""
+    assert "gh pr review" not in REVIEWER_SYSTEM_PROMPT
+    assert "NOT allowed to run any `gh` commands" in REVIEWER_SYSTEM_PROMPT
+
+
+def test_reviewer_system_prompt_instructs_structured_output() -> None:
+    assert "REVIEW_VERDICT:" in REVIEWER_SYSTEM_PROMPT
+    assert "REVIEW_BODY:" in REVIEWER_SYSTEM_PROMPT
+    assert "END_REVIEW" in REVIEWER_SYSTEM_PROMPT
+
+
+# ── Briefing: structured output instructions ────────────────────────────────
+
+
+def test_briefing_does_not_contain_gh_pr_review_command() -> None:
+    """The briefing must not tell the reviewer to call gh pr review."""
+    briefing = build_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Fix login",
+        issue_body="",
+        branch="issue-7-fix-login",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True),
+        repo_claude_md=None,
+    )
+    assert "gh pr review" not in briefing
+
+
+def test_briefing_contains_structured_output_instructions() -> None:
+    """The briefing must contain the REVIEW_VERDICT / REVIEW_BODY / END_REVIEW instructions."""
+    briefing = build_review_briefing(
+        pr_number=42,
+        pr_url=None,
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Fix login",
+        issue_body="",
+        branch="issue-7",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True),
+        repo_claude_md=None,
+    )
+    assert "REVIEW_VERDICT: approve" in briefing
+    assert "REVIEW_BODY:" in briefing
+    assert "END_REVIEW" in briefing
+    assert "do NOT run any `gh` commands" in briefing
+
+
+# ── parse_review_from_log ───────────────────────────────────────────────────
+
+
+def _write_plain_log(path: Path, content: str) -> Path:
+    """Write a plain-text log file."""
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _write_stream_json_log(path: Path, assistant_texts: list[str]) -> Path:
+    """Write a stream-json format log with assistant messages."""
+    lines = []
+    for text in assistant_texts:
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": text}]
+            }
+        }
+        lines.append(json.dumps(event))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+class TestParseReviewFromLog:
+    def test_plain_text_approve(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+I reviewed the diff carefully.
+
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+The implementation looks correct. Tests pass.
+No CLAUDE.md violations found.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "approve"
+        assert "Tests pass." in result.body
+
+    def test_plain_text_request_changes(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: request-changes
+REVIEW_BODY:
+## Issues found
+
+- `src/auth.py:42` — missing input validation
+- Tests do not cover the error path
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "missing input validation" in result.body
+
+    def test_plain_text_last_block_wins(self, tmp_path: Path) -> None:
+        """When multiple blocks exist, the last one is used."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+First pass — looks OK.
+END_REVIEW
+
+Actually I missed something...
+
+REVIEW_VERDICT: request-changes
+REVIEW_BODY:
+Found a critical bug at line 42.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "critical bug" in result.body
+
+    def test_stream_json_approve(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_stream_json_log(log, [
+            "I'm reading the diff now...",
+            "The tests look good.\n\nREVIEW_VERDICT: approve\nREVIEW_BODY:\nLGTM — clean diff, tests pass.\nEND_REVIEW",
+        ])
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "approve"
+        assert "LGTM" in result.body
+
+    def test_stream_json_request_changes(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_stream_json_log(log, [
+            "Let me check the diff...",
+            "REVIEW_VERDICT: request-changes\nREVIEW_BODY:\nSecurity issue at auth.py:10.\nEND_REVIEW",
+        ])
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "Security issue" in result.body
+
+    def test_stream_json_last_assistant_message_wins(self, tmp_path: Path) -> None:
+        """The last assistant message containing the block is used."""
+        log = tmp_path / "review.log"
+        _write_stream_json_log(log, [
+            "REVIEW_VERDICT: approve\nREVIEW_BODY:\nInitially approved.\nEND_REVIEW",
+            "Wait, I found a bug.\nREVIEW_VERDICT: request-changes\nREVIEW_BODY:\nBug at line 7.\nEND_REVIEW",
+        ])
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "Bug at line 7" in result.body
+
+    def test_not_found_returns_none(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_plain_log(log, "I reviewed the diff. It looks fine.\n")
+        result = parse_review_from_log(log)
+        assert result is None
+
+    def test_missing_file_returns_none(self, tmp_path: Path) -> None:
+        result = parse_review_from_log(tmp_path / "nonexistent.log")
+        assert result is None
+
+    def test_stream_json_no_review_block_returns_none(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_stream_json_log(log, [
+            "I read the diff.",
+            "The code looks okay but I forgot to output my verdict.",
+        ])
+        result = parse_review_from_log(log)
+        assert result is None
+
+    def test_case_insensitive_verdict(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: Approve
+REVIEW_BODY:
+Looks good to me.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "approve"  # normalised to lowercase
+
+    def test_multiline_body_preserved(self, tmp_path: Path) -> None:
+        log = tmp_path / "review.log"
+        body_text = "## Summary\n\nLine 1.\nLine 2.\n\n### Details\n\n- Point A\n- Point B"
+        _write_plain_log(log, f"REVIEW_VERDICT: request-changes\nREVIEW_BODY:\n{body_text}\nEND_REVIEW\n")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert "Line 1." in result.body
+        assert "Point B" in result.body
