@@ -437,6 +437,10 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
 
     Returns (posted_transitions, posted_stuck).
     """
+    # Collect (transition, record, entry) tuples for review completions so we
+    # can feed them to the auto-loop after all notifications are posted.
+    review_completions: list[tuple[Transition, dict, dict]] = []
+
     posted: list[Transition] = []
     for transition, record, entry in detect_transitions(config):
         try:
@@ -444,6 +448,13 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
         except Exception:  # noqa: BLE001 — surface to caller; continue with rest
             continue
         posted.append(transition)
+        # Track completed reviews for auto-loop processing below.
+        from coord.comments import EVENT_COMPLETION  # noqa: PLC0415
+        if (
+            record.get("type") == "review"
+            and transition.event == EVENT_COMPLETION
+        ):
+            review_completions.append((transition, record, entry))
 
     # Also detect and post stuck signals
     stuck_posted: list[StuckDetection] = []
@@ -459,5 +470,29 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
         _dispatch_board_pending_reviews(config)
     except Exception:  # noqa: BLE001
         pass
+
+    # Auto-loop: for each completed review, optionally dispatch a fix worker.
+    # Runs after notify posts the completion comment so GitHub has the full
+    # review body before any fix briefing references "previous findings".
+    if review_completions:
+        try:
+            from coord.auto_loop import run_for_review_transition  # noqa: PLC0415
+            for transition, record, entry in review_completions:
+                try:
+                    actions = run_for_review_transition(
+                        transition.assignment_id, record, entry, config
+                    )
+                    for action in actions:
+                        log.info(
+                            "auto_loop %s: %s (assignment=%s)",
+                            action.kind, action.detail, action.assignment_id,
+                        )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "auto_loop: error processing review %s",
+                        transition.assignment_id,
+                    )
+        except Exception:  # noqa: BLE001
+            log.exception("auto_loop: unexpected error in review completion loop")
 
     return posted, stuck_posted
