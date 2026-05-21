@@ -27,9 +27,10 @@
 //! - `~/.coord/coord.db` — SQLite database (WAL mode) written by the coordinator
 //!
 //! **Auto-refresh:** every 5 s, triggered at the start of the next
-//! [`AppLogic::handle`] call after the deadline. For TUI this fires on
-//! the first keystroke or mouse event after the 5 s window; for GTK the
-//! 33 ms idle drain keeps it near the deadline.
+//! [`AppLogic::handle`] call after the deadline. The TUI runner in
+//! `main.rs` injects a synthetic `UiEvent::WindowFocused` on every idle
+//! poll (16 ms) so the timer fires near the deadline even with no user
+//! input; for GTK the 33 ms idle drain keeps it near the deadline.
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
