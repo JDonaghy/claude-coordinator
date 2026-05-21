@@ -65,6 +65,7 @@ enum SidebarView {
     #[default]
     Board,
     Machines,
+    Pipeline,
 }
 
 impl SidebarView {
@@ -72,6 +73,7 @@ impl SidebarView {
         match self {
             SidebarView::Board => "Board",
             SidebarView::Machines => "Machines",
+            SidebarView::Pipeline => "Pipeline",
         }
     }
 
@@ -79,6 +81,7 @@ impl SidebarView {
         match self {
             SidebarView::Board => 0,
             SidebarView::Machines => 1,
+            SidebarView::Pipeline => 2,
         }
     }
 
@@ -86,7 +89,8 @@ impl SidebarView {
     fn next(self) -> Self {
         match self {
             SidebarView::Board => SidebarView::Machines,
-            SidebarView::Machines => SidebarView::Board,
+            SidebarView::Machines => SidebarView::Pipeline,
+            SidebarView::Pipeline => SidebarView::Board,
         }
     }
 }
@@ -149,11 +153,22 @@ struct Machine {
     active_count: usize,
 }
 
+#[derive(Clone)]
+#[allow(dead_code)] // assignment_id and pr_url stored for future display
+struct MergeQueueEntry {
+    assignment_id: String,
+    issue_number: Option<u64>,
+    state: String,
+    pr_number: Option<i64>,
+    pr_url: Option<String>,
+}
+
 #[derive(Default)]
 struct BoardData {
     local_machine: String,
     assignments: Vec<Assignment>,
     machines: Vec<Machine>,
+    merge_queue: Vec<MergeQueueEntry>,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -465,6 +480,102 @@ fn load_activity_log(id: &str) -> Vec<ListItem> {
     items
 }
 
+// ─── Pipeline stage rendering ─────────────────────────────────────────────────
+
+/// Build a `ListItem` for one pipeline stage (plan/work/review/smoke).
+///
+/// `assignment` is the best-matching assignment for the stage, or `None`
+/// when the stage hasn't started yet.
+fn pipeline_stage_item(name: &str, assignment: Option<&Assignment>) -> ListItem {
+    let (indicator, color, detail_str) = match assignment {
+        None => (
+            "  -",
+            Color::rgb(100, 100, 100),
+            "pending".to_string(),
+        ),
+        Some(a) => match a.status.as_str() {
+            "running" => (
+                "  ~",
+                Color::rgb(80, 220, 80),
+                format!("{}  {}", trunc(&a.id, 8), a.age_str()),
+            ),
+            "done" => (
+                "  ✓",
+                Color::rgb(120, 200, 120),
+                format!("{}  {}", trunc(&a.id, 8), a.age_str()),
+            ),
+            "failed" => (
+                "  ✗",
+                Color::rgb(220, 70, 70),
+                format!("{}  {}", trunc(&a.id, 8), a.age_str()),
+            ),
+            _ => (
+                "  ?",
+                Color::rgb(200, 200, 70),
+                format!("{}  {}", trunc(&a.id, 8), a.age_str()),
+            ),
+        },
+    };
+    ListItem {
+        text: StyledText {
+            spans: vec![
+                StyledSpan::with_fg(indicator, color),
+                StyledSpan::with_fg(
+                    format!(" {:8}", name),
+                    Color::rgb(180, 180, 200),
+                ),
+                StyledSpan::with_fg(format!("  {}", detail_str), color),
+            ],
+        },
+        icon: None,
+        detail: None,
+        decoration: if assignment.map(|a| a.status.as_str()) == Some("failed") {
+            Decoration::Error
+        } else {
+            Decoration::Normal
+        },
+    }
+}
+
+/// Build a `ListItem` for the PR/Merge stage, sourced from `merge_queue`.
+fn pipeline_merge_item(entry: Option<&MergeQueueEntry>) -> ListItem {
+    let (indicator, color, detail_str) = match entry {
+        None => (
+            "  -",
+            Color::rgb(100, 100, 100),
+            "pending".to_string(),
+        ),
+        Some(e) => {
+            let pr_label = match e.pr_number {
+                Some(n) => format!("PR #{}", n),
+                None => e.state.clone(),
+            };
+            match e.state.as_str() {
+                "merged" => ("  ✓", Color::rgb(120, 200, 120), pr_label),
+                "open" | "queued" => ("  ~", Color::rgb(80, 220, 80), pr_label),
+                "failed" => ("  ✗", Color::rgb(220, 70, 70), pr_label),
+                _ => ("  -", Color::rgb(100, 100, 100), pr_label),
+            }
+        }
+    };
+    ListItem {
+        text: StyledText {
+            spans: vec![
+                StyledSpan::with_fg(indicator, color),
+                StyledSpan::with_fg(" PR/Merge".to_string(), Color::rgb(180, 180, 200)),
+                StyledSpan::with_fg(format!("  {}", detail_str), color),
+            ],
+        },
+        icon: None,
+        detail: None,
+        decoration: if entry.map(|e| e.state.as_str()) == Some("failed") {
+            Decoration::Error
+        } else {
+            Decoration::Normal
+        },
+    }
+}
+
 // ─── Data loading ─────────────────────────────────────────────────────────────
 
 fn home_dir() -> PathBuf {
@@ -625,10 +736,54 @@ fn load_data() -> BoardData {
         .map(|(name, _)| name.clone())
         .unwrap_or_default();
 
+    // ── Query merge_queue ──────────────────────────────────────────────────
+    // Join to assignments to resolve issue_number (merge_queue may not have it).
+    let merge_queue: Vec<MergeQueueEntry> = {
+        let mut stmt = match conn.prepare(
+            "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url \
+             FROM merge_queue mq \
+             LEFT JOIN assignments a ON mq.assignment_id = a.assignment_id",
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                // merge_queue table may not exist yet — return what we have.
+                return BoardData {
+                    local_machine,
+                    assignments,
+                    machines,
+                    merge_queue: Vec::new(),
+                };
+            }
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok(MergeQueueEntry {
+                assignment_id: row.get::<_, String>(0)?,
+                issue_number: row
+                    .get::<_, Option<i64>>(1)?
+                    .map(|n| n as u64),
+                state: row.get::<_, String>(2)?,
+                pr_number: row.get::<_, Option<i64>>(3)?,
+                pr_url: row.get::<_, Option<String>>(4)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => {
+                return BoardData {
+                    local_machine,
+                    assignments,
+                    machines,
+                    merge_queue: Vec::new(),
+                };
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
     BoardData {
         local_machine,
         assignments,
         machines,
+        merge_queue,
     }
 }
 
@@ -655,6 +810,10 @@ pub struct CoordApp {
     refreshed_at: Instant,
     /// Which tab is active in the Board detail panel.
     detail_tab: DetailTab,
+    /// Selected issue index in the Pipeline view.
+    pipeline_sel: usize,
+    /// Scroll offset for the Pipeline issue list.
+    pipeline_scroll: usize,
 }
 
 impl Default for CoordApp {
@@ -676,6 +835,8 @@ impl CoordApp {
             machine_scroll: 0,
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
+            pipeline_sel: 0,
+            pipeline_scroll: 0,
         };
         app.rebuild_board_tree_rows();
         app
@@ -689,6 +850,12 @@ impl CoordApp {
             self.machine_sel = self.machine_sel.min(m - 1);
         } else {
             self.machine_sel = 0;
+        }
+        let p = self.pipeline_issues().len();
+        if p > 0 {
+            self.pipeline_sel = self.pipeline_sel.min(p - 1);
+        } else {
+            self.pipeline_sel = 0;
         }
         self.rebuild_board_tree_rows();
     }
@@ -870,6 +1037,7 @@ impl CoordApp {
         const VIEWS: &[(&str, SidebarView)] = &[
             ("Board", SidebarView::Board),
             ("Machines", SidebarView::Machines),
+            ("Pipeline", SidebarView::Pipeline),
         ];
 
         let items: Vec<ListItem> = VIEWS
@@ -1230,6 +1398,207 @@ impl CoordApp {
         }
     }
 
+    /// Clamp `pipeline_scroll` so that `pipeline_sel` is inside the visible window.
+    fn fix_pipeline_scroll(&mut self, visible: usize) {
+        if visible == 0 {
+            return;
+        }
+        if self.pipeline_sel < self.pipeline_scroll {
+            self.pipeline_scroll = self.pipeline_sel;
+        } else if self.pipeline_sel >= self.pipeline_scroll + visible {
+            self.pipeline_scroll = self.pipeline_sel + 1 - visible;
+        }
+    }
+
+    /// Return the unique issues present in assignments, ordered by most-recent
+    /// dispatched_at descending. Each entry is `(issue_number, repo, title)`.
+    fn pipeline_issues(&self) -> Vec<(u64, String, String)> {
+        use std::collections::HashMap;
+        // Map issue_number → (repo, title, max_dispatched_at)
+        let mut map: HashMap<u64, (String, String, f64)> = HashMap::new();
+        for a in &self.data.assignments {
+            let ts = a.dispatched_at.unwrap_or(0.0);
+            let entry = map
+                .entry(a.issue_number)
+                .or_insert_with(|| (a.repo.clone(), a.issue_title.clone(), ts));
+            if ts > entry.2 {
+                entry.2 = ts;
+            }
+        }
+        let mut result: Vec<(u64, String, String, f64)> = map
+            .into_iter()
+            .map(|(n, (r, t, ts))| (n, r, t, ts))
+            .collect();
+        result.sort_by(|a, b| {
+            b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        result.into_iter().map(|(n, r, t, _)| (n, r, t)).collect()
+    }
+
+    /// Left panel for the Pipeline view: list of unique issues.
+    fn pipeline_issue_list(&self) -> ListView {
+        let issues = self.pipeline_issues();
+        let n = issues.len();
+
+        let items: Vec<ListItem> = issues
+            .iter()
+            .map(|(issue_num, repo, title)| {
+                // Collect all assignments for this issue to show aggregate status.
+                let issue_assignments: Vec<&Assignment> = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.issue_number == *issue_num)
+                    .collect();
+                let (sc, bullet) = if issue_assignments
+                    .iter()
+                    .any(|a| a.status == "running")
+                {
+                    (Color::rgb(80, 220, 80), "~ ")
+                } else if issue_assignments.iter().any(|a| a.status == "failed") {
+                    (Color::rgb(220, 70, 70), "✗ ")
+                } else if issue_assignments.iter().all(|a| a.status == "done") {
+                    (Color::rgb(120, 180, 120), "✓ ")
+                } else {
+                    (Color::rgb(140, 140, 160), "- ")
+                };
+                let text = StyledText {
+                    spans: vec![
+                        StyledSpan::with_fg(bullet, sc),
+                        StyledSpan::with_fg(
+                            format!("#{} ", issue_num),
+                            Color::rgb(150, 150, 240),
+                        ),
+                        StyledSpan::plain(trunc(title, 22)),
+                    ],
+                };
+                let detail = Some(StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        trunc(repo, 14),
+                        Color::rgb(100, 130, 170),
+                    )],
+                });
+                ListItem {
+                    text,
+                    icon: None,
+                    detail,
+                    decoration: Decoration::Normal,
+                }
+            })
+            .collect();
+
+        ListView {
+            id: WidgetId::new("pipeline"),
+            title: Some(StyledText::plain(format!(" PIPELINE ({}) ", n))),
+            items,
+            selected_idx: if n > 0 { self.pipeline_sel } else { 0 },
+            scroll_offset: self.pipeline_scroll,
+            has_focus: true,
+            bordered: false,
+        }
+    }
+
+    /// Right panel for the Pipeline view: per-stage breakdown for the
+    /// selected issue.
+    fn pipeline_detail_list(&self) -> ListView {
+        let issues = self.pipeline_issues();
+
+        let mut items: Vec<ListItem> = Vec::new();
+
+        match issues.get(self.pipeline_sel) {
+            None => {
+                items.push(kv_item("", " No issue selected", None));
+            }
+            Some((issue_number, repo, title)) => {
+                // Section header
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            format!(" {} #{} ", repo, issue_number),
+                            Color::rgb(210, 220, 255),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+                items.push(kv_item(
+                    "",
+                    &format!("  {}", trunc(title, 52)),
+                    None,
+                ));
+                items.push(kv_item("", "", None)); // blank spacer
+
+                // Sub-header
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            " STAGES ",
+                            Color::rgb(130, 130, 150),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+
+                // All assignments for this issue (assignments sorted most-recent first).
+                let issue_assignments: Vec<&Assignment> = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.issue_number == *issue_number)
+                    .collect();
+
+                // Stage definitions: (display name, type filter fn)
+                // We render them in pipeline order even if some are absent.
+                let stage_filters: &[(&str, fn(&Assignment) -> bool)] = &[
+                    ("Plan", |a| {
+                        a.assignment_type.as_deref() == Some("plan")
+                    }),
+                    ("Work", |a| {
+                        a.assignment_type.as_deref() == Some("work")
+                            || a.assignment_type.is_none()
+                    }),
+                    ("Review", |a| {
+                        a.assignment_type.as_deref() == Some("review")
+                    }),
+                    ("Smoke", |a| {
+                        a.assignment_type.as_deref() == Some("smoke")
+                    }),
+                ];
+
+                for (stage_name, filter) in stage_filters {
+                    let assignment = issue_assignments.iter().find(|a| filter(a));
+                    items.push(pipeline_stage_item(stage_name, assignment.copied()));
+                }
+
+                // PR/Merge stage from merge_queue
+                let mq_entry = self
+                    .data
+                    .merge_queue
+                    .iter()
+                    .find(|e| e.issue_number == Some(*issue_number));
+                items.push(pipeline_merge_item(mq_entry));
+            }
+        }
+
+        let title = match issues.get(self.pipeline_sel) {
+            Some((n, r, _)) => format!(" PIPELINE — {} #{} ", r, n),
+            None => " PIPELINE ".to_string(),
+        };
+
+        ListView {
+            id: WidgetId::new("pipeline-detail"),
+            title: Some(StyledText::plain(&title)),
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
     fn status_bar(&self) -> StatusBar {
         let since = self.refreshed_at.elapsed().as_secs();
         let view_label = self.active_view.label();
@@ -1259,7 +1628,7 @@ impl CoordApp {
                 },
             ],
             right_segments: vec![StatusBarSegment {
-                text: " 1=Board  2=Machines  Tab=switch  j/k=nav  h/l=tabs  Enter/Space=expand  r=refresh  q=quit ".to_string(),
+                text: " 1=Board  2=Machines  3=Pipeline  Tab=switch  j/k=nav  h/l=tabs  Enter/Space=expand  r=refresh  q=quit ".to_string(),
                 fg: Color::rgb(140, 140, 140),
                 bg: Color::rgb(30, 30, 40),
                 bold: false,
@@ -1331,6 +1700,10 @@ impl AppLogic for CoordApp {
                 backend.draw_list(inner.first_bounds, &self.machines_list(true));
                 backend.draw_list(inner.second_bounds, &self.machine_detail_list());
             }
+            SidebarView::Pipeline => {
+                backend.draw_list(inner.first_bounds, &self.pipeline_issue_list());
+                backend.draw_list(inner.second_bounds, &self.pipeline_detail_list());
+            }
         }
 
         // Status bar
@@ -1368,6 +1741,10 @@ impl AppLogic for CoordApp {
                         self.active_view = SidebarView::Machines;
                         needs_redraw = true;
                     }
+                    Key::Char('3') => {
+                        self.active_view = SidebarView::Pipeline;
+                        needs_redraw = true;
+                    }
 
                     // ── Down / j ─────────────────────────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down) => {
@@ -1382,6 +1759,13 @@ impl AppLogic for CoordApp {
                                     self.machine_sel += 1;
                                 }
                                 self.fix_machine_scroll(content_visible_rows(backend));
+                            }
+                            SidebarView::Pipeline => {
+                                let p = self.pipeline_issues().len();
+                                if p > 0 && self.pipeline_sel + 1 < p {
+                                    self.pipeline_sel += 1;
+                                }
+                                self.fix_pipeline_scroll(content_visible_rows(backend));
                             }
                         }
                         needs_redraw = true;
@@ -1400,6 +1784,12 @@ impl AppLogic for CoordApp {
                                 }
                                 self.fix_machine_scroll(content_visible_rows(backend));
                             }
+                            SidebarView::Pipeline => {
+                                if self.pipeline_sel > 0 {
+                                    self.pipeline_sel -= 1;
+                                }
+                                self.fix_pipeline_scroll(content_visible_rows(backend));
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -1414,6 +1804,10 @@ impl AppLogic for CoordApp {
                             SidebarView::Machines => {
                                 self.machine_sel = 0;
                                 self.fix_machine_scroll(content_visible_rows(backend));
+                            }
+                            SidebarView::Pipeline => {
+                                self.pipeline_sel = 0;
+                                self.fix_pipeline_scroll(content_visible_rows(backend));
                             }
                         }
                         needs_redraw = true;
@@ -1432,6 +1826,13 @@ impl AppLogic for CoordApp {
                                     self.machine_sel = m - 1;
                                 }
                                 self.fix_machine_scroll(content_visible_rows(backend));
+                            }
+                            SidebarView::Pipeline => {
+                                let p = self.pipeline_issues().len();
+                                if p > 0 {
+                                    self.pipeline_sel = p - 1;
+                                }
+                                self.fix_pipeline_scroll(content_visible_rows(backend));
                             }
                         }
                         needs_redraw = true;
@@ -1611,6 +2012,8 @@ mod tests {
             machine_scroll: 0,
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
+            pipeline_sel: 0,
+            pipeline_scroll: 0,
         }
     }
 
@@ -1627,6 +2030,8 @@ mod tests {
             machine_scroll: 0,
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
+            pipeline_sel: 0,
+            pipeline_scroll: 0,
         };
         app.rebuild_board_tree_rows();
         app
@@ -1779,6 +2184,8 @@ mod tests {
             machine_scroll,
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
+            pipeline_sel: 0,
+            pipeline_scroll: 0,
         }
     }
 
@@ -1808,24 +2215,80 @@ mod tests {
     #[test]
     fn sidebar_view_next_cycles() {
         assert_eq!(SidebarView::Board.next(), SidebarView::Machines);
-        assert_eq!(SidebarView::Machines.next(), SidebarView::Board);
+        assert_eq!(SidebarView::Machines.next(), SidebarView::Pipeline);
+        assert_eq!(SidebarView::Pipeline.next(), SidebarView::Board);
     }
 
     #[test]
     fn sidebar_view_index() {
         assert_eq!(SidebarView::Board.index(), 0);
         assert_eq!(SidebarView::Machines.index(), 1);
+        assert_eq!(SidebarView::Pipeline.index(), 2);
     }
 
     #[test]
     fn sidebar_view_label() {
         assert_eq!(SidebarView::Board.label(), "Board");
         assert_eq!(SidebarView::Machines.label(), "Machines");
+        assert_eq!(SidebarView::Pipeline.label(), "Pipeline");
     }
 
     #[test]
     fn sidebar_view_default_is_board() {
         assert_eq!(SidebarView::default(), SidebarView::Board);
+    }
+
+    // ── Pipeline ─────────────────────────────────────────────────────────────
+
+    fn make_assignment_typed(status: &str, issue: u64, repo: &str, atype: Option<&str>) -> Assignment {
+        Assignment {
+            id: format!("id-{}-{}", issue, status),
+            repo: repo.to_string(),
+            issue_number: issue,
+            issue_title: format!("Issue {}", issue),
+            machine: "testmachine".to_string(),
+            status: status.to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1_000_000.0 + issue as f64),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: atype.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn pipeline_issues_deduplicates_by_issue_number() {
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 10, "repo-a", Some("plan")),
+            make_assignment_typed("done", 20, "repo-b", Some("work")),
+        ];
+        let app = make_app_with_assignments(assignments);
+        let issues = app.pipeline_issues();
+        assert_eq!(issues.len(), 2);
+        let nums: Vec<u64> = issues.iter().map(|(n, _, _)| *n).collect();
+        assert!(nums.contains(&10));
+        assert!(nums.contains(&20));
+    }
+
+    #[test]
+    fn pipeline_issues_orders_by_most_recent_dispatched_at() {
+        let mut a_old = make_assignment_typed("done", 5, "repo", Some("work"));
+        a_old.dispatched_at = Some(1_000.0);
+        let mut a_new = make_assignment_typed("done", 7, "repo", Some("work"));
+        a_new.dispatched_at = Some(9_000.0);
+        let app = make_app_with_assignments(vec![a_old, a_new]);
+        let issues = app.pipeline_issues();
+        // Issue 7 (newer) should come first.
+        assert_eq!(issues[0].0, 7);
+        assert_eq!(issues[1].0, 5);
+    }
+
+    #[test]
+    fn pipeline_issues_empty_when_no_assignments() {
+        let app = make_app_default();
+        assert!(app.pipeline_issues().is_empty());
     }
 
     // ── Assignment::status_label ───────────────────────────────────────────────
