@@ -14,3 +14,4 @@ quadraui = { path = "../../quadraui/quadraui", features = ["tui"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # ratatui re-exports crossterm; we use ratatui::crossterm::* for terminal setup
 ratatui = "0.29"
+gethostname = "1.1"

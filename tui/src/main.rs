@@ -60,7 +60,7 @@ struct Assignment {
     status: String,
     branch: Option<String>,
     model: Option<String>,
-    started_at: Option<f64>,
+    dispatched_at: Option<f64>,
     finished_at: Option<f64>,
     exit_code: Option<i32>,
     assignment_type: Option<String>,
@@ -86,7 +86,7 @@ impl Assignment {
     }
 
     fn age_str(&self) -> String {
-        match self.started_at {
+        match self.dispatched_at {
             None => "-".to_string(),
             Some(ts) => {
                 let now = SystemTime::now()
@@ -223,7 +223,7 @@ fn load_data() -> BoardData {
                 branch: row.get::<_, Option<String>>(6)?,
                 model: row.get::<_, Option<String>>(7)?,
                 assignment_type: row.get::<_, Option<String>>(8)?,
-                started_at: row.get::<_, Option<f64>>(9)?,
+                dispatched_at: row.get::<_, Option<f64>>(9)?,
                 finished_at: row.get::<_, Option<f64>>(10)?,
                 exit_code: row.get::<_, Option<i32>>(11)?,
             })
@@ -243,8 +243,8 @@ fn load_data() -> BoardData {
             _ => 3,
         };
         rank(&a.status).cmp(&rank(&b.status)).then_with(|| {
-            b.started_at
-                .partial_cmp(&a.started_at)
+            b.dispatched_at
+                .partial_cmp(&a.dispatched_at)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
     });
@@ -306,8 +306,19 @@ fn load_data() -> BoardData {
         })
         .collect();
 
+    // ── Determine which machine is local ──────────────────────────────────
+    // Match the OS hostname against the `host` column in the machines table.
+    let local_hostname = gethostname::gethostname()
+        .into_string()
+        .unwrap_or_default();
+    let local_machine = machine_rows
+        .iter()
+        .find(|(_, host)| *host == local_hostname)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default();
+
     BoardData {
-        local_machine: String::new(),
+        local_machine,
         assignments,
         machines,
     }
@@ -528,7 +539,7 @@ impl Dashboard {
                     items.push(kv_item("Exit code", &s, c));
                 }
 
-                if let (Some(start), Some(end)) = (a.started_at, a.finished_at) {
+                if let (Some(start), Some(end)) = (a.dispatched_at, a.finished_at) {
                     let dur = (end - start).max(0.0) as u64;
                     items.push(kv_item("Duration", &fmt_dur(dur), None));
                 }
@@ -896,7 +907,7 @@ mod tests {
             status: status.to_string(),
             branch: None,
             model: None,
-            started_at: None,
+            dispatched_at: None,
             finished_at: None,
             exit_code: None,
             assignment_type: None,
