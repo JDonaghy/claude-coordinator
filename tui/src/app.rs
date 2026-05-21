@@ -8,19 +8,17 @@
 //! ## Layout
 //!
 //! ```text
-//! ┌──────────────────────────┬─────────────────────────────────────────┐
-//! │ BOARD (12 assignments)   │ DETAIL — claude-coordinator #115        │
-//! │ #115  claude-coord  RUN  │                                         │
-//! │ #110  claude-coord  DONE │  TUI dashboard Phase 1: static bo…      │
-//! │ #67   claude-coord  DONE │                                         │
-//! │ #931  vimcode       FAIL │  ID           6b2670e37e1b              │
-//! │                          │  Machine      dellserver                │
-//! ├──────────────────────────│  Status       RUN                       │
-//! │ MACHINES (1)             │  Model        sonnet                    │
-//! │ ● dellserver (local)  1  │  Branch       (none yet)               │
-//! │ ○ elitebook         idle │  Age          14m                       │
-//! └──────────────────────────┴─────────────────────────────────────────┘
-//! │ coord-tui  ↻ 3s           j/k=nav  r=refresh  q=quit             │
+//! ┌────────────┬────────────────────────────┬──────────────────────────┐
+//! │ VIEWS      │ BOARD (Board view)          │ DETAIL                  │
+//! │ ▶ Board    │ #115  claude-coord  RUN     │ claude-coordinator #115  │
+//! │   Machines │ #110  claude-coord  DONE    │  ID     6b2670e…        │
+//! │            │ …                           │  Machine dellserver      │
+//! ├────────────┼────────────────────────────┼──────────────────────────┤
+//! │            │ MACHINES (Machines view)    │ DETAIL — dellserver     │
+//! │   Board    │ ● dellserver (local)  1     │  Status  reachable      │
+//! │ ▶ Machines │ ○ elitebook         idle    │  JOB HISTORY            │
+//! └────────────┴────────────────────────────┴──────────────────────────┘
+//! │ coord-tui  Board  ↻ 3s   1=Board  2=Machines  Tab=switch  j/k=nav │
 //! ```
 //!
 //! **Data sources:**
@@ -44,6 +42,40 @@ use quadraui::{
 
 /// Reload board data every 5 seconds.
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
+
+// ─── Sidebar views ────────────────────────────────────────────────────────────
+
+/// The selectable top-level views shown in the left sidebar.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum SidebarView {
+    #[default]
+    Board,
+    Machines,
+}
+
+impl SidebarView {
+    fn label(self) -> &'static str {
+        match self {
+            SidebarView::Board => "Board",
+            SidebarView::Machines => "Machines",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            SidebarView::Board => 0,
+            SidebarView::Machines => 1,
+        }
+    }
+
+    /// Cycle to the next view (wraps around).
+    fn next(self) -> Self {
+        match self {
+            SidebarView::Board => SidebarView::Machines,
+            SidebarView::Machines => SidebarView::Board,
+        }
+    }
+}
 
 // ─── App data model ───────────────────────────────────────────────────────────
 
@@ -330,8 +362,16 @@ fn load_data() -> BoardData {
 /// mutations. No ratatui or GTK types appear here.
 pub struct CoordApp {
     data: BoardData,
+    /// Which top-level view is currently shown in the content area.
+    active_view: SidebarView,
+    /// Selected assignment index in the Board view.
     board_sel: usize,
+    /// Scroll offset for the board list.
     board_scroll: usize,
+    /// Selected machine index in the Machines view.
+    machine_sel: usize,
+    /// Scroll offset for the machines list.
+    machine_scroll: usize,
     refreshed_at: Instant,
 }
 
@@ -347,8 +387,11 @@ impl CoordApp {
         let data = load_data();
         Self {
             data,
+            active_view: SidebarView::default(),
             board_sel: 0,
             board_scroll: 0,
+            machine_sel: 0,
+            machine_scroll: 0,
             refreshed_at: Instant::now(),
         }
     }
@@ -361,6 +404,12 @@ impl CoordApp {
             self.board_sel = self.board_sel.min(n - 1);
         } else {
             self.board_sel = 0;
+        }
+        let m = self.data.machines.len();
+        if m > 0 {
+            self.machine_sel = self.machine_sel.min(m - 1);
+        } else {
+            self.machine_sel = 0;
         }
     }
 
@@ -380,7 +429,66 @@ impl CoordApp {
         }
     }
 
+    /// Clamp `machine_scroll` so that `machine_sel` is inside the visible window.
+    fn fix_machine_scroll(&mut self, visible: usize) {
+        if visible == 0 {
+            return;
+        }
+        if self.machine_sel < self.machine_scroll {
+            self.machine_scroll = self.machine_sel;
+        } else if self.machine_sel >= self.machine_scroll + visible {
+            self.machine_scroll = self.machine_sel + 1 - visible;
+        }
+    }
+
     // ── ListView builders ────────────────────────────────────────────────
+
+    /// Left sidebar listing selectable views.
+    fn sidebar_list(&self) -> ListView {
+        const VIEWS: &[(&str, SidebarView)] = &[
+            ("Board", SidebarView::Board),
+            ("Machines", SidebarView::Machines),
+        ];
+
+        let items: Vec<ListItem> = VIEWS
+            .iter()
+            .map(|(label, view)| {
+                let is_active = *view == self.active_view;
+                let text = StyledText {
+                    spans: vec![
+                        StyledSpan::with_fg(
+                            if is_active { "▶ " } else { "  " },
+                            Color::rgb(100, 160, 220),
+                        ),
+                        StyledSpan::with_fg(
+                            *label,
+                            if is_active {
+                                Color::rgb(255, 255, 255)
+                            } else {
+                                Color::rgb(160, 160, 170)
+                            },
+                        ),
+                    ],
+                };
+                ListItem {
+                    text,
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Normal,
+                }
+            })
+            .collect();
+
+        ListView {
+            id: WidgetId::new("sidebar"),
+            title: Some(StyledText::plain(" VIEWS ")),
+            items,
+            selected_idx: self.active_view.index(),
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+        }
+    }
 
     fn board_list(&self, has_focus: bool) -> ListView {
         let items: Vec<ListItem> = self
@@ -433,7 +541,7 @@ impl CoordApp {
         }
     }
 
-    fn machines_list(&self) -> ListView {
+    fn machines_list(&self, has_focus: bool) -> ListView {
         let items: Vec<ListItem> = self
             .data
             .machines
@@ -481,9 +589,9 @@ impl CoordApp {
             id: WidgetId::new("machines"),
             title: Some(StyledText::plain(format!(" MACHINES ({}) ", n))),
             items,
-            selected_idx: 0,
-            scroll_offset: 0,
-            has_focus: false,
+            selected_idx: if n > 0 { self.machine_sel } else { 0 },
+            scroll_offset: self.machine_scroll,
+            has_focus,
             bordered: false,
         }
     }
@@ -571,8 +679,132 @@ impl CoordApp {
         }
     }
 
+    /// Detail panel for the selected machine: status + job history.
+    fn machine_detail_list(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+
+        match self.data.machines.get(self.machine_sel) {
+            None => {
+                items.push(kv_item("", " No machine selected", None));
+            }
+            Some(m) => {
+                // Section header
+                let header_text = format!(" {} ", m.name);
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(&header_text, Color::rgb(210, 220, 255))],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+
+                items.push(kv_item("", "", None)); // blank
+
+                let (reach_str, reach_col) = if m.reachable {
+                    ("reachable", Color::rgb(80, 210, 80))
+                } else {
+                    ("unreachable", Color::rgb(220, 70, 70))
+                };
+                items.push(kv_item("Status", reach_str, Some(reach_col)));
+
+                let is_local = m.name == self.data.local_machine;
+                if is_local {
+                    items.push(kv_item(
+                        "Location",
+                        "local",
+                        Some(Color::rgb(100, 180, 240)),
+                    ));
+                }
+
+                let (active_str, active_col) = if m.active_count > 0 {
+                    (
+                        format!("{} running", m.active_count),
+                        Color::rgb(80, 210, 80),
+                    )
+                } else {
+                    ("idle".to_string(), Color::rgb(90, 90, 90))
+                };
+                items.push(kv_item("Jobs", &active_str, Some(active_col)));
+
+                items.push(kv_item("", "", None)); // blank
+
+                // Job history sub-header
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            " JOB HISTORY ",
+                            Color::rgb(130, 130, 150),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+
+                let machine_jobs: Vec<&Assignment> = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.machine == m.name)
+                    .take(20)
+                    .collect();
+
+                if machine_jobs.is_empty() {
+                    items.push(kv_item("", "  No jobs found", None));
+                } else {
+                    for a in machine_jobs {
+                        let sc = a.status_color();
+                        let issue = format!("  #{:<5}", a.issue_number);
+                        let repo = format!("{:<15}", trunc(&a.repo, 15));
+                        let st = a.status_label();
+                        let text = StyledText {
+                            spans: vec![
+                                StyledSpan::with_fg(&issue, Color::rgb(150, 150, 240)),
+                                StyledSpan::plain(&repo),
+                                StyledSpan::with_fg(st, sc),
+                            ],
+                        };
+                        let detail = Some(StyledText {
+                            spans: vec![StyledSpan::with_fg(
+                                a.age_str(),
+                                Color::rgb(100, 100, 100),
+                            )],
+                        });
+                        items.push(ListItem {
+                            text,
+                            icon: None,
+                            detail,
+                            decoration: if a.status == "failed" {
+                                Decoration::Error
+                            } else {
+                                Decoration::Normal
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
+        let title = match self.data.machines.get(self.machine_sel) {
+            Some(m) => format!(" DETAIL — {} ", m.name),
+            None => " DETAIL ".to_string(),
+        };
+
+        ListView {
+            id: WidgetId::new("machine-detail"),
+            title: Some(StyledText::plain(&title)),
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
     fn status_bar(&self) -> StatusBar {
         let since = self.refreshed_at.elapsed().as_secs();
+        let view_label = self.active_view.label();
         StatusBar {
             id: WidgetId::new("statusbar"),
             left_segments: vec![
@@ -584,6 +816,13 @@ impl CoordApp {
                     action_id: None,
                 },
                 StatusBarSegment {
+                    text: format!(" {} ", view_label),
+                    fg: Color::rgb(200, 220, 255),
+                    bg: Color::rgb(40, 60, 90),
+                    bold: false,
+                    action_id: None,
+                },
+                StatusBarSegment {
                     text: format!(" ↻ {}s ", since),
                     fg: Color::rgb(140, 140, 140),
                     bg: Color::rgb(30, 30, 40),
@@ -592,7 +831,7 @@ impl CoordApp {
                 },
             ],
             right_segments: vec![StatusBarSegment {
-                text: " j/k=nav  r=refresh  q=quit ".to_string(),
+                text: " 1=Board  2=Machines  Tab=switch  j/k=nav  r=refresh  q=quit ".to_string(),
                 fg: Color::rgb(140, 140, 140),
                 bg: Color::rgb(30, 30, 40),
                 bold: false,
@@ -614,30 +853,40 @@ impl AppLogic for CoordApp {
         // Reserve one line for the status bar at the bottom.
         let main_rect = Rect::new(0.0, 0.0, vp.width, vp.height - lh);
 
-        // ── Outer split: 35% left column | 65% right detail ──────────
-        let outer_split = Split {
-            id: WidgetId::new("outer"),
+        // ── Outer split: 18% sidebar | 82% content ───────────────────
+        let sidebar_split = Split {
+            id: WidgetId::new("sidebar-outer"),
             direction: SplitDirection::Horizontal,
-            ratio: 0.35,
+            ratio: 0.18,
             first_min: 0.0,
             second_min: 0.0,
         };
-        let outer = backend.draw_split(main_rect, &outer_split);
+        let outer = backend.draw_split(main_rect, &sidebar_split);
 
-        // ── Left column: 65% board | 35% machines ────────────────────
-        let left_split = Split {
-            id: WidgetId::new("left"),
-            direction: SplitDirection::Vertical,
-            ratio: 0.65,
+        // Draw the sidebar navigation list
+        backend.draw_list(outer.first_bounds, &self.sidebar_list());
+
+        // ── Content split: 40% list | 60% detail ─────────────────────
+        let content_split = Split {
+            id: WidgetId::new("content-split"),
+            direction: SplitDirection::Horizontal,
+            ratio: 0.40,
             first_min: 0.0,
             second_min: 0.0,
         };
-        let left = backend.draw_split(outer.first_bounds, &left_split);
+        let inner = backend.draw_split(outer.second_bounds, &content_split);
 
-        // Draw the three panels
-        backend.draw_list(left.first_bounds, &self.board_list(true));
-        backend.draw_list(left.second_bounds, &self.machines_list());
-        backend.draw_list(outer.second_bounds, &self.detail_list());
+        // Draw the active view's panels
+        match self.active_view {
+            SidebarView::Board => {
+                backend.draw_list(inner.first_bounds, &self.board_list(true));
+                backend.draw_list(inner.second_bounds, &self.detail_list());
+            }
+            SidebarView::Machines => {
+                backend.draw_list(inner.first_bounds, &self.machines_list(true));
+                backend.draw_list(inner.second_bounds, &self.machine_detail_list());
+            }
+        }
 
         // Status bar
         let sb_rect = Rect::new(0.0, vp.height - lh, vp.width, lh);
@@ -655,40 +904,96 @@ impl AppLogic for CoordApp {
 
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend) -> Reaction {
         let mut needs_redraw = false;
-        let n = self.data.assignments.len();
 
         match event {
             UiEvent::KeyPressed { key, .. } => {
                 match key {
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
 
+                    // ── Switch sidebar views ─────────────────────────────
+                    Key::Named(NamedKey::Tab) => {
+                        self.active_view = self.active_view.next();
+                        needs_redraw = true;
+                    }
+                    Key::Char('1') => {
+                        self.active_view = SidebarView::Board;
+                        needs_redraw = true;
+                    }
+                    Key::Char('2') => {
+                        self.active_view = SidebarView::Machines;
+                        needs_redraw = true;
+                    }
+
+                    // ── Navigate within the active panel ─────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down) => {
-                        if n > 0 && self.board_sel + 1 < n {
-                            self.board_sel += 1;
+                        match self.active_view {
+                            SidebarView::Board => {
+                                let n = self.data.assignments.len();
+                                if n > 0 && self.board_sel + 1 < n {
+                                    self.board_sel += 1;
+                                }
+                                self.fix_scroll(content_visible_rows(backend));
+                            }
+                            SidebarView::Machines => {
+                                let m = self.data.machines.len();
+                                if m > 0 && self.machine_sel + 1 < m {
+                                    self.machine_sel += 1;
+                                }
+                                self.fix_machine_scroll(content_visible_rows(backend));
+                            }
                         }
-                        self.fix_scroll(board_visible_rows(backend));
                         needs_redraw = true;
                     }
 
                     Key::Char('k') | Key::Named(NamedKey::Up) => {
-                        if self.board_sel > 0 {
-                            self.board_sel -= 1;
+                        match self.active_view {
+                            SidebarView::Board => {
+                                if self.board_sel > 0 {
+                                    self.board_sel -= 1;
+                                }
+                                self.fix_scroll(content_visible_rows(backend));
+                            }
+                            SidebarView::Machines => {
+                                if self.machine_sel > 0 {
+                                    self.machine_sel -= 1;
+                                }
+                                self.fix_machine_scroll(content_visible_rows(backend));
+                            }
                         }
-                        self.fix_scroll(board_visible_rows(backend));
                         needs_redraw = true;
                     }
 
                     Key::Named(NamedKey::Home) => {
-                        self.board_sel = 0;
-                        self.fix_scroll(board_visible_rows(backend));
+                        match self.active_view {
+                            SidebarView::Board => {
+                                self.board_sel = 0;
+                                self.fix_scroll(content_visible_rows(backend));
+                            }
+                            SidebarView::Machines => {
+                                self.machine_sel = 0;
+                                self.fix_machine_scroll(content_visible_rows(backend));
+                            }
+                        }
                         needs_redraw = true;
                     }
 
                     Key::Named(NamedKey::End) => {
-                        if n > 0 {
-                            self.board_sel = n - 1;
+                        match self.active_view {
+                            SidebarView::Board => {
+                                let n = self.data.assignments.len();
+                                if n > 0 {
+                                    self.board_sel = n - 1;
+                                }
+                                self.fix_scroll(content_visible_rows(backend));
+                            }
+                            SidebarView::Machines => {
+                                let m = self.data.machines.len();
+                                if m > 0 {
+                                    self.machine_sel = m - 1;
+                                }
+                                self.fix_machine_scroll(content_visible_rows(backend));
+                            }
                         }
-                        self.fix_scroll(board_visible_rows(backend));
                         needs_redraw = true;
                     }
 
@@ -714,19 +1019,18 @@ impl AppLogic for CoordApp {
     }
 }
 
-/// Estimate the number of visible rows in the board panel.
+/// Estimate the number of visible rows in the main content panel.
 ///
-/// Board occupies 65% of the left column height, minus the title row.
-/// Left column is the full terminal height minus the status bar row.
-fn board_visible_rows(backend: &dyn Backend) -> usize {
+/// The content panel occupies the full terminal height minus the status bar
+/// row and the list title row.
+fn content_visible_rows(backend: &dyn Backend) -> usize {
     let vp = backend.viewport();
     let lh = backend.line_height();
     if lh <= 0.0 {
         return 10;
     }
     let main_h = vp.height - lh; // minus status bar
-    let board_h = main_h * 0.65; // 65% for board panel
-    let content_h = (board_h - lh).max(0.0); // minus title row
+    let content_h = (main_h - lh).max(0.0); // minus list title row
     (content_h / lh) as usize
 }
 
@@ -797,8 +1101,11 @@ mod tests {
     fn make_app(sel: usize, scroll: usize) -> CoordApp {
         CoordApp {
             data: BoardData::default(),
+            active_view: SidebarView::default(),
             board_sel: sel,
             board_scroll: scroll,
+            machine_sel: 0,
+            machine_scroll: 0,
             refreshed_at: Instant::now(),
         }
     }
@@ -832,6 +1139,66 @@ mod tests {
         let mut d = make_app(0, 0);
         d.fix_scroll(0); // visible == 0 → early return
         assert_eq!(d.board_scroll, 0);
+    }
+
+    // ── fix_machine_scroll ────────────────────────────────────────────────────
+
+    fn make_app_machine(machine_sel: usize, machine_scroll: usize) -> CoordApp {
+        CoordApp {
+            data: BoardData::default(),
+            active_view: SidebarView::Machines,
+            board_sel: 0,
+            board_scroll: 0,
+            machine_sel,
+            machine_scroll,
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn fix_machine_scroll_within_visible_window() {
+        let mut d = make_app_machine(3, 0);
+        d.fix_machine_scroll(10);
+        assert_eq!(d.machine_scroll, 0);
+    }
+
+    #[test]
+    fn fix_machine_scroll_past_end_of_window() {
+        let mut d = make_app_machine(12, 0);
+        d.fix_machine_scroll(10);
+        assert_eq!(d.machine_scroll, 3);
+    }
+
+    #[test]
+    fn fix_machine_scroll_before_scroll_offset() {
+        let mut d = make_app_machine(0, 5);
+        d.fix_machine_scroll(10);
+        assert_eq!(d.machine_scroll, 0);
+    }
+
+    // ── SidebarView ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn sidebar_view_next_cycles() {
+        assert_eq!(SidebarView::Board.next(), SidebarView::Machines);
+        assert_eq!(SidebarView::Machines.next(), SidebarView::Board);
+    }
+
+    #[test]
+    fn sidebar_view_index() {
+        assert_eq!(SidebarView::Board.index(), 0);
+        assert_eq!(SidebarView::Machines.index(), 1);
+    }
+
+    #[test]
+    fn sidebar_view_label() {
+        assert_eq!(SidebarView::Board.label(), "Board");
+        assert_eq!(SidebarView::Machines.label(), "Machines");
+    }
+
+    #[test]
+    fn sidebar_view_default_is_board() {
+        assert_eq!(SidebarView::default(), SidebarView::Board);
     }
 
     // ── Assignment::status_label ───────────────────────────────────────────────
