@@ -146,6 +146,7 @@ The coordinator session (typically Opus) costs ~10x more per token than Sonnet w
 - **Audit before dispatching.** Include a step in briefings: "Before coding, verify this isn't already implemented." Workers have wasted full sessions building features that already existed.
 - **Only the coordinator writes docs.** Workers must not update README, CHANGELOG, or shared documentation files. Parallel doc edits cause merge conflicts. Add docs to `files_forbidden` in briefings; the coordinator handles doc updates at session end.
 - **Catch platform violations at review time.** The adversarial reviewer should check for platform-specific code in shared/cross-platform paths. Catching after merge costs an entire round-trip.
+- **Never dispatch reviews via `coord assign`.** Workers have `gh` on the deny-list, so a worker dispatched with `coord assign` cannot run `gh pr diff` or `gh pr review`. Reviews must go through the review pipeline (`coord review` or auto-dispatch on completion) which uses `type="review"` and grants GitHub access.
 
 ## Conventions
 
