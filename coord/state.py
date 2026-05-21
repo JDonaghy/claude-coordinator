@@ -548,18 +548,11 @@ def save_board(board: Board) -> Path:
                     f"anon-{a.machine_name}-{a.repo_name}-{a.issue_number}"
                 )
             conn.execute(_UPSERT_SQL, _assignment_upsert_params(a))
-        # Delete DB rows that were pruned from the board (e.g. by Board.gc()).
-        # Without this, pruned assignments survive in the DB and reappear on the
-        # next load_board().
-        current_ids = [a.assignment_id for a in board.active + board.completed]
-        if current_ids:
-            placeholders = ",".join("?" * len(current_ids))
-            conn.execute(
-                f"DELETE FROM assignments WHERE assignment_id NOT IN ({placeholders})",
-                current_ids,
-            )
-        else:
-            conn.execute("DELETE FROM assignments")
+        # NOTE: we intentionally never DELETE here.  The assignments table is
+        # append-only ground truth.  A partial board snapshot (e.g. from
+        # coord status loading only recent assignments) must not wipe rows that
+        # simply weren't included in the snapshot.  Explicit archival/pruning
+        # should be a separate operation if ever needed.
         # Save round_number and mark that the board has been initialised
         conn.execute(
             "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', ?)",

@@ -454,9 +454,11 @@ class TestBoardGC:
         ])
         assert board.gc(keep=50) == 0
 
-    def test_gc_pruned_rows_deleted_from_db(self, coord_db) -> None:
-        """Regression: after gc() prunes completed assignments, save+load must
-        reflect the pruned count — not the original count."""
+    def test_gc_prunes_in_memory_but_db_retains_all(self, coord_db) -> None:
+        """gc() removes old assignments from the in-memory board, but
+        save_board() must NOT delete them from the DB.  The assignments table
+        is append-only; DB rows are never deleted as a side-effect of saving
+        a partial snapshot."""
         board = Board(completed=[
             Assignment(
                 machine_name="m", repo_name="r", issue_number=i,
@@ -471,12 +473,43 @@ class TestBoardGC:
         assert removed == 10
         assert len(board.completed) == 50
 
+        # After saving the pruned board, DB still has all 60 rows.
         save_board(board)
         loaded = load_board()
         assert loaded is not None
-        assert len(loaded.completed) == 50, (
-            f"Expected 50 completed after gc+save, got {len(loaded.completed)}"
+        assert len(loaded.completed) == 60, (
+            f"Expected 60 completed in DB after gc+save (append-only), "
+            f"got {len(loaded.completed)}"
         )
+
+    def test_partial_board_save_does_not_delete_other_assignments(
+        self, coord_db
+    ) -> None:
+        """save_board() with a partial board snapshot must NOT delete assignments
+        that are present in the DB but absent from the snapshot.
+
+        Regression for: freshly dispatched reviews vanishing because coord status
+        loaded only recent assignments and then called save_board()."""
+        a1 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="First", assignment_id="aaa", status="running",
+        )
+        a2 = Assignment(
+            machine_name="server", repo_name="shared", issue_number=2,
+            issue_title="Second", assignment_id="bbb", status="running",
+        )
+        # Save both assignments to the DB.
+        save_board(Board(active=[a1, a2]))
+
+        # Now save a board containing only a1 (simulating a partial snapshot,
+        # e.g. coord status loaded only recent items).
+        save_board(Board(active=[a1]))
+
+        loaded = load_board()
+        assert loaded is not None
+        ids = {a.assignment_id for a in loaded.active + loaded.completed}
+        assert "aaa" in ids, "a1 should still be in DB"
+        assert "bbb" in ids, "a2 should still be in DB — partial save must not delete it"
 
 
 # ── Board model id-based methods ───────────────────────────────────────────────
