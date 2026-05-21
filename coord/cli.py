@@ -1297,6 +1297,16 @@ def assign(
                 err=True,
             )
             sys.exit(1)
+    else:
+        # --force: delete stale remote branches so the worker starts fresh from main
+        from coord.claim import _default_branch_lookup
+
+        stale_branches = _default_branch_lookup(repo_cfg.github, issue)
+        for branch_name in stale_branches:
+            if github_ops.delete_remote_branch(repo_cfg.github, branch_name):
+                click.echo(f"  deleted stale remote branch: {branch_name}")
+            else:
+                click.echo(f"  warning: failed to delete remote branch: {branch_name}", err=True)
 
     # Dispatch to agent server
     try:

@@ -53,6 +53,15 @@ def check_branch_exists(repo: str, branch: str) -> bool:
         return False
 
 
+def delete_remote_branch(repo: str, branch: str) -> bool:
+    """Delete a remote branch. Returns True on success, False on failure."""
+    try:
+        _gh("api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}")
+        return True
+    except RuntimeError:
+        return False
+
+
 def get_default_branch_head(repo: str, branch: str) -> str:
     """Return the full commit SHA at the tip of `branch` on `repo` (owner/name)."""
     raw = _gh("api", f"repos/{repo}/branches/{branch}")

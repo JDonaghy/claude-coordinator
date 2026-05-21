@@ -214,6 +214,51 @@ class TestAssignDispatch:
         assert result.exit_code == 1
         assert "skipping" in result.output
 
+    def test_force_deletes_stale_remote_branches(self, config_file: Path, coord_dir: Path) -> None:
+        """--force should delete existing remote branches before dispatching."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "f-1"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.claim._default_branch_lookup", return_value=["issue-7-old-attempt"]) as lookup, \
+             patch("coord.github_ops.delete_remote_branch", return_value=True) as delete_br:
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "7", "--config", str(config_file), "--force"],
+            )
+        assert result.exit_code == 0
+        assert "deleted stale remote branch: issue-7-old-attempt" in result.output
+        delete_br.assert_called_once_with("acme/api", "issue-7-old-attempt")
+        assert "dispatched" in result.output
+
+    def test_force_no_stale_branches(self, config_file: Path, coord_dir: Path) -> None:
+        """--force with no stale branches should dispatch normally."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "f-2"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.claim._default_branch_lookup", return_value=[]):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "7", "--config", str(config_file), "--force"],
+            )
+        assert result.exit_code == 0
+        assert "deleted stale" not in result.output
+        assert "dispatched" in result.output
+
+    def test_force_delete_failure_warns_but_continues(self, config_file: Path, coord_dir: Path) -> None:
+        """If branch deletion fails, warn but still dispatch."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "f-3"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.claim._default_branch_lookup", return_value=["issue-7-stuck"]), \
+             patch("coord.github_ops.delete_remote_branch", return_value=False):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "7", "--config", str(config_file), "--force"],
+            )
+        assert result.exit_code == 0
+        assert "warning: failed to delete remote branch: issue-7-stuck" in result.output
+        assert "dispatched" in result.output
+
     def test_dispatch_http_error(self, config_file: Path, coord_dir: Path) -> None:
         import httpx
 
