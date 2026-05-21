@@ -131,6 +131,22 @@ class ModelsConfig:
 
 
 @dataclass
+class DispatchConfig:
+    """Smart task-splitting configuration.
+
+    When ``auto_split`` is ``True`` (the default), the ``coord approve``
+    command analyses each proposal's ``files_likely`` list.  If the file
+    count exceeds ``max_files_per_worker``, the work is shown to the user
+    split into parallel/sequential chunks for confirmation before dispatch.
+
+    Set ``auto_split: false`` to disable the splitting analysis entirely.
+    """
+
+    max_files_per_worker: int = 8
+    auto_split: bool = True
+
+
+@dataclass
 class PipelineConfig:
     """Assignment lifecycle gate configuration.
 
@@ -154,6 +170,7 @@ class Config:
     smoke_tests: SmokeTestsConfig = field(default_factory=SmokeTestsConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -185,6 +202,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
     models = _parse_models(raw.get("models"))
     pipeline = _parse_pipeline(raw.get("pipeline"))
+    dispatch = _parse_dispatch(raw.get("dispatch"))
 
     return Config(
         repos=repos,
@@ -195,6 +213,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
         smoke_tests=smoke_tests,
         models=models,
         pipeline=pipeline,
+        dispatch=dispatch,
         path=p,
     )
 
@@ -565,6 +584,29 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
                     f"pipeline.labels[{k!r}] must be a list of gate name strings"
                 )
         cfg.labels = {k: list(v) for k, v in value.items()}
+
+    return cfg
+
+
+def _parse_dispatch(raw: Any) -> DispatchConfig:
+    if raw is None:
+        return DispatchConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'dispatch' must be a mapping")
+
+    cfg = DispatchConfig()
+
+    if "max_files_per_worker" in raw:
+        value = raw["max_files_per_worker"]
+        if not isinstance(value, int) or value < 1:
+            raise ConfigError("dispatch.max_files_per_worker must be a positive integer")
+        cfg.max_files_per_worker = value
+
+    if "auto_split" in raw:
+        value = raw["auto_split"]
+        if not isinstance(value, bool):
+            raise ConfigError("dispatch.auto_split must be a boolean")
+        cfg.auto_split = value
 
     return cfg
 

@@ -1035,6 +1035,20 @@ def approve(
                 click.echo(f"  warning: could not get HEAD of {repo_cfg.github}: {e}", err=True)
                 github_heads[repo_name] = None
 
+    # ── Auto-split advisory ───────────────────────────────────────────────
+    if cfg.dispatch.auto_split:
+        from coord.split_work import analyze_plan, format_chunks_summary
+
+        for p in selected:
+            chunks = analyze_plan(p.files_likely, cfg.dispatch)
+            if len(chunks) > 1:
+                click.echo(
+                    f"  ⚠ [{p.id}] {p.repo_name} #{p.issue_number} touches "
+                    f"{len(p.files_likely)} files (threshold: "
+                    f"{cfg.dispatch.max_files_per_worker}) — consider splitting:"
+                )
+                click.echo(format_chunks_summary(chunks))
+
     for p in selected:
         click.echo(f"[{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
         # Resolve model so the dispatched record and board reflect what ran.

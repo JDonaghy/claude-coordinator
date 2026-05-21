@@ -273,6 +273,23 @@ def parse_split_proposals(text: str) -> list[SplitProposal]:
     return splits
 
 
+def _annotate_large_proposals(proposals: list[Proposal], config: Config) -> None:
+    """Append a split-suggestion note to proposals that exceed the file threshold.
+
+    Mutates proposals in place.  The note is appended to ``rationale`` so it
+    surfaces in ``coord plan`` output without cluttering the briefing itself.
+    """
+    threshold = config.dispatch.max_files_per_worker
+    for p in proposals:
+        if len(p.files_likely) > threshold:
+            note = (
+                f" [⚠ {len(p.files_likely)} files > threshold {threshold} — "
+                "consider splitting via coord split]"
+            )
+            if note not in p.rationale:
+                p.rationale += note
+
+
 def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
     """Full brain cycle: gather context, call Claude, return proposals and splits."""
     context = gather_context(config)
@@ -280,4 +297,5 @@ def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
     response = call_claude(SYSTEM_PROMPT, prompt)
     proposals = parse_proposals(response)
     resolve_required_gates(proposals, config, context["issues_by_repo"])
+    _annotate_large_proposals(proposals, config)
     return proposals, parse_split_proposals(response)
