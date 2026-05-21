@@ -182,7 +182,6 @@ class TestDependencyDetection:
         chunks = analyze_plan(files, _cfg(max_files=3))
 
         # All test-free chunks are impl chunks and must be independent
-        test_file_sets = {"test_", "tests/"}
         impl_chunks = [
             c for c in chunks
             if not any(
@@ -309,7 +308,8 @@ class TestApproveSplitAdvisory:
         save_proposals([self._make_proposal(files)])
 
         runner = CliRunner()
-        result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
+        with patch("coord.claim.find_work_claim", return_value=None):
+            result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
 
         assert result.exit_code == 0, result.output
         # Should warn about splitting
@@ -326,7 +326,8 @@ class TestApproveSplitAdvisory:
         save_proposals([self._make_proposal(files)])
 
         runner = CliRunner()
-        result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
+        with patch("coord.claim.find_work_claim", return_value=None):
+            result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
 
         assert result.exit_code == 0, result.output
         # Should NOT show any split advisory
@@ -355,7 +356,8 @@ class TestApproveSplitAdvisory:
         save_proposals([self._make_proposal(files)])
 
         runner = CliRunner()
-        result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
+        with patch("coord.claim.find_work_claim", return_value=None):
+            result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
 
         assert result.exit_code == 0, result.output
         # auto_split=false means no advisory

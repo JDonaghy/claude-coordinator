@@ -84,7 +84,6 @@ def _module_stem(f: str) -> str | None:
 def analyze_plan(
     files_likely: list[str],
     dispatch_config: "DispatchConfig",
-    plan: dict | None = None,
 ) -> list[WorkChunk]:
     """Analyse files and split into parallel/sequential chunks if needed.
 
@@ -107,7 +106,6 @@ def analyze_plan(
     Args:
         files_likely: List of file paths the worker will touch.
         dispatch_config: Config section with splitting thresholds.
-        plan: Optional structured plan dict (reserved for future enrichment).
 
     Returns:
         Ordered list of WorkChunk objects.  Independent chunks can be
