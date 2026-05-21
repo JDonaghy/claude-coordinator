@@ -140,10 +140,19 @@ class DispatchConfig:
     split into parallel/sequential chunks for confirmation before dispatch.
 
     Set ``auto_split: false`` to disable the splitting analysis entirely.
+
+    When ``require_plan`` is ``True``, ``coord assign`` defaults to
+    ``--plan-only`` behaviour — the worker reads the codebase and produces a
+    structured plan without writing any code.  The user then runs
+    ``coord approve-plan`` or ``coord reject-plan`` to act on the plan.
+    Pass ``--no-plan`` to ``coord assign`` to override this default and
+    dispatch a work assignment directly.  Assignments of type ``review``,
+    ``smoke``, or ``plan`` are never affected by this setting.
     """
 
     max_files_per_worker: int = 8
     auto_split: bool = True
+    require_plan: bool = False
 
 
 @dataclass
@@ -631,6 +640,12 @@ def _parse_dispatch(raw: Any) -> DispatchConfig:
         if not isinstance(value, bool):
             raise ConfigError("dispatch.auto_split must be a boolean")
         cfg.auto_split = value
+
+    if "require_plan" in raw:
+        value = raw["require_plan"]
+        if not isinstance(value, bool):
+            raise ConfigError("dispatch.require_plan must be a boolean")
+        cfg.require_plan = value
 
     return cfg
 
