@@ -35,9 +35,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags};
 
 use quadraui::{
-    AppLogic, Backend, Badge, Color, Decoration, Key, ListItem, ListView, NamedKey, Reaction, Rect,
-    Split, SplitDirection, StatusBar, StatusBarSegment, StyledSpan, StyledText, TabBar, TabItem,
-    TreeController, TreeRow, UiEvent, WidgetId,
+    AppLogic, Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
+    Point, Reaction, Rect, ScrollDelta, Split, SplitDirection, SplitMeasure, StatusBar,
+    StatusBarSegment, StyledSpan, StyledText, TabBar, TabItem, TreeController,
+    TreeControllerEvent, TreeRow, UiEvent, WidgetId,
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
@@ -814,6 +815,16 @@ pub struct CoordApp {
     pipeline_sel: usize,
     /// Scroll offset for the Pipeline issue list.
     pipeline_scroll: usize,
+    /// Scroll offset for the Board Summary detail panel (right side).
+    detail_scroll: usize,
+    /// Scroll offset for the Board Activity panel.
+    /// `None` = auto-scroll to the most-recent entries (default).
+    /// `Some(n)` = user has manually scrolled; preserve `n`.
+    activity_scroll: Option<usize>,
+    /// Scroll offset for the Machine detail panel.
+    machine_detail_scroll: usize,
+    /// Scroll offset for the Pipeline detail panel.
+    pipeline_detail_scroll: usize,
 }
 
 impl Default for CoordApp {
@@ -837,6 +848,10 @@ impl CoordApp {
             detail_tab: DetailTab::default(),
             pipeline_sel: 0,
             pipeline_scroll: 0,
+            detail_scroll: 0,
+            activity_scroll: None,
+            machine_detail_scroll: 0,
+            pipeline_detail_scroll: 0,
         };
         app.rebuild_board_tree_rows();
         app
@@ -1212,7 +1227,7 @@ impl CoordApp {
             title: Some(StyledText::plain(&title)),
             items,
             selected_idx: 0,
-            scroll_offset: 0,
+            scroll_offset: self.detail_scroll,
             has_focus: false,
             bordered: false,
         }
@@ -1260,9 +1275,12 @@ impl CoordApp {
             }
         };
 
-        // Scroll to show the most-recent entries (bottom of the list).
-        // Subtract a generous window so the panel is filled with recent items.
-        let scroll_offset = items.len().saturating_sub(40);
+        // Scroll to show the most-recent entries (bottom of the list) unless
+        // the user has manually scrolled to a specific position.
+        let scroll_offset = match self.activity_scroll {
+            Some(n) => n,
+            None => items.len().saturating_sub(40),
+        };
 
         ListView {
             id: WidgetId::new("activity"),
@@ -1392,7 +1410,7 @@ impl CoordApp {
             title: Some(StyledText::plain(&title)),
             items,
             selected_idx: 0,
-            scroll_offset: 0,
+            scroll_offset: self.machine_detail_scroll,
             has_focus: false,
             bordered: false,
         }
@@ -1593,9 +1611,244 @@ impl CoordApp {
             title: Some(StyledText::plain(&title)),
             items,
             selected_idx: 0,
-            scroll_offset: 0,
+            scroll_offset: self.pipeline_detail_scroll,
             has_focus: false,
             bordered: false,
+        }
+    }
+
+    // ── Mouse dispatch ────────────────────────────────────────────────────
+
+    /// Dispatch one mouse event. Called from `handle()` before the keyboard
+    /// match so we can still pass `&UiEvent` to `board_tree.handle()`.
+    /// Returns `true` if a redraw is needed.
+    fn handle_mouse(&mut self, event: &UiEvent, backend: &mut dyn Backend) -> bool {
+        match event {
+            UiEvent::MouseDown {
+                position,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let pos = *position;
+                let (sidebar_b, first_b, second_b) = compute_panel_layout(backend);
+                let lh = backend.line_height();
+                if sidebar_b.contains(pos) {
+                    self.mouse_sidebar_click(pos, sidebar_b)
+                } else if first_b.contains(pos) {
+                    self.mouse_first_click(event, pos, first_b, backend)
+                } else if second_b.contains(pos) {
+                    self.mouse_second_click(pos, second_b, lh)
+                } else {
+                    false
+                }
+            }
+
+            UiEvent::Scroll { position, delta, .. } => {
+                let pos = *position;
+                let d = *delta;
+                let (_, first_b, second_b) = compute_panel_layout(backend);
+                if first_b.contains(pos) {
+                    self.mouse_first_scroll(event, d, first_b, backend)
+                } else if second_b.contains(pos) {
+                    self.mouse_second_scroll(d, backend)
+                } else {
+                    false
+                }
+            }
+
+            _ => false,
+        }
+    }
+
+    /// Click in the left sidebar — switch to the clicked view.
+    fn mouse_sidebar_click(&mut self, pos: Point, sidebar_b: Rect) -> bool {
+        // Row 0 of the panel is the title; views start at row 1.
+        let row = (pos.y - sidebar_b.y).max(0.0) as usize;
+        let view = match row.saturating_sub(1) {
+            0 => Some(SidebarView::Board),
+            1 => Some(SidebarView::Machines),
+            2 => Some(SidebarView::Pipeline),
+            _ => None,
+        };
+        if let Some(v) = view {
+            if v != self.active_view {
+                self.active_view = v;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Click in the left content panel (board tree / machines list / pipeline
+    /// list, depending on the active view).
+    fn mouse_first_click(
+        &mut self,
+        event: &UiEvent,
+        pos: Point,
+        first_b: Rect,
+        backend: &mut dyn Backend,
+    ) -> bool {
+        match self.active_view {
+            SidebarView::Board => {
+                // Delegate fully to the TreeController — it handles row
+                // hit-testing, selection, and scroll-thumb dragging.
+                let result = self.board_tree.handle(event, backend, first_b);
+                if let TreeControllerEvent::RowSelected { ref path } = result {
+                    // Reset detail-panel scroll when the user picks a new leaf.
+                    if path.len() >= 2 {
+                        self.detail_scroll = 0;
+                        self.activity_scroll = None; // back to auto-scroll
+                    }
+                }
+                result != TreeControllerEvent::Ignored
+            }
+            SidebarView::Machines => {
+                // Row 0 = title strip; item i starts at row 1+i-scroll.
+                let row = (pos.y - first_b.y).max(0.0) as usize;
+                if row >= 1 {
+                    let item_idx = (row - 1) + self.machine_scroll;
+                    let m = self.data.machines.len();
+                    if item_idx < m && item_idx != self.machine_sel {
+                        self.machine_sel = item_idx;
+                        self.machine_detail_scroll = 0;
+                        return true;
+                    }
+                }
+                false
+            }
+            SidebarView::Pipeline => {
+                let row = (pos.y - first_b.y).max(0.0) as usize;
+                if row >= 1 {
+                    let item_idx = (row - 1) + self.pipeline_scroll;
+                    let p = self.pipeline_issues().len();
+                    if item_idx < p && item_idx != self.pipeline_sel {
+                        self.pipeline_sel = item_idx;
+                        self.pipeline_detail_scroll = 0;
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Click in the right content panel — in Board view this handles the
+    /// tab bar (first row of the panel).
+    fn mouse_second_click(&mut self, pos: Point, second_b: Rect, lh: f32) -> bool {
+        if self.active_view != SidebarView::Board {
+            return false;
+        }
+        // The tab bar occupies the first `lh` pixels/cells of the panel.
+        if pos.y - second_b.y < lh {
+            // " Summary " is 9 chars; " Activity " is 10 chars (compact tabs,
+            // no separator). Anything in the first 9 columns → Summary tab.
+            let x_off = pos.x - second_b.x;
+            let new_tab = if x_off < 9.0 {
+                DetailTab::Summary
+            } else {
+                DetailTab::Activity
+            };
+            if new_tab != self.detail_tab {
+                self.detail_tab = new_tab;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Scroll wheel in the left content panel.
+    fn mouse_first_scroll(
+        &mut self,
+        event: &UiEvent,
+        delta: ScrollDelta,
+        first_b: Rect,
+        backend: &mut dyn Backend,
+    ) -> bool {
+        match self.active_view {
+            SidebarView::Board => {
+                // Delegate to the TreeController's built-in scroll handler.
+                self.board_tree.handle(event, backend, first_b);
+                true
+            }
+            SidebarView::Machines => {
+                let visible = content_visible_rows(backend);
+                let m = self.data.machines.len();
+                if delta.y > 0.0 {
+                    // Scroll up → show earlier items.
+                    self.machine_scroll = self.machine_scroll.saturating_sub(1);
+                } else if delta.y < 0.0 {
+                    // Scroll down → show later items.
+                    let max = m.saturating_sub(visible);
+                    self.machine_scroll = (self.machine_scroll + 1).min(max);
+                }
+                true
+            }
+            SidebarView::Pipeline => {
+                let visible = content_visible_rows(backend);
+                let p = self.pipeline_issues().len();
+                if delta.y > 0.0 {
+                    self.pipeline_scroll = self.pipeline_scroll.saturating_sub(1);
+                } else if delta.y < 0.0 {
+                    let max = p.saturating_sub(visible);
+                    self.pipeline_scroll = (self.pipeline_scroll + 1).min(max);
+                }
+                true
+            }
+        }
+    }
+
+    /// Scroll wheel in the right content panel (detail / activity / machine
+    /// detail / pipeline detail).
+    fn mouse_second_scroll(&mut self, delta: ScrollDelta, backend: &dyn Backend) -> bool {
+        let visible = content_visible_rows(backend);
+        match self.active_view {
+            SidebarView::Board => {
+                match self.detail_tab {
+                    DetailTab::Summary => {
+                        let items = self.detail_list().items.len();
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if delta.y > 0.0 {
+                            self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                        } else if delta.y < 0.0 {
+                            self.detail_scroll = (self.detail_scroll + 1).min(max);
+                        }
+                    }
+                    DetailTab::Activity => {
+                        // Build the activity list to find its item count; also
+                        // resolves the current auto-scroll offset if needed.
+                        let list = self.activity_list();
+                        let items = list.items.len();
+                        let current = self.activity_scroll.unwrap_or(list.scroll_offset);
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if delta.y > 0.0 {
+                            self.activity_scroll = Some(current.saturating_sub(1));
+                        } else if delta.y < 0.0 {
+                            self.activity_scroll = Some((current + 1).min(max));
+                        }
+                    }
+                }
+                true
+            }
+            SidebarView::Machines => {
+                let items = self.machine_detail_list().items.len();
+                let max = items.saturating_sub(visible.saturating_sub(1));
+                if delta.y > 0.0 {
+                    self.machine_detail_scroll = self.machine_detail_scroll.saturating_sub(1);
+                } else if delta.y < 0.0 {
+                    self.machine_detail_scroll = (self.machine_detail_scroll + 1).min(max);
+                }
+                true
+            }
+            SidebarView::Pipeline => {
+                let items = self.pipeline_detail_list().items.len();
+                let max = items.saturating_sub(visible.saturating_sub(1));
+                if delta.y > 0.0 {
+                    self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_sub(1);
+                } else if delta.y < 0.0 {
+                    self.pipeline_detail_scroll = (self.pipeline_detail_scroll + 1).min(max);
+                }
+                true
+            }
         }
     }
 
@@ -1636,6 +1889,42 @@ impl CoordApp {
             }],
         }
     }
+}
+
+// ─── Panel layout helper ──────────────────────────────────────────────────────
+
+/// Recompute the panel bounds that `render()` produces, without drawing.
+///
+/// Returns `(sidebar_bounds, content_first_bounds, content_second_bounds)`.
+/// Used in `handle()` to hit-test mouse events against the same layout that
+/// the last frame drew, without requiring interior mutability.
+///
+/// The TUI backend always uses a divider thickness of 1 cell, so we pass
+/// `SplitMeasure::new(1.0)` here to match the rendered layout exactly.
+fn compute_panel_layout(backend: &dyn Backend) -> (Rect, Rect, Rect) {
+    let vp = backend.viewport();
+    let lh = backend.line_height();
+    let main_rect = Rect::new(0.0, 0.0, vp.width, vp.height - lh);
+
+    let outer = Split {
+        id: WidgetId::new("sidebar-outer"),
+        direction: SplitDirection::Horizontal,
+        ratio: 0.18,
+        first_min: 0.0,
+        second_min: 0.0,
+    }
+    .layout(main_rect, SplitMeasure::new(1.0));
+
+    let inner = Split {
+        id: WidgetId::new("content-split"),
+        direction: SplitDirection::Horizontal,
+        ratio: 0.40,
+        first_min: 0.0,
+        second_min: 0.0,
+    }
+    .layout(outer.second_bounds, SplitMeasure::new(1.0));
+
+    (outer.first_bounds, inner.first_bounds, inner.second_bounds)
 }
 
 // ─── AppLogic implementation ──────────────────────────────────────────────────
@@ -1723,6 +2012,10 @@ impl AppLogic for CoordApp {
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend) -> Reaction {
         let mut needs_redraw = false;
 
+        // ── Mouse / scroll dispatch (before consuming the event) ─────────────
+        needs_redraw |= self.handle_mouse(&event, backend);
+
+        // ── Keyboard and window events ────────────────────────────────────────
         match event {
             UiEvent::KeyPressed { key, .. } => {
                 match key {
@@ -1751,12 +2044,18 @@ impl AppLogic for CoordApp {
                         match self.active_view {
                             SidebarView::Board => {
                                 let vr = board_visible_rows(backend);
+                                let prev = self.board_tree.selected_path().cloned();
                                 self.board_tree.move_selection_by(1, vr);
+                                if self.board_tree.selected_path() != prev.as_ref() {
+                                    self.detail_scroll = 0;
+                                    self.activity_scroll = None;
+                                }
                             }
                             SidebarView::Machines => {
                                 let m = self.data.machines.len();
                                 if m > 0 && self.machine_sel + 1 < m {
                                     self.machine_sel += 1;
+                                    self.machine_detail_scroll = 0;
                                 }
                                 self.fix_machine_scroll(content_visible_rows(backend));
                             }
@@ -1764,6 +2063,7 @@ impl AppLogic for CoordApp {
                                 let p = self.pipeline_issues().len();
                                 if p > 0 && self.pipeline_sel + 1 < p {
                                     self.pipeline_sel += 1;
+                                    self.pipeline_detail_scroll = 0;
                                 }
                                 self.fix_pipeline_scroll(content_visible_rows(backend));
                             }
@@ -1776,17 +2076,24 @@ impl AppLogic for CoordApp {
                         match self.active_view {
                             SidebarView::Board => {
                                 let vr = board_visible_rows(backend);
+                                let prev = self.board_tree.selected_path().cloned();
                                 self.board_tree.move_selection_by(-1, vr);
+                                if self.board_tree.selected_path() != prev.as_ref() {
+                                    self.detail_scroll = 0;
+                                    self.activity_scroll = None;
+                                }
                             }
                             SidebarView::Machines => {
                                 if self.machine_sel > 0 {
                                     self.machine_sel -= 1;
+                                    self.machine_detail_scroll = 0;
                                 }
                                 self.fix_machine_scroll(content_visible_rows(backend));
                             }
                             SidebarView::Pipeline => {
                                 if self.pipeline_sel > 0 {
                                     self.pipeline_sel -= 1;
+                                    self.pipeline_detail_scroll = 0;
                                 }
                                 self.fix_pipeline_scroll(content_visible_rows(backend));
                             }
@@ -1799,14 +2106,21 @@ impl AppLogic for CoordApp {
                         match self.active_view {
                             SidebarView::Board => {
                                 let vr = board_visible_rows(backend);
+                                let prev = self.board_tree.selected_path().cloned();
                                 self.board_tree.jump_to_edge(true, vr);
+                                if self.board_tree.selected_path() != prev.as_ref() {
+                                    self.detail_scroll = 0;
+                                    self.activity_scroll = None;
+                                }
                             }
                             SidebarView::Machines => {
                                 self.machine_sel = 0;
+                                self.machine_detail_scroll = 0;
                                 self.fix_machine_scroll(content_visible_rows(backend));
                             }
                             SidebarView::Pipeline => {
                                 self.pipeline_sel = 0;
+                                self.pipeline_detail_scroll = 0;
                                 self.fix_pipeline_scroll(content_visible_rows(backend));
                             }
                         }
@@ -1818,12 +2132,18 @@ impl AppLogic for CoordApp {
                         match self.active_view {
                             SidebarView::Board => {
                                 let vr = board_visible_rows(backend);
+                                let prev = self.board_tree.selected_path().cloned();
                                 self.board_tree.jump_to_edge(false, vr);
+                                if self.board_tree.selected_path() != prev.as_ref() {
+                                    self.detail_scroll = 0;
+                                    self.activity_scroll = None;
+                                }
                             }
                             SidebarView::Machines => {
                                 let m = self.data.machines.len();
                                 if m > 0 {
                                     self.machine_sel = m - 1;
+                                    self.machine_detail_scroll = 0;
                                 }
                                 self.fix_machine_scroll(content_visible_rows(backend));
                             }
@@ -1831,6 +2151,7 @@ impl AppLogic for CoordApp {
                                 let p = self.pipeline_issues().len();
                                 if p > 0 {
                                     self.pipeline_sel = p - 1;
+                                    self.pipeline_detail_scroll = 0;
                                 }
                                 self.fix_pipeline_scroll(content_visible_rows(backend));
                             }
@@ -1844,7 +2165,12 @@ impl AppLogic for CoordApp {
                     {
                         let vr = board_visible_rows(backend);
                         let jump = (vr.max(1) - 1).max(1) as isize;
+                        let prev = self.board_tree.selected_path().cloned();
                         self.board_tree.move_selection_by(jump, vr);
+                        if self.board_tree.selected_path() != prev.as_ref() {
+                            self.detail_scroll = 0;
+                            self.activity_scroll = None;
+                        }
                         needs_redraw = true;
                     }
 
@@ -1854,7 +2180,12 @@ impl AppLogic for CoordApp {
                     {
                         let vr = board_visible_rows(backend);
                         let jump = (vr.max(1) - 1).max(1) as isize;
+                        let prev = self.board_tree.selected_path().cloned();
                         self.board_tree.move_selection_by(-jump, vr);
+                        if self.board_tree.selected_path() != prev.as_ref() {
+                            self.detail_scroll = 0;
+                            self.activity_scroll = None;
+                        }
                         needs_redraw = true;
                     }
 
@@ -2014,6 +2345,10 @@ mod tests {
             detail_tab: DetailTab::default(),
             pipeline_sel: 0,
             pipeline_scroll: 0,
+            detail_scroll: 0,
+            activity_scroll: None,
+            machine_detail_scroll: 0,
+            pipeline_detail_scroll: 0,
         }
     }
 
@@ -2032,6 +2367,10 @@ mod tests {
             detail_tab: DetailTab::default(),
             pipeline_sel: 0,
             pipeline_scroll: 0,
+            detail_scroll: 0,
+            activity_scroll: None,
+            machine_detail_scroll: 0,
+            pipeline_detail_scroll: 0,
         };
         app.rebuild_board_tree_rows();
         app
@@ -2186,6 +2525,10 @@ mod tests {
             detail_tab: DetailTab::default(),
             pipeline_sel: 0,
             pipeline_scroll: 0,
+            detail_scroll: 0,
+            activity_scroll: None,
+            machine_detail_scroll: 0,
+            pipeline_detail_scroll: 0,
         }
     }
 
@@ -2534,5 +2877,147 @@ mod tests {
             make_assignment("pending").status_color(),
             Color::rgb(200, 200, 70)
         );
+    }
+
+    // ── Mouse helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn mouse_sidebar_click_switches_view() {
+        let mut app = make_app_default();
+        assert_eq!(app.active_view, SidebarView::Board);
+
+        // Simulate a click at row 2 in the sidebar (row 0 = title, 1 = Board,
+        // 2 = Machines, 3 = Pipeline).
+        let sidebar_b = Rect::new(0.0, 0.0, 14.0, 40.0);
+        let changed = app.mouse_sidebar_click(Point::new(2.0, 2.0), sidebar_b);
+        assert!(changed);
+        assert_eq!(app.active_view, SidebarView::Machines);
+    }
+
+    #[test]
+    fn mouse_sidebar_click_same_view_no_redraw() {
+        let mut app = make_app_default();
+        let sidebar_b = Rect::new(0.0, 0.0, 14.0, 40.0);
+        // Row 1 = Board, which is already active.
+        let changed = app.mouse_sidebar_click(Point::new(2.0, 1.0), sidebar_b);
+        assert!(!changed);
+        assert_eq!(app.active_view, SidebarView::Board);
+    }
+
+    #[test]
+    fn mouse_sidebar_click_pipeline_view() {
+        let mut app = make_app_default();
+        let sidebar_b = Rect::new(0.0, 0.0, 14.0, 40.0);
+        // Row 3 = Pipeline.
+        let changed = app.mouse_sidebar_click(Point::new(2.0, 3.0), sidebar_b);
+        assert!(changed);
+        assert_eq!(app.active_view, SidebarView::Pipeline);
+    }
+
+    #[test]
+    fn mouse_second_click_tab_summary() {
+        let mut app = make_app_default();
+        app.detail_tab = DetailTab::Activity;
+        let second_b = Rect::new(50.0, 0.0, 40.0, 40.0);
+        // Click at x=51 → offset 1 < 9 → Summary tab.
+        let changed = app.mouse_second_click(Point::new(51.0, 0.0), second_b, 1.0);
+        assert!(changed);
+        assert_eq!(app.detail_tab, DetailTab::Summary);
+    }
+
+    #[test]
+    fn mouse_second_click_tab_activity() {
+        let mut app = make_app_default();
+        assert_eq!(app.detail_tab, DetailTab::Summary);
+        let second_b = Rect::new(50.0, 0.0, 40.0, 40.0);
+        // Click at x=60 → offset 10 ≥ 9 → Activity tab.
+        let changed = app.mouse_second_click(Point::new(60.0, 0.0), second_b, 1.0);
+        assert!(changed);
+        assert_eq!(app.detail_tab, DetailTab::Activity);
+    }
+
+    #[test]
+    fn mouse_second_click_below_tab_row_is_ignored() {
+        let mut app = make_app_default();
+        let second_b = Rect::new(50.0, 0.0, 40.0, 40.0);
+        // Click at row y=2, well below the tab bar at y=0.
+        let changed = app.mouse_second_click(Point::new(55.0, 2.0), second_b, 1.0);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn mouse_second_click_non_board_view_is_ignored() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Machines;
+        let second_b = Rect::new(50.0, 0.0, 40.0, 40.0);
+        let changed = app.mouse_second_click(Point::new(55.0, 0.0), second_b, 1.0);
+        assert!(!changed);
+    }
+
+    // ── compute_panel_layout ──────────────────────────────────────────────────
+
+    #[test]
+    fn compute_panel_layout_sidebar_starts_at_origin() {
+        use quadraui::Viewport;
+        // Use a mock backend substitute: we can exercise layout math directly.
+        let vp = Viewport::new(120.0, 40.0, 1.0);
+        let lh = 1.0_f32;
+        let main_rect = Rect::new(0.0, 0.0, vp.width, vp.height - lh);
+
+        let outer = Split {
+            id: WidgetId::new("sidebar-outer"),
+            direction: SplitDirection::Horizontal,
+            ratio: 0.18,
+            first_min: 0.0,
+            second_min: 0.0,
+        }
+        .layout(main_rect, SplitMeasure::new(1.0));
+
+        // Sidebar x should be 0, content should start after sidebar + divider.
+        assert_eq!(outer.first_bounds.x, 0.0);
+        assert!(outer.second_bounds.x > outer.first_bounds.x);
+    }
+
+    // ── Scroll offset preservation across refresh ─────────────────────────────
+
+    #[test]
+    fn detail_scroll_preserved_after_refresh_on_fixed_data() {
+        let mut app = make_app_default();
+        // Set a non-zero detail scroll offset.
+        app.detail_scroll = 3;
+        // `refresh()` re-reads the DB; with no DB present it loads empty data.
+        // The scroll offset must not be clamped to zero by refresh().
+        app.refresh();
+        assert_eq!(app.detail_scroll, 3);
+    }
+
+    #[test]
+    fn activity_scroll_none_means_auto() {
+        let app = make_app_default();
+        assert!(app.activity_scroll.is_none());
+    }
+
+    #[test]
+    fn activity_scroll_manual_value_preserved() {
+        let mut app = make_app_default();
+        app.activity_scroll = Some(7);
+        app.refresh();
+        assert_eq!(app.activity_scroll, Some(7));
+    }
+
+    #[test]
+    fn machine_detail_scroll_preserved_after_refresh() {
+        let mut app = make_app_default();
+        app.machine_detail_scroll = 5;
+        app.refresh();
+        assert_eq!(app.machine_detail_scroll, 5);
+    }
+
+    #[test]
+    fn pipeline_detail_scroll_preserved_after_refresh() {
+        let mut app = make_app_default();
+        app.pipeline_detail_scroll = 2;
+        app.refresh();
+        assert_eq!(app.pipeline_detail_scroll, 2);
     }
 }
