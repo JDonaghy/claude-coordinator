@@ -277,7 +277,10 @@ class AgentServer:
         for a in assignments:
             d = a.to_dict()
             if a.status == RUNNING:
-                prog = self.progress(a.id)
+                try:
+                    prog = self.progress(a.id)
+                except Exception:
+                    prog = None
                 if prog:
                     d["progress"] = prog
                 # Tail-read stream-json log for live summary fields.

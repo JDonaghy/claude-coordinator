@@ -95,6 +95,13 @@ class TestParseEvent:
         assert e is not None
         assert e.type == "unknown"
 
+    def test_truncated_json_returns_none(self) -> None:
+        """A mid-write incomplete JSON line (e.g. last line of a live log) is
+        skipped silently — not raised to the caller."""
+        assert parse_event('{"type": "assistant", "message": {') is None
+        assert parse_event('{"type": "result",') is None
+        assert parse_event("{") is None
+
 
 # ── is_stream_json ─────────────────────────────────────────────────────────
 
