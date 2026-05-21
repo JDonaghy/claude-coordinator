@@ -364,6 +364,7 @@ def _row_to_dispatched_dict(row: object) -> dict:
         "required_gates": _json_loads(d.get("required_gates")) or [],
         "dispatched_at": d.get("dispatched_at"),
         "review_of_assignment_id": d.get("review_of_assignment_id"),
+        "review_target": d.get("review_target"),
     }
 
 
@@ -412,8 +413,8 @@ def record_dispatched_assignment(
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, review_of_assignment_id,
-            required_gates
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+            review_target, required_gates
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -423,6 +424,7 @@ def record_dispatched_assignment(
             model = excluded.model,
             dispatched_at = excluded.dispatched_at,
             review_of_assignment_id = excluded.review_of_assignment_id,
+            review_target = excluded.review_target,
             required_gates = excluded.required_gates""",
         (
             assignment.assignment_id or "",
@@ -437,6 +439,7 @@ def record_dispatched_assignment(
             assignment.model,
             assignment.dispatched_at or time.time(),
             assignment.review_of_assignment_id,
+            assignment.review_target,
             json.dumps(list(assignment.required_gates)),
         ),
     )
