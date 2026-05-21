@@ -186,7 +186,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 # ── JSON migration ─────────────────────────────────────────────────────────────
 
 def _maybe_migrate_json(conn: sqlite3.Connection) -> None:
-    """Migrate old JSON files to SQLite if dispatched.json exists and DB is empty."""
+    """Migrate old JSON files to SQLite if dispatched.json exists and DB is empty.
+
+    The ``json_migrated`` marker in board_meta is checked first.  Once set it
+    persists forever, so migration never re-runs even if JSON files reappear
+    (e.g. from stale code, test fixtures, or an agent writing legacy state).
+    """
+    # Marker check must come first — bail out immediately if migration already ran.
+    cursor = conn.execute(
+        "SELECT value FROM board_meta WHERE key='json_migrated'"
+    )
+    if cursor.fetchone() is not None:
+        return
     dispatched_json = COORD_DIR / "dispatched.json"
     if not dispatched_json.exists():
         return
@@ -420,6 +431,15 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
                     )
             except Exception:  # noqa: BLE001
                 pass
+
+        # Persist migration marker — this is the canonical "already migrated" signal.
+        # Checked at the top of _maybe_migrate_json(), so JSON files reappearing
+        # later (stale code, test fixtures, agent writing legacy state) won't
+        # re-trigger the migration.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('json_migrated', ?)",
+            (str(_time.time()),),
+        )
 
         # Rename JSON files to .bak so migration doesn't re-run
         for f in [
