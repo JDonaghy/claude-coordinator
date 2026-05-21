@@ -36,14 +36,26 @@ use rusqlite::{Connection, OpenFlags};
 
 use quadraui::{
     AppLogic, Backend, Badge, Color, Decoration, Key, ListItem, ListView, NamedKey, Reaction, Rect,
-    Split, SplitDirection, StatusBar, StatusBarSegment, StyledSpan, StyledText, TreeController,
-    TreeRow, UiEvent, WidgetId,
+    Split, SplitDirection, StatusBar, StatusBarSegment, StyledSpan, StyledText, TabBar, TabItem,
+    TreeController, TreeRow, UiEvent, WidgetId,
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
 /// Reload board data every 5 seconds.
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
+
+// ─── Detail panel tabs ────────────────────────────────────────────────────────
+
+/// The two tabs shown in the Board view detail panel.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum DetailTab {
+    /// Static assignment info (ID, machine, status, branch, etc.).
+    #[default]
+    Summary,
+    /// Live feed of worker events parsed from the log file.
+    Activity,
+}
 
 // ─── Sidebar views ────────────────────────────────────────────────────────────
 
@@ -186,6 +198,271 @@ fn kv_item(key: &str, val: &str, val_color: Option<Color>) -> ListItem {
         detail: None,
         decoration: Decoration::Normal,
     }
+}
+
+// ─── Activity log parsing ─────────────────────────────────────────────────────
+
+/// Build a plain `ListItem` for the Activity feed.
+fn activity_item(text: &str, color: Color) -> ListItem {
+    ListItem {
+        text: StyledText {
+            spans: vec![StyledSpan::with_fg(text, color)],
+        },
+        icon: None,
+        detail: None,
+        decoration: Decoration::Normal,
+    }
+}
+
+/// Minimal JSON string-field extractor.
+///
+/// Finds the first occurrence of `"field":"value"` in `json` and returns
+/// the unescaped string value. Returns `None` if the field is absent or
+/// its value is not a quoted string. Only handles compact (no-space) JSON,
+/// which is what `claude -p --output-format stream-json` emits.
+fn json_str(json: &str, field: &str) -> Option<String> {
+    let key = format!("\"{}\":\"", field);
+    let start = json.find(&key)? + key.len();
+    let rest = &json[start..];
+    let mut result = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '"' => break,
+            '\\' => {
+                match chars.next()? {
+                    'n' => result.push(' '),
+                    't' => result.push(' '),
+                    'r' => {}
+                    c => result.push(c),
+                }
+            }
+            c => result.push(c),
+        }
+    }
+    Some(result)
+}
+
+/// Minimal JSON numeric-field extractor (handles integers and floats).
+fn json_num(json: &str, field: &str) -> Option<f64> {
+    // Match `"field":NUMBER` — value is terminated by , } or whitespace.
+    let key = format!("\"{}\":", field);
+    let pos = json.find(&key)? + key.len();
+    let rest = json[pos..].trim_start();
+    // Skip null / boolean / quoted values.
+    if rest.starts_with('"') || rest.starts_with("null") || rest.starts_with("true") {
+        return None;
+    }
+    let end = rest
+        .find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    rest[..end].parse::<f64>().ok()
+}
+
+/// Return all tool names found in `"type":"tool_use"` blocks within `json`.
+///
+/// Searches for each `"type":"tool_use"` marker and extracts the `"name"`
+/// field from the same JSON object. Works for both top-level `tool_use`
+/// events and tool-use blocks nested inside `assistant` message content.
+fn extract_tool_names(json: &str) -> Vec<String> {
+    let marker = "\"type\":\"tool_use\"";
+    let mut names: Vec<String> = Vec::new();
+    let mut pos = 0;
+    while let Some(found) = json[pos..].find(marker) {
+        let after = pos + found + marker.len();
+        // "name" should appear within the next ~200 chars of the same object.
+        let window_end = (after + 200).min(json.len());
+        let window = &json[after..window_end];
+        if let Some(name) = json_str(window, "name") {
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        pos = after;
+    }
+    names
+}
+
+/// Extract the first non-empty text block from an assistant message.
+///
+/// Looks for `"type":"text"` content blocks and returns the `"text"` field.
+/// Returns an empty string if no text block is found.
+fn extract_text_block(json: &str) -> String {
+    let marker = "\"type\":\"text\"";
+    if let Some(pos) = json.find(marker) {
+        let after = &json[pos + marker.len()..];
+        if let Some(text) = json_str(after, "text") {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// Parse one stream-json event line into a displayable `ListItem`.
+///
+/// Returns `None` for event types that are too noisy to surface (e.g.
+/// `tool_result`, `system/task_*`, `rate_limit_event`).
+/// `turn_n` is a mutable counter incremented for each `assistant` event.
+fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
+    let type_val = json_str(line, "type")?;
+    match type_val.as_str() {
+        "system" => {
+            let subtype = json_str(line, "subtype").unwrap_or_default();
+            if subtype == "init" {
+                let model = json_str(line, "model").unwrap_or_else(|| "?".to_string());
+                return Some(activity_item(
+                    &format!("[init] {}", model),
+                    Color::rgb(100, 100, 180),
+                ));
+            }
+            // Skip task_started / task_completed / other system subtypes.
+            None
+        }
+
+        "assistant" => {
+            *turn_n += 1;
+            let n = *turn_n;
+
+            // Check for STATUS: / STUCK: inside the text block first.
+            let text = extract_text_block(line);
+            if let Some(idx) = text.find("STATUS:") {
+                let rest = &text[idx..];
+                let end = rest.find('\n').unwrap_or(rest.len());
+                let trimmed = rest[..end].trim();
+                return Some(activity_item(trimmed, Color::rgb(80, 210, 80)));
+            }
+            if let Some(idx) = text.find("STUCK:") {
+                let rest = &text[idx..];
+                let end = rest.find('\n').unwrap_or(rest.len());
+                let trimmed = rest[..end].trim();
+                return Some(activity_item(trimmed, Color::rgb(220, 120, 50)));
+            }
+
+            // Summarise tool calls in this turn.
+            let tools = extract_tool_names(line);
+            let summary = if !tools.is_empty() {
+                format!("[assistant] Turn {}: tool_use={}", n, tools.join(","))
+            } else if !text.is_empty() {
+                let display = trunc(&text, 80);
+                format!("[assistant] Turn {}: {:?}", n, display)
+            } else {
+                format!("[assistant] Turn {}", n)
+            };
+            Some(activity_item(&summary, Color::rgb(150, 180, 240)))
+        }
+
+        "tool_use" => {
+            let name = json_str(line, "name").unwrap_or_else(|| "?".to_string());
+            let detail = match name.as_str() {
+                "Bash" => json_str(line, "command")
+                    .map(|c| trunc(&c, 60).to_string())
+                    .unwrap_or_default(),
+                "Edit" | "Write" | "Read" | "Glob" | "NotebookEdit" => {
+                    json_str(line, "file_path").unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            let text = if detail.is_empty() {
+                format!("[tool] {}", name)
+            } else {
+                format!("[tool] {}: {}", name, detail)
+            };
+            Some(activity_item(&text, Color::rgb(180, 150, 220)))
+        }
+
+        "result" => {
+            let turns = json_num(line, "num_turns").unwrap_or(0.0) as u64;
+            let cost = json_num(line, "total_cost_usd").unwrap_or(0.0);
+            let stop = json_str(line, "stop_reason").unwrap_or_else(|| "?".to_string());
+            let dur_ms = json_num(line, "duration_ms").unwrap_or(0.0) as u64;
+            let dur = fmt_dur(dur_ms / 1000);
+            let text = format!(
+                "[result] {} turns  ${:.2}  {}  stop={}",
+                turns, cost, dur, stop
+            );
+            Some(activity_item(&text, Color::rgb(200, 200, 100)))
+        }
+
+        "rate_limit_event" => Some(activity_item(
+            "[rate_limit]",
+            Color::rgb(220, 150, 50),
+        )),
+
+        _ => None,
+    }
+}
+
+/// Read `~/.coord/logs/<id>.log` and return displayable `ListItem`s.
+///
+/// Handles both stream-json logs (NDJSON from `claude -p --output-format
+/// stream-json`) and plain-text logs (stdout of older workers). If the log
+/// file doesn't exist locally, returns a single "remote assignment" notice.
+fn load_activity_log(id: &str) -> Vec<ListItem> {
+    let path = coord_dir().join("logs").join(format!("{}.log", id));
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return vec![kv_item(
+                "",
+                "  Log not available (remote assignment)",
+                Some(Color::rgb(100, 100, 100)),
+            )];
+        }
+        Err(e) => {
+            return vec![kv_item(
+                "",
+                &format!("  Error reading log: {}", e),
+                Some(Color::rgb(220, 70, 70)),
+            )];
+        }
+    };
+
+    // Detect format: stream-json if the first non-comment non-blank line
+    // starts with `{`.
+    let is_json = content
+        .lines()
+        .find(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| l.trim_start().starts_with('{'))
+        .unwrap_or(false);
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut turn_n: usize = 0;
+
+    for line in content.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+
+        if is_json {
+            if let Some(item) = parse_json_event(line, &mut turn_n) {
+                items.push(item);
+            }
+        } else {
+            // Plain-text log: surface STATUS: / STUCK: lines.
+            if line.contains("STATUS:") {
+                if let Some(idx) = line.find("STATUS:") {
+                    let rest = line[idx..].trim();
+                    items.push(activity_item(rest, Color::rgb(80, 210, 80)));
+                }
+            } else if line.contains("STUCK:") {
+                if let Some(idx) = line.find("STUCK:") {
+                    let rest = line[idx..].trim();
+                    items.push(activity_item(rest, Color::rgb(220, 120, 50)));
+                }
+            }
+        }
+    }
+
+    if items.is_empty() {
+        items.push(kv_item(
+            "",
+            "  No activity yet",
+            Some(Color::rgb(100, 100, 100)),
+        ));
+    }
+
+    items
 }
 
 // ─── Data loading ─────────────────────────────────────────────────────────────
@@ -376,6 +653,8 @@ pub struct CoordApp {
     /// Scroll offset for the machines list.
     machine_scroll: usize,
     refreshed_at: Instant,
+    /// Which tab is active in the Board detail panel.
+    detail_tab: DetailTab,
 }
 
 impl Default for CoordApp {
@@ -396,6 +675,7 @@ impl CoordApp {
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
+            detail_tab: DetailTab::default(),
         };
         app.rebuild_board_tree_rows();
         app
@@ -770,6 +1050,63 @@ impl CoordApp {
         }
     }
 
+    /// Build the `TabBar` that sits at the top of the Board detail panel.
+    fn detail_tab_bar(&self) -> TabBar {
+        TabBar {
+            id: WidgetId::new("detail-tabs"),
+            tabs: vec![
+                TabItem {
+                    label: " Summary ".to_string(),
+                    is_active: self.detail_tab == DetailTab::Summary,
+                    is_dirty: false,
+                    is_preview: false,
+                },
+                TabItem {
+                    label: " Activity ".to_string(),
+                    is_active: self.detail_tab == DetailTab::Activity,
+                    is_dirty: false,
+                    is_preview: false,
+                },
+            ],
+            scroll_offset: 0,
+            right_segments: vec![],
+            active_accent: None,
+            show_tab_close: false,
+            compact: true,
+        }
+    }
+
+    /// Activity tab: live feed of worker events parsed from the log file.
+    fn activity_list(&self) -> ListView {
+        let (title, items) = match self.board_selected_assignment() {
+            None => (
+                " ACTIVITY ".to_string(),
+                vec![kv_item("", " No assignment selected", None)],
+            ),
+            Some(a) => {
+                let log_items = load_activity_log(&a.id);
+                (
+                    format!(" ACTIVITY — {} #{} ", a.repo, a.issue_number),
+                    log_items,
+                )
+            }
+        };
+
+        // Scroll to show the most-recent entries (bottom of the list).
+        // Subtract a generous window so the panel is filled with recent items.
+        let scroll_offset = items.len().saturating_sub(40);
+
+        ListView {
+            id: WidgetId::new("activity"),
+            title: Some(StyledText::plain(&title)),
+            items,
+            selected_idx: 0,
+            scroll_offset,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
     /// Detail panel for the selected machine: status + job history.
     fn machine_detail_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
@@ -922,7 +1259,7 @@ impl CoordApp {
                 },
             ],
             right_segments: vec![StatusBarSegment {
-                text: " 1=Board  2=Machines  Tab=switch  j/k=nav  Enter/Space=expand  r=refresh  q=quit ".to_string(),
+                text: " 1=Board  2=Machines  Tab=switch  j/k=nav  h/l=tabs  Enter/Space=expand  r=refresh  q=quit ".to_string(),
                 fg: Color::rgb(140, 140, 140),
                 bg: Color::rgb(30, 30, 40),
                 bold: false,
@@ -973,7 +1310,22 @@ impl AppLogic for CoordApp {
                 // TreeController::render reads self.board_tree (immutable) and
                 // passes it to backend.draw_tree — no mutation needed here.
                 self.board_tree.render(backend, inner.first_bounds);
-                backend.draw_list(inner.second_bounds, &self.detail_list());
+
+                // Detail panel: tab bar (1 line) + tab content below.
+                let d = inner.second_bounds;
+                let tab_h = lh;
+                let tab_rect = Rect::new(d.x, d.y, d.width, tab_h);
+                let content_rect =
+                    Rect::new(d.x, d.y + tab_h, d.width, (d.height - tab_h).max(0.0));
+                backend.draw_tab_bar(tab_rect, &self.detail_tab_bar(), None);
+                match self.detail_tab {
+                    DetailTab::Summary => {
+                        backend.draw_list(content_rect, &self.detail_list());
+                    }
+                    DetailTab::Activity => {
+                        backend.draw_list(content_rect, &self.activity_list());
+                    }
+                }
             }
             SidebarView::Machines => {
                 backend.draw_list(inner.first_bounds, &self.machines_list(true));
@@ -1113,6 +1465,26 @@ impl AppLogic for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── Left / h — switch to Summary tab (Board only) ─────
+                    Key::Named(NamedKey::Left) | Key::Char('h')
+                        if self.active_view == SidebarView::Board =>
+                    {
+                        if self.detail_tab != DetailTab::Summary {
+                            self.detail_tab = DetailTab::Summary;
+                            needs_redraw = true;
+                        }
+                    }
+
+                    // ── Right / l — switch to Activity tab (Board only) ───
+                    Key::Named(NamedKey::Right) | Key::Char('l')
+                        if self.active_view == SidebarView::Board =>
+                    {
+                        if self.detail_tab != DetailTab::Activity {
+                            self.detail_tab = DetailTab::Activity;
+                            needs_redraw = true;
+                        }
+                    }
+
                     Key::Char('r') => {
                         self.refresh();
                         needs_redraw = true;
@@ -1238,6 +1610,7 @@ mod tests {
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
+            detail_tab: DetailTab::default(),
         }
     }
 
@@ -1253,6 +1626,7 @@ mod tests {
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
+            detail_tab: DetailTab::default(),
         };
         app.rebuild_board_tree_rows();
         app
@@ -1404,6 +1778,7 @@ mod tests {
             machine_sel,
             machine_scroll,
             refreshed_at: Instant::now(),
+            detail_tab: DetailTab::default(),
         }
     }
 
@@ -1490,6 +1865,178 @@ mod tests {
     #[test]
     fn status_label_unknown_falls_back_to_pend() {
         assert_eq!(make_assignment("pending").status_label(), "PEND");
+    }
+
+    // ── DetailTab ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn detail_tab_default_is_summary() {
+        assert_eq!(DetailTab::default(), DetailTab::Summary);
+    }
+
+    #[test]
+    fn detail_tab_summary_active_in_new_app() {
+        let app = make_app_default();
+        assert_eq!(app.detail_tab, DetailTab::Summary);
+    }
+
+    // ── json_str ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn json_str_simple_string_field() {
+        let json = r#"{"type":"assistant","subtype":"init"}"#;
+        assert_eq!(json_str(json, "type"), Some("assistant".to_string()));
+        assert_eq!(json_str(json, "subtype"), Some("init".to_string()));
+    }
+
+    #[test]
+    fn json_str_missing_field_returns_none() {
+        let json = r#"{"type":"assistant"}"#;
+        assert_eq!(json_str(json, "model"), None);
+    }
+
+    #[test]
+    fn json_str_handles_backslash_n_escape() {
+        let json = r#"{"text":"hello\nworld"}"#;
+        // \n should become a space
+        assert_eq!(json_str(json, "text"), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn json_str_handles_escaped_quote() {
+        let json = r#"{"text":"say \"hi\""}"#;
+        assert_eq!(json_str(json, "text"), Some(r#"say "hi""#.to_string()));
+    }
+
+    // ── json_num ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn json_num_integer_field() {
+        let json = r#"{"num_turns":42,"cost":0.5}"#;
+        assert_eq!(json_num(json, "num_turns"), Some(42.0));
+    }
+
+    #[test]
+    fn json_num_float_field() {
+        let json = r#"{"total_cost_usd":1.23}"#;
+        let v = json_num(json, "total_cost_usd").unwrap();
+        assert!((v - 1.23).abs() < 1e-9);
+    }
+
+    #[test]
+    fn json_num_missing_field_returns_none() {
+        let json = r#"{"type":"result"}"#;
+        assert_eq!(json_num(json, "num_turns"), None);
+    }
+
+    #[test]
+    fn json_num_null_value_returns_none() {
+        let json = r#"{"num_turns":null}"#;
+        assert_eq!(json_num(json, "num_turns"), None);
+    }
+
+    // ── extract_tool_names ────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_tool_names_finds_bash_in_assistant_content() {
+        // Simplified assistant event with one tool_use block.
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"x","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let names = extract_tool_names(json);
+        assert_eq!(names, vec!["Bash"]);
+    }
+
+    #[test]
+    fn extract_tool_names_finds_multiple_unique_tools() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"},{"type":"tool_use","name":"Edit"},{"type":"tool_use","name":"Read"}]}}"#;
+        let names = extract_tool_names(json);
+        // Deduped: Read and Edit only once each.
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"Read".to_string()));
+        assert!(names.contains(&"Edit".to_string()));
+    }
+
+    #[test]
+    fn extract_tool_names_empty_if_no_tool_use() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}"#;
+        assert!(extract_tool_names(json).is_empty());
+    }
+
+    // ── parse_json_event ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_json_event_init_returns_item() {
+        let json = r#"{"type":"system","subtype":"init","model":"claude-sonnet-4-6","session_id":"abc"}"#;
+        let mut n = 0;
+        let item = parse_json_event(json, &mut n);
+        assert!(item.is_some());
+        let text = &item.unwrap().text.spans[0].text;
+        assert!(text.contains("[init]"));
+        assert!(text.contains("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn parse_json_event_assistant_increments_turn_counter() {
+        let json = r#"{"type":"assistant","message":{"content":[]}}"#;
+        let mut n = 0usize;
+        parse_json_event(json, &mut n);
+        assert_eq!(n, 1);
+        parse_json_event(json, &mut n);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn parse_json_event_assistant_with_tool_shows_tool_name() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"x"}]}}"#;
+        let mut n = 0;
+        let item = parse_json_event(json, &mut n).unwrap();
+        let text = &item.text.spans[0].text;
+        assert!(text.contains("tool_use=Bash"), "got: {}", text);
+    }
+
+    #[test]
+    fn parse_json_event_status_in_text_block() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"STATUS: did thing → doing next → confidence: high"}]}}"#;
+        let mut n = 0;
+        let item = parse_json_event(json, &mut n).unwrap();
+        let text = &item.text.spans[0].text;
+        assert!(text.starts_with("STATUS:"), "got: {}", text);
+    }
+
+    #[test]
+    fn parse_json_event_stuck_in_text_block() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"STUCK: tried X [why] [blocker]"}]}}"#;
+        let mut n = 0;
+        let item = parse_json_event(json, &mut n).unwrap();
+        let text = &item.text.spans[0].text;
+        assert!(text.starts_with("STUCK:"), "got: {}", text);
+    }
+
+    #[test]
+    fn parse_json_event_result_shows_summary() {
+        let json = r#"{"type":"result","num_turns":10,"total_cost_usd":0.42,"stop_reason":"end_turn","duration_ms":30000}"#;
+        let mut n = 0;
+        let item = parse_json_event(json, &mut n).unwrap();
+        let text = &item.text.spans[0].text;
+        assert!(text.contains("[result]"), "got: {}", text);
+        assert!(text.contains("10 turns"), "got: {}", text);
+    }
+
+    #[test]
+    fn parse_json_event_tool_result_returns_none() {
+        // tool_result events are filtered out (too noisy).
+        let json = r#"{"type":"tool_result","tool_use_id":"x","content":"ok"}"#;
+        let mut n = 0;
+        assert!(parse_json_event(json, &mut n).is_none());
+    }
+
+    // ── load_activity_log — plain text ────────────────────────────────────────
+
+    #[test]
+    fn load_activity_log_missing_file_returns_remote_notice() {
+        let items = load_activity_log("nonexistent_assignment_id_xyz");
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(text.contains("remote assignment"), "got: {}", text);
     }
 
     // ── Assignment::status_color ───────────────────────────────────────────────
