@@ -72,6 +72,7 @@ def _row_to_assignment(row: object) -> Assignment:
         required_gates=_json_loads(d.get("required_gates")) or [],
         plan=_json_loads(d.get("plan")),
         unreachable_count=d.get("unreachable_count") or 0,
+        review_iteration=d.get("review_iteration") or 0,
     )
 
 
@@ -101,6 +102,7 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         json.dumps(a.required_gates),
         json.dumps(a.plan) if a.plan is not None else None,
         a.unreachable_count,
+        a.review_iteration,
     )
 
 
@@ -110,13 +112,13 @@ _UPSERT_SQL = """
         status, type, branch, pr_url, briefing,
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
-        review_target, required_gates, plan, unreachable_count
+        review_target, required_gates, plan, unreachable_count, review_iteration
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
-        ?, ?, ?, ?
+        ?, ?, ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         status             = excluded.status,
@@ -134,7 +136,8 @@ _UPSERT_SQL = """
         briefing           = excluded.briefing,
         files_allowed      = excluded.files_allowed,
         files_forbidden    = excluded.files_forbidden,
-        required_gates     = excluded.required_gates
+        required_gates     = excluded.required_gates,
+        review_iteration   = excluded.review_iteration
 """
 
 
@@ -413,8 +416,8 @@ def record_dispatched_assignment(
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, review_of_assignment_id,
-            review_target, required_gates
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
+            review_target, required_gates, review_iteration
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -425,7 +428,8 @@ def record_dispatched_assignment(
             dispatched_at = excluded.dispatched_at,
             review_of_assignment_id = excluded.review_of_assignment_id,
             review_target = excluded.review_target,
-            required_gates = excluded.required_gates""",
+            required_gates = excluded.required_gates,
+            review_iteration = excluded.review_iteration""",
         (
             assignment.assignment_id or "",
             assignment.machine_name,
@@ -441,6 +445,7 @@ def record_dispatched_assignment(
             assignment.review_of_assignment_id,
             assignment.review_target,
             json.dumps(list(assignment.required_gates)),
+            assignment.review_iteration,
         ),
     )
     conn.commit()

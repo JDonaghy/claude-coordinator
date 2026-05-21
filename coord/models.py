@@ -91,6 +91,10 @@ class Assignment:
     # Empty list means "use config.pipeline.default_gates".
     # Examples: ["review", "merge"], ["merge"], ["review", "smoke", "merge"]
     required_gates: list[str] = field(default_factory=list)
+    # Auto-loop iteration counter. For the original work assignment this is 0.
+    # Each fix worker dispatched by auto_loop increments this by 1. Used to
+    # enforce pipeline.max_review_iterations and stop runaway loops.
+    review_iteration: int = 0
 
 
 @dataclass

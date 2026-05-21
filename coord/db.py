@@ -90,7 +90,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             required_gates TEXT DEFAULT '[]',
             plan TEXT,
             unreachable_count INTEGER DEFAULT 0,
-            exit_code INTEGER
+            exit_code INTEGER,
+            review_iteration INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -181,6 +182,26 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         INSERT OR IGNORE INTO schema_version VALUES (1);
     """)
     conn.commit()
+    # Column-level migrations for existing databases.  SQLite does not support
+    # "ADD COLUMN IF NOT EXISTS", so we catch OperationalError instead.
+    _migrate_add_columns(conn)
+
+
+def _migrate_add_columns(conn: sqlite3.Connection) -> None:
+    """Add new columns to existing databases via ALTER TABLE.
+
+    Safe to call on databases that already have the columns — the
+    OperationalError raised by SQLite is silently swallowed.
+    """
+    migrations = [
+        "ALTER TABLE assignments ADD COLUMN review_iteration INTEGER DEFAULT 0",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
 # ── JSON migration ─────────────────────────────────────────────────────────────

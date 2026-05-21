@@ -154,10 +154,22 @@ class PipelineConfig:
     assignment unless overridden by an issue label.  ``labels`` maps GitHub
     issue label names to gate lists, allowing per-label overrides — e.g.
     a ``hotfix`` label could bypass review with ``hotfix: [merge]``.
+
+    ``auto_loop`` enables the automated review → fix → re-review cycle.
+    When ``True`` (default), a review that requests changes automatically
+    dispatches a fix worker.  The fix worker then receives a fresh review,
+    and the cycle continues until the review approves or
+    ``max_review_iterations`` is reached.
+
+    ``max_review_iterations`` is the maximum number of fix rounds before
+    the auto-loop stops and posts a notice asking for manual intervention.
+    Default is 3.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["review", "merge"])
     labels: dict[str, list[str]] = field(default_factory=dict)
+    auto_loop: bool = True
+    max_review_iterations: int = 3
 
 
 @dataclass
@@ -584,6 +596,18 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
                     f"pipeline.labels[{k!r}] must be a list of gate name strings"
                 )
         cfg.labels = {k: list(v) for k, v in value.items()}
+
+    if "auto_loop" in raw:
+        value = raw["auto_loop"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.auto_loop must be a boolean")
+        cfg.auto_loop = value
+
+    if "max_review_iterations" in raw:
+        value = raw["max_review_iterations"]
+        if not isinstance(value, int) or value < 1:
+            raise ConfigError("pipeline.max_review_iterations must be a positive integer")
+        cfg.max_review_iterations = value
 
     return cfg
 
