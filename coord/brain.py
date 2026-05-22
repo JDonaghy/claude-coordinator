@@ -290,12 +290,26 @@ def _annotate_large_proposals(proposals: list[Proposal], config: Config) -> None
                 p.rationale += note
 
 
+def _apply_require_plan(proposals: list[Proposal], config: Config) -> None:
+    """When dispatch.require_plan is true, upgrade all work proposals to plan type.
+
+    Mutates proposals in place.  Only work proposals are affected — review, smoke,
+    and already-typed plan proposals are left unchanged.
+    """
+    if not config.dispatch.require_plan:
+        return
+    for p in proposals:
+        if p.type == "work":
+            p.type = "plan"
+
+
 def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
     """Full brain cycle: gather context, call Claude, return proposals and splits."""
     context = gather_context(config)
     prompt = build_prompt(config, context)
     response = call_claude(SYSTEM_PROMPT, prompt)
     proposals = parse_proposals(response)
+    _apply_require_plan(proposals, config)
     resolve_required_gates(proposals, config, context["issues_by_repo"])
     _annotate_large_proposals(proposals, config)
     return proposals, parse_split_proposals(response)
