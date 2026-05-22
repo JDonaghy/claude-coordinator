@@ -143,6 +143,8 @@ impl Assignment {
 #[derive(Clone)]
 struct Machine {
     name: String,
+    /// Tailscale FQDN (the `host` column in the machines table).
+    host: String,
     reachable: bool,
     active_count: usize,
     repos: Vec<String>,
@@ -445,32 +447,11 @@ fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
     }
 }
 
-/// Read `~/.coord/logs/<id>.log` and return displayable `ListItem`s.
+/// Parse log content (NDJSON stream-json or plain text) into displayable `ListItem`s.
 ///
 /// Handles both stream-json logs (NDJSON from `claude -p --output-format
-/// stream-json`) and plain-text logs (stdout of older workers). If the log
-/// file doesn't exist locally, returns a single "remote assignment" notice.
-fn load_activity_log(id: &str) -> Vec<ListItem> {
-    let path = coord_dir().join("logs").join(format!("{}.log", id));
-
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return vec![kv_item(
-                "",
-                "  Log not available (remote assignment)",
-                Some(Color::rgb(100, 100, 100)),
-            )];
-        }
-        Err(e) => {
-            return vec![kv_item(
-                "",
-                &format!("  Error reading log: {}", e),
-                Some(Color::rgb(220, 70, 70)),
-            )];
-        }
-    };
-
+/// stream-json`) and plain-text logs (stdout of older workers).
+fn parse_log_content(content: &str) -> Vec<ListItem> {
     // Detect format: stream-json if the first non-comment non-blank line
     // starts with `{`.
     let is_json = content
@@ -516,6 +497,35 @@ fn load_activity_log(id: &str) -> Vec<ListItem> {
     }
 
     items
+}
+
+/// Read `~/.coord/logs/<id>.log` and return displayable `ListItem`s.
+///
+/// If the log file doesn't exist locally, returns a single "remote assignment"
+/// notice. Callers that know the machine name should use
+/// [`CoordApp::get_activity_log`] instead, which fetches from the remote agent.
+fn load_activity_log(id: &str) -> Vec<ListItem> {
+    let path = coord_dir().join("logs").join(format!("{}.log", id));
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return vec![kv_item(
+                "",
+                "  Log not available (remote assignment)",
+                Some(Color::rgb(100, 100, 100)),
+            )];
+        }
+        Err(e) => {
+            return vec![kv_item(
+                "",
+                &format!("  Error reading log: {}", e),
+                Some(Color::rgb(220, 70, 70)),
+            )];
+        }
+    };
+
+    parse_log_content(&content)
 }
 
 // ─── Pipeline stage rendering ─────────────────────────────────────────────────
@@ -736,7 +746,7 @@ fn load_data() -> BoardData {
     // ── Machine reachability probes ────────────────────────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
     // Spawn all probes concurrently; collect within a 250 ms budget.
-    let probes: Vec<(String, Vec<String>, std::sync::mpsc::Receiver<bool>)> = machine_rows
+    let probes: Vec<(String, String, Vec<String>, std::sync::mpsc::Receiver<bool>)> = machine_rows
         .iter()
         .map(|(name, host, repos)| {
             use std::sync::mpsc;
@@ -745,13 +755,13 @@ fn load_data() -> BoardData {
             std::thread::spawn(move || {
                 let _ = tx.send(tcp_probe(&h, 7433));
             });
-            (name.clone(), repos.clone(), rx)
+            (name.clone(), host.clone(), repos.clone(), rx)
         })
         .collect();
 
     let machines: Vec<Machine> = probes
         .into_iter()
-        .map(|(name, repos, rx)| {
+        .map(|(name, host, repos, rx)| {
             let reachable = rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false);
             let active_count = assignments
                 .iter()
@@ -759,6 +769,7 @@ fn load_data() -> BoardData {
                 .count();
             Machine {
                 name,
+                host,
                 reachable,
                 active_count,
                 repos,
@@ -914,6 +925,12 @@ pub struct CoordApp {
     last_notify: Instant,
     /// Scroll offset for the bottom (command output) panel.
     command_scroll: usize,
+    /// Cache of remotely-fetched log items, keyed by assignment ID.
+    ///
+    /// Each entry stores `(fetched_at, items)`. Entries older than 30 s are
+    /// re-fetched on the next render that needs them. `RefCell` is used so the
+    /// cache can be updated from `&self` methods (render path).
+    remote_log_cache: std::cell::RefCell<std::collections::HashMap<String, (Instant, Vec<ListItem>)>>,
 }
 
 impl Default for CoordApp {
@@ -946,6 +963,7 @@ impl CoordApp {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         app.rebuild_board_sidebar();
         app
@@ -1684,6 +1702,77 @@ impl CoordApp {
         }
     }
 
+    /// Fetch the log for `id` from the remote agent at `http://<host>:7433/logs/<id>`.
+    ///
+    /// Returns parsed `ListItem`s. On network or HTTP error, returns a single
+    /// error notice row. Uses a 5-second connect+read timeout so a slow or
+    /// unreachable agent doesn't freeze the TUI render cycle.
+    fn fetch_remote_log(&self, id: &str, machine_name: &str) -> Vec<ListItem> {
+        let host = match self.data.machines.iter().find(|m| m.name == machine_name) {
+            Some(m) if !m.host.is_empty() => m.host.clone(),
+            _ => {
+                return vec![kv_item(
+                    "",
+                    "  Log unavailable: machine host unknown",
+                    Some(Color::rgb(100, 100, 100)),
+                )];
+            }
+        };
+
+        let url = format!("http://{}:7433/logs/{}", host, id);
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(5))
+            .build();
+
+        match agent.get(&url).call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(content) => parse_log_content(&content),
+                Err(e) => vec![kv_item(
+                    "",
+                    &format!("  Log unavailable: {}", e),
+                    Some(Color::rgb(220, 70, 70)),
+                )],
+            },
+            Err(e) => vec![kv_item(
+                "",
+                &format!("  Log unavailable: {}", e),
+                Some(Color::rgb(100, 100, 100)),
+            )],
+        }
+    }
+
+    /// Return log items for `id`, reading locally or fetching from the remote agent.
+    ///
+    /// 1. If a local log file exists, parse and return it immediately.
+    /// 2. Otherwise check the in-memory cache (30-second TTL).
+    /// 3. If the cache is cold or stale, fetch from `http://<host>:7433/logs/<id>`,
+    ///    update the cache, and return the items.
+    fn get_activity_log(&self, id: &str, machine_name: &str) -> Vec<ListItem> {
+        // 1. Local file takes priority — fast path, no cache involved.
+        let path = coord_dir().join("logs").join(format!("{}.log", id));
+        if path.exists() {
+            return load_activity_log(id);
+        }
+
+        // 2. Cache hit (within 30-second TTL).
+        {
+            let cache = self.remote_log_cache.borrow();
+            if let Some((fetched_at, items)) = cache.get(id) {
+                if fetched_at.elapsed() < Duration::from_secs(30) {
+                    return items.clone();
+                }
+            }
+        }
+
+        // 3. Fetch from remote agent and update cache.
+        let items = self.fetch_remote_log(id, machine_name);
+        self.remote_log_cache
+            .borrow_mut()
+            .insert(id.to_string(), (Instant::now(), items.clone()));
+        items
+    }
+
     /// Activity tab: live feed of worker events parsed from the log file.
     /// Shows the log for the most recent (or running) assignment in the group.
     fn activity_list(&self) -> ListView {
@@ -1702,7 +1791,7 @@ impl CoordApp {
                     .or_else(|| group.assignments.last());
                 match best {
                     Some(a) => {
-                        let log_items = load_activity_log(&a.id);
+                        let log_items = self.get_activity_log(&a.id, &a.machine);
                         let repo = self.board_active_repo().unwrap_or("?");
                         (
                             format!(" ACTIVITY — {} #{} ", repo, group.issue_number),
@@ -2621,6 +2710,7 @@ mod tests {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2787,6 +2877,7 @@ mod tests {
         let mut app = make_test_app(BoardData {
             machines: vec![Machine {
                 name: "m1".to_string(),
+                host: String::new(),
                 reachable: true,
                 active_count: 0,
                 repos: vec!["empty-repo".to_string()],
@@ -3172,6 +3263,7 @@ mod tests {
         let mut app = make_test_app(BoardData {
             machines: vec![Machine {
                 name: "m1".to_string(),
+                host: String::new(),
                 reachable: true,
                 active_count: 0,
                 repos: vec!["empty-repo".to_string()],
