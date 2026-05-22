@@ -134,6 +134,9 @@ Old agents (installed before 0.3.0) don't have the `/update` endpoint. SSH in to
 # If installed via install-agent.sh (venv + systemd user service):
 ~/.coord-venv/bin/pip install --upgrade claude-coordinator && systemctl --user restart coord-agent
 
+# Alternatively, re-run the installer (it's idempotent):
+curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash
+
 # If installed editable (git clone):
 cd ~/src/claude-coordinator && git pull --ff-only
 # then restart the agent process
