@@ -45,8 +45,9 @@ use quadraui::compose::sidebar_system::{
 };
 use quadraui::{
     Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
-    Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp, ShellConfig, ShellContext,
-    StatusBar, StatusBarSegment, StyledSpan, StyledText,
+    PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
+    Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
+    ShellConfig, ShellContext, StageStatus, StatusBar, StatusBarSegment, StyledSpan, StyledText,
     TabBar, TabItem, TreeRow, UiEvent, WidgetId,
 };
 
@@ -78,6 +79,8 @@ enum SidebarView {
     #[default]
     Board,
     Machines,
+    /// Pipeline panel: tracked-issue list + horizontal stage view per issue.
+    Pipeline,
 }
 
 impl SidebarView {
@@ -85,6 +88,7 @@ impl SidebarView {
         match self {
             SidebarView::Board => "Board",
             SidebarView::Machines => "Machines",
+            SidebarView::Pipeline => "Pipeline",
         }
     }
 }
@@ -200,6 +204,27 @@ struct Proposal {
     proposal_type: String,
 }
 
+/// One GitHub issue tracked by the pipeline panel.
+///
+/// Sourced from a background `gh search issues label:<L> state:open` poll
+/// and matched back to a coord-local repo name via `pipeline_repos` in
+/// `board_meta`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PipelineIssue {
+    /// Issue number within the GitHub repo.
+    number: u64,
+    /// Issue title (as returned by gh).
+    title: String,
+    /// `owner/name` slug of the GitHub repo the issue lives in.
+    repo_slug: String,
+    /// Coord-local repo name (matched via `pipeline_repos` map). `None` when
+    /// the issue is in a repo not declared in coordinator.yml — such issues
+    /// are still listed but cannot be dispatched.
+    coord_repo: Option<String>,
+    /// Tracked labels that flagged this issue.
+    matched_labels: Vec<String>,
+}
+
 #[derive(Default)]
 struct BoardData {
     local_machine: String,
@@ -207,6 +232,15 @@ struct BoardData {
     machines: Vec<Machine>,
     merge_queue: Vec<MergeQueueEntry>,
     proposals: Vec<Proposal>,
+    /// Pipeline gate names from `pipeline.default_gates` in coordinator.yml.
+    /// Defaults to `["review", "merge"]` when the board_meta key is absent.
+    pipeline_default_gates: Vec<String>,
+    /// GitHub issue labels considered "in the pipeline". Defaults to
+    /// `["coord"]` when the board_meta key is absent.
+    pipeline_tracked_labels: Vec<String>,
+    /// Coord-local repo name → GitHub `owner/repo` slug (and inverse).
+    /// Empty when no config snapshot has been written yet.
+    pipeline_repos: Vec<(String, String)>,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -792,8 +826,7 @@ fn load_data() -> BoardData {
                     local_machine,
                     assignments,
                     machines,
-                    merge_queue: Vec::new(),
-                    proposals: Vec::new(),
+                    ..BoardData::default()
                 };
             }
         };
@@ -814,8 +847,7 @@ fn load_data() -> BoardData {
                     local_machine,
                     assignments,
                     machines,
-                    merge_queue: Vec::new(),
-                    proposals: Vec::new(),
+                    ..BoardData::default()
                 };
             }
         };
@@ -835,7 +867,7 @@ fn load_data() -> BoardData {
                     assignments,
                     machines,
                     merge_queue,
-                    proposals: Vec::new(),
+                    ..BoardData::default()
                 };
             }
         };
@@ -857,12 +889,16 @@ fn load_data() -> BoardData {
                     assignments,
                     machines,
                     merge_queue,
-                    proposals: Vec::new(),
+                    ..BoardData::default()
                 };
             }
         };
         rows.filter_map(|r| r.ok()).collect()
     };
+
+    // ── Query board_meta for pipeline config ───────────────────────────────
+    let (pipeline_default_gates, pipeline_tracked_labels, pipeline_repos) =
+        load_pipeline_meta(&conn);
 
     BoardData {
         local_machine,
@@ -870,7 +906,223 @@ fn load_data() -> BoardData {
         machines,
         merge_queue,
         proposals,
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
     }
+}
+
+/// Width of one arrow connector between stages, in TUI cells. Mirrors the
+/// constant used by quadraui's `tui_pipeline_view_layout` so host
+/// hit-testing matches the painted geometry.
+const PIPELINE_ARROW_WIDTH: f32 = 4.0;
+/// Height of the action-button row when any stage has an action.
+const PIPELINE_ACTION_HEIGHT: f32 = 1.0;
+
+/// Compute the PipelineView layout that the TUI backend would paint into
+/// `rect`. Lets `mouse_main_click` hit-test without holding a `Backend`.
+///
+/// Matches the constants used by `quadraui::tui::tui_pipeline_view_layout`;
+/// if those drift, the GTK and TUI flows could disagree on stage bounds.
+fn tui_pipeline_layout(
+    view: &QuiPipelineView,
+    rect: Rect,
+) -> quadraui::PipelineViewLayout {
+    let action_h = if view.stages.iter().any(|s| s.action.is_some()) {
+        PIPELINE_ACTION_HEIGHT
+    } else {
+        0.0
+    };
+    view.layout(
+        rect.x,
+        rect.y,
+        quadraui::PipelineViewMeasure::new(
+            rect.width,
+            rect.height,
+            PIPELINE_ARROW_WIDTH,
+            action_h,
+        ),
+    )
+}
+
+/// Status badge text + colour for the Pipeline sidebar row.
+fn stage_badge(stage: &str) -> (String, Color) {
+    match stage {
+        "work" => ("work".into(), Color::rgb(150, 200, 240)),
+        "review" => ("review".into(), Color::rgb(200, 180, 100)),
+        "smoke" => ("smoke".into(), Color::rgb(180, 150, 220)),
+        "merge" => ("merge".into(), Color::rgb(100, 180, 240)),
+        "done" => ("done".into(), Color::rgb(120, 200, 120)),
+        other => (other.to_string(), Color::rgb(180, 180, 180)),
+    }
+}
+
+/// Fetch open GitHub issues with at least one of `labels`, via `gh search
+/// issues`.  Results are mapped back to coord-local repo names using
+/// `repos` (coord_name → owner/repo slug).
+///
+/// Implementation note: the function shells out to `gh`, parses the JSON
+/// blob it emits, and constructs a `PipelineLoaderResult`.  It runs in a
+/// background thread spawned from `maybe_kick_pipeline_loader` so the UI
+/// thread is never blocked on `gh`.
+fn fetch_pipeline_issues(
+    labels: &[String],
+    repos: &[(String, String)],
+) -> PipelineLoaderResult {
+    if labels.is_empty() {
+        return PipelineLoaderResult::Ok(Vec::new());
+    }
+
+    // Build inverse lookup: github slug → coord-local repo name.
+    let mut slug_to_local: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (local, slug) in repos {
+        slug_to_local.insert(slug.clone(), local.clone());
+    }
+
+    // One `gh search issues` call covers all configured labels at once.
+    // We OR the labels with `label:A,B,C` syntax.
+    let label_clause = labels
+        .iter()
+        .map(|l| format!("label:{}", l))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = format!("{} state:open", label_clause);
+
+    let output = std::process::Command::new("gh")
+        .args([
+            "search",
+            "issues",
+            &query,
+            "--json",
+            "number,title,labels,repository,url",
+            "--limit",
+            "100",
+        ])
+        .output();
+
+    let stdout = match output {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(o) => {
+            return PipelineLoaderResult::Err(
+                String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            );
+        }
+        Err(e) => return PipelineLoaderResult::Err(format!("could not run gh: {}", e)),
+    };
+
+    let value: serde_json::Value = match serde_json::from_slice(&stdout) {
+        Ok(v) => v,
+        Err(e) => return PipelineLoaderResult::Err(format!("gh JSON parse: {}", e)),
+    };
+
+    let arr = match value.as_array() {
+        Some(a) => a,
+        None => return PipelineLoaderResult::Ok(Vec::new()),
+    };
+
+    let label_set: std::collections::HashSet<&str> =
+        labels.iter().map(|s| s.as_str()).collect();
+    let mut issues: Vec<PipelineIssue> = Vec::new();
+    for item in arr {
+        let number = item
+            .get("number")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        if number == 0 {
+            continue;
+        }
+        let title = item
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let repo_slug = item
+            .get("repository")
+            .and_then(|r| r.get("nameWithOwner"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                // `gh search issues` sometimes returns the repo as a string url-tail.
+                item.get("url").and_then(|u| u.as_str()).and_then(|u| {
+                    // https://github.com/owner/name/issues/123
+                    let parts: Vec<&str> = u.trim_start_matches("https://github.com/").splitn(4, '/').collect();
+                    if parts.len() >= 2 {
+                        Some(format!("{}/{}", parts[0], parts[1]))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_default();
+        let issue_labels: Vec<String> = item
+            .get("labels")
+            .and_then(|l| l.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let matched_labels: Vec<String> = issue_labels
+            .iter()
+            .filter(|l| label_set.contains(l.as_str()))
+            .cloned()
+            .collect();
+        let coord_repo = slug_to_local.get(&repo_slug).cloned();
+        issues.push(PipelineIssue {
+            number,
+            title,
+            repo_slug,
+            coord_repo,
+            matched_labels,
+        });
+    }
+    // Stable order: by repo, then by issue number.
+    issues.sort_by(|a, b| a.repo_slug.cmp(&b.repo_slug).then(a.number.cmp(&b.number)));
+    PipelineLoaderResult::Ok(issues)
+}
+
+/// Read pipeline-related entries from the `board_meta` table.
+///
+/// Returns ``(default_gates, tracked_labels, repos)`` with the documented
+/// fallbacks when the keys are missing or unparseable: gates default to
+/// ``["review", "merge"]``, tracked labels to ``["coord"]``, and repos to
+/// an empty list.  Repos are returned as ``(coord_name, github_slug)``
+/// pairs preserving insertion order.
+fn load_pipeline_meta(
+    conn: &Connection,
+) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
+    fn read_key(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM board_meta WHERE key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    let default_gates: Vec<String> = read_key(conn, "pipeline_default_gates")
+        .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+        .unwrap_or_else(|| vec!["review".to_string(), "merge".to_string()]);
+
+    let tracked_labels: Vec<String> = read_key(conn, "pipeline_tracked_labels")
+        .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+        .unwrap_or_else(|| vec!["coord".to_string()]);
+
+    let repos: Vec<(String, String)> = read_key(conn, "pipeline_repos")
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+        .and_then(|val| match val {
+            serde_json::Value::Object(map) => Some(
+                map.into_iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    (default_gates, tracked_labels, repos)
 }
 
 // ─── CoordApp ─────────────────────────────────────────────────────────────────
@@ -914,6 +1166,28 @@ pub struct CoordApp {
     last_notify: Instant,
     /// Scroll offset for the bottom (command output) panel.
     command_scroll: usize,
+    // ── Pipeline panel state ────────────────────────────────────────────
+    /// SidebarSystem listing tracked issues (one section per label).
+    pipeline_sidebar: SidebarSystem,
+    /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
+    pipeline_issues: Vec<PipelineIssue>,
+    /// Selected issue index into `pipeline_issues`, if any.
+    pipeline_sel: Option<usize>,
+    /// In-flight `gh search issues` poll (None when idle).
+    pipeline_loader: Option<std::sync::mpsc::Receiver<PipelineLoaderResult>>,
+    /// When `gh` was last queried — bounds refresh rate.
+    pipeline_last_load: Option<Instant>,
+    /// Status message shown when a dispatch is queued/skipped due to no
+    /// available machine. Cleared after a short TTL.
+    pipeline_status: Option<(String, Instant)>,
+}
+
+/// Result returned by the background `gh search issues` poll.
+enum PipelineLoaderResult {
+    /// Successfully parsed issues from gh output.
+    Ok(Vec<PipelineIssue>),
+    /// gh failed (missing CLI, network error, auth issue, etc.).
+    Err(String),
 }
 
 impl Default for CoordApp {
@@ -929,6 +1203,9 @@ impl CoordApp {
         let mut sidebar = SidebarSystem::new(Vec::new());
         sidebar.set_navigation_mode(NavigationMode::Selection);
         sidebar.set_allow_collapse(true);
+        let mut pipeline_sidebar = SidebarSystem::new(Vec::new());
+        pipeline_sidebar.set_navigation_mode(NavigationMode::Selection);
+        pipeline_sidebar.set_allow_collapse(true);
         let mut app = Self {
             data,
             active_view: SidebarView::default(),
@@ -946,8 +1223,15 @@ impl CoordApp {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            pipeline_sidebar,
+            pipeline_issues: Vec::new(),
+            pipeline_sel: None,
+            pipeline_loader: None,
+            pipeline_last_load: None,
+            pipeline_status: None,
         };
         app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar();
         app
     }
 
@@ -972,6 +1256,13 @@ impl CoordApp {
                     tooltip: "Machines".into(),
                     title: "MACHINES".into(),
                 },
+                PanelDefinition {
+                    id: WidgetId::new("panel:pipeline"),
+                    // ▶ marks a horizontal play / run pipeline.
+                    icon: "▶".into(),
+                    tooltip: "Pipeline".into(),
+                    title: "PIPELINE".into(),
+                },
             ],
         )
         .with_status_bar()
@@ -993,6 +1284,8 @@ impl CoordApp {
             self.machine_sel = 0;
         }
         self.rebuild_board_sidebar();
+        // Re-derive pipeline stage badges from the fresh assignment data.
+        self.rebuild_pipeline_sidebar();
     }
 
     /// Group assignments by `(repo, issue_number)`, returning repos in a
@@ -1859,6 +2152,464 @@ impl CoordApp {
     }
 
 
+    // ── Pipeline panel ────────────────────────────────────────────────────
+
+    /// Effective list of stages: always "work" followed by the configured
+    /// `pipeline.default_gates` (deduplicated to handle accidental "work"
+    /// entries in the gate list).
+    fn pipeline_stage_names(&self) -> Vec<String> {
+        let mut stages: Vec<String> = vec!["work".to_string()];
+        for g in &self.data.pipeline_default_gates {
+            if g != "work" {
+                stages.push(g.clone());
+            }
+        }
+        stages
+    }
+
+    /// Build the SidebarSystem entries for the Pipeline panel. One section
+    /// per tracked label, with one row per matching issue.  Re-runs after
+    /// every successful `gh` poll.
+    fn rebuild_pipeline_sidebar(&mut self) {
+        // Preserve selection across rebuilds by (repo_slug, issue#).
+        let prev_sel = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .map(|i| (i.repo_slug.clone(), i.number));
+
+        // Build one section per label (so empty-label apps still render
+        // a useful sidebar).
+        let mut defs: Vec<SidebarSectionDef> = Vec::new();
+        for label in &self.data.pipeline_tracked_labels {
+            let mut def = SidebarSectionDef::new(
+                format!("section:label:{}", label),
+                label.clone(),
+            );
+            def.show_chevron = true;
+            def.size = SectionSize::Content;
+            defs.push(def);
+        }
+
+        let mut sidebar = SidebarSystem::new(defs);
+        sidebar.set_navigation_mode(NavigationMode::Selection);
+        sidebar.set_allow_collapse(true);
+        sidebar.set_scroll_mode(ScrollMode::WholePanel);
+
+        // Group issues by their first matched label (a single issue with
+        // multiple matched labels appears once, under its first match).
+        for (sec_idx, label) in self.data.pipeline_tracked_labels.iter().enumerate() {
+            let mut rows: Vec<TreeRow> = Vec::new();
+            let mut count = 0usize;
+            for (i, issue) in self.pipeline_issues.iter().enumerate() {
+                if issue
+                    .matched_labels
+                    .first()
+                    .map(|l| l == label)
+                    .unwrap_or(false)
+                {
+                    let stage_name = self.derive_current_stage(issue);
+                    let (badge_text, badge_color) = stage_badge(&stage_name);
+                    let title_color = if issue.coord_repo.is_some() {
+                        Color::rgb(210, 210, 210)
+                    } else {
+                        Color::rgb(140, 140, 140)
+                    };
+                    let text = StyledText {
+                        spans: vec![
+                            StyledSpan::with_fg(
+                                format!("#{:<5}", issue.number),
+                                Color::rgb(150, 150, 240),
+                            ),
+                            StyledSpan::with_fg(trunc(&issue.title, 22), title_color),
+                        ],
+                    };
+                    rows.push(TreeRow {
+                        path: vec![count as u16],
+                        indent: 0,
+                        icon: None,
+                        text,
+                        badge: Some(Badge::colored(&badge_text, badge_color)),
+                        is_expanded: None,
+                        decoration: Decoration::Normal,
+                        edit: None,
+                    });
+                    let _ = i;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                sidebar.set_section_badge(
+                    sec_idx,
+                    Some(StyledText::plain(format!("({})", count))),
+                );
+            }
+            sidebar.set_rows(sec_idx, rows);
+        }
+
+        // Default-select the first label section that has at least one issue.
+        if sidebar.active_section().is_none() {
+            for (i, label) in self.data.pipeline_tracked_labels.iter().enumerate() {
+                let has_any = self.pipeline_issues.iter().any(|issue| {
+                    issue
+                        .matched_labels
+                        .first()
+                        .map(|l| l == label)
+                        .unwrap_or(false)
+                });
+                if has_any {
+                    sidebar.set_active_section(Some(i));
+                    sidebar.set_selected_path(i, Some(vec![0]));
+                    break;
+                }
+            }
+        }
+
+        self.pipeline_sidebar = sidebar;
+
+        // Restore previous selection if the issue still exists.
+        if let Some((repo, num)) = prev_sel {
+            for (i, issue) in self.pipeline_issues.iter().enumerate() {
+                if issue.repo_slug == repo && issue.number == num {
+                    self.pipeline_sel = Some(i);
+                    return;
+                }
+            }
+        }
+        // Otherwise sync `pipeline_sel` to the sidebar's default selection.
+        self.pipeline_sel = self.selected_pipeline_index();
+    }
+
+    /// Resolve the SidebarSystem's current selection to a `pipeline_issues`
+    /// index.  Returns `None` when nothing is selected or the selection
+    /// points past the end (can happen after rebuild + label re-grouping).
+    fn selected_pipeline_index(&self) -> Option<usize> {
+        let section = self.pipeline_sidebar.active_section()?;
+        let label = self.data.pipeline_tracked_labels.get(section)?;
+        let path = self.pipeline_sidebar.selected_path(section)?;
+        let row = *path.first()? as usize;
+        let mut count = 0usize;
+        for (i, issue) in self.pipeline_issues.iter().enumerate() {
+            if issue
+                .matched_labels
+                .first()
+                .map(|l| l == label)
+                .unwrap_or(false)
+            {
+                if count == row {
+                    return Some(i);
+                }
+                count += 1;
+            }
+        }
+        None
+    }
+
+    /// Resolve the per-stage status of an issue from existing assignments.
+    ///
+    /// "work" is the first stage and matches assignments with
+    /// `assignment_type` `None` or `"work"`.  Other stage names match
+    /// assignments by exact `assignment_type`.
+    fn stage_status_for(
+        &self,
+        issue: &PipelineIssue,
+        stage: &str,
+    ) -> StageStatus {
+        // Collect assignments for this issue (matching repo or repo_slug).
+        let related: Vec<&Assignment> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| {
+                if let Some(local) = &issue.coord_repo {
+                    a.repo == *local
+                } else {
+                    // No local mapping known — match by issue # alone.
+                    true
+                }
+            })
+            .collect();
+
+        let stage_match = |a: &&Assignment| -> bool {
+            let t = a.assignment_type.as_deref().unwrap_or("work");
+            if stage == "work" {
+                t == "work" || t == "plan"
+            } else {
+                t == stage
+            }
+        };
+
+        // Most recent first (assignments are pre-sorted by dispatched_at desc).
+        let matching: Vec<&Assignment> = related.into_iter().filter(stage_match).collect();
+        if matching.iter().any(|a| a.status == "running") {
+            return StageStatus::Active;
+        }
+        if let Some(latest) = matching.first() {
+            match latest.status.as_str() {
+                "done" => return StageStatus::Done,
+                "failed" => return StageStatus::Failed,
+                _ => {}
+            }
+        }
+        StageStatus::Pending
+    }
+
+    /// Returns the *display* current stage for the sidebar badge — the
+    /// first non-Done stage, or "merged" once every stage is Done.
+    fn derive_current_stage(&self, issue: &PipelineIssue) -> String {
+        let stages = self.pipeline_stage_names();
+        for s in &stages {
+            let st = self.stage_status_for(issue, s);
+            if st != StageStatus::Done {
+                return s.clone();
+            }
+        }
+        "done".to_string()
+    }
+
+    /// Build the quadraui `PipelineView` widget for the selected issue.
+    fn build_pipeline_widget(&self) -> Option<QuiPipelineView> {
+        let idx = self.pipeline_sel?;
+        let issue = self.pipeline_issues.get(idx)?;
+        let stage_names = self.pipeline_stage_names();
+
+        // The Go button goes on the first Pending stage that we know how
+        // to dispatch — currently the "work" stage only (other gates are
+        // dispatched implicitly by the coordinator after work completes).
+        let mut go_attached = false;
+        let stages: Vec<QuiPipelineStage> = stage_names
+            .iter()
+            .map(|name| {
+                let status = self.stage_status_for(issue, name);
+                let label = match name.as_str() {
+                    "work" => "Work".to_string(),
+                    other => {
+                        let mut s = other.to_string();
+                        if let Some(c) = s.get_mut(0..1) {
+                            c.make_ascii_uppercase();
+                        }
+                        s
+                    }
+                };
+                let action = if !go_attached
+                    && status == StageStatus::Pending
+                    && name == "work"
+                    && issue.coord_repo.is_some()
+                {
+                    go_attached = true;
+                    Some("Go".to_string())
+                } else {
+                    None
+                };
+                QuiPipelineStage {
+                    label,
+                    status,
+                    action,
+                }
+            })
+            .collect();
+
+        Some(QuiPipelineView {
+            id: WidgetId::new("pipeline:detail"),
+            stages,
+            focused_stage: None,
+        })
+    }
+
+    /// Pick the best machine to dispatch `coord_repo` work to.
+    ///
+    /// Prefers reachable machines that list `coord_repo` in their `repos`
+    /// and have the fewest currently-running assignments.  Returns `None`
+    /// when no reachable machine claims this repo.
+    fn best_machine_for(&self, coord_repo: &str) -> Option<&Machine> {
+        self.data
+            .machines
+            .iter()
+            .filter(|m| m.reachable && m.repos.iter().any(|r| r == coord_repo))
+            .min_by_key(|m| m.active_count)
+    }
+
+    /// Dispatch the "Go" action for the currently selected issue. Spawns
+    /// `coord assign <machine> <repo> <issue>` via the existing command
+    /// runner. Returns `true` if a command was spawned, `false` if we
+    /// fell back to a queue-style status message.
+    fn dispatch_pipeline_go(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let Some(coord_repo) = issue.coord_repo.clone() else {
+            self.pipeline_status = Some((
+                format!(
+                    "no local repo mapping for {} — add it to coordinator.yml",
+                    issue.repo_slug
+                ),
+                Instant::now(),
+            ));
+            return false;
+        };
+        let Some(machine) = self.best_machine_for(&coord_repo) else {
+            self.pipeline_status = Some((
+                format!(
+                    "no reachable machine for {} — queued (issue #{})",
+                    coord_repo, issue.number
+                ),
+                Instant::now(),
+            ));
+            return false;
+        };
+        let machine_name = machine.name.clone();
+        let issue_str = issue.number.to_string();
+        let spawned = self.command_runner.spawn(&[
+            "assign",
+            &machine_name,
+            &coord_repo,
+            &issue_str,
+        ]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("dispatched #{} → {}", issue.number, machine_name),
+                Instant::now(),
+            ));
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
+    }
+
+    /// Kick off a background `gh search issues` poll (no-op if one is
+    /// already in flight or we polled less than 15 s ago).
+    fn maybe_kick_pipeline_loader(&mut self) {
+        if self.pipeline_loader.is_some() {
+            return;
+        }
+        if let Some(t) = self.pipeline_last_load {
+            if t.elapsed() < Duration::from_secs(15) {
+                return;
+            }
+        }
+        if self.data.pipeline_tracked_labels.is_empty() {
+            return;
+        }
+        let labels = self.data.pipeline_tracked_labels.clone();
+        let repos = self.data.pipeline_repos.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = fetch_pipeline_issues(&labels, &repos);
+            let _ = tx.send(result);
+        });
+        self.pipeline_loader = Some(rx);
+        self.pipeline_last_load = Some(Instant::now());
+    }
+
+    /// Drain the in-flight poll channel without blocking. Returns `true`
+    /// when results were received and the issue list/sidebar changed.
+    fn poll_pipeline_loader(&mut self) -> bool {
+        let rx = match &self.pipeline_loader {
+            Some(rx) => rx,
+            None => return false,
+        };
+        match rx.try_recv() {
+            Ok(PipelineLoaderResult::Ok(issues)) => {
+                self.pipeline_issues = issues;
+                self.pipeline_loader = None;
+                self.rebuild_pipeline_sidebar();
+                true
+            }
+            Ok(PipelineLoaderResult::Err(msg)) => {
+                self.pipeline_status = Some((format!("gh: {}", msg), Instant::now()));
+                self.pipeline_loader = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pipeline_loader = None;
+                false
+            }
+        }
+    }
+
+    /// Pipeline panel detail-side: list-style fallback when no PipelineView
+    /// can be drawn yet (no issue selected / still loading).
+    fn pipeline_placeholder_list(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+        if self.pipeline_loader.is_some() && self.pipeline_issues.is_empty() {
+            items.push(kv_item(
+                "",
+                "  Loading tracked issues from GitHub...",
+                Some(Color::rgb(180, 180, 100)),
+            ));
+        } else if self.pipeline_issues.is_empty() {
+            let labels = self.data.pipeline_tracked_labels.join(", ");
+            items.push(kv_item(
+                "",
+                &format!(
+                    "  No issues found with label(s): {}",
+                    if labels.is_empty() { "(none)".into() } else { labels }
+                ),
+                Some(Color::rgb(140, 140, 140)),
+            ));
+            items.push(kv_item(
+                "",
+                "  Press 'r' to refresh, or label issues with 'coord' on GitHub.",
+                Some(Color::rgb(100, 100, 100)),
+            ));
+        } else {
+            items.push(kv_item(
+                "",
+                "  Select an issue on the left to see its pipeline.",
+                Some(Color::rgb(140, 140, 140)),
+            ));
+        }
+        ListView {
+            id: WidgetId::new("pipeline-empty"),
+            title: Some(StyledText::plain(" PIPELINE ")),
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
+    /// Detail strip for the selected issue (issue title, repo, gates, etc.).
+    fn pipeline_issue_summary(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+        if let Some(idx) = self.pipeline_sel {
+            if let Some(issue) = self.pipeline_issues.get(idx) {
+                items.push(kv_item("", &format!(" #{}  {}", issue.number, trunc(&issue.title, 60)), Some(Color::rgb(220, 220, 240))));
+                items.push(kv_item("Repo", &issue.repo_slug, None));
+                if let Some(local) = &issue.coord_repo {
+                    items.push(kv_item("Local", local, Some(Color::rgb(140, 200, 140))));
+                } else {
+                    items.push(kv_item("Local", "(no coordinator.yml mapping)", Some(Color::rgb(220, 150, 80))));
+                }
+                items.push(kv_item("Labels", &issue.matched_labels.join(", "), None));
+                items.push(kv_item("Gates", &self.pipeline_stage_names().join(" → "), None));
+                if let Some((msg, when)) = &self.pipeline_status {
+                    if when.elapsed() < Duration::from_secs(8) {
+                        items.push(kv_item(
+                            "",
+                            &format!("  {}", msg),
+                            Some(Color::rgb(180, 180, 100)),
+                        ));
+                    }
+                }
+            }
+        }
+        ListView {
+            id: WidgetId::new("pipeline-summary"),
+            title: Some(StyledText::plain(" ISSUE ")),
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
+
     // ── Bottom panel: command output ──────────────────────────────────────
 
     fn command_output_list(&self) -> ListView {
@@ -2021,12 +2772,40 @@ impl CoordApp {
                 }
                 false
             }
+            SidebarView::Pipeline => {
+                let result = self.pipeline_sidebar.handle(event, backend, sidebar_b);
+                self.pipeline_sel = self.selected_pipeline_index();
+                match result {
+                    SidebarEvent::RowSelected { .. }
+                    | SidebarEvent::RowActivated { .. }
+                    | SidebarEvent::HeaderActivated { .. }
+                    | SidebarEvent::StateChanged
+                    | SidebarEvent::Consumed
+                    | SidebarEvent::ScrollChanged { .. } => true,
+                    _ => false,
+                }
+            }
         }
     }
 
     /// Click in the main panel — in Board view this handles the tab bar
-    /// (first row of the panel).
+    /// (first row of the panel).  In Pipeline view this hit-tests the
+    /// PipelineView primitive and dispatches the "Go" action.
     fn mouse_main_click(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
+        if self.active_view == SidebarView::Pipeline {
+            if let Some(view) = self.build_pipeline_widget() {
+                let pv_rect = pipeline_detail_pv_rect(main_b, lh);
+                let layout = tui_pipeline_layout(&view, pv_rect);
+                match layout.hit_test(pos.x, pos.y) {
+                    PipelineHit::Action(_) => {
+                        self.dispatch_pipeline_go();
+                        return true;
+                    }
+                    PipelineHit::Body(_) | PipelineHit::Empty => return false,
+                }
+            }
+            return false;
+        }
         if self.active_view != SidebarView::Board {
             return false;
         }
@@ -2076,6 +2855,10 @@ impl CoordApp {
                 }
                 true
             }
+            SidebarView::Pipeline => {
+                self.pipeline_sidebar.handle(event, backend, sidebar_b);
+                true
+            }
         }
     }
 
@@ -2116,6 +2899,13 @@ impl CoordApp {
                 } else if delta.y < 0.0 {
                     self.machine_detail_scroll = (self.machine_detail_scroll + 1).min(max);
                 }
+                true
+            }
+            SidebarView::Pipeline => {
+                // The Pipeline detail pane has no scrollable region today —
+                // the issue summary fits in a fixed strip. Consume the event
+                // anyway so it doesn't propagate further.
+                let _ = visible;
                 true
             }
         }
@@ -2213,6 +3003,9 @@ impl ShellApp for CoordApp {
                 SidebarView::Machines => {
                     backend.draw_list(sidebar_rect, &self.machines_list(true));
                 }
+                SidebarView::Pipeline => {
+                    self.pipeline_sidebar.render(backend, sidebar_rect);
+                }
             }
         }
 
@@ -2238,6 +3031,23 @@ impl ShellApp for CoordApp {
             SidebarView::Machines => {
                 backend.draw_list(m, &self.machine_detail_list());
             }
+            SidebarView::Pipeline => {
+                // Top: PipelineView widget if an issue is selected.
+                // Bottom: issue summary list.
+                let pv_rect = pipeline_detail_pv_rect(m, lh);
+                let summary_rect = Rect::new(
+                    m.x,
+                    pv_rect.y + pv_rect.height,
+                    m.width,
+                    (m.height - (pv_rect.y - m.y) - pv_rect.height).max(0.0),
+                );
+                if let Some(view) = self.build_pipeline_widget() {
+                    backend.draw_pipeline_view(pv_rect, &view);
+                    backend.draw_list(summary_rect, &self.pipeline_issue_summary());
+                } else {
+                    backend.draw_list(m, &self.pipeline_placeholder_list());
+                }
+            }
         }
 
         // ── Bottom panel: command output ─────────────────────────────────
@@ -2252,12 +3062,20 @@ impl ShellApp for CoordApp {
         // ── Auto-refresh (ShellApp has no tick(); check elapsed on every event) ─
         if self.refreshed_at.elapsed() >= REFRESH_EVERY {
             self.refresh();
+            if self.active_view == SidebarView::Pipeline {
+                self.maybe_kick_pipeline_loader();
+            }
             needs_redraw = true;
         }
 
         // ── Poll background command runner ──────────────────────────────
         if self.command_runner.poll() {
             self.refresh();
+            needs_redraw = true;
+        }
+
+        // ── Poll background gh issue loader ─────────────────────────────
+        if self.poll_pipeline_loader() {
             needs_redraw = true;
         }
 
@@ -2291,6 +3109,11 @@ impl ShellApp for CoordApp {
                     }
                     Key::Char('2') => {
                         self.active_view = SidebarView::Machines;
+                        needs_redraw = true;
+                    }
+                    Key::Char('3') => {
+                        self.active_view = SidebarView::Pipeline;
+                        self.maybe_kick_pipeline_loader();
                         needs_redraw = true;
                     }
 
@@ -2332,6 +3155,10 @@ impl ShellApp for CoordApp {
                                 }
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
+                            SidebarView::Pipeline => {
+                                self.pipeline_sidebar.handle(&event, backend, list_b);
+                                self.pipeline_sel = self.selected_pipeline_index();
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -2357,6 +3184,10 @@ impl ShellApp for CoordApp {
                                 }
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
+                            SidebarView::Pipeline => {
+                                self.pipeline_sidebar.handle(&event, backend, list_b);
+                                self.pipeline_sel = self.selected_pipeline_index();
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -2377,6 +3208,10 @@ impl ShellApp for CoordApp {
                                 self.machine_sel = 0;
                                 self.machine_detail_scroll = 0;
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
+                            }
+                            SidebarView::Pipeline => {
+                                self.pipeline_sidebar.handle(&event, backend, list_b);
+                                self.pipeline_sel = self.selected_pipeline_index();
                             }
                         }
                         needs_redraw = true;
@@ -2402,7 +3237,19 @@ impl ShellApp for CoordApp {
                                 }
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
+                            SidebarView::Pipeline => {
+                                self.pipeline_sidebar.handle(&event, backend, list_b);
+                                self.pipeline_sel = self.selected_pipeline_index();
+                            }
                         }
+                        needs_redraw = true;
+                    }
+
+                    // ── Enter — fire Go for selected Pipeline issue ──────
+                    Key::Named(NamedKey::Enter)
+                        if self.active_view == SidebarView::Pipeline =>
+                    {
+                        self.dispatch_pipeline_go();
                         needs_redraw = true;
                     }
 
@@ -2519,6 +3366,10 @@ impl ShellApp for CoordApp {
             self.active_view = match panel_id.as_str() {
                 "panel:board" => SidebarView::Board,
                 "panel:machines" => SidebarView::Machines,
+                "panel:pipeline" => {
+                    self.maybe_kick_pipeline_loader();
+                    SidebarView::Pipeline
+                }
                 _ => return,
             };
         }
@@ -2534,6 +3385,20 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
     }
     let content_h = (panel.height - lh).max(0.0); // minus list title row
     (content_h / lh) as usize
+}
+
+/// Carve out the rect used by the PipelineView primitive at the top of the
+/// Pipeline detail pane.  Reserves 6 rows by default (icon row + label row
+/// + action row + 1 row of padding/border), clamped to ≤ 50 % of the
+/// available height so the issue summary below remains visible.
+fn pipeline_detail_pv_rect(main: Rect, lh: f32) -> Rect {
+    if lh <= 0.0 {
+        return Rect::new(main.x, main.y, main.width, 0.0);
+    }
+    let want_rows = 6.0_f32;
+    let max_h = (main.height * 0.55).max(lh);
+    let h = (want_rows * lh).min(max_h);
+    Rect::new(main.x, main.y, main.width, h)
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -2604,6 +3469,9 @@ mod tests {
         let mut sidebar = SidebarSystem::new(Vec::new());
         sidebar.set_navigation_mode(NavigationMode::Selection);
         sidebar.set_allow_collapse(true);
+        let mut pipeline_sidebar = SidebarSystem::new(Vec::new());
+        pipeline_sidebar.set_navigation_mode(NavigationMode::Selection);
+        pipeline_sidebar.set_allow_collapse(true);
         CoordApp {
             data,
             active_view: SidebarView::default(),
@@ -2621,6 +3489,12 @@ mod tests {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            pipeline_sidebar,
+            pipeline_issues: Vec::new(),
+            pipeline_sel: None,
+            pipeline_loader: None,
+            pipeline_last_load: None,
+            pipeline_status: None,
         }
     }
 
@@ -3199,6 +4073,275 @@ mod tests {
         app.rebuild_board_sidebar();
         let after = app.board_selected_issue();
         assert_eq!(before, after, "selection should survive rebuild");
+    }
+
+    // ── Pipeline panel ────────────────────────────────────────────────────
+
+    fn make_pipeline_app() -> CoordApp {
+        let data = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            machines: vec![Machine {
+                name: "m1".to_string(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["api".to_string()],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 42,
+                title: "Add cool thing".to_string(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+            },
+            PipelineIssue {
+                number: 99,
+                title: "Mystery repo issue".to_string(),
+                repo_slug: "other/repo".to_string(),
+                coord_repo: None,
+                matched_labels: vec!["coord".to_string()],
+            },
+        ];
+        app.rebuild_pipeline_sidebar();
+        app
+    }
+
+    #[test]
+    fn pipeline_stage_names_prepends_work() {
+        let app = make_pipeline_app();
+        assert_eq!(
+            app.pipeline_stage_names(),
+            vec!["work".to_string(), "review".to_string(), "merge".to_string()]
+        );
+    }
+
+    #[test]
+    fn pipeline_stage_names_dedupes_explicit_work_in_gates() {
+        let mut app = make_pipeline_app();
+        app.data.pipeline_default_gates = vec![
+            "work".to_string(),
+            "review".to_string(),
+        ];
+        // Explicit "work" in default_gates must not duplicate the prepended one.
+        assert_eq!(
+            app.pipeline_stage_names(),
+            vec!["work".to_string(), "review".to_string()]
+        );
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_groups_issues_by_label() {
+        let app = make_pipeline_app();
+        // One section per tracked label.
+        assert_eq!(app.data.pipeline_tracked_labels.len(), 1);
+        // Two issues both have label "coord" → both appear in section 0.
+        assert!(app.pipeline_issues.len() == 2);
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_default_selects_first_issue() {
+        let app = make_pipeline_app();
+        // Default selection should be the first issue under the first label.
+        assert!(app.pipeline_sel.is_some());
+        assert_eq!(app.pipeline_sel.unwrap(), 0);
+    }
+
+    #[test]
+    fn stage_status_for_pending_when_no_assignment_exists() {
+        let app = make_pipeline_app();
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Pending);
+        assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Pending);
+    }
+
+    #[test]
+    fn stage_status_for_running_work_marks_active() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "abc".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "running".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: Some("work".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
+    }
+
+    #[test]
+    fn stage_status_for_done_work_marks_done() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "abc".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
+    }
+
+    #[test]
+    fn stage_status_for_assignment_in_other_repo_is_ignored() {
+        // An assignment for the same issue number but a different coord repo
+        // must not pollute the stage status of a different issue.
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "abc".to_string(),
+            repo: "different-repo".to_string(),
+            issue_number: 42,
+            issue_title: "unrelated".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        // issue.coord_repo == "api", assignment.repo == "different-repo" →
+        // assignment is filtered out → status stays Pending.
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Pending);
+    }
+
+    #[test]
+    fn build_pipeline_widget_attaches_go_to_first_pending_work() {
+        let app = make_pipeline_app();
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages.len(), 3);
+        assert_eq!(view.stages[0].label, "Work");
+        // Only the work stage gets a Go button (and only when Pending).
+        assert_eq!(view.stages[0].action.as_deref(), Some("Go"));
+        assert!(view.stages[1].action.is_none());
+        assert!(view.stages[2].action.is_none());
+    }
+
+    #[test]
+    fn build_pipeline_widget_no_go_for_unmappable_repo() {
+        let mut app = make_pipeline_app();
+        // Select the second issue (the one with no coord_repo mapping).
+        app.pipeline_sel = Some(1);
+        let view = app.build_pipeline_widget().unwrap();
+        // Without a coord_repo, Go is suppressed — we can't dispatch.
+        for stage in &view.stages {
+            assert!(stage.action.is_none(), "stage {:?} should have no action", stage.label);
+        }
+    }
+
+    #[test]
+    fn best_machine_for_picks_least_loaded_with_repo() {
+        let app = CoordApp {
+            data: BoardData {
+                machines: vec![
+                    Machine {
+                        name: "busy".to_string(),
+                        reachable: true,
+                        active_count: 3,
+                        repos: vec!["api".to_string()],
+                    },
+                    Machine {
+                        name: "idle".to_string(),
+                        reachable: true,
+                        active_count: 0,
+                        repos: vec!["api".to_string()],
+                    },
+                    Machine {
+                        name: "wrong-repo".to_string(),
+                        reachable: true,
+                        active_count: 0,
+                        repos: vec!["other".to_string()],
+                    },
+                ],
+                ..BoardData::default()
+            },
+            ..make_test_app(BoardData::default())
+        };
+        let picked = app.best_machine_for("api").unwrap();
+        assert_eq!(picked.name, "idle");
+    }
+
+    #[test]
+    fn best_machine_for_skips_unreachable() {
+        let app = CoordApp {
+            data: BoardData {
+                machines: vec![Machine {
+                    name: "off".to_string(),
+                    reachable: false,
+                    active_count: 0,
+                    repos: vec!["api".to_string()],
+                }],
+                ..BoardData::default()
+            },
+            ..make_test_app(BoardData::default())
+        };
+        assert!(app.best_machine_for("api").is_none());
+    }
+
+    #[test]
+    fn sidebar_view_pipeline_label() {
+        assert_eq!(SidebarView::Pipeline.label(), "Pipeline");
+    }
+
+    #[test]
+    fn stage_badge_known_stages() {
+        assert_eq!(stage_badge("work").0, "work");
+        assert_eq!(stage_badge("review").0, "review");
+        assert_eq!(stage_badge("merge").0, "merge");
+        assert_eq!(stage_badge("done").0, "done");
+    }
+
+    #[test]
+    fn pipeline_loader_defaults_when_no_meta() {
+        // Sanity: load_pipeline_meta returns documented defaults when the
+        // DB is missing the keys (or the table is empty).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        let (gates, labels, repos) = load_pipeline_meta(&conn);
+        assert_eq!(gates, vec!["review".to_string(), "merge".to_string()]);
+        assert_eq!(labels, vec!["coord".to_string()]);
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn pipeline_loader_reads_persisted_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO board_meta VALUES \
+              ('pipeline_default_gates', '[\"plan\",\"work\",\"smoke\"]'), \
+              ('pipeline_tracked_labels', '[\"hotfix\",\"feature\"]'), \
+              ('pipeline_repos', '{\"api\":\"acme/api\"}');",
+        )
+        .unwrap();
+        let (gates, labels, repos) = load_pipeline_meta(&conn);
+        assert_eq!(gates, vec!["plan", "work", "smoke"]);
+        assert_eq!(labels, vec!["hotfix", "feature"]);
+        assert_eq!(repos, vec![("api".to_string(), "acme/api".to_string())]);
     }
 
 }

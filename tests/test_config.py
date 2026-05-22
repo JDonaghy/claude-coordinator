@@ -190,3 +190,68 @@ def test_repo_housekeeping_invalid_element(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="housekeeping must be a list of strings"):
         load(p)
+
+
+# ── PipelineConfig helpers ──────────────────────────────────────────────────
+
+
+def test_pipeline_tracked_labels_defaults_to_coord(tmp_path: Path) -> None:
+    """When pipeline.labels is unset, tracked_labels() returns ['coord']."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.tracked_labels() == ["coord"]
+
+
+def test_pipeline_tracked_labels_from_labels_keys(tmp_path: Path) -> None:
+    """tracked_labels() returns sorted keys when pipeline.labels is configured."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  labels:\n"
+        "    hotfix: [merge]\n"
+        "    feature: [review, merge]\n"
+    )
+    cfg = load(p)
+    # Sorted alphabetically for stable ordering.
+    assert cfg.pipeline.tracked_labels() == ["feature", "hotfix"]
+
+
+def test_pipeline_gates_for_label_uses_override(tmp_path: Path) -> None:
+    """gates_for_label() returns the override list when the label matches."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  labels:\n"
+        "    hotfix: [merge]\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.gates_for_label("hotfix") == ["merge"]
+
+
+def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
+    """When the label is not in labels, gates_for_label() returns default_gates."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    # Default default_gates is ['review', 'merge'].
+    assert cfg.pipeline.gates_for_label("coord") == ["review", "merge"]
+    assert cfg.pipeline.gates_for_label(None) == ["review", "merge"]

@@ -33,7 +33,17 @@ _CONFIG_OPTION = click.option(
 
 
 def _save_config_snapshot(config: Config) -> None:
-    """Persist machine metadata to the DB so the dashboard can read it."""
+    """Persist machine + pipeline metadata to the DB so dashboards can read it.
+
+    Writes:
+    - ``machines`` rows (used by the web dashboard + the TUI Machines view)
+    - ``board_meta['pipeline_default_gates']`` JSON list of default gates
+    - ``board_meta['pipeline_tracked_labels']`` JSON list of tracked GitHub
+      issue labels (defaults to ``['coord']`` when unconfigured)
+
+    The pipeline keys let the TUI Pipeline panel pick up coordinator.yml
+    settings without having to parse YAML itself.
+    """
     try:
         from coord.db import get_connection
         conn = get_connection()
@@ -43,6 +53,24 @@ def _save_config_snapshot(config: Config) -> None:
                 "INSERT INTO machines (name, host, capabilities, repos) VALUES (?, ?, ?, ?)",
                 (m.name, m.host, json.dumps(m.capabilities), json.dumps(m.repos)),
             )
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_default_gates', ?)",
+            (json.dumps(list(config.pipeline.default_gates)),),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_tracked_labels', ?)",
+            (json.dumps(config.pipeline.tracked_labels()),),
+        )
+        # Repo name → GitHub slug map: the TUI pipeline panel uses this to
+        # translate a `gh search issues` repository.nameWithOwner back into
+        # the coord-local repo name expected by `coord assign`.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_repos', ?)",
+            (json.dumps({r.name: r.github for r in config.repos}),),
+        )
         conn.commit()
     except Exception:  # noqa: BLE001 — non-critical, don't abort CLI
         pass
