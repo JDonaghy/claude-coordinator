@@ -829,6 +829,8 @@ pub struct CoordApp {
     /// Ordered list of repo names used as section IDs in the sidebar.
     /// Rebuilt on each data refresh to stay in sync with `board_sidebar`.
     board_repo_names: Vec<String>,
+    /// Cached result of `issues_by_repo()`. Rebuilt on `rebuild_board_sidebar()`.
+    board_issues_cache: Vec<(String, Vec<IssueGroup>)>,
     /// Selected machine index in the Machines view.
     machine_sel: usize,
     /// Scroll offset for the machines list.
@@ -864,6 +866,7 @@ impl CoordApp {
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
+            board_issues_cache: Vec::new(),
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
@@ -1035,7 +1038,8 @@ impl CoordApp {
     /// Rebuild the SidebarSystem from current data. Creates one section per
     /// repo, with issue rows inside each section.
     fn rebuild_board_sidebar(&mut self) {
-        let grouped = self.issues_by_repo();
+        self.board_issues_cache = self.issues_by_repo();
+        let grouped = &self.board_issues_cache;
 
         // Save current selection to restore after rebuild.
         let prev_selection = self.board_selected_issue();
@@ -1063,7 +1067,7 @@ impl CoordApp {
         self.board_sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
         // Set rows for each section and configure initial state.
-        for (section_idx, (repo, issues)) in grouped.iter().enumerate() {
+        for (section_idx, (_repo, issues)) in grouped.iter().enumerate() {
             let has_active = issues.iter().any(|i| i.status_summary == "running" || i.status_summary == "failed");
             let n_issues = issues.len();
 
@@ -1113,9 +1117,6 @@ impl CoordApp {
                 })
                 .collect();
             self.board_sidebar.set_rows(section_idx, rows);
-
-            // Activate first section if none active.
-            let _ = repo; // used above for section_idx correlation
         }
 
         // Activate first non-empty section.
@@ -1134,25 +1135,35 @@ impl CoordApp {
         }
     }
 
-    /// Return the (repo, issue_number) currently selected in the board sidebar.
-    fn board_selected_issue(&self) -> Option<(String, u64)> {
+    /// Return the repo name for the active sidebar section, if any.
+    fn board_active_repo(&self) -> Option<&str> {
+        let section = self.board_sidebar.active_section()?;
+        self.board_repo_names.get(section).map(|s| s.as_str())
+    }
+
+    /// Return the IssueGroup currently selected in the board sidebar.
+    fn board_selected_issue_group(&self) -> Option<&IssueGroup> {
         let section = self.board_sidebar.active_section()?;
         let path = self.board_sidebar.selected_path(section)?;
         if path.is_empty() {
             return None;
         }
         let repo = self.board_repo_names.get(section)?;
-        let grouped = self.issues_by_repo();
-        let (_, issues) = grouped.iter().find(|(r, _)| r == repo)?;
+        let (_, issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
         let row_idx = path[0] as usize;
-        let group = issues.get(row_idx)?;
-        Some((repo.clone(), group.issue_number))
+        issues.get(row_idx)
+    }
+
+    /// Return the (repo, issue_number) currently selected in the board sidebar.
+    fn board_selected_issue(&self) -> Option<(String, u64)> {
+        let group = self.board_selected_issue_group()?;
+        let repo = self.board_active_repo()?;
+        Some((repo.to_string(), group.issue_number))
     }
 
     /// Try to select a specific issue in the sidebar by repo and issue number.
     fn select_issue(&mut self, repo: &str, issue_number: u64) {
-        let grouped = self.issues_by_repo();
-        for (section_idx, (r, issues)) in grouped.iter().enumerate() {
+        for (section_idx, (r, issues)) in self.board_issues_cache.iter().enumerate() {
             if r == repo {
                 for (row_idx, group) in issues.iter().enumerate() {
                     if group.issue_number == issue_number {
@@ -1163,20 +1174,6 @@ impl CoordApp {
                 }
             }
         }
-    }
-
-    /// Return the IssueGroup currently selected in the board sidebar.
-    fn board_selected_issue_group(&self) -> Option<IssueGroup> {
-        let section = self.board_sidebar.active_section()?;
-        let path = self.board_sidebar.selected_path(section)?;
-        if path.is_empty() {
-            return None;
-        }
-        let repo = self.board_repo_names.get(section)?;
-        let grouped = self.issues_by_repo();
-        let (_, issues) = grouped.iter().find(|(r, _)| r == repo)?;
-        let row_idx = path[0] as usize;
-        issues.get(row_idx).cloned()
     }
 
     /// Clamp `machine_scroll` so that `machine_sel` is inside the visible window.
@@ -1256,10 +1253,7 @@ impl CoordApp {
                 items.push(kv_item("", " No issue selected", None));
             }
             Some(group) => {
-                let repo = self.board_repo_names
-                    .get(self.board_sidebar.active_section().unwrap_or(0))
-                    .map(|s| s.as_str())
-                    .unwrap_or("?");
+                let repo = self.board_active_repo().unwrap_or("?");
 
                 // Section header
                 let header_text = format!(" {} #{} ", repo, group.issue_number);
@@ -1386,10 +1380,7 @@ impl CoordApp {
 
         let title = match self.board_selected_issue_group() {
             Some(group) => {
-                let repo = self.board_repo_names
-                    .get(self.board_sidebar.active_section().unwrap_or(0))
-                    .map(|s| s.as_str())
-                    .unwrap_or("?");
+                let repo = self.board_active_repo().unwrap_or("?");
                 format!(" {} #{} ", repo, group.issue_number)
             }
             None => " DETAIL ".to_string(),
@@ -1451,10 +1442,7 @@ impl CoordApp {
                 match best {
                     Some(a) => {
                         let log_items = load_activity_log(&a.id);
-                        let repo = self.board_repo_names
-                            .get(self.board_sidebar.active_section().unwrap_or(0))
-                            .map(|s| s.as_str())
-                            .unwrap_or("?");
+                        let repo = self.board_active_repo().unwrap_or("?");
                         (
                             format!(" ACTIVITY — {} #{} ", repo, group.issue_number),
                             log_items,
@@ -2211,6 +2199,7 @@ mod tests {
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
+            board_issues_cache: Vec::new(),
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
@@ -2233,6 +2222,7 @@ mod tests {
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
+            board_issues_cache: Vec::new(),
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
@@ -2324,6 +2314,7 @@ mod tests {
             active_view: SidebarView::Machines,
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
+            board_issues_cache: Vec::new(),
             machine_sel,
             machine_scroll,
             refreshed_at: Instant::now(),
@@ -2419,6 +2410,7 @@ mod tests {
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
+            board_issues_cache: Vec::new(),
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
