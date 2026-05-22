@@ -23,4 +23,5 @@ gtk = ["quadraui/gtk"]
 [dependencies]
 quadraui = { path = "../../quadraui/quadraui", features = ["tui"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
 gethostname = "1.1"
