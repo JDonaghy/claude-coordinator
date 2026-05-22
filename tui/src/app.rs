@@ -40,11 +40,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags};
 
 use quadraui::compose::app_shell::{AppShellEvent, AppShellLayout, PanelDefinition};
+use quadraui::compose::sidebar_system::{
+    NavigationMode, SidebarEvent, SidebarSectionDef, SidebarSystem,
+};
 use quadraui::{
     Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
-    Point, Reaction, Rect, ScrollDelta, ShellApp, ShellConfig, ShellContext,
+    Point, Reaction, Rect, ScrollDelta, SectionSize, ShellApp, ShellConfig, ShellContext,
     StatusBar, StatusBarSegment, StyledSpan, StyledText,
-    TabBar, TabItem, TreeController, TreeControllerEvent, TreeRow, UiEvent, WidgetId,
+    TabBar, TabItem, TreeRow, UiEvent, WidgetId,
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
@@ -72,7 +75,6 @@ enum SidebarView {
     #[default]
     Board,
     Machines,
-    Pipeline,
 }
 
 impl SidebarView {
@@ -80,10 +82,8 @@ impl SidebarView {
         match self {
             SidebarView::Board => "Board",
             SidebarView::Machines => "Machines",
-            SidebarView::Pipeline => "Pipeline",
         }
     }
-
 }
 
 // ─── App data model ───────────────────────────────────────────────────────────
@@ -142,6 +142,38 @@ struct Machine {
     name: String,
     reachable: bool,
     active_count: usize,
+    repos: Vec<String>,
+}
+
+/// An issue grouped with all its assignments and a summary status.
+#[derive(Clone)]
+struct IssueGroup {
+    issue_number: u64,
+    issue_title: String,
+    assignments: Vec<Assignment>,
+    /// Derived summary: "running", "failed", "done", "merged", "pending"
+    status_summary: String,
+}
+
+impl IssueGroup {
+    fn status_icon(&self) -> &str {
+        match self.status_summary.as_str() {
+            "running" => "~",
+            "failed" => "✗",
+            "done" | "merged" => "✓",
+            _ => "-",
+        }
+    }
+
+    fn status_color(&self) -> Color {
+        match self.status_summary.as_str() {
+            "running" => Color::rgb(80, 220, 80),
+            "failed" => Color::rgb(220, 70, 70),
+            "done" => Color::rgb(120, 180, 120),
+            "merged" => Color::rgb(100, 180, 240),
+            _ => Color::rgb(140, 140, 160),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -659,9 +691,9 @@ fn load_data() -> BoardData {
         })
     });
 
-    // ── Query machines (name = nickname, host = Tailscale FQDN) ───────────
-    let machine_rows: Vec<(String, String)> = {
-        let mut stmt = match conn.prepare("SELECT name, host FROM machines") {
+    // ── Query machines (name = nickname, host = Tailscale FQDN, repos = JSON array) ─
+    let machine_rows: Vec<(String, String, Vec<String>)> = {
+        let mut stmt = match conn.prepare("SELECT name, host, repos FROM machines") {
             Ok(s) => s,
             Err(_) => {
                 return BoardData {
@@ -671,7 +703,9 @@ fn load_data() -> BoardData {
             }
         };
         let rows = match stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let repos_json: String = row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "[]".to_string());
+            let repos: Vec<String> = serde_json::from_str(&repos_json).unwrap_or_default();
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, repos))
         }) {
             Ok(r) => r,
             Err(_) => {
@@ -687,22 +721,22 @@ fn load_data() -> BoardData {
     // ── Machine reachability probes ────────────────────────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
     // Spawn all probes concurrently; collect within a 250 ms budget.
-    let probes: Vec<(String, std::sync::mpsc::Receiver<bool>)> = machine_rows
+    let probes: Vec<(String, Vec<String>, std::sync::mpsc::Receiver<bool>)> = machine_rows
         .iter()
-        .map(|(name, host)| {
+        .map(|(name, host, repos)| {
             use std::sync::mpsc;
             let h = host.clone();
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(tcp_probe(&h, 7433));
             });
-            (name.clone(), rx)
+            (name.clone(), repos.clone(), rx)
         })
         .collect();
 
     let machines: Vec<Machine> = probes
         .into_iter()
-        .map(|(name, rx)| {
+        .map(|(name, repos, rx)| {
             let reachable = rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false);
             let active_count = assignments
                 .iter()
@@ -712,6 +746,7 @@ fn load_data() -> BoardData {
                 name,
                 reachable,
                 active_count,
+                repos,
             }
         })
         .collect();
@@ -723,8 +758,8 @@ fn load_data() -> BoardData {
         .unwrap_or_default();
     let local_machine = machine_rows
         .iter()
-        .find(|(_, host)| *host == local_hostname)
-        .map(|(name, _)| name.clone())
+        .find(|(_, host, _)| *host == local_hostname)
+        .map(|(name, _, _)| name.clone())
         .unwrap_or_default();
 
     // ── Query merge_queue ──────────────────────────────────────────────────
@@ -789,11 +824,11 @@ pub struct CoordApp {
     data: BoardData,
     /// Which top-level view is currently shown in the content area.
     active_view: SidebarView,
-    /// Tree controller for the Board view (selection, scroll, vim-keys).
-    board_tree: TreeController,
-    /// Expand/collapse state for each status group: [Running, Failed, Done].
-    /// Running and Failed are expanded by default; Done is collapsed.
-    board_groups_expanded: [bool; 3],
+    /// SidebarSystem for the Board view — repo sections with issue rows.
+    board_sidebar: SidebarSystem,
+    /// Ordered list of repo names used as section IDs in the sidebar.
+    /// Rebuilt on each data refresh to stay in sync with `board_sidebar`.
+    board_repo_names: Vec<String>,
     /// Selected machine index in the Machines view.
     machine_sel: usize,
     /// Scroll offset for the machines list.
@@ -801,10 +836,6 @@ pub struct CoordApp {
     refreshed_at: Instant,
     /// Which tab is active in the Board detail panel.
     detail_tab: DetailTab,
-    /// Selected issue index in the Pipeline view.
-    pipeline_sel: usize,
-    /// Scroll offset for the Pipeline issue list.
-    pipeline_scroll: usize,
     /// Scroll offset for the Board Summary detail panel (right side).
     detail_scroll: usize,
     /// Scroll offset for the Board Activity panel.
@@ -813,8 +844,6 @@ pub struct CoordApp {
     activity_scroll: Option<usize>,
     /// Scroll offset for the Machine detail panel.
     machine_detail_scroll: usize,
-    /// Scroll offset for the Pipeline detail panel.
-    pipeline_detail_scroll: usize,
 }
 
 impl Default for CoordApp {
@@ -827,23 +856,23 @@ impl CoordApp {
     /// Create a new app, loading initial board data from the SQLite DB.
     pub fn new() -> Self {
         let data = load_data();
+        let mut sidebar = SidebarSystem::new(Vec::new());
+        sidebar.set_navigation_mode(NavigationMode::Selection);
+        sidebar.set_allow_collapse(true);
         let mut app = Self {
             data,
             active_view: SidebarView::default(),
-            board_tree: TreeController::new("board"),
-            board_groups_expanded: [true, true, false],
+            board_sidebar: sidebar,
+            board_repo_names: Vec::new(),
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
-            pipeline_sel: 0,
-            pipeline_scroll: 0,
             detail_scroll: 0,
             activity_scroll: None,
             machine_detail_scroll: 0,
-            pipeline_detail_scroll: 0,
         };
-        app.rebuild_board_tree_rows();
+        app.rebuild_board_sidebar();
         app
     }
 
@@ -868,12 +897,6 @@ impl CoordApp {
                     tooltip: "Machines".into(),
                     title: "MACHINES".into(),
                 },
-                PanelDefinition {
-                    id: WidgetId::new("panel:pipeline"),
-                    icon: "P".into(),
-                    tooltip: "Pipeline".into(),
-                    title: "PIPELINE".into(),
-                },
             ],
         )
         .with_status_bar();
@@ -892,171 +915,267 @@ impl CoordApp {
         } else {
             self.machine_sel = 0;
         }
-        let p = self.pipeline_issues().len();
-        if p > 0 {
-            self.pipeline_sel = self.pipeline_sel.min(p - 1);
-        } else {
-            self.pipeline_sel = 0;
-        }
-        self.rebuild_board_tree_rows();
+        self.rebuild_board_sidebar();
     }
 
-    /// Rebuild the tree rows from current data + expansion state, then push
-    /// them into the `TreeController`. Clears the selection if it no longer
-    /// exists in the new row set (e.g. after collapsing a group).
-    fn rebuild_board_tree_rows(&mut self) {
-        let rows = self.build_board_rows();
-        // Clear selection if its path vanished (e.g. group was collapsed).
-        if let Some(path) = self.board_tree.selected_path().cloned() {
-            if !rows.iter().any(|r| r.path == path) {
-                self.board_tree.set_selected_path(None);
+    /// Group assignments by `(repo, issue_number)`, returning repos in a
+    /// stable order (repos with running issues first, then by name).
+    fn issues_by_repo(&self) -> Vec<(String, Vec<IssueGroup>)> {
+        use std::collections::{BTreeMap, HashMap};
+
+        // Collect unique repos from machines + assignments.
+        let mut all_repos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for m in &self.data.machines {
+            for r in &m.repos {
+                all_repos.insert(r.clone());
             }
         }
-        self.board_tree.set_rows(rows);
-    }
+        for a in &self.data.assignments {
+            all_repos.insert(a.repo.clone());
+        }
 
-    /// Build the flat-ordered [`TreeRow`] list from current assignments and
-    /// group expansion state.  The assignments vector is already sorted
-    /// running → failed → done, so group offsets are trivially computed.
-    fn build_board_rows(&self) -> Vec<TreeRow> {
-        let n_running = self
-            .data
-            .assignments
-            .iter()
-            .filter(|a| a.status == "running")
-            .count();
-        let n_failed = self
-            .data
-            .assignments
-            .iter()
-            .filter(|a| a.status == "failed")
-            .count();
-        let n_done = self.data.assignments.len() - n_running - n_failed;
-
-        // (label, count, color, start-index-into-assignments)
-        let groups: [(&str, usize, Color, usize); 3] = [
-            ("Running", n_running, Color::rgb(80, 220, 80), 0),
-            (
-                "Failed",
-                n_failed,
-                Color::rgb(220, 70, 70),
-                n_running,
-            ),
-            (
-                "Done",
-                n_done,
-                Color::rgb(120, 120, 120),
-                n_running + n_failed,
-            ),
-        ];
-
-        let mut rows = Vec::new();
-
-        for (g_idx, (label, count, color, start)) in groups.iter().enumerate() {
-            let expanded = self.board_groups_expanded[g_idx];
-
-            // ── Group header ──────────────────────────────────────────
-            let header_text = StyledText {
-                spans: vec![StyledSpan::with_fg(
-                    format!("{} ({})", label, count),
-                    *color,
-                )],
-            };
-            rows.push(TreeRow {
-                path: vec![g_idx as u16],
-                indent: 0,
-                icon: None,
-                text: header_text,
-                badge: None,
-                is_expanded: Some(expanded),
-                decoration: Decoration::Normal,
-                edit: None,
-            });
-
-            if !expanded {
-                continue;
-            }
-
-            // ── Assignment leaves ─────────────────────────────────────
-            for i in 0..*count {
-                let a = &self.data.assignments[start + i];
-                let sc = a.status_color();
-                let issue = format!("#{:<5}", a.issue_number);
-                let repo = format!("{:<18}", trunc(&a.repo, 18));
-                let st = a.status_label();
-                let text = StyledText {
-                    spans: vec![
-                        StyledSpan::with_fg(issue, Color::rgb(150, 150, 240)),
-                        StyledSpan::plain(repo),
-                        StyledSpan::with_fg(st, sc),
-                    ],
-                };
-                rows.push(TreeRow {
-                    path: vec![g_idx as u16, i as u16],
-                    indent: 1,
-                    icon: None,
-                    text,
-                    badge: Some(Badge::plain(a.age_str())),
-                    is_expanded: None, // leaf node
-                    decoration: if a.status == "failed" {
-                        Decoration::Error
-                    } else {
-                        Decoration::Normal
-                    },
-                    edit: None,
+        // Group assignments by (repo, issue_number).
+        let mut repo_issues: HashMap<String, BTreeMap<u64, IssueGroup>> = HashMap::new();
+        for a in &self.data.assignments {
+            let group = repo_issues
+                .entry(a.repo.clone())
+                .or_default()
+                .entry(a.issue_number)
+                .or_insert_with(|| IssueGroup {
+                    issue_number: a.issue_number,
+                    issue_title: a.issue_title.clone(),
+                    assignments: Vec::new(),
+                    status_summary: String::new(),
                 });
-            }
+            group.assignments.push(a.clone());
         }
 
-        rows
-    }
+        // Derive status_summary for each issue group.
+        for groups in repo_issues.values_mut() {
+            for group in groups.values_mut() {
+                // Sort assignments by dispatched_at ascending.
+                group.assignments.sort_by(|a, b| {
+                    a.dispatched_at
+                        .partial_cmp(&b.dispatched_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
 
-    /// Return the assignment currently selected in the Board tree, if any.
-    ///
-    /// Only leaf paths (length 2) map to assignments; group-header paths
-    /// (length 1) return `None`.
-    fn board_selected_assignment(&self) -> Option<&Assignment> {
-        let path = self.board_tree.selected_path()?;
-        if path.len() < 2 {
-            return None; // group header, not a leaf
-        }
-        let group = path[0] as usize;
-        let item = path[1] as usize;
+                // Check merge queue for this issue.
+                let merged = self
+                    .data
+                    .merge_queue
+                    .iter()
+                    .any(|e| e.issue_number == Some(group.issue_number) && e.state == "merged");
 
-        let n_running = self
-            .data
-            .assignments
-            .iter()
-            .filter(|a| a.status == "running")
-            .count();
-        let n_failed = self
-            .data
-            .assignments
-            .iter()
-            .filter(|a| a.status == "failed")
-            .count();
-
-        let idx = match group {
-            0 => item,
-            1 => n_running + item,
-            2 => n_running + n_failed + item,
-            _ => return None,
-        };
-        self.data.assignments.get(idx)
-    }
-
-    /// Toggle expand/collapse for the group that is currently selected (if
-    /// the selection sits on a group header row).
-    fn toggle_selected_group(&mut self) {
-        if let Some(path) = self.board_tree.selected_path().cloned() {
-            if path.len() == 1 {
-                let g = path[0] as usize;
-                if g < 3 {
-                    self.board_groups_expanded[g] = !self.board_groups_expanded[g];
-                    self.rebuild_board_tree_rows();
+                if merged && group.assignments.iter().all(|a| a.status == "done") {
+                    group.status_summary = "merged".to_string();
+                } else if group.assignments.iter().any(|a| a.status == "running") {
+                    group.status_summary = "running".to_string();
+                } else if group
+                    .assignments
+                    .last()
+                    .map(|a| a.status == "failed")
+                    .unwrap_or(false)
+                {
+                    group.status_summary = "failed".to_string();
+                } else if group.assignments.iter().all(|a| a.status == "done") {
+                    group.status_summary = "done".to_string();
+                } else {
+                    group.status_summary = "pending".to_string();
                 }
             }
         }
+
+        // Build result: each repo with its issues, sorted.
+        let mut result: Vec<(String, Vec<IssueGroup>)> = Vec::new();
+        for repo in &all_repos {
+            let issues = repo_issues
+                .remove(repo)
+                .map(|m| {
+                    let mut v: Vec<IssueGroup> = m.into_values().collect();
+                    // Issues with running status first, then by issue number.
+                    v.sort_by(|a, b| {
+                        let rank = |s: &str| match s {
+                            "running" => 0u8,
+                            "failed" => 1,
+                            "pending" => 2,
+                            "done" => 3,
+                            "merged" => 4,
+                            _ => 5,
+                        };
+                        rank(&a.status_summary)
+                            .cmp(&rank(&b.status_summary))
+                            .then_with(|| a.issue_number.cmp(&b.issue_number))
+                    });
+                    v
+                })
+                .unwrap_or_default();
+            result.push((repo.clone(), issues));
+        }
+
+        // Sort repos: those with running/failed issues first.
+        result.sort_by(|a, b| {
+            let has_active = |issues: &[IssueGroup]| -> u8 {
+                if issues.iter().any(|i| i.status_summary == "running") {
+                    0
+                } else if issues.iter().any(|i| i.status_summary == "failed") {
+                    1
+                } else if issues.is_empty() {
+                    3
+                } else {
+                    2
+                }
+            };
+            has_active(&a.1).cmp(&has_active(&b.1)).then_with(|| a.0.cmp(&b.0))
+        });
+
+        result
+    }
+
+    /// Rebuild the SidebarSystem from current data. Creates one section per
+    /// repo, with issue rows inside each section.
+    fn rebuild_board_sidebar(&mut self) {
+        let grouped = self.issues_by_repo();
+
+        // Save current selection to restore after rebuild.
+        let prev_selection = self.board_selected_issue();
+
+        // Build section definitions.
+        let defs: Vec<SidebarSectionDef> = grouped
+            .iter()
+            .map(|(repo, _)| {
+                let mut def = SidebarSectionDef::new(
+                    format!("repo:{}", repo),
+                    repo.clone(),
+                );
+                def.show_chevron = true;
+                def.size = SectionSize::Content;
+                def
+            })
+            .collect();
+
+        self.board_repo_names = grouped.iter().map(|(r, _)| r.clone()).collect();
+
+        // Recreate sidebar with new section defs.
+        self.board_sidebar = SidebarSystem::new(defs);
+        self.board_sidebar.set_navigation_mode(NavigationMode::Selection);
+        self.board_sidebar.set_allow_collapse(true);
+
+        // Set rows for each section and configure initial state.
+        for (section_idx, (repo, issues)) in grouped.iter().enumerate() {
+            let has_active = issues.iter().any(|i| i.status_summary == "running" || i.status_summary == "failed");
+            let n_issues = issues.len();
+
+            // Set badge with issue count.
+            if n_issues > 0 {
+                self.board_sidebar.set_section_badge(
+                    section_idx,
+                    Some(StyledText::plain(format!("({})", n_issues))),
+                );
+            }
+
+            // Repos with no active issues are collapsed by default.
+            if !has_active && n_issues == 0 {
+                self.board_sidebar.set_collapsed(section_idx, true);
+            }
+
+            let rows: Vec<TreeRow> = issues
+                .iter()
+                .enumerate()
+                .map(|(i, group)| {
+                    let sc = group.status_color();
+                    let icon_str = group.status_icon();
+                    let text = StyledText {
+                        spans: vec![
+                            StyledSpan::with_fg(format!("{} ", icon_str), sc),
+                            StyledSpan::with_fg(
+                                format!("#{:<5}", group.issue_number),
+                                Color::rgb(150, 150, 240),
+                            ),
+                            StyledSpan::plain(trunc(&group.issue_title, 20)),
+                        ],
+                    };
+                    TreeRow {
+                        path: vec![i as u16],
+                        indent: 0,
+                        icon: None,
+                        text,
+                        badge: Some(Badge::colored(&group.status_summary, sc)),
+                        is_expanded: None,
+                        decoration: if group.status_summary == "failed" {
+                            Decoration::Error
+                        } else {
+                            Decoration::Normal
+                        },
+                        edit: None,
+                    }
+                })
+                .collect();
+            self.board_sidebar.set_rows(section_idx, rows);
+
+            // Activate first section if none active.
+            let _ = repo; // used above for section_idx correlation
+        }
+
+        // Activate first non-empty section.
+        if self.board_sidebar.active_section().is_none() && !self.board_repo_names.is_empty() {
+            for (i, (_repo, issues)) in grouped.iter().enumerate() {
+                if !issues.is_empty() {
+                    self.board_sidebar.set_active_section(Some(i));
+                    break;
+                }
+            }
+        }
+
+        // Restore previous selection if possible.
+        if let Some((prev_repo, prev_issue)) = prev_selection {
+            self.select_issue(&prev_repo, prev_issue);
+        }
+    }
+
+    /// Return the (repo, issue_number) currently selected in the board sidebar.
+    fn board_selected_issue(&self) -> Option<(String, u64)> {
+        let section = self.board_sidebar.active_section()?;
+        let path = self.board_sidebar.selected_path(section)?;
+        if path.is_empty() {
+            return None;
+        }
+        let repo = self.board_repo_names.get(section)?;
+        let grouped = self.issues_by_repo();
+        let (_, issues) = grouped.iter().find(|(r, _)| r == repo)?;
+        let row_idx = path[0] as usize;
+        let group = issues.get(row_idx)?;
+        Some((repo.clone(), group.issue_number))
+    }
+
+    /// Try to select a specific issue in the sidebar by repo and issue number.
+    fn select_issue(&mut self, repo: &str, issue_number: u64) {
+        let grouped = self.issues_by_repo();
+        for (section_idx, (r, issues)) in grouped.iter().enumerate() {
+            if r == repo {
+                for (row_idx, group) in issues.iter().enumerate() {
+                    if group.issue_number == issue_number {
+                        self.board_sidebar.set_active_section(Some(section_idx));
+                        self.board_sidebar.set_selected_path(section_idx, Some(vec![row_idx as u16]));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the IssueGroup currently selected in the board sidebar.
+    fn board_selected_issue_group(&self) -> Option<IssueGroup> {
+        let section = self.board_sidebar.active_section()?;
+        let path = self.board_sidebar.selected_path(section)?;
+        if path.is_empty() {
+            return None;
+        }
+        let repo = self.board_repo_names.get(section)?;
+        let grouped = self.issues_by_repo();
+        let (_, issues) = grouped.iter().find(|(r, _)| r == repo)?;
+        let row_idx = path[0] as usize;
+        issues.get(row_idx).cloned()
     }
 
     /// Clamp `machine_scroll` so that `machine_sel` is inside the visible window.
@@ -1131,13 +1250,18 @@ impl CoordApp {
     fn detail_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
 
-        match self.board_selected_assignment() {
+        match self.board_selected_issue_group() {
             None => {
-                items.push(kv_item("", " No assignment selected", None));
+                items.push(kv_item("", " No issue selected", None));
             }
-            Some(a) => {
+            Some(group) => {
+                let repo = self.board_repo_names
+                    .get(self.board_sidebar.active_section().unwrap_or(0))
+                    .map(|s| s.as_str())
+                    .unwrap_or("?");
+
                 // Section header
-                let header_text = format!(" {} #{} ", a.repo, a.issue_number);
+                let header_text = format!(" {} #{} ", repo, group.issue_number);
                 items.push(ListItem {
                     text: StyledText {
                         spans: vec![StyledSpan::with_fg(
@@ -1150,53 +1274,129 @@ impl CoordApp {
                     decoration: Decoration::Header,
                 });
 
-                // Issue title (truncated to fit panel width)
-                items.push(kv_item("", &format!("  {}", trunc(&a.issue_title, 52)), None));
+                // Issue title
+                items.push(kv_item("", &format!("  {}", trunc(&group.issue_title, 52)), None));
                 items.push(kv_item("", "", None)); // blank separator
 
-                // Key-value field rows
-                items.push(kv_item("ID", trunc(&a.id, 12), None));
-                items.push(kv_item("Machine", &a.machine, None));
-                items.push(kv_item(
-                    "Status",
-                    a.status_label().trim(),
-                    Some(a.status_color()),
-                ));
-                if let Some(m) = &a.model {
-                    items.push(kv_item("Model", m, None));
-                }
-                if let Some(b) = &a.branch {
-                    items.push(kv_item("Branch", trunc(b, 44), None));
-                } else {
-                    items.push(kv_item(
-                        "Branch",
-                        "(none yet)",
-                        Some(Color::rgb(100, 100, 100)),
-                    ));
-                }
-                if let Some(t) = &a.assignment_type {
-                    items.push(kv_item("Type", t, None));
-                }
-                items.push(kv_item("Age", &a.age_str(), None));
+                // Pipeline stages sub-header
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            " PIPELINE STAGES ",
+                            Color::rgb(130, 130, 150),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
 
-                if let Some(code) = a.exit_code {
-                    let (s, c) = if code == 0 {
-                        (format!("{} (ok)", code), Some(Color::rgb(80, 210, 80)))
-                    } else {
-                        (format!("{} (err)", code), Some(Color::rgb(210, 70, 70)))
+                // Stage definitions: (display name, type filter fn)
+                let stage_filters: &[(&str, fn(&Assignment) -> bool)] = &[
+                    ("Work", |a| {
+                        a.assignment_type.as_deref() == Some("work")
+                            || a.assignment_type.is_none()
+                    }),
+                    ("Review", |a| {
+                        a.assignment_type.as_deref() == Some("review")
+                    }),
+                    ("Smoke", |a| {
+                        a.assignment_type.as_deref() == Some("smoke")
+                    }),
+                ];
+
+                for (stage_name, filter) in stage_filters {
+                    let assignment = group.assignments.iter().find(|a| filter(a));
+                    items.push(pipeline_stage_item(stage_name, assignment));
+                }
+
+                // PR/Merge stage from merge_queue
+                let mq_entry = self
+                    .data
+                    .merge_queue
+                    .iter()
+                    .find(|e| e.issue_number == Some(group.issue_number));
+                items.push(pipeline_merge_item(mq_entry));
+
+                items.push(kv_item("", "", None)); // blank separator
+
+                // Per-assignment detail section
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            " ASSIGNMENTS ",
+                            Color::rgb(130, 130, 150),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+
+                for a in &group.assignments {
+                    let sc = a.status_color();
+                    let type_label = a.assignment_type.as_deref().unwrap_or("work");
+                    let text = StyledText {
+                        spans: vec![
+                            StyledSpan::with_fg(
+                                format!("  {:<8}", type_label),
+                                Color::rgb(180, 180, 200),
+                            ),
+                            StyledSpan::with_fg(a.status_label(), sc),
+                            StyledSpan::with_fg(
+                                format!("  {}", trunc(&a.machine, 15)),
+                                Color::rgb(160, 160, 160),
+                            ),
+                            StyledSpan::with_fg(
+                                format!("  {}", a.age_str()),
+                                Color::rgb(100, 100, 100),
+                            ),
+                        ],
                     };
-                    items.push(kv_item("Exit code", &s, c));
-                }
+                    items.push(ListItem {
+                        text,
+                        icon: None,
+                        detail: Some(StyledText {
+                            spans: vec![StyledSpan::with_fg(
+                                trunc(&a.id, 8),
+                                Color::rgb(100, 100, 120),
+                            )],
+                        }),
+                        decoration: if a.status == "failed" {
+                            Decoration::Error
+                        } else {
+                            Decoration::Normal
+                        },
+                    });
 
-                if let (Some(start), Some(end)) = (a.dispatched_at, a.finished_at) {
-                    let dur = (end - start).max(0.0) as u64;
-                    items.push(kv_item("Duration", &fmt_dur(dur), None));
+                    // Show branch if present
+                    if let Some(b) = &a.branch {
+                        items.push(kv_item("    Branch", trunc(b, 40), None));
+                    }
+                    if let Some(code) = a.exit_code {
+                        let (s, c) = if code == 0 {
+                            (format!("{} (ok)", code), Some(Color::rgb(80, 210, 80)))
+                        } else {
+                            (format!("{} (err)", code), Some(Color::rgb(210, 70, 70)))
+                        };
+                        items.push(kv_item("    Exit", &s, c));
+                    }
+                    if let (Some(start), Some(end)) = (a.dispatched_at, a.finished_at) {
+                        let dur = (end - start).max(0.0) as u64;
+                        items.push(kv_item("    Duration", &fmt_dur(dur), None));
+                    }
                 }
             }
         }
 
-        let title = match self.board_selected_assignment() {
-            Some(a) => format!(" DETAIL — {} #{} ", a.repo, a.issue_number),
+        let title = match self.board_selected_issue_group() {
+            Some(group) => {
+                let repo = self.board_repo_names
+                    .get(self.board_sidebar.active_section().unwrap_or(0))
+                    .map(|s| s.as_str())
+                    .unwrap_or("?");
+                format!(" {} #{} ", repo, group.issue_number)
+            }
             None => " DETAIL ".to_string(),
         };
 
@@ -1238,18 +1438,38 @@ impl CoordApp {
     }
 
     /// Activity tab: live feed of worker events parsed from the log file.
+    /// Shows the log for the most recent (or running) assignment in the group.
     fn activity_list(&self) -> ListView {
-        let (title, items) = match self.board_selected_assignment() {
+        let (title, items) = match self.board_selected_issue_group() {
             None => (
                 " ACTIVITY ".to_string(),
-                vec![kv_item("", " No assignment selected", None)],
+                vec![kv_item("", " No issue selected", None)],
             ),
-            Some(a) => {
-                let log_items = load_activity_log(&a.id);
-                (
-                    format!(" ACTIVITY — {} #{} ", a.repo, a.issue_number),
-                    log_items,
-                )
+            Some(group) => {
+                // Pick the most interesting assignment: running > failed > last done.
+                let best = group
+                    .assignments
+                    .iter()
+                    .find(|a| a.status == "running")
+                    .or_else(|| group.assignments.iter().rev().find(|a| a.status == "failed"))
+                    .or_else(|| group.assignments.last());
+                match best {
+                    Some(a) => {
+                        let log_items = load_activity_log(&a.id);
+                        let repo = self.board_repo_names
+                            .get(self.board_sidebar.active_section().unwrap_or(0))
+                            .map(|s| s.as_str())
+                            .unwrap_or("?");
+                        (
+                            format!(" ACTIVITY — {} #{} ", repo, group.issue_number),
+                            log_items,
+                        )
+                    }
+                    None => (
+                        " ACTIVITY ".to_string(),
+                        vec![kv_item("", " No assignment data", None)],
+                    ),
+                }
             }
         };
 
@@ -1394,206 +1614,6 @@ impl CoordApp {
         }
     }
 
-    /// Clamp `pipeline_scroll` so that `pipeline_sel` is inside the visible window.
-    fn fix_pipeline_scroll(&mut self, visible: usize) {
-        if visible == 0 {
-            return;
-        }
-        if self.pipeline_sel < self.pipeline_scroll {
-            self.pipeline_scroll = self.pipeline_sel;
-        } else if self.pipeline_sel >= self.pipeline_scroll + visible {
-            self.pipeline_scroll = self.pipeline_sel + 1 - visible;
-        }
-    }
-
-    /// Return the unique issues present in assignments, ordered by most-recent
-    /// dispatched_at descending. Each entry is `(issue_number, repo, title)`.
-    fn pipeline_issues(&self) -> Vec<(u64, String, String)> {
-        use std::collections::HashMap;
-        // Map issue_number → (repo, title, max_dispatched_at)
-        let mut map: HashMap<u64, (String, String, f64)> = HashMap::new();
-        for a in &self.data.assignments {
-            let ts = a.dispatched_at.unwrap_or(0.0);
-            let entry = map
-                .entry(a.issue_number)
-                .or_insert_with(|| (a.repo.clone(), a.issue_title.clone(), ts));
-            if ts > entry.2 {
-                entry.2 = ts;
-            }
-        }
-        let mut result: Vec<(u64, String, String, f64)> = map
-            .into_iter()
-            .map(|(n, (r, t, ts))| (n, r, t, ts))
-            .collect();
-        result.sort_by(|a, b| {
-            b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        result.into_iter().map(|(n, r, t, _)| (n, r, t)).collect()
-    }
-
-    /// Left panel for the Pipeline view: list of unique issues.
-    fn pipeline_issue_list(&self) -> ListView {
-        let issues = self.pipeline_issues();
-        let n = issues.len();
-
-        let items: Vec<ListItem> = issues
-            .iter()
-            .map(|(issue_num, repo, title)| {
-                // Collect all assignments for this issue to show aggregate status.
-                let issue_assignments: Vec<&Assignment> = self
-                    .data
-                    .assignments
-                    .iter()
-                    .filter(|a| a.issue_number == *issue_num)
-                    .collect();
-                let (sc, bullet) = if issue_assignments
-                    .iter()
-                    .any(|a| a.status == "running")
-                {
-                    (Color::rgb(80, 220, 80), "~ ")
-                } else if issue_assignments.iter().any(|a| a.status == "failed") {
-                    (Color::rgb(220, 70, 70), "✗ ")
-                } else if issue_assignments.iter().all(|a| a.status == "done") {
-                    (Color::rgb(120, 180, 120), "✓ ")
-                } else {
-                    (Color::rgb(140, 140, 160), "- ")
-                };
-                let text = StyledText {
-                    spans: vec![
-                        StyledSpan::with_fg(bullet, sc),
-                        StyledSpan::with_fg(
-                            format!("#{} ", issue_num),
-                            Color::rgb(150, 150, 240),
-                        ),
-                        StyledSpan::plain(trunc(title, 22)),
-                    ],
-                };
-                let detail = Some(StyledText {
-                    spans: vec![StyledSpan::with_fg(
-                        trunc(repo, 14),
-                        Color::rgb(100, 130, 170),
-                    )],
-                });
-                ListItem {
-                    text,
-                    icon: None,
-                    detail,
-                    decoration: Decoration::Normal,
-                }
-            })
-            .collect();
-
-        ListView {
-            id: WidgetId::new("pipeline"),
-            title: Some(StyledText::plain(format!(" PIPELINE ({}) ", n))),
-            items,
-            selected_idx: if n > 0 { self.pipeline_sel } else { 0 },
-            scroll_offset: self.pipeline_scroll,
-            has_focus: true,
-            bordered: false,
-        }
-    }
-
-    /// Right panel for the Pipeline view: per-stage breakdown for the
-    /// selected issue.
-    fn pipeline_detail_list(&self) -> ListView {
-        let issues = self.pipeline_issues();
-
-        let mut items: Vec<ListItem> = Vec::new();
-
-        match issues.get(self.pipeline_sel) {
-            None => {
-                items.push(kv_item("", " No issue selected", None));
-            }
-            Some((issue_number, repo, title)) => {
-                // Section header
-                items.push(ListItem {
-                    text: StyledText {
-                        spans: vec![StyledSpan::with_fg(
-                            format!(" {} #{} ", repo, issue_number),
-                            Color::rgb(210, 220, 255),
-                        )],
-                    },
-                    icon: None,
-                    detail: None,
-                    decoration: Decoration::Header,
-                });
-                items.push(kv_item(
-                    "",
-                    &format!("  {}", trunc(title, 52)),
-                    None,
-                ));
-                items.push(kv_item("", "", None)); // blank spacer
-
-                // Sub-header
-                items.push(ListItem {
-                    text: StyledText {
-                        spans: vec![StyledSpan::with_fg(
-                            " STAGES ",
-                            Color::rgb(130, 130, 150),
-                        )],
-                    },
-                    icon: None,
-                    detail: None,
-                    decoration: Decoration::Header,
-                });
-
-                // All assignments for this issue (assignments sorted most-recent first).
-                let issue_assignments: Vec<&Assignment> = self
-                    .data
-                    .assignments
-                    .iter()
-                    .filter(|a| a.issue_number == *issue_number)
-                    .collect();
-
-                // Stage definitions: (display name, type filter fn)
-                // We render them in pipeline order even if some are absent.
-                let stage_filters: &[(&str, fn(&Assignment) -> bool)] = &[
-                    ("Plan", |a| {
-                        a.assignment_type.as_deref() == Some("plan")
-                    }),
-                    ("Work", |a| {
-                        a.assignment_type.as_deref() == Some("work")
-                            || a.assignment_type.is_none()
-                    }),
-                    ("Review", |a| {
-                        a.assignment_type.as_deref() == Some("review")
-                    }),
-                    ("Smoke", |a| {
-                        a.assignment_type.as_deref() == Some("smoke")
-                    }),
-                ];
-
-                for (stage_name, filter) in stage_filters {
-                    let assignment = issue_assignments.iter().find(|a| filter(a));
-                    items.push(pipeline_stage_item(stage_name, assignment.copied()));
-                }
-
-                // PR/Merge stage from merge_queue
-                let mq_entry = self
-                    .data
-                    .merge_queue
-                    .iter()
-                    .find(|e| e.issue_number == Some(*issue_number));
-                items.push(pipeline_merge_item(mq_entry));
-            }
-        }
-
-        let title = match issues.get(self.pipeline_sel) {
-            Some((n, r, _)) => format!(" PIPELINE — {} #{} ", r, n),
-            None => " PIPELINE ".to_string(),
-        };
-
-        ListView {
-            id: WidgetId::new("pipeline-detail"),
-            title: Some(StyledText::plain(&title)),
-            items,
-            selected_idx: 0,
-            scroll_offset: self.pipeline_detail_scroll,
-            has_focus: false,
-            bordered: false,
-        }
-    }
 
     // ── Mouse dispatch ────────────────────────────────────────────────────
 
@@ -1649,7 +1669,7 @@ impl CoordApp {
         }
     }
 
-    /// Click in the sidebar (board tree / machines list / pipeline list,
+    /// Click in the sidebar (board sidebar system / machines list,
     /// depending on the active view).
     fn mouse_sidebar_click(
         &mut self,
@@ -1660,17 +1680,20 @@ impl CoordApp {
     ) -> bool {
         match self.active_view {
             SidebarView::Board => {
-                // Delegate fully to the TreeController — it handles row
-                // hit-testing, selection, and scroll-thumb dragging.
-                let result = self.board_tree.handle(event, backend, sidebar_b);
-                if let TreeControllerEvent::RowSelected { ref path } = result {
-                    // Reset detail-panel scroll when the user picks a new leaf.
-                    if path.len() >= 2 {
+                // Delegate to the SidebarSystem for hit-testing.
+                let result = self.board_sidebar.handle(event, backend, sidebar_b);
+                match result {
+                    SidebarEvent::RowSelected { .. } | SidebarEvent::RowActivated { .. } => {
                         self.detail_scroll = 0;
-                        self.activity_scroll = None; // back to auto-scroll
+                        self.activity_scroll = None;
+                        true
                     }
+                    SidebarEvent::HeaderActivated { .. }
+                    | SidebarEvent::StateChanged
+                    | SidebarEvent::Consumed
+                    | SidebarEvent::ScrollChanged { .. } => true,
+                    _ => false,
                 }
-                result != TreeControllerEvent::Ignored
             }
             SidebarView::Machines => {
                 // Row 0 = title strip; item i starts at row 1+i-scroll.
@@ -1681,19 +1704,6 @@ impl CoordApp {
                     if item_idx < m && item_idx != self.machine_sel {
                         self.machine_sel = item_idx;
                         self.machine_detail_scroll = 0;
-                        return true;
-                    }
-                }
-                false
-            }
-            SidebarView::Pipeline => {
-                let row = (pos.y - sidebar_b.y).max(0.0) as usize;
-                if row >= 1 {
-                    let item_idx = (row - 1) + self.pipeline_scroll;
-                    let p = self.pipeline_issues().len();
-                    if item_idx < p && item_idx != self.pipeline_sel {
-                        self.pipeline_sel = item_idx;
-                        self.pipeline_detail_scroll = 0;
                         return true;
                     }
                 }
@@ -1737,8 +1747,8 @@ impl CoordApp {
     ) -> bool {
         match self.active_view {
             SidebarView::Board => {
-                // Delegate to the TreeController's built-in scroll handler.
-                self.board_tree.handle(event, backend, sidebar_b);
+                // Delegate to the SidebarSystem's built-in scroll handler.
+                self.board_sidebar.handle(event, backend, sidebar_b);
                 true
             }
             SidebarView::Machines => {
@@ -1754,22 +1764,10 @@ impl CoordApp {
                 }
                 true
             }
-            SidebarView::Pipeline => {
-                let visible = content_visible_rows(sidebar_b, lh);
-                let p = self.pipeline_issues().len();
-                if delta.y > 0.0 {
-                    self.pipeline_scroll = self.pipeline_scroll.saturating_sub(1);
-                } else if delta.y < 0.0 {
-                    let max = p.saturating_sub(visible);
-                    self.pipeline_scroll = (self.pipeline_scroll + 1).min(max);
-                }
-                true
-            }
         }
     }
 
-    /// Scroll wheel in the main panel (detail / activity / machine detail /
-    /// pipeline detail).
+    /// Scroll wheel in the main panel (detail / activity / machine detail).
     fn mouse_main_scroll(&mut self, delta: ScrollDelta, main_b: Rect, lh: f32) -> bool {
         let visible = content_visible_rows(main_b, lh);
         match self.active_view {
@@ -1785,8 +1783,6 @@ impl CoordApp {
                         }
                     }
                     DetailTab::Activity => {
-                        // Build the activity list to find its item count; also
-                        // resolves the current auto-scroll offset if needed.
                         let list = self.activity_list();
                         let items = list.items.len();
                         let current = self.activity_scroll.unwrap_or(list.scroll_offset);
@@ -1807,16 +1803,6 @@ impl CoordApp {
                     self.machine_detail_scroll = self.machine_detail_scroll.saturating_sub(1);
                 } else if delta.y < 0.0 {
                     self.machine_detail_scroll = (self.machine_detail_scroll + 1).min(max);
-                }
-                true
-            }
-            SidebarView::Pipeline => {
-                let items = self.pipeline_detail_list().items.len();
-                let max = items.saturating_sub(visible.saturating_sub(1));
-                if delta.y > 0.0 {
-                    self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_sub(1);
-                } else if delta.y < 0.0 {
-                    self.pipeline_detail_scroll = (self.pipeline_detail_scroll + 1).min(max);
                 }
                 true
             }
@@ -1852,7 +1838,7 @@ impl CoordApp {
                 },
             ],
             right_segments: vec![StatusBarSegment {
-                text: " 1=Board  2=Machines  3=Pipeline  j/k=nav  h/l=tabs  Enter/Space=expand  r=refresh  q=quit ".to_string(),
+                text: " 1=Board  2=Machines  j/k=nav  h/l=tabs  Tab=section  r=refresh  q=quit ".to_string(),
                 fg: Color::rgb(140, 140, 140),
                 bg: Color::rgb(30, 30, 40),
                 bold: false,
@@ -1880,17 +1866,14 @@ impl ShellApp for CoordApp {
             backend.draw_status_bar(sb_bounds, &self.status_bar(), None, None);
         }
 
-        // ── Sidebar: list content (tree / machines / pipeline) ───────
+        // ── Sidebar: list content (sidebar system / machines) ────────
         if let Some(sidebar_rect) = layout.sidebar_content_bounds {
             match self.active_view {
                 SidebarView::Board => {
-                    self.board_tree.render(backend, sidebar_rect);
+                    self.board_sidebar.render(backend, sidebar_rect);
                 }
                 SidebarView::Machines => {
                     backend.draw_list(sidebar_rect, &self.machines_list(true));
-                }
-                SidebarView::Pipeline => {
-                    backend.draw_list(sidebar_rect, &self.pipeline_issue_list());
                 }
             }
         }
@@ -1917,9 +1900,6 @@ impl ShellApp for CoordApp {
             SidebarView::Machines => {
                 backend.draw_list(m, &self.machine_detail_list());
             }
-            SidebarView::Pipeline => {
-                backend.draw_list(m, &self.pipeline_detail_list());
-            }
         }
     }
 
@@ -1936,22 +1916,16 @@ impl ShellApp for CoordApp {
         needs_redraw |= self.handle_mouse(&event, backend, ctx);
 
         // ── Pre-compute panel bounds for keyboard visible-row estimates ───────
-        // The sidebar holds the list views (board tree / machines / pipeline);
-        // when the sidebar is hidden, fall back to the main area.
         let list_b = ctx.sidebar_bounds().unwrap_or(ctx.main_bounds());
         let lh = backend.line_height();
 
         // ── Keyboard and window events ────────────────────────────────────────
-        match event {
+        match &event {
             UiEvent::KeyPressed { key, .. } => {
                 match key {
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
 
                     // ── Switch sidebar views ─────────────────────────────
-                    // 1/2/3 jump directly to a view. Tab is reserved for
-                    // future section cycling within a panel (see issue
-                    // for the SidebarSystem refactor) — handling it here
-                    // would desync the activity bar highlight.
                     Key::Char('1') => {
                         self.active_view = SidebarView::Board;
                         needs_redraw = true;
@@ -1960,21 +1934,35 @@ impl ShellApp for CoordApp {
                         self.active_view = SidebarView::Machines;
                         needs_redraw = true;
                     }
-                    Key::Char('3') => {
-                        self.active_view = SidebarView::Pipeline;
-                        needs_redraw = true;
+
+                    // ── Tab — cycle sections within Board SidebarSystem ──
+                    Key::Named(NamedKey::Tab)
+                        if self.active_view == SidebarView::Board =>
+                    {
+                        let prev_sel = self.board_selected_issue();
+                        let result = self.board_sidebar.handle(&event, backend, list_b);
+                        if result != SidebarEvent::Ignored {
+                            let new_sel = self.board_selected_issue();
+                            if new_sel != prev_sel {
+                                self.detail_scroll = 0;
+                                self.activity_scroll = None;
+                            }
+                            needs_redraw = true;
+                        }
                     }
 
                     // ── Down / j ─────────────────────────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down) => {
                         match self.active_view {
                             SidebarView::Board => {
-                                let vr = board_visible_rows(list_b, lh);
-                                let prev = self.board_tree.selected_path().cloned();
-                                self.board_tree.move_selection_by(1, vr);
-                                if self.board_tree.selected_path() != prev.as_ref() {
-                                    self.detail_scroll = 0;
-                                    self.activity_scroll = None;
+                                let prev_sel = self.board_selected_issue();
+                                let result = self.board_sidebar.handle(&event, backend, list_b);
+                                if result != SidebarEvent::Ignored {
+                                    let new_sel = self.board_selected_issue();
+                                    if new_sel != prev_sel {
+                                        self.detail_scroll = 0;
+                                        self.activity_scroll = None;
+                                    }
                                 }
                             }
                             SidebarView::Machines => {
@@ -1985,14 +1973,6 @@ impl ShellApp for CoordApp {
                                 }
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
-                            SidebarView::Pipeline => {
-                                let p = self.pipeline_issues().len();
-                                if p > 0 && self.pipeline_sel + 1 < p {
-                                    self.pipeline_sel += 1;
-                                    self.pipeline_detail_scroll = 0;
-                                }
-                                self.fix_pipeline_scroll(content_visible_rows(list_b, lh));
-                            }
                         }
                         needs_redraw = true;
                     }
@@ -2001,12 +1981,14 @@ impl ShellApp for CoordApp {
                     Key::Char('k') | Key::Named(NamedKey::Up) => {
                         match self.active_view {
                             SidebarView::Board => {
-                                let vr = board_visible_rows(list_b, lh);
-                                let prev = self.board_tree.selected_path().cloned();
-                                self.board_tree.move_selection_by(-1, vr);
-                                if self.board_tree.selected_path() != prev.as_ref() {
-                                    self.detail_scroll = 0;
-                                    self.activity_scroll = None;
+                                let prev_sel = self.board_selected_issue();
+                                let result = self.board_sidebar.handle(&event, backend, list_b);
+                                if result != SidebarEvent::Ignored {
+                                    let new_sel = self.board_selected_issue();
+                                    if new_sel != prev_sel {
+                                        self.detail_scroll = 0;
+                                        self.activity_scroll = None;
+                                    }
                                 }
                             }
                             SidebarView::Machines => {
@@ -2016,13 +1998,6 @@ impl ShellApp for CoordApp {
                                 }
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
-                            SidebarView::Pipeline => {
-                                if self.pipeline_sel > 0 {
-                                    self.pipeline_sel -= 1;
-                                    self.pipeline_detail_scroll = 0;
-                                }
-                                self.fix_pipeline_scroll(content_visible_rows(list_b, lh));
-                            }
                         }
                         needs_redraw = true;
                     }
@@ -2031,10 +2006,10 @@ impl ShellApp for CoordApp {
                     Key::Named(NamedKey::Home) => {
                         match self.active_view {
                             SidebarView::Board => {
-                                let vr = board_visible_rows(list_b, lh);
-                                let prev = self.board_tree.selected_path().cloned();
-                                self.board_tree.jump_to_edge(true, vr);
-                                if self.board_tree.selected_path() != prev.as_ref() {
+                                let prev_sel = self.board_selected_issue();
+                                self.board_sidebar.handle(&event, backend, list_b);
+                                let new_sel = self.board_selected_issue();
+                                if new_sel != prev_sel {
                                     self.detail_scroll = 0;
                                     self.activity_scroll = None;
                                 }
@@ -2044,11 +2019,6 @@ impl ShellApp for CoordApp {
                                 self.machine_detail_scroll = 0;
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
-                            SidebarView::Pipeline => {
-                                self.pipeline_sel = 0;
-                                self.pipeline_detail_scroll = 0;
-                                self.fix_pipeline_scroll(content_visible_rows(list_b, lh));
-                            }
                         }
                         needs_redraw = true;
                     }
@@ -2057,10 +2027,10 @@ impl ShellApp for CoordApp {
                     Key::Named(NamedKey::End) => {
                         match self.active_view {
                             SidebarView::Board => {
-                                let vr = board_visible_rows(list_b, lh);
-                                let prev = self.board_tree.selected_path().cloned();
-                                self.board_tree.jump_to_edge(false, vr);
-                                if self.board_tree.selected_path() != prev.as_ref() {
+                                let prev_sel = self.board_selected_issue();
+                                self.board_sidebar.handle(&event, backend, list_b);
+                                let new_sel = self.board_selected_issue();
+                                if new_sel != prev_sel {
                                     self.detail_scroll = 0;
                                     self.activity_scroll = None;
                                 }
@@ -2073,14 +2043,6 @@ impl ShellApp for CoordApp {
                                 }
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
-                            SidebarView::Pipeline => {
-                                let p = self.pipeline_issues().len();
-                                if p > 0 {
-                                    self.pipeline_sel = p - 1;
-                                    self.pipeline_detail_scroll = 0;
-                                }
-                                self.fix_pipeline_scroll(content_visible_rows(list_b, lh));
-                            }
                         }
                         needs_redraw = true;
                     }
@@ -2089,11 +2051,10 @@ impl ShellApp for CoordApp {
                     Key::Named(NamedKey::PageDown)
                         if self.active_view == SidebarView::Board =>
                     {
-                        let vr = board_visible_rows(list_b, lh);
-                        let jump = (vr.max(1) - 1).max(1) as isize;
-                        let prev = self.board_tree.selected_path().cloned();
-                        self.board_tree.move_selection_by(jump, vr);
-                        if self.board_tree.selected_path() != prev.as_ref() {
+                        let prev_sel = self.board_selected_issue();
+                        self.board_sidebar.handle(&event, backend, list_b);
+                        let new_sel = self.board_selected_issue();
+                        if new_sel != prev_sel {
                             self.detail_scroll = 0;
                             self.activity_scroll = None;
                         }
@@ -2104,22 +2065,13 @@ impl ShellApp for CoordApp {
                     Key::Named(NamedKey::PageUp)
                         if self.active_view == SidebarView::Board =>
                     {
-                        let vr = board_visible_rows(list_b, lh);
-                        let jump = (vr.max(1) - 1).max(1) as isize;
-                        let prev = self.board_tree.selected_path().cloned();
-                        self.board_tree.move_selection_by(-jump, vr);
-                        if self.board_tree.selected_path() != prev.as_ref() {
+                        let prev_sel = self.board_selected_issue();
+                        self.board_sidebar.handle(&event, backend, list_b);
+                        let new_sel = self.board_selected_issue();
+                        if new_sel != prev_sel {
                             self.detail_scroll = 0;
                             self.activity_scroll = None;
                         }
-                        needs_redraw = true;
-                    }
-
-                    // ── Enter / Space — expand/collapse group (Board only) ─
-                    Key::Named(NamedKey::Enter) | Key::Char(' ')
-                        if self.active_view == SidebarView::Board =>
-                    {
-                        self.toggle_selected_group();
                         needs_redraw = true;
                     }
 
@@ -2152,7 +2104,7 @@ impl ShellApp for CoordApp {
                 }
             }
 
-            UiEvent::WindowResized { .. } => needs_redraw = true,
+            UiEvent::WindowResized { .. } => { needs_redraw = true; }
 
             _ => {}
         }
@@ -2170,7 +2122,6 @@ impl ShellApp for CoordApp {
             self.active_view = match panel_id.as_str() {
                 "panel:board" => SidebarView::Board,
                 "panel:machines" => SidebarView::Machines,
-                "panel:pipeline" => SidebarView::Pipeline,
                 _ => return,
             };
         }
@@ -2186,18 +2137,6 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
     }
     let content_h = (panel.height - lh).max(0.0); // minus list title row
     (content_h / lh) as usize
-}
-
-/// Estimate the number of visible rows in the Board `TreeController` panel.
-///
-/// The Board tree has no separate title row (unlike `ListView`), so the full
-/// panel height is usable. Used to provide a viewport-rows hint to
-/// [`TreeController`] navigation primitives.
-fn board_visible_rows(panel: Rect, lh: f32) -> usize {
-    if lh <= 0.0 {
-        return 10;
-    }
-    (panel.height / lh) as usize
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -2262,204 +2201,137 @@ mod tests {
         assert_eq!(trunc(s, 3), "🎉 h");
     }
 
-    // ── Board tree helpers ────────────────────────────────────────────────────
+    // ── Board helpers ──────────────────────────────────────────────────────
 
     fn make_app_default() -> CoordApp {
+        let mut sidebar = SidebarSystem::new(Vec::new());
+        sidebar.set_navigation_mode(NavigationMode::Selection);
+        sidebar.set_allow_collapse(true);
         CoordApp {
             data: BoardData::default(),
             active_view: SidebarView::default(),
-            board_tree: TreeController::new("board"),
-            board_groups_expanded: [true, true, false],
+            board_sidebar: sidebar,
+            board_repo_names: Vec::new(),
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
-            pipeline_sel: 0,
-            pipeline_scroll: 0,
             detail_scroll: 0,
             activity_scroll: None,
             machine_detail_scroll: 0,
-            pipeline_detail_scroll: 0,
         }
     }
 
     fn make_app_with_assignments(assignments: Vec<Assignment>) -> CoordApp {
+        let mut sidebar = SidebarSystem::new(Vec::new());
+        sidebar.set_navigation_mode(NavigationMode::Selection);
+        sidebar.set_allow_collapse(true);
         let mut app = CoordApp {
             data: BoardData {
                 assignments,
                 ..BoardData::default()
             },
             active_view: SidebarView::default(),
-            board_tree: TreeController::new("board"),
-            board_groups_expanded: [true, true, false],
+            board_sidebar: sidebar,
+            board_repo_names: Vec::new(),
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
-            pipeline_sel: 0,
-            pipeline_scroll: 0,
             detail_scroll: 0,
             activity_scroll: None,
             machine_detail_scroll: 0,
-            pipeline_detail_scroll: 0,
         };
-        app.rebuild_board_tree_rows();
+        app.rebuild_board_sidebar();
         app
     }
 
-    // ── build_board_rows / board_selected_assignment ──────────────────────────
+    // ── issues_by_repo ──────────────────────────────────────────────────────
 
     #[test]
-    fn board_rows_empty_data_produces_three_group_headers() {
+    fn issues_by_repo_empty_data() {
         let app = make_app_default();
-        let rows = app.build_board_rows();
-        // Three group headers (Running, Failed, Done) — all expanded=true/true/false.
-        // Running(0) + Failed(0) both expanded → 0 leaves; Done collapsed → 0 leaves.
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].path, vec![0]);
-        assert_eq!(rows[1].path, vec![1]);
-        assert_eq!(rows[2].path, vec![2]);
+        let grouped = app.issues_by_repo();
+        assert!(grouped.is_empty());
     }
 
     #[test]
-    fn board_rows_expanded_group_shows_leaves() {
+    fn issues_by_repo_groups_by_repo() {
         let assignments = vec![
-            make_assignment("running"),
-            make_assignment("running"),
-            make_assignment("failed"),
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 10, "repo-a", Some("review")),
+            make_assignment_typed("done", 20, "repo-b", Some("work")),
         ];
         let app = make_app_with_assignments(assignments);
-        let rows = app.build_board_rows();
-        // Running(2 expanded) + 2 leaves + Failed(1 expanded) + 1 leaf + Done(0 collapsed)
-        assert_eq!(rows.len(), 3 + 2 + 1); // 3 headers + 3 leaves
-        // First header: Running group
-        assert_eq!(rows[0].path, vec![0]);
-        assert_eq!(rows[0].is_expanded, Some(true));
-        // Leaves for running
-        assert_eq!(rows[1].path, vec![0, 0]);
-        assert_eq!(rows[2].path, vec![0, 1]);
-        // Failed header
-        assert_eq!(rows[3].path, vec![1]);
-        assert_eq!(rows[3].is_expanded, Some(true));
-        // Leaf for failed
-        assert_eq!(rows[4].path, vec![1, 0]);
-        // Done header — collapsed by default
-        assert_eq!(rows[5].path, vec![2]);
-        assert_eq!(rows[5].is_expanded, Some(false));
+        let grouped = app.issues_by_repo();
+        assert_eq!(grouped.len(), 2);
+        // repo-a has running issue → sorted first.
+        let (repo_a_name, repo_a_issues) = &grouped[0];
+        assert_eq!(repo_a_name, "repo-a");
+        assert_eq!(repo_a_issues.len(), 1); // issue #10
+        assert_eq!(repo_a_issues[0].issue_number, 10);
+        assert_eq!(repo_a_issues[0].assignments.len(), 2);
+        assert_eq!(repo_a_issues[0].status_summary, "running");
+
+        let (repo_b_name, repo_b_issues) = &grouped[1];
+        assert_eq!(repo_b_name, "repo-b");
+        assert_eq!(repo_b_issues.len(), 1); // issue #20
+        assert_eq!(repo_b_issues[0].status_summary, "done");
     }
 
     #[test]
-    fn board_rows_collapsed_group_hides_leaves() {
-        let assignments = vec![make_assignment("done"), make_assignment("done")];
-        let app = make_app_with_assignments(assignments);
-        let rows = app.build_board_rows();
-        // Running(0) + Failed(0) expanded with 0 leaves; Done(2) collapsed → 0 leaves
-        assert_eq!(rows.len(), 3); // only the 3 headers
-    }
-
-    #[test]
-    fn board_selected_assignment_on_leaf_returns_correct_assignment() {
+    fn issues_by_repo_status_failed_when_latest_failed() {
         let assignments = vec![
-            make_assignment("running"), // idx 0 → path [0, 0]
-            make_assignment("failed"),  // idx 1 → path [1, 0]
-            make_assignment("done"),    // idx 2 → path [2, 0]  (collapsed, won't be selectable)
+            make_assignment_typed("done", 10, "repo", Some("work")),
+            make_assignment_typed("failed", 10, "repo", Some("review")),
         ];
-        let mut app = make_app_with_assignments(assignments.clone());
-
-        // Select running leaf [0, 0]
-        app.board_tree.set_selected_path(Some(vec![0, 0]));
-        let sel = app.board_selected_assignment().unwrap();
-        assert_eq!(sel.status, "running");
-
-        // Select failed leaf [1, 0]
-        app.board_tree.set_selected_path(Some(vec![1, 0]));
-        let sel = app.board_selected_assignment().unwrap();
-        assert_eq!(sel.status, "failed");
+        let app = make_app_with_assignments(assignments);
+        let grouped = app.issues_by_repo();
+        assert_eq!(grouped[0].1[0].status_summary, "failed");
     }
 
     #[test]
-    fn board_selected_assignment_on_group_header_returns_none() {
-        let assignments = vec![make_assignment("running")];
-        let mut app = make_app_with_assignments(assignments);
-
-        // Select the Running group header [0]
-        app.board_tree.set_selected_path(Some(vec![0]));
-        assert!(app.board_selected_assignment().is_none());
-    }
-
-    #[test]
-    fn board_selected_assignment_no_selection_returns_none() {
+    fn board_selected_issue_none_when_no_selection() {
         let app = make_app_default();
-        assert!(app.board_selected_assignment().is_none());
+        assert!(app.board_selected_issue().is_none());
     }
 
     #[test]
-    fn toggle_selected_group_expands_collapsed_done_group() {
-        let assignments = vec![make_assignment("done")];
+    fn board_selected_issue_returns_correct_issue() {
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 20, "repo-b", Some("work")),
+        ];
         let mut app = make_app_with_assignments(assignments);
-        // Done is group index 2, collapsed by default
-        app.board_tree.set_selected_path(Some(vec![2]));
-        assert!(!app.board_groups_expanded[2]);
-
-        app.toggle_selected_group();
-        assert!(app.board_groups_expanded[2]);
-
-        let rows = app.build_board_rows();
-        // Now Done expanded → 1 leaf visible
-        let done_leaf = rows.iter().any(|r| r.path == vec![2, 0]);
-        assert!(done_leaf, "done leaf should be visible after expand");
-    }
-
-    #[test]
-    fn toggle_selected_group_collapses_expanded_running_group() {
-        let assignments = vec![make_assignment("running")];
-        let mut app = make_app_with_assignments(assignments);
-        app.board_tree.set_selected_path(Some(vec![0]));
-        assert!(app.board_groups_expanded[0]); // expanded by default
-
-        app.toggle_selected_group();
-        assert!(!app.board_groups_expanded[0]);
-
-        let rows = app.build_board_rows();
-        // After collapse, no running leaf
-        let has_leaf = rows.iter().any(|r| r.path.len() == 2 && r.path[0] == 0);
-        assert!(!has_leaf, "running leaves should be hidden after collapse");
-    }
-
-    #[test]
-    fn rebuild_clears_stale_selection_on_collapse() {
-        let assignments = vec![make_assignment("running")];
-        let mut app = make_app_with_assignments(assignments);
-        // Select the running leaf
-        app.board_tree.set_selected_path(Some(vec![0, 0]));
-        assert!(app.board_selected_assignment().is_some());
-
-        // Collapse running group — leaf path [0, 0] no longer exists
-        app.board_groups_expanded[0] = false;
-        app.rebuild_board_tree_rows();
-
-        // Selection should have been cleared
-        assert!(app.board_tree.selected_path().is_none());
+        // Select first section (repo with running issue), first row
+        app.board_sidebar.set_active_section(Some(0));
+        app.board_sidebar.set_selected_path(0, Some(vec![0]));
+        let sel = app.board_selected_issue();
+        assert!(sel.is_some());
+        // Should be issue #10 from repo-a (sorted first due to running status).
+        let (repo, issue_num) = sel.unwrap();
+        assert_eq!(repo, "repo-a");
+        assert_eq!(issue_num, 10);
     }
 
     // ── fix_machine_scroll ────────────────────────────────────────────────────
 
     fn make_app_machine(machine_sel: usize, machine_scroll: usize) -> CoordApp {
+        let mut sidebar = SidebarSystem::new(Vec::new());
+        sidebar.set_navigation_mode(NavigationMode::Selection);
+        sidebar.set_allow_collapse(true);
         CoordApp {
             data: BoardData::default(),
             active_view: SidebarView::Machines,
-            board_tree: TreeController::new("board"),
-            board_groups_expanded: [true, true, false],
+            board_sidebar: sidebar,
+            board_repo_names: Vec::new(),
             machine_sel,
             machine_scroll,
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
-            pipeline_sel: 0,
-            pipeline_scroll: 0,
             detail_scroll: 0,
             activity_scroll: None,
             machine_detail_scroll: 0,
-            pipeline_detail_scroll: 0,
         }
     }
 
@@ -2490,7 +2362,6 @@ mod tests {
     fn sidebar_view_label() {
         assert_eq!(SidebarView::Board.label(), "Board");
         assert_eq!(SidebarView::Machines.label(), "Machines");
-        assert_eq!(SidebarView::Pipeline.label(), "Pipeline");
     }
 
     #[test]
@@ -2498,7 +2369,7 @@ mod tests {
         assert_eq!(SidebarView::default(), SidebarView::Board);
     }
 
-    // ── Pipeline ─────────────────────────────────────────────────────────────
+    // ── Issue grouping (replaces old pipeline tests) ─────────────────────────
 
     fn make_assignment_typed(status: &str, issue: u64, repo: &str, atype: Option<&str>) -> Assignment {
         Assignment {
@@ -2518,37 +2389,51 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_issues_deduplicates_by_issue_number() {
+    fn issues_by_repo_deduplicates_issues() {
         let assignments = vec![
             make_assignment_typed("running", 10, "repo-a", Some("work")),
             make_assignment_typed("done", 10, "repo-a", Some("plan")),
             make_assignment_typed("done", 20, "repo-b", Some("work")),
         ];
         let app = make_app_with_assignments(assignments);
-        let issues = app.pipeline_issues();
-        assert_eq!(issues.len(), 2);
-        let nums: Vec<u64> = issues.iter().map(|(n, _, _)| *n).collect();
-        assert!(nums.contains(&10));
-        assert!(nums.contains(&20));
+        let grouped = app.issues_by_repo();
+        // Two repos, one issue each.
+        let total_issues: usize = grouped.iter().map(|(_, issues)| issues.len()).sum();
+        assert_eq!(total_issues, 2);
     }
 
     #[test]
-    fn pipeline_issues_orders_by_most_recent_dispatched_at() {
-        let mut a_old = make_assignment_typed("done", 5, "repo", Some("work"));
-        a_old.dispatched_at = Some(1_000.0);
-        let mut a_new = make_assignment_typed("done", 7, "repo", Some("work"));
-        a_new.dispatched_at = Some(9_000.0);
-        let app = make_app_with_assignments(vec![a_old, a_new]);
-        let issues = app.pipeline_issues();
-        // Issue 7 (newer) should come first.
-        assert_eq!(issues[0].0, 7);
-        assert_eq!(issues[1].0, 5);
-    }
-
-    #[test]
-    fn pipeline_issues_empty_when_no_assignments() {
-        let app = make_app_default();
-        assert!(app.pipeline_issues().is_empty());
+    fn issues_by_repo_includes_empty_repos_from_machines() {
+        let mut sidebar = SidebarSystem::new(Vec::new());
+        sidebar.set_navigation_mode(NavigationMode::Selection);
+        sidebar.set_allow_collapse(true);
+        let mut app = CoordApp {
+            data: BoardData {
+                machines: vec![Machine {
+                    name: "m1".to_string(),
+                    reachable: true,
+                    active_count: 0,
+                    repos: vec!["empty-repo".to_string()],
+                }],
+                ..BoardData::default()
+            },
+            active_view: SidebarView::default(),
+            board_sidebar: sidebar,
+            board_repo_names: Vec::new(),
+            machine_sel: 0,
+            machine_scroll: 0,
+            refreshed_at: Instant::now(),
+            detail_tab: DetailTab::default(),
+            detail_scroll: 0,
+            activity_scroll: None,
+            machine_detail_scroll: 0,
+        };
+        app.rebuild_board_sidebar();
+        let grouped = app.issues_by_repo();
+        // Empty repo should appear with 0 issues.
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0, "empty-repo");
+        assert!(grouped[0].1.is_empty());
     }
 
     // ── Assignment::status_label ───────────────────────────────────────────────
@@ -2873,11 +2758,4 @@ mod tests {
         assert_eq!(app.machine_detail_scroll, 5);
     }
 
-    #[test]
-    fn pipeline_detail_scroll_preserved_after_refresh() {
-        let mut app = make_app_default();
-        app.pipeline_detail_scroll = 2;
-        app.refresh();
-        assert_eq!(app.pipeline_detail_scroll, 2);
-    }
 }
