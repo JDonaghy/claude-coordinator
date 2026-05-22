@@ -84,14 +84,6 @@ impl SidebarView {
         }
     }
 
-    /// Cycle to the next view (wraps around).
-    fn next(self) -> Self {
-        match self {
-            SidebarView::Board => SidebarView::Machines,
-            SidebarView::Machines => SidebarView::Pipeline,
-            SidebarView::Pipeline => SidebarView::Board,
-        }
-    }
 }
 
 // ─── App data model ───────────────────────────────────────────────────────────
@@ -1860,7 +1852,7 @@ impl CoordApp {
                 },
             ],
             right_segments: vec![StatusBarSegment {
-                text: " 1=Board  2=Machines  3=Pipeline  Tab=switch  j/k=nav  h/l=tabs  Enter/Space=expand  r=refresh  q=quit ".to_string(),
+                text: " 1=Board  2=Machines  3=Pipeline  j/k=nav  h/l=tabs  Enter/Space=expand  r=refresh  q=quit ".to_string(),
                 fg: Color::rgb(140, 140, 140),
                 bg: Color::rgb(30, 30, 40),
                 bold: false,
@@ -1956,14 +1948,10 @@ impl ShellApp for CoordApp {
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
 
                     // ── Switch sidebar views ─────────────────────────────
-                    // Tab cycles through panels; 1/2/3 jump directly.
-                    // Note: the activity bar highlight reflects the last
-                    // shell-driven panel click (on_shell_event), not
-                    // keyboard switches — content is correct regardless.
-                    Key::Named(NamedKey::Tab) => {
-                        self.active_view = self.active_view.next();
-                        needs_redraw = true;
-                    }
+                    // 1/2/3 jump directly to a view. Tab is reserved for
+                    // future section cycling within a panel (see issue
+                    // for the SidebarSystem refactor) — handling it here
+                    // would desync the activity bar highlight.
                     Key::Char('1') => {
                         self.active_view = SidebarView::Board;
                         needs_redraw = true;
@@ -2497,13 +2485,6 @@ mod tests {
     }
 
     // ── SidebarView ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn sidebar_view_next_cycles() {
-        assert_eq!(SidebarView::Board.next(), SidebarView::Machines);
-        assert_eq!(SidebarView::Machines.next(), SidebarView::Pipeline);
-        assert_eq!(SidebarView::Pipeline.next(), SidebarView::Board);
-    }
 
     #[test]
     fn sidebar_view_label() {
