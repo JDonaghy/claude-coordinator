@@ -1977,6 +1977,38 @@ impl CoordApp {
         }
     }
 
+    /// Dispatch a [`SidebarEvent`] produced by the board view's
+    /// [`SidebarSystem`] to the appropriate handler. Returns `true`
+    /// when the event was consumed.
+    ///
+    /// Issue #167: the `HeaderActivated` arm manually toggles the
+    /// section's collapsed state. Once quadraui #239 lands on the
+    /// pinned quadraui revision, `SidebarSystem::click` will toggle
+    /// collapse internally and the manual `set_collapsed` call here
+    /// becomes redundant. Until then, removing this workaround would
+    /// regress click-to-collapse. The observable contract
+    /// (`header click → is_collapsed flips`) is covered by
+    /// `header_click_toggles_section_collapse` in the tests module
+    /// and must hold whichever side of the upgrade we're on.
+    fn apply_board_sidebar_event(&mut self, result: SidebarEvent) -> bool {
+        match result {
+            SidebarEvent::RowSelected { .. } | SidebarEvent::RowActivated { .. } => {
+                self.detail_scroll = 0;
+                self.activity_scroll = None;
+                true
+            }
+            SidebarEvent::HeaderActivated { section } => {
+                let collapsed = self.board_sidebar.is_collapsed(section);
+                self.board_sidebar.set_collapsed(section, !collapsed);
+                true
+            }
+            SidebarEvent::StateChanged
+            | SidebarEvent::Consumed
+            | SidebarEvent::ScrollChanged { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Click in the sidebar (board sidebar system / machines list,
     /// depending on the active view).
     fn mouse_sidebar_click(
@@ -1988,24 +2020,12 @@ impl CoordApp {
     ) -> bool {
         match self.active_view {
             SidebarView::Board => {
-                // Delegate to the SidebarSystem for hit-testing.
+                // Delegate to the SidebarSystem for hit-testing, then
+                // route the resulting SidebarEvent through the shared
+                // dispatch helper (so tests can exercise the same path
+                // without a Backend in hand).
                 let result = self.board_sidebar.handle(event, backend, sidebar_b);
-                match result {
-                    SidebarEvent::RowSelected { .. } | SidebarEvent::RowActivated { .. } => {
-                        self.detail_scroll = 0;
-                        self.activity_scroll = None;
-                        true
-                    }
-                    SidebarEvent::HeaderActivated { section } => {
-                        let collapsed = self.board_sidebar.is_collapsed(section);
-                        self.board_sidebar.set_collapsed(section, !collapsed);
-                        true
-                    }
-                    SidebarEvent::StateChanged
-                    | SidebarEvent::Consumed
-                    | SidebarEvent::ScrollChanged { .. } => true,
-                    _ => false,
-                }
+                self.apply_board_sidebar_event(result)
             }
             SidebarView::Machines => {
                 // Row 0 = title strip; item i starts at row 1+i-scroll.
@@ -3199,6 +3219,125 @@ mod tests {
         app.rebuild_board_sidebar();
         let after = app.board_selected_issue();
         assert_eq!(before, after, "selection should survive rebuild");
+    }
+
+    // ── Click → collapse pipeline (issue #167) ─────────────────────────────
+    //
+    // Regression coverage for the click → collapse pipeline:
+    //
+    //   MouseDown on header
+    //     → board_sidebar.handle() / handle_cached()
+    //     → SidebarEvent::HeaderActivated { section }
+    //     → apply_board_sidebar_event()
+    //     → board_sidebar.set_collapsed(section, !was_collapsed)
+    //
+    // Today the final `set_collapsed` is a manual workaround in
+    // `apply_board_sidebar_event`. Once quadraui #239 lands on the pinned
+    // quadraui revision, `SidebarSystem::click` will toggle collapse
+    // internally and the workaround will be removed — at which point the
+    // manual toggle test below would start failing (double-toggle) and
+    // must be updated to assert the *single* toggle delivered by quadraui.
+    // Either way, the observable contract tested here — one click on a
+    // section header flips that section's `is_collapsed` — must hold.
+
+    #[test]
+    fn apply_board_sidebar_event_header_toggles_collapse() {
+        // Direct unit test of the dispatch arm: a HeaderActivated event
+        // must flip is_collapsed for the addressed section.
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 20, "repo-b", Some("work")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+
+        assert!(
+            !app.board_sidebar.is_collapsed(0),
+            "section 0 should start uncollapsed"
+        );
+
+        let consumed = app.apply_board_sidebar_event(SidebarEvent::HeaderActivated { section: 0 });
+        assert!(consumed, "HeaderActivated should consume the event");
+        assert!(
+            app.board_sidebar.is_collapsed(0),
+            "section 0 should be collapsed after first HeaderActivated"
+        );
+
+        // A second HeaderActivated for the same section toggles back.
+        app.apply_board_sidebar_event(SidebarEvent::HeaderActivated { section: 0 });
+        assert!(
+            !app.board_sidebar.is_collapsed(0),
+            "section 0 should be uncollapsed after a second HeaderActivated"
+        );
+
+        // Adjacent sections are not affected.
+        assert!(
+            !app.board_sidebar.is_collapsed(1),
+            "section 1 should remain uncollapsed throughout"
+        );
+    }
+
+    #[test]
+    fn header_click_toggles_section_collapse() {
+        // End-to-end test of the click → collapse pipeline. We can't call
+        // `mouse_sidebar_click` directly without constructing a `Backend`
+        // (200+ trait stubs), so we drive `SidebarSystem::handle_cached`
+        // — which `mouse_sidebar_click` calls via `.handle()` — and then
+        // pass its result through the same dispatch helper the runtime
+        // uses (`apply_board_sidebar_event`).
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 20, "repo-b", Some("work")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+
+        // Configure backend info so `handle_cached` can lay out without
+        // a real Backend impl. With line_height=1.0 and default metrics
+        // (header_size=1.0), section 0's header row is y ∈ [0, 1).
+        app.board_sidebar
+            .set_backend_info(1.0, quadraui::MsvLayoutMetrics::default());
+
+        assert!(
+            !app.board_sidebar.is_collapsed(0),
+            "section 0 should start uncollapsed"
+        );
+
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 35.0,
+            height: 24.0,
+        };
+        let click = UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Left,
+            position: Point { x: 1.0, y: 0.0 },
+            modifiers: quadraui::Modifiers::default(),
+        };
+
+        // Step 1: the SidebarSystem reports a header activation for
+        // section 0.
+        let result = app.board_sidebar.handle_cached(&click, rect);
+        assert!(
+            matches!(result, SidebarEvent::HeaderActivated { section: 0 }),
+            "expected HeaderActivated {{ section: 0 }}, got {:?}",
+            result
+        );
+
+        // Step 2: the dispatch helper flips is_collapsed.
+        let consumed = app.apply_board_sidebar_event(result);
+        assert!(consumed, "header click should consume the event");
+        assert!(
+            app.board_sidebar.is_collapsed(0),
+            "section 0 should be collapsed after header click"
+        );
+
+        // Step 3: a second click toggles back.
+        let result2 = app.board_sidebar.handle_cached(&click, rect);
+        app.apply_board_sidebar_event(result2);
+        assert!(
+            !app.board_sidebar.is_collapsed(0),
+            "section 0 should be uncollapsed after a second header click"
+        );
     }
 
 }
