@@ -7,8 +7,15 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from coord.brain import build_prompt, parse_proposals, gather_context, propose, resolve_required_gates
-from coord.config import Config, PipelineConfig
+from coord.brain import (
+    _apply_require_plan,
+    build_prompt,
+    gather_context,
+    parse_proposals,
+    propose,
+    resolve_required_gates,
+)
+from coord.config import Config, DispatchConfig, PipelineConfig
 from coord.models import Machine, Proposal, Repo
 
 
@@ -381,3 +388,132 @@ class TestResolveRequiredGates:
 
         assert len(proposals) == 1
         assert proposals[0].required_gates == ["merge"]
+
+
+# ---------------------------------------------------------------------------
+# _apply_require_plan and propose() integration with dispatch.require_plan
+# ---------------------------------------------------------------------------
+
+
+def _make_work_proposal(issue_number: int = 1, type: str = "work") -> Proposal:
+    return Proposal(
+        id=1,
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=issue_number,
+        issue_title="Test issue",
+        rationale="",
+        type=type,
+    )
+
+
+def _cfg_with_require_plan(require_plan: bool) -> Config:
+    return Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        dispatch=DispatchConfig(require_plan=require_plan),
+    )
+
+
+class TestApplyRequirePlan:
+    def test_false_leaves_proposals_unchanged(self) -> None:
+        """When require_plan=False, work proposals stay type='work'."""
+        cfg = _cfg_with_require_plan(False)
+        p = _make_work_proposal()
+        _apply_require_plan([p], cfg)
+        assert p.type == "work"
+
+    def test_true_upgrades_work_to_plan(self) -> None:
+        """When require_plan=True, work proposals are upgraded to type='plan'."""
+        cfg = _cfg_with_require_plan(True)
+        p = _make_work_proposal()
+        _apply_require_plan([p], cfg)
+        assert p.type == "plan"
+
+    def test_true_does_not_change_already_plan(self) -> None:
+        """Proposals already typed 'plan' are not double-processed."""
+        cfg = _cfg_with_require_plan(True)
+        p = _make_work_proposal(type="plan")
+        _apply_require_plan([p], cfg)
+        assert p.type == "plan"
+
+    def test_true_does_not_change_review_type(self) -> None:
+        """Review-type proposals are not affected by require_plan."""
+        cfg = _cfg_with_require_plan(True)
+        p = _make_work_proposal(type="review")
+        _apply_require_plan([p], cfg)
+        assert p.type == "review"
+
+    def test_true_does_not_change_smoke_type(self) -> None:
+        """Smoke-type proposals are not affected by require_plan."""
+        cfg = _cfg_with_require_plan(True)
+        p = _make_work_proposal(type="smoke")
+        _apply_require_plan([p], cfg)
+        assert p.type == "smoke"
+
+    def test_multiple_proposals_all_upgraded(self) -> None:
+        """All work proposals in the list are upgraded when require_plan=True."""
+        cfg = _cfg_with_require_plan(True)
+        proposals = [_make_work_proposal(i) for i in range(1, 4)]
+        _apply_require_plan(proposals, cfg)
+        assert all(p.type == "plan" for p in proposals)
+
+    def test_empty_list_is_noop(self) -> None:
+        cfg = _cfg_with_require_plan(True)
+        _apply_require_plan([], cfg)  # should not raise
+
+
+class TestProposeRequirePlan:
+    """Integration tests: propose() respects dispatch.require_plan."""
+
+    def _response_json(self) -> str:
+        return json.dumps([{
+            "machine_name": "laptop",
+            "repo_name": "api",
+            "issue_number": 10,
+            "issue_title": "Fix auth",
+            "rationale": "best fit",
+            "files_likely": ["auth.py"],
+            "briefing": "do the thing",
+        }])
+
+    def _context(self) -> dict:
+        return {
+            "issues_by_repo": {"api": [{"number": 10, "title": "Fix auth", "labels": [], "body": ""}]},
+            "machine_status": {"laptop": {"status": "idle"}},
+        }
+
+    def test_propose_require_plan_true_sets_type_plan(self) -> None:
+        """When dispatch.require_plan=True, propose() returns type='plan' proposals."""
+        cfg = _cfg_with_require_plan(True)
+
+        with patch("coord.brain.gather_context", return_value=self._context()), \
+             patch("coord.brain.call_claude", return_value=self._response_json()):
+            proposals, _ = propose(cfg)
+
+        assert len(proposals) == 1
+        assert proposals[0].type == "plan"
+
+    def test_propose_require_plan_false_keeps_type_work(self) -> None:
+        """When dispatch.require_plan=False (default), propose() returns type='work' proposals."""
+        cfg = _cfg_with_require_plan(False)
+
+        with patch("coord.brain.gather_context", return_value=self._context()), \
+             patch("coord.brain.call_claude", return_value=self._response_json()):
+            proposals, _ = propose(cfg)
+
+        assert len(proposals) == 1
+        assert proposals[0].type == "work"
+
+    def test_propose_require_plan_default_is_work(self) -> None:
+        """Default Config (no explicit dispatch config) gives type='work' proposals."""
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        )
+        with patch("coord.brain.gather_context", return_value=self._context()), \
+             patch("coord.brain.call_claude", return_value=self._response_json()):
+            proposals, _ = propose(cfg)
+
+        assert len(proposals) == 1
+        assert proposals[0].type == "work"
