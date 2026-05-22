@@ -110,6 +110,41 @@ curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/ins
 This installs coord, sets up a systemd service with auto-restart, and starts the agent.
 Then add the machine to your coordinator.yml and run `coord status` to verify connectivity.
 
+## Upgrading Agents
+
+### Check current agent version
+
+```bash
+curl -s http://<host>:7433/status | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('version','<0.3.0 (old)'))"
+```
+
+### Agents >= 0.3.0 — remote self-update
+
+```bash
+curl -X POST http://<host>:7433/update
+```
+
+The agent installs the latest version from PyPI and restarts itself. The HTTP 202 response is returned immediately; the upgrade runs in the background (~10–30 seconds). Wait a moment, then re-check the version.
+
+### Agents < 0.3.0 — manual upgrade
+
+Old agents (installed before 0.3.0) don't have the `/update` endpoint. SSH in to each machine and run:
+
+```bash
+# If installed from PyPI (systemd service):
+pip install --upgrade claude-coordinator
+sudo systemctl restart coord-agent   # or whatever your service is named
+
+# If installed editable (git clone):
+cd ~/src/claude-coordinator
+git pull --ff-only
+# restart the agent process (Ctrl+C and re-run, or systemctl restart)
+```
+
+After upgrading, verify with `curl -s http://<host>:7433/status | python3 -c "import sys,json; print(json.load(sys.stdin).get('version'))"`.
+
+**Why this matters:** agents older than 0.3.0 reject `coord assign --force` with a 400 error (`unexpected keyword argument 'fresh_branch'`).
+
 ## Command Reference
 
 ### Core Workflow
@@ -363,4 +398,17 @@ When `coord approve` warns about stale dependencies, an upstream repo on the tar
 - Python 3.12+
 - Claude Code CLI with Max or Pro subscription
 - `gh` CLI (authenticated, for coordinator-side GitHub operations)
+
+## Releasing a New Version
+
+1. Bump the version in `coord/__init__.py` and `pyproject.toml` (both must match)
+2. Commit: `git commit -am "chore: bump version to X.Y.Z"`
+3. Tag and push:
+   ```bash
+   git tag vX.Y.Z
+   git push origin main vX.Y.Z
+   ```
+4. GitHub Actions (`publish.yml`) builds and publishes to PyPI automatically using the `PYPI_API_TOKEN` repository secret. Check the Actions tab for progress.
+
+After the PyPI publish completes, upgrade remote agents — see [Upgrading Agents](#upgrading-agents).
 - Tailscale — optional, only needed for multi-machine setups
