@@ -1118,6 +1118,28 @@ impl CoordApp {
         // Save current selection to restore after rebuild.
         let prev_selection = self.board_selected_issue();
 
+        // Save panel scroll and per-section collapse state keyed by name so
+        // that the state survives indices shifting when repos are added or
+        // removed.  We capture BEFORE updating `has_proposals_section` and
+        // `board_repo_names` so that the old offset is still valid here.
+        let prev_panel_scroll = self.board_sidebar.panel_scroll();
+        let prev_collapsed: std::collections::HashMap<String, bool> = {
+            let offset = if self.has_proposals_section { 1 } else { 0 };
+            let mut map = std::collections::HashMap::new();
+            if self.has_proposals_section {
+                map.insert(
+                    "__proposals__".to_string(),
+                    self.board_sidebar.is_collapsed(0),
+                );
+            }
+            // Clone names to avoid borrow conflicts in the loop body.
+            let old_names: Vec<String> = self.board_repo_names.clone();
+            for (i, name) in old_names.into_iter().enumerate() {
+                map.insert(name, self.board_sidebar.is_collapsed(i + offset));
+            }
+            map
+        };
+
         // Build section definitions — prepend PROPOSALS if any exist.
         self.has_proposals_section = !self.data.proposals.is_empty();
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
@@ -1263,6 +1285,28 @@ impl CoordApp {
         // Restore previous selection if possible.
         if let Some((prev_repo, prev_issue)) = prev_selection {
             self.select_issue(&prev_repo, prev_issue);
+        }
+
+        // Restore panel scroll (set_panel_scroll clamps to ≥ 0.0 internally).
+        self.board_sidebar.set_panel_scroll(prev_panel_scroll);
+
+        // Restore collapsed state by section name.  Only override sections
+        // that existed before the rebuild; new sections keep whatever the
+        // auto-collapse logic set above.
+        {
+            let new_offset = if self.has_proposals_section { 1 } else { 0 };
+            if self.has_proposals_section {
+                if let Some(&was_collapsed) = prev_collapsed.get("__proposals__") {
+                    self.board_sidebar.set_collapsed(0, was_collapsed);
+                }
+            }
+            // Clone names to avoid borrow conflict with board_sidebar.set_collapsed.
+            let new_names: Vec<String> = self.board_repo_names.clone();
+            for (i, name) in new_names.into_iter().enumerate() {
+                if let Some(&was_collapsed) = prev_collapsed.get(&name) {
+                    self.board_sidebar.set_collapsed(i + new_offset, was_collapsed);
+                }
+            }
         }
     }
 
@@ -1575,6 +1619,9 @@ impl CoordApp {
                     // Show branch if present
                     if let Some(b) = &a.branch {
                         items.push(kv_item("    Branch", trunc(b, 40), None));
+                    }
+                    if let Some(m) = &a.model {
+                        items.push(kv_item("    Model", trunc(m, 30), None));
                     }
                     if let Some(code) = a.exit_code {
                         let (s, c) = if code == 0 {
@@ -3074,6 +3121,84 @@ mod tests {
         app.machine_detail_scroll = 5;
         app.refresh();
         assert_eq!(app.machine_detail_scroll, 5);
+    }
+
+    // ── Board sidebar state preservation across rebuild ───────────────────────
+
+    #[test]
+    fn rebuild_board_sidebar_preserves_panel_scroll() {
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 20, "repo-b", Some("work")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+        // Simulate the user having scrolled the sidebar panel.
+        app.board_sidebar.set_panel_scroll(42.0);
+        // A 5-second data refresh triggers rebuild_board_sidebar().
+        app.rebuild_board_sidebar();
+        assert_eq!(
+            app.board_sidebar.panel_scroll(),
+            42.0,
+            "panel_scroll should survive rebuild"
+        );
+    }
+
+    #[test]
+    fn rebuild_board_sidebar_preserves_collapsed_state() {
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 20, "repo-b", Some("work")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+        // Manually collapse the first section (repo-a, index 0 — no proposals).
+        app.board_sidebar.set_collapsed(0, true);
+        assert!(app.board_sidebar.is_collapsed(0));
+        // Rebuild as if a 5-second refresh fired.
+        app.rebuild_board_sidebar();
+        assert!(
+            app.board_sidebar.is_collapsed(0),
+            "collapsed state should survive rebuild"
+        );
+        // The second section should not have been collapsed by our restore logic.
+        assert!(
+            !app.board_sidebar.is_collapsed(1),
+            "uncollapsed section should remain uncollapsed"
+        );
+    }
+
+    #[test]
+    fn rebuild_board_sidebar_new_repo_auto_collapses_when_empty() {
+        // On the first build (no previous state) an empty repo is auto-collapsed.
+        let mut app = make_test_app(BoardData {
+            machines: vec![Machine {
+                name: "m1".to_string(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["empty-repo".to_string()],
+            }],
+            ..BoardData::default()
+        });
+        app.rebuild_board_sidebar();
+        // Empty repo with no active issues should be auto-collapsed.
+        assert!(
+            app.board_sidebar.is_collapsed(0),
+            "empty repo should be auto-collapsed on first build"
+        );
+    }
+
+    #[test]
+    fn rebuild_board_sidebar_preserves_selection_across_rebuild() {
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 20, "repo-b", Some("work")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+        // Select issue #20 in repo-b (section 1, row 0).
+        app.select_issue("repo-b", 20);
+        let before = app.board_selected_issue();
+        app.rebuild_board_sidebar();
+        let after = app.board_selected_issue();
+        assert_eq!(before, after, "selection should survive rebuild");
     }
 
 }
