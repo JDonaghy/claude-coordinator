@@ -219,7 +219,8 @@ class TestAssignDispatch:
         with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
              patch("coord.dispatch.dispatch", return_value={"id": "f-1"}), \
              patch("coord.github_ops.post_issue_comment"), \
-             patch("coord.claim._default_branch_lookup", return_value=["issue-7-old-attempt"]) as lookup, \
+             patch("coord.claim._default_branch_lookup", return_value=["issue-7-old-attempt"]), \
+             patch("coord.github_ops.find_pr_for_branch", return_value=None), \
              patch("coord.github_ops.delete_remote_branch", return_value=True) as delete_br:
             result = CliRunner().invoke(
                 main,
@@ -228,6 +229,23 @@ class TestAssignDispatch:
         assert result.exit_code == 0
         assert "deleted stale remote branch: issue-7-old-attempt" in result.output
         delete_br.assert_called_once_with("acme/api", "issue-7-old-attempt")
+        assert "dispatched" in result.output
+
+    def test_force_skips_branch_with_open_pr(self, config_file: Path, coord_dir: Path) -> None:
+        """--force should not delete branches that are heads of open PRs."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "f-pr"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.claim._default_branch_lookup", return_value=["issue-7-has-pr"]), \
+             patch("coord.github_ops.find_pr_for_branch", return_value={"number": 42, "url": "..."}), \
+             patch("coord.github_ops.delete_remote_branch") as delete_br:
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "7", "--config", str(config_file), "--force"],
+            )
+        assert result.exit_code == 0
+        assert "skipping issue-7-has-pr (head of PR #42)" in result.output
+        delete_br.assert_not_called()
         assert "dispatched" in result.output
 
     def test_force_no_stale_branches(self, config_file: Path, coord_dir: Path) -> None:
@@ -250,6 +268,7 @@ class TestAssignDispatch:
              patch("coord.dispatch.dispatch", return_value={"id": "f-3"}), \
              patch("coord.github_ops.post_issue_comment"), \
              patch("coord.claim._default_branch_lookup", return_value=["issue-7-stuck"]), \
+             patch("coord.github_ops.find_pr_for_branch", return_value=None), \
              patch("coord.github_ops.delete_remote_branch", return_value=False):
             result = CliRunner().invoke(
                 main,
