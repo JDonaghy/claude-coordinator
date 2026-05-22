@@ -71,8 +71,11 @@ def dispatch(
         "deny_commands": deny_commands,
         "model": model,
         "type": proposal.type,
-        "fresh_branch": fresh_branch,
     }
+    # Only send fresh_branch when True — older agents don't have this field
+    # and will reject the payload with a 400.
+    if fresh_branch:
+        payload["fresh_branch"] = True
 
     resp = httpx.post(url, json=payload, timeout=15)
     resp.raise_for_status()
