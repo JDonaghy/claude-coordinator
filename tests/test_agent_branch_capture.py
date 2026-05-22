@@ -105,6 +105,81 @@ def test_main_repo_untouched_by_worker(
     server.shutdown()
 
 
+def test_fresh_branch_ignores_existing_local_branch(
+    tmp_path: Path, repo_clone: Path
+) -> None:
+    """With fresh_branch=True, a stale local branch is deleted and a new one is created from main."""
+    # Create a stale branch with old content
+    _git(repo_clone, "checkout", "-b", "issue-42-add-feature-x")
+    (repo_clone / "stale.txt").write_text("old content\n")
+    _git(repo_clone, "add", "stale.txt")
+    _git(repo_clone, "commit", "-m", "stale work")
+    stale_sha = _git(repo_clone, "rev-parse", "HEAD")
+    _git(repo_clone, "checkout", "main")
+
+    # Add new work to main after the stale branch
+    (repo_clone / "new_file.txt").write_text("new\n")
+    _git(repo_clone, "add", "new_file.txt")
+    _git(repo_clone, "commit", "-m", "new main work")
+    main_sha = _git(repo_clone, "rev-parse", "HEAD")
+
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/true"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api", repo_path=str(repo_clone),
+        issue_number=42, issue_title="add feature X", briefing="b",
+        fresh_branch=True,
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == DONE
+    assert final.branch == "issue-42-add-feature-x"
+
+    # The branch tip in the main repo should match main, not the stale branch
+    branch_sha = _git(repo_clone, "rev-parse", "issue-42-add-feature-x")
+    assert branch_sha == main_sha
+    assert branch_sha != stale_sha
+    server.shutdown()
+
+
+def test_fresh_branch_false_reuses_existing_branch(
+    tmp_path: Path, repo_clone: Path
+) -> None:
+    """Without fresh_branch, an existing branch is reused (default behavior)."""
+    _git(repo_clone, "checkout", "-b", "issue-42-add-feature-x")
+    (repo_clone / "existing.txt").write_text("existing work\n")
+    _git(repo_clone, "add", "existing.txt")
+    _git(repo_clone, "commit", "-m", "existing work")
+    existing_sha = _git(repo_clone, "rev-parse", "HEAD")
+    _git(repo_clone, "checkout", "main")
+
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/true"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api", repo_path=str(repo_clone),
+        issue_number=42, issue_title="add feature X", briefing="b",
+        fresh_branch=False,
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == DONE
+
+    # Branch tip should match the existing branch, not main
+    branch_sha = _git(repo_clone, "rev-parse", "issue-42-add-feature-x")
+    assert branch_sha == existing_sha
+    server.shutdown()
+
+
 def test_worktree_setup_failure_marks_assignment_failed(tmp_path: Path) -> None:
     """If worktree setup fails (e.g. not a git repo), the assignment goes to FAILED."""
     not_a_repo = tmp_path / "not-git"

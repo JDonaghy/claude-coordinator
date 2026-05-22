@@ -214,19 +214,19 @@ class TestAssignDispatch:
         assert result.exit_code == 1
         assert "skipping" in result.output
 
-    def test_force_bypasses_claim_check(self, config_file: Path, coord_dir: Path) -> None:
-        """--force should skip claim detection and dispatch directly (no branch deletion)."""
+    def test_force_bypasses_claim_check_and_sets_fresh_branch(self, config_file: Path, coord_dir: Path) -> None:
+        """--force should skip claim detection and pass fresh_branch=True to dispatch."""
         with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
-             patch("coord.dispatch.dispatch", return_value={"id": "f-1"}), \
-             patch("coord.github_ops.post_issue_comment"), \
-             patch("coord.github_ops.delete_remote_branch") as delete_br:
+             patch("coord.dispatch.dispatch", return_value={"id": "f-1"}) as mock_dispatch, \
+             patch("coord.github_ops.post_issue_comment"):
             result = CliRunner().invoke(
                 main,
                 ["assign", "laptop", "api", "7", "--config", str(config_file), "--force"],
             )
         assert result.exit_code == 0
         assert "dispatched" in result.output
-        delete_br.assert_not_called()
+        _, kwargs = mock_dispatch.call_args
+        assert kwargs.get("fresh_branch") is True
 
     def test_dispatch_http_error(self, config_file: Path, coord_dir: Path) -> None:
         import httpx
