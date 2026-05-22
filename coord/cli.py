@@ -1175,7 +1175,7 @@ def approve(
 @click.option(
     "--force",
     is_flag=True,
-    help="Bypass claim detection (use when retrying after infra failures).",
+    help="Bypass claim detection only (use when retrying after infra failures).",
 )
 def assign(
     machine: str,
@@ -1297,21 +1297,6 @@ def assign(
                 err=True,
             )
             sys.exit(1)
-    else:
-        # --force: delete stale remote branches so the worker starts fresh from main
-        # but skip branches that are the head of an open PR
-        from coord.claim import _default_branch_lookup
-
-        stale_branches = _default_branch_lookup(repo_cfg.github, issue)
-        for branch_name in stale_branches:
-            pr = github_ops.find_pr_for_branch(repo_cfg.github, branch_name)
-            if pr is not None:
-                click.echo(f"  skipping {branch_name} (head of PR #{pr['number']})")
-                continue
-            if github_ops.delete_remote_branch(repo_cfg.github, branch_name):
-                click.echo(f"  deleted stale remote branch: {branch_name}")
-            else:
-                click.echo(f"  warning: failed to delete remote branch: {branch_name}", err=True)
 
     # Dispatch to agent server
     try:
