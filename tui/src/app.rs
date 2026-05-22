@@ -55,6 +55,9 @@ use quadraui::{
 /// Reload board data every 5 seconds.
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
 
+/// Auto-run `coord notify` every 30 seconds when assignments are running.
+const NOTIFY_EVERY: Duration = Duration::from_secs(30);
+
 // ─── Detail panel tabs ────────────────────────────────────────────────────────
 
 /// The two tabs shown in the Board view detail panel.
@@ -186,12 +189,24 @@ struct MergeQueueEntry {
     pr_url: Option<String>,
 }
 
+#[derive(Clone)]
+struct Proposal {
+    id: i64,
+    machine: String,
+    repo: String,
+    issue_number: u64,
+    issue_title: String,
+    rationale: String,
+    proposal_type: String,
+}
+
 #[derive(Default)]
 struct BoardData {
     local_machine: String,
     assignments: Vec<Assignment>,
     machines: Vec<Machine>,
     merge_queue: Vec<MergeQueueEntry>,
+    proposals: Vec<Proposal>,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -778,6 +793,7 @@ fn load_data() -> BoardData {
                     assignments,
                     machines,
                     merge_queue: Vec::new(),
+                    proposals: Vec::new(),
                 };
             }
         };
@@ -799,6 +815,49 @@ fn load_data() -> BoardData {
                     assignments,
                     machines,
                     merge_queue: Vec::new(),
+                    proposals: Vec::new(),
+                };
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // ── Query proposals ───────────────────────────────────────────────────
+    let proposals: Vec<Proposal> = {
+        let mut stmt = match conn.prepare(
+            "SELECT id, machine_name, repo_name, issue_number, issue_title, \
+             rationale, type FROM proposals ORDER BY id",
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                return BoardData {
+                    local_machine,
+                    assignments,
+                    machines,
+                    merge_queue,
+                    proposals: Vec::new(),
+                };
+            }
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok(Proposal {
+                id: row.get::<_, i64>(0)?,
+                machine: row.get::<_, String>(1)?,
+                repo: row.get::<_, String>(2)?,
+                issue_number: row.get::<_, i64>(3)? as u64,
+                issue_title: row.get::<_, String>(4)?,
+                rationale: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                proposal_type: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "work".into()),
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => {
+                return BoardData {
+                    local_machine,
+                    assignments,
+                    machines,
+                    merge_queue,
+                    proposals: Vec::new(),
                 };
             }
         };
@@ -810,6 +869,7 @@ fn load_data() -> BoardData {
         assignments,
         machines,
         merge_queue,
+        proposals,
     }
 }
 
@@ -831,6 +891,8 @@ pub struct CoordApp {
     board_repo_names: Vec<String>,
     /// Cached result of `issues_by_repo()`. Rebuilt on `rebuild_board_sidebar()`.
     board_issues_cache: Vec<(String, Vec<IssueGroup>)>,
+    /// True when a PROPOSALS section is prepended to the sidebar.
+    has_proposals_section: bool,
     /// Selected machine index in the Machines view.
     machine_sel: usize,
     /// Scroll offset for the machines list.
@@ -846,6 +908,12 @@ pub struct CoordApp {
     activity_scroll: Option<usize>,
     /// Scroll offset for the Machine detail panel.
     machine_detail_scroll: usize,
+    /// Background command runner for `coord` CLI subcommands.
+    command_runner: crate::commands::CommandRunner,
+    /// Last time `coord notify` was auto-triggered.
+    last_notify: Instant,
+    /// Scroll offset for the bottom (command output) panel.
+    command_scroll: usize,
 }
 
 impl Default for CoordApp {
@@ -867,6 +935,7 @@ impl CoordApp {
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
             board_issues_cache: Vec::new(),
+            has_proposals_section: false,
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
@@ -874,6 +943,9 @@ impl CoordApp {
             detail_scroll: 0,
             activity_scroll: None,
             machine_detail_scroll: 0,
+            command_runner: crate::commands::CommandRunner::new(),
+            last_notify: Instant::now(),
+            command_scroll: 0,
         };
         app.rebuild_board_sidebar();
         app
@@ -902,7 +974,9 @@ impl CoordApp {
                 },
             ],
         )
-        .with_status_bar();
+        .with_status_bar()
+        .with_bottom_panel(6.0)
+        .with_bottom_panel_limits(3.0, 20.0);
         config.default_sidebar_width = 35.0;
         config.min_sidebar_width = 20.0;
         config.max_sidebar_width = 55.0;
@@ -1044,19 +1118,26 @@ impl CoordApp {
         // Save current selection to restore after rebuild.
         let prev_selection = self.board_selected_issue();
 
-        // Build section definitions.
-        let defs: Vec<SidebarSectionDef> = grouped
-            .iter()
-            .map(|(repo, _)| {
-                let mut def = SidebarSectionDef::new(
-                    format!("repo:{}", repo),
-                    repo.clone(),
-                );
-                def.show_chevron = true;
-                def.size = SectionSize::Content;
-                def
-            })
-            .collect();
+        // Build section definitions — prepend PROPOSALS if any exist.
+        self.has_proposals_section = !self.data.proposals.is_empty();
+        let mut defs: Vec<SidebarSectionDef> = Vec::new();
+
+        if self.has_proposals_section {
+            let mut def = SidebarSectionDef::new("section:proposals".to_string(), "PROPOSALS".to_string());
+            def.show_chevron = true;
+            def.size = SectionSize::Content;
+            defs.push(def);
+        }
+
+        for (repo, _) in grouped.iter() {
+            let mut def = SidebarSectionDef::new(
+                format!("repo:{}", repo),
+                repo.clone(),
+            );
+            def.show_chevron = true;
+            def.size = SectionSize::Content;
+            defs.push(def);
+        }
 
         self.board_repo_names = grouped.iter().map(|(r, _)| r.clone()).collect();
 
@@ -1066,12 +1147,59 @@ impl CoordApp {
         self.board_sidebar.set_allow_collapse(true);
         self.board_sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
-        // Set rows for each section and configure initial state.
-        for (section_idx, (_repo, issues)) in grouped.iter().enumerate() {
+        let offset = if self.has_proposals_section { 1 } else { 0 };
+
+        // Populate PROPOSALS section rows.
+        if self.has_proposals_section {
+            let proposal_color = Color::rgb(200, 180, 255);
+            let rows: Vec<TreeRow> = self
+                .data
+                .proposals
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let text = StyledText {
+                        spans: vec![
+                            StyledSpan::with_fg(
+                                format!("[{}] ", p.id),
+                                Color::rgb(180, 180, 220),
+                            ),
+                            StyledSpan::with_fg(
+                                format!("{} ", p.machine),
+                                Color::rgb(140, 200, 140),
+                            ),
+                            StyledSpan::with_fg(
+                                format!("#{} ", p.issue_number),
+                                Color::rgb(150, 150, 240),
+                            ),
+                            StyledSpan::plain(trunc(&p.issue_title, 18)),
+                        ],
+                    };
+                    TreeRow {
+                        path: vec![i as u16],
+                        indent: 0,
+                        icon: None,
+                        text,
+                        badge: Some(Badge::colored(&p.proposal_type, proposal_color)),
+                        is_expanded: None,
+                        decoration: Decoration::Normal,
+                        edit: None,
+                    }
+                })
+                .collect();
+            self.board_sidebar.set_rows(0, rows);
+            self.board_sidebar.set_section_badge(
+                0,
+                Some(StyledText::plain(format!("({})", self.data.proposals.len()))),
+            );
+        }
+
+        // Set rows for each repo section.
+        for (cache_idx, (_repo, issues)) in grouped.iter().enumerate() {
+            let section_idx = cache_idx + offset;
             let has_active = issues.iter().any(|i| i.status_summary == "running" || i.status_summary == "failed");
             let n_issues = issues.len();
 
-            // Set badge with issue count.
             if n_issues > 0 {
                 self.board_sidebar.set_section_badge(
                     section_idx,
@@ -1079,7 +1207,6 @@ impl CoordApp {
                 );
             }
 
-            // Repos with no active issues are collapsed by default.
             if !has_active && n_issues == 0 {
                 self.board_sidebar.set_collapsed(section_idx, true);
             }
@@ -1120,11 +1247,15 @@ impl CoordApp {
         }
 
         // Activate first non-empty section.
-        if self.board_sidebar.active_section().is_none() && !self.board_repo_names.is_empty() {
-            for (i, (_repo, issues)) in grouped.iter().enumerate() {
-                if !issues.is_empty() {
-                    self.board_sidebar.set_active_section(Some(i));
-                    break;
+        if self.board_sidebar.active_section().is_none() {
+            if self.has_proposals_section {
+                self.board_sidebar.set_active_section(Some(0));
+            } else if !self.board_repo_names.is_empty() {
+                for (i, (_repo, issues)) in grouped.iter().enumerate() {
+                    if !issues.is_empty() {
+                        self.board_sidebar.set_active_section(Some(i));
+                        break;
+                    }
                 }
             }
         }
@@ -1138,17 +1269,27 @@ impl CoordApp {
     /// Return the repo name for the active sidebar section, if any.
     fn board_active_repo(&self) -> Option<&str> {
         let section = self.board_sidebar.active_section()?;
-        self.board_repo_names.get(section).map(|s| s.as_str())
+        let offset = if self.has_proposals_section { 1 } else { 0 };
+        if section < offset {
+            return None;
+        }
+        self.board_repo_names
+            .get(section - offset)
+            .map(|s| s.as_str())
     }
 
     /// Return the IssueGroup currently selected in the board sidebar.
     fn board_selected_issue_group(&self) -> Option<&IssueGroup> {
         let section = self.board_sidebar.active_section()?;
+        let offset = if self.has_proposals_section { 1 } else { 0 };
+        if section < offset {
+            return None;
+        }
         let path = self.board_sidebar.selected_path(section)?;
         if path.is_empty() {
             return None;
         }
-        let repo = self.board_repo_names.get(section)?;
+        let repo = self.board_repo_names.get(section - offset)?;
         let (_, issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
         let row_idx = path[0] as usize;
         issues.get(row_idx)
@@ -1161,12 +1302,40 @@ impl CoordApp {
         Some((repo.to_string(), group.issue_number))
     }
 
+    /// Return the Proposal currently selected in the sidebar's PROPOSALS section.
+    fn board_selected_proposal(&self) -> Option<&Proposal> {
+        if !self.has_proposals_section {
+            return None;
+        }
+        let section = self.board_sidebar.active_section()?;
+        if section != 0 {
+            return None;
+        }
+        let path = self.board_sidebar.selected_path(0)?;
+        if path.is_empty() {
+            return None;
+        }
+        self.data.proposals.get(path[0] as usize)
+    }
+
+    /// Return the failed Assignment currently selected in the board sidebar.
+    fn board_selected_failed_assignment(&self) -> Option<&Assignment> {
+        let group = self.board_selected_issue_group()?;
+        let failed = group
+            .assignments
+            .iter()
+            .find(|a| a.status == "failed")?;
+        Some(failed)
+    }
+
     /// Try to select a specific issue in the sidebar by repo and issue number.
     fn select_issue(&mut self, repo: &str, issue_number: u64) {
-        for (section_idx, (r, issues)) in self.board_issues_cache.iter().enumerate() {
+        let offset = if self.has_proposals_section { 1 } else { 0 };
+        for (cache_idx, (r, issues)) in self.board_issues_cache.iter().enumerate() {
             if r == repo {
                 for (row_idx, group) in issues.iter().enumerate() {
                     if group.issue_number == issue_number {
+                        let section_idx = cache_idx + offset;
                         self.board_sidebar.set_active_section(Some(section_idx));
                         self.board_sidebar.set_selected_path(section_idx, Some(vec![row_idx as u16]));
                         return;
@@ -1247,6 +1416,51 @@ impl CoordApp {
 
     fn detail_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
+
+        // If a proposal is selected, show proposal detail instead.
+        if let Some(p) = self.board_selected_proposal() {
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        format!(" Proposal #{} ", p.id),
+                        Color::rgb(210, 220, 255),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Header,
+            });
+            items.push(kv_item("  Machine", &format!("  {}", p.machine), None));
+            items.push(kv_item("  Repo", &format!("  {}", p.repo), None));
+            items.push(kv_item("  Issue", &format!("  #{}: {}", p.issue_number, p.issue_title), None));
+            items.push(kv_item("  Type", &format!("  {}", p.proposal_type), None));
+            items.push(kv_item("", "", None));
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        " RATIONALE ",
+                        Color::rgb(130, 130, 150),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Header,
+            });
+            for line in p.rationale.lines() {
+                items.push(kv_item("", &format!("  {}", line), None));
+            }
+            items.push(kv_item("", "", None));
+            items.push(kv_item("", "  a=approve  A=approve all", Some(Color::rgb(180, 180, 120))));
+            return ListView {
+                id: WidgetId::new("detail"),
+                title: Some(StyledText::plain(&format!("Proposal #{}", p.id))),
+                items,
+                selected_idx: 0,
+                scroll_offset: self.detail_scroll,
+                has_focus: false,
+                bordered: false,
+            };
+        }
 
         match self.board_selected_issue_group() {
             None => {
@@ -1598,6 +1812,70 @@ impl CoordApp {
     }
 
 
+    // ── Bottom panel: command output ──────────────────────────────────────
+
+    fn command_output_list(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+
+        if let Some((label, elapsed)) = self.command_runner.running_info() {
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        format!(" {} ({:.0}s)... ", label, elapsed.as_secs_f64()),
+                        Color::rgb(255, 220, 100),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+        } else if let Some(result) = self.command_runner.last_result() {
+            let color = if result.exit_code == 0 {
+                Color::rgb(120, 200, 120)
+            } else {
+                Color::rgb(220, 100, 100)
+            };
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        format!(
+                            " {} (exit {}, {:.1}s) ",
+                            result.label, result.exit_code, result.duration.as_secs_f64()
+                        ),
+                        color,
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Header,
+            });
+            for line in result.stdout.lines().take(50) {
+                items.push(kv_item("", &format!(" {}", line), None));
+            }
+            if !result.stderr.is_empty() {
+                for line in result.stderr.lines().take(20) {
+                    items.push(kv_item("", &format!(" {}", line), Some(Color::rgb(220, 100, 100))));
+                }
+            }
+        } else {
+            items.push(kv_item(
+                "",
+                " No commands run yet. p=plan  n=notify  a=approve  m=merge",
+                Some(Color::rgb(100, 100, 120)),
+            ));
+        }
+
+        ListView {
+            id: WidgetId::new("command-output"),
+            title: Some(StyledText::plain(" COMMANDS ")),
+            items,
+            selected_idx: 0,
+            scroll_offset: self.command_scroll,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
     // ── Mouse dispatch ────────────────────────────────────────────────────
 
     /// Dispatch one mouse event. Called from `handle()` before the keyboard
@@ -1799,33 +2077,59 @@ impl CoordApp {
     fn status_bar(&self) -> StatusBar {
         let since = self.refreshed_at.elapsed().as_secs();
         let view_label = self.active_view.label();
+        let mut left = vec![
+            StatusBarSegment {
+                text: " coord-tui ".to_string(),
+                fg: Color::rgb(255, 255, 255),
+                bg: Color::rgb(25, 70, 130),
+                bold: true,
+                action_id: None,
+            },
+            StatusBarSegment {
+                text: format!(" {} ", view_label),
+                fg: Color::rgb(200, 220, 255),
+                bg: Color::rgb(40, 60, 90),
+                bold: false,
+                action_id: None,
+            },
+            StatusBarSegment {
+                text: format!(" ↻ {}s ", since),
+                fg: Color::rgb(140, 140, 140),
+                bg: Color::rgb(30, 30, 40),
+                bold: false,
+                action_id: None,
+            },
+        ];
+        if let Some((label, elapsed)) = self.command_runner.running_info() {
+            left.push(StatusBarSegment {
+                text: format!(" {} ({:.0}s) ", label, elapsed.as_secs_f64()),
+                fg: Color::rgb(255, 220, 100),
+                bg: Color::rgb(60, 50, 20),
+                bold: true,
+                action_id: None,
+            });
+        } else if let Some((msg, when)) = &self.command_runner.message {
+            if when.elapsed() < Duration::from_secs(8) {
+                left.push(StatusBarSegment {
+                    text: format!(" {} ", msg),
+                    fg: Color::rgb(120, 200, 120),
+                    bg: Color::rgb(20, 50, 20),
+                    bold: false,
+                    action_id: None,
+                });
+            }
+        }
+        let proposals = self.data.proposals.len();
+        let hints = if proposals > 0 {
+            format!(" p=plan  a=approve({})  m=merge  R=retry  q=quit ", proposals)
+        } else {
+            " p=plan  n=notify  m=merge  R=retry  q=quit ".to_string()
+        };
         StatusBar {
             id: WidgetId::new("statusbar"),
-            left_segments: vec![
-                StatusBarSegment {
-                    text: " coord-tui ".to_string(),
-                    fg: Color::rgb(255, 255, 255),
-                    bg: Color::rgb(25, 70, 130),
-                    bold: true,
-                    action_id: None,
-                },
-                StatusBarSegment {
-                    text: format!(" {} ", view_label),
-                    fg: Color::rgb(200, 220, 255),
-                    bg: Color::rgb(40, 60, 90),
-                    bold: false,
-                    action_id: None,
-                },
-                StatusBarSegment {
-                    text: format!(" ↻ {}s ", since),
-                    fg: Color::rgb(140, 140, 140),
-                    bg: Color::rgb(30, 30, 40),
-                    bold: false,
-                    action_id: None,
-                },
-            ],
+            left_segments: left,
             right_segments: vec![StatusBarSegment {
-                text: " 1=Board  2=Machines  j/k=nav  h/l=tabs  Tab=section  r=refresh  q=quit ".to_string(),
+                text: hints,
                 fg: Color::rgb(140, 140, 140),
                 bg: Color::rgb(30, 30, 40),
                 bold: false,
@@ -1888,6 +2192,11 @@ impl ShellApp for CoordApp {
                 backend.draw_list(m, &self.machine_detail_list());
             }
         }
+
+        // ── Bottom panel: command output ─────────────────────────────────
+        if let Some(bp) = layout.bottom_panel_bounds {
+            backend.draw_list(bp, &self.command_output_list());
+        }
     }
 
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend, ctx: &ShellContext) -> Reaction {
@@ -1897,6 +2206,22 @@ impl ShellApp for CoordApp {
         if self.refreshed_at.elapsed() >= REFRESH_EVERY {
             self.refresh();
             needs_redraw = true;
+        }
+
+        // ── Poll background command runner ──────────────────────────────
+        if self.command_runner.poll() {
+            self.refresh();
+            needs_redraw = true;
+        }
+
+        // ── Auto-notify: run `coord notify` when running assignments exist ─
+        let has_running = self.data.assignments.iter().any(|a| a.status == "running");
+        if has_running
+            && self.last_notify.elapsed() >= NOTIFY_EVERY
+            && !self.command_runner.is_running()
+        {
+            self.command_runner.spawn(&["notify"]);
+            self.last_notify = Instant::now();
         }
 
         // ── Mouse / scroll dispatch (before consuming the event) ─────────────
@@ -2087,6 +2412,44 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── Coordinator commands ─────────────────────────────
+                    Key::Char('p') => {
+                        self.command_runner.spawn(&["plan"]);
+                        needs_redraw = true;
+                    }
+                    Key::Char('n') => {
+                        self.command_runner.spawn(&["notify"]);
+                        self.last_notify = Instant::now();
+                        needs_redraw = true;
+                    }
+                    Key::Char('a') => {
+                        if let Some(proposal) = self.board_selected_proposal() {
+                            let id_str = proposal.id.to_string();
+                            self.command_runner.spawn(&["approve", &id_str]);
+                            needs_redraw = true;
+                        }
+                    }
+                    Key::Char('A') => {
+                        if !self.data.proposals.is_empty() {
+                            let ids: Vec<String> =
+                                self.data.proposals.iter().map(|p| p.id.to_string()).collect();
+                            let joined = ids.join(",");
+                            self.command_runner.spawn(&["approve", &joined]);
+                            needs_redraw = true;
+                        }
+                    }
+                    Key::Char('m') => {
+                        self.command_runner.spawn(&["merge"]);
+                        needs_redraw = true;
+                    }
+                    Key::Char('R') => {
+                        if let Some(a) = self.board_selected_failed_assignment() {
+                            let id = a.id.clone();
+                            self.command_runner.spawn(&["retry", &id]);
+                            needs_redraw = true;
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -2190,16 +2553,17 @@ mod tests {
 
     // ── Board helpers ──────────────────────────────────────────────────────
 
-    fn make_app_default() -> CoordApp {
+    fn make_test_app(data: BoardData) -> CoordApp {
         let mut sidebar = SidebarSystem::new(Vec::new());
         sidebar.set_navigation_mode(NavigationMode::Selection);
         sidebar.set_allow_collapse(true);
         CoordApp {
-            data: BoardData::default(),
+            data,
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
             board_issues_cache: Vec::new(),
+            has_proposals_section: false,
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
@@ -2207,30 +2571,21 @@ mod tests {
             detail_scroll: 0,
             activity_scroll: None,
             machine_detail_scroll: 0,
+            command_runner: crate::commands::CommandRunner::new(),
+            last_notify: Instant::now(),
+            command_scroll: 0,
         }
     }
 
+    fn make_app_default() -> CoordApp {
+        make_test_app(BoardData::default())
+    }
+
     fn make_app_with_assignments(assignments: Vec<Assignment>) -> CoordApp {
-        let mut sidebar = SidebarSystem::new(Vec::new());
-        sidebar.set_navigation_mode(NavigationMode::Selection);
-        sidebar.set_allow_collapse(true);
-        let mut app = CoordApp {
-            data: BoardData {
-                assignments,
-                ..BoardData::default()
-            },
-            active_view: SidebarView::default(),
-            board_sidebar: sidebar,
-            board_repo_names: Vec::new(),
-            board_issues_cache: Vec::new(),
-            machine_sel: 0,
-            machine_scroll: 0,
-            refreshed_at: Instant::now(),
-            detail_tab: DetailTab::default(),
-            detail_scroll: 0,
-            activity_scroll: None,
-            machine_detail_scroll: 0,
-        };
+        let mut app = make_test_app(BoardData {
+            assignments,
+            ..BoardData::default()
+        });
         app.rebuild_board_sidebar();
         app
     }
@@ -2306,23 +2661,11 @@ mod tests {
     // ── fix_machine_scroll ────────────────────────────────────────────────────
 
     fn make_app_machine(machine_sel: usize, machine_scroll: usize) -> CoordApp {
-        let mut sidebar = SidebarSystem::new(Vec::new());
-        sidebar.set_navigation_mode(NavigationMode::Selection);
-        sidebar.set_allow_collapse(true);
-        CoordApp {
-            data: BoardData::default(),
-            active_view: SidebarView::Machines,
-            board_sidebar: sidebar,
-            board_repo_names: Vec::new(),
-            board_issues_cache: Vec::new(),
-            machine_sel,
-            machine_scroll,
-            refreshed_at: Instant::now(),
-            detail_tab: DetailTab::default(),
-            detail_scroll: 0,
-            activity_scroll: None,
-            machine_detail_scroll: 0,
-        }
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Machines;
+        app.machine_sel = machine_sel;
+        app.machine_scroll = machine_scroll;
+        app
     }
 
     #[test]
@@ -2394,31 +2737,15 @@ mod tests {
 
     #[test]
     fn issues_by_repo_includes_empty_repos_from_machines() {
-        let mut sidebar = SidebarSystem::new(Vec::new());
-        sidebar.set_navigation_mode(NavigationMode::Selection);
-        sidebar.set_allow_collapse(true);
-        let mut app = CoordApp {
-            data: BoardData {
-                machines: vec![Machine {
-                    name: "m1".to_string(),
-                    reachable: true,
-                    active_count: 0,
-                    repos: vec!["empty-repo".to_string()],
-                }],
-                ..BoardData::default()
-            },
-            active_view: SidebarView::default(),
-            board_sidebar: sidebar,
-            board_repo_names: Vec::new(),
-            board_issues_cache: Vec::new(),
-            machine_sel: 0,
-            machine_scroll: 0,
-            refreshed_at: Instant::now(),
-            detail_tab: DetailTab::default(),
-            detail_scroll: 0,
-            activity_scroll: None,
-            machine_detail_scroll: 0,
-        };
+        let mut app = make_test_app(BoardData {
+            machines: vec![Machine {
+                name: "m1".to_string(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["empty-repo".to_string()],
+            }],
+            ..BoardData::default()
+        });
         app.rebuild_board_sidebar();
         let grouped = app.issues_by_repo();
         // Empty repo should appear with 0 issues.
