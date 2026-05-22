@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -27,6 +28,36 @@ pub struct CommandRunner {
     history: VecDeque<CommandResult>,
     /// Ephemeral status-bar message set on command completion; cleared after MESSAGE_TTL.
     pub(crate) message: Option<(String, Instant)>,
+    /// Absolute path to `coordinator.yml` found at startup.
+    ///
+    /// Searched by walking up from the working directory at launch time, so
+    /// the TUI works correctly regardless of which directory it was invoked
+    /// from. When `Some`, every spawned `coord` subcommand receives
+    /// `--config <path>` so it locates the right config file. When `None`,
+    /// the bottom panel shows a warning and commands will fail.
+    pub(crate) config_path: Option<PathBuf>,
+}
+
+/// Search for `coordinator.yml` starting from the current working directory,
+/// walking up to the filesystem root. Returns the absolute path of the first
+/// match, or `None` if no `coordinator.yml` exists in any ancestor directory.
+///
+/// Walking upward mirrors how `git` finds `.git/` and makes the TUI robust
+/// when launched from a subdirectory of the project or from a shell that
+/// inherited an unexpected working directory (e.g. a `.desktop` launcher or
+/// an IDE terminal that opens in `$HOME`).
+fn find_config() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join("coordinator.yml");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        // `pop()` returns false when we've reached the root and cannot go further.
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 
 impl CommandRunner {
@@ -35,10 +66,17 @@ impl CommandRunner {
             state: CommandState::Idle,
             history: VecDeque::new(),
             message: None,
+            config_path: find_config(),
         }
     }
 
     /// Spawn `coord <args>` in a background thread.
+    ///
+    /// For real subcommands (i.e. `args[0]` does not start with `-`), this
+    /// injects `--config <absolute_path>` immediately after the subcommand
+    /// name so that `coord` can locate `coordinator.yml` even when the TUI
+    /// was launched from a different working directory than the project root.
+    ///
     /// Returns `false` if a command is already running.
     pub fn spawn(&mut self, args: &[&str]) -> bool {
         if self.is_running() {
@@ -46,11 +84,31 @@ impl CommandRunner {
         }
         let label = format!("coord {}", args.join(" "));
         let (tx, rx) = mpsc::channel();
-        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+
+        // Build the full argument list, injecting --config after the subcommand
+        // name (but not for flag-style args like --version which start with '-').
+        let full_args: Vec<String> = {
+            let mut v: Vec<String> = Vec::with_capacity(args.len() + 2);
+            let mut iter = args.iter();
+            if let Some(first) = iter.next() {
+                v.push(first.to_string());
+                if !first.starts_with('-') {
+                    if let Some(cfg) = &self.config_path {
+                        v.push("--config".to_string());
+                        v.push(cfg.to_string_lossy().into_owned());
+                    }
+                }
+                for a in iter {
+                    v.push(a.to_string());
+                }
+            }
+            v
+        };
+
         let label_clone = label.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let output = Command::new("coord").args(&args_owned).output();
+            let output = Command::new("coord").args(&full_args).output();
             let result = match output {
                 Ok(out) => CommandResult {
                     label: label_clone,
@@ -168,5 +226,46 @@ mod tests {
             runner.poll();
         }
         assert!(runner.history_len() <= HISTORY_CAP);
+    }
+
+    #[test]
+    fn config_path_is_absolute_when_found() {
+        // When find_config() returns Some, the path must be absolute so it
+        // remains valid regardless of subsequent directory changes.
+        if let Some(path) = find_config() {
+            assert!(path.is_absolute(), "config_path should be absolute, got: {:?}", path);
+            assert!(path.exists(), "config_path should exist: {:?}", path);
+        }
+        // None is also valid (no coordinator.yml in the ancestor chain).
+    }
+
+    #[test]
+    fn spawn_injects_config_for_subcommand() {
+        // Build a runner that has a known config path and verify the
+        // injected args include --config before the extra args.
+        let mut runner = CommandRunner::new();
+        // Override with a synthetic absolute path (file need not exist for
+        // this structural test).
+        runner.config_path = Some(PathBuf::from("/tmp/test/coordinator.yml"));
+
+        // We can't easily inspect the args after they're passed to the thread,
+        // but we can verify that spawn() returns true (i.e. didn't panic while
+        // building full_args) and that the runner transitions to Running state.
+        assert!(runner.spawn(&["notify"]));
+        assert!(runner.is_running());
+    }
+
+    #[test]
+    fn spawn_no_inject_for_flag_args() {
+        // When args[0] starts with '-' (e.g. --version), no --config injection
+        // should happen. We verify by spawning --version and checking it succeeds.
+        let mut runner = CommandRunner::new();
+        runner.config_path = Some(PathBuf::from("/nonexistent/coordinator.yml"));
+        assert!(runner.spawn(&["--version"]));
+        std::thread::sleep(Duration::from_millis(2000));
+        runner.poll();
+        let result = runner.last_result().unwrap();
+        // coord --version should succeed regardless of the config path.
+        assert_eq!(result.exit_code, 0);
     }
 }

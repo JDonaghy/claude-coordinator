@@ -1953,6 +1953,23 @@ impl CoordApp {
     fn command_output_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
 
+        // Persistent warning when coordinator.yml could not be located at
+        // startup. The commands panel is shown regardless so the user can see
+        // the message even before pressing any key.
+        if self.command_runner.config_path.is_none() {
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        " coordinator.yml not found — run coord-tui from your project directory ",
+                        Color::rgb(220, 100, 60),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Error,
+            });
+        }
+
         if let Some((label, elapsed)) = self.command_runner.running_info() {
             items.push(ListItem {
                 text: StyledText {
