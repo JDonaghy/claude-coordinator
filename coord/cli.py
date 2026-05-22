@@ -1299,10 +1299,15 @@ def assign(
             sys.exit(1)
     else:
         # --force: delete stale remote branches so the worker starts fresh from main
+        # but skip branches that are the head of an open PR
         from coord.claim import _default_branch_lookup
 
         stale_branches = _default_branch_lookup(repo_cfg.github, issue)
         for branch_name in stale_branches:
+            pr = github_ops.find_pr_for_branch(repo_cfg.github, branch_name)
+            if pr is not None:
+                click.echo(f"  skipping {branch_name} (head of PR #{pr['number']})")
+                continue
             if github_ops.delete_remote_branch(repo_cfg.github, branch_name):
                 click.echo(f"  deleted stale remote branch: {branch_name}")
             else:
