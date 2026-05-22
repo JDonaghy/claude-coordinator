@@ -131,14 +131,12 @@ The agent installs the latest version from PyPI and restarts itself. The HTTP 20
 Old agents (installed before 0.3.0) don't have the `/update` endpoint. SSH in to each machine and run:
 
 ```bash
-# If installed from PyPI (systemd service):
-pip install --upgrade claude-coordinator
-sudo systemctl restart coord-agent   # or whatever your service is named
+# If installed via install-agent.sh (venv + systemd user service):
+~/.coord-venv/bin/pip install --upgrade claude-coordinator && systemctl --user restart coord-agent
 
 # If installed editable (git clone):
-cd ~/src/claude-coordinator
-git pull --ff-only
-# restart the agent process (Ctrl+C and re-run, or systemctl restart)
+cd ~/src/claude-coordinator && git pull --ff-only
+# then restart the agent process
 ```
 
 After upgrading, verify with `curl -s http://<host>:7433/status | python3 -c "import sys,json; print(json.load(sys.stdin).get('version'))"`.
