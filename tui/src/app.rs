@@ -1996,9 +1996,9 @@ impl CoordApp {
                         self.activity_scroll = None;
                         true
                     }
-                    SidebarEvent::HeaderActivated { section } => {
-                        let collapsed = self.board_sidebar.is_collapsed(section);
-                        self.board_sidebar.set_collapsed(section, !collapsed);
+                    SidebarEvent::HeaderActivated { section: _ } => {
+                        // quadraui #239: HeaderActivated now handles collapse internally
+                        // when allow_collapse is true. We no longer need to manually toggle.
                         true
                     }
                     SidebarEvent::StateChanged
