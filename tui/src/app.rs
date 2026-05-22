@@ -45,7 +45,7 @@ use quadraui::compose::sidebar_system::{
 };
 use quadraui::{
     Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
-    Point, Reaction, Rect, ScrollDelta, SectionSize, ShellApp, ShellConfig, ShellContext,
+    Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp, ShellConfig, ShellContext,
     StatusBar, StatusBarSegment, StyledSpan, StyledText,
     TabBar, TabItem, TreeRow, UiEvent, WidgetId,
 };
@@ -1060,6 +1060,7 @@ impl CoordApp {
         self.board_sidebar = SidebarSystem::new(defs);
         self.board_sidebar.set_navigation_mode(NavigationMode::Selection);
         self.board_sidebar.set_allow_collapse(true);
+        self.board_sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
         // Set rows for each section and configure initial state.
         for (section_idx, (repo, issues)) in grouped.iter().enumerate() {
@@ -1291,32 +1292,26 @@ impl CoordApp {
                     decoration: Decoration::Header,
                 });
 
-                // Stage definitions: (display name, type filter fn)
-                let stage_filters: &[(&str, fn(&Assignment) -> bool)] = &[
-                    ("Work", |a| {
-                        a.assignment_type.as_deref() == Some("work")
-                            || a.assignment_type.is_none()
-                    }),
-                    ("Review", |a| {
-                        a.assignment_type.as_deref() == Some("review")
-                    }),
-                    ("Smoke", |a| {
-                        a.assignment_type.as_deref() == Some("smoke")
-                    }),
-                ];
-
-                for (stage_name, filter) in stage_filters {
-                    let assignment = group.assignments.iter().find(|a| filter(a));
-                    items.push(pipeline_stage_item(stage_name, assignment));
+                // Show actual pipeline stages from assignments (ordered by dispatched_at).
+                for a in &group.assignments {
+                    let type_label = match a.assignment_type.as_deref() {
+                        Some("review") => "Review",
+                        Some("smoke") => "Smoke",
+                        Some("plan") => "Plan",
+                        _ => "Work",
+                    };
+                    items.push(pipeline_stage_item(type_label, Some(a)));
                 }
 
-                // PR/Merge stage from merge_queue
-                let mq_entry = self
+                // PR/Merge stage from merge_queue (only if entry exists).
+                if let Some(mq_entry) = self
                     .data
                     .merge_queue
                     .iter()
-                    .find(|e| e.issue_number == Some(group.issue_number));
-                items.push(pipeline_merge_item(mq_entry));
+                    .find(|e| e.issue_number == Some(group.issue_number))
+                {
+                    items.push(pipeline_merge_item(Some(mq_entry)));
+                }
 
                 items.push(kv_item("", "", None)); // blank separator
 
@@ -1688,8 +1683,12 @@ impl CoordApp {
                         self.activity_scroll = None;
                         true
                     }
-                    SidebarEvent::HeaderActivated { .. }
-                    | SidebarEvent::StateChanged
+                    SidebarEvent::HeaderActivated { section } => {
+                        let collapsed = self.board_sidebar.is_collapsed(section);
+                        self.board_sidebar.set_collapsed(section, !collapsed);
+                        true
+                    }
+                    SidebarEvent::StateChanged
                     | SidebarEvent::Consumed
                     | SidebarEvent::ScrollChanged { .. } => true,
                     _ => false,
