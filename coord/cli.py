@@ -532,7 +532,13 @@ def _build_init_yaml(
     return "\n".join(lines) + "\n"
 
 
-@main.command(help="Start the agent server on this machine (port 7433).")
+@main.group(
+    invoke_without_command=True,
+    help=(
+        "Agent server management.  Without a subcommand, starts the agent "
+        "server on this machine (port 7433)."
+    ),
+)
 @_CONFIG_OPTION
 @click.option(
     "--machine",
@@ -542,7 +548,32 @@ def _build_init_yaml(
 )
 @click.option("--host", "bind_host", default="0.0.0.0", show_default=True)
 @click.option("--port", "bind_port", default=AGENT_PORT, show_default=True, type=int)
-def agent(config_path: Path, machine_name: str | None, bind_host: str, bind_port: int) -> None:
+@click.pass_context
+def agent(
+    ctx: click.Context,
+    config_path: Path,
+    machine_name: str | None,
+    bind_host: str,
+    bind_port: int,
+) -> None:
+    ctx.ensure_object(dict)
+    ctx.obj.update(
+        config_path=config_path,
+        machine_name=machine_name,
+        bind_host=bind_host,
+        bind_port=bind_port,
+    )
+    if ctx.invoked_subcommand is None:
+        _start_agent_server(config_path, machine_name, bind_host, bind_port)
+
+
+def _start_agent_server(
+    config_path: Path,
+    machine_name: str | None,
+    bind_host: str,
+    bind_port: int,
+) -> None:
+    """Internal helper: start the uvicorn-backed agent server."""
     import uvicorn
 
     from coord.agent import AgentServer
@@ -579,6 +610,211 @@ def agent(config_path: Path, machine_name: str | None, bind_host: str, bind_port
         uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
     finally:
         server.shutdown()
+
+
+@agent.command(
+    "update",
+    help=(
+        "POST /update to one or all agent servers.  The agent upgrades the "
+        "claude-coordinator package (git pull for editable installs, "
+        "pip install --upgrade otherwise) then restarts itself.  Waits up to "
+        "--timeout seconds for the agent(s) to come back online."
+    ),
+)
+@_CONFIG_OPTION
+@click.option(
+    "--machine",
+    "machine_filter",
+    default=None,
+    help="Name of a single machine to update (from coordinator.yml).",
+)
+@click.option(
+    "--all",
+    "all_machines",
+    is_flag=True,
+    help="Update all machines (mutually exclusive with --machine).",
+)
+@click.option(
+    "--timeout",
+    default=120,
+    show_default=True,
+    type=int,
+    help="Seconds to wait for the agent to come back online after restart.",
+)
+def agent_update(
+    config_path: Path,
+    machine_filter: str | None,
+    all_machines: bool,
+    timeout: int,
+) -> None:
+    cfg = _load_config(config_path)
+    targets = _resolve_agent_targets(cfg, machine_filter, all_machines)
+    if not targets:
+        click.echo("No machines to update.", err=True)
+        sys.exit(2)
+
+    for machine in targets:
+        url = f"http://{machine.host}:{AGENT_PORT}/update"
+        click.echo(f"  {machine.name}: POST {url} ...", nl=False)
+        try:
+            resp = httpx.post(url, timeout=10)
+            if resp.status_code == 202:
+                data = resp.json()
+                click.echo(f" accepted (mode: {data.get('mode', '?')})")
+            else:
+                click.echo(f" HTTP {resp.status_code}")
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            click.echo(f" error: {e}")
+
+    if targets:
+        click.echo(f"\nWaiting up to {timeout}s for agent(s) to come back online...")
+        results = _wait_agents_online(targets, timeout=timeout)
+        for name, came_back in results.items():
+            tag = "✓ online" if came_back else "✗ did not come back"
+            click.echo(f"  {name}: {tag}")
+        if not all(results.values()):
+            sys.exit(1)
+
+
+@agent.command(
+    "restart",
+    help=(
+        "POST /restart to one or all agent servers.  The agent waits for "
+        "active workers to finish (or cancels them after --cancel-timeout "
+        "seconds) then restarts itself.  Waits up to --timeout seconds for "
+        "the agent(s) to come back online."
+    ),
+)
+@_CONFIG_OPTION
+@click.option(
+    "--machine",
+    "machine_filter",
+    default=None,
+    help="Name of a single machine to restart (from coordinator.yml).",
+)
+@click.option(
+    "--all",
+    "all_machines",
+    is_flag=True,
+    help="Restart all machines (mutually exclusive with --machine).",
+)
+@click.option(
+    "--timeout",
+    default=120,
+    show_default=True,
+    type=int,
+    help="Seconds to wait for the agent to come back online after restart.",
+)
+@click.option(
+    "--cancel-timeout",
+    default=30,
+    show_default=True,
+    type=int,
+    help="Seconds the agent waits for active workers to finish before cancelling them.",
+)
+def agent_restart(
+    config_path: Path,
+    machine_filter: str | None,
+    all_machines: bool,
+    timeout: int,
+    cancel_timeout: int,
+) -> None:
+    cfg = _load_config(config_path)
+    targets = _resolve_agent_targets(cfg, machine_filter, all_machines)
+    if not targets:
+        click.echo("No machines to restart.", err=True)
+        sys.exit(2)
+
+    for machine in targets:
+        url = f"http://{machine.host}:{AGENT_PORT}/restart"
+        click.echo(f"  {machine.name}: POST {url} ...", nl=False)
+        try:
+            resp = httpx.post(
+                url,
+                json={"cancel_timeout": cancel_timeout},
+                timeout=10,
+            )
+            if resp.status_code == 202:
+                data = resp.json()
+                active = data.get("active_workers", 0)
+                click.echo(f" accepted ({active} active worker(s))")
+            else:
+                click.echo(f" HTTP {resp.status_code}")
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            click.echo(f" error: {e}")
+
+    if targets:
+        click.echo(f"\nWaiting up to {timeout}s for agent(s) to come back online...")
+        results = _wait_agents_online(targets, timeout=timeout)
+        for name, came_back in results.items():
+            tag = "✓ online" if came_back else "✗ did not come back"
+            click.echo(f"  {name}: {tag}")
+        if not all(results.values()):
+            sys.exit(1)
+
+
+def _resolve_agent_targets(cfg, machine_filter: str | None, all_machines: bool):
+    """Return the list of Machine objects to target for update/restart.
+
+    Validates --machine / --all flags and prints errors on bad input.
+    """
+    if machine_filter and all_machines:
+        click.echo("error: --machine and --all are mutually exclusive.", err=True)
+        sys.exit(2)
+    if not machine_filter and not all_machines:
+        click.echo(
+            "error: specify either --machine NAME or --all.", err=True
+        )
+        sys.exit(2)
+
+    if machine_filter:
+        machine = next((m for m in cfg.machines if m.name == machine_filter), None)
+        if machine is None:
+            click.echo(
+                f"error: machine {machine_filter!r} not in coordinator.yml "
+                f"(have: {[m.name for m in cfg.machines]})",
+                err=True,
+            )
+            sys.exit(2)
+        return [machine]
+
+    return list(cfg.machines)
+
+
+def _wait_agents_online(
+    machines: list,
+    *,
+    timeout: float = 120.0,
+    poll_interval: float = 2.0,
+) -> dict[str, bool]:
+    """Poll /health on each machine until all are online or timeout expires.
+
+    Returns ``{machine_name: came_back_online}`` for every machine in
+    *machines*.  Machines that were already online before the process started
+    count as not-yet-back until we see them respond after the restart.
+    """
+    deadline = time.time() + timeout
+    online: set[str] = set()
+
+    while time.time() < deadline:
+        for machine in machines:
+            if machine.name in online:
+                continue
+            try:
+                resp = httpx.get(
+                    f"http://{machine.host}:{AGENT_PORT}/health",
+                    timeout=3.0,
+                )
+                if resp.status_code == 200:
+                    online.add(machine.name)
+            except Exception:
+                pass
+
+        if len(online) == len(machines):
+            break
+        time.sleep(poll_interval)
+
+    return {m.name: m.name in online for m in machines}
 
 
 def _resolve_machine(cfg: Config, explicit_name: str | None):
@@ -696,9 +932,21 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         else:
             status_result = None
             label = f"{s.state} — {s.reason}{latency}"
+
+        # Extract agent version from /status response (added in #104).
+        agent_version: str | None = None
+        if status_result and status_result.ok and status_result.data:
+            agent_version = status_result.data.get("version")
+
         repos = ", ".join(m.repos) if m.repos else "(none)"
         click.echo(f"  {m.name:15s} [{label}]")
-        click.echo(f"    host: {m.host}  repos: {repos}")
+        version_line = ""
+        if agent_version:
+            if agent_version != __version__:
+                version_line = f"  agent-version: {agent_version} ⚠ (coord is {__version__})"
+            else:
+                version_line = f"  agent-version: {agent_version}"
+        click.echo(f"    host: {m.host}  repos: {repos}{version_line}")
 
         if status_result and status_result.ok and status_result.data:
             for entry in status_result.data.get("active", []):
