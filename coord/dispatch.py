@@ -24,6 +24,7 @@ def dispatch(
     config: Config,
     *,
     pull_repos: Iterable[str] = (),
+    fresh_branch: bool = False,
 ) -> dict:
     """POST an assignment to the agent server on the target machine.
 
@@ -70,6 +71,7 @@ def dispatch(
         "deny_commands": deny_commands,
         "model": model,
         "type": proposal.type,
+        "fresh_branch": fresh_branch,
     }
 
     resp = httpx.post(url, json=payload, timeout=15)
@@ -84,6 +86,7 @@ def dispatch_with_retry(
     max_retries: int = 3,
     backoff_base: float = 60.0,
     pull_repos: Iterable[str] = (),
+    fresh_branch: bool = False,
     on_retry: callable | None = None,
 ) -> dict:
     """Dispatch with exponential backoff on transient failures."""
@@ -92,7 +95,7 @@ def dispatch_with_retry(
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return dispatch(proposal, config, pull_repos=pull_repos)
+            return dispatch(proposal, config, pull_repos=pull_repos, fresh_branch=fresh_branch)
         except httpx.HTTPError as exc:
             state, reason = classify_error(exc)
             if not is_retryable(state) or attempt == max_retries:

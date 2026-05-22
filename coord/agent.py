@@ -59,6 +59,9 @@ class AssignmentSpec:
     # Claude model tier alias (e.g. "haiku", "sonnet", "opus"). When None,
     # the worker command omits --model so claude -p picks its default.
     model: str | None = None
+    # When True, ignore existing issue-N-* branches and create a fresh branch
+    # from the default branch. Used by --force dispatch to avoid stale branches.
+    fresh_branch: bool = False
 
 
 class _GitError(RuntimeError):
@@ -513,18 +516,25 @@ class AgentServer:
 
         # Check if branch already exists (locally or on remote — retry scenario)
         branch_exists = False
-        for ref in (f"origin/{branch_name}", branch_name):
-            try:
-                _git(repo_path, "rev-parse", "--verify", ref)
-                branch_exists = True
-                break
-            except _GitError:
-                continue
+        if not assignment.spec.fresh_branch:
+            for ref in (f"origin/{branch_name}", branch_name):
+                try:
+                    _git(repo_path, "rev-parse", "--verify", ref)
+                    branch_exists = True
+                    break
+                except _GitError:
+                    continue
 
         if branch_exists:
             # Branch exists — check it out in the worktree
             _git(repo_path, "worktree", "add", str(worktree_path), branch_name)
         else:
+            if assignment.spec.fresh_branch:
+                # Delete stale local branch if it exists so -b doesn't fail
+                try:
+                    _git(repo_path, "branch", "-D", branch_name)
+                except _GitError:
+                    pass
             # Branch doesn't exist — create new worktree with new branch
             _git(
                 repo_path, "worktree", "add", "-b", branch_name,

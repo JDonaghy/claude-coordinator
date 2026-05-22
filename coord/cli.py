@@ -1300,7 +1300,7 @@ def assign(
 
     # Dispatch to agent server
     try:
-        response = dispatch(proposal, cfg)
+        response = dispatch(proposal, cfg, fresh_branch=force)
     except httpx.HTTPError as e:
         click.echo(f"  dispatch failed: {e}", err=True)
         sys.exit(1)
