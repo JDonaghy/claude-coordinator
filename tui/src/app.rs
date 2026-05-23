@@ -218,6 +218,8 @@ struct PipelineIssue {
     number: u64,
     /// Issue title (as returned by gh).
     title: String,
+    /// Issue body text (as returned by gh). Empty string when absent.
+    body: String,
     /// `owner/name` slug of the GitHub repo the issue lives in.
     repo_slug: String,
     /// Coord-local repo name (matched via `pipeline_repos` map). `None` when
@@ -1068,7 +1070,7 @@ fn fetch_pipeline_issues(
         "--state".into(),
         "open".into(),
         "--json".into(),
-        "number,title,labels,repository,url".into(),
+        "number,title,body,labels,repository,url".into(),
         "--limit".into(),
         "100".into(),
     ];
@@ -1154,10 +1156,16 @@ fn fetch_pipeline_issues(
             .filter(|l| label_set.contains(l.as_str()))
             .cloned()
             .collect();
+        let body = item
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string();
         let coord_repo = slug_to_local.get(&repo_slug).cloned();
         issues.push(PipelineIssue {
             number,
             title,
+            body,
             repo_slug,
             coord_repo,
             matched_labels,
@@ -1277,6 +1285,8 @@ pub struct CoordApp {
     /// Status message shown when a dispatch is queued/skipped due to no
     /// available machine. Cleared after a short TTL.
     pipeline_status: Option<(String, Instant)>,
+    /// Scroll offset for the issue body in the Pipeline detail pane.
+    pipeline_detail_scroll: usize,
     /// Cache of remotely-fetched log items, keyed by assignment ID.
     ///
     /// Each entry stores `(fetched_at, items)`. Entries older than 30 s are
@@ -1352,6 +1362,7 @@ impl CoordApp {
             pipeline_loader: None,
             pipeline_last_load: None,
             pipeline_status: None,
+            pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: Some(start_data_load()),
             fetch_error: None,
@@ -3024,22 +3035,55 @@ impl CoordApp {
         let mut items: Vec<ListItem> = Vec::new();
         if let Some(idx) = self.pipeline_sel {
             if let Some(issue) = self.pipeline_issues.get(idx) {
-                items.push(kv_item("", &format!(" #{}  {}", issue.number, trunc(&issue.title, 60)), Some(Color::rgb(220, 220, 240))));
-                items.push(kv_item("Repo", &issue.repo_slug, None));
+                // ── Title ────────────────────────────────────────────────
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![
+                            StyledSpan::with_fg(
+                                format!(" #{}", issue.number),
+                                Color::rgb(150, 150, 240),
+                            ),
+                            StyledSpan::with_fg(
+                                format!("  {}", issue.title),
+                                Color::rgb(230, 230, 255),
+                            ),
+                        ],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+
+                // ── Meta ─────────────────────────────────────────────────
+                items.push(kv_item("Repo", &issue.repo_slug, Some(Color::rgb(160, 160, 180))));
                 if let Some(local) = &issue.coord_repo {
                     items.push(kv_item("Local", local, Some(Color::rgb(140, 200, 140))));
                 } else {
                     items.push(kv_item("Local", "(no coordinator.yml mapping)", Some(Color::rgb(220, 150, 80))));
                 }
-                items.push(kv_item("Labels", &issue.matched_labels.join(", "), None));
-                items.push(kv_item("Gates", &self.pipeline_stage_names().join(" → "), None));
+                if !issue.matched_labels.is_empty() {
+                    items.push(kv_item("Labels", &issue.matched_labels.join(", "), Some(Color::rgb(160, 160, 180))));
+                }
+                items.push(kv_item("Gates", &self.pipeline_stage_names().join(" → "), Some(Color::rgb(160, 160, 180))));
+
+                // ── Body ─────────────────────────────────────────────────
+                if !issue.body.is_empty() {
+                    items.push(kv_item("", "", None)); // spacer
+                    for line in issue.body.lines() {
+                        let text = if line.is_empty() {
+                            " ".to_string()
+                        } else {
+                            format!(" {}", line)
+                        };
+                        items.push(kv_item("", &text, Some(Color::rgb(200, 200, 210))));
+                    }
+                }
+
+                // ── Status message ───────────────────────────────────────
                 if let Some((msg, when)) = &self.pipeline_status {
                     if when.elapsed() < Duration::from_secs(8) {
-                        items.push(kv_item(
-                            "",
-                            &format!("  {}", msg),
-                            Some(Color::rgb(180, 180, 100)),
-                        ));
+                        items.push(kv_item("", "", None));
+                        items.push(kv_item("", &format!("  {}", msg), Some(Color::rgb(180, 180, 100))));
                     }
                 }
             }
@@ -3049,7 +3093,7 @@ impl CoordApp {
             title: Some(StyledText::plain(" ISSUE ")),
             items,
             selected_idx: 0,
-            scroll_offset: 0,
+            scroll_offset: self.pipeline_detail_scroll,
             has_focus: false,
             bordered: false,
         }
@@ -3744,8 +3788,12 @@ impl ShellApp for CoordApp {
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
                             SidebarView::Pipeline => {
+                                let prev = self.pipeline_sel;
                                 self.pipeline_sidebar.handle(&event, backend, list_b);
                                 self.pipeline_sel = self.selected_pipeline_index();
+                                if self.pipeline_sel != prev {
+                                    self.pipeline_detail_scroll = 0;
+                                }
                             }
                         }
                         needs_redraw = true;
@@ -3773,10 +3821,28 @@ impl ShellApp for CoordApp {
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
                             SidebarView::Pipeline => {
+                                let prev = self.pipeline_sel;
                                 self.pipeline_sidebar.handle(&event, backend, list_b);
                                 self.pipeline_sel = self.selected_pipeline_index();
+                                if self.pipeline_sel != prev {
+                                    self.pipeline_detail_scroll = 0;
+                                }
                             }
                         }
+                        needs_redraw = true;
+                    }
+
+                    // ── J / K — scroll Pipeline detail body ──────────────
+                    Key::Char('J')
+                        if self.active_view == SidebarView::Pipeline =>
+                    {
+                        self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_add(1);
+                        needs_redraw = true;
+                    }
+                    Key::Char('K')
+                        if self.active_view == SidebarView::Pipeline =>
+                    {
+                        self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_sub(1);
                         needs_redraw = true;
                     }
 
@@ -4122,6 +4188,7 @@ mod tests {
             pipeline_loader: None,
             pipeline_last_load: None,
             pipeline_status: None,
+            pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: None,
             fetch_error: None,
@@ -4802,6 +4869,7 @@ mod tests {
             PipelineIssue {
                 number: 42,
                 title: "Add cool thing".to_string(),
+                body: String::new(),
                 repo_slug: "acme/api".to_string(),
                 coord_repo: Some("api".to_string()),
                 matched_labels: vec!["coord".to_string()],
@@ -4809,6 +4877,7 @@ mod tests {
             PipelineIssue {
                 number: 99,
                 title: "Mystery repo issue".to_string(),
+                body: String::new(),
                 repo_slug: "other/repo".to_string(),
                 coord_repo: None,
                 matched_labels: vec!["coord".to_string()],
