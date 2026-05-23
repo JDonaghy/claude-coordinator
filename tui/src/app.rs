@@ -1375,6 +1375,12 @@ pub struct CoordApp {
     /// Active watch overlay (live log + kill controls). `None` when no
     /// assignment is being watched.
     watch: Option<WatchState>,
+    /// Input text for the inline inject prompt inside the watch overlay.
+    /// Empty when not in input mode.
+    inject_input: String,
+    /// Whether the inject input is currently capturing keyboard input.
+    /// Toggled by 'b' (open) and Escape/Enter (close).
+    inject_focused: bool,
     /// Which tab is active in the Pipeline detail pane.
     pipeline_detail_tab: PipelineDetailTab,
     /// Scroll offset for the issue body on the Issue tab.
@@ -1457,6 +1463,8 @@ impl CoordApp {
             toasts: Vec::new(),
             next_toast_id: 0,
             watch: None,
+            inject_input: String::new(),
+            inject_focused: false,
             pipeline_detail_tab: PipelineDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1655,7 +1663,7 @@ impl CoordApp {
 
     /// Build the body `ListView` for the watch overlay — the raw log lines
     /// from the worker.  Title carries the repo/issue/machine context.
-    /// Footer hint is rendered separately by the caller.
+    /// Inject prompt (when open) is rendered as the last list row.
     fn watch_log_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
         let title = match &self.watch {
@@ -1663,14 +1671,42 @@ impl CoordApp {
             Some(w) => {
                 items.extend(self.get_activity_log(&w.assignment_id, &w.machine));
                 format!(
-                    " WATCH — {} #{} → {} (K=kill  q=close) ",
+                    " WATCH — {} #{} → {} (b=ask  K=kill  q=close) ",
                     w.repo, w.issue_number, w.machine
                 )
             }
         };
+        // If the inject prompt is open, append it as a visible row at the
+        // bottom — chrome stays minimal but the user can see what they're
+        // typing.
+        if self.inject_focused {
+            items.push(kv_item("", "", None));
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![
+                        StyledSpan::with_fg(
+                            " ask> ".to_string(),
+                            Color::rgb(130, 170, 210),
+                        ),
+                        StyledSpan::with_fg(
+                            format!("{}_", self.inject_input),
+                            Color::rgb(255, 255, 255),
+                        ),
+                    ],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+            items.push(kv_item(
+                "",
+                " Enter=send  Esc=cancel ",
+                Some(Color::rgb(140, 140, 140)),
+            ));
+        }
         // Stick-to-bottom default: position the viewport ~40 rows from the
-        // end so the latest log lines are visible (same heuristic as the
-        // Board view's Activity tab).  Any explicit scroll wins.
+        // end so the latest log lines + prompt are visible. Any explicit
+        // scroll wins.
         let scroll = self
             .watch
             .as_ref()
@@ -1691,6 +1727,34 @@ impl CoordApp {
             has_focus: false,
             bordered: true,
         }
+    }
+
+    /// Submit the current inject input to the watched worker via
+    /// `coord inject`.  Closes the input on success.
+    fn submit_inject(&mut self) -> bool {
+        let Some(w) = self.watch.clone() else { return false; };
+        let text = self.inject_input.trim().to_string();
+        if text.is_empty() {
+            self.inject_focused = false;
+            return false;
+        }
+        let spawned = self
+            .command_runner
+            .spawn(&["inject", &w.assignment_id, &text]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("asked worker #{}: {}", w.issue_number, text),
+                Instant::now(),
+            ));
+            self.inject_input.clear();
+            self.inject_focused = false;
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
     }
 
     /// Spawn `coord sync --quiet` in the background if not already running
@@ -4568,9 +4632,33 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── Watch overlay: K kills, q/Esc closes ─────────────
-                    // These handlers MUST come before the general q/Esc
-                    // exit handler so an open watch absorbs them.
+                    // ── Watch overlay: inject input mode takes priority ──
+                    // When the inject prompt is open, ALL char/Enter/Esc/
+                    // Backspace go to the input buffer until it closes.
+                    Key::Named(NamedKey::Enter) if self.inject_focused => {
+                        self.submit_inject();
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Escape) if self.inject_focused => {
+                        self.inject_input.clear();
+                        self.inject_focused = false;
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Backspace) if self.inject_focused => {
+                        self.inject_input.pop();
+                        needs_redraw = true;
+                    }
+                    Key::Char(ch) if self.inject_focused => {
+                        self.inject_input.push(*ch);
+                        needs_redraw = true;
+                    }
+
+                    // ── Watch overlay (no input active): control keys ────
+                    Key::Char('b') if self.watch.is_some() => {
+                        self.inject_focused = true;
+                        self.inject_input.clear();
+                        needs_redraw = true;
+                    }
                     Key::Char('K') if self.watch.is_some() => {
                         self.kill_watched();
                         needs_redraw = true;
@@ -5094,6 +5182,8 @@ mod tests {
             toasts: Vec::new(),
             next_toast_id: 0,
             watch: None,
+            inject_input: String::new(),
+            inject_focused: false,
             pipeline_detail_tab: PipelineDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
