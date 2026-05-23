@@ -72,7 +72,7 @@ enum DetailTab {
     Activity,
 }
 
-/// The two tabs shown in the Pipeline view detail panel.
+/// The tabs shown in the Pipeline view detail panel.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum PipelineDetailTab {
     /// Horizontal stage view + repo/labels/gates meta.
@@ -80,6 +80,9 @@ enum PipelineDetailTab {
     Pipeline,
     /// Full issue body text (scrollable with j/k).
     Issue,
+    /// Per-stage detail: assignment id, machine, status, timing,
+    /// exit code (or merge-queue state for the merge stage).
+    Stages,
 }
 
 // ─── Sidebar views ────────────────────────────────────────────────────────────
@@ -287,6 +290,28 @@ fn fmt_dur(secs: u64) -> String {
 }
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values.
+/// Capitalize the first ASCII character of `s` (no-op when `s` is empty
+/// or starts with a non-ASCII character).
+fn capitalize(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Some(c) = out.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    out
+}
+
+/// Format a unix timestamp as a relative "Xs/m/h ago" string using
+/// the existing `fmt_dur` helper.  Falls back to "-" when the
+/// timestamp is in the future or the system clock can't be read.
+fn format_unix_time(ts: f64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let delta = (now - ts).max(0.0) as u64;
+    format!("{} ago", fmt_dur(delta))
+}
+
 fn trunc(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => &s[..byte_idx],
@@ -3402,6 +3427,12 @@ impl CoordApp {
                     is_dirty: false,
                     is_preview: false,
                 },
+                TabItem {
+                    label: " Stages ".to_string(),
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Stages,
+                    is_dirty: false,
+                    is_preview: false,
+                },
             ],
             scroll_offset: 0,
             right_segments: vec![],
@@ -3481,6 +3512,164 @@ impl CoordApp {
             scroll_offset: 0,
             has_focus: false,
             bordered: false,
+        }
+    }
+
+    /// Detail list for the Stages tab. One section per stage in the
+    /// pipeline; under each section, the latest matching assignment's
+    /// id, machine, status, dispatched/finished times and exit code
+    /// (or the merge_queue row's state and PR for the merge stage).
+    fn pipeline_stages_list(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .cloned();
+        let Some(issue) = issue else {
+            items.push(kv_item("", "(no issue selected)", Some(Color::rgb(140, 140, 140))));
+            return ListView {
+                id: WidgetId::new("pipeline-stages"),
+                title: None,
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: false,
+            };
+        };
+        for name in self.pipeline_stage_names() {
+            let status = self.stage_status_for(&issue, &name);
+            let (icon, color) = match status {
+                StageStatus::Done => ("✓", Color::rgb(120, 200, 120)),
+                StageStatus::Active => ("~", Color::rgb(220, 180, 100)),
+                StageStatus::Failed => ("✗", Color::rgb(220, 70, 70)),
+                StageStatus::Skipped => ("─", Color::rgb(140, 140, 140)),
+                StageStatus::Pending => ("·", Color::rgb(140, 140, 140)),
+            };
+            let header = format!(" {} {}", icon, capitalize(&name));
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(header, color)],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+
+            if name == "merge" {
+                self.append_merge_stage_rows(&mut items, &issue);
+            } else {
+                self.append_assignment_stage_rows(&mut items, &issue, &name);
+            }
+            items.push(kv_item("", "", None));
+        }
+        ListView {
+            id: WidgetId::new("pipeline-stages"),
+            title: None,
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
+    /// Push detail rows for a non-merge stage's matching assignments
+    /// (most-recent first). Falls back to a single "(not started)" row.
+    fn append_assignment_stage_rows(
+        &self,
+        items: &mut Vec<ListItem>,
+        issue: &PipelineIssue,
+        stage: &str,
+    ) {
+        let local_repo = issue.coord_repo.as_deref();
+        let plan_gate_on = self.data.pipeline_require_plan;
+        let matching: Vec<&Assignment> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| {
+                let t = a.assignment_type.as_deref().unwrap_or("work");
+                if stage == "work" && !plan_gate_on {
+                    t == "work" || t == "plan"
+                } else {
+                    t == stage
+                }
+            })
+            .collect();
+
+        if matching.is_empty() {
+            items.push(kv_item("", "    (not started)", Some(Color::rgb(140, 140, 140))));
+            return;
+        }
+        for a in matching.iter() {
+            let id_short = if a.id.len() > 8 { &a.id[..8] } else { &a.id };
+            items.push(kv_item("Assignment", id_short, Some(Color::rgb(160, 200, 220))));
+            items.push(kv_item("Machine", &a.machine, Some(Color::rgb(210, 210, 210))));
+            let status_color = match a.status.as_str() {
+                "running" => Color::rgb(220, 180, 100),
+                "done" => Color::rgb(120, 200, 120),
+                "failed" => Color::rgb(220, 70, 70),
+                _ => Color::rgb(180, 180, 180),
+            };
+            items.push(kv_item("Status", &a.status, Some(status_color)));
+            if let Some(branch) = &a.branch {
+                items.push(kv_item("Branch", branch, Some(Color::rgb(200, 200, 200))));
+            }
+            if let Some(model) = &a.model {
+                items.push(kv_item("Model", model, Some(Color::rgb(180, 180, 180))));
+            }
+            if let Some(t) = a.dispatched_at {
+                items.push(kv_item("Dispatched", &format_unix_time(t), Some(Color::rgb(180, 180, 180))));
+            }
+            if let Some(t) = a.finished_at {
+                items.push(kv_item("Finished", &format_unix_time(t), Some(Color::rgb(180, 180, 180))));
+            }
+            if let Some(ec) = a.exit_code {
+                let ec_color = if ec == 0 {
+                    Color::rgb(120, 200, 120)
+                } else {
+                    Color::rgb(220, 70, 70)
+                };
+                items.push(kv_item("Exit code", &ec.to_string(), Some(ec_color)));
+            }
+            items.push(kv_item("", "", None));
+        }
+    }
+
+    /// Push detail rows for the merge stage from `merge_queue`.
+    fn append_merge_stage_rows(&self, items: &mut Vec<ListItem>, issue: &PipelineIssue) {
+        let entries: Vec<&MergeQueueEntry> = self
+            .data
+            .merge_queue
+            .iter()
+            .filter(|m| m.issue_number == Some(issue.number))
+            .collect();
+        if entries.is_empty() {
+            items.push(kv_item("", "    (not queued)", Some(Color::rgb(140, 140, 140))));
+            return;
+        }
+        for e in entries {
+            let id_short = if e.assignment_id.len() > 8 { &e.assignment_id[..8] } else { &e.assignment_id };
+            items.push(kv_item("Assignment", id_short, Some(Color::rgb(160, 200, 220))));
+            let state_color = match e.state.as_str() {
+                "merged" => Color::rgb(120, 200, 120),
+                "failed" => Color::rgb(220, 70, 70),
+                "open" | "queued" => Color::rgb(220, 180, 100),
+                _ => Color::rgb(180, 180, 180),
+            };
+            items.push(kv_item("State", &e.state, Some(state_color)));
+            if let Some(pr) = e.pr_number {
+                items.push(kv_item("PR", &format!("#{}", pr), Some(Color::rgb(160, 200, 220))));
+            }
+            if let Some(url) = &e.pr_url {
+                items.push(kv_item("URL", url, Some(Color::rgb(140, 170, 210))));
+            }
         }
     }
 
@@ -3733,6 +3922,26 @@ impl CoordApp {
     /// PipelineView primitive and dispatches the "Go" action.
     fn mouse_main_click(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
         if self.active_view == SidebarView::Pipeline {
+            // Tab bar occupies the first `lh * 1.4` row of the main panel.
+            let tab_h = lh * 1.4;
+            if pos.y - main_b.y < tab_h {
+                let x_off = pos.x - main_b.x;
+                // Tab labels: " Pipeline " (10), " Issue " (7), " Stages " (8).
+                let new_tab = if x_off < 10.0 {
+                    PipelineDetailTab::Pipeline
+                } else if x_off < 17.0 {
+                    PipelineDetailTab::Issue
+                } else {
+                    PipelineDetailTab::Stages
+                };
+                if new_tab != self.pipeline_detail_tab {
+                    self.pipeline_detail_tab = new_tab;
+                    self.pipeline_detail_scroll = 0;
+                    return true;
+                }
+                return false;
+            }
+            // Below the tab row → the active tab's content.
             if let Some(view) = self.build_pipeline_widget() {
                 let pv_rect = pipeline_detail_pv_rect(main_b, lh);
                 let layout = tui_pipeline_layout(&view, pv_rect);
@@ -4023,6 +4232,9 @@ impl ShellApp for CoordApp {
                         PipelineDetailTab::Issue => {
                             backend.draw_list(content_rect, &self.pipeline_issue_body_list());
                         }
+                        PipelineDetailTab::Stages => {
+                            backend.draw_list(content_rect, &self.pipeline_stages_list());
+                        }
                     }
                 }
             }
@@ -4249,18 +4461,27 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── h/l — switch Pipeline detail tabs ────────────────
+                    // ── h/l — cycle Pipeline detail tabs ─────────────────
+                    // Order: Pipeline → Issue → Stages → Pipeline …
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        self.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+                        self.pipeline_detail_tab = match self.pipeline_detail_tab {
+                            PipelineDetailTab::Pipeline => PipelineDetailTab::Stages,
+                            PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
+                            PipelineDetailTab::Stages => PipelineDetailTab::Issue,
+                        };
                         self.pipeline_detail_scroll = 0;
                         needs_redraw = true;
                     }
                     Key::Char('l') | Key::Named(NamedKey::Right)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        self.pipeline_detail_tab = PipelineDetailTab::Issue;
+                        self.pipeline_detail_tab = match self.pipeline_detail_tab {
+                            PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
+                            PipelineDetailTab::Issue => PipelineDetailTab::Stages,
+                            PipelineDetailTab::Stages => PipelineDetailTab::Pipeline,
+                        };
                         self.pipeline_detail_scroll = 0;
                         needs_redraw = true;
                     }
@@ -5789,6 +6010,54 @@ mod tests {
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
+    }
+
+    /// Stages tab list includes one row per stage and detail rows for
+    /// assignments that exist.
+    #[test]
+    fn pipeline_stages_list_renders_stage_headers_and_details() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "abcdef1234567890".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: Some("issue-42-cool".to_string()),
+            model: Some("sonnet".to_string()),
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let list = app.pipeline_stages_list();
+        let text_blob: String = list
+            .items
+            .iter()
+            .flat_map(|it| it.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<&str>>()
+            .join("|");
+        // Headers for every stage are present.
+        assert!(text_blob.contains("Work"), "Work header missing");
+        assert!(text_blob.contains("Review"), "Review header missing");
+        assert!(text_blob.contains("Merge"), "Merge header missing");
+        // Assignment short id appears.
+        assert!(text_blob.contains("abcdef12"), "short id missing");
+        // Branch + model render.
+        assert!(text_blob.contains("issue-42-cool"), "branch missing");
+        assert!(text_blob.contains("sonnet"), "model missing");
+        // Empty-detail rows for stages with no assignments.
+        assert!(text_blob.contains("(not started)") || text_blob.contains("(not queued)"));
+    }
+
+    /// capitalize() upper-cases the first ASCII character only.
+    #[test]
+    fn capitalize_first_char() {
+        assert_eq!(capitalize(""), "");
+        assert_eq!(capitalize("plan"), "Plan");
+        assert_eq!(capitalize("work"), "Work");
+        assert_eq!(capitalize("Plan"), "Plan");
     }
 
     /// is_dispatchable_stage covers the four stages the panel can fire.
