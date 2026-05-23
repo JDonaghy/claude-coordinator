@@ -2916,6 +2916,11 @@ impl CoordApp {
                 {
                     go_attached = true;
                     Some("Go".to_string())
+                } else if status == StageStatus::Failed
+                    && is_dispatchable_stage(name)
+                    && issue.coord_repo.is_some()
+                {
+                    Some("Retry".to_string())
                 } else {
                     None
                 };
@@ -2947,17 +2952,36 @@ impl CoordApp {
             .min_by_key(|m| m.active_count)
     }
 
-    /// Dispatch the `[Go]` action attached to a specific stage index.
-    /// Routes to the per-stage handler based on the stage name; falls back
-    /// to a status message for stages we don't know how to dispatch.
+    /// Dispatch the action button (`[Go]` or `[Retry]`) attached to a
+    /// specific stage index. Branches on the stage's current status: a
+    /// Failed stage gets retry semantics; everything else gets fresh
+    /// dispatch.  Falls back to a status message for stages we don't
+    /// know how to dispatch.
     fn dispatch_pipeline_stage(&mut self, stage_idx: usize) -> bool {
         let stage_name = match self.pipeline_stage_names().get(stage_idx).cloned() {
             Some(s) => s,
             None => return false,
         };
+        let Some(sel) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(sel).cloned() else { return false; };
+        let is_retry = self.stage_status_for(&issue, &stage_name) == StageStatus::Failed;
         match stage_name.as_str() {
-            "work" => self.dispatch_pipeline_work(),
-            "review" => self.dispatch_pipeline_review(),
+            "work" => {
+                if is_retry {
+                    self.retry_pipeline_assignment(&issue, "work")
+                } else {
+                    self.dispatch_pipeline_work()
+                }
+            }
+            "review" => {
+                if is_retry {
+                    self.retry_pipeline_assignment(&issue, "review")
+                } else {
+                    self.dispatch_pipeline_review()
+                }
+            }
+            // Merge has no assignment row to retry against — re-running
+            // `coord merge` is the right call for both fresh and retry.
             "merge" => self.dispatch_pipeline_merge(),
             other => {
                 self.pipeline_status = Some((
@@ -2969,10 +2993,10 @@ impl CoordApp {
         }
     }
 
-    /// Dispatch the `[Go]` on whichever stage currently owns it. Used by
-    /// the Enter key handler where we don't have a stage index from a
-    /// click — fall through to the first dispatchable Pending stage whose
-    /// predecessors are all Done.
+    /// Dispatch the action button on whichever stage currently owns it.
+    /// Used by the Enter key handler where we don't have a stage index
+    /// from a click — falls through to the first stage with an attached
+    /// `[Go]` or `[Retry]`.
     fn dispatch_pipeline_active_go(&mut self) -> bool {
         let widget = match self.build_pipeline_widget() {
             Some(w) => w,
@@ -2983,6 +3007,60 @@ impl CoordApp {
             Some(i) => self.dispatch_pipeline_stage(i),
             None => false,
         }
+    }
+
+    /// Retry the latest failed `<stage>` assignment for `issue` via
+    /// `coord retry <assignment_id>`.  No-op with a status message when
+    /// no matching failed assignment is found.
+    fn retry_pipeline_assignment(&mut self, issue: &PipelineIssue, stage: &str) -> bool {
+        let Some(coord_repo) = issue.coord_repo.clone() else {
+            self.pipeline_status = Some((
+                format!(
+                    "no local repo mapping for {} — add it to coordinator.yml",
+                    issue.repo_slug
+                ),
+                Instant::now(),
+            ));
+            return false;
+        };
+        let assignment_id = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number && a.repo == coord_repo)
+            .filter(|a| {
+                let t = a.assignment_type.as_deref().unwrap_or("work");
+                if stage == "work" {
+                    t == "work" || t == "plan"
+                } else {
+                    t == stage
+                }
+            })
+            .find(|a| a.status == "failed")
+            .map(|a| a.id.clone());
+        let Some(id) = assignment_id else {
+            self.pipeline_status = Some((
+                format!(
+                    "no failed {} assignment found for #{}",
+                    stage, issue.number
+                ),
+                Instant::now(),
+            ));
+            return false;
+        };
+        let spawned = self.command_runner.spawn(&["retry", &id]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("retry dispatched for {} #{}", stage, issue.number),
+                Instant::now(),
+            ));
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
     }
 
     /// Dispatch the Work stage: `coord assign <machine> <repo> <issue>`.
@@ -5374,6 +5452,92 @@ mod tests {
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
             assert_eq!(stage.status, StageStatus::Done);
+            assert!(stage.action.is_none());
+        }
+    }
+
+    /// Failed Work stage gets a [Retry] action; later Pending stages stay quiet.
+    #[test]
+    fn build_pipeline_widget_retry_on_failed_work() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "w-failed".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "failed".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(1),
+            assignment_type: Some("work".to_string()),
+        });
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[0].status, StageStatus::Failed);
+        assert_eq!(view.stages[0].action.as_deref(), Some("Retry"));
+        // Review still Pending but its predecessor (Work) is Failed, not
+        // Done — no Go on Review.
+        assert!(view.stages[1].action.is_none());
+        assert!(view.stages[2].action.is_none());
+    }
+
+    /// Failed merge_queue entry → [Retry] on Merge.
+    #[test]
+    fn build_pipeline_widget_retry_on_failed_merge() {
+        let mut app = make_pipeline_app();
+        // Work + Review done so the merge stage is reachable on the timeline.
+        for stage_name in ["work", "review"] {
+            app.data.assignments.push(Assignment {
+                id: stage_name.to_string(),
+                repo: "api".to_string(),
+                issue_number: 42,
+                issue_title: "Add cool thing".to_string(),
+                machine: "m1".to_string(),
+                status: "done".to_string(),
+                branch: None,
+                model: None,
+                dispatched_at: Some(1.0),
+                finished_at: Some(2.0),
+                exit_code: Some(0),
+                assignment_type: Some(stage_name.to_string()),
+            });
+        }
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w".to_string(),
+            issue_number: Some(42),
+            state: "failed".to_string(),
+            pr_number: None,
+            pr_url: None,
+        });
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[2].status, StageStatus::Failed);
+        assert_eq!(view.stages[2].action.as_deref(), Some("Retry"));
+    }
+
+    /// Failed stage without a coord_repo mapping must not show Retry —
+    /// we'd have nothing to dispatch.
+    #[test]
+    fn build_pipeline_widget_no_retry_without_coord_repo() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(1); // the unmapped issue
+        app.data.assignments.push(Assignment {
+            id: "x".to_string(),
+            repo: "other".to_string(),
+            issue_number: 99,
+            issue_title: "Mystery".to_string(),
+            machine: "m1".to_string(),
+            status: "failed".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(1),
+            assignment_type: Some("work".to_string()),
+        });
+        let view = app.build_pipeline_widget().unwrap();
+        for stage in &view.stages {
             assert!(stage.action.is_none());
         }
     }
