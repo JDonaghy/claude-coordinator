@@ -1256,6 +1256,9 @@ pub struct CoordApp {
     last_notify: Instant,
     /// Scroll offset for the bottom (command output) panel.
     command_scroll: usize,
+    // ── Issue sync state ─────────────────────────────────────────────────
+    /// Last time `coord sync --quiet` was spawned (to rate-limit kicks).
+    issue_sync_last: Option<Instant>,
     // ── Board search / status-group state ───────────────────────────────
     /// Current value in the board filter input.
     board_search: String,
@@ -1343,6 +1346,7 @@ impl CoordApp {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            issue_sync_last: None,
             board_search: String::new(),
             board_search_cursor: 0,
             board_search_focused: false,
@@ -1360,6 +1364,8 @@ impl CoordApp {
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
+        // Sync issues from GitHub on startup so the board backlog is fresh.
+        app.kick_issue_sync();
         app
     }
 
@@ -1406,6 +1412,23 @@ impl CoordApp {
     fn refresh(&mut self) {
         if self.pending_data.is_none() {
             self.pending_data = Some(start_data_load());
+        }
+    }
+
+    /// Spawn `coord sync --quiet` in the background if not already running
+    /// and the last sync was more than 5 minutes ago (or never run).
+    fn kick_issue_sync(&mut self) {
+        const SYNC_INTERVAL: Duration = Duration::from_secs(300);
+        if let Some(last) = self.issue_sync_last {
+            if last.elapsed() < SYNC_INTERVAL {
+                return;
+            }
+        }
+        if self.command_runner.is_running() {
+            return;
+        }
+        if self.command_runner.spawn(&["sync", "--quiet"]) {
+            self.issue_sync_last = Some(Instant::now());
         }
     }
 
@@ -3906,6 +3929,7 @@ impl ShellApp for CoordApp {
 
                     Key::Char('r') => {
                         self.refresh();
+                        self.kick_issue_sync();
                         needs_redraw = true;
                     }
 
@@ -4092,6 +4116,7 @@ mod tests {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            issue_sync_last: None,
             board_search: String::new(),
             board_search_cursor: 0,
             board_search_focused: false,
