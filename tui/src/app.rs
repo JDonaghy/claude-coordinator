@@ -588,6 +588,13 @@ fn load_activity_log(id: &str) -> Vec<ListItem> {
 
 // ─── Pipeline stage rendering ─────────────────────────────────────────────────
 
+/// Whether a pipeline stage can be dispatched by clicking `[Go]` in the
+/// Pipeline panel.  Stages outside this list still render — they just
+/// don't show a button (they're driven implicitly by the coordinator).
+fn is_dispatchable_stage(name: &str) -> bool {
+    matches!(name, "work" | "review" | "merge")
+}
+
 /// Build a `ListItem` for one pipeline stage (plan/work/review/smoke).
 ///
 /// `assignment` is the best-matching assignment for the stage, or `None`
@@ -2783,12 +2790,17 @@ impl CoordApp {
     ///
     /// "work" is the first stage and matches assignments with
     /// `assignment_type` `None` or `"work"`.  Other stage names match
-    /// assignments by exact `assignment_type`.
+    /// assignments by exact `assignment_type`.  The "merge" stage is
+    /// special-cased to read from the `merge_queue` table instead, since
+    /// merges are not modelled as assignments.
     fn stage_status_for(
         &self,
         issue: &PipelineIssue,
         stage: &str,
     ) -> StageStatus {
+        if stage == "merge" {
+            return self.merge_stage_status_for(issue);
+        }
         // Collect assignments for this issue (matching repo or repo_slug).
         let related: Vec<&Assignment> = self
             .data
@@ -2829,6 +2841,24 @@ impl CoordApp {
         StageStatus::Pending
     }
 
+    /// Resolve the merge stage status from `merge_queue` entries.
+    ///
+    /// `merged` → Done, `open`/`queued` → Active, `failed` → Failed, anything
+    /// else (or no entry) → Pending.
+    fn merge_stage_status_for(&self, issue: &PipelineIssue) -> StageStatus {
+        let entry = self
+            .data
+            .merge_queue
+            .iter()
+            .find(|m| m.issue_number == Some(issue.number));
+        match entry.map(|e| e.state.as_str()) {
+            Some("merged") => StageStatus::Done,
+            Some("open") | Some("queued") => StageStatus::Active,
+            Some("failed") => StageStatus::Failed,
+            _ => StageStatus::Pending,
+        }
+    }
+
     /// Returns the *display* current stage for the sidebar badge — the
     /// first non-Done stage, or "merged" once every stage is Done.
     fn derive_current_stage(&self, issue: &PipelineIssue) -> String {
@@ -2843,19 +2873,29 @@ impl CoordApp {
     }
 
     /// Build the quadraui `PipelineView` widget for the selected issue.
+    ///
+    /// The `[Go]` button is attached to the leftmost stage that is
+    /// (a) Pending, (b) dispatchable from the TUI (work, review, merge),
+    /// (c) preceded only by Done stages, and (d) for an issue we can map
+    /// back to a coordinator-local repo.
     fn build_pipeline_widget(&self) -> Option<QuiPipelineView> {
         let idx = self.pipeline_sel?;
         let issue = self.pipeline_issues.get(idx)?;
         let stage_names = self.pipeline_stage_names();
 
-        // The Go button goes on the first Pending stage that we know how
-        // to dispatch — currently the "work" stage only (other gates are
-        // dispatched implicitly by the coordinator after work completes).
+        // Precompute every stage's status once so we can check predecessors
+        // without re-querying.
+        let statuses: Vec<StageStatus> = stage_names
+            .iter()
+            .map(|name| self.stage_status_for(issue, name))
+            .collect();
+
         let mut go_attached = false;
         let stages: Vec<QuiPipelineStage> = stage_names
             .iter()
-            .map(|name| {
-                let status = self.stage_status_for(issue, name);
+            .enumerate()
+            .map(|(i, name)| {
+                let status = statuses[i].clone();
                 let label = match name.as_str() {
                     "work" => "Work".to_string(),
                     other => {
@@ -2866,9 +2906,12 @@ impl CoordApp {
                         s
                     }
                 };
+                let prior_all_done =
+                    statuses[..i].iter().all(|s| *s == StageStatus::Done);
                 let action = if !go_attached
                     && status == StageStatus::Pending
-                    && name == "work"
+                    && prior_all_done
+                    && is_dispatchable_stage(name)
                     && issue.coord_repo.is_some()
                 {
                     go_attached = true;
@@ -2904,11 +2947,46 @@ impl CoordApp {
             .min_by_key(|m| m.active_count)
     }
 
-    /// Dispatch the "Go" action for the currently selected issue. Spawns
-    /// `coord assign <machine> <repo> <issue>` via the existing command
-    /// runner. Returns `true` if a command was spawned, `false` if we
-    /// fell back to a queue-style status message.
-    fn dispatch_pipeline_go(&mut self) -> bool {
+    /// Dispatch the `[Go]` action attached to a specific stage index.
+    /// Routes to the per-stage handler based on the stage name; falls back
+    /// to a status message for stages we don't know how to dispatch.
+    fn dispatch_pipeline_stage(&mut self, stage_idx: usize) -> bool {
+        let stage_name = match self.pipeline_stage_names().get(stage_idx).cloned() {
+            Some(s) => s,
+            None => return false,
+        };
+        match stage_name.as_str() {
+            "work" => self.dispatch_pipeline_work(),
+            "review" => self.dispatch_pipeline_review(),
+            "merge" => self.dispatch_pipeline_merge(),
+            other => {
+                self.pipeline_status = Some((
+                    format!("stage '{}' not dispatchable from TUI", other),
+                    Instant::now(),
+                ));
+                false
+            }
+        }
+    }
+
+    /// Dispatch the `[Go]` on whichever stage currently owns it. Used by
+    /// the Enter key handler where we don't have a stage index from a
+    /// click — fall through to the first dispatchable Pending stage whose
+    /// predecessors are all Done.
+    fn dispatch_pipeline_active_go(&mut self) -> bool {
+        let widget = match self.build_pipeline_widget() {
+            Some(w) => w,
+            None => return false,
+        };
+        let stage_idx = widget.stages.iter().position(|s| s.action.is_some());
+        match stage_idx {
+            Some(i) => self.dispatch_pipeline_stage(i),
+            None => false,
+        }
+    }
+
+    /// Dispatch the Work stage: `coord assign <machine> <repo> <issue>`.
+    fn dispatch_pipeline_work(&mut self) -> bool {
         let Some(idx) = self.pipeline_sel else { return false; };
         let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
         let Some(coord_repo) = issue.coord_repo.clone() else {
@@ -2942,6 +3020,64 @@ impl CoordApp {
         if spawned {
             self.pipeline_status = Some((
                 format!("dispatched #{} → {}", issue.number, machine_name),
+                Instant::now(),
+            ));
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
+    }
+
+    /// Dispatch the Review stage: `coord notify`.
+    ///
+    /// `coord notify` polls every machine for completion and auto-dispatches
+    /// a review when a worker has finished — this is a session-wide poll,
+    /// not scoped to a single issue, but in practice it's the right call:
+    /// the worker we want a review for has just finished, and notify is
+    /// idempotent for already-reviewed work.
+    fn dispatch_pipeline_review(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let spawned = self.command_runner.spawn(&["notify"]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("notify dispatched for #{}", issue.number),
+                Instant::now(),
+            ));
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
+    }
+
+    /// Dispatch the Merge stage: `coord merge --repo <coord_repo>`.
+    fn dispatch_pipeline_merge(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let Some(coord_repo) = issue.coord_repo.clone() else {
+            self.pipeline_status = Some((
+                format!(
+                    "no local repo mapping for {} — add it to coordinator.yml",
+                    issue.repo_slug
+                ),
+                Instant::now(),
+            ));
+            return false;
+        };
+        let spawned = self.command_runner.spawn(&[
+            "merge",
+            "--repo",
+            &coord_repo,
+        ]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("merge dispatched for {} (#{})", coord_repo, issue.number),
                 Instant::now(),
             ));
         } else {
@@ -3399,8 +3535,8 @@ impl CoordApp {
                 let pv_rect = pipeline_detail_pv_rect(main_b, lh);
                 let layout = tui_pipeline_layout(&view, pv_rect);
                 match layout.hit_test(pos.x, pos.y) {
-                    PipelineHit::Action(_) => {
-                        self.dispatch_pipeline_go();
+                    PipelineHit::Action(stage_idx) => {
+                        self.dispatch_pipeline_stage(stage_idx);
                         return true;
                     }
                     PipelineHit::Body(_) | PipelineHit::Empty => return false,
@@ -3980,11 +4116,11 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── Enter — fire Go for selected Pipeline issue ──────
+                    // ── Enter — fire Go for whichever stage owns it ─────
                     Key::Named(NamedKey::Enter)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        self.dispatch_pipeline_go();
+                        self.dispatch_pipeline_active_go();
                         needs_redraw = true;
                     }
 
@@ -5106,6 +5242,151 @@ mod tests {
         for stage in &view.stages {
             assert!(stage.action.is_none(), "stage {:?} should have no action", stage.label);
         }
+    }
+
+    /// Work done, no review assignment → [Go] moves to the Review stage.
+    #[test]
+    fn build_pipeline_widget_go_on_review_when_work_done() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "w1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[0].label, "Work");
+        assert_eq!(view.stages[0].status, StageStatus::Done);
+        assert!(view.stages[0].action.is_none(), "Work is done — no Go");
+        assert_eq!(
+            view.stages[1].action.as_deref(),
+            Some("Go"),
+            "Review should now own the Go button"
+        );
+        assert!(view.stages[2].action.is_none(), "Merge still gated on review");
+    }
+
+    /// Work + review both done, merge_queue empty → [Go] on Merge stage.
+    #[test]
+    fn build_pipeline_widget_go_on_merge_when_review_done() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "w1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        app.data.assignments.push(Assignment {
+            id: "r1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(3.0),
+            finished_at: Some(4.0),
+            exit_code: Some(0),
+            assignment_type: Some("review".to_string()),
+        });
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[0].status, StageStatus::Done);
+        assert_eq!(view.stages[1].status, StageStatus::Done);
+        assert!(view.stages[0].action.is_none());
+        assert!(view.stages[1].action.is_none());
+        assert_eq!(view.stages[2].action.as_deref(), Some("Go"));
+    }
+
+    /// A `merged` row in merge_queue makes the Merge stage Done.
+    #[test]
+    fn merge_stage_status_done_from_merge_queue() {
+        let mut app = make_pipeline_app();
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(7),
+            pr_url: Some("https://example/pr/7".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Done);
+    }
+
+    /// An `open` row in merge_queue marks the Merge stage Active.
+    #[test]
+    fn merge_stage_status_active_from_open_pr() {
+        let mut app = make_pipeline_app();
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "open".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Active);
+    }
+
+    /// Merge stage already merged → no [Go] anywhere; full pipeline Done.
+    #[test]
+    fn build_pipeline_widget_no_go_when_all_done() {
+        let mut app = make_pipeline_app();
+        for stage_name in ["work", "review"] {
+            app.data.assignments.push(Assignment {
+                id: stage_name.to_string(),
+                repo: "api".to_string(),
+                issue_number: 42,
+                issue_title: "Add cool thing".to_string(),
+                machine: "m1".to_string(),
+                status: "done".to_string(),
+                branch: None,
+                model: None,
+                dispatched_at: Some(1.0),
+                finished_at: Some(2.0),
+                exit_code: Some(0),
+                assignment_type: Some(stage_name.to_string()),
+            });
+        }
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+        });
+        let view = app.build_pipeline_widget().unwrap();
+        for stage in &view.stages {
+            assert_eq!(stage.status, StageStatus::Done);
+            assert!(stage.action.is_none());
+        }
+    }
+
+    /// is_dispatchable_stage covers the three stages the panel can fire.
+    #[test]
+    fn is_dispatchable_stage_recognises_known_stages() {
+        assert!(is_dispatchable_stage("work"));
+        assert!(is_dispatchable_stage("review"));
+        assert!(is_dispatchable_stage("merge"));
+        assert!(!is_dispatchable_stage("plan"));
+        assert!(!is_dispatchable_stage("smoke"));
+        assert!(!is_dispatchable_stage(""));
     }
 
     #[test]
