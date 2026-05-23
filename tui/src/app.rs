@@ -85,6 +85,10 @@ struct WatchState {
     machine: String,
     repo: String,
     issue_number: u64,
+    /// Assignment type ("work", "plan", "review"). Drives which control
+    /// keys are available — e.g. 'A' (approve plan → dispatch work) is
+    /// only meaningful when watching a plan-type assignment.
+    assignment_type: String,
     /// Scroll offset into the log lines.  `usize::MAX` is a sentinel
     /// meaning "stick to the bottom"; any explicit user scroll replaces
     /// this with a concrete row.
@@ -1623,6 +1627,10 @@ impl CoordApp {
                     machine: a.machine.clone(),
                     repo: a.repo.clone(),
                     issue_number: a.issue_number,
+                    assignment_type: a
+                        .assignment_type
+                        .clone()
+                        .unwrap_or_else(|| "work".to_string()),
                     scroll: usize::MAX,
                 });
                 true
@@ -1640,6 +1648,37 @@ impl CoordApp {
     /// Close the watch overlay.
     fn close_watch(&mut self) {
         self.watch = None;
+    }
+
+    /// Accept the plan being watched: dispatches `coord approve-plan <id>`.
+    /// No-op when the watched assignment isn't a plan; toasts otherwise.
+    fn approve_watched_plan(&mut self) -> bool {
+        let Some(w) = self.watch.clone() else { return false; };
+        if w.assignment_type != "plan" {
+            self.pipeline_status = Some((
+                "approve only works on a plan-type assignment".to_string(),
+                Instant::now(),
+            ));
+            return false;
+        }
+        let spawned = self
+            .command_runner
+            .spawn(&["approve-plan", &w.assignment_id]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("approving plan #{} → dispatching work", w.issue_number),
+                Instant::now(),
+            ));
+            // Close the watch so the user returns to Stages and can see the
+            // new work assignment appear on the next refresh.
+            self.close_watch();
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
     }
 
     /// Stop the assignment being watched: dispatches `coord stop <id>`.
@@ -1670,9 +1709,14 @@ impl CoordApp {
             None => " WATCH ".to_string(),
             Some(w) => {
                 items.extend(self.get_activity_log(&w.assignment_id, &w.machine));
+                let extra_keys = if w.assignment_type == "plan" {
+                    "  A=accept"
+                } else {
+                    ""
+                };
                 format!(
-                    " WATCH — {} #{} → {} (b=ask  K=kill  q=close) ",
-                    w.repo, w.issue_number, w.machine
+                    " WATCH — {} #{} → {} ({}) (b=ask{}  K=kill  q=close) ",
+                    w.repo, w.issue_number, w.machine, w.assignment_type, extra_keys
                 )
             }
         };
@@ -4661,6 +4705,10 @@ impl ShellApp for CoordApp {
                     }
                     Key::Char('K') if self.watch.is_some() => {
                         self.kill_watched();
+                        needs_redraw = true;
+                    }
+                    Key::Char('A') if self.watch.is_some() => {
+                        self.approve_watched_plan();
                         needs_redraw = true;
                     }
                     Key::Char('q') | Key::Named(NamedKey::Escape)
