@@ -673,3 +673,54 @@ class TestSaveConfigSnapshot:
         rows = coord_db.execute("SELECT name FROM machines ORDER BY name").fetchall()
         assert len(rows) == 1
         assert rows[0]["name"] == "new"
+
+
+# ── upsert_open_issues ──────────────────────────────────────────────────────
+
+def test_upsert_open_issues_inserts_rows(coord_db) -> None:
+    from coord.state import upsert_open_issues
+    from coord.db import get_connection
+
+    issues = [
+        {"number": 1, "title": "Fix login", "body": "Broken", "labels": [{"name": "bug"}]},
+        {"number": 2, "title": "Add tests", "body": "", "labels": []},
+    ]
+    upsert_open_issues("myrepo", issues)
+
+    rows = get_connection().execute(
+        "SELECT number, title, state, labels FROM issues WHERE repo_name='myrepo' ORDER BY number"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["number"] == 1
+    assert rows[0]["title"] == "Fix login"
+    assert rows[0]["state"] == "open"
+    assert rows[1]["number"] == 2
+
+
+def test_upsert_open_issues_marks_removed_issues_closed(coord_db) -> None:
+    from coord.state import upsert_open_issues
+    from coord.db import get_connection
+
+    upsert_open_issues("repo", [{"number": 1, "title": "A", "body": "", "labels": []}])
+    upsert_open_issues("repo", [{"number": 2, "title": "B", "body": "", "labels": []}])
+
+    rows = get_connection().execute(
+        "SELECT number, state FROM issues WHERE repo_name='repo' ORDER BY number"
+    ).fetchall()
+    assert rows[0]["number"] == 1
+    assert rows[0]["state"] == "closed"   # was open, now absent from latest sync
+    assert rows[1]["number"] == 2
+    assert rows[1]["state"] == "open"
+
+
+def test_upsert_open_issues_updates_title_on_resync(coord_db) -> None:
+    from coord.state import upsert_open_issues
+    from coord.db import get_connection
+
+    upsert_open_issues("repo", [{"number": 5, "title": "Old title", "body": "", "labels": []}])
+    upsert_open_issues("repo", [{"number": 5, "title": "New title", "body": "", "labels": []}])
+
+    row = get_connection().execute(
+        "SELECT title FROM issues WHERE repo_name='repo' AND number=5"
+    ).fetchone()
+    assert row["title"] == "New title"

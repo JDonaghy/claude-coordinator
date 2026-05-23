@@ -2050,6 +2050,35 @@ def retry(assignment_id: str, config_path: Path) -> None:
     )
 
 
+@main.command(help="Sync open issues from GitHub into the local SQLite cache.")
+@_CONFIG_OPTION
+@click.option("--quiet", "-q", is_flag=True, help="Suppress per-repo output.")
+def sync(config_path: Path, quiet: bool) -> None:
+    """Fetch open issues for every configured repo and write them to the local
+    ``issues`` table in ``~/.coord/coord.db``.
+
+    The TUI board reads from this table to show the full backlog under
+    Pending.  Run this manually, call it from a cron job, or press 'r' in
+    the TUI which triggers it automatically alongside the data refresh.
+    """
+    from coord import github_ops
+    from coord.state import upsert_open_issues
+
+    cfg = _load_config(config_path)
+    total = 0
+    for repo in cfg.repos:
+        try:
+            issues = github_ops.get_open_issues(repo.github)
+            upsert_open_issues(repo.name, issues)
+            if not quiet:
+                click.echo(f"  {repo.name}: {len(issues)} open issue(s)")
+            total += len(issues)
+        except Exception as e:  # noqa: BLE001
+            click.echo(f"  {repo.name}: sync failed — {e}", err=True)
+    if not quiet:
+        click.echo(f"synced {total} open issue(s) across {len(cfg.repos)} repo(s)")
+
+
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")
 @_CONFIG_OPTION
 def notify(config_path: Path) -> None:

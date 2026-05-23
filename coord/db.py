@@ -175,6 +175,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             value TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS issues (
+            repo_name  TEXT    NOT NULL,
+            number     INTEGER NOT NULL,
+            title      TEXT    NOT NULL DEFAULT '',
+            body       TEXT    NOT NULL DEFAULT '',
+            state      TEXT    NOT NULL DEFAULT 'open',
+            labels     TEXT    NOT NULL DEFAULT '[]',
+            synced_at  REAL,
+            PRIMARY KEY (repo_name, number)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);

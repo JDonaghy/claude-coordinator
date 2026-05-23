@@ -229,9 +229,20 @@ struct PipelineIssue {
 }
 
 #[derive(Default)]
+/// An open issue from the local `issues` table (synced from GitHub on coord plan).
+#[derive(Clone)]
+struct OpenIssue {
+    repo_name: String,
+    number: u64,
+    title: String,
+}
+
+#[derive(Default)]
 struct BoardData {
     local_machine: String,
     assignments: Vec<Assignment>,
+    /// Open issues from the local SQLite `issues` table — the full backlog.
+    open_issues: Vec<OpenIssue>,
     machines: Vec<Machine>,
     merge_queue: Vec<MergeQueueEntry>,
     proposals: Vec<Proposal>,
@@ -908,6 +919,28 @@ fn load_data() -> BoardData {
         rows.filter_map(|r| r.ok()).collect()
     };
 
+    // ── Query open issues (synced from GitHub on coord plan) ──────────────
+    let open_issues: Vec<OpenIssue> = {
+        let mut stmt = match conn.prepare(
+            "SELECT repo_name, number, title FROM issues WHERE state = 'open' \
+             ORDER BY repo_name, number",
+        ) {
+            Ok(s) => s,
+            Err(_) => return BoardData { local_machine, assignments, machines, merge_queue, proposals, ..BoardData::default() },
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok(OpenIssue {
+                repo_name: row.get::<_, String>(0)?,
+                number: row.get::<_, i64>(1)? as u64,
+                title: row.get::<_, String>(2)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return BoardData { local_machine, assignments, machines, merge_queue, proposals, ..BoardData::default() },
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
     // ── Query board_meta for pipeline config ───────────────────────────────
     let (pipeline_default_gates, pipeline_tracked_labels, pipeline_repos) =
         load_pipeline_meta(&conn);
@@ -915,6 +948,7 @@ fn load_data() -> BoardData {
     BoardData {
         local_machine,
         assignments,
+        open_issues,
         machines,
         merge_queue,
         proposals,
@@ -1222,6 +1256,9 @@ pub struct CoordApp {
     last_notify: Instant,
     /// Scroll offset for the bottom (command output) panel.
     command_scroll: usize,
+    // ── Issue sync state ─────────────────────────────────────────────────
+    /// Last time `coord sync --quiet` was spawned (to rate-limit kicks).
+    issue_sync_last: Option<Instant>,
     // ── Board search / status-group state ───────────────────────────────
     /// Current value in the board filter input.
     board_search: String,
@@ -1309,6 +1346,7 @@ impl CoordApp {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            issue_sync_last: None,
             board_search: String::new(),
             board_search_cursor: 0,
             board_search_focused: false,
@@ -1326,6 +1364,8 @@ impl CoordApp {
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
+        // Sync issues from GitHub on startup so the board backlog is fresh.
+        app.kick_issue_sync();
         app
     }
 
@@ -1375,6 +1415,23 @@ impl CoordApp {
         }
     }
 
+    /// Spawn `coord sync --quiet` in the background if not already running
+    /// and the last sync was more than 5 minutes ago (or never run).
+    fn kick_issue_sync(&mut self) {
+        const SYNC_INTERVAL: Duration = Duration::from_secs(300);
+        if let Some(last) = self.issue_sync_last {
+            if last.elapsed() < SYNC_INTERVAL {
+                return;
+            }
+        }
+        if self.command_runner.is_running() {
+            return;
+        }
+        if self.command_runner.spawn(&["sync", "--quiet"]) {
+            self.issue_sync_last = Some(Instant::now());
+        }
+    }
+
     /// Drain any completed background data load, applying results to
     /// `self.data`.  Returns `true` if data was updated (caller should
     /// trigger a redraw).
@@ -1414,7 +1471,7 @@ impl CoordApp {
     fn issues_by_repo(&self) -> Vec<(String, Vec<IssueGroup>)> {
         use std::collections::{BTreeMap, HashMap};
 
-        // Collect unique repos from machines + assignments.
+        // Collect unique repos from machines, assignments, and open issues.
         let mut all_repos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for m in &self.data.machines {
             for r in &m.repos {
@@ -1423,6 +1480,9 @@ impl CoordApp {
         }
         for a in &self.data.assignments {
             all_repos.insert(a.repo.clone());
+        }
+        for oi in &self.data.open_issues {
+            all_repos.insert(oi.repo_name.clone());
         }
 
         // Group assignments by (repo, issue_number).
@@ -1475,6 +1535,21 @@ impl CoordApp {
                     group.status_summary = "pending".to_string();
                 }
             }
+        }
+
+        // Inject open issues with no assignment as Pending entries.
+        for oi in &self.data.open_issues {
+            let entry = repo_issues
+                .entry(oi.repo_name.clone())
+                .or_default()
+                .entry(oi.number);
+            // Only insert if there's no existing assignment group for this issue.
+            entry.or_insert_with(|| IssueGroup {
+                issue_number: oi.number,
+                issue_title: oi.title.clone(),
+                assignments: Vec::new(),
+                status_summary: "pending".to_string(),
+            });
         }
 
         // Build result: each repo with its issues, sorted.
@@ -3854,6 +3929,7 @@ impl ShellApp for CoordApp {
 
                     Key::Char('r') => {
                         self.refresh();
+                        self.kick_issue_sync();
                         needs_redraw = true;
                     }
 
@@ -4040,6 +4116,7 @@ mod tests {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            issue_sync_last: None,
             board_search: String::new(),
             board_search_cursor: 0,
             board_search_focused: false,
