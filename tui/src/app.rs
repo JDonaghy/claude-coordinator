@@ -76,6 +76,21 @@ enum DetailTab {
     Activity,
 }
 
+/// Per-assignment context for the live watch overlay (Pipeline > Stages
+/// > Enter).  The overlay takes over the main panel, auto-refreshes the
+/// worker log every render, and accepts K/q/scroll keys.
+#[derive(Clone)]
+struct WatchState {
+    assignment_id: String,
+    machine: String,
+    repo: String,
+    issue_number: u64,
+    /// Scroll offset into the log lines.  `usize::MAX` is a sentinel
+    /// meaning "stick to the bottom"; any explicit user scroll replaces
+    /// this with a concrete row.
+    scroll: usize,
+}
+
 /// The tabs shown in the Pipeline view detail panel.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum PipelineDetailTab {
@@ -1356,8 +1371,10 @@ pub struct CoordApp {
     /// them after a few seconds without the user dismissing manually.
     toasts: Vec<(ToastItem, Instant, ToastSeverity)>,
     /// Monotonic counter for toast widget IDs (must be unique per toast).
-    #[allow(dead_code)] // read by push_toast (used by watch overlay)
     next_toast_id: u64,
+    /// Active watch overlay (live log + kill controls). `None` when no
+    /// assignment is being watched.
+    watch: Option<WatchState>,
     /// Which tab is active in the Pipeline detail pane.
     pipeline_detail_tab: PipelineDetailTab,
     /// Scroll offset for the issue body on the Issue tab.
@@ -1439,6 +1456,7 @@ impl CoordApp {
             pipeline_status: None,
             toasts: Vec::new(),
             next_toast_id: 0,
+            watch: None,
             pipeline_detail_tab: PipelineDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1557,6 +1575,122 @@ impl CoordApp {
             corner: ToastCorner::BottomRight,
             toasts: items,
         })
+    }
+
+    /// Open the watch overlay for the running assignment of the currently
+    /// selected Pipeline issue. Falls back to the most recent non-done
+    /// assignment when nothing is actively running; pushes a toast and
+    /// returns `false` when there's nothing to watch.
+    fn open_watch_for_selected_issue(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let local_repo = issue.coord_repo.as_deref();
+
+        let pick = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .find(|a| a.status == "running")
+            .or_else(|| {
+                self.data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.issue_number == issue.number)
+                    .filter(|a| match local_repo {
+                        Some(r) => a.repo == r,
+                        None => true,
+                    })
+                    .find(|a| a.status != "done")
+            });
+
+        match pick {
+            Some(a) => {
+                self.watch = Some(WatchState {
+                    assignment_id: a.id.clone(),
+                    machine: a.machine.clone(),
+                    repo: a.repo.clone(),
+                    issue_number: a.issue_number,
+                    scroll: usize::MAX,
+                });
+                true
+            }
+            None => {
+                self.pipeline_status = Some((
+                    format!("no assignment to watch for #{}", issue.number),
+                    Instant::now(),
+                ));
+                false
+            }
+        }
+    }
+
+    /// Close the watch overlay.
+    fn close_watch(&mut self) {
+        self.watch = None;
+    }
+
+    /// Stop the assignment being watched: dispatches `coord stop <id>`.
+    /// Pushes a toast on success or when another command is running.
+    fn kill_watched(&mut self) -> bool {
+        let Some(w) = self.watch.clone() else { return false; };
+        let spawned = self.command_runner.spawn(&["stop", &w.assignment_id]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("stop dispatched for #{}", w.issue_number),
+                Instant::now(),
+            ));
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
+    }
+
+    /// Build the body `ListView` for the watch overlay — the raw log lines
+    /// from the worker.  Title carries the repo/issue/machine context.
+    /// Footer hint is rendered separately by the caller.
+    fn watch_log_list(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+        let title = match &self.watch {
+            None => " WATCH ".to_string(),
+            Some(w) => {
+                items.extend(self.get_activity_log(&w.assignment_id, &w.machine));
+                format!(
+                    " WATCH — {} #{} → {} (K=kill  q=close) ",
+                    w.repo, w.issue_number, w.machine
+                )
+            }
+        };
+        // Stick-to-bottom default: position the viewport ~40 rows from the
+        // end so the latest log lines are visible (same heuristic as the
+        // Board view's Activity tab).  Any explicit scroll wins.
+        let scroll = self
+            .watch
+            .as_ref()
+            .map(|w| {
+                if w.scroll == usize::MAX {
+                    items.len().saturating_sub(40)
+                } else {
+                    w.scroll
+                }
+            })
+            .unwrap_or(0);
+        ListView {
+            id: WidgetId::new("watch-log"),
+            title: Some(StyledText::plain(&title)),
+            items,
+            selected_idx: 0,
+            scroll_offset: scroll,
+            has_focus: false,
+            bordered: true,
+        }
     }
 
     /// Spawn `coord sync --quiet` in the background if not already running
@@ -4276,7 +4410,11 @@ impl ShellApp for CoordApp {
                 backend.draw_list(m, &self.machine_detail_list());
             }
             SidebarView::Pipeline => {
-                if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
+                // Watch overlay takes over the entire main panel when active —
+                // tabs, pipeline view, meta line all hidden while watching.
+                if self.watch.is_some() {
+                    backend.draw_list(m, &self.watch_log_list());
+                } else if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
                     backend.draw_list(m, &self.pipeline_placeholder_list());
                 } else {
                     // Tab bar.
@@ -4427,6 +4565,34 @@ impl ShellApp for CoordApp {
                     {
                         self.board_search_focused = true;
                         self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+
+                    // ── Watch overlay: K kills, q/Esc closes ─────────────
+                    // These handlers MUST come before the general q/Esc
+                    // exit handler so an open watch absorbs them.
+                    Key::Char('K') if self.watch.is_some() => {
+                        self.kill_watched();
+                        needs_redraw = true;
+                    }
+                    Key::Char('q') | Key::Named(NamedKey::Escape)
+                        if self.watch.is_some() =>
+                    {
+                        self.close_watch();
+                        needs_redraw = true;
+                    }
+                    Key::Char('j') | Key::Named(NamedKey::Down) if self.watch.is_some() => {
+                        if let Some(w) = self.watch.as_mut() {
+                            let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
+                            w.scroll = current.saturating_add(1);
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up) if self.watch.is_some() => {
+                        if let Some(w) = self.watch.as_mut() {
+                            let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
+                            w.scroll = current.saturating_sub(1);
+                        }
                         needs_redraw = true;
                     }
 
@@ -4624,11 +4790,17 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── Enter — fire Go for whichever stage owns it ─────
+                    // ── Enter — Stages tab: open watch overlay for the
+                    //              issue's running assignment. Other
+                    //              tabs: fire Go on the active stage.
                     Key::Named(NamedKey::Enter)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        self.dispatch_pipeline_active_go();
+                        if self.pipeline_detail_tab == PipelineDetailTab::Stages {
+                            self.open_watch_for_selected_issue();
+                        } else {
+                            self.dispatch_pipeline_active_go();
+                        }
                         needs_redraw = true;
                     }
 
@@ -4921,6 +5093,7 @@ mod tests {
             pipeline_status: None,
             toasts: Vec::new(),
             next_toast_id: 0,
+            watch: None,
             pipeline_detail_tab: PipelineDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
