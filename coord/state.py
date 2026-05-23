@@ -656,3 +656,51 @@ def _infer_review_state(board: Board, conn: sqlite3.Connection) -> None:
             a.review_state = "done"
         else:
             a.review_state = "dispatched"
+
+
+def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
+    """Persist open issues for a repo into the local issues table.
+
+    Called by ``brain.gather_context`` after fetching from GitHub so the
+    TUI board can show the full backlog without making external calls.
+
+    ``issues`` is the list of dicts returned by ``github_ops.get_open_issues``:
+    each dict has at minimum ``number``, ``title``, ``body``, and ``labels``
+    (a list of label dicts with a ``name`` key).
+
+    All rows for this repo are first marked closed; then the supplied open
+    issues are upserted with ``state='open'``.  This means issues closed on
+    GitHub since the last sync will disappear from the Pending group on the
+    next ``coord plan``.
+    """
+    conn = get_connection()
+    now = time.time()
+    conn.execute(
+        "UPDATE issues SET state = 'closed' WHERE repo_name = ?",
+        (repo_name,),
+    )
+    for issue in issues:
+        labels = json.dumps(
+            [lbl["name"] for lbl in issue.get("labels", []) if isinstance(lbl, dict)]
+        )
+        conn.execute(
+            """
+            INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at)
+            VALUES (?, ?, ?, ?, 'open', ?, ?)
+            ON CONFLICT (repo_name, number) DO UPDATE SET
+                title     = excluded.title,
+                body      = excluded.body,
+                state     = 'open',
+                labels    = excluded.labels,
+                synced_at = excluded.synced_at
+            """,
+            (
+                repo_name,
+                issue["number"],
+                issue.get("title", ""),
+                issue.get("body", "") or "",
+                labels,
+                now,
+            ),
+        )
+    conn.commit()

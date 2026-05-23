@@ -229,9 +229,20 @@ struct PipelineIssue {
 }
 
 #[derive(Default)]
+/// An open issue from the local `issues` table (synced from GitHub on coord plan).
+#[derive(Clone)]
+struct OpenIssue {
+    repo_name: String,
+    number: u64,
+    title: String,
+}
+
+#[derive(Default)]
 struct BoardData {
     local_machine: String,
     assignments: Vec<Assignment>,
+    /// Open issues from the local SQLite `issues` table — the full backlog.
+    open_issues: Vec<OpenIssue>,
     machines: Vec<Machine>,
     merge_queue: Vec<MergeQueueEntry>,
     proposals: Vec<Proposal>,
@@ -908,6 +919,28 @@ fn load_data() -> BoardData {
         rows.filter_map(|r| r.ok()).collect()
     };
 
+    // ── Query open issues (synced from GitHub on coord plan) ──────────────
+    let open_issues: Vec<OpenIssue> = {
+        let mut stmt = match conn.prepare(
+            "SELECT repo_name, number, title FROM issues WHERE state = 'open' \
+             ORDER BY repo_name, number",
+        ) {
+            Ok(s) => s,
+            Err(_) => return BoardData { local_machine, assignments, machines, merge_queue, proposals, ..BoardData::default() },
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok(OpenIssue {
+                repo_name: row.get::<_, String>(0)?,
+                number: row.get::<_, i64>(1)? as u64,
+                title: row.get::<_, String>(2)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return BoardData { local_machine, assignments, machines, merge_queue, proposals, ..BoardData::default() },
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
     // ── Query board_meta for pipeline config ───────────────────────────────
     let (pipeline_default_gates, pipeline_tracked_labels, pipeline_repos) =
         load_pipeline_meta(&conn);
@@ -915,6 +948,7 @@ fn load_data() -> BoardData {
     BoardData {
         local_machine,
         assignments,
+        open_issues,
         machines,
         merge_queue,
         proposals,
@@ -1414,7 +1448,7 @@ impl CoordApp {
     fn issues_by_repo(&self) -> Vec<(String, Vec<IssueGroup>)> {
         use std::collections::{BTreeMap, HashMap};
 
-        // Collect unique repos from machines + assignments.
+        // Collect unique repos from machines, assignments, and open issues.
         let mut all_repos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for m in &self.data.machines {
             for r in &m.repos {
@@ -1423,6 +1457,9 @@ impl CoordApp {
         }
         for a in &self.data.assignments {
             all_repos.insert(a.repo.clone());
+        }
+        for oi in &self.data.open_issues {
+            all_repos.insert(oi.repo_name.clone());
         }
 
         // Group assignments by (repo, issue_number).
@@ -1475,6 +1512,21 @@ impl CoordApp {
                     group.status_summary = "pending".to_string();
                 }
             }
+        }
+
+        // Inject open issues with no assignment as Pending entries.
+        for oi in &self.data.open_issues {
+            let entry = repo_issues
+                .entry(oi.repo_name.clone())
+                .or_default()
+                .entry(oi.number);
+            // Only insert if there's no existing assignment group for this issue.
+            entry.or_insert_with(|| IssueGroup {
+                issue_number: oi.number,
+                issue_title: oi.title.clone(),
+                assignments: Vec::new(),
+                status_summary: "pending".to_string(),
+            });
         }
 
         // Build result: each repo with its issues, sorted.

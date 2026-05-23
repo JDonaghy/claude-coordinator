@@ -71,10 +71,14 @@ Respond with ONLY the JSON array — no markdown fences, no commentary.\
 
 def gather_context(config: Config) -> dict:
     """Fetch open issues per repo and agent status per machine."""
+    from coord.state import upsert_open_issues
+
     issues_by_repo: dict[str, list[dict]] = {}
     for repo in config.repos:
         try:
-            issues_by_repo[repo.name] = github_ops.get_open_issues(repo.github)
+            issues = github_ops.get_open_issues(repo.github)
+            issues_by_repo[repo.name] = issues
+            upsert_open_issues(repo.name, issues)
         except RuntimeError:
             issues_by_repo[repo.name] = []
 
