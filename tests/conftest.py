@@ -40,21 +40,18 @@ def valid_config_path(tmp_path: Path, valid_config_yaml: str) -> Path:
     return p
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def coord_db():
-    """Provide an isolated in-memory SQLite database for each test.
+    """Isolated in-memory SQLite database, active for every test automatically.
 
     Overrides the module-level singleton in coord.db so that all state
     functions (save_board, load_board, record_dispatched, etc.) operate on a
     fresh :memory: database rather than the real ``~/.coord/coord.db``.
 
-    Usage::
-
-        def test_something(coord_db):
-            from coord.state import save_board, load_board
-            from coord.models import Board
-            save_board(Board(round_number=7))
-            assert load_board().round_number == 7
+    autouse=True means no test needs to request this fixture explicitly —
+    every test gets a clean DB and can never leak rows into the real database.
+    Tests that need the connection object (e.g. to inspect raw rows) can still
+    declare ``coord_db`` in their parameter list to receive it.
     """
     from coord import db
     from coord.db import _ensure_schema
