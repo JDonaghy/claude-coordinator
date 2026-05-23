@@ -22,8 +22,27 @@ from coord.events import stream_assignment_log
 
 
 def _installed_version() -> str | None:
-    """Return the currently-installed claude-coordinator version, or None
-    if pip can't tell us (e.g. metadata corrupted, pip missing)."""
+    """Return the currently-installed claude-coordinator version.
+
+    Reads ``__version__`` directly from ``coord/__init__.py`` on disk so
+    a bumped version in source is picked up immediately — important for
+    editable installs where ``importlib.metadata`` reads from a
+    ``.egg-info`` that's only regenerated on ``pip install -e .``.
+
+    Falls back to ``importlib.metadata`` only if the disk read fails.
+    """
+    try:
+        import coord  # noqa: PLC0415
+        if coord.__file__:
+            from pathlib import Path  # noqa: PLC0415
+            text = Path(coord.__file__).read_text()
+            for line in text.splitlines():
+                if line.startswith("__version__"):
+                    # parse: __version__ = "0.4.1"
+                    raw = line.split("=", 1)[1].strip()
+                    return raw.strip('"').strip("'")
+    except Exception:
+        pass
     try:
         from importlib.metadata import version as _metaver  # noqa: PLC0415
         return _metaver("claude-coordinator")
