@@ -180,6 +180,31 @@ class PipelineConfig:
     auto_loop: bool = True
     max_review_iterations: int = 3
 
+    def tracked_labels(self) -> list[str]:
+        """Return the GitHub issue labels considered part of the pipeline.
+
+        Always includes ``'coord'`` so normal coordinator-tagged issues appear
+        in the pipeline panel regardless of per-label gate configuration.
+        Additional labels come from the ``labels`` dict keys, sorted for
+        stable ordering.
+        """
+        if not self.labels:
+            return ["coord"]
+        keys = sorted(self.labels.keys())
+        if "coord" not in keys:
+            keys = ["coord"] + keys
+        return keys
+
+    def gates_for_label(self, label: str | None) -> list[str]:
+        """Return the gate list for a specific label, falling back to defaults.
+
+        ``label`` may be ``None`` (no matching tracked label found on the
+        issue) — in that case the configured ``default_gates`` are returned.
+        """
+        if label and label in self.labels:
+            return list(self.labels[label])
+        return list(self.default_gates)
+
 
 @dataclass
 class Config:
