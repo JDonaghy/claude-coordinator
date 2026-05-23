@@ -72,6 +72,15 @@ def _save_config_snapshot(config: Config) -> None:
             "('pipeline_repos', ?)",
             (json.dumps({r.name: r.github for r in config.repos}),),
         )
+        # Whether the pipeline includes a Plan gate before Work. Sourced
+        # from dispatch.require_plan — when true, the TUI prepends a Plan
+        # stage and Work [Go] becomes "approve plan" rather than fresh
+        # dispatch.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_require_plan', ?)",
+            ("1" if config.dispatch.require_plan else "0",),
+        )
         conn.commit()
     except Exception:  # noqa: BLE001 — non-critical, don't abort CLI
         if conn is not None:

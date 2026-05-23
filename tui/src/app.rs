@@ -267,6 +267,11 @@ struct BoardData {
     /// Coord-local repo name → GitHub `owner/repo` slug (and inverse).
     /// Empty when no config snapshot has been written yet.
     pipeline_repos: Vec<(String, String)>,
+    /// Mirror of `dispatch.require_plan` from coordinator.yml.  When true,
+    /// the pipeline prepends a Plan stage before Work, and Work [Go]
+    /// becomes "approve the plan and dispatch work" rather than fresh
+    /// dispatch.  Defaults to `false`.
+    pipeline_require_plan: bool,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -592,7 +597,7 @@ fn load_activity_log(id: &str) -> Vec<ListItem> {
 /// Pipeline panel.  Stages outside this list still render — they just
 /// don't show a button (they're driven implicitly by the coordinator).
 fn is_dispatchable_stage(name: &str) -> bool {
-    matches!(name, "work" | "review" | "merge")
+    matches!(name, "plan" | "work" | "review" | "merge")
 }
 
 /// Build a `ListItem` for one pipeline stage (plan/work/review/smoke).
@@ -961,8 +966,12 @@ fn load_data() -> BoardData {
     };
 
     // ── Query board_meta for pipeline config ───────────────────────────────
-    let (pipeline_default_gates, pipeline_tracked_labels, pipeline_repos) =
-        load_pipeline_meta(&conn);
+    let (
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_require_plan,
+    ) = load_pipeline_meta(&conn);
 
     BoardData {
         local_machine,
@@ -974,6 +983,7 @@ fn load_data() -> BoardData {
         pipeline_default_gates,
         pipeline_tracked_labels,
         pipeline_repos,
+        pipeline_require_plan,
     }
 }
 
@@ -1200,14 +1210,15 @@ fn fetch_pipeline_issues(
 
 /// Read pipeline-related entries from the `board_meta` table.
 ///
-/// Returns ``(default_gates, tracked_labels, repos)`` with the documented
-/// fallbacks when the keys are missing or unparseable: gates default to
-/// ``["review", "merge"]``, tracked labels to ``["coord"]``, and repos to
-/// an empty list.  Repos are returned as ``(coord_name, github_slug)``
-/// pairs preserving insertion order.
+/// Returns ``(default_gates, tracked_labels, repos, require_plan)`` with
+/// the documented fallbacks when the keys are missing or unparseable:
+/// gates default to ``["review", "merge"]``, tracked labels to
+/// ``["coord"]``, repos to an empty list, and require_plan to ``false``.
+/// Repos are returned as ``(coord_name, github_slug)`` pairs preserving
+/// insertion order.
 fn load_pipeline_meta(
     conn: &Connection,
-) -> (Vec<String>, Vec<String>, Vec<(String, String)>) {
+) -> (Vec<String>, Vec<String>, Vec<(String, String)>, bool) {
     fn read_key(conn: &Connection, key: &str) -> Option<String> {
         conn.query_row(
             "SELECT value FROM board_meta WHERE key = ?1",
@@ -1237,7 +1248,11 @@ fn load_pipeline_meta(
         })
         .unwrap_or_default();
 
-    (default_gates, tracked_labels, repos)
+    let require_plan: bool = read_key(conn, "pipeline_require_plan")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    (default_gates, tracked_labels, repos, require_plan)
 }
 
 // ─── CoordApp ─────────────────────────────────────────────────────────────────
@@ -2628,13 +2643,18 @@ impl CoordApp {
 
     // ── Pipeline panel ────────────────────────────────────────────────────
 
-    /// Effective list of stages: always "work" followed by the configured
-    /// `pipeline.default_gates` (deduplicated to handle accidental "work"
-    /// entries in the gate list).
+    /// Effective list of stages: a Plan stage (when `pipeline_require_plan`
+    /// is set), then "work", then the configured `pipeline.default_gates`
+    /// (deduplicated to handle accidental "work" / "plan" entries in the
+    /// gate list).
     fn pipeline_stage_names(&self) -> Vec<String> {
-        let mut stages: Vec<String> = vec!["work".to_string()];
+        let mut stages: Vec<String> = Vec::with_capacity(4);
+        if self.data.pipeline_require_plan {
+            stages.push("plan".to_string());
+        }
+        stages.push("work".to_string());
         for g in &self.data.pipeline_default_gates {
-            if g != "work" {
+            if g != "work" && g != "plan" {
                 stages.push(g.clone());
             }
         }
@@ -2819,7 +2839,11 @@ impl CoordApp {
 
         let stage_match = |a: &&Assignment| -> bool {
             let t = a.assignment_type.as_deref().unwrap_or("work");
-            if stage == "work" {
+            // Each stage matches only its own assignment type. When the
+            // pipeline has no Plan gate (the common case), plan-typed
+            // assignments don't appear at all — but if one was produced
+            // ad-hoc, count it as Work so the stage advances normally.
+            if stage == "work" && !self.data.pipeline_require_plan {
                 t == "work" || t == "plan"
             } else {
                 t == stage
@@ -2966,6 +2990,13 @@ impl CoordApp {
         let Some(issue) = self.pipeline_issues.get(sel).cloned() else { return false; };
         let is_retry = self.stage_status_for(&issue, &stage_name) == StageStatus::Failed;
         match stage_name.as_str() {
+            "plan" => {
+                if is_retry {
+                    self.retry_pipeline_assignment(&issue, "plan")
+                } else {
+                    self.dispatch_pipeline_plan()
+                }
+            }
             "work" => {
                 if is_retry {
                     self.retry_pipeline_assignment(&issue, "work")
@@ -3063,7 +3094,12 @@ impl CoordApp {
         spawned
     }
 
-    /// Dispatch the Work stage: `coord assign <machine> <repo> <issue>`.
+    /// Dispatch the Work stage.
+    ///
+    /// If a completed Plan assignment exists for this issue, runs
+    /// `coord approve-plan <plan_id>` — which uses the plan output as the
+    /// briefing for the new work assignment.  Otherwise falls back to a
+    /// fresh `coord assign <machine> <repo> <issue>`.
     fn dispatch_pipeline_work(&mut self) -> bool {
         let Some(idx) = self.pipeline_sel else { return false; };
         let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
@@ -3077,6 +3113,30 @@ impl CoordApp {
             ));
             return false;
         };
+
+        // If a done plan exists for this issue, approve it — that path
+        // dispatches the work assignment with the plan output baked into
+        // the briefing.
+        if let Some(plan_id) = self.find_done_plan_assignment_id(&issue, &coord_repo) {
+            let spawned = self.command_runner.spawn(&["approve-plan", &plan_id]);
+            if spawned {
+                self.pipeline_status = Some((
+                    format!(
+                        "approving plan {} → dispatching work for #{}",
+                        &plan_id[..plan_id.len().min(8)],
+                        issue.number
+                    ),
+                    Instant::now(),
+                ));
+            } else {
+                self.pipeline_status = Some((
+                    "another command is running — try again in a moment".to_string(),
+                    Instant::now(),
+                ));
+            }
+            return spawned;
+        }
+
         let Some(machine) = self.best_machine_for(&coord_repo) else {
             self.pipeline_status = Some((
                 format!(
@@ -3107,6 +3167,70 @@ impl CoordApp {
             ));
         }
         spawned
+    }
+
+    /// Dispatch the Plan stage: `coord assign --plan-only <machine> <repo> <issue>`.
+    fn dispatch_pipeline_plan(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let Some(coord_repo) = issue.coord_repo.clone() else {
+            self.pipeline_status = Some((
+                format!(
+                    "no local repo mapping for {} — add it to coordinator.yml",
+                    issue.repo_slug
+                ),
+                Instant::now(),
+            ));
+            return false;
+        };
+        let Some(machine) = self.best_machine_for(&coord_repo) else {
+            self.pipeline_status = Some((
+                format!(
+                    "no reachable machine for {} — queued (issue #{})",
+                    coord_repo, issue.number
+                ),
+                Instant::now(),
+            ));
+            return false;
+        };
+        let machine_name = machine.name.clone();
+        let issue_str = issue.number.to_string();
+        let spawned = self.command_runner.spawn(&[
+            "assign",
+            "--plan-only",
+            &machine_name,
+            &coord_repo,
+            &issue_str,
+        ]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("plan dispatched for #{} → {}", issue.number, machine_name),
+                Instant::now(),
+            ));
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
+    }
+
+    /// Find the most recent done plan-typed assignment for this issue.
+    /// Used by Work [Go] to decide between `approve-plan` and a fresh
+    /// `coord assign`.
+    fn find_done_plan_assignment_id(
+        &self,
+        issue: &PipelineIssue,
+        coord_repo: &str,
+    ) -> Option<String> {
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number && a.repo == coord_repo)
+            .filter(|a| a.assignment_type.as_deref() == Some("plan"))
+            .find(|a| a.status == "done")
+            .map(|a| a.id.clone())
     }
 
     /// Dispatch the Review stage: `coord notify`.
@@ -5542,13 +5666,132 @@ mod tests {
         }
     }
 
-    /// is_dispatchable_stage covers the three stages the panel can fire.
+    /// Plan stage is prepended when pipeline_require_plan is true.
+    #[test]
+    fn pipeline_stage_names_prepends_plan_when_required() {
+        let mut app = make_pipeline_app();
+        app.data.pipeline_require_plan = true;
+        assert_eq!(
+            app.pipeline_stage_names(),
+            vec![
+                "plan".to_string(),
+                "work".to_string(),
+                "review".to_string(),
+                "merge".to_string(),
+            ]
+        );
+    }
+
+    /// Plan stage is omitted when pipeline_require_plan is false (default).
+    #[test]
+    fn pipeline_stage_names_omits_plan_when_not_required() {
+        let app = make_pipeline_app();
+        // Default is false — already covered by pipeline_stage_names_prepends_work,
+        // but re-assert explicitly for documentation.
+        assert!(!app.data.pipeline_require_plan);
+        assert_eq!(
+            app.pipeline_stage_names(),
+            vec!["work".to_string(), "review".to_string(), "merge".to_string()]
+        );
+    }
+
+    /// With pipeline_require_plan on, Plan is Pending → [Go] on Plan, no Go on Work.
+    #[test]
+    fn build_pipeline_widget_go_on_plan_when_required() {
+        let mut app = make_pipeline_app();
+        app.data.pipeline_require_plan = true;
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[0].label, "Plan");
+        assert_eq!(view.stages[0].action.as_deref(), Some("Go"));
+        // Work and later stages are gated behind a Done Plan.
+        for stage in &view.stages[1..] {
+            assert!(stage.action.is_none());
+        }
+    }
+
+    /// With pipeline_require_plan on, a Done plan assignment must NOT make
+    /// the Work stage Done — they're now distinct stage types.
+    #[test]
+    fn stage_status_for_plan_done_does_not_advance_work_when_plan_gate_on() {
+        let mut app = make_pipeline_app();
+        app.data.pipeline_require_plan = true;
+        app.data.assignments.push(Assignment {
+            id: "p1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("plan".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Pending);
+        // Now Work stage owns the [Go] button.
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[0].status, StageStatus::Done);
+        assert!(view.stages[0].action.is_none());
+        assert_eq!(view.stages[1].label, "Work");
+        assert_eq!(view.stages[1].action.as_deref(), Some("Go"));
+    }
+
+    /// find_done_plan_assignment_id returns the plan assignment when present.
+    #[test]
+    fn find_done_plan_assignment_id_returns_done_plan() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "p-done".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("plan".to_string()),
+        });
+        let issue = &app.pipeline_issues[0].clone();
+        let id = app.find_done_plan_assignment_id(issue, "api");
+        assert_eq!(id, Some("p-done".to_string()));
+    }
+
+    /// find_done_plan_assignment_id returns None for running or absent plans.
+    #[test]
+    fn find_done_plan_assignment_id_skips_non_done() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "p-running".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "running".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: Some("plan".to_string()),
+        });
+        let issue = &app.pipeline_issues[0].clone();
+        assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
+    }
+
+    /// is_dispatchable_stage covers the four stages the panel can fire.
     #[test]
     fn is_dispatchable_stage_recognises_known_stages() {
+        assert!(is_dispatchable_stage("plan"));
         assert!(is_dispatchable_stage("work"));
         assert!(is_dispatchable_stage("review"));
         assert!(is_dispatchable_stage("merge"));
-        assert!(!is_dispatchable_stage("plan"));
         assert!(!is_dispatchable_stage("smoke"));
         assert!(!is_dispatchable_stage(""));
     }
@@ -5628,10 +5871,11 @@ mod tests {
             "CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);",
         )
         .unwrap();
-        let (gates, labels, repos) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan) = load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["review".to_string(), "merge".to_string()]);
         assert_eq!(labels, vec!["coord".to_string()]);
         assert!(repos.is_empty());
+        assert!(!require_plan);
     }
 
     #[test]
@@ -5642,13 +5886,15 @@ mod tests {
              INSERT INTO board_meta VALUES \
               ('pipeline_default_gates', '[\"plan\",\"work\",\"smoke\"]'), \
               ('pipeline_tracked_labels', '[\"hotfix\",\"feature\"]'), \
-              ('pipeline_repos', '{\"api\":\"acme/api\"}');",
+              ('pipeline_repos', '{\"api\":\"acme/api\"}'), \
+              ('pipeline_require_plan', '1');",
         )
         .unwrap();
-        let (gates, labels, repos) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan) = load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["plan", "work", "smoke"]);
         assert_eq!(labels, vec!["hotfix", "feature"]);
         assert_eq!(repos, vec![("api".to_string(), "acme/api".to_string())]);
+        assert!(require_plan);
     }
 
 }

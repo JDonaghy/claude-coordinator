@@ -674,6 +674,36 @@ class TestSaveConfigSnapshot:
         assert len(rows) == 1
         assert rows[0]["name"] == "new"
 
+    def test_writes_pipeline_require_plan_from_dispatch_flag(self, coord_db) -> None:
+        """pipeline_require_plan in board_meta reflects dispatch.require_plan."""
+        from coord.cli import _save_config_snapshot
+        from coord.config import Config, DispatchConfig
+        from coord.models import Machine, Repo
+
+        cfg_on = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="m1", host="m1.tailnet", repos=["api"])],
+            dispatch=DispatchConfig(require_plan=True),
+        )
+        _save_config_snapshot(cfg_on)
+        row = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key = 'pipeline_require_plan'"
+        ).fetchone()
+        assert row is not None
+        assert row["value"] == "1"
+
+        cfg_off = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="m1", host="m1.tailnet", repos=["api"])],
+            dispatch=DispatchConfig(require_plan=False),
+        )
+        _save_config_snapshot(cfg_off)
+        row = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key = 'pipeline_require_plan'"
+        ).fetchone()
+        assert row is not None
+        assert row["value"] == "0"
+
 
 # ── upsert_open_issues ──────────────────────────────────────────────────────
 
