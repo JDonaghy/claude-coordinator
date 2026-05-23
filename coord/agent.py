@@ -24,6 +24,12 @@ from typing import Callable, Iterable
 DEFAULT_STATE_DIR = Path.home() / ".coord"
 DEFAULT_WORKER_BINARY = "claude"
 
+# Stamp captured at module import so `health()` can report when THIS
+# process started. exec_restart() replaces the image, so the new
+# process re-imports this module and the stamp updates — letting the
+# CLI detect a real restart vs the old agent still answering.
+_PROCESS_STARTED_AT: float = time.time()
+
 # Statuses
 PENDING = "pending"
 RUNNING = "running"
@@ -279,6 +285,11 @@ class AgentServer:
             "repos": self.repos,
             "active": active,
             "completed": completed,
+            # Monotonic-ish stamp of when THIS Python process started.
+            # exec_restart replaces the image so this changes across an
+            # /update — letting the CLI distinguish "old agent still
+            # responding" from "new agent has come back online".
+            "agent_started_at": _PROCESS_STARTED_AT,
         }
 
     def list_assignments(self) -> dict:

@@ -695,6 +695,11 @@ def agent_update(
         click.echo("No machines to update.", err=True)
         sys.exit(2)
 
+    # Capture each agent's start time BEFORE we trigger /update so the
+    # wait loop can distinguish "old agent still answering during pip"
+    # from "new agent came back up".
+    pre_started_at = _fetch_pre_started_at(targets)
+
     for machine in targets:
         url = f"http://{machine.host}:{AGENT_PORT}/update"
         click.echo(f"  {machine.name}: POST {url} ...", nl=False)
@@ -710,7 +715,9 @@ def agent_update(
 
     if targets:
         click.echo(f"\nWaiting up to {timeout}s for agent(s) to come back online...")
-        results = _wait_agents_online(targets, timeout=timeout)
+        results = _wait_agents_online(
+            targets, timeout=timeout, pre_started_at=pre_started_at
+        )
         for name, came_back in results.items():
             tag = "✓ online" if came_back else "✗ did not come back"
             click.echo(f"  {name}: {tag}")
@@ -861,15 +868,24 @@ def _wait_agents_online(
     *,
     timeout: float = 120.0,
     poll_interval: float = 2.0,
+    pre_started_at: dict[str, float | None] | None = None,
 ) -> dict[str, bool]:
     """Poll /health on each machine until all are online or timeout expires.
 
-    Returns ``{machine_name: came_back_online}`` for every machine in
-    *machines*.  Machines that were already online before the process started
-    count as not-yet-back until we see them respond after the restart.
+    When ``pre_started_at`` is provided, a machine is only considered
+    "back" once its reported ``agent_started_at`` differs from the
+    pre-update value (or appears for the first time on an agent that
+    didn't expose it before).  This stops the CLI from racing the old
+    agent while a pip upgrade is still running inside it.
+
+    For agents that don't expose ``agent_started_at`` at all (pre-v0.4.3),
+    we fall back to "responding to /health is enough."
+
+    Returns ``{machine_name: came_back_online}`` for every machine.
     """
     deadline = time.time() + timeout
     online: set[str] = set()
+    pre = pre_started_at or {}
 
     while time.time() < deadline:
         for machine in machines:
@@ -880,7 +896,25 @@ def _wait_agents_online(
                     f"http://{machine.host}:{AGENT_PORT}/health",
                     timeout=3.0,
                 )
-                if resp.status_code == 200:
+                if resp.status_code != 200:
+                    continue
+                if machine.name in pre:
+                    pre_val = pre[machine.name]
+                    try:
+                        cur = resp.json().get("agent_started_at")
+                    except Exception:
+                        cur = None
+                    if cur is None:
+                        # Old agent (no started_at) — fall back to "alive
+                        # is good enough" so /update on a pre-v0.4.3
+                        # agent isn't blocked forever.
+                        online.add(machine.name)
+                    elif pre_val is None or cur != pre_val:
+                        # Either the agent didn't expose started_at
+                        # before (just upgraded TO v0.4.3) or the value
+                        # changed (restart happened).
+                        online.add(machine.name)
+                else:
                     online.add(machine.name)
             except Exception:
                 pass
@@ -890,6 +924,25 @@ def _wait_agents_online(
         time.sleep(poll_interval)
 
     return {m.name: m.name in online for m in machines}
+
+
+def _fetch_pre_started_at(machines: list) -> dict[str, float | None]:
+    """Capture each agent's `agent_started_at` BEFORE we trigger /update.
+
+    Returns ``{name: started_at_or_None}`` — None when the agent is
+    unreachable or doesn't expose the field yet.
+    """
+    out: dict[str, float | None] = {}
+    for m in machines:
+        try:
+            resp = httpx.get(f"http://{m.host}:{AGENT_PORT}/health", timeout=3.0)
+            if resp.status_code == 200:
+                out[m.name] = resp.json().get("agent_started_at")
+            else:
+                out[m.name] = None
+        except Exception:
+            out[m.name] = None
+    return out
 
 
 def _resolve_machine(cfg: Config, explicit_name: str | None):
