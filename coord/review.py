@@ -48,11 +48,19 @@ class ReviewFindings:
 
 # Matches the structured block the reviewer is instructed to emit at end of session.
 # Allows optional leading/trailing whitespace and tolerates both LF and CRLF.
+# Accepts canonical verdicts (approve / request-changes) and short aliases
+# (PASS → approve, FAIL → request-changes) for workers that use the shorter form.
 _REVIEW_BLOCK_RE = re.compile(
-    r"REVIEW_VERDICT:\s*(approve|request-changes)\s*[\r\n]+"
+    r"REVIEW_VERDICT:\s*(approve|request-changes|pass|fail)\s*[\r\n]+"
     r"REVIEW_BODY:\s*[\r\n]+(.*?)[\r\n]*END_REVIEW",
     re.DOTALL | re.IGNORECASE,
 )
+
+# Map short-form aliases to the canonical verdicts understood by post_pr_review.
+_VERDICT_ALIASES: dict[str, str] = {
+    "pass": "approve",
+    "fail": "request-changes",
+}
 
 
 def _parse_review_text(text: str) -> ReviewFindings | None:
@@ -61,7 +69,9 @@ def _parse_review_text(text: str) -> ReviewFindings | None:
     if not matches:
         return None
     m = matches[-1]
-    verdict = m.group(1).lower().strip()
+    verdict_raw = m.group(1).lower().strip()
+    # Normalize aliases: PASS → approve, FAIL → request-changes.
+    verdict = _VERDICT_ALIASES.get(verdict_raw, verdict_raw)
     body = m.group(2).strip()
     if verdict not in ("approve", "request-changes"):
         return None

@@ -183,14 +183,17 @@ class PipelineConfig:
     def tracked_labels(self) -> list[str]:
         """Return the GitHub issue labels considered part of the pipeline.
 
-        Defaults to ``['coord']`` when no per-label gate overrides are
-        configured.  When ``labels`` is non-empty, returns its keys in a
-        deterministic (alphabetical) order so that callers — including the
-        TUI pipeline panel — can rely on a stable ordering.
+        Always includes ``'coord'`` so normal coordinator-tagged issues appear
+        in the pipeline panel regardless of per-label gate configuration.
+        Additional labels come from the ``labels`` dict keys, sorted for
+        stable ordering.
         """
         if not self.labels:
             return ["coord"]
-        return sorted(self.labels.keys())
+        keys = sorted(self.labels.keys())
+        if "coord" not in keys:
+            keys = ["coord"] + keys
+        return keys
 
     def gates_for_label(self, label: str | None) -> list[str]:
         """Return the gate list for a specific label, falling back to defaults.

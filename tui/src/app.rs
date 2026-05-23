@@ -147,6 +147,8 @@ impl Assignment {
 #[derive(Clone)]
 struct Machine {
     name: String,
+    /// Tailscale FQDN (the `host` column in the machines table).
+    host: String,
     reachable: bool,
     active_count: usize,
     repos: Vec<String>,
@@ -479,32 +481,11 @@ fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
     }
 }
 
-/// Read `~/.coord/logs/<id>.log` and return displayable `ListItem`s.
+/// Parse log content (NDJSON stream-json or plain text) into displayable `ListItem`s.
 ///
 /// Handles both stream-json logs (NDJSON from `claude -p --output-format
-/// stream-json`) and plain-text logs (stdout of older workers). If the log
-/// file doesn't exist locally, returns a single "remote assignment" notice.
-fn load_activity_log(id: &str) -> Vec<ListItem> {
-    let path = coord_dir().join("logs").join(format!("{}.log", id));
-
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return vec![kv_item(
-                "",
-                "  Log not available (remote assignment)",
-                Some(Color::rgb(100, 100, 100)),
-            )];
-        }
-        Err(e) => {
-            return vec![kv_item(
-                "",
-                &format!("  Error reading log: {}", e),
-                Some(Color::rgb(220, 70, 70)),
-            )];
-        }
-    };
-
+/// stream-json`) and plain-text logs (stdout of older workers).
+fn parse_log_content(content: &str) -> Vec<ListItem> {
     // Detect format: stream-json if the first non-comment non-blank line
     // starts with `{`.
     let is_json = content
@@ -550,6 +531,35 @@ fn load_activity_log(id: &str) -> Vec<ListItem> {
     }
 
     items
+}
+
+/// Read `~/.coord/logs/<id>.log` and return displayable `ListItem`s.
+///
+/// If the log file doesn't exist locally, returns a single "remote assignment"
+/// notice. Callers that know the machine name should use
+/// [`CoordApp::get_activity_log`] instead, which fetches from the remote agent.
+fn load_activity_log(id: &str) -> Vec<ListItem> {
+    let path = coord_dir().join("logs").join(format!("{}.log", id));
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return vec![kv_item(
+                "",
+                "  Log not available (remote assignment)",
+                Some(Color::rgb(100, 100, 100)),
+            )];
+        }
+        Err(e) => {
+            return vec![kv_item(
+                "",
+                &format!("  Error reading log: {}", e),
+                Some(Color::rgb(220, 70, 70)),
+            )];
+        }
+    };
+
+    parse_log_content(&content)
 }
 
 // ─── Pipeline stage rendering ─────────────────────────────────────────────────
@@ -770,7 +780,7 @@ fn load_data() -> BoardData {
     // ── Machine reachability probes ────────────────────────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
     // Spawn all probes concurrently; collect within a 250 ms budget.
-    let probes: Vec<(String, Vec<String>, std::sync::mpsc::Receiver<bool>)> = machine_rows
+    let probes: Vec<(String, String, Vec<String>, std::sync::mpsc::Receiver<bool>)> = machine_rows
         .iter()
         .map(|(name, host, repos)| {
             use std::sync::mpsc;
@@ -779,13 +789,13 @@ fn load_data() -> BoardData {
             std::thread::spawn(move || {
                 let _ = tx.send(tcp_probe(&h, 7433));
             });
-            (name.clone(), repos.clone(), rx)
+            (name.clone(), host.clone(), repos.clone(), rx)
         })
         .collect();
 
     let machines: Vec<Machine> = probes
         .into_iter()
-        .map(|(name, repos, rx)| {
+        .map(|(name, host, repos, rx)| {
             let reachable = rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false);
             let active_count = assignments
                 .iter()
@@ -793,6 +803,7 @@ fn load_data() -> BoardData {
                 .count();
             Machine {
                 name,
+                host,
                 reachable,
                 active_count,
                 repos,
@@ -912,6 +923,39 @@ fn load_data() -> BoardData {
     }
 }
 
+/// Spawn a background thread that calls [`load_data`] and sends the result
+/// over a channel.  The caller polls the returned [`Receiver`] without
+/// blocking the UI thread.
+fn start_data_load() -> std::sync::mpsc::Receiver<BoardData> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(load_data());
+    });
+    rx
+}
+
+/// Spawn a background thread that fetches a remote agent log over HTTP.
+///
+/// Returns a `Receiver` that yields `Ok(raw_content)` or `Err(error_message)`.
+/// The caller must parse the content with [`parse_log_content`] on the main
+/// thread — keeping `ListItem` construction off the worker thread.
+fn spawn_log_fetch(host: &str, id: &str) -> std::sync::mpsc::Receiver<Result<String, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = format!("http://{}:7433/logs/{}", host, id);
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(5))
+            .build();
+        let result = match agent.get(&url).call() {
+            Ok(resp) => resp.into_string().map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
 /// Width of one arrow connector between stages, in TUI cells. Mirrors the
 /// constant used by quadraui's `tui_pipeline_view_layout` so host
 /// hit-testing matches the painted geometry.
@@ -984,7 +1028,13 @@ fn fetch_pipeline_issues(
     // We OR the labels with `label:A,B,C` syntax.
     let label_clause = labels
         .iter()
-        .map(|l| format!("label:{}", l))
+        .map(|l| {
+            if l.contains(' ') {
+                format!("label:\"{}\"", l)
+            } else {
+                format!("label:{}", l)
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ");
     let query = format!("{} state:open", label_clause);
@@ -1045,12 +1095,17 @@ fn fetch_pipeline_issues(
             .or_else(|| {
                 // `gh search issues` sometimes returns the repo as a string url-tail.
                 item.get("url").and_then(|u| u.as_str()).and_then(|u| {
-                    // https://github.com/owner/name/issues/123
-                    let parts: Vec<&str> = u.trim_start_matches("https://github.com/").splitn(4, '/').collect();
-                    if parts.len() >= 2 {
-                        Some(format!("{}/{}", parts[0], parts[1]))
-                    } else {
+                    // https://<host>/owner/name/issues/123 — strip scheme+host,
+                    // then take the first two path segments as owner/repo.
+                    let path = u.splitn(4, "//").nth(1).unwrap_or(u);
+                    let mut parts = path.splitn(4, '/');
+                    parts.next(); // skip host
+                    let owner = parts.next()?;
+                    let repo = parts.next()?;
+                    if owner.is_empty() || repo.is_empty() {
                         None
+                    } else {
+                        Some(format!("{}/{}", owner, repo))
                     }
                 })
             })
@@ -1180,6 +1235,23 @@ pub struct CoordApp {
     /// Status message shown when a dispatch is queued/skipped due to no
     /// available machine. Cleared after a short TTL.
     pipeline_status: Option<(String, Instant)>,
+    /// Cache of remotely-fetched log items, keyed by assignment ID.
+    ///
+    /// Each entry stores `(fetched_at, items)`. Entries older than 30 s are
+    /// re-fetched on the next render that needs them. `RefCell` is used so the
+    /// cache can be updated from `&self` methods (render path).
+    remote_log_cache: std::cell::RefCell<std::collections::HashMap<String, (Instant, Vec<ListItem>)>>,
+    /// Pending background board-data load.  `Some` while a load is in flight;
+    /// `None` when idle.  Polled non-blockingly on every [`handle`] call.
+    pending_data: Option<std::sync::mpsc::Receiver<BoardData>>,
+    /// Most-recent data-load error (message + timestamp), displayed in the
+    /// status bar for a short time.  Cleared when the next load succeeds.
+    fetch_error: Option<(String, Instant)>,
+    /// In-flight remote log fetches keyed by assignment ID.
+    ///
+    /// Each `Receiver` yields `Ok(raw_content)` or `Err(error_message)`.
+    /// `RefCell` allows mutation from `&self` render methods.
+    pending_log_fetches: std::cell::RefCell<std::collections::HashMap<String, std::sync::mpsc::Receiver<Result<String, String>>>>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -1197,9 +1269,12 @@ impl Default for CoordApp {
 }
 
 impl CoordApp {
-    /// Create a new app, loading initial board data from the SQLite DB.
+    /// Create a new app.
+    ///
+    /// Board data is fetched on a background thread so the UI renders
+    /// immediately.  The status bar shows "↻ loading…" until the first
+    /// load completes.
     pub fn new() -> Self {
-        let data = load_data();
         let mut sidebar = SidebarSystem::new(Vec::new());
         sidebar.set_navigation_mode(NavigationMode::Selection);
         sidebar.set_allow_collapse(true);
@@ -1207,7 +1282,7 @@ impl CoordApp {
         pipeline_sidebar.set_navigation_mode(NavigationMode::Selection);
         pipeline_sidebar.set_allow_collapse(true);
         let mut app = Self {
-            data,
+            data: BoardData::default(),
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
@@ -1215,6 +1290,7 @@ impl CoordApp {
             has_proposals_section: false,
             machine_sel: 0,
             machine_scroll: 0,
+            // Use a far-past instant so the "↻ Xs" counter starts at 0.
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
             detail_scroll: 0,
@@ -1229,6 +1305,10 @@ impl CoordApp {
             pipeline_loader: None,
             pipeline_last_load: None,
             pipeline_status: None,
+            remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_data: Some(start_data_load()),
+            fetch_error: None,
+            pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
@@ -1274,18 +1354,45 @@ impl CoordApp {
         config
     }
 
+    /// Kick off a background data load if one is not already in flight.
     fn refresh(&mut self) {
-        self.data = load_data();
-        self.refreshed_at = Instant::now();
-        let m = self.data.machines.len();
-        if m > 0 {
-            self.machine_sel = self.machine_sel.min(m - 1);
-        } else {
-            self.machine_sel = 0;
+        if self.pending_data.is_none() {
+            self.pending_data = Some(start_data_load());
         }
-        self.rebuild_board_sidebar();
-        // Re-derive pipeline stage badges from the fresh assignment data.
-        self.rebuild_pipeline_sidebar();
+    }
+
+    /// Drain any completed background data load, applying results to
+    /// `self.data`.  Returns `true` if data was updated (caller should
+    /// trigger a redraw).
+    fn apply_pending_data(&mut self) -> bool {
+        let rx = match &self.pending_data {
+            Some(rx) => rx,
+            None => return false,
+        };
+        match rx.try_recv() {
+            Ok(data) => {
+                self.data = data;
+                self.pending_data = None;
+                self.refreshed_at = Instant::now();
+                self.fetch_error = None;
+                let m = self.data.machines.len();
+                if m > 0 {
+                    self.machine_sel = self.machine_sel.min(m - 1);
+                } else {
+                    self.machine_sel = 0;
+                }
+                self.rebuild_board_sidebar();
+                self.rebuild_pipeline_sidebar();
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Worker thread panicked or dropped sender without sending.
+                self.pending_data = None;
+                self.fetch_error = Some(("data load failed".into(), Instant::now()));
+                true
+            }
+        }
     }
 
     /// Group assignments by `(repo, issue_number)`, returning repos in a
@@ -1977,6 +2084,88 @@ impl CoordApp {
         }
     }
 
+    /// Return log items for `id`, reading locally or fetching from the remote agent.
+    ///
+    /// This method **never blocks** the UI thread:
+    ///
+    /// 1. If a local log file exists, parse and return it immediately.
+    /// 2. Drain any completed background fetch from `pending_log_fetches`; on
+    ///    success update `remote_log_cache` and return the parsed items.
+    /// 3. Return cached items if the 30-second TTL has not expired.
+    /// 4. If a fetch is already in flight, return a "Loading log…" placeholder.
+    /// 5. Otherwise spawn a background fetch (via [`spawn_log_fetch`]) and
+    ///    return a "Loading log…" placeholder; the result will be picked up on
+    ///    the next render pass.
+    fn get_activity_log(&self, id: &str, machine_name: &str) -> Vec<ListItem> {
+        // 1. Local file takes priority — fast path, no network involved.
+        let path = coord_dir().join("logs").join(format!("{}.log", id));
+        if path.exists() {
+            return load_activity_log(id);
+        }
+
+        // 2. Drain any completed background fetch for this ID.
+        //    We borrow, call try_recv(), then drop the borrow before touching
+        //    `remote_log_cache` to avoid a double-borrow panic.
+        let pending_result = {
+            let pending = self.pending_log_fetches.borrow();
+            pending.get(id).map(|rx| rx.try_recv())
+        };
+        if let Some(recv_result) = pending_result {
+            match recv_result {
+                Ok(fetch_result) => {
+                    self.pending_log_fetches.borrow_mut().remove(id);
+                    let items = match fetch_result {
+                        Ok(content) => parse_log_content(&content),
+                        Err(e) => vec![kv_item(
+                            "",
+                            &format!("  Log unavailable: {}", e),
+                            Some(Color::rgb(100, 100, 100)),
+                        )],
+                    };
+                    self.remote_log_cache
+                        .borrow_mut()
+                        .insert(id.to_string(), (Instant::now(), items.clone()));
+                    return items;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Thread died without sending; remove so we retry below.
+                    self.pending_log_fetches.borrow_mut().remove(id);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {} // still in flight
+            }
+        }
+
+        // 3. Cache hit (within 30-second TTL).
+        {
+            let cache = self.remote_log_cache.borrow();
+            if let Some((fetched_at, items)) = cache.get(id) {
+                if fetched_at.elapsed() < Duration::from_secs(30) {
+                    return items.clone();
+                }
+            }
+        }
+
+        // 4. Fetch still in flight — return placeholder so the render doesn't block.
+        if self.pending_log_fetches.borrow().contains_key(id) {
+            return vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))];
+        }
+
+        // 5. Cache cold/stale and no fetch in flight. Look up host and spawn.
+        let host = match self.data.machines.iter().find(|m| m.name == machine_name) {
+            Some(m) if !m.host.is_empty() => m.host.clone(),
+            _ => {
+                return vec![kv_item(
+                    "",
+                    "  Log unavailable: machine host unknown",
+                    Some(Color::rgb(100, 100, 100)),
+                )];
+            }
+        };
+        let rx = spawn_log_fetch(&host, id);
+        self.pending_log_fetches.borrow_mut().insert(id.to_string(), rx);
+        vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))]
+    }
+
     /// Activity tab: live feed of worker events parsed from the log file.
     /// Shows the log for the most recent (or running) assignment in the group.
     fn activity_list(&self) -> ListView {
@@ -1995,7 +2184,7 @@ impl CoordApp {
                     .or_else(|| group.assignments.last());
                 match best {
                     Some(a) => {
-                        let log_items = load_activity_log(&a.id);
+                        let log_items = self.get_activity_log(&a.id, &a.machine);
                         let repo = self.board_active_repo().unwrap_or("?");
                         (
                             format!(" ACTIVITY — {} #{} ", repo, group.issue_number),
@@ -2268,10 +2457,18 @@ impl CoordApp {
 
         // Restore previous selection if the issue still exists.
         if let Some((repo, num)) = prev_sel {
-            for (i, issue) in self.pipeline_issues.iter().enumerate() {
-                if issue.repo_slug == repo && issue.number == num {
-                    self.pipeline_sel = Some(i);
-                    return;
+            'outer: for (sec_idx, label) in self.data.pipeline_tracked_labels.iter().enumerate() {
+                let mut row = 0u16;
+                for (i, issue) in self.pipeline_issues.iter().enumerate() {
+                    if issue.matched_labels.first().map(|l| l == label).unwrap_or(false) {
+                        if issue.repo_slug == repo && issue.number == num {
+                            self.pipeline_sel = Some(i);
+                            self.pipeline_sidebar.set_active_section(Some(sec_idx));
+                            self.pipeline_sidebar.set_selected_path(sec_idx, Some(vec![row]));
+                            break 'outer;
+                        }
+                        row += 1;
+                    }
                 }
             }
         }
@@ -2615,6 +2812,23 @@ impl CoordApp {
     fn command_output_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
 
+        // Persistent warning when coordinator.yml could not be located at
+        // startup. The commands panel is shown regardless so the user can see
+        // the message even before pressing any key.
+        if self.command_runner.config_path.is_none() {
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        " coordinator.yml not found — run coord-tui from your project directory ",
+                        Color::rgb(220, 100, 60),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Error,
+            });
+        }
+
         if let Some((label, elapsed)) = self.command_runner.running_info() {
             items.push(ListItem {
                 text: StyledText {
@@ -2747,9 +2961,9 @@ impl CoordApp {
                         self.activity_scroll = None;
                         true
                     }
-                    SidebarEvent::HeaderActivated { section } => {
-                        let collapsed = self.board_sidebar.is_collapsed(section);
-                        self.board_sidebar.set_collapsed(section, !collapsed);
+                    SidebarEvent::HeaderActivated { section: _ } => {
+                        // quadraui #239: HeaderActivated now handles collapse internally
+                        // when allow_collapse is true. We no longer need to manually toggle.
                         true
                     }
                     SidebarEvent::StateChanged
@@ -2912,8 +3126,18 @@ impl CoordApp {
     }
 
     fn status_bar(&self) -> StatusBar {
-        let since = self.refreshed_at.elapsed().as_secs();
         let view_label = self.active_view.label();
+        // Show a loading indicator while a background fetch is in flight;
+        // otherwise show seconds since the last completed refresh.
+        let (refresh_text, refresh_fg, refresh_bold) = if self.pending_data.is_some() {
+            (" ↻ loading… ".to_string(), Color::rgb(255, 220, 80), true)
+        } else {
+            (
+                format!(" ↻ {}s ", self.refreshed_at.elapsed().as_secs()),
+                Color::rgb(140, 140, 140),
+                false,
+            )
+        };
         let mut left = vec![
             StatusBarSegment {
                 text: " coord-tui ".to_string(),
@@ -2930,13 +3154,25 @@ impl CoordApp {
                 action_id: None,
             },
             StatusBarSegment {
-                text: format!(" ↻ {}s ", since),
-                fg: Color::rgb(140, 140, 140),
+                text: refresh_text,
+                fg: refresh_fg,
                 bg: Color::rgb(30, 30, 40),
-                bold: false,
+                bold: refresh_bold,
                 action_id: None,
             },
         ];
+        // Non-blocking warning if the last load failed.
+        if let Some((err_msg, when)) = &self.fetch_error {
+            if when.elapsed() < Duration::from_secs(10) {
+                left.push(StatusBarSegment {
+                    text: format!(" ⚠ {} ", err_msg),
+                    fg: Color::rgb(255, 160, 60),
+                    bg: Color::rgb(50, 30, 10),
+                    bold: true,
+                    action_id: None,
+                });
+            }
+        }
         if let Some((label, elapsed)) = self.command_runner.running_info() {
             left.push(StatusBarSegment {
                 text: format!(" {} ({:.0}s) ", label, elapsed.as_secs_f64()),
@@ -3059,9 +3295,15 @@ impl ShellApp for CoordApp {
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend, ctx: &ShellContext) -> Reaction {
         let mut needs_redraw = false;
 
-        // ── Auto-refresh (ShellApp has no tick(); check elapsed on every event) ─
-        if self.refreshed_at.elapsed() >= REFRESH_EVERY {
-            self.refresh();
+        // ── Drain pending background data load ──────────────────────────
+        if self.apply_pending_data() {
+            needs_redraw = true;
+        }
+
+        // ── Auto-refresh: kick off background load when interval elapses ─
+        // (ShellApp has no tick(); check elapsed on every UI event.)
+        if self.refreshed_at.elapsed() >= REFRESH_EVERY && self.pending_data.is_none() {
+            self.pending_data = Some(start_data_load());
             if self.active_view == SidebarView::Pipeline {
                 self.maybe_kick_pipeline_loader();
             }
@@ -3495,6 +3737,10 @@ mod tests {
             pipeline_loader: None,
             pipeline_last_load: None,
             pipeline_status: None,
+            remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_data: None,
+            fetch_error: None,
+            pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3661,6 +3907,7 @@ mod tests {
         let mut app = make_test_app(BoardData {
             machines: vec![Machine {
                 name: "m1".to_string(),
+                host: String::new(),
                 reachable: true,
                 active_count: 0,
                 repos: vec!["empty-repo".to_string()],
@@ -4046,6 +4293,7 @@ mod tests {
         let mut app = make_test_app(BoardData {
             machines: vec![Machine {
                 name: "m1".to_string(),
+                host: String::new(),
                 reachable: true,
                 active_count: 0,
                 repos: vec!["empty-repo".to_string()],
@@ -4084,6 +4332,7 @@ mod tests {
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
             machines: vec![Machine {
                 name: "m1".to_string(),
+                host: String::new(),
                 reachable: true,
                 active_count: 0,
                 repos: vec!["api".to_string()],
@@ -4257,18 +4506,21 @@ mod tests {
                 machines: vec![
                     Machine {
                         name: "busy".to_string(),
+                        host: String::new(),
                         reachable: true,
                         active_count: 3,
                         repos: vec!["api".to_string()],
                     },
                     Machine {
                         name: "idle".to_string(),
+                        host: String::new(),
                         reachable: true,
                         active_count: 0,
                         repos: vec!["api".to_string()],
                     },
                     Machine {
                         name: "wrong-repo".to_string(),
+                        host: String::new(),
                         reachable: true,
                         active_count: 0,
                         repos: vec!["other".to_string()],
@@ -4288,6 +4540,7 @@ mod tests {
             data: BoardData {
                 machines: vec![Machine {
                     name: "off".to_string(),
+                    host: String::new(),
                     reachable: false,
                     active_count: 0,
                     repos: vec!["api".to_string()],

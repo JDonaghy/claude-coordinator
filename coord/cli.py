@@ -44,6 +44,7 @@ def _save_config_snapshot(config: Config) -> None:
     The pipeline keys let the TUI Pipeline panel pick up coordinator.yml
     settings without having to parse YAML itself.
     """
+    conn = None
     try:
         from coord.db import get_connection
         conn = get_connection()
@@ -73,7 +74,11 @@ def _save_config_snapshot(config: Config) -> None:
         )
         conn.commit()
     except Exception:  # noqa: BLE001 — non-critical, don't abort CLI
-        pass
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _load_config(path: Path) -> Config:

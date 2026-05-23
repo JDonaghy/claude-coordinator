@@ -344,3 +344,33 @@ class TestReviewNotify:
 
         assert posted_again == []
         assert mock_review.call_count == 1
+
+    def test_review_fallback_to_issue_comment_when_pr_review_raises(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """When gh pr review raises (e.g. self-review rejected), findings are
+        posted as an issue comment — never silently dropped."""
+        _record_review_assignment("rev7", review_target="173")
+        log_path = _make_log_with_review(tmp_path, "request-changes", "Bug at line 42.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev7", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch(
+                 "coord.notify.github_ops.post_pr_review",
+                 side_effect=RuntimeError("GraphQL: Can't request changes on your own pull request"),
+             ) as mock_pr_review, \
+             patch("coord.notify.github_ops.post_issue_comment") as mock_post:
+            posted, _stuck = notify_mod.run(config)
+
+        assert len(posted) == 1
+        # PR review was attempted then failed.
+        mock_pr_review.assert_called_once_with("acme/api", 173, "request-changes", "Bug at line 42.")
+        # Findings posted to the issue as a comment instead.
+        mock_post.assert_called_once()
+        body = mock_post.call_args.args[2]
+        assert "Bug at line 42." in body
+        assert "Changes Requested" in body
+        # Fallback message should reference the PR number so the reader knows context.
+        assert "173" in body

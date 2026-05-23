@@ -46,11 +46,45 @@ coord session
 - **Clean last session:** Briefly note "Last session: N assignments, $X.XX cost" and continue.
 - **"No session state found":** First time — continue normally.
 
-### 5. Check machine state
+**After `coord resume` — purge stale merge queue entries:**
+
+`coord resume` enrolls every completed assignment into the merge queue, including old work for issues that are now closed. Running `coord merge` on those creates junk PRs. Always check first:
+
+```bash
+# List pending merge queue issues
+sqlite3 ~/.coord/coord.db "SELECT repo_name, issue_number FROM merge_queue WHERE state='pending' ORDER BY repo_name, issue_number;"
+
+# For each repo, verify issues are still open (replace OWNER/REPO):
+for n in $(sqlite3 ~/.coord/coord.db "SELECT issue_number FROM merge_queue WHERE repo_name='claude-coordinator' AND state='pending';"); do
+  state=$(gh issue view $n --repo JDonaghy/claude-coordinator --json state --jq '.state' 2>/dev/null)
+  [ "$state" != "OPEN" ] && echo "STALE: $n ($state)"
+done
+
+# Delete stale entries (replace issue numbers):
+sqlite3 ~/.coord/coord.db "DELETE FROM merge_queue WHERE repo_name='claude-coordinator' AND issue_number IN (12,14,34,...);"
+```
+
+### 5. Check agent versions and machine state
 
 ```bash
 coord status
 ```
+
+Check agent versions — version skew causes `--force` dispatch failures (400 errors):
+
+```bash
+# Quick version check across all agents (replace hostnames from coordinator.yml):
+for host in john-precision-3571 john-hp-elitebook-830-g7-notebook-pc dellserver; do
+  echo -n "$host: "
+  curl -s http://$host:7433/status | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('version','<0.3.0 (old)'))" 2>/dev/null || echo "unreachable"
+done
+```
+
+If any agent is old (no `version` in /status, or version < current):
+- **Agent >= 0.3.0**: `curl -X POST http://<host>:7433/update` — self-updates from PyPI and restarts
+- **Agent < 0.3.0**: must SSH in — see README "Upgrading Agents"
+
+**Symptom of version skew:** `coord assign ... --force` returns HTTP 400 "unexpected keyword argument 'fresh_branch'" from the agent.
 
 ### 6. Load open issues for each repo
 
@@ -158,3 +192,27 @@ Update it after every dispatch, completion, failure, or status check.
 - Don't assign the same issue to two machines.
 - Don't assign work to a repo while its upstream dependency (`depends_on`) has active work.
 - Don't hardcode repo names, machine names, or GitHub orgs — read them from `coordinator.yml`.
+- Don't run `coord merge` blindly after `coord resume` — purge stale merge queue entries first (see Startup step 4).
+
+---
+
+## Common Pitfalls
+
+### Merge queue is full of stale entries after crash recovery
+`coord resume` enrolls all old completed assignments — even for issues closed months ago. Always check issue state before `coord merge`. See Startup step 4 for the purge procedure.
+
+### `coord assign --force` returns HTTP 400
+Agents older than 0.3.0 don't accept the `fresh_branch` field. Check versions (Startup step 5) and upgrade agents before using `--force`.
+
+### PR exists but merge queue doesn't know about it
+If a PR was opened via `coord pr` before it entered the merge queue, the DB `pr_number` column is NULL. `coord merge` will try to open a duplicate. Fix it:
+```bash
+sqlite3 ~/.coord/coord.db "UPDATE merge_queue SET pr_number=<N>, pr_url='https://github.com/OWNER/REPO/pull/<N>' WHERE repo_name='<repo>' AND issue_number=<issue>;"
+```
+
+### `coord merge` fails with conflict
+The branch conflicts with something that merged after the worker finished. Dispatch a rebase worker:
+```bash
+coord assign <machine> <repo> <issue> --force --briefing "Rebase branch <branch> onto main. git fetch origin, git checkout <branch>, git rebase origin/main, resolve conflicts, git push --force-with-lease. Do not change any logic."
+```
+Note: requires agents >= 0.3.0 for `--force` to work.

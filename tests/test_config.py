@@ -209,7 +209,7 @@ def test_pipeline_tracked_labels_defaults_to_coord(tmp_path: Path) -> None:
 
 
 def test_pipeline_tracked_labels_from_labels_keys(tmp_path: Path) -> None:
-    """tracked_labels() returns sorted keys when pipeline.labels is configured."""
+    """tracked_labels() always includes 'coord' plus sorted configured keys."""
     p = tmp_path / "coordinator.yml"
     p.write_text(
         "repos:\n"
@@ -222,8 +222,25 @@ def test_pipeline_tracked_labels_from_labels_keys(tmp_path: Path) -> None:
         "    feature: [review, merge]\n"
     )
     cfg = load(p)
-    # Sorted alphabetically for stable ordering.
-    assert cfg.pipeline.tracked_labels() == ["feature", "hotfix"]
+    # 'coord' is always first; configured keys follow alphabetically.
+    assert cfg.pipeline.tracked_labels() == ["coord", "feature", "hotfix"]
+
+
+def test_pipeline_tracked_labels_coord_not_duplicated(tmp_path: Path) -> None:
+    """When 'coord' is explicitly in labels, it is not duplicated."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  labels:\n"
+        "    coord: [review, merge]\n"
+        "    hotfix: [merge]\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.tracked_labels() == ["coord", "hotfix"]
 
 
 def test_pipeline_gates_for_label_uses_override(tmp_path: Path) -> None:
