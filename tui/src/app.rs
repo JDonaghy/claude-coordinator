@@ -43,6 +43,7 @@ use quadraui::compose::app_shell::{AppShellEvent, AppShellLayout, PanelDefinitio
 use quadraui::compose::sidebar_system::{
     NavigationMode, SidebarEvent, SidebarSectionDef, SidebarSystem,
 };
+use quadraui::primitives::form::{FieldKind, Form, FormEvent, FormField};
 use quadraui::{
     Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
@@ -1221,6 +1222,13 @@ pub struct CoordApp {
     last_notify: Instant,
     /// Scroll offset for the bottom (command output) panel.
     command_scroll: usize,
+    // ── Board search / status-group state ───────────────────────────────
+    /// Current value in the board filter input.
+    board_search: String,
+    /// Cursor byte offset into `board_search` (always kept at end of value).
+    board_search_cursor: usize,
+    /// Expanded state for each (repo, status_group) pair. Default: true.
+    board_status_expanded: std::collections::HashMap<(String, String), bool>,
     // ── Pipeline panel state ────────────────────────────────────────────
     /// SidebarSystem listing tracked issues (one section per label).
     pipeline_sidebar: SidebarSystem,
@@ -1299,6 +1307,9 @@ impl CoordApp {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            board_search: String::new(),
+            board_search_cursor: 0,
+            board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
@@ -1509,30 +1520,34 @@ impl CoordApp {
         result
     }
 
-    /// Rebuild the SidebarSystem from current data. Creates one section per
-    /// repo, with issue rows inside each section.
+    /// Rebuild the SidebarSystem from current data.
+    ///
+    /// Layout:
+    /// - Section 0: search form (always present)
+    /// - Section 1: PROPOSALS (only when proposals exist)
+    /// - Section 1/2+: one section per repo
+    ///
+    /// Within each repo section, issues are grouped by status into sub-trees:
+    /// Running → Failed → Completed → Pending. Empty groups are omitted.
+    /// Rows are filtered by `board_search` (case-insensitive substring).
     fn rebuild_board_sidebar(&mut self) {
         self.board_issues_cache = self.issues_by_repo();
         let grouped = &self.board_issues_cache;
 
-        // Save current selection to restore after rebuild.
         let prev_selection = self.board_selected_issue();
-
-        // Save panel scroll and per-section collapse state keyed by name so
-        // that the state survives indices shifting when repos are added or
-        // removed.  We capture BEFORE updating `has_proposals_section` and
-        // `board_repo_names` so that the old offset is still valid here.
         let prev_panel_scroll = self.board_sidebar.panel_scroll();
+
+        // Save per-section collapse state keyed by section name.
+        let search_offset = 1usize; // always one search section
         let prev_collapsed: std::collections::HashMap<String, bool> = {
-            let offset = if self.has_proposals_section { 1 } else { 0 };
+            let offset = search_offset + if self.has_proposals_section { 1 } else { 0 };
             let mut map = std::collections::HashMap::new();
             if self.has_proposals_section {
                 map.insert(
                     "__proposals__".to_string(),
-                    self.board_sidebar.is_collapsed(0),
+                    self.board_sidebar.is_collapsed(search_offset),
                 );
             }
-            // Clone names to avoid borrow conflicts in the loop body.
             let old_names: Vec<String> = self.board_repo_names.clone();
             for (i, name) in old_names.into_iter().enumerate() {
                 map.insert(name, self.board_sidebar.is_collapsed(i + offset));
@@ -1540,9 +1555,11 @@ impl CoordApp {
             map
         };
 
-        // Build section definitions — prepend PROPOSALS if any exist.
         self.has_proposals_section = !self.data.proposals.is_empty();
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
+
+        // Section 0: search/filter form.
+        defs.push(SidebarSectionDef::form("board-search", "FILTER"));
 
         if self.has_proposals_section {
             let mut def = SidebarSectionDef::new("section:proposals".to_string(), "PROPOSALS".to_string());
@@ -1552,10 +1569,7 @@ impl CoordApp {
         }
 
         for (repo, _) in grouped.iter() {
-            let mut def = SidebarSectionDef::new(
-                format!("repo:{}", repo),
-                repo.clone(),
-            );
+            let mut def = SidebarSectionDef::new(format!("repo:{}", repo), repo.clone());
             def.show_chevron = true;
             def.size = SectionSize::Content;
             defs.push(def);
@@ -1563,15 +1577,35 @@ impl CoordApp {
 
         self.board_repo_names = grouped.iter().map(|(r, _)| r.clone()).collect();
 
-        // Recreate sidebar with new section defs.
         self.board_sidebar = SidebarSystem::new(defs);
         self.board_sidebar.set_navigation_mode(NavigationMode::Selection);
         self.board_sidebar.set_allow_collapse(true);
         self.board_sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
-        let offset = if self.has_proposals_section { 1 } else { 0 };
+        // Populate search form (section 0).
+        self.board_sidebar.set_form(0, Form {
+            id: WidgetId::new("board-search-form"),
+            fields: vec![FormField {
+                id: WidgetId::new("board-search-input"),
+                label: StyledText::plain(""),
+                kind: FieldKind::TextInput {
+                    value: self.board_search.clone(),
+                    placeholder: "Filter issues…".to_string(),
+                    cursor: Some(self.board_search_cursor),
+                    selection_anchor: None,
+                },
+                hint: StyledText::plain(""),
+                disabled: false,
+                validation: None,
+            }],
+            focused_field: None,
+            scroll_offset: 0,
+            has_focus: false,
+        });
 
-        // Populate PROPOSALS section rows.
+        let offset = search_offset + if self.has_proposals_section { 1 } else { 0 };
+
+        // Populate PROPOSALS section.
         if self.has_proposals_section {
             let proposal_color = Color::rgb(200, 180, 255);
             let rows: Vec<TreeRow> = self
@@ -1582,18 +1616,9 @@ impl CoordApp {
                 .map(|(i, p)| {
                     let text = StyledText {
                         spans: vec![
-                            StyledSpan::with_fg(
-                                format!("[{}] ", p.id),
-                                Color::rgb(180, 180, 220),
-                            ),
-                            StyledSpan::with_fg(
-                                format!("{} ", p.machine),
-                                Color::rgb(140, 200, 140),
-                            ),
-                            StyledSpan::with_fg(
-                                format!("#{} ", p.issue_number),
-                                Color::rgb(150, 150, 240),
-                            ),
+                            StyledSpan::with_fg(format!("[{}] ", p.id), Color::rgb(180, 180, 220)),
+                            StyledSpan::with_fg(format!("{} ", p.machine), Color::rgb(140, 200, 140)),
+                            StyledSpan::with_fg(format!("#{} ", p.issue_number), Color::rgb(150, 150, 240)),
                             StyledSpan::plain(trunc(&p.issue_title, 18)),
                         ],
                     };
@@ -1609,98 +1634,161 @@ impl CoordApp {
                     }
                 })
                 .collect();
-            self.board_sidebar.set_rows(0, rows);
+            self.board_sidebar.set_rows(search_offset, rows);
             self.board_sidebar.set_section_badge(
-                0,
+                search_offset,
                 Some(StyledText::plain(format!("({})", self.data.proposals.len()))),
             );
         }
 
-        // Set rows for each repo section.
-        for (cache_idx, (_repo, issues)) in grouped.iter().enumerate() {
-            let section_idx = cache_idx + offset;
-            let has_active = issues.iter().any(|i| i.status_summary == "running" || i.status_summary == "failed");
-            let n_issues = issues.len();
+        // Helper: fuzzy filter — true if the issue matches the search query.
+        let query = self.board_search.to_lowercase();
 
-            if n_issues > 0 {
+        let issue_matches = |num: u64, title: &str| -> bool {
+            if query.is_empty() {
+                return true;
+            }
+            let num_str = num.to_string();
+            num_str.contains(&query) || title.to_lowercase().contains(&query)
+        };
+
+        // Build per-repo status groups.
+        for (cache_idx, (repo, issues)) in grouped.iter().enumerate() {
+            let section_idx = cache_idx + offset;
+
+            // Bucket issues by status group; apply filter.
+            let mut running: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut failed: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut completed: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut pending: Vec<(usize, &IssueGroup)> = Vec::new();
+            for (flat_idx, g) in issues.iter().enumerate() {
+                if !issue_matches(g.issue_number, &g.issue_title) {
+                    continue;
+                }
+                match g.status_summary.as_str() {
+                    "running" => running.push((flat_idx, g)),
+                    "failed" => failed.push((flat_idx, g)),
+                    "done" | "merged" => completed.push((flat_idx, g)),
+                    _ => pending.push((flat_idx, g)),
+                }
+            }
+
+            let groups: Vec<(&str, &str, &Vec<(usize, &IssueGroup)>)> = [
+                ("Running",   "running",   &running),
+                ("Failed",    "failed",    &failed),
+                ("Completed", "completed", &completed),
+                ("Pending",   "pending",   &pending),
+            ]
+            .into_iter()
+            .filter(|(_, _, v)| !v.is_empty())
+            .collect();
+
+            let total: usize = running.len() + failed.len() + completed.len() + pending.len();
+            if total > 0 {
                 self.board_sidebar.set_section_badge(
                     section_idx,
-                    Some(StyledText::plain(format!("({})", n_issues))),
+                    Some(StyledText::plain(format!("({})", total))),
                 );
             }
 
-            if !has_active && n_issues == 0 {
+            // Auto-collapse repos with no running/failed issues and no filter.
+            let has_active = !running.is_empty() || !failed.is_empty();
+            if !has_active && total == 0 {
                 self.board_sidebar.set_collapsed(section_idx, true);
             }
 
-            let rows: Vec<TreeRow> = issues
-                .iter()
-                .enumerate()
-                .map(|(i, group)| {
-                    let sc = group.status_color();
-                    let icon_str = group.status_icon();
-                    let text = StyledText {
-                        spans: vec![
-                            StyledSpan::with_fg(format!("{} ", icon_str), sc),
-                            StyledSpan::with_fg(
-                                format!("#{:<5}", group.issue_number),
-                                Color::rgb(150, 150, 240),
-                            ),
-                            StyledSpan::plain(trunc(&group.issue_title, 20)),
-                        ],
-                    };
-                    TreeRow {
-                        path: vec![i as u16],
-                        indent: 0,
-                        icon: None,
-                        text,
-                        badge: Some(Badge::colored(&group.status_summary, sc)),
-                        is_expanded: None,
-                        decoration: if group.status_summary == "failed" {
-                            Decoration::Error
-                        } else {
-                            Decoration::Normal
-                        },
-                        edit: None,
+            let mut rows: Vec<TreeRow> = Vec::new();
+            for (group_idx, (display_name, key, group_issues)) in groups.iter().enumerate() {
+                let gi = group_idx as u16;
+                let is_exp = *self
+                    .board_status_expanded
+                    .get(&(repo.clone(), key.to_string()))
+                    .unwrap_or(&true);
+
+                let header_color = match *key {
+                    "running" => Color::rgb(80, 220, 80),
+                    "failed" => Color::rgb(220, 70, 70),
+                    "completed" => Color::rgb(120, 180, 120),
+                    _ => Color::rgb(140, 140, 160),
+                };
+                rows.push(TreeRow {
+                    path: vec![gi],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            format!("{} ({})", display_name, group_issues.len()),
+                            header_color,
+                        )],
+                    },
+                    badge: None,
+                    is_expanded: Some(is_exp),
+                    decoration: Decoration::Header,
+                    edit: None,
+                });
+
+                if is_exp {
+                    for (issue_idx, (_flat_idx, g)) in group_issues.iter().enumerate() {
+                        let sc = g.status_color();
+                        let text = StyledText {
+                            spans: vec![
+                                StyledSpan::with_fg(
+                                    format!("#{:<5}", g.issue_number),
+                                    Color::rgb(150, 150, 240),
+                                ),
+                                StyledSpan::plain(trunc(&g.issue_title, 20)),
+                            ],
+                        };
+                        rows.push(TreeRow {
+                            path: vec![gi, issue_idx as u16],
+                            indent: 1,
+                            icon: None,
+                            text,
+                            badge: Some(Badge::colored(&g.status_summary, sc)),
+                            is_expanded: None,
+                            decoration: if g.status_summary == "failed" {
+                                Decoration::Error
+                            } else {
+                                Decoration::Normal
+                            },
+                            edit: None,
+                        });
                     }
-                })
-                .collect();
+                }
+            }
+
             self.board_sidebar.set_rows(section_idx, rows);
         }
 
-        // Activate first non-empty section.
+        // Activate first non-empty repo section.
         if self.board_sidebar.active_section().is_none() {
             if self.has_proposals_section {
-                self.board_sidebar.set_active_section(Some(0));
-            } else if !self.board_repo_names.is_empty() {
+                self.board_sidebar.set_active_section(Some(search_offset));
+            } else {
                 for (i, (_repo, issues)) in grouped.iter().enumerate() {
                     if !issues.is_empty() {
-                        self.board_sidebar.set_active_section(Some(i));
+                        self.board_sidebar.set_active_section(Some(i + offset));
                         break;
                     }
                 }
             }
         }
 
-        // Restore previous selection if possible.
+        // Restore previous selection.
         if let Some((prev_repo, prev_issue)) = prev_selection {
             self.select_issue(&prev_repo, prev_issue);
         }
 
-        // Restore panel scroll (set_panel_scroll clamps to ≥ 0.0 internally).
         self.board_sidebar.set_panel_scroll(prev_panel_scroll);
 
-        // Restore collapsed state by section name.  Only override sections
-        // that existed before the rebuild; new sections keep whatever the
-        // auto-collapse logic set above.
+        // Restore collapsed state by section name.
         {
-            let new_offset = if self.has_proposals_section { 1 } else { 0 };
+            let new_offset = search_offset + if self.has_proposals_section { 1 } else { 0 };
             if self.has_proposals_section {
                 if let Some(&was_collapsed) = prev_collapsed.get("__proposals__") {
-                    self.board_sidebar.set_collapsed(0, was_collapsed);
+                    self.board_sidebar.set_collapsed(search_offset, was_collapsed);
                 }
             }
-            // Clone names to avoid borrow conflict with board_sidebar.set_collapsed.
             let new_names: Vec<String> = self.board_repo_names.clone();
             for (i, name) in new_names.into_iter().enumerate() {
                 if let Some(&was_collapsed) = prev_collapsed.get(&name) {
@@ -1710,10 +1798,15 @@ impl CoordApp {
         }
     }
 
+    /// Repo section offset: 1 for the search form + 1 more if proposals exist.
+    fn board_repo_offset(&self) -> usize {
+        1 + if self.has_proposals_section { 1 } else { 0 }
+    }
+
     /// Return the repo name for the active sidebar section, if any.
     fn board_active_repo(&self) -> Option<&str> {
         let section = self.board_sidebar.active_section()?;
-        let offset = if self.has_proposals_section { 1 } else { 0 };
+        let offset = self.board_repo_offset();
         if section < offset {
             return None;
         }
@@ -1722,21 +1815,64 @@ impl CoordApp {
             .map(|s| s.as_str())
     }
 
+    /// Reconstruct the status groups for a repo using the current search filter.
+    /// Returns `(flat_idx, &IssueGroup)` vecs ordered Running / Failed / Completed / Pending.
+    fn board_grouped_for_repo<'a>(
+        &'a self,
+        issues: &'a [(String, Vec<IssueGroup>)],
+        repo: &str,
+    ) -> Vec<(&'static str, Vec<(usize, &'a IssueGroup)>)> {
+        let (_, flat) = match issues.iter().find(|(r, _)| r == repo) {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+        let query = self.board_search.to_lowercase();
+        let mut running = Vec::new();
+        let mut failed = Vec::new();
+        let mut completed = Vec::new();
+        let mut pending = Vec::new();
+        for (i, g) in flat.iter().enumerate() {
+            if !query.is_empty() {
+                let num_str = g.issue_number.to_string();
+                if !num_str.contains(&query) && !g.issue_title.to_lowercase().contains(&query) {
+                    continue;
+                }
+            }
+            match g.status_summary.as_str() {
+                "running" => running.push((i, g)),
+                "failed" => failed.push((i, g)),
+                "done" | "merged" => completed.push((i, g)),
+                _ => pending.push((i, g)),
+            }
+        }
+        [("running", running), ("failed", failed), ("completed", completed), ("pending", pending)]
+            .into_iter()
+            .filter(|(_, v)| !v.is_empty())
+            .collect()
+    }
+
     /// Return the IssueGroup currently selected in the board sidebar.
+    ///
+    /// Paths are now two-level: `[group_idx, issue_idx_within_group]`. A
+    /// one-level path (group header selected) returns `None`.
     fn board_selected_issue_group(&self) -> Option<&IssueGroup> {
         let section = self.board_sidebar.active_section()?;
-        let offset = if self.has_proposals_section { 1 } else { 0 };
+        let offset = self.board_repo_offset();
         if section < offset {
             return None;
         }
         let path = self.board_sidebar.selected_path(section)?;
-        if path.is_empty() {
+        if path.len() < 2 {
             return None;
         }
+        let group_idx = path[0] as usize;
+        let issue_idx = path[1] as usize;
         let repo = self.board_repo_names.get(section - offset)?;
-        let (_, issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
-        let row_idx = path[0] as usize;
-        issues.get(row_idx)
+        let groups = self.board_grouped_for_repo(&self.board_issues_cache, repo);
+        let (_, issues_in_group) = groups.get(group_idx)?;
+        let (flat_idx, _) = issues_in_group.get(issue_idx)?;
+        let (_, all_issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
+        all_issues.get(*flat_idx)
     }
 
     /// Return the (repo, issue_number) currently selected in the board sidebar.
@@ -1752,10 +1888,11 @@ impl CoordApp {
             return None;
         }
         let section = self.board_sidebar.active_section()?;
-        if section != 0 {
+        // Proposals section is at index 1 (after the search form).
+        if section != 1 {
             return None;
         }
-        let path = self.board_sidebar.selected_path(0)?;
+        let path = self.board_sidebar.selected_path(1)?;
         if path.is_empty() {
             return None;
         }
@@ -1774,16 +1911,51 @@ impl CoordApp {
 
     /// Try to select a specific issue in the sidebar by repo and issue number.
     fn select_issue(&mut self, repo: &str, issue_number: u64) {
-        let offset = if self.has_proposals_section { 1 } else { 0 };
-        for (cache_idx, (r, issues)) in self.board_issues_cache.iter().enumerate() {
-            if r == repo {
-                for (row_idx, group) in issues.iter().enumerate() {
-                    if group.issue_number == issue_number {
-                        let section_idx = cache_idx + offset;
-                        self.board_sidebar.set_active_section(Some(section_idx));
-                        self.board_sidebar.set_selected_path(section_idx, Some(vec![row_idx as u16]));
-                        return;
-                    }
+        let offset = self.board_repo_offset();
+        // Find the repo's cache entry and its groups.
+        let cache_idx = match self.board_repo_names.iter().position(|r| r == repo) {
+            Some(i) => i,
+            None => return,
+        };
+        let section_idx = cache_idx + offset;
+        // Reconstruct groups to find the 2-level path for this issue.
+        // Clone the flat list to avoid borrow conflicts.
+        let flat: Vec<IssueGroup> = match self.board_issues_cache.iter().find(|(r, _)| r == repo) {
+            Some((_, v)) => v.clone(),
+            None => return,
+        };
+        let query = self.board_search.to_lowercase();
+        let mut running: Vec<(usize, u64)> = Vec::new();
+        let mut failed: Vec<(usize, u64)> = Vec::new();
+        let mut completed: Vec<(usize, u64)> = Vec::new();
+        let mut pending: Vec<(usize, u64)> = Vec::new();
+        for (i, g) in flat.iter().enumerate() {
+            if !query.is_empty() {
+                let num_str = g.issue_number.to_string();
+                if !num_str.contains(&query) && !g.issue_title.to_lowercase().contains(&query) {
+                    continue;
+                }
+            }
+            match g.status_summary.as_str() {
+                "running" => running.push((i, g.issue_number)),
+                "failed" => failed.push((i, g.issue_number)),
+                "done" | "merged" => completed.push((i, g.issue_number)),
+                _ => pending.push((i, g.issue_number)),
+            }
+        }
+        let groups_ordered: Vec<Vec<(usize, u64)>> = [running, failed, completed, pending]
+            .into_iter()
+            .filter(|v| !v.is_empty())
+            .collect();
+        for (group_idx, group_issues) in groups_ordered.iter().enumerate() {
+            for (issue_idx, (_flat_idx, num)) in group_issues.iter().enumerate() {
+                if *num == issue_number {
+                    self.board_sidebar.set_active_section(Some(section_idx));
+                    self.board_sidebar.set_selected_path(
+                        section_idx,
+                        Some(vec![group_idx as u16, issue_idx as u16]),
+                    );
+                    return;
                 }
             }
         }
@@ -2953,22 +3125,51 @@ impl CoordApp {
     ) -> bool {
         match self.active_view {
             SidebarView::Board => {
-                // Delegate to the SidebarSystem for hit-testing.
                 let result = self.board_sidebar.handle(event, backend, sidebar_b);
                 match result {
-                    SidebarEvent::RowSelected { .. } | SidebarEvent::RowActivated { .. } => {
+                    SidebarEvent::RowSelected { .. } => {
                         self.detail_scroll = 0;
                         self.activity_scroll = None;
                         true
                     }
-                    SidebarEvent::HeaderActivated { section: _ } => {
-                        // quadraui #239: HeaderActivated now handles collapse internally
-                        // when allow_collapse is true. We no longer need to manually toggle.
+                    SidebarEvent::RowActivated { section, ref path } => {
+                        // A 1-deep path means a status-group header was activated —
+                        // toggle its expansion and rebuild the sidebar.
+                        if path.len() == 1 {
+                            let offset = self.board_repo_offset();
+                            if section >= offset {
+                                let repo_idx = section - offset;
+                                if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
+                                    let group_idx = path[0] as usize;
+                                    let cache = self.board_issues_cache.clone();
+                                    let groups = self.board_grouped_for_repo(&cache, &repo);
+                                    if let Some((key, _)) = groups.get(group_idx) {
+                                        let key = key.to_string();
+                                        let entry = self.board_status_expanded
+                                            .entry((repo, key))
+                                            .or_insert(true);
+                                        *entry = !*entry;
+                                        self.rebuild_board_sidebar();
+                                    }
+                                }
+                            }
+                        } else {
+                            self.detail_scroll = 0;
+                            self.activity_scroll = None;
+                        }
+                        true
+                    }
+                    SidebarEvent::HeaderActivated { section: _ } => true,
+                    SidebarEvent::FormEvent { section: 0, event: FormEvent::TextInputChanged { ref value, .. } } => {
+                        self.board_search = value.clone();
+                        self.board_search_cursor = value.len();
+                        self.rebuild_board_sidebar();
                         true
                     }
                     SidebarEvent::StateChanged
                     | SidebarEvent::Consumed
-                    | SidebarEvent::ScrollChanged { .. } => true,
+                    | SidebarEvent::ScrollChanged { .. }
+                    | SidebarEvent::FormEvent { .. } => true,
                     _ => false,
                 }
             }
@@ -3731,6 +3932,9 @@ mod tests {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             command_scroll: 0,
+            board_search: String::new(),
+            board_search_cursor: 0,
+            board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
@@ -3814,12 +4018,12 @@ mod tests {
             make_assignment_typed("done", 20, "repo-b", Some("work")),
         ];
         let mut app = make_app_with_assignments(assignments);
-        // Select first section (repo with running issue), first row
-        app.board_sidebar.set_active_section(Some(0));
-        app.board_sidebar.set_selected_path(0, Some(vec![0]));
+        // Section 0 = search form; section 1 = repo-a (running first).
+        // Path is 2-level: [group_idx=0 (Running), issue_idx=0].
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
         let sel = app.board_selected_issue();
-        assert!(sel.is_some());
-        // Should be issue #10 from repo-a (sorted first due to running status).
+        assert!(sel.is_some(), "expected Some, got None");
         let (repo, issue_num) = sel.unwrap();
         assert_eq!(repo, "repo-a");
         assert_eq!(issue_num, 10);
@@ -4271,18 +4475,16 @@ mod tests {
             make_assignment_typed("done", 20, "repo-b", Some("work")),
         ];
         let mut app = make_app_with_assignments(assignments);
-        // Manually collapse the first section (repo-a, index 0 — no proposals).
-        app.board_sidebar.set_collapsed(0, true);
-        assert!(app.board_sidebar.is_collapsed(0));
-        // Rebuild as if a 5-second refresh fired.
+        // Section 0 = search form; section 1 = repo-a; section 2 = repo-b.
+        app.board_sidebar.set_collapsed(1, true);
+        assert!(app.board_sidebar.is_collapsed(1));
         app.rebuild_board_sidebar();
         assert!(
-            app.board_sidebar.is_collapsed(0),
+            app.board_sidebar.is_collapsed(1),
             "collapsed state should survive rebuild"
         );
-        // The second section should not have been collapsed by our restore logic.
         assert!(
-            !app.board_sidebar.is_collapsed(1),
+            !app.board_sidebar.is_collapsed(2),
             "uncollapsed section should remain uncollapsed"
         );
     }
@@ -4301,9 +4503,9 @@ mod tests {
             ..BoardData::default()
         });
         app.rebuild_board_sidebar();
-        // Empty repo with no active issues should be auto-collapsed.
+        // Section 0 = search form; section 1 = empty-repo.
         assert!(
-            app.board_sidebar.is_collapsed(0),
+            app.board_sidebar.is_collapsed(1),
             "empty repo should be auto-collapsed on first build"
         );
     }
@@ -4321,6 +4523,81 @@ mod tests {
         app.rebuild_board_sidebar();
         let after = app.board_selected_issue();
         assert_eq!(before, after, "selection should survive rebuild");
+    }
+
+    // ── Board status grouping and fuzzy search ────────────────────────────
+
+    #[test]
+    fn board_search_section_is_section_zero() {
+        let mut app = make_app_default();
+        app.rebuild_board_sidebar();
+        assert!(app.board_sidebar.form(0).is_some(), "section 0 should be the search form");
+    }
+
+    #[test]
+    fn board_repos_start_at_section_one_without_proposals() {
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let app = make_app_with_assignments(assignments);
+        assert!(!app.has_proposals_section);
+        assert_eq!(app.board_repo_offset(), 1);
+    }
+
+    #[test]
+    fn board_fuzzy_search_hides_non_matching_issues() {
+        let assignments = vec![
+            make_assignment_typed("running", 42, "repo-a", Some("work")),
+            make_assignment_typed("done", 99, "repo-a", Some("work")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+        app.board_search = "42".to_string();
+        app.board_search_cursor = 2;
+        app.rebuild_board_sidebar();
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        assert_eq!(groups.len(), 1, "only Running group should be visible");
+        assert_eq!(groups[0].1.len(), 1, "only issue #42 should match");
+        assert_eq!(groups[0].1[0].1.issue_number, 42);
+    }
+
+    #[test]
+    fn board_status_groups_order_running_failed_completed_pending() {
+        let assignments = vec![
+            make_assignment_typed("done", 1, "repo-a", Some("work")),
+            make_assignment_typed("running", 2, "repo-a", Some("work")),
+            make_assignment_typed("failed", 3, "repo-a", Some("work")),
+        ];
+        let app = make_app_with_assignments(assignments);
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].0, "running");
+        assert_eq!(groups[1].0, "failed");
+        assert_eq!(groups[2].0, "completed");
+    }
+
+    #[test]
+    fn board_empty_status_groups_are_hidden() {
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let app = make_app_with_assignments(assignments);
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "running");
+    }
+
+    #[test]
+    fn board_select_issue_uses_two_level_path() {
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 20, "repo-a", Some("work")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+        app.select_issue("repo-a", 20);
+        // Issue #20 is "done" → Completed group (index 1 after Running), issue index 0.
+        let path = app.board_sidebar.selected_path(1).cloned();
+        assert_eq!(path, Some(vec![1u16, 0u16]), "done issue should be at [1,0]");
+        let sel = app.board_selected_issue();
+        assert_eq!(sel, Some(("repo-a".to_string(), 20)));
     }
 
     // ── Pipeline panel ────────────────────────────────────────────────────
