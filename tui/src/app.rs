@@ -1059,31 +1059,26 @@ fn fetch_pipeline_issues(
         slug_to_local.insert(slug.clone(), local.clone());
     }
 
-    // One `gh search issues` call covers all configured labels at once.
-    // We OR the labels with `label:A,B,C` syntax.
-    let label_clause = labels
-        .iter()
-        .map(|l| {
-            if l.contains(' ') {
-                format!("label:\"{}\"", l)
-            } else {
-                format!("label:{}", l)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let query = format!("{} state:open", label_clause);
+    // Use --label and --state flags (not a query string — gh search issues
+    // ignores label:/state: qualifiers in the positional query argument).
+    // Multiple --label flags are OR'd by gh.
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        "issues".into(),
+        "--state".into(),
+        "open".into(),
+        "--json".into(),
+        "number,title,labels,repository,url".into(),
+        "--limit".into(),
+        "100".into(),
+    ];
+    for label in labels {
+        args.push("--label".into());
+        args.push(label.clone());
+    }
 
     let output = std::process::Command::new("gh")
-        .args([
-            "search",
-            "issues",
-            &query,
-            "--json",
-            "number,title,labels,repository,url",
-            "--limit",
-            "100",
-        ])
+        .args(&args)
         .output();
 
     let stdout = match output {
