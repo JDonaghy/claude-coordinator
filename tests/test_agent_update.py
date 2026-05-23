@@ -102,21 +102,51 @@ class TestUpdateEndpoint:
         server.shutdown()
 
     def test_update_triggers_exec_restart_after_success(self, tmp_path: Path) -> None:
-        """exec_restart must be called after a successful upgrade."""
-        restarted: list[list[str]] = []
-        # Patch subprocess.run so the upgrade always succeeds (returncode 0)
-        # and returns quickly.
-        with patch("coord.agent_app.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-            client, server = _make_client(tmp_path, exec_restart=restarted.append)
-            client.post("/update")
+        """exec_restart must be called after a successful upgrade.
 
-        # Give the background thread time to finish.
-        deadline = time.time() + 5
-        while not restarted and time.time() < deadline:
-            time.sleep(0.05)
+        Force the editable-mode path so we always restart on a 0 returncode
+        (the pip-install path also requires a version delta — covered in
+        test_update_skips_restart_when_pip_no_change below).
+
+        NOTE: the polling loop MUST stay inside the patch context — the
+        background thread reads `subprocess.run` lazily; if the patch
+        exits first, the real `git pull` runs against the fake path and
+        fails with returncode != 0.
+        """
+        restarted: list[list[str]] = []
+        with patch("coord.agent_app._detect_install_mode") as mock_detect:
+            mock_detect.return_value = (True, "/fake/project")
+            with patch("coord.agent_app.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                client, server = _make_client(tmp_path, exec_restart=restarted.append)
+                client.post("/update")
+                deadline = time.time() + 5
+                while not restarted and time.time() < deadline:
+                    time.sleep(0.05)
 
         assert restarted, "exec_restart was never called"
+        server.shutdown()
+
+    def test_update_skips_restart_when_pip_no_change(self, tmp_path: Path) -> None:
+        """If pip succeeds but resolves to the same version, no restart and
+        a no_change result is persisted for the next /health to surface."""
+        import json
+        restarted: list[list[str]] = []
+        with patch("coord.agent_app._detect_install_mode") as mock_detect:
+            mock_detect.return_value = (False, None)  # pip path
+            with patch("coord.agent_app._installed_version", return_value="0.3.0"):
+                with patch("coord.agent_app.subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+                    client, server = _make_client(tmp_path, exec_restart=restarted.append)
+                    client.post("/update")
+                # Wait a bit to confirm no restart occurred.
+                time.sleep(0.5)
+
+        assert not restarted, "exec_restart fired even though version didn't change"
+        last = json.loads((server.state_dir / "last_update.json").read_text())
+        assert last["result"] == "no_change"
+        assert last["version_before"] == "0.3.0"
+        assert last["version_after"] == "0.3.0"
         server.shutdown()
 
     def test_update_does_not_restart_on_upgrade_failure(self, tmp_path: Path) -> None:

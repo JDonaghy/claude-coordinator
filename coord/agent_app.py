@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,33 @@ from starlette.routing import Route
 from coord import __version__
 from coord.agent import RUNNING, PENDING, AgentServer, AssignmentSpec
 from coord.events import stream_assignment_log
+
+
+def _installed_version() -> str | None:
+    """Return the currently-installed claude-coordinator version, or None
+    if pip can't tell us (e.g. metadata corrupted, pip missing)."""
+    try:
+        from importlib.metadata import version as _metaver  # noqa: PLC0415
+        return _metaver("claude-coordinator")
+    except Exception:
+        return None
+
+
+def _write_last_update(state_dir: Path, payload: dict) -> None:
+    """Persist the most recent update attempt summary so /health can
+    surface it after the agent restarts."""
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "last_update.json").write_text(json.dumps(payload, indent=2))
+    except Exception:
+        pass
+
+
+def _read_last_update(state_dir: Path) -> dict | None:
+    try:
+        return json.loads((state_dir / "last_update.json").read_text())
+    except Exception:
+        return None
 
 
 def _default_exec_restart(argv: list[str]) -> None:
@@ -74,7 +102,14 @@ def build_app(
         exec_restart = _default_exec_restart
 
     async def health(request: Request) -> JSONResponse:
-        return JSONResponse(server.health())
+        data = server.health()
+        data["version"] = __version__
+        # Surface the most recent /update attempt so the CLI can show
+        # "0.3.0 → 0.4.0" or "no_change (0.3.0)" or "failed: <error>".
+        last = _read_last_update(server.state_dir)
+        if last is not None:
+            data["last_update"] = last
+        return JSONResponse(data)
 
     async def status(request: Request) -> JSONResponse:
         data = server.list_assignments()
@@ -228,8 +263,20 @@ def build_app(
 
         # Capture argv now — os.execv replaces the process later.
         saved_argv = list(sys.argv)
+        state_dir = server.state_dir
 
         def _do_update() -> None:
+            version_before = _installed_version() or "unknown"
+            started_at = time.time()
+            payload: dict = {
+                "mode": mode,
+                "started_at": started_at,
+                "version_before": version_before,
+                "version_after": version_before,
+                "result": "failed",
+                "error": None,
+                "log_excerpt": "",
+            }
             try:
                 if is_editable and project_path:
                     result = subprocess.run(
@@ -239,25 +286,74 @@ def build_app(
                         text=True,
                         timeout=60,
                     )
-                    if result.returncode != 0:
-                        return  # Can't surface this error after the response is sent
                 else:
+                    # --no-cache-dir bypasses pip's local wheel cache, which
+                    # has caused stale-version resolutions on at least one
+                    # machine (PyPI metadata races with `pip install --upgrade`).
                     result = subprocess.run(
                         [
                             sys.executable, "-m", "pip", "install",
-                            "--upgrade", "claude-coordinator",
+                            "--upgrade", "--no-cache-dir",
+                            "claude-coordinator",
                         ],
                         capture_output=True,
                         text=True,
-                        timeout=120,
+                        timeout=180,
                     )
-                    if result.returncode != 0:
-                        return
+                payload["finished_at"] = time.time()
+                # Persist the full pip/git output to a log file so the
+                # user can read it after the agent restarts.
+                log_path = state_dir / "last_update.log"
+                try:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.write_text(
+                        f"# mode: {mode}\n"
+                        f"# returncode: {result.returncode}\n"
+                        f"# argv: {result.args}\n\n"
+                        f"--- stdout ---\n{result.stdout}\n"
+                        f"--- stderr ---\n{result.stderr}\n"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                # Keep a short excerpt inline so it appears in /health.
+                tail = (result.stderr or result.stdout or "").splitlines()
+                payload["log_excerpt"] = "\n".join(tail[-20:])
+
+                if result.returncode != 0:
+                    payload["error"] = (
+                        f"upgrade exited {result.returncode}; see "
+                        f"~/.coord/last_update.log on this machine"
+                    )
+                    _write_last_update(state_dir, payload)
+                    return
+
+                # Resolve what's installed now so we can report a delta and
+                # skip restarting if nothing actually changed.
+                version_after = _installed_version() or "unknown"
+                payload["version_after"] = version_after
+                if version_after == version_before and not is_editable:
+                    # Nothing to do — pip reported success but resolved to
+                    # the same version. Common cause: PyPI hasn't propagated
+                    # the new release yet, or the package isn't on the index
+                    # the venv's pip is pointed at.
+                    payload["result"] = "no_change"
+                    payload["error"] = (
+                        f"pip resolved to {version_after} (same as installed). "
+                        "PyPI may not have propagated the new release yet, or "
+                        "this venv's pip is pointed at a different index."
+                    )
+                    _write_last_update(state_dir, payload)
+                    return
+
+                payload["result"] = "upgraded"
+                _write_last_update(state_dir, payload)
+
                 # Brief pause so the HTTP response reaches the client first.
                 time.sleep(0.5)
                 exec_restart(saved_argv)
-            except Exception:
-                pass
+            except Exception as e:
+                payload["error"] = f"{type(e).__name__}: {e}"
+                _write_last_update(state_dir, payload)
 
         threading.Thread(target=_do_update, daemon=False, name="agent-update").start()
         return JSONResponse({"status": "updating", "mode": mode}, status_code=202)

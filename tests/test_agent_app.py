@@ -181,6 +181,35 @@ def test_inject_endpoint_rejects_bad_body(tmp_path: Path) -> None:
     assert r.status_code == 400
 
 
+def test_health_surfaces_version_and_last_update(tmp_path: Path) -> None:
+    """/health includes the running version and any persisted last_update
+    payload so the CLI can show a clear before/after delta."""
+    import json as _json
+    client, server = _client(tmp_path)
+    # No last_update file → version present, last_update absent.
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert "version" in body
+    assert body["version"]
+    assert "last_update" not in body
+
+    # Persist a last_update.json — /health should now include it.
+    (server.state_dir / "last_update.json").write_text(
+        _json.dumps({
+            "mode": "pip install --upgrade",
+            "version_before": "0.3.0",
+            "version_after": "0.4.0",
+            "result": "upgraded",
+            "error": None,
+        })
+    )
+    r = client.get("/health")
+    body = r.json()
+    assert body["last_update"]["result"] == "upgraded"
+    assert body["last_update"]["version_after"] == "0.4.0"
+
+
 def test_logs_endpoint_returns_log_content(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo hello-from-worker"], repo_path=repo)

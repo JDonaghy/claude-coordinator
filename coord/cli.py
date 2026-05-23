@@ -714,6 +714,39 @@ def agent_update(
         for name, came_back in results.items():
             tag = "✓ online" if came_back else "✗ did not come back"
             click.echo(f"  {name}: {tag}")
+        # Fetch each agent's /health to report what actually happened —
+        # version delta or the recorded failure reason.
+        click.echo("")
+        for machine in targets:
+            if not results.get(machine.name):
+                continue
+            try:
+                resp = httpx.get(
+                    f"http://{machine.host}:{AGENT_PORT}/health",
+                    timeout=5,
+                )
+                health = resp.json() if resp.status_code == 200 else {}
+            except (httpx.HTTPError, httpx.TimeoutException):
+                health = {}
+            version_now = health.get("version") or "?"
+            last = health.get("last_update") or {}
+            result = last.get("result")
+            if result == "upgraded":
+                vbefore = last.get("version_before", "?")
+                vafter = last.get("version_after", version_now)
+                click.echo(f"  {machine.name}: {vbefore} → {vafter}")
+            elif result == "no_change":
+                click.echo(
+                    f"  {machine.name}: no change (still {version_now}) — "
+                    f"{last.get('error', 'pip resolved to the same version')}"
+                )
+            elif result == "failed":
+                err = last.get("error") or "pip failed; see ~/.coord/last_update.log"
+                click.echo(f"  {machine.name}: ✗ failed — {err}", err=True)
+            else:
+                # Old agent build (no last_update payload yet) — just
+                # report the version it's now reporting.
+                click.echo(f"  {machine.name}: now reporting v{version_now}")
         if not all(results.values()):
             sys.exit(1)
 
