@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+import pytest
+
 from coord.agent import (
     CANCELLED,
     DONE,
@@ -101,6 +103,58 @@ def test_assign_unknown_binary_marks_failed(tmp_path: Path) -> None:
     final = server.wait_for(a.id)
     assert final.status == FAILED
     assert final.error is not None
+
+
+def test_initial_briefing_is_written_to_worker_stdin(tmp_path: Path) -> None:
+    """The briefing must reach the worker via stdin as a stream-json line."""
+    repo = _init_repo(tmp_path / "repo")
+    # Read exactly one line from stdin into the log, then exit.
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "read line; echo $line"],
+        repo_path=repo,
+    )
+    a = server.assign(_spec(repo, briefing="hello world"))
+    final = server.wait_for(a.id)
+    log = Path(final.log_path).read_text()
+    assert '"type": "user"' in log, "stream-json envelope missing from stdin echo"
+    assert "hello world" in log, "briefing text missing from stdin echo"
+
+
+def test_inject_message_writes_to_worker_stdin(tmp_path: Path) -> None:
+    """inject_message writes a stream-json user line to the worker's stdin."""
+    import time as _time
+    repo = _init_repo(tmp_path / "repo")
+    # Worker reads two lines (initial briefing + injection) then exits.
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "read a; echo got1=$a; read b; echo got2=$b"],
+        repo_path=repo,
+    )
+    a = server.assign(_spec(repo, briefing="first"))
+    # Give Popen a moment to wire stdin and consume the first line.
+    _time.sleep(0.3)
+    server.inject_message(a.id, "second message")
+    final = server.wait_for(a.id, timeout=5.0)
+    log = Path(final.log_path).read_text()
+    assert "got1=" in log and "first" in log
+    assert "got2=" in log and "second message" in log
+    assert "# inject: second message" in log, "inject marker missing from log"
+
+
+def test_inject_message_unknown_id_raises(tmp_path: Path) -> None:
+    server = _server(tmp_path)
+    with pytest.raises(KeyError):
+        server.inject_message("does-not-exist", "hi")
+
+
+def test_inject_message_on_finished_assignment_raises(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+    a = server.assign(_spec(repo))
+    server.wait_for(a.id)  # let it finish
+    with pytest.raises((RuntimeError, BrokenPipeError)):
+        server.inject_message(a.id, "too late")
 
 
 def test_cancel_running_assignment(tmp_path: Path) -> None:

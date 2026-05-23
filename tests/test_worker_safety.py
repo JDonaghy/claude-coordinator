@@ -91,6 +91,23 @@ class TestDefaultWorkerCommand:
         assert argv[idx + 1] == "stream-json"
         assert "--verbose" in argv
 
+    def test_input_format_stream_json_for_injection(self) -> None:
+        """Workers must launch with stream-json input so messages can be
+        injected mid-session via AgentServer.inject_message."""
+        spec = _spec()
+        argv = default_worker_command(spec)
+        assert "--input-format" in argv
+        idx = argv.index("--input-format")
+        assert argv[idx + 1] == "stream-json"
+
+    def test_briefing_not_appended_as_positional_arg(self) -> None:
+        """Briefing is sent via stdin (first stream-json user message),
+        not as a positional argv entry — keeping a positional briefing
+        would force claude into text input mode and break injection."""
+        spec = _spec(briefing="DO NOT APPEAR IN ARGV")
+        argv = default_worker_command(spec)
+        assert spec.briefing not in argv
+
 
 # ── Config parsing ───────────────────────────────────────────────────────────
 

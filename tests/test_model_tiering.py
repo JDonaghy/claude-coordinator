@@ -182,10 +182,16 @@ class TestWorkerCommandModel:
         argv = default_worker_command(spec)
         assert "--model" not in argv
 
-    def test_briefing_is_last_when_model_set(self) -> None:
+    def test_model_pair_present_when_set(self) -> None:
+        """With stream-json input mode the briefing is sent on stdin, not
+        as a positional argv tail — but --model still needs to appear as
+        a flag/value pair."""
         spec = _spec(model="haiku", briefing="my-briefing")
         argv = default_worker_command(spec)
-        assert argv[-1] == "my-briefing"
+        idx = argv.index("--model")
+        assert argv[idx + 1] == "haiku"
+        # Briefing no longer appears in argv — it's stdin-delivered now.
+        assert "my-briefing" not in argv
 
     def test_model_haiku(self) -> None:
         spec = _spec(model="haiku")

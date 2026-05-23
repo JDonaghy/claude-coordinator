@@ -191,9 +191,12 @@ def build_deny_prompt(deny_commands: list[str]) -> str:
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment.
 
-    Uses ``--output-format stream-json --verbose`` so the agent log captures
-    one structured JSON event per line. Downstream tooling
-    (:mod:`coord.worker_events`) parses these for real-time observability.
+    Uses ``--output-format stream-json --verbose`` for structured one-event-
+    per-line log output that :mod:`coord.worker_events` parses for real-time
+    observability.  Also uses ``--input-format stream-json`` so the worker
+    reads turn-by-turn user messages from stdin — the orchestrator writes
+    the initial briefing as a JSON line in :meth:`AgentServer._spawn`, and
+    can later inject additional messages via :meth:`AgentServer.inject_message`.
 
     For ``type="plan"`` specs the worker gets :data:`WORKER_PLAN_PROMPT` as
     its system prompt and only ``Read,Bash`` in ``--allowedTools`` — no
@@ -207,8 +210,11 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         system_prompt += build_deny_prompt(spec.deny_commands)
         allowed_tools = "Read,Edit,Write,Bash"
 
+    # NOTE: briefing is NOT passed as a positional arg — it is written to
+    # stdin as the first stream-json user message by ``_spawn``.
     argv = [
         binary, "-p",
+        "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--verbose",
         "--system-prompt", system_prompt,
@@ -217,8 +223,13 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     ]
     if spec.model:
         argv.extend(["--model", spec.model])
-    argv.append(spec.briefing)
     return argv
+
+
+def _user_message_line(text: str) -> bytes:
+    """Encode a user message as a single stream-json line (with newline)."""
+    payload = {"type": "user", "message": {"role": "user", "content": text}}
+    return (json.dumps(payload) + "\n").encode("utf-8")
 
 
 class AgentServer:
@@ -454,6 +465,44 @@ class AgentServer:
 
         return assignment
 
+    def inject_message(self, assignment_id: str, text: str) -> None:
+        """Inject a new user message into a running worker via its stdin.
+
+        Raises :class:`KeyError` when the assignment doesn't exist on this
+        agent, :class:`RuntimeError` when the worker isn't running, and
+        :class:`BrokenPipeError` when the worker closed its stdin (e.g.
+        already finished or crashed).
+
+        The worker picks up the message at its next turn boundary — between
+        tool calls, not mid-tool.  Each injection appends a `# inject:`
+        marker to the assignment log for traceability.
+        """
+        with self._lock:
+            assignment = self._assignments.get(assignment_id)
+            if assignment is None:
+                raise KeyError(assignment_id)
+            if assignment.status != RUNNING:
+                raise RuntimeError(
+                    f"assignment {assignment_id} is {assignment.status!r}, not running"
+                )
+            proc = self._processes.get(assignment_id)
+        if proc is None or proc.stdin is None or proc.poll() is not None:
+            raise BrokenPipeError(
+                f"worker for {assignment_id} has no open stdin (process exited?)"
+            )
+        try:
+            proc.stdin.write(_user_message_line(text))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise BrokenPipeError(str(e)) from e
+        # Trace the injection in the log so users can correlate later.
+        if assignment.log_path:
+            try:
+                with open(assignment.log_path, "a") as fh:
+                    fh.write(f"# inject: {text}\n")
+            except OSError:
+                pass
+
     def get(self, assignment_id: str) -> AgentAssignment | None:
         with self._lock:
             return self._assignments.get(assignment_id)
@@ -615,7 +664,7 @@ class AgentServer:
                 cwd=str(repo_path),
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 start_new_session=True,
             )
         except (FileNotFoundError, OSError) as e:
@@ -627,6 +676,16 @@ class AgentServer:
                 assignment.finished_at = time.time()
             self._persist()
             return
+
+        # Send the initial briefing as the first stream-json user message.
+        # If this fails (worker exited immediately), let `_reap` capture the
+        # exit code — we just stop trying to write.
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(_user_message_line(assignment.spec.briefing))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            log_fh.write(f"\n# failed to send initial briefing: {e}\n")
 
         with self._lock:
             assignment.status = RUNNING
