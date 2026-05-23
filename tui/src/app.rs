@@ -245,7 +245,7 @@ struct Proposal {
 
 /// One GitHub issue tracked by the pipeline panel.
 ///
-/// Sourced from a background `gh search issues label:<L> state:open` poll
+/// Sourced from a background `gh search issues label:<L> --state all` poll
 /// and matched back to a coord-local repo name via `pipeline_repos` in
 /// `board_meta`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,8 +262,13 @@ struct PipelineIssue {
     /// the issue is in a repo not declared in coordinator.yml — such issues
     /// are still listed but cannot be dispatched.
     coord_repo: Option<String>,
-    /// Tracked labels that flagged this issue.
+    /// Tracked labels that flagged this issue (subset of `all_labels`).
     matched_labels: Vec<String>,
+    /// All GitHub labels on this issue (not filtered by tracked labels).
+    /// Used to compute lifecycle sections (status:refining, status:ready, …).
+    all_labels: Vec<String>,
+    /// True when the issue is closed on GitHub (`state == "closed"`).
+    is_closed: bool,
 }
 
 #[derive(Default)]
@@ -1140,15 +1145,16 @@ fn fetch_pipeline_issues(
     // ignores label:/state: qualifiers in the positional query argument).
     // Scope to the configured repos to avoid noise from unrelated repos that
     // happen to share the same label name (e.g. gcc-postcommit-ci uses "coord").
+    // Fetch both open and closed so the Done lifecycle section is populated.
     let mut args: Vec<String> = vec![
         "search".into(),
         "issues".into(),
         "--state".into(),
-        "open".into(),
+        "all".into(),
         "--json".into(),
-        "number,title,body,labels,repository,url".into(),
+        "number,title,body,labels,repository,url,state".into(),
         "--limit".into(),
-        "100".into(),
+        "200".into(),
     ];
     for label in labels {
         args.push("--label".into());
@@ -1242,6 +1248,12 @@ fn fetch_pipeline_issues(
             .unwrap_or("")
             .to_string();
         let coord_repo = slug_to_local.get(&repo_slug).cloned();
+        let is_closed = item
+            .get("state")
+            .and_then(|s| s.as_str())
+            .map(|s| s == "closed")
+            .unwrap_or(false);
+        let all_labels = issue_labels;
         issues.push(PipelineIssue {
             number,
             title,
@@ -1249,6 +1261,8 @@ fn fetch_pipeline_issues(
             repo_slug,
             coord_repo,
             matched_labels,
+            all_labels,
+            is_closed,
         });
     }
     // Stable order: by repo, then by issue number.
@@ -1357,8 +1371,11 @@ pub struct CoordApp {
     /// Expanded state for each (repo, status_group) pair. Default: true.
     board_status_expanded: std::collections::HashMap<(String, String), bool>,
     // ── Pipeline panel state ────────────────────────────────────────────
-    /// SidebarSystem listing tracked issues (one section per label).
+    /// SidebarSystem listing tracked issues grouped by repo → lifecycle section.
     pipeline_sidebar: SidebarSystem,
+    /// Ordered list of repo keys (coord_repo or repo_slug) used as section IDs
+    /// in the pipeline sidebar.  Rebuilt on each `rebuild_pipeline_sidebar()`.
+    pipeline_repo_names: Vec<String>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
     /// Selected issue index into `pipeline_issues`, if any.
@@ -1459,6 +1476,7 @@ impl CoordApp {
             board_search_focused: false,
             board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
+            pipeline_repo_names: Vec::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_loader: None,
@@ -3001,9 +3019,75 @@ impl CoordApp {
         stages
     }
 
-    /// Build the SidebarSystem entries for the Pipeline panel. One section
-    /// per tracked label, with one row per matching issue.  Re-runs after
-    /// every successful `gh` poll.
+    /// Compute the lifecycle section key for a pipeline issue.
+    ///
+    /// Priority (highest wins):
+    /// 1. `is_closed`            → "done"
+    /// 2. Has any assignment     → "in-progress"
+    /// 3. Has label `status:ready` (no assignments) → "pending"
+    /// 4. Has label `status:refining`               → "refining"
+    /// 5. Otherwise                                 → "new"
+    fn pipeline_lifecycle_section(&self, issue: &PipelineIssue) -> &'static str {
+        if issue.is_closed {
+            return "done";
+        }
+        let has_assignments = self.data.assignments.iter().any(|a| {
+            a.issue_number == issue.number
+                && issue
+                    .coord_repo
+                    .as_deref()
+                    .map(|r| r == a.repo)
+                    .unwrap_or(true)
+        });
+        if has_assignments {
+            return "in-progress";
+        }
+        if issue.all_labels.iter().any(|l| l == "status:ready") {
+            return "pending";
+        }
+        if issue.all_labels.iter().any(|l| l == "status:refining") {
+            return "refining";
+        }
+        "new"
+    }
+
+    /// Return the coord_repo name for an issue, falling back to the repo_slug.
+    fn pipeline_repo_key(issue: &PipelineIssue) -> &str {
+        issue.coord_repo.as_deref().unwrap_or(&issue.repo_slug)
+    }
+
+    /// Group pipeline issues under a repo into non-empty lifecycle sections.
+    ///
+    /// Returns `(lifecycle_key, Vec<pipeline_issues index>)` in display
+    /// order (New → Refining → Pending → In-progress → Done), skipping
+    /// any lifecycle section that contains no issues for this repo.
+    fn pipeline_groups_for_repo(&self, repo_key: &str) -> Vec<(&'static str, Vec<usize>)> {
+        const LIFECYCLE: [&str; 5] = ["new", "refining", "pending", "in-progress", "done"];
+        let mut result: Vec<(&'static str, Vec<usize>)> = Vec::new();
+        for &lc in &LIFECYCLE {
+            let idxs: Vec<usize> = self
+                .pipeline_issues
+                .iter()
+                .enumerate()
+                .filter(|(_, issue)| {
+                    Self::pipeline_repo_key(issue) == repo_key
+                        && self.pipeline_lifecycle_section(issue) == lc
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if !idxs.is_empty() {
+                result.push((lc, idxs));
+            }
+        }
+        result
+    }
+
+    /// Build the SidebarSystem entries for the Pipeline panel.
+    ///
+    /// One section per repo; within each repo, issues are bucketed into
+    /// five lifecycle sub-groups (New → Refining → Pending → In-progress →
+    /// Done).  Empty sub-groups collapse automatically.  Re-runs after every
+    /// successful `gh` poll.
     fn rebuild_pipeline_sidebar(&mut self) {
         // Preserve selection across rebuilds by (repo_slug, issue#).
         let prev_sel = self
@@ -3011,14 +3095,21 @@ impl CoordApp {
             .and_then(|i| self.pipeline_issues.get(i))
             .map(|i| (i.repo_slug.clone(), i.number));
 
-        // Build one section per label (so empty-label apps still render
-        // a useful sidebar).
+        // Collect unique repo keys in stable order (issues are already sorted
+        // by repo_slug within fetch_pipeline_issues).
+        let mut repos: Vec<String> = Vec::new();
+        for issue in &self.pipeline_issues {
+            let key = Self::pipeline_repo_key(issue).to_string();
+            if !repos.contains(&key) {
+                repos.push(key);
+            }
+        }
+
+        // One section per repo.
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
-        for label in &self.data.pipeline_tracked_labels {
-            let mut def = SidebarSectionDef::new(
-                format!("section:label:{}", label),
-                label.clone(),
-            );
+        for repo in &repos {
+            let mut def =
+                SidebarSectionDef::new(format!("section:repo:{}", repo), repo.clone());
             def.show_chevron = true;
             def.size = SectionSize::Content;
             defs.push(def);
@@ -3029,18 +3120,61 @@ impl CoordApp {
         sidebar.set_allow_collapse(true);
         sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
-        // Group issues by their first matched label (a single issue with
-        // multiple matched labels appears once, under its first match).
-        for (sec_idx, label) in self.data.pipeline_tracked_labels.iter().enumerate() {
+        // Lifecycle display labels and header colors.
+        const LIFECYCLE_META: [(&str, &str); 5] = [
+            ("new",         "New"),
+            ("refining",    "Refining"),
+            ("pending",     "Pending"),
+            ("in-progress", "In-progress"),
+            ("done",        "Done"),
+        ];
+
+        // Populate rows for each repo section.
+        for (sec_idx, repo_key) in repos.iter().enumerate() {
+            let groups = self.pipeline_groups_for_repo(repo_key);
+            let total: usize = groups.iter().map(|(_, v)| v.len()).sum();
+            if total > 0 {
+                sidebar.set_section_badge(
+                    sec_idx,
+                    Some(StyledText::plain(format!("({})", total))),
+                );
+            }
+
             let mut rows: Vec<TreeRow> = Vec::new();
-            let mut count = 0usize;
-            for (i, issue) in self.pipeline_issues.iter().enumerate() {
-                if issue
-                    .matched_labels
-                    .first()
-                    .map(|l| l == label)
-                    .unwrap_or(false)
-                {
+            for (li, (lc_key, issue_idxs)) in groups.iter().enumerate() {
+                // Find the display label for this lifecycle key.
+                let lc_label = LIFECYCLE_META
+                    .iter()
+                    .find(|(k, _)| k == lc_key)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(lc_key);
+
+                let header_color = match *lc_key {
+                    "in-progress" => Color::rgb(80, 220, 80),
+                    "done"        => Color::rgb(120, 180, 120),
+                    "pending"     => Color::rgb(140, 180, 240),
+                    "refining"    => Color::rgb(220, 180, 80),
+                    _             => Color::rgb(140, 140, 160), // new
+                };
+
+                rows.push(TreeRow {
+                    path: vec![li as u16],
+                    indent: 1,
+                    icon: None,
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            format!("{} ({})", lc_label, issue_idxs.len()),
+                            header_color,
+                        )],
+                    },
+                    badge: None,
+                    is_expanded: Some(true),
+                    decoration: Decoration::Header,
+                    edit: None,
+                });
+
+                for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
+                    let issue = &self.pipeline_issues[issue_idx];
                     let stage_name = self.derive_current_stage(issue);
                     let (badge_text, badge_color) = stage_badge(&stage_name);
                     let title_color = if issue.coord_repo.is_some() {
@@ -3054,12 +3188,12 @@ impl CoordApp {
                                 format!("#{:<5}", issue.number),
                                 Color::rgb(150, 150, 240),
                             ),
-                            StyledSpan::with_fg(trunc(&issue.title, 22), title_color),
+                            StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
                         ],
                     };
                     rows.push(TreeRow {
-                        path: vec![count as u16],
-                        indent: 0,
+                        path: vec![li as u16, ii as u16],
+                        indent: 2,
                         icon: None,
                         text,
                         badge: Some(Badge::colored(&badge_text, badge_color)),
@@ -3067,83 +3201,65 @@ impl CoordApp {
                         decoration: Decoration::Normal,
                         edit: None,
                     });
-                    let _ = i;
-                    count += 1;
                 }
-            }
-            if count > 0 {
-                sidebar.set_section_badge(
-                    sec_idx,
-                    Some(StyledText::plain(format!("({})", count))),
-                );
             }
             sidebar.set_rows(sec_idx, rows);
         }
 
-        // Default-select the first label section that has at least one issue.
+        // Default-select the first issue in the first non-empty repo section.
         if sidebar.active_section().is_none() {
-            for (i, label) in self.data.pipeline_tracked_labels.iter().enumerate() {
-                let has_any = self.pipeline_issues.iter().any(|issue| {
-                    issue
-                        .matched_labels
-                        .first()
-                        .map(|l| l == label)
-                        .unwrap_or(false)
-                });
-                if has_any {
-                    sidebar.set_active_section(Some(i));
-                    sidebar.set_selected_path(i, Some(vec![0]));
-                    break;
+            'find_default: for sec_idx in 0..repos.len() {
+                let groups = self.pipeline_groups_for_repo(&repos[sec_idx]);
+                if !groups.is_empty() {
+                    sidebar.set_active_section(Some(sec_idx));
+                    // Select the first issue row (path [0, 0] = first lifecycle
+                    // group header expanded → first issue).
+                    sidebar.set_selected_path(sec_idx, Some(vec![0u16, 0u16]));
+                    break 'find_default;
                 }
             }
         }
 
+        self.pipeline_repo_names = repos;
         self.pipeline_sidebar = sidebar;
 
         // Restore previous selection if the issue still exists.
         if let Some((repo, num)) = prev_sel {
-            'outer: for (sec_idx, label) in self.data.pipeline_tracked_labels.iter().enumerate() {
-                let mut row = 0u16;
-                for (i, issue) in self.pipeline_issues.iter().enumerate() {
-                    if issue.matched_labels.first().map(|l| l == label).unwrap_or(false) {
+            'outer: for (sec_idx, repo_key) in self.pipeline_repo_names.iter().enumerate() {
+                let groups = self.pipeline_groups_for_repo(repo_key);
+                for (li, (_, issue_idxs)) in groups.iter().enumerate() {
+                    for (ii, &idx) in issue_idxs.iter().enumerate() {
+                        let issue = &self.pipeline_issues[idx];
                         if issue.repo_slug == repo && issue.number == num {
-                            self.pipeline_sel = Some(i);
+                            self.pipeline_sel = Some(idx);
                             self.pipeline_sidebar.set_active_section(Some(sec_idx));
-                            self.pipeline_sidebar.set_selected_path(sec_idx, Some(vec![row]));
+                            self.pipeline_sidebar
+                                .set_selected_path(sec_idx, Some(vec![li as u16, ii as u16]));
                             break 'outer;
                         }
-                        row += 1;
                     }
                 }
             }
         }
-        // Otherwise sync `pipeline_sel` to the sidebar's default selection.
+        // Sync `pipeline_sel` to the sidebar's actual selection.
         self.pipeline_sel = self.selected_pipeline_index();
     }
 
     /// Resolve the SidebarSystem's current selection to a `pipeline_issues`
-    /// index.  Returns `None` when nothing is selected or the selection
-    /// points past the end (can happen after rebuild + label re-grouping).
+    /// index.  Paths are two-level: `[lifecycle_group_idx, issue_idx_in_group]`.
+    /// A one-level path (group header selected) returns `None`.
     fn selected_pipeline_index(&self) -> Option<usize> {
         let section = self.pipeline_sidebar.active_section()?;
-        let label = self.data.pipeline_tracked_labels.get(section)?;
         let path = self.pipeline_sidebar.selected_path(section)?;
-        let row = *path.first()? as usize;
-        let mut count = 0usize;
-        for (i, issue) in self.pipeline_issues.iter().enumerate() {
-            if issue
-                .matched_labels
-                .first()
-                .map(|l| l == label)
-                .unwrap_or(false)
-            {
-                if count == row {
-                    return Some(i);
-                }
-                count += 1;
-            }
+        if path.len() < 2 {
+            return None; // group header selected, not an issue
         }
-        None
+        let li = path[0] as usize;
+        let ii = path[1] as usize;
+        let repo_key = self.pipeline_repo_names.get(section)?;
+        let groups = self.pipeline_groups_for_repo(repo_key);
+        let (_, issue_idxs) = groups.get(li)?;
+        issue_idxs.get(ii).copied()
     }
 
     /// Resolve the per-stage status of an issue from existing assignments.
@@ -5222,6 +5338,7 @@ mod tests {
             board_search_focused: false,
             board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
+            pipeline_repo_names: Vec::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_loader: None,
@@ -5918,6 +6035,8 @@ mod tests {
                 repo_slug: "acme/api".to_string(),
                 coord_repo: Some("api".to_string()),
                 matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
             },
             PipelineIssue {
                 number: 99,
@@ -5926,6 +6045,8 @@ mod tests {
                 repo_slug: "other/repo".to_string(),
                 coord_repo: None,
                 matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
             },
         ];
         app.rebuild_pipeline_sidebar();
@@ -5956,20 +6077,101 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_pipeline_sidebar_groups_issues_by_label() {
+    fn rebuild_pipeline_sidebar_groups_issues_by_repo() {
         let app = make_pipeline_app();
-        // One section per tracked label.
-        assert_eq!(app.data.pipeline_tracked_labels.len(), 1);
-        // Two issues both have label "coord" → both appear in section 0.
-        assert!(app.pipeline_issues.len() == 2);
+        // Two issues from two different repos → two repo sections.
+        assert_eq!(app.pipeline_repo_names.len(), 2);
+        assert_eq!(app.pipeline_issues.len(), 2);
+        // First repo key comes from coord_repo ("api") for issue #42.
+        assert_eq!(app.pipeline_repo_names[0], "api");
+        // Second repo has no coord mapping, falls back to repo_slug.
+        assert_eq!(app.pipeline_repo_names[1], "other/repo");
     }
 
     #[test]
     fn rebuild_pipeline_sidebar_default_selects_first_issue() {
         let app = make_pipeline_app();
-        // Default selection should be the first issue under the first label.
+        // Default selection should resolve to the first issue (index 0).
         assert!(app.pipeline_sel.is_some());
         assert_eq!(app.pipeline_sel.unwrap(), 0);
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_lifecycle_new_when_no_labels() {
+        let app = make_pipeline_app();
+        // Issue #42 has no status:* labels and no assignments → "new" section.
+        let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
+        assert_eq!(section, "new");
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_lifecycle_refining() {
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].all_labels.push("status:refining".to_string());
+        let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
+        assert_eq!(section, "refining");
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_lifecycle_pending() {
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].all_labels.push("status:ready".to_string());
+        let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
+        assert_eq!(section, "pending");
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_lifecycle_in_progress_beats_ready_label() {
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].all_labels.push("status:ready".to_string());
+        app.data.assignments.push(Assignment {
+            id: "x1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "running".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: Some("work".to_string()),
+        });
+        // Has assignment → in-progress, even though status:ready label is set.
+        let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
+        assert_eq!(section, "in-progress");
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_lifecycle_done_when_closed() {
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
+        assert_eq!(section, "done");
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_lifecycle_done_beats_in_progress() {
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        app.data.assignments.push(Assignment {
+            id: "x2".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "running".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: Some("work".to_string()),
+        });
+        // is_closed wins over has-assignment.
+        let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
+        assert_eq!(section, "done");
     }
 
     #[test]
