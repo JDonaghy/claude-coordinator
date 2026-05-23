@@ -1227,6 +1227,8 @@ pub struct CoordApp {
     board_search: String,
     /// Cursor byte offset into `board_search` (always kept at end of value).
     board_search_cursor: usize,
+    /// Whether the search input is accepting keyboard input.
+    board_search_focused: bool,
     /// Expanded state for each (repo, status_group) pair. Default: true.
     board_status_expanded: std::collections::HashMap<(String, String), bool>,
     // ── Pipeline panel state ────────────────────────────────────────────
@@ -1309,6 +1311,7 @@ impl CoordApp {
             command_scroll: 0,
             board_search: String::new(),
             board_search_cursor: 0,
+            board_search_focused: false,
             board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_issues: Vec::new(),
@@ -1598,9 +1601,13 @@ impl CoordApp {
                 disabled: false,
                 validation: None,
             }],
-            focused_field: None,
+            focused_field: if self.board_search_focused {
+                Some(WidgetId::new("board-search-input"))
+            } else {
+                None
+            },
             scroll_offset: 0,
-            has_focus: false,
+            has_focus: self.board_search_focused,
         });
 
         let offset = search_offset + if self.has_proposals_section { 1 } else { 0 };
@@ -1713,7 +1720,7 @@ impl CoordApp {
                 };
                 rows.push(TreeRow {
                     path: vec![gi],
-                    indent: 0,
+                    indent: 1,
                     icon: None,
                     text: StyledText {
                         spans: vec![StyledSpan::with_fg(
@@ -1729,7 +1736,7 @@ impl CoordApp {
 
                 if is_exp {
                     for (issue_idx, (_flat_idx, g)) in group_issues.iter().enumerate() {
-                        let sc = g.status_color();
+                        let _sc = g.status_color();
                         let text = StyledText {
                             spans: vec![
                                 StyledSpan::with_fg(
@@ -1741,10 +1748,10 @@ impl CoordApp {
                         };
                         rows.push(TreeRow {
                             path: vec![gi, issue_idx as u16],
-                            indent: 1,
+                            indent: 2,
                             icon: None,
                             text,
-                            badge: Some(Badge::colored(&g.status_summary, sc)),
+                            badge: None,
                             is_expanded: None,
                             decoration: if g.status_summary == "failed" {
                                 Decoration::Error
@@ -3127,14 +3134,33 @@ impl CoordApp {
             SidebarView::Board => {
                 let result = self.board_sidebar.handle(event, backend, sidebar_b);
                 match result {
-                    SidebarEvent::RowSelected { .. } => {
-                        self.detail_scroll = 0;
-                        self.activity_scroll = None;
+                    SidebarEvent::RowSelected { section, ref path } => {
+                        if path.len() == 1 {
+                            // Single-click on a status-group header toggles expansion.
+                            let offset = self.board_repo_offset();
+                            if section >= offset {
+                                let repo_idx = section - offset;
+                                if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
+                                    let group_idx = path[0] as usize;
+                                    let cache = self.board_issues_cache.clone();
+                                    let groups = self.board_grouped_for_repo(&cache, &repo);
+                                    if let Some((key, _)) = groups.get(group_idx) {
+                                        let key = key.to_string();
+                                        let entry = self.board_status_expanded
+                                            .entry((repo, key))
+                                            .or_insert(true);
+                                        *entry = !*entry;
+                                        self.rebuild_board_sidebar();
+                                    }
+                                }
+                            }
+                        } else {
+                            self.detail_scroll = 0;
+                            self.activity_scroll = None;
+                        }
                         true
                     }
                     SidebarEvent::RowActivated { section, ref path } => {
-                        // A 1-deep path means a status-group header was activated —
-                        // toggle its expansion and rebuild the sidebar.
                         if path.len() == 1 {
                             let offset = self.board_repo_offset();
                             if section >= offset {
@@ -3543,6 +3569,55 @@ impl ShellApp for CoordApp {
         match &event {
             UiEvent::KeyPressed { key, .. } => {
                 match key {
+                    // ── Board search input ───────────────────────────────
+                    // Escape clears search or (if already empty) quits.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search.is_empty() =>
+                    {
+                        self.board_search.clear();
+                        self.board_search_cursor = 0;
+                        self.board_search_focused = false;
+                        self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+                    // Backspace while search is active removes char before cursor.
+                    Key::Named(NamedKey::Backspace)
+                        if self.active_view == SidebarView::Board
+                            && self.board_search_focused =>
+                    {
+                        if self.board_search_cursor > 0 {
+                            // Find the start of the previous char (UTF-8 aware).
+                            let mut prev = self.board_search_cursor - 1;
+                            while prev > 0 && !self.board_search.is_char_boundary(prev) {
+                                prev -= 1;
+                            }
+                            self.board_search.remove(prev);
+                            self.board_search_cursor = prev;
+                        }
+                        self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+                    // Any printable char while search is active inserts at cursor.
+                    Key::Char(ch)
+                        if self.active_view == SidebarView::Board
+                            && self.board_search_focused =>
+                    {
+                        self.board_search.insert(self.board_search_cursor, *ch);
+                        self.board_search_cursor += ch.len_utf8();
+                        self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+                    // '/' activates search when not already active.
+                    Key::Char('/')
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search_focused =>
+                    {
+                        self.board_search_focused = true;
+                        self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
 
                     // ── Switch sidebar views ─────────────────────────────
@@ -3724,9 +3799,41 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── Arrow cursor movement inside the search box ───────
+                    Key::Named(NamedKey::Left)
+                        if self.active_view == SidebarView::Board
+                            && self.board_search_focused =>
+                    {
+                        // Move cursor one Unicode scalar left.
+                        let chars: Vec<char> = self.board_search.chars().collect();
+                        let char_pos = chars.len().min(self.board_search_cursor);
+                        if char_pos > 0 {
+                            self.board_search_cursor =
+                                chars[..char_pos - 1].iter().collect::<String>().len();
+                        }
+                        self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Board
+                            && self.board_search_focused =>
+                    {
+                        let max = self.board_search.len();
+                        if self.board_search_cursor < max {
+                            // Advance past the next char boundary.
+                            let rest = &self.board_search[self.board_search_cursor..];
+                            if let Some(ch) = rest.chars().next() {
+                                self.board_search_cursor += ch.len_utf8();
+                            }
+                        }
+                        self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+
                     // ── Left / h — switch to Summary tab (Board only) ─────
                     Key::Named(NamedKey::Left) | Key::Char('h')
-                        if self.active_view == SidebarView::Board =>
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search_focused =>
                     {
                         if self.detail_tab != DetailTab::Summary {
                             self.detail_tab = DetailTab::Summary;
@@ -3736,7 +3843,8 @@ impl ShellApp for CoordApp {
 
                     // ── Right / l — switch to Activity tab (Board only) ───
                     Key::Named(NamedKey::Right) | Key::Char('l')
-                        if self.active_view == SidebarView::Board =>
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search_focused =>
                     {
                         if self.detail_tab != DetailTab::Activity {
                             self.detail_tab = DetailTab::Activity;
@@ -3934,6 +4042,7 @@ mod tests {
             command_scroll: 0,
             board_search: String::new(),
             board_search_cursor: 0,
+            board_search_focused: false,
             board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_issues: Vec::new(),
