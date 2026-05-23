@@ -263,28 +263,43 @@ def _try_parse_and_post_review(
             github_ops.post_pr_review(repo_github, pr_number, findings.verdict, findings.body)
             return True
         except Exception as exc:  # noqa: BLE001
+            # GitHub rejects self-reviews (same user who opened the PR can't
+            # review it via the API). Log the actual error and fall through to
+            # post the findings as an issue comment instead of silently failing.
             log.warning(
-                "Failed to post PR review for %s PR#%s: %s",
+                "Failed to post PR review for %s PR#%s via gh: %s — "
+                "falling back to issue comment",
                 transition.assignment_id, pr_number, exc,
             )
-            return False
-    else:
-        # No PR number — post findings as an issue comment.
-        verdict_label = "✅ Approved" if findings.verdict == "approve" else "⚠️ Changes Requested"
-        body = (
-            f"## Review Complete — {verdict_label}\n\n"
-            f"*Reviewer could not post directly to a PR (no PR number available). "
-            f"Findings are reproduced here.*\n\n"
-            f"{findings.body}"
+            # Fall through to the issue-comment path below.
+
+    # No PR number available, or gh pr review was rejected — post findings as
+    # an issue comment so they are never silently lost.
+    verdict_label = "✅ Approved" if findings.verdict == "approve" else "⚠️ Changes Requested"
+    if pr_number is not None:
+        preamble = (
+            f"*Reviewer findings could not be posted directly to PR #{pr_number} "
+            f"(gh pr review was rejected — likely a self-review restriction). "
+            f"Findings are reproduced here.*"
         )
-        try:
-            github_ops.post_issue_comment(repo_github, transition.issue_number, body)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Failed to post review comment for %s: %s", transition.assignment_id, exc
-            )
-            return False
+    else:
+        preamble = (
+            "*Reviewer could not post directly to a PR (no PR number available). "
+            "Findings are reproduced here.*"
+        )
+    body = (
+        f"## Review Complete — {verdict_label}\n\n"
+        f"{preamble}\n\n"
+        f"{findings.body}"
+    )
+    try:
+        github_ops.post_issue_comment(repo_github, transition.issue_number, body)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Failed to post review comment for %s: %s", transition.assignment_id, exc
+        )
+        return False
 
 
 def _try_parse_and_post_plan(

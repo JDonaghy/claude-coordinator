@@ -685,3 +685,47 @@ END_REVIEW
         assert result is not None
         assert "Line 1." in result.body
         assert "Point B" in result.body
+
+    def test_pass_alias_maps_to_approve(self, tmp_path: Path) -> None:
+        """PASS is accepted as an alias for approve."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: PASS
+REVIEW_BODY:
+All checks pass. Clean diff.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "approve"
+        assert "All checks pass." in result.body
+
+    def test_fail_alias_maps_to_request_changes(self, tmp_path: Path) -> None:
+        """FAIL is accepted as an alias for request-changes."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: FAIL
+REVIEW_BODY:
+Security issue at auth.py:10.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "Security issue" in result.body
+
+    def test_pass_alias_case_insensitive(self, tmp_path: Path) -> None:
+        """'pass' in any case is normalized to 'approve'."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, "REVIEW_VERDICT: Pass\nREVIEW_BODY:\nOK.\nEND_REVIEW\n")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "approve"
+
+    def test_fail_alias_case_insensitive(self, tmp_path: Path) -> None:
+        """'fail' in any case is normalized to 'request-changes'."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, "REVIEW_VERDICT: Fail\nREVIEW_BODY:\nProblems found.\nEND_REVIEW\n")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
