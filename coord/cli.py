@@ -1924,6 +1924,59 @@ def _display_plan(plan: object, assignment: object) -> None:
         click.echo(plan.estimate)
 
 
+@main.command(help="Send a user message to a running worker mid-session.")
+@click.argument("assignment_id")
+@click.argument("text", nargs=-1, required=True)
+@_CONFIG_OPTION
+def inject(assignment_id: str, text: tuple[str, ...], config_path: Path) -> None:
+    """Inject TEXT as a new user message into the running worker's session.
+
+    The worker picks the message up at its next turn boundary — between
+    tool calls, not mid-tool.  Useful for adding guidance to a worker
+    that's going off the rails without having to stop + re-dispatch.
+    """
+    from coord.network import inject_message
+    from coord.state import build_board, load_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    machine = next(
+        (m for m in cfg.machines if m.name == assignment.machine_name), None
+    )
+    if machine is None:
+        click.echo(f"error: machine {assignment.machine_name!r} not in config", err=True)
+        sys.exit(1)
+
+    message = " ".join(text).strip()
+    if not message:
+        click.echo("error: message text is empty", err=True)
+        sys.exit(2)
+
+    try:
+        status, body = inject_message(machine, assignment_id, message)
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        click.echo(f"error: could not reach agent on {machine.name}: {e}", err=True)
+        sys.exit(1)
+
+    if status == 202:
+        click.echo(
+            f"Message delivered to {assignment.repo_name} #{assignment.issue_number} "
+            f"on {machine.name}"
+        )
+    else:
+        click.echo(
+            f"error: agent rejected message (HTTP {status}): {body.get('error', body)}",
+            err=True,
+        )
+        sys.exit(1)
+
+
 @main.command(help="Cancel a running assignment.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION

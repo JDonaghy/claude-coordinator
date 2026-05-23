@@ -109,6 +109,37 @@ def build_app(
             return JSONResponse({"error": f"unknown assignment {assignment_id}"}, status_code=404)
         return JSONResponse(assignment.to_dict())
 
+    async def inject(request: Request) -> JSONResponse:
+        """Inject a new user message into a running worker's session.
+
+        Body (JSON): ``{"text": "..."}``.  Worker picks up the message at
+        its next turn boundary.  Returns 404 if the assignment isn't on
+        this agent, 409 if it isn't running, 410 if the worker's stdin
+        is already closed.
+        """
+        assignment_id = request.path_params["id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            return JSONResponse(
+                {"error": "body must be {\"text\": \"<non-empty string>\"}"},
+                status_code=400,
+            )
+        try:
+            server.inject_message(assignment_id, text)
+        except KeyError:
+            return JSONResponse(
+                {"error": f"unknown assignment {assignment_id}"}, status_code=404
+            )
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        except BrokenPipeError as e:
+            return JSONResponse({"error": str(e)}, status_code=410)
+        return JSONResponse({"status": "delivered"}, status_code=202)
+
     async def logs(request: Request) -> Response:
         assignment_id = request.path_params["id"]
         assignment = server.get(assignment_id)
@@ -305,6 +336,7 @@ def build_app(
         Route("/repos", repos, methods=["GET"]),
         Route("/assign", assign, methods=["POST"]),
         Route("/cancel/{id}", cancel, methods=["POST"]),
+        Route("/inject/{id}", inject, methods=["POST"]),
         Route("/logs/{id}", logs, methods=["GET"]),
         Route("/stream/{id}", stream, methods=["GET"]),
         Route("/update", update, methods=["POST"]),

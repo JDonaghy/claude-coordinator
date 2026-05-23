@@ -132,6 +132,55 @@ def test_cancel_unknown_id_returns_404(tmp_path: Path) -> None:
     assert r.status_code == 404
 
 
+def test_inject_endpoint_delivers_message(tmp_path: Path) -> None:
+    """POST /inject/{id} writes the text to the worker's stdin."""
+    import time
+    repo = _init_repo(tmp_path / "repo")
+    client, server = _client(
+        tmp_path,
+        argv=["/bin/sh", "-c", "read a; echo got1=$a; read b; echo got2=$b"],
+        repo_path=repo,
+    )
+    r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
+    aid = r.json()["id"]
+    time.sleep(0.3)  # let stdin wire up + first line drain
+
+    r = client.post(f"/inject/{aid}", json={"text": "injected-content"})
+    assert r.status_code == 202, r.text
+    assert r.json()["status"] == "delivered"
+
+    final = server.wait_for(aid, timeout=5.0)
+    log = Path(final.log_path).read_text()
+    assert "injected-content" in log
+    assert "# inject: injected-content" in log
+
+
+def test_inject_endpoint_unknown_id_returns_404(tmp_path: Path) -> None:
+    client, _ = _client(tmp_path)
+    r = client.post("/inject/missing", json={"text": "hi"})
+    assert r.status_code == 404
+
+
+def test_inject_endpoint_finished_assignment_returns_409_or_410(tmp_path: Path) -> None:
+    """A finished assignment can no longer be injected into."""
+    repo = _init_repo(tmp_path / "repo")
+    client, server = _client(tmp_path, argv=["/bin/echo", "done"], repo_path=repo)
+    r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
+    aid = r.json()["id"]
+    server.wait_for(aid)
+
+    r = client.post(f"/inject/{aid}", json={"text": "too late"})
+    assert r.status_code in (409, 410)
+
+
+def test_inject_endpoint_rejects_bad_body(tmp_path: Path) -> None:
+    client, _ = _client(tmp_path)
+    r = client.post("/inject/anything", json={"wrong_key": "x"})
+    assert r.status_code == 400
+    r = client.post("/inject/anything", json={"text": ""})
+    assert r.status_code == 400
+
+
 def test_logs_endpoint_returns_log_content(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo hello-from-worker"], repo_path=repo)

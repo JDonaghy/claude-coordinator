@@ -177,3 +177,24 @@ def fetch_log(
     params = {"since": since} if since else None
     resp = httpx.get(url, params=params, timeout=timeout)
     return resp.status_code, resp.content
+
+
+def inject_message(
+    machine: Machine,
+    assignment_id: str,
+    text: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> tuple[int, dict]:
+    """POST /inject/{id} to send `text` as a new user message to a running
+    worker.  Returns (status_code, response_body_dict).  Returned status:
+    202 on delivery, 404 unknown assignment, 409 not running, 410 stdin
+    closed, 400 bad body.
+    """
+    url = f"http://{machine.host}:{AGENT_PORT}/inject/{assignment_id}"
+    resp = httpx.post(url, json={"text": text}, timeout=timeout)
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"error": "non-json response", "raw": resp.text[:200]}
+    return resp.status_code, body
