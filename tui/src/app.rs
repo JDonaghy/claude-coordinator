@@ -4444,7 +4444,13 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
                     Key::Char('R') => {
-                        if let Some(a) = self.board_selected_failed_assignment() {
+                        if self.active_view == SidebarView::Pipeline {
+                            // In the Pipeline panel, R fires the active
+                            // stage button — Retry on a Failed stage, or
+                            // Go on a Pending one (same as Enter).
+                            self.dispatch_pipeline_active_go();
+                            needs_redraw = true;
+                        } else if let Some(a) = self.board_selected_failed_assignment() {
                             let id = a.id.clone();
                             self.command_runner.spawn(&["retry", &id]);
                             needs_redraw = true;
