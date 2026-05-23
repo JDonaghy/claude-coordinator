@@ -44,6 +44,7 @@ use quadraui::compose::sidebar_system::{
     NavigationMode, SidebarEvent, SidebarSectionDef, SidebarSystem,
 };
 use quadraui::primitives::form::{FieldKind, Form, FormEvent, FormField};
+use quadraui::primitives::toast::{ToastCorner, ToastItem, ToastSeverity, ToastStack};
 use quadraui::{
     Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
@@ -59,6 +60,9 @@ const REFRESH_EVERY: Duration = Duration::from_secs(5);
 
 /// Auto-run `coord notify` every 30 seconds when assignments are running.
 const NOTIFY_EVERY: Duration = Duration::from_secs(30);
+
+/// How long a toast stays visible before auto-dismissing.
+const TOAST_TTL: Duration = Duration::from_secs(4);
 
 // ─── Detail panel tabs ────────────────────────────────────────────────────────
 
@@ -1347,6 +1351,13 @@ pub struct CoordApp {
     /// Status message shown when a dispatch is queued/skipped due to no
     /// available machine. Cleared after a short TTL.
     pipeline_status: Option<(String, Instant)>,
+    /// Active toasts rendered as a bottom-right overlay. Each entry pairs
+    /// a `ToastItem` with the time it was added so the host can auto-expire
+    /// them after a few seconds without the user dismissing manually.
+    toasts: Vec<(ToastItem, Instant, ToastSeverity)>,
+    /// Monotonic counter for toast widget IDs (must be unique per toast).
+    #[allow(dead_code)] // read by push_toast (used by watch overlay)
+    next_toast_id: u64,
     /// Which tab is active in the Pipeline detail pane.
     pipeline_detail_tab: PipelineDetailTab,
     /// Scroll offset for the issue body on the Issue tab.
@@ -1426,6 +1437,8 @@ impl CoordApp {
             pipeline_loader: None,
             pipeline_last_load: None,
             pipeline_status: None,
+            toasts: Vec::new(),
+            next_toast_id: 0,
             pipeline_detail_tab: PipelineDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1484,6 +1497,66 @@ impl CoordApp {
         if self.pending_data.is_none() {
             self.pending_data = Some(start_data_load());
         }
+    }
+
+    /// Push a new toast with the given title, body, and severity. Toasts
+    /// auto-expire after [`TOAST_TTL`] in [`render`]/[`prune_toasts`].
+    #[allow(dead_code)] // used by the watch overlay (#TBD)
+    fn push_toast(&mut self, title: &str, body: &str, severity: ToastSeverity) {
+        self.next_toast_id += 1;
+        let id = WidgetId::new(format!("toast-{}", self.next_toast_id));
+        let item = ToastItem {
+            id,
+            title: title.to_string(),
+            body: body.to_string(),
+            severity,
+            action: None,
+            accent: None,
+        };
+        self.toasts.push((item, Instant::now(), severity));
+    }
+
+    /// Drop toasts older than [`TOAST_TTL`] so the overlay stays uncluttered.
+    fn prune_toasts(&mut self) {
+        self.toasts.retain(|(_, t, _)| t.elapsed() < TOAST_TTL);
+    }
+
+    /// Build the visible `ToastStack` for the bottom-right overlay.
+    ///
+    /// Returns `None` when no toasts are active.  Auto-promotes the
+    /// most recent `pipeline_status` message to a toast so every
+    /// dispatch site already gets corner feedback without each helper
+    /// having to call `push_toast` explicitly.
+    fn toast_stack(&self) -> Option<ToastStack> {
+        let mut items: Vec<ToastItem> = self
+            .toasts
+            .iter()
+            .map(|(it, _, _)| it.clone())
+            .collect();
+        if let Some((msg, when)) = &self.pipeline_status {
+            if when.elapsed() < TOAST_TTL {
+                items.push(ToastItem {
+                    id: WidgetId::new(format!("pipeline-status-{}", when.elapsed().as_millis())),
+                    title: "Pipeline".to_string(),
+                    body: msg.clone(),
+                    severity: if msg.contains("no reachable") || msg.contains("no failed") || msg.contains("not found") {
+                        ToastSeverity::Warning
+                    } else {
+                        ToastSeverity::Info
+                    },
+                    action: None,
+                    accent: None,
+                });
+            }
+        }
+        if items.is_empty() {
+            return None;
+        }
+        Some(ToastStack {
+            id: WidgetId::new("coord-toasts"),
+            corner: ToastCorner::BottomRight,
+            toasts: items,
+        })
     }
 
     /// Spawn `coord sync --quiet` in the background if not already running
@@ -4244,6 +4317,11 @@ impl ShellApp for CoordApp {
         if let Some(bp) = layout.bottom_panel_bounds {
             backend.draw_list(bp, &self.command_output_list());
         }
+
+        // ── Toast overlay (bottom-right of main content) ────────────────
+        if let Some(stack) = self.toast_stack() {
+            backend.draw_toast_stack(layout.main_content_bounds, &stack);
+        }
     }
 
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend, ctx: &ShellContext) -> Reaction {
@@ -4251,6 +4329,13 @@ impl ShellApp for CoordApp {
 
         // ── Drain pending background data load ──────────────────────────
         if self.apply_pending_data() {
+            needs_redraw = true;
+        }
+
+        // ── Expire stale toasts ─────────────────────────────────────────
+        let before = self.toasts.len();
+        self.prune_toasts();
+        if self.toasts.len() != before {
             needs_redraw = true;
         }
 
@@ -4834,6 +4919,8 @@ mod tests {
             pipeline_loader: None,
             pipeline_last_load: None,
             pipeline_status: None,
+            toasts: Vec::new(),
+            next_toast_id: 0,
             pipeline_detail_tab: PipelineDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
