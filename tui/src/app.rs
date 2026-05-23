@@ -72,6 +72,16 @@ enum DetailTab {
     Activity,
 }
 
+/// The two tabs shown in the Pipeline view detail panel.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum PipelineDetailTab {
+    /// Horizontal stage view + repo/labels/gates meta.
+    #[default]
+    Pipeline,
+    /// Full issue body text (scrollable with j/k).
+    Issue,
+}
+
 // ─── Sidebar views ────────────────────────────────────────────────────────────
 
 /// The selectable top-level views shown in the left sidebar.
@@ -1063,7 +1073,8 @@ fn fetch_pipeline_issues(
 
     // Use --label and --state flags (not a query string — gh search issues
     // ignores label:/state: qualifiers in the positional query argument).
-    // Multiple --label flags are OR'd by gh.
+    // Scope to the configured repos to avoid noise from unrelated repos that
+    // happen to share the same label name (e.g. gcc-postcommit-ci uses "coord").
     let mut args: Vec<String> = vec![
         "search".into(),
         "issues".into(),
@@ -1077,6 +1088,10 @@ fn fetch_pipeline_issues(
     for label in labels {
         args.push("--label".into());
         args.push(label.clone());
+    }
+    for (_local, slug) in repos {
+        args.push("--repo".into());
+        args.push(slug.clone());
     }
 
     let output = std::process::Command::new("gh")
@@ -1285,7 +1300,9 @@ pub struct CoordApp {
     /// Status message shown when a dispatch is queued/skipped due to no
     /// available machine. Cleared after a short TTL.
     pipeline_status: Option<(String, Instant)>,
-    /// Scroll offset for the issue body in the Pipeline detail pane.
+    /// Which tab is active in the Pipeline detail pane.
+    pipeline_detail_tab: PipelineDetailTab,
+    /// Scroll offset for the issue body on the Issue tab.
     pipeline_detail_scroll: usize,
     /// Cache of remotely-fetched log items, keyed by assignment ID.
     ///
@@ -1362,6 +1379,7 @@ impl CoordApp {
             pipeline_loader: None,
             pipeline_last_load: None,
             pipeline_status: None,
+            pipeline_detail_tab: PipelineDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: Some(start_data_load()),
@@ -3030,31 +3048,75 @@ impl CoordApp {
         }
     }
 
-    /// Detail strip for the selected issue (issue title, repo, gates, etc.).
-    fn pipeline_issue_summary(&self) -> ListView {
+    fn pipeline_detail_tab_bar(&self) -> TabBar {
+        TabBar {
+            id: WidgetId::new("pipeline-detail-tabs"),
+            tabs: vec![
+                TabItem {
+                    label: " Pipeline ".to_string(),
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Pipeline,
+                    is_dirty: false,
+                    is_preview: false,
+                },
+                TabItem {
+                    label: " Issue ".to_string(),
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Issue,
+                    is_dirty: false,
+                    is_preview: false,
+                },
+            ],
+            scroll_offset: 0,
+            right_segments: vec![],
+            active_accent: None,
+            show_tab_close: false,
+            compact: true,
+        }
+    }
+
+    /// Issue tab: title header + scrollable full body (j/k to scroll).
+    fn pipeline_issue_body_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
         if let Some(idx) = self.pipeline_sel {
             if let Some(issue) = self.pipeline_issues.get(idx) {
-                // ── Title ────────────────────────────────────────────────
                 items.push(ListItem {
                     text: StyledText {
                         spans: vec![
-                            StyledSpan::with_fg(
-                                format!(" #{}", issue.number),
-                                Color::rgb(150, 150, 240),
-                            ),
-                            StyledSpan::with_fg(
-                                format!("  {}", issue.title),
-                                Color::rgb(230, 230, 255),
-                            ),
+                            StyledSpan::with_fg(format!(" #{}", issue.number), Color::rgb(150, 150, 240)),
+                            StyledSpan::with_fg(format!("  {}", issue.title), Color::rgb(230, 230, 255)),
                         ],
                     },
                     icon: None,
                     detail: None,
                     decoration: Decoration::Header,
                 });
+                items.push(kv_item("", "", None));
+                if issue.body.is_empty() {
+                    items.push(kv_item("", " (no description)", Some(Color::rgb(100, 100, 100))));
+                } else {
+                    for line in issue.body.lines() {
+                        items.push(kv_item("", &format!(" {}", line), Some(Color::rgb(200, 200, 210))));
+                    }
+                }
+            }
+        } else {
+            items.push(kv_item("", " No issue selected", Some(Color::rgb(100, 100, 100))));
+        }
+        ListView {
+            id: WidgetId::new("pipeline-issue-body"),
+            title: None,
+            items,
+            selected_idx: 0,
+            scroll_offset: self.pipeline_detail_scroll,
+            has_focus: false,
+            bordered: false,
+        }
+    }
 
-                // ── Meta ─────────────────────────────────────────────────
+    /// Pipeline tab: meta strip (repo/labels/gates/status).
+    fn pipeline_issue_summary(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+        if let Some(idx) = self.pipeline_sel {
+            if let Some(issue) = self.pipeline_issues.get(idx) {
                 items.push(kv_item("Repo", &issue.repo_slug, Some(Color::rgb(160, 160, 180))));
                 if let Some(local) = &issue.coord_repo {
                     items.push(kv_item("Local", local, Some(Color::rgb(140, 200, 140))));
@@ -3065,21 +3127,6 @@ impl CoordApp {
                     items.push(kv_item("Labels", &issue.matched_labels.join(", "), Some(Color::rgb(160, 160, 180))));
                 }
                 items.push(kv_item("Gates", &self.pipeline_stage_names().join(" → "), Some(Color::rgb(160, 160, 180))));
-
-                // ── Body ─────────────────────────────────────────────────
-                if !issue.body.is_empty() {
-                    items.push(kv_item("", "", None)); // spacer
-                    for line in issue.body.lines() {
-                        let text = if line.is_empty() {
-                            " ".to_string()
-                        } else {
-                            format!(" {}", line)
-                        };
-                        items.push(kv_item("", &text, Some(Color::rgb(200, 200, 210))));
-                    }
-                }
-
-                // ── Status message ───────────────────────────────────────
                 if let Some((msg, when)) = &self.pipeline_status {
                     if when.elapsed() < Duration::from_secs(8) {
                         items.push(kv_item("", "", None));
@@ -3090,10 +3137,10 @@ impl CoordApp {
         }
         ListView {
             id: WidgetId::new("pipeline-summary"),
-            title: Some(StyledText::plain(" ISSUE ")),
+            title: None,
             items,
             selected_idx: 0,
-            scroll_offset: self.pipeline_detail_scroll,
+            scroll_offset: 0,
             has_focus: false,
             bordered: false,
         }
@@ -3609,20 +3656,36 @@ impl ShellApp for CoordApp {
                 backend.draw_list(m, &self.machine_detail_list());
             }
             SidebarView::Pipeline => {
-                // Top: PipelineView widget if an issue is selected.
-                // Bottom: issue summary list.
-                let pv_rect = pipeline_detail_pv_rect(m, lh);
-                let summary_rect = Rect::new(
-                    m.x,
-                    pv_rect.y + pv_rect.height,
-                    m.width,
-                    (m.height - (pv_rect.y - m.y) - pv_rect.height).max(0.0),
-                );
-                if let Some(view) = self.build_pipeline_widget() {
-                    backend.draw_pipeline_view(pv_rect, &view);
-                    backend.draw_list(summary_rect, &self.pipeline_issue_summary());
-                } else {
+                if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
                     backend.draw_list(m, &self.pipeline_placeholder_list());
+                } else {
+                    // Tab bar.
+                    let tab_bar = self.pipeline_detail_tab_bar();
+                    let tab_h = lh * 1.4;
+                    let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
+                    let content_rect = Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
+                    backend.draw_tab_bar(tab_rect, &tab_bar, None);
+
+                    match self.pipeline_detail_tab {
+                        PipelineDetailTab::Pipeline => {
+                            let pv_rect = pipeline_detail_pv_rect(content_rect, lh);
+                            let meta_rect = Rect::new(
+                                content_rect.x,
+                                pv_rect.y + pv_rect.height,
+                                content_rect.width,
+                                (content_rect.height - pv_rect.height).max(0.0),
+                            );
+                            if let Some(view) = self.build_pipeline_widget() {
+                                backend.draw_pipeline_view(pv_rect, &view);
+                            } else {
+                                backend.draw_list(pv_rect, &self.pipeline_placeholder_list());
+                            }
+                            backend.draw_list(meta_rect, &self.pipeline_issue_summary());
+                        }
+                        PipelineDetailTab::Issue => {
+                            backend.draw_list(content_rect, &self.pipeline_issue_body_list());
+                        }
+                    }
                 }
             }
         }
@@ -3765,6 +3828,22 @@ impl ShellApp for CoordApp {
                         }
                     }
 
+                    // ── j/k — scroll Issue tab body ───────────────────────
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Issue =>
+                    {
+                        self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_add(1);
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Issue =>
+                    {
+                        self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+
                     // ── Down / j ─────────────────────────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down) => {
                         match self.active_view {
@@ -3832,17 +3911,19 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── J / K — scroll Pipeline detail body ──────────────
-                    Key::Char('J')
+                    // ── h/l — switch Pipeline detail tabs ────────────────
+                    Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_add(1);
+                        self.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+                        self.pipeline_detail_scroll = 0;
                         needs_redraw = true;
                     }
-                    Key::Char('K')
+                    Key::Char('l') | Key::Named(NamedKey::Right)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_sub(1);
+                        self.pipeline_detail_tab = PipelineDetailTab::Issue;
+                        self.pipeline_detail_scroll = 0;
                         needs_redraw = true;
                     }
 
@@ -4188,6 +4269,7 @@ mod tests {
             pipeline_loader: None,
             pipeline_last_load: None,
             pipeline_status: None,
+            pipeline_detail_tab: PipelineDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: None,

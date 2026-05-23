@@ -675,9 +675,16 @@ def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
     """
     conn = get_connection()
     now = time.time()
+    # Mark all current open issues for this repo as closed; the upsert below
+    # will reopen those still present in the fetched list.
     conn.execute(
         "UPDATE issues SET state = 'closed' WHERE repo_name = ?",
         (repo_name,),
+    )
+    # Prune closed issues synced more than 7 days ago to keep the DB lean.
+    conn.execute(
+        "DELETE FROM issues WHERE repo_name = ? AND state = 'closed' AND synced_at < ?",
+        (repo_name, now - 7 * 86400),
     )
     for issue in issues:
         labels = json.dumps(
