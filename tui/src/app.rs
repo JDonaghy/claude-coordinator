@@ -884,6 +884,39 @@ fn load_data() -> BoardData {
     }
 }
 
+/// Spawn a background thread that calls [`load_data`] and sends the result
+/// over a channel.  The caller polls the returned [`Receiver`] without
+/// blocking the UI thread.
+fn start_data_load() -> std::sync::mpsc::Receiver<BoardData> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(load_data());
+    });
+    rx
+}
+
+/// Spawn a background thread that fetches a remote agent log over HTTP.
+///
+/// Returns a `Receiver` that yields `Ok(raw_content)` or `Err(error_message)`.
+/// The caller must parse the content with [`parse_log_content`] on the main
+/// thread — keeping `ListItem` construction off the worker thread.
+fn spawn_log_fetch(host: &str, id: &str) -> std::sync::mpsc::Receiver<Result<String, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = format!("http://{}:7433/logs/{}", host, id);
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(5))
+            .build();
+        let result = match agent.get(&url).call() {
+            Ok(resp) => resp.into_string().map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
 // ─── CoordApp ─────────────────────────────────────────────────────────────────
 
 /// Backend-neutral coordinator dashboard.
@@ -931,6 +964,17 @@ pub struct CoordApp {
     /// re-fetched on the next render that needs them. `RefCell` is used so the
     /// cache can be updated from `&self` methods (render path).
     remote_log_cache: std::cell::RefCell<std::collections::HashMap<String, (Instant, Vec<ListItem>)>>,
+    /// Pending background board-data load.  `Some` while a load is in flight;
+    /// `None` when idle.  Polled non-blockingly on every [`handle`] call.
+    pending_data: Option<std::sync::mpsc::Receiver<BoardData>>,
+    /// Most-recent data-load error (message + timestamp), displayed in the
+    /// status bar for a short time.  Cleared when the next load succeeds.
+    fetch_error: Option<(String, Instant)>,
+    /// In-flight remote log fetches keyed by assignment ID.
+    ///
+    /// Each `Receiver` yields `Ok(raw_content)` or `Err(error_message)`.
+    /// `RefCell` allows mutation from `&self` render methods.
+    pending_log_fetches: std::cell::RefCell<std::collections::HashMap<String, std::sync::mpsc::Receiver<Result<String, String>>>>,
 }
 
 impl Default for CoordApp {
@@ -940,14 +984,17 @@ impl Default for CoordApp {
 }
 
 impl CoordApp {
-    /// Create a new app, loading initial board data from the SQLite DB.
+    /// Create a new app.
+    ///
+    /// Board data is fetched on a background thread so the UI renders
+    /// immediately.  The status bar shows "↻ loading…" until the first
+    /// load completes.
     pub fn new() -> Self {
-        let data = load_data();
         let mut sidebar = SidebarSystem::new(Vec::new());
         sidebar.set_navigation_mode(NavigationMode::Selection);
         sidebar.set_allow_collapse(true);
         let mut app = Self {
-            data,
+            data: BoardData::default(),
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
@@ -955,6 +1002,7 @@ impl CoordApp {
             has_proposals_section: false,
             machine_sel: 0,
             machine_scroll: 0,
+            // Use a far-past instant so the "↻ Xs" counter starts at 0.
             refreshed_at: Instant::now(),
             detail_tab: DetailTab::default(),
             detail_scroll: 0,
@@ -964,6 +1012,9 @@ impl CoordApp {
             last_notify: Instant::now(),
             command_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_data: Some(start_data_load()),
+            fetch_error: None,
+            pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         app.rebuild_board_sidebar();
         app
@@ -1001,16 +1052,44 @@ impl CoordApp {
         config
     }
 
+    /// Kick off a background data load if one is not already in flight.
     fn refresh(&mut self) {
-        self.data = load_data();
-        self.refreshed_at = Instant::now();
-        let m = self.data.machines.len();
-        if m > 0 {
-            self.machine_sel = self.machine_sel.min(m - 1);
-        } else {
-            self.machine_sel = 0;
+        if self.pending_data.is_none() {
+            self.pending_data = Some(start_data_load());
         }
-        self.rebuild_board_sidebar();
+    }
+
+    /// Drain any completed background data load, applying results to
+    /// `self.data`.  Returns `true` if data was updated (caller should
+    /// trigger a redraw).
+    fn apply_pending_data(&mut self) -> bool {
+        let rx = match &self.pending_data {
+            Some(rx) => rx,
+            None => return false,
+        };
+        match rx.try_recv() {
+            Ok(data) => {
+                self.data = data;
+                self.pending_data = None;
+                self.refreshed_at = Instant::now();
+                self.fetch_error = None;
+                let m = self.data.machines.len();
+                if m > 0 {
+                    self.machine_sel = self.machine_sel.min(m - 1);
+                } else {
+                    self.machine_sel = 0;
+                }
+                self.rebuild_board_sidebar();
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Worker thread panicked or dropped sender without sending.
+                self.pending_data = None;
+                self.fetch_error = Some(("data load failed".into(), Instant::now()));
+                true
+            }
+        }
     }
 
     /// Group assignments by `(repo, issue_number)`, returning repos in a
@@ -1702,12 +1781,73 @@ impl CoordApp {
         }
     }
 
-    /// Fetch the log for `id` from the remote agent at `http://<host>:7433/logs/<id>`.
+    /// Return log items for `id`, reading locally or fetching from the remote agent.
     ///
-    /// Returns parsed `ListItem`s. On network or HTTP error, returns a single
-    /// error notice row. Uses a 5-second connect+read timeout so a slow or
-    /// unreachable agent doesn't freeze the TUI render cycle.
-    fn fetch_remote_log(&self, id: &str, machine_name: &str) -> Vec<ListItem> {
+    /// This method **never blocks** the UI thread:
+    ///
+    /// 1. If a local log file exists, parse and return it immediately.
+    /// 2. Drain any completed background fetch from `pending_log_fetches`; on
+    ///    success update `remote_log_cache` and return the parsed items.
+    /// 3. Return cached items if the 30-second TTL has not expired.
+    /// 4. If a fetch is already in flight, return a "Loading log…" placeholder.
+    /// 5. Otherwise spawn a background fetch (via [`spawn_log_fetch`]) and
+    ///    return a "Loading log…" placeholder; the result will be picked up on
+    ///    the next render pass.
+    fn get_activity_log(&self, id: &str, machine_name: &str) -> Vec<ListItem> {
+        // 1. Local file takes priority — fast path, no network involved.
+        let path = coord_dir().join("logs").join(format!("{}.log", id));
+        if path.exists() {
+            return load_activity_log(id);
+        }
+
+        // 2. Drain any completed background fetch for this ID.
+        //    We borrow, call try_recv(), then drop the borrow before touching
+        //    `remote_log_cache` to avoid a double-borrow panic.
+        let pending_result = {
+            let pending = self.pending_log_fetches.borrow();
+            pending.get(id).map(|rx| rx.try_recv())
+        };
+        if let Some(recv_result) = pending_result {
+            match recv_result {
+                Ok(fetch_result) => {
+                    self.pending_log_fetches.borrow_mut().remove(id);
+                    let items = match fetch_result {
+                        Ok(content) => parse_log_content(&content),
+                        Err(e) => vec![kv_item(
+                            "",
+                            &format!("  Log unavailable: {}", e),
+                            Some(Color::rgb(100, 100, 100)),
+                        )],
+                    };
+                    self.remote_log_cache
+                        .borrow_mut()
+                        .insert(id.to_string(), (Instant::now(), items.clone()));
+                    return items;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Thread died without sending; remove so we retry below.
+                    self.pending_log_fetches.borrow_mut().remove(id);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {} // still in flight
+            }
+        }
+
+        // 3. Cache hit (within 30-second TTL).
+        {
+            let cache = self.remote_log_cache.borrow();
+            if let Some((fetched_at, items)) = cache.get(id) {
+                if fetched_at.elapsed() < Duration::from_secs(30) {
+                    return items.clone();
+                }
+            }
+        }
+
+        // 4. Fetch still in flight — return placeholder so the render doesn't block.
+        if self.pending_log_fetches.borrow().contains_key(id) {
+            return vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))];
+        }
+
+        // 5. Cache cold/stale and no fetch in flight. Look up host and spawn.
         let host = match self.data.machines.iter().find(|m| m.name == machine_name) {
             Some(m) if !m.host.is_empty() => m.host.clone(),
             _ => {
@@ -1718,59 +1858,9 @@ impl CoordApp {
                 )];
             }
         };
-
-        let url = format!("http://{}:7433/logs/{}", host, id);
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(5))
-            .build();
-
-        match agent.get(&url).call() {
-            Ok(resp) => match resp.into_string() {
-                Ok(content) => parse_log_content(&content),
-                Err(e) => vec![kv_item(
-                    "",
-                    &format!("  Log unavailable: {}", e),
-                    Some(Color::rgb(220, 70, 70)),
-                )],
-            },
-            Err(e) => vec![kv_item(
-                "",
-                &format!("  Log unavailable: {}", e),
-                Some(Color::rgb(100, 100, 100)),
-            )],
-        }
-    }
-
-    /// Return log items for `id`, reading locally or fetching from the remote agent.
-    ///
-    /// 1. If a local log file exists, parse and return it immediately.
-    /// 2. Otherwise check the in-memory cache (30-second TTL).
-    /// 3. If the cache is cold or stale, fetch from `http://<host>:7433/logs/<id>`,
-    ///    update the cache, and return the items.
-    fn get_activity_log(&self, id: &str, machine_name: &str) -> Vec<ListItem> {
-        // 1. Local file takes priority — fast path, no cache involved.
-        let path = coord_dir().join("logs").join(format!("{}.log", id));
-        if path.exists() {
-            return load_activity_log(id);
-        }
-
-        // 2. Cache hit (within 30-second TTL).
-        {
-            let cache = self.remote_log_cache.borrow();
-            if let Some((fetched_at, items)) = cache.get(id) {
-                if fetched_at.elapsed() < Duration::from_secs(30) {
-                    return items.clone();
-                }
-            }
-        }
-
-        // 3. Fetch from remote agent and update cache.
-        let items = self.fetch_remote_log(id, machine_name);
-        self.remote_log_cache
-            .borrow_mut()
-            .insert(id.to_string(), (Instant::now(), items.clone()));
-        items
+        let rx = spawn_log_fetch(&host, id);
+        self.pending_log_fetches.borrow_mut().insert(id.to_string(), rx);
+        vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))]
     }
 
     /// Activity tab: live feed of worker events parsed from the log file.
@@ -2228,8 +2318,18 @@ impl CoordApp {
     }
 
     fn status_bar(&self) -> StatusBar {
-        let since = self.refreshed_at.elapsed().as_secs();
         let view_label = self.active_view.label();
+        // Show a loading indicator while a background fetch is in flight;
+        // otherwise show seconds since the last completed refresh.
+        let (refresh_text, refresh_fg, refresh_bold) = if self.pending_data.is_some() {
+            (" ↻ loading… ".to_string(), Color::rgb(255, 220, 80), true)
+        } else {
+            (
+                format!(" ↻ {}s ", self.refreshed_at.elapsed().as_secs()),
+                Color::rgb(140, 140, 140),
+                false,
+            )
+        };
         let mut left = vec![
             StatusBarSegment {
                 text: " coord-tui ".to_string(),
@@ -2246,13 +2346,25 @@ impl CoordApp {
                 action_id: None,
             },
             StatusBarSegment {
-                text: format!(" ↻ {}s ", since),
-                fg: Color::rgb(140, 140, 140),
+                text: refresh_text,
+                fg: refresh_fg,
                 bg: Color::rgb(30, 30, 40),
-                bold: false,
+                bold: refresh_bold,
                 action_id: None,
             },
         ];
+        // Non-blocking warning if the last load failed.
+        if let Some((err_msg, when)) = &self.fetch_error {
+            if when.elapsed() < Duration::from_secs(10) {
+                left.push(StatusBarSegment {
+                    text: format!(" ⚠ {} ", err_msg),
+                    fg: Color::rgb(255, 160, 60),
+                    bg: Color::rgb(50, 30, 10),
+                    bold: true,
+                    action_id: None,
+                });
+            }
+        }
         if let Some((label, elapsed)) = self.command_runner.running_info() {
             left.push(StatusBarSegment {
                 text: format!(" {} ({:.0}s) ", label, elapsed.as_secs_f64()),
@@ -2355,9 +2467,15 @@ impl ShellApp for CoordApp {
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend, ctx: &ShellContext) -> Reaction {
         let mut needs_redraw = false;
 
-        // ── Auto-refresh (ShellApp has no tick(); check elapsed on every event) ─
-        if self.refreshed_at.elapsed() >= REFRESH_EVERY {
-            self.refresh();
+        // ── Drain pending background data load ──────────────────────────
+        if self.apply_pending_data() {
+            needs_redraw = true;
+        }
+
+        // ── Auto-refresh: kick off background load when interval elapses ─
+        // (ShellApp has no tick(); check elapsed on every UI event.)
+        if self.refreshed_at.elapsed() >= REFRESH_EVERY && self.pending_data.is_none() {
+            self.pending_data = Some(start_data_load());
             needs_redraw = true;
         }
 
@@ -2728,6 +2846,9 @@ mod tests {
             last_notify: Instant::now(),
             command_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_data: None,
+            fetch_error: None,
+            pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
