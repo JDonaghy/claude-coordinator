@@ -2265,6 +2265,56 @@ def notify(config_path: Path) -> None:
     save_board(board)
 
 
+@main.command(
+    "post-pending-reviews",
+    help=(
+        "Post unposted review findings for done review assignments.\n\n"
+        "Useful when a reviewer finished but notify didn't see the transition "
+        "(e.g. agent reported 'cancelled', reap hung, or notify ran at the wrong time). "
+        "Idempotent — already-posted findings are never re-posted."
+    ),
+)
+@_CONFIG_OPTION
+@click.option("--repo", "repo_name", default=None, help="Only process assignments for this repo.")
+def post_pending_reviews(config_path: Path, repo_name: str | None) -> None:
+    from coord.notify import post_orphaned_review_findings
+    from coord.state import load_done_reviews_needing_post
+
+    cfg = _load_config(config_path)
+
+    candidates = load_done_reviews_needing_post(repo_name=repo_name)
+    if not candidates:
+        click.echo("No pending review assignments found.")
+        return
+
+    click.echo(f"Found {len(candidates)} review assignment(s) with unposted findings:")
+    for row in candidates:
+        aid = row["assignment_id"]
+        click.echo(
+            f"  {aid} — {row['repo_name']} #{row['issue_number']} "
+            f"(machine: {row['machine_name']}, target: {row['review_target'] or 'n/a'})"
+        )
+
+    posted_ids = post_orphaned_review_findings(cfg, repo_name=repo_name)
+
+    if not posted_ids:
+        click.echo("\nNo findings posted (agents may be offline or logs unavailable).")
+        return
+
+    click.echo(f"\nPosted findings for {len(posted_ids)} assignment(s):")
+    for aid in posted_ids:
+        click.echo(f"  {aid}")
+
+    still_pending = load_done_reviews_needing_post(repo_name=repo_name)
+    if still_pending:
+        click.echo(f"\n{len(still_pending)} assignment(s) still pending (logs not available):")
+        for row in still_pending:
+            click.echo(
+                f"  {row['assignment_id']} — {row['repo_name']} #{row['issue_number']} "
+                f"(machine: {row['machine_name']})"
+            )
+
+
 @main.command(help="Process the merge queue: open PRs and merge in sequence.")
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Show the plan without opening or merging PRs.")

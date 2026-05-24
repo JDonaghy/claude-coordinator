@@ -374,3 +374,225 @@ class TestReviewNotify:
         assert "Changes Requested" in body
         # Fallback message should reference the PR number so the reader knows context.
         assert "173" in body
+
+    def test_review_posted_at_set_on_success(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """review_posted_at is set on the assignment when findings are successfully posted."""
+        _record_review_assignment("rev8", review_target="10")
+        log_path = _make_log_with_review(tmp_path, "approve", "Looks good.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev8", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        # Assignment should have review_posted_at set
+        from coord.state import build_board
+        board = build_board()
+        rev = next((a for a in board.completed if a.assignment_id == "rev8"), None)
+        assert rev is not None
+        assert rev.review_posted_at is not None
+
+    def test_review_posted_at_not_set_on_fallback(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """review_posted_at stays None when only a fallback comment (no findings) is posted."""
+        _record_review_assignment("rev9", review_target="20")
+        log = tmp_path / "no_verdict.log"
+        log.write_text("I looked at the diff. Seems fine.\n", encoding="utf-8")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev9", "done", log_path=str(log))],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.state import build_board
+        board = build_board()
+        rev = next((a for a in board.completed if a.assignment_id == "rev9"), None)
+        assert rev is not None
+        assert rev.review_posted_at is None
+
+
+# ── Orphaned review findings ────────────────────────────────────────────────
+
+
+class TestPostOrphanedReviewFindings:
+    def test_posts_orphaned_review_findings(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """post_orphaned_review_findings posts findings when the agent has the log."""
+        _record_review_assignment("orphan1", review_target="50")
+        # Mark done in DB without going through notify (simulates manual mark or missed transition).
+        state_mod.mark_notified.__module__  # ensure module loaded
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE assignments SET status='done', finished_at=1234.0 WHERE assignment_id='orphan1'")
+        conn.commit()
+
+        log_path = _make_log_with_review(tmp_path, "approve", "Orphaned LGTM.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan1", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.notify.github_ops.post_issue_comment"):
+            posted = notify_mod.post_orphaned_review_findings(config)
+
+        assert "orphan1" in posted
+        mock_review.assert_called_once_with("acme/api", 50, "approve", "Orphaned LGTM.")
+
+        # review_posted_at should now be set
+        from coord.state import load_done_reviews_needing_post
+        still_pending = load_done_reviews_needing_post()
+        assert not any(r["assignment_id"] == "orphan1" for r in still_pending)
+
+    def test_skips_when_agent_offline(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """post_orphaned_review_findings silently skips when agent is offline."""
+        _record_review_assignment("orphan2", review_target="55")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE assignments SET status='done', finished_at=1234.0 WHERE assignment_id='orphan2'")
+        conn.commit()
+
+        with patch.object(notify_mod, "_agent_status", return_value=None):
+            posted = notify_mod.post_orphaned_review_findings(config)
+
+        assert posted == []
+        from coord.state import load_done_reviews_needing_post
+        still_pending = load_done_reviews_needing_post()
+        assert any(r["assignment_id"] == "orphan2" for r in still_pending)
+
+    def test_skips_when_no_structured_findings(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """post_orphaned_review_findings skips when log has no structured output."""
+        _record_review_assignment("orphan3", review_target="60")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE assignments SET status='done', finished_at=1234.0 WHERE assignment_id='orphan3'")
+        conn.commit()
+
+        log = tmp_path / "no_verdict.log"
+        log.write_text("Just looking at the diff.\n", encoding="utf-8")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan3", "done", log_path=str(log))],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review:
+            posted = notify_mod.post_orphaned_review_findings(config)
+
+        assert posted == []
+        mock_review.assert_not_called()
+
+    def test_idempotent_after_posting(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """post_orphaned_review_findings is idempotent — once review_posted_at is set, skips."""
+        _record_review_assignment("orphan4", review_target="70")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE assignments SET status='done', finished_at=1234.0 WHERE assignment_id='orphan4'")
+        conn.commit()
+
+        log_path = _make_log_with_review(tmp_path, "approve", "Good.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan4", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.notify.github_ops.post_issue_comment"):
+            notify_mod.post_orphaned_review_findings(config)
+            posted_again = notify_mod.post_orphaned_review_findings(config)
+
+        assert posted_again == []
+        assert mock_review.call_count == 1
+
+    def test_adds_notification_record_for_truly_orphaned(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """Assignments with no notification record get one added after orphan posting."""
+        _record_review_assignment("orphan5", review_target="80")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE assignments SET status='done', finished_at=1234.0 WHERE assignment_id='orphan5'")
+        conn.commit()
+
+        # Confirm no notification record yet
+        assert "orphan5" not in state_mod.load_notified()
+
+        log_path = _make_log_with_review(tmp_path, "request-changes", "Has a bug.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan5", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.notify.github_ops.post_issue_comment"):
+            notify_mod.post_orphaned_review_findings(config)
+
+        assert "orphan5" in state_mod.load_notified()
+
+    def test_run_calls_orphaned_posting(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """notify.run() also invokes orphaned-findings posting, not just direct transitions."""
+        _record_review_assignment("orphan6", review_target="90")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute("UPDATE assignments SET status='done', finished_at=1234.0 WHERE assignment_id='orphan6'")
+        conn.commit()
+
+        log_path = _make_log_with_review(tmp_path, "approve", "All clear.")
+        # Agent says nothing new (no direct transitions for orphan6)
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan6", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        # Findings should have been posted via the orphaned path inside run()
+        mock_review.assert_called_once_with("acme/api", 90, "approve", "All clear.")
+
+    def test_load_done_reviews_needing_post_filters_by_repo(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """load_done_reviews_needing_post respects the optional repo_name filter."""
+        _record_review_assignment("rp1", review_target="1", repo_github="acme/api")
+        _record_review_assignment(
+            "rp2", review_target="2",
+            repo_github="acme/other",
+            issue_number=43,
+        )
+        # Override repo_name for rp2
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET repo_name='other', repo_github='acme/other', "
+            "status='done', finished_at=1234.0 WHERE assignment_id='rp2'"
+        )
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=1234.0 WHERE assignment_id='rp1'"
+        )
+        conn.commit()
+
+        from coord.state import load_done_reviews_needing_post
+        api_only = load_done_reviews_needing_post(repo_name="api")
+        all_repos = load_done_reviews_needing_post()
+
+        assert all(r["assignment_id"] == "rp1" for r in api_only)
+        assert len(all_repos) == 2
