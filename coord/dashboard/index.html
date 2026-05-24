@@ -70,6 +70,8 @@ a { color: #58a6ff; }
 .btn-gate:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn-gate-danger { background: #da3633; }
 .btn-gate-green { background: #238636; }
+.btn-gate-warn { background: #d29922; color: #000; }
+.pill-warn { background: #d29922; color: #000; }
 
 .dispatch-status { margin-top: 6px; padding: 4px 8px; border-radius: 4px; font-size: 0.82em; font-family: monospace; word-break: break-word; }
 .dispatch-pending { background: #161b22; color: #8b949e; border: 1px solid #30363d; }
@@ -186,10 +188,14 @@ function renderPipelineBar(pv, issueNum) {
   if (!pv) return '';
   const pills = pv.stages.map(s => {
     let cls = 'pill-waiting';
-    if (s.status === 'completed') cls = 'pill-completed';
+    // If review findings are pending, show the review pill with a warning colour.
+    if (s.name === 'review' && pv.review_findings_pending) cls = 'pill-warn';
+    else if (s.status === 'completed') cls = 'pill-completed';
     else if (s.status === 'active') cls = 'pill-active';
     else if (s.status === 'skipped') cls = 'pill-skipped';
-    return `<span class="pipeline-pill ${cls}">${E(s.name)}</span>`;
+    const label = (s.name === 'review' && pv.review_findings_pending)
+      ? `⚠ ${E(s.name)}` : E(s.name);
+    return `<span class="pipeline-pill ${cls}" title="${pv.review_findings_pending && s.name === 'review' ? 'Review findings not posted to GitHub' : ''}">${label}</span>`;
   }).join('<span class="pipeline-arrow">›</span>');
 
   const isPending = dispatchStatus[pv.assignment_id]?.phase === 'pending';
@@ -197,6 +203,7 @@ function renderPipelineBar(pv, issueNum) {
     let extra = '';
     if (g.action === 'retry' || g.action === 'dispatch_fix') extra = 'btn-gate-danger';
     else if (g.action === 'merge') extra = 'btn-gate-green';
+    else if (g.action === 'post_findings') extra = 'btn-gate-warn';
     const dis = isPending ? ' disabled' : '';
     return `<button class="btn-gate ${extra}"${dis} onclick="doPipelineAction(${JSON.stringify(pv.assignment_id)},${JSON.stringify(g.action)},${JSON.stringify(issueNum || null)})">${E(g.label)}</button>`;
   }).join('');

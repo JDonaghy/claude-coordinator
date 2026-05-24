@@ -95,6 +95,11 @@ class Assignment:
     # Each fix worker dispatched by auto_loop increments this by 1. Used to
     # enforce pipeline.max_review_iterations and stop runaway loops.
     review_iteration: int = 0
+    # Timestamp when review findings were successfully posted to GitHub (as a
+    # PR review or issue comment).  None means findings have not been posted
+    # yet — either the review is still running, the worker produced no
+    # structured output, or notify never saw the completion event.
+    review_posted_at: float | None = None
 
 
 @dataclass
