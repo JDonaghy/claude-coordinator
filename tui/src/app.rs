@@ -245,15 +245,6 @@ struct IssueGroup {
 }
 
 impl IssueGroup {
-    fn status_icon(&self) -> &str {
-        match self.status_summary.as_str() {
-            "running" => "~",
-            "failed" => "✗",
-            "done" | "merged" => "✓",
-            _ => "-",
-        }
-    }
-
     fn status_color(&self) -> Color {
         match self.status_summary.as_str() {
             "running" => Color::rgb(80, 220, 80),
@@ -5443,7 +5434,11 @@ impl CoordApp {
                         got_new = true;
                         break;
                     }
-                    SseWatchMsg::Error(_) => {
+                    SseWatchMsg::Error(msg) => {
+                        // Surface the actual error in the log so the user
+                        // can diagnose connection issues without grepping
+                        // agent journalctl. Capped to one line in the panel.
+                        sse.lines.push(format!("[sse error] {}", msg));
                         // Connection failure. Update the failure window.
                         sse.fail_count += 1;
                         match sse.first_fail_at {
