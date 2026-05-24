@@ -179,6 +179,13 @@ def reconcile(board: Board, config: Config) -> list[str]:
                         if orig is not None:
                             orig.review_state = "done"
         else:
+            # Defensive: don't downgrade a DB-done assignment to failed when
+            # the agent reports cancelled (e.g. after POST /cancel cleanup
+            # of a hung reap). The work succeeded; cancellation here is
+            # bookkeeping noise.
+            if (entry.get("status") == "cancelled"
+                    and (a.status or "").lower() == "done"):
+                continue
             failed = board.mark_failed_by_id(
                 a.assignment_id,
                 finished_at=entry.get("finished_at"),

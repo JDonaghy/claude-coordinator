@@ -93,6 +93,12 @@ def detect_transitions(config: Config) -> list[tuple[Transition, dict, dict]]:
             if record is None or aid in notified:
                 continue
             entry_status = entry.get("status")
+            # Cancelled-on-agent for an assignment the DB already marks done
+            # is cleanup noise (e.g. operator ran POST /cancel to unstick a
+            # hung reap). Don't post a false failure for it.
+            db_status = (record.get("status") or "").lower()
+            if entry_status == "cancelled" and db_status == "done":
+                continue
             if entry_status == "done":
                 event = EVENT_COMPLETION
             elif entry_status in ("failed", "cancelled"):
