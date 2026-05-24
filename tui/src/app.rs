@@ -4927,8 +4927,13 @@ impl CoordApp {
                 bold: true,
                 action_id: None,
             },
+            // #201: surface the view-switch keys in the active view label so
+            // new users discover that 1/2/3 swaps Board/Machines/Pipeline.
+            // Without this hint, the Pipeline panel's [Go]/[Retry] buttons
+            // (now wired to mouse clicks) are unreachable for users who don't
+            // know about the activity-bar key shortcuts.
             StatusBarSegment {
-                text: format!(" {} ", view_label),
+                text: format!(" {}  [1=Board 2=Machines 3=Pipeline] ", view_label),
                 fg: Color::rgb(200, 220, 255),
                 bg: Color::rgb(40, 60, 90),
                 bold: false,
@@ -6574,6 +6579,49 @@ mod tests {
         let main_b = Rect::new(50.0, 0.0, 40.0, 40.0);
         let changed = app.mouse_main_click(Point::new(55.0, 0.0), main_b, 1.0);
         assert!(!changed);
+    }
+
+    // #201: clicking a Pipeline stage's action button must dispatch.
+    // The wiring goes through PipelineHit::Action(stage_idx) →
+    // dispatch_pipeline_stage(idx). This test verifies the click reaches
+    // the dispatcher; an integration test of dispatch itself lives elsewhere.
+    #[test]
+    fn mouse_click_on_pipeline_stage_action_dispatches() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_sel = Some(0);
+        // No assignments → Work stage is Pending with no predecessors, so it
+        // gets a [Go] action button per build_pipeline_widget.
+
+        // Use a large content rect so the layout produces well-separated stages.
+        let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
+        let lh: f32 = 1.0;
+        let tab_h = lh * 1.4;
+        let content_rect = Rect::new(
+            main_b.x,
+            main_b.y + tab_h,
+            main_b.width,
+            (main_b.height - tab_h).max(0.0),
+        );
+        let pv_rect = pipeline_detail_pv_rect(content_rect, lh);
+        let view = app.build_pipeline_widget().expect("widget");
+        let layout = tui_pipeline_layout(&view, pv_rect);
+
+        // Work is stage index 0 and should carry the [Go] action.
+        let work_stage = &layout.stages[0];
+        let ab = work_stage
+            .action_bounds
+            .expect("Work stage should have a [Go] action button");
+        let click_pos = Point::new(ab.x + ab.width / 2.0, ab.y + ab.height / 2.0);
+
+        // mouse_main_click returns true if state changed (dispatch attempted).
+        // The dispatch may toast an error if no machine is reachable in tests,
+        // but the wiring itself is what we're verifying — the click reaches
+        // dispatch_pipeline_stage, which is the integration the user lost in
+        // a prior session.
+        let result = app.mouse_main_click(click_pos, main_b, lh);
+        assert!(result, "click on stage action button should be handled");
     }
 
     // ── Scroll offset preservation across refresh ─────────────────────────────
