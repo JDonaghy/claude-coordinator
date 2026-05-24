@@ -1756,6 +1756,10 @@ pub struct CoordApp {
     /// Which interactive field is focused within the current category's form.
     /// Reset to 0 when the category changes.
     settings_field_sel: usize,
+    /// Assignment IDs that were in `running` state at the most recent data
+    /// refresh.  Used to detect running→done/failed transitions so we can
+    /// ring the terminal bell when `audio_on_completion` is enabled.
+    audio_prev_running: std::collections::HashSet<String>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -1835,6 +1839,7 @@ impl CoordApp {
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
             settings_category_sel: 0,
             settings_field_sel: 0,
+            audio_prev_running: std::collections::HashSet::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
@@ -2265,6 +2270,16 @@ impl CoordApp {
         };
         match rx.try_recv() {
             Ok(data) => {
+                // Snapshot which assignments were running before the update so
+                // we can detect running→done/failed transitions for the audio bell.
+                let prev_running: std::collections::HashSet<String> = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.status == "running")
+                    .map(|a| a.id.clone())
+                    .collect();
+
                 self.data = data;
                 self.pending_data = None;
                 self.refreshed_at = Instant::now();
@@ -2277,6 +2292,32 @@ impl CoordApp {
                 }
                 self.rebuild_board_sidebar();
                 self.rebuild_pipeline_sidebar();
+
+                // Ring the terminal bell (BEL) when an assignment that was
+                // running is now done or failed, if the user enabled audio.
+                if self.settings.audio_on_completion && !prev_running.is_empty() {
+                    let newly_finished = self
+                        .data
+                        .assignments
+                        .iter()
+                        .any(|a| {
+                            (a.status == "done" || a.status == "failed")
+                                && prev_running.contains(&a.id)
+                        });
+                    if newly_finished {
+                        // BEL character — rings the terminal bell or triggers
+                        // a system notification depending on terminal settings.
+                        eprint!("\x07");
+                    }
+                }
+                self.audio_prev_running = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.status == "running")
+                    .map(|a| a.id.clone())
+                    .collect();
+
                 true
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
@@ -4201,12 +4242,25 @@ impl CoordApp {
         };
         let machine_name = machine.name.clone();
         let issue_str = issue.number.to_string();
-        let spawned = self.command_runner.spawn(&[
-            "assign",
-            &machine_name,
-            &coord_repo,
-            &issue_str,
-        ]);
+        // Inject session-level model override when the user configured one for
+        // this machine in Settings → Dispatch → Per-Machine Model Overrides.
+        let model_str = self
+            .settings
+            .machine_model
+            .get(&machine_name)
+            .map(|p| p.as_str().to_string());
+        let mut cmd: Vec<String> = vec![
+            "assign".into(),
+            machine_name.clone(),
+            coord_repo.clone(),
+            issue_str.clone(),
+        ];
+        if let Some(ref m) = model_str {
+            cmd.push("--model".into());
+            cmd.push(m.clone());
+        }
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let spawned = self.command_runner.spawn(&cmd_refs);
         if spawned {
             self.pipeline_status = Some((
                 format!("dispatched #{} → {}", issue.number, machine_name),
@@ -4247,13 +4301,25 @@ impl CoordApp {
         };
         let machine_name = machine.name.clone();
         let issue_str = issue.number.to_string();
-        let spawned = self.command_runner.spawn(&[
-            "assign",
-            "--plan-only",
-            &machine_name,
-            &coord_repo,
-            &issue_str,
-        ]);
+        // Inject session-level model override when configured for this machine.
+        let model_str = self
+            .settings
+            .machine_model
+            .get(&machine_name)
+            .map(|p| p.as_str().to_string());
+        let mut cmd: Vec<String> = vec![
+            "assign".into(),
+            "--plan-only".into(),
+            machine_name.clone(),
+            coord_repo.clone(),
+            issue_str.clone(),
+        ];
+        if let Some(ref m) = model_str {
+            cmd.push("--model".into());
+            cmd.push(m.clone());
+        }
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let spawned = self.command_runner.spawn(&cmd_refs);
         if spawned {
             self.pipeline_status = Some((
                 format!("plan dispatched for #{} → {}", issue.number, machine_name),
@@ -5100,9 +5166,14 @@ impl CoordApp {
         }
     }
 
-    /// bar and the PipelineView primitive hit-test (Go action). In Board
-    /// view this handles the Board/Issue tab bar. In Settings view this
-    /// routes to FormController. Machines view is a no-op.
+    /// Handle a left-click in the main panel.
+    ///
+    /// Routes the click to the right handler depending on the active view:
+    /// - **Settings** — delegates to the `FormController` (field clicks, toggle, segmented control).
+    /// - **Board** — handles the Board/Issue tab bar.
+    /// - **Pipeline** — handles the tab bar and the `PipelineView` primitive
+    ///   hit-test (dispatches the Go action when a stage button is clicked).
+    /// - **Machines** — no-op (no interactive elements in the main panel).
     fn mouse_main_click(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
         if self.active_view == SidebarView::Settings {
             // Route click to FormController. FormController::handle_cached
@@ -5117,7 +5188,22 @@ impl CoordApp {
             let result = self.settings_form.borrow_mut().handle_cached(&click_event, main_b);
             match result {
                 FormControllerEvent::FormAction(ref form_event) => {
+                    // Sync keyboard focus indicator to the clicked field so
+                    // keyboard navigation picks up from where the mouse clicked.
+                    let clicked_id = match form_event {
+                        FormEvent::SegmentedControlChanged { id, .. }
+                        | FormEvent::ToggleChanged { id, .. } => Some(id.clone()),
+                        _ => None,
+                    };
                     let changed = self.apply_settings_event(form_event);
+                    if changed {
+                        if let Some(id) = clicked_id {
+                            let field_ids = self.settings_interactive_field_ids();
+                            if let Some(pos) = field_ids.iter().position(|fid| fid == &id) {
+                                self.settings_field_sel = pos;
+                            }
+                        }
+                    }
                     return changed;
                 }
                 FormControllerEvent::ScrollChanged | FormControllerEvent::Consumed => return true,
@@ -5763,19 +5849,22 @@ impl CoordApp {
 
     /// Handle a directional key (h/l or Left/Right) against the focused
     /// settings form field.  Returns `true` when a setting changed.
+    ///
+    /// Builds the form only once to avoid the double-rebuild that occurred
+    /// when `settings_interactive_field_ids` and the field-kind lookup both
+    /// called `build_settings_form` separately.
     fn settings_change_focused(&mut self, direction: i32) -> bool {
-        let field_ids = self.settings_interactive_field_ids();
-        let Some(field_id) = field_ids.get(self.settings_field_sel) else {
-            return false;
-        };
-        // Clone so we can pass to apply_settings_event without borrow conflicts.
-        let field_id = field_id.clone();
-
-        // Find the current kind for the focused field by rebuilding just enough.
+        // Build once; extract both the interactive-field list and the kind.
         let form = self.build_settings_form();
-        let Some(field) = form.fields.iter().find(|f| f.id == field_id) else {
+        let interactive: Vec<_> = form
+            .fields
+            .iter()
+            .filter(|f| !matches!(f.kind, FieldKind::Label | FieldKind::ReadOnly { .. }))
+            .collect();
+        let Some(field) = interactive.get(self.settings_field_sel) else {
             return false;
         };
+        let field_id = field.id.clone();
 
         let event = match &field.kind {
             FieldKind::SegmentedControl { options, selected_idx } => {
@@ -5789,13 +5878,13 @@ impl CoordApp {
                     selected_idx.checked_sub(1).unwrap_or(n - 1)
                 };
                 FormEvent::SegmentedControlChanged {
-                    id: field_id.clone(),
+                    id: field_id,
                     selected_idx: new_idx,
                 }
             }
             FieldKind::Toggle { value } => {
                 FormEvent::ToggleChanged {
-                    id: field_id.clone(),
+                    id: field_id,
                     value: !value,
                 }
             }
@@ -5806,6 +5895,10 @@ impl CoordApp {
 
     /// Apply a `FormEvent` from the settings form to the settings state,
     /// save to disk, and return `true` if something changed.
+    ///
+    /// When the save fails (e.g. read-only home directory), a non-fatal
+    /// error toast is shown so the user is aware without interrupting their
+    /// workflow.
     fn apply_settings_event(&mut self, event: &FormEvent) -> bool {
         match event {
             FormEvent::SegmentedControlChanged { id, selected_idx } => {
@@ -5825,13 +5918,17 @@ impl CoordApp {
                     }
                     _ => return false,
                 }
-                self.settings.save();
+                if let Err(e) = self.settings.save() {
+                    self.push_toast("Settings", &format!("could not persist settings: {e}"), ToastSeverity::Error);
+                }
                 true
             }
             FormEvent::ToggleChanged { id, value } => {
                 if id.as_str() == "settings:audio" {
                     self.settings.audio_on_completion = *value;
-                    self.settings.save();
+                    if let Err(e) = self.settings.save() {
+                        self.push_toast("Settings", &format!("could not persist settings: {e}"), ToastSeverity::Error);
+                    }
                     true
                 } else {
                     false
@@ -7019,6 +7116,7 @@ mod tests {
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
             settings_category_sel: 0,
             settings_field_sel: 0,
+            audio_prev_running: std::collections::HashSet::new(),
         }
     }
 
@@ -9377,5 +9475,120 @@ mod tests {
             t.spans.iter().map(|s| s.text.clone()).collect::<String>()
         }).unwrap_or_default();
         assert!(title.contains("R=refresh"), "title should show R=refresh hint, got: {}", title);
+    }
+
+    // ── Settings: apply_settings_event ────────────────────────────────────────
+
+    #[test]
+    fn apply_settings_event_theme_mutates_and_returns_true() {
+        use crate::settings::Theme;
+        let mut app = make_app_default();
+        app.settings.theme = Theme::Dark;
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:theme"),
+            selected_idx: Theme::Light.to_idx(),
+        };
+        let changed = app.apply_settings_event(&ev);
+        assert!(changed, "should return true on theme change");
+        assert_eq!(app.settings.theme, Theme::Light);
+    }
+
+    #[test]
+    fn apply_settings_event_cadence_mutates_and_returns_true() {
+        use crate::settings::RefreshCadence;
+        let mut app = make_app_default();
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:cadence"),
+            selected_idx: RefreshCadence::ThirtySec.to_idx(),
+        };
+        assert!(app.apply_settings_event(&ev));
+        assert_eq!(app.settings.refresh_cadence, RefreshCadence::ThirtySec);
+    }
+
+    #[test]
+    fn apply_settings_event_log_ttl_mutates_and_returns_true() {
+        use crate::settings::LogCacheTtl;
+        let mut app = make_app_default();
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:log-ttl"),
+            selected_idx: LogCacheTtl::FiveSec.to_idx(),
+        };
+        assert!(app.apply_settings_event(&ev));
+        assert_eq!(app.settings.log_cache_ttl, LogCacheTtl::FiveSec);
+    }
+
+    #[test]
+    fn apply_settings_event_audio_toggle_mutates_and_returns_true() {
+        let mut app = make_app_default();
+        assert!(!app.settings.audio_on_completion);
+        let ev = FormEvent::ToggleChanged {
+            id: WidgetId::new("settings:audio"),
+            value: true,
+        };
+        assert!(app.apply_settings_event(&ev));
+        assert!(app.settings.audio_on_completion);
+    }
+
+    #[test]
+    fn apply_settings_event_machine_model_mutates_and_returns_true() {
+        use crate::settings::ModelPref;
+        let mut app = make_app_default();
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:model:mybox"),
+            selected_idx: ModelPref::Opus.to_idx(),
+        };
+        assert!(app.apply_settings_event(&ev));
+        assert_eq!(app.settings.machine_model.get("mybox"), Some(&ModelPref::Opus));
+    }
+
+    #[test]
+    fn apply_settings_event_unknown_id_returns_false() {
+        let mut app = make_app_default();
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:nonexistent"),
+            selected_idx: 0,
+        };
+        assert!(!app.apply_settings_event(&ev), "unknown ID should return false");
+    }
+
+    #[test]
+    fn apply_settings_event_unknown_toggle_id_returns_false() {
+        let mut app = make_app_default();
+        let ev = FormEvent::ToggleChanged {
+            id: WidgetId::new("settings:not-audio"),
+            value: true,
+        };
+        assert!(!app.apply_settings_event(&ev), "unknown toggle ID should return false");
+    }
+
+    // ── Settings: settings_change_focused ─────────────────────────────────────
+
+    #[test]
+    fn settings_change_focused_wraps_forward_from_last_to_first() {
+        use crate::settings::Theme;
+        // Category 0 (Appearance) has a theme SegmentedControl with 3 options.
+        let mut app = make_app_default();
+        app.settings_category_sel = 0;
+        app.settings.theme = Theme::HighContrast; // last option (idx 2)
+        app.settings_field_sel = 0; // the theme field is the first interactive field
+
+        // Forward from last option → wraps to first.
+        let changed = app.settings_change_focused(1);
+        assert!(changed, "should change when wrapping");
+        assert_eq!(app.settings.theme, Theme::Dark, "should wrap from HighContrast → Dark");
+    }
+
+    #[test]
+    fn settings_change_focused_wraps_backward_from_first_to_last() {
+        use crate::settings::Theme;
+        let mut app = make_app_default();
+        app.settings_category_sel = 0;
+        app.settings.theme = Theme::Dark; // first option (idx 0)
+        app.settings_field_sel = 0;
+
+        // Backward from first option → wraps to last.
+        let changed = app.settings_change_focused(-1);
+        assert!(changed, "should change when wrapping backward");
+        assert_eq!(app.settings.theme, Theme::HighContrast, "should wrap from Dark → HighContrast");
     }
 }

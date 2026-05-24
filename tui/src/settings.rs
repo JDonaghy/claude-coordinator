@@ -216,20 +216,23 @@ impl Default for TuiSettings {
 }
 
 impl TuiSettings {
-    /// Return the path to the settings file (`~/.coord/settings.toml`).
-    pub fn path() -> PathBuf {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        home.join(".coord").join("settings.toml")
+    /// Return the path to the settings file (`~/.coord/settings.toml`), or
+    /// `None` when the `HOME` environment variable is not set.
+    ///
+    /// When `HOME` is absent, load and save are skipped entirely — we never
+    /// fall back to `/tmp` because that risks leaking settings between users
+    /// on a shared system.
+    pub fn path() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        Some(home.join(".coord").join("settings.toml"))
     }
 
-    /// Load settings from disk.  If the file does not exist or cannot be
-    /// parsed, default settings are returned and no error is surfaced — the
-    /// first save will create a clean file.
-    pub fn load() -> Self {
-        let path = Self::path();
-        let Ok(text) = std::fs::read_to_string(&path) else {
+    /// Load settings from a specific path.
+    ///
+    /// Returns defaults when the file does not exist or cannot be parsed —
+    /// malformed TOML never causes a panic.  Used by [`load`] and in tests.
+    pub fn load_from_path(path: &std::path::Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
         };
         match toml::from_str::<Self>(&text) {
@@ -238,15 +241,180 @@ impl TuiSettings {
         }
     }
 
-    /// Persist settings to disk.  Silently ignores write errors — the TUI
-    /// must remain usable even when the home directory is read-only.
-    pub fn save(&self) {
-        let path = Self::path();
+    /// Load settings from disk.  Returns defaults when `HOME` is unset, the
+    /// file does not exist, or the file cannot be parsed.
+    pub fn load() -> Self {
+        let Some(path) = Self::path() else {
+            eprintln!("coord-tui: HOME not set — settings will not be persisted");
+            return Self::default();
+        };
+        Self::load_from_path(&path)
+    }
+
+    /// Persist settings to a specific path.
+    ///
+    /// Creates parent directories as needed.  Returns an error string when
+    /// the directory cannot be created or the file cannot be written.
+    /// Used by [`save`] and in tests.
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create settings dir: {e}"))?;
         }
-        if let Ok(text) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(&path, text);
+        let text = toml::to_string_pretty(self)
+            .map_err(|e| format!("serialize settings: {e}"))?;
+        std::fs::write(path, text)
+            .map_err(|e| format!("write settings: {e}"))?;
+        Ok(())
+    }
+
+    /// Persist settings to `~/.coord/settings.toml`.
+    ///
+    /// Returns an error string when `HOME` is unset or the write fails.
+    /// The caller is responsible for surfacing the error to the user.
+    /// The TUI must remain functional even when the home directory is
+    /// read-only, so errors should be shown as non-fatal toasts.
+    pub fn save(&self) -> Result<(), String> {
+        let Some(path) = Self::path() else {
+            // HOME not set — skip save silently (already warned on load).
+            return Ok(());
+        };
+        self.save_to_path(&path)
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Enum round-trips ──────────────────────────────────────────────────────
+
+    #[test]
+    fn theme_round_trip_all_variants() {
+        for v in [Theme::Dark, Theme::Light, Theme::HighContrast] {
+            assert_eq!(Theme::from_idx(v.to_idx()), v, "round-trip failed for {v:?}");
         }
+    }
+
+    #[test]
+    fn theme_from_idx_out_of_range_returns_high_contrast() {
+        assert_eq!(Theme::from_idx(99), Theme::HighContrast);
+        assert_eq!(Theme::from_idx(usize::MAX), Theme::HighContrast);
+    }
+
+    #[test]
+    fn refresh_cadence_round_trip_all_variants() {
+        for v in [
+            RefreshCadence::OneSec,
+            RefreshCadence::FiveSec,
+            RefreshCadence::ThirtySec,
+            RefreshCadence::Off,
+        ] {
+            assert_eq!(RefreshCadence::from_idx(v.to_idx()), v, "round-trip failed for {v:?}");
+        }
+    }
+
+    #[test]
+    fn refresh_cadence_from_idx_out_of_range_returns_off() {
+        assert_eq!(RefreshCadence::from_idx(99), RefreshCadence::Off);
+        assert_eq!(RefreshCadence::from_idx(usize::MAX), RefreshCadence::Off);
+    }
+
+    #[test]
+    fn log_cache_ttl_round_trip_all_variants() {
+        for v in [LogCacheTtl::OneSec, LogCacheTtl::TwoSec, LogCacheTtl::FiveSec] {
+            assert_eq!(LogCacheTtl::from_idx(v.to_idx()), v, "round-trip failed for {v:?}");
+        }
+    }
+
+    #[test]
+    fn log_cache_ttl_from_idx_out_of_range_returns_five_sec() {
+        assert_eq!(LogCacheTtl::from_idx(99), LogCacheTtl::FiveSec);
+        assert_eq!(LogCacheTtl::from_idx(usize::MAX), LogCacheTtl::FiveSec);
+    }
+
+    #[test]
+    fn model_pref_round_trip_all_variants() {
+        for v in [ModelPref::Sonnet, ModelPref::Opus, ModelPref::Haiku] {
+            assert_eq!(ModelPref::from_idx(v.to_idx()), v, "round-trip failed for {v:?}");
+        }
+    }
+
+    #[test]
+    fn model_pref_from_idx_out_of_range_returns_haiku() {
+        assert_eq!(ModelPref::from_idx(99), ModelPref::Haiku);
+        assert_eq!(ModelPref::from_idx(usize::MAX), ModelPref::Haiku);
+    }
+
+    // ── load_from_path with malformed TOML ────────────────────────────────────
+
+    #[test]
+    fn load_from_path_malformed_toml_returns_defaults() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("coord_settings_test_malformed_{}.toml", std::process::id()));
+        std::fs::write(&path, b"this is [[[ not valid toml at all").unwrap();
+        let s = TuiSettings::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        // Must return defaults without panicking.
+        assert_eq!(s.theme, Theme::default());
+        assert_eq!(s.refresh_cadence, RefreshCadence::default());
+        assert!(!s.audio_on_completion);
+        assert_eq!(s.log_cache_ttl, LogCacheTtl::default());
+        assert!(s.machine_model.is_empty());
+    }
+
+    #[test]
+    fn load_from_path_missing_file_returns_defaults() {
+        let path = std::env::temp_dir().join("coord_settings_test_missing_9999999.toml");
+        let s = TuiSettings::load_from_path(&path);
+        assert_eq!(s.theme, Theme::default());
+        assert!(s.machine_model.is_empty());
+    }
+
+    // ── TOML round-trip ───────────────────────────────────────────────────────
+
+    #[test]
+    fn save_to_path_then_load_from_path_preserves_all_fields() {
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("coord_settings_test_roundtrip_{}.toml", std::process::id()));
+
+        let mut machine_model = HashMap::new();
+        machine_model.insert("mybox".to_string(), ModelPref::Opus);
+        machine_model.insert("laptop".to_string(), ModelPref::Haiku);
+
+        let original = TuiSettings {
+            theme: Theme::Light,
+            refresh_cadence: RefreshCadence::ThirtySec,
+            audio_on_completion: true,
+            log_cache_ttl: LogCacheTtl::FiveSec,
+            machine_model,
+        };
+
+        original.save_to_path(&path).expect("save should succeed");
+        let loaded = TuiSettings::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.theme, Theme::Light);
+        assert_eq!(loaded.refresh_cadence, RefreshCadence::ThirtySec);
+        assert!(loaded.audio_on_completion);
+        assert_eq!(loaded.log_cache_ttl, LogCacheTtl::FiveSec);
+        assert_eq!(loaded.machine_model.get("mybox"), Some(&ModelPref::Opus));
+        assert_eq!(loaded.machine_model.get("laptop"), Some(&ModelPref::Haiku));
+    }
+
+    #[test]
+    fn save_to_path_creates_parent_dirs() {
+        let dir = std::env::temp_dir()
+            .join(format!("coord_test_mkdirs_{}", std::process::id()));
+        let path = dir.join("nested").join("settings.toml");
+        TuiSettings::default()
+            .save_to_path(&path)
+            .expect("should create parent dirs and succeed");
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
