@@ -2265,6 +2265,68 @@ def sync(config_path: Path, quiet: bool) -> None:
         click.echo(f"synced {total} open issue(s) across {len(cfg.repos)} repo(s)")
 
 
+@main.command(
+    help=(
+        "Mark a refined issue as ready for dispatch.\n\n"
+        "Sets the GitHub `status:ready` label and removes `status:refining` / "
+        "`status:backlog` if present. After this the issue appears in the "
+        "Pipeline panel as Pending with a [Go] button.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the GH "
+        "issue number."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def ready(repo: str, issue: int, config_path: Path) -> None:
+    import subprocess as _sp  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r} (not in coordinator.yml)", err=True)
+        sys.exit(1)
+    slug = repo_entry.github
+
+    # Fetch current labels first. gh issue edit --remove-label errors when
+    # the label doesn't exist on the *repo* (not just absent from the issue),
+    # so we must only request removal of labels that are actually present.
+    try:
+        view = _sp.run(
+            ["gh", "issue", "view", str(issue), "--repo", slug, "--json", "labels"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (_sp.TimeoutExpired, OSError) as e:
+        click.echo(f"error: failed to run gh view: {e}", err=True)
+        sys.exit(1)
+    if view.returncode != 0:
+        click.echo(f"gh failed: {view.stderr.strip()}", err=True)
+        sys.exit(1)
+    try:
+        current = {lbl.get("name", "") for lbl in _json.loads(view.stdout).get("labels", [])}
+    except _json.JSONDecodeError as e:
+        click.echo(f"could not parse gh view output: {e}", err=True)
+        sys.exit(1)
+
+    # Build edit args: always add status:ready; remove only present status:* peers.
+    args = ["gh", "issue", "edit", str(issue), "--repo", slug,
+            "--add-label", "status:ready"]
+    for stale in ("status:refining", "status:backlog"):
+        if stale in current:
+            args.extend(["--remove-label", stale])
+
+    try:
+        result = _sp.run(args, capture_output=True, text=True, timeout=15)
+    except (_sp.TimeoutExpired, OSError) as e:
+        click.echo(f"error: failed to run gh edit: {e}", err=True)
+        sys.exit(1)
+    if result.returncode != 0:
+        click.echo(f"gh failed: {result.stderr.strip()}", err=True)
+        sys.exit(1)
+    click.echo(f"#{issue} ({slug}) marked ready for dispatch")
+
+
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")
 @_CONFIG_OPTION
 def notify(config_path: Path) -> None:

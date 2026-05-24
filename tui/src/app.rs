@@ -137,6 +137,17 @@ enum PipelineDetailTab {
     Stages,
 }
 
+/// The tabs shown in the Board view detail panel.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum BoardDetailTab {
+    /// Default: assignment summary, status, machine, etc.
+    #[default]
+    Board,
+    /// Full issue body text + labels (scrollable with j/k or scrollwheel).
+    /// Reuses `issue_body_list` so the rendering matches the Pipeline view.
+    Issue,
+}
+
 // ─── Sidebar views ────────────────────────────────────────────────────────────
 
 /// The selectable top-level views shown in the left sidebar.
@@ -304,12 +315,36 @@ struct PipelineIssue {
 }
 
 #[derive(Default)]
+/// A single issue freshly fetched via `gh issue view` for the Board Issue tab
+/// when no row exists in the local `issues` table. Mirrors [`OpenIssue`] but
+/// produced on-demand rather than from a sync.
+#[derive(Clone, Debug)]
+struct FetchedIssue {
+    number: u64,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+    /// "open" | "closed".  Carried so the DB upsert mirrors what `coord sync`
+    /// would have written.
+    state: String,
+}
+
 /// An open issue from the local `issues` table (synced from GitHub on coord plan).
 #[derive(Clone)]
 struct OpenIssue {
     repo_name: String,
     number: u64,
     title: String,
+    /// Issue body, synced from GitHub via `coord sync`.  Empty string when
+    /// the issue has no description.
+    body: String,
+    /// GitHub labels on this issue. Used by the Board Issue tab to render the
+    /// same context the Pipeline Issue tab shows.
+    labels: Vec<String>,
+    /// "open" | "closed".  We load both into `data.open_issues` so the Board
+    /// Issue tab can display bodies for closed issues (e.g. in the Completed
+    /// group), but only "open" entries get injected as Pending rows.
+    state: String,
 }
 
 #[derive(Default)]
@@ -1030,20 +1065,28 @@ fn load_data() -> BoardData {
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // ── Query open issues (synced from GitHub on coord plan) ──────────────
+    // ── Query synced issues (both open and closed) ─────────────────────────
+    // Loaded eagerly so the Board Issue tab can show bodies for issues in
+    // any lifecycle group, including closed ones in Completed. Only the
+    // "open" entries are injected as Pending rows downstream.
     let open_issues: Vec<OpenIssue> = {
         let mut stmt = match conn.prepare(
-            "SELECT repo_name, number, title FROM issues WHERE state = 'open' \
+            "SELECT repo_name, number, title, body, labels, state FROM issues \
              ORDER BY repo_name, number",
         ) {
             Ok(s) => s,
             Err(_) => return BoardData { local_machine, assignments, machines, merge_queue, proposals, ..BoardData::default() },
         };
         let rows = match stmt.query_map([], |row| {
+            let labels_raw: String = row.get(4).unwrap_or_default();
+            let labels: Vec<String> = serde_json::from_str(&labels_raw).unwrap_or_default();
             Ok(OpenIssue {
                 repo_name: row.get::<_, String>(0)?,
                 number: row.get::<_, i64>(1)? as u64,
                 title: row.get::<_, String>(2)?,
+                body: row.get::<_, String>(3).unwrap_or_default(),
+                labels,
+                state: row.get::<_, String>(5).unwrap_or_else(|_| "open".to_string()),
             })
         }) {
             Ok(r) => r,
@@ -1105,6 +1148,111 @@ fn spawn_log_fetch(host: &str, id: &str) -> std::sync::mpsc::Receiver<Result<Str
         let _ = tx.send(result);
     });
     rx
+}
+
+/// Spawn a `gh issue view` for a single issue and parse the response into a
+/// [`FetchedIssue`]. Used by the Board Issue tab when the issue isn't in the
+/// local `issues` table (e.g. closed >7d ago and pruned).
+///
+/// On success, also upserts the row into the local `issues` table so the
+/// fetch becomes durable — the next `load_data` finds it and we don't repeat
+/// the gh call on the next session. The upsert uses a writer connection with
+/// busy_timeout=5s, the same pattern as the purge/test-verdict writers.
+fn spawn_issue_fetch(
+    repo_slug: String,
+    repo_name: String,
+    number: u64,
+) -> std::sync::mpsc::Receiver<Result<FetchedIssue, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let output = std::process::Command::new("gh")
+            .args([
+                "issue",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &repo_slug,
+                "--json",
+                "number,title,body,labels,state",
+            ])
+            .output();
+        let result = match output {
+            Ok(o) if o.status.success() => {
+                match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                    Ok(v) => {
+                        let labels: Vec<String> = v
+                            .get("labels")
+                            .and_then(|l| l.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|l| {
+                                        l.get("name").and_then(|n| n.as_str()).map(String::from)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let issue = FetchedIssue {
+                            number,
+                            title: v.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            body: v.get("body").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            labels,
+                            state: v
+                                .get("state")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("open")
+                                .to_ascii_lowercase(),
+                        };
+                        // Best-effort upsert into the local DB. Failures (DB
+                        // locked, schema missing, etc.) are non-fatal — the
+                        // in-memory cache still serves the body for the rest
+                        // of the session.
+                        let _ = upsert_issue_db(&repo_name, &issue);
+                        Ok(issue)
+                    }
+                    Err(e) => Err(format!("gh json parse failed: {}", e)),
+                }
+            }
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(format!("could not run gh: {}", e)),
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// Upsert a freshly-fetched issue into the local `issues` table. Mirrors the
+/// `upsert_open_issues` Python helper but for a single row, using the same
+/// connection-with-busy-timeout pattern as the other TUI writers (purge,
+/// test-verdict). Single-statement transaction, safe under concurrent
+/// coord/TUI writers per SQLite WAL semantics.
+fn upsert_issue_db(repo_name: &str, issue: &FetchedIssue) -> rusqlite::Result<()> {
+    let conn = open_purge_conn()?;
+    let labels_json =
+        serde_json::to_string(&issue.labels).unwrap_or_else(|_| "[]".to_string());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(repo_name, number) DO UPDATE SET \
+            title = excluded.title, \
+            body = excluded.body, \
+            state = excluded.state, \
+            labels = excluded.labels, \
+            synced_at = excluded.synced_at",
+        rusqlite::params![
+            repo_name,
+            issue.number as i64,
+            issue.title,
+            issue.body,
+            issue.state,
+            labels_json,
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 /// Spawn a background thread that opens a Server-Sent Events connection to
@@ -1539,6 +1687,8 @@ pub struct CoordApp {
     inject_focused: bool,
     /// Which tab is active in the Pipeline detail pane.
     pipeline_detail_tab: PipelineDetailTab,
+    /// Which tab is active in the Board detail pane.
+    board_detail_tab: BoardDetailTab,
     /// Scroll offset for the issue body on the Issue tab.
     pipeline_detail_scroll: usize,
     /// Cache of remotely-fetched log items, keyed by assignment ID.
@@ -1558,6 +1708,16 @@ pub struct CoordApp {
     /// Each `Receiver` yields `Ok(raw_content)` or `Err(error_message)`.
     /// `RefCell` allows mutation from `&self` render methods.
     pending_log_fetches: std::cell::RefCell<std::collections::HashMap<String, std::sync::mpsc::Receiver<Result<String, String>>>>,
+    /// In-flight `gh issue view` fetches for Board Issue tab bodies that
+    /// weren't in the local issues table (e.g. closed >7d ago and pruned).
+    /// Keyed by `(repo_name, issue_number)`. The receiver yields `Ok(issue)`
+    /// or `Err(error_message)`.
+    pending_issue_fetches: std::cell::RefCell<std::collections::HashMap<(String, u64), std::sync::mpsc::Receiver<Result<FetchedIssue, String>>>>,
+    /// In-memory cache for successfully-fetched single issues. Survives until
+    /// the TUI restarts; the background thread also upserts into the DB so
+    /// the next `load_data()` finds it. No TTL — `coord sync` is the source
+    /// of truth for invalidation.
+    fetched_issues_cache: std::cell::RefCell<std::collections::HashMap<(String, u64), FetchedIssue>>,
     /// Pending purge confirmation state.  `Some((assignments, issues))` means
     /// we are waiting for the user to confirm; `None` means not pending.
     ///
@@ -1644,11 +1804,14 @@ impl CoordApp {
             inject_input: String::new(),
             inject_focused: false,
             pipeline_detail_tab: PipelineDetailTab::default(),
+            board_detail_tab: BoardDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: Some(start_data_load()),
             fetch_error: None,
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_issue_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
             purge_days: 7,
@@ -2172,7 +2335,10 @@ impl CoordApp {
         }
 
         // Inject open issues with no assignment as Pending entries.
-        for oi in &self.data.open_issues {
+        // `data.open_issues` now also carries closed issues (for the Board
+        // Issue tab's body lookup), so we must filter to state="open" here
+        // or closed issues would appear as Pending rows.
+        for oi in self.data.open_issues.iter().filter(|i| i.state == "open") {
             let entry = repo_issues
                 .entry(oi.repo_name.clone())
                 .or_default()
@@ -4261,6 +4427,137 @@ impl CoordApp {
         }
     }
 
+    fn board_detail_tab_bar(&self) -> TabBar {
+        TabBar {
+            id: WidgetId::new("board-detail-tabs"),
+            tabs: vec![
+                TabItem {
+                    label: " Board ".to_string(),
+                    is_active: self.board_detail_tab == BoardDetailTab::Board,
+                    is_dirty: false,
+                    is_preview: false,
+                },
+                TabItem {
+                    label: " Issue ".to_string(),
+                    is_active: self.board_detail_tab == BoardDetailTab::Issue,
+                    is_dirty: false,
+                    is_preview: false,
+                },
+            ],
+            scroll_offset: 0,
+            right_segments: vec![],
+            active_accent: None,
+            show_tab_close: false,
+            compact: true,
+        }
+    }
+
+    /// Look up the selected board issue's body and render via the shared
+    /// `issue_body_list` helper. Layered lookup (#168 motivated this):
+    ///
+    /// 1. Synced row in `data.open_issues` — fast path, no I/O.
+    /// 2. In-memory `fetched_issues_cache` populated by a prior background
+    ///    `gh issue view` for this session.
+    /// 3. In-flight background fetch — show a "Fetching…" placeholder and
+    ///    let the next render pick up the result.
+    /// 4. No data yet — spawn `gh issue view` in the background (writes the
+    ///    result through to the local `issues` table on success so future
+    ///    sessions don't re-fetch) and show a placeholder.
+    fn board_issue_body_list(&self) -> ListView {
+        let repo = self.board_active_repo().map(str::to_string);
+        let group = self.board_selected_issue_group().cloned();
+        let (Some(repo), Some(g)) = (repo, group) else {
+            return issue_body_list(None, self.detail_scroll, "board-issue-body");
+        };
+        let key = (repo.clone(), g.issue_number);
+
+        // 1. Synced row.
+        if let Some(oi) = self
+            .data
+            .open_issues
+            .iter()
+            .find(|oi| oi.repo_name == repo && oi.number == g.issue_number)
+        {
+            return issue_body_list(
+                Some((oi.number, oi.title.as_str(), oi.body.as_str(), &oi.labels[..])),
+                self.detail_scroll,
+                "board-issue-body",
+            );
+        }
+
+        // 2. Drain any completed background fetch into the cache so step 3 picks it up.
+        let pending_result = {
+            let pending = self.pending_issue_fetches.borrow();
+            pending.get(&key).map(|rx| rx.try_recv())
+        };
+        if let Some(recv) = pending_result {
+            match recv {
+                Ok(Ok(fetched)) => {
+                    self.pending_issue_fetches.borrow_mut().remove(&key);
+                    self.fetched_issues_cache
+                        .borrow_mut()
+                        .insert(key.clone(), fetched);
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Fetch finished with an error or the thread died — drop
+                    // the receiver so the cold-path below will re-spawn next
+                    // render. Error surfaces below as the placeholder.
+                    self.pending_issue_fetches.borrow_mut().remove(&key);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {} // still in flight
+            }
+        }
+
+        // 3. In-memory cache (populated by a completed fetch).
+        if let Some(f) = self.fetched_issues_cache.borrow().get(&key).cloned() {
+            return issue_body_list(
+                Some((f.number, f.title.as_str(), f.body.as_str(), &f.labels[..])),
+                self.detail_scroll,
+                "board-issue-body",
+            );
+        }
+
+        // 4. Spawn if no fetch is already running.
+        if !self.pending_issue_fetches.borrow().contains_key(&key) {
+            // Resolve the GitHub slug for this repo. If we can't, fall back to
+            // the title-only placeholder instead of a broken gh call.
+            let slug = self
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(local, _)| local == &repo)
+                .map(|(_, slug)| slug.clone());
+            if let Some(slug) = slug {
+                let rx = spawn_issue_fetch(slug, repo.clone(), g.issue_number);
+                self.pending_issue_fetches.borrow_mut().insert(key.clone(), rx);
+            } else {
+                // No slug → can't fetch. Show the title we have with a hint.
+                return issue_body_list(
+                    Some((
+                        g.issue_number,
+                        g.issue_title.as_str(),
+                        "(no GitHub slug for this repo — add it to coordinator.yml.repos[].github)",
+                        &[][..],
+                    )),
+                    self.detail_scroll,
+                    "board-issue-body",
+                );
+            }
+        }
+
+        // Placeholder while fetch is in flight.
+        issue_body_list(
+            Some((
+                g.issue_number,
+                g.issue_title.as_str(),
+                "(fetching body via `gh issue view`…)",
+                &[][..],
+            )),
+            self.detail_scroll,
+            "board-issue-body",
+        )
+    }
+
     fn pipeline_detail_tab_bar(&self) -> TabBar {
         TabBar {
             id: WidgetId::new("pipeline-detail-tabs"),
@@ -4294,41 +4591,14 @@ impl CoordApp {
 
     /// Issue tab: title header + scrollable full body (j/k to scroll).
     fn pipeline_issue_body_list(&self) -> ListView {
-        let mut items: Vec<ListItem> = Vec::new();
-        if let Some(idx) = self.pipeline_sel {
-            if let Some(issue) = self.pipeline_issues.get(idx) {
-                items.push(ListItem {
-                    text: StyledText {
-                        spans: vec![
-                            StyledSpan::with_fg(format!(" #{}", issue.number), Color::rgb(150, 150, 240)),
-                            StyledSpan::with_fg(format!("  {}", issue.title), Color::rgb(230, 230, 255)),
-                        ],
-                    },
-                    icon: None,
-                    detail: None,
-                    decoration: Decoration::Header,
-                });
-                items.push(kv_item("", "", None));
-                if issue.body.is_empty() {
-                    items.push(kv_item("", " (no description)", Some(Color::rgb(100, 100, 100))));
-                } else {
-                    for line in issue.body.lines() {
-                        items.push(kv_item("", &format!(" {}", line), Some(Color::rgb(200, 200, 210))));
-                    }
-                }
-            }
-        } else {
-            items.push(kv_item("", " No issue selected", Some(Color::rgb(100, 100, 100))));
-        }
-        ListView {
-            id: WidgetId::new("pipeline-issue-body"),
-            title: None,
-            items,
-            selected_idx: 0,
-            scroll_offset: self.pipeline_detail_scroll,
-            has_focus: false,
-            bordered: false,
-        }
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i));
+        issue_body_list(
+            issue.map(|i| (i.number, i.title.as_str(), i.body.as_str(), &i.all_labels[..])),
+            self.pipeline_detail_scroll,
+            "pipeline-issue-body",
+        )
     }
 
     /// Pipeline tab: meta strip (repo/labels/gates/status).
@@ -4786,9 +5056,28 @@ impl CoordApp {
     }
 
     /// Click in the main panel — in Pipeline view this handles the tab
-    /// bar and the PipelineView primitive hit-test (Go action). Board
-    /// and Machines views are no-ops.
+    /// bar and the PipelineView primitive hit-test (Go action). In Board
+    /// view this handles the Board/Issue tab bar. Machines is a no-op.
     fn mouse_main_click(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
+        if self.active_view == SidebarView::Board {
+            // Tab bar: " Board " (7 chars) ~ x_off < 7, then " Issue ".
+            let tab_h = lh * 1.4;
+            if pos.y - main_b.y < tab_h {
+                let x_off = pos.x - main_b.x;
+                let new_tab = if x_off < 7.0 {
+                    BoardDetailTab::Board
+                } else {
+                    BoardDetailTab::Issue
+                };
+                if new_tab != self.board_detail_tab {
+                    self.board_detail_tab = new_tab;
+                    self.detail_scroll = 0;
+                    return true;
+                }
+                return false;
+            }
+            return false;
+        }
         if self.active_view == SidebarView::Pipeline {
             // Tab bar occupies the first `lh * 1.4` row of the main panel.
             let tab_h = lh * 1.4;
@@ -4877,7 +5166,12 @@ impl CoordApp {
         let visible = content_visible_rows(main_b, lh);
         match self.active_view {
             SidebarView::Board => {
-                let items = self.detail_list().items.len();
+                // Use the active tab's actual list so the scroll max matches
+                // what's rendered. Board tab → detail_list; Issue tab → body.
+                let items = match self.board_detail_tab {
+                    BoardDetailTab::Board => self.detail_list().items.len(),
+                    BoardDetailTab::Issue => self.board_issue_body_list().items.len(),
+                };
                 let max = items.saturating_sub(visible.saturating_sub(1));
                 if delta.y > 0.0 {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
@@ -4897,9 +5191,20 @@ impl CoordApp {
                 true
             }
             SidebarView::Pipeline => {
-                // The Pipeline detail pane has no scrollable region today —
-                // the issue summary fits in a fixed strip. Consume the event
-                // anyway so it doesn't propagate further.
+                // Issue tab body is the scrollable region on the Pipeline view.
+                // The Pipeline and Stages tabs render fixed-size widgets, so
+                // scrollwheel on those is consumed but otherwise inert.
+                if self.pipeline_detail_tab == PipelineDetailTab::Issue {
+                    let items = self.pipeline_issue_body_list().items.len();
+                    let max = items.saturating_sub(visible.saturating_sub(1));
+                    if delta.y > 0.0 {
+                        self.pipeline_detail_scroll =
+                            self.pipeline_detail_scroll.saturating_sub(1);
+                    } else if delta.y < 0.0 {
+                        self.pipeline_detail_scroll =
+                            (self.pipeline_detail_scroll + 1).min(max);
+                    }
+                }
                 let _ = visible;
                 true
             }
@@ -5219,7 +5524,21 @@ impl ShellApp for CoordApp {
         let m = layout.main_content_bounds;
         match self.active_view {
             SidebarView::Board => {
-                backend.draw_list(m, &self.detail_list());
+                // Tab bar (Board / Issue), then the active tab's content.
+                let tab_bar = self.board_detail_tab_bar();
+                let tab_h = lh * 1.4;
+                let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
+                let content_rect =
+                    Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
+                backend.draw_tab_bar(tab_rect, &tab_bar, None);
+                match self.board_detail_tab {
+                    BoardDetailTab::Board => {
+                        backend.draw_list(content_rect, &self.detail_list());
+                    }
+                    BoardDetailTab::Issue => {
+                        backend.draw_list(content_rect, &self.board_issue_body_list());
+                    }
+                }
             }
             SidebarView::Machines => {
                 backend.draw_list(m, &self.machine_detail_list());
@@ -5620,6 +5939,22 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── h/l — cycle Board detail tabs ────────────────────
+                    // Board ↔ Issue (no third tab — toggle on either key).
+                    Key::Char('h') | Key::Char('l')
+                    | Key::Named(NamedKey::Left)
+                    | Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search_focused =>
+                    {
+                        self.board_detail_tab = match self.board_detail_tab {
+                            BoardDetailTab::Board => BoardDetailTab::Issue,
+                            BoardDetailTab::Issue => BoardDetailTab::Board,
+                        };
+                        self.detail_scroll = 0;
+                        needs_redraw = true;
+                    }
+
                     // ── Home ─────────────────────────────────────────────
                     Key::Named(NamedKey::Home) => {
                         match self.active_view {
@@ -5683,6 +6018,34 @@ impl ShellApp for CoordApp {
                             self.dispatch_pipeline_active_go();
                         }
                         needs_redraw = true;
+                    }
+
+                    // ── r — mark refined issue ready for dispatch ────────
+                    // For an issue with status:refining (or status:backlog,
+                    // or no status:* label), `r` spawns `coord ready` which
+                    // sets status:ready via gh. After the GH side returns,
+                    // the next data refresh moves the row into the Pending
+                    // lifecycle section and the Pipeline tab shows [Go].
+                    Key::Char('r')
+                        if self.active_view == SidebarView::Pipeline =>
+                    {
+                        let issue_info = self
+                            .pipeline_sel
+                            .and_then(|i| self.pipeline_issues.get(i))
+                            .and_then(|i| {
+                                let coord_repo = i.coord_repo.clone()?;
+                                Some((coord_repo, i.number))
+                            });
+                        if let Some((repo, num)) = issue_info {
+                            let num_str = num.to_string();
+                            if self.command_runner.spawn(&["ready", &repo, &num_str]) {
+                                self.pipeline_status = Some((
+                                    format!("#{}: marking ready", num),
+                                    Instant::now(),
+                                ));
+                            }
+                            needs_redraw = true;
+                        }
                     }
 
                     // ── PageDown (Board only) ─────────────────────────────
@@ -5911,6 +6274,62 @@ fn pipeline_detail_pv_rect(main: Rect, lh: f32) -> Rect {
     Rect::new(main.x, main.y, main.width, h)
 }
 
+/// Render an issue's GitHub body as a ListView. Shared between the Pipeline
+/// view's Issue tab and the Board view's Issue tab so the rendering and
+/// scroll handling stay in lock-step.
+///
+/// `issue` is `Some((number, title, body, labels))` for the selected issue,
+/// or `None` when no issue is selected (renders a placeholder).
+fn issue_body_list(
+    issue: Option<(u64, &str, &str, &[String])>,
+    scroll_offset: usize,
+    widget_id: &'static str,
+) -> ListView {
+    let mut items: Vec<ListItem> = Vec::new();
+    match issue {
+        None => {
+            items.push(kv_item("", " No issue selected", Some(Color::rgb(100, 100, 100))));
+        }
+        Some((number, title, body, labels)) => {
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![
+                        StyledSpan::with_fg(format!(" #{}", number), Color::rgb(150, 150, 240)),
+                        StyledSpan::with_fg(format!("  {}", title), Color::rgb(230, 230, 255)),
+                    ],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Header,
+            });
+            if !labels.is_empty() {
+                items.push(kv_item(
+                    "",
+                    &format!(" labels: {}", labels.join(", ")),
+                    Some(Color::rgb(160, 160, 180)),
+                ));
+            }
+            items.push(kv_item("", "", None));
+            if body.is_empty() {
+                items.push(kv_item("", " (no description)", Some(Color::rgb(100, 100, 100))));
+            } else {
+                for line in body.lines() {
+                    items.push(kv_item("", &format!(" {}", line), Some(Color::rgb(200, 200, 210))));
+                }
+            }
+        }
+    }
+    ListView {
+        id: WidgetId::new(widget_id),
+        title: None,
+        items,
+        selected_idx: 0,
+        scroll_offset,
+        has_focus: false,
+        bordered: false,
+    }
+}
+
 // ─── Purge helper ─────────────────────────────────────────────────────────────
 
 /// Open a short-lived read-write connection to `coord.db` and delete:
@@ -6125,11 +6544,14 @@ mod tests {
             inject_input: String::new(),
             inject_focused: false,
             pipeline_detail_tab: PipelineDetailTab::default(),
+            board_detail_tab: BoardDetailTab::default(),
             pipeline_detail_scroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: None,
             fetch_error: None,
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_issue_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
             purge_days: 7,
