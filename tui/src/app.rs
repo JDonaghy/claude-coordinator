@@ -85,6 +85,45 @@ struct WatchState {
     scroll: usize,
 }
 
+/// Messages sent from the background SSE watch thread to the main thread.
+enum SseWatchMsg {
+    /// New log text arrived; `last_id` is the byte-offset after this chunk
+    /// (used as `Last-Event-Id` on reconnect to resume without refetching).
+    Lines { last_id: u64, text: String },
+    /// Stream ended cleanly (agent sent `event: end`). No reconnect needed.
+    Done { last_id: u64 },
+    /// Connection or read error. The main thread decides whether to reconnect.
+    Error(String),
+    /// SSE keepalive comment received. Used to detect when the receiver has
+    /// been dropped (cancel signal): if `tx.send` fails, the thread exits.
+    Heartbeat,
+}
+
+/// State for the live SSE log-stream connection backing the watch overlay.
+///
+/// Held on `CoordApp` separately from `WatchState` because `Receiver<T>`
+/// is not `Clone` and `WatchState` must be.  Dropped (and thus the background
+/// thread cancelled) when the overlay closes via `close_watch()`.
+struct WatchSseState {
+    /// Receive end of the channel from the background SSE thread.
+    rx: std::sync::mpsc::Receiver<SseWatchMsg>,
+    /// Accumulated raw log lines, appended as `Lines` messages arrive.
+    lines: Vec<String>,
+    /// Byte offset of the last received event, for `Last-Event-Id` on reconnect.
+    last_event_id: u64,
+    /// Number of connection failures in the current 10-second window.
+    fail_count: u32,
+    /// When the first failure in the current window occurred, for TTL reset.
+    first_fail_at: Option<Instant>,
+    /// True once a clean `end` event arrives or the failure limit is hit.
+    /// When true, no further reconnect attempts are made.
+    done: bool,
+    /// Machine hostname, stored here so reconnect doesn't need `self.watch`.
+    host: String,
+    /// Assignment ID, stored here so reconnect doesn't need `self.watch`.
+    assignment_id: String,
+}
+
 /// The tabs shown in the Pipeline view detail panel.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum PipelineDetailTab {
@@ -1063,6 +1102,110 @@ fn spawn_log_fetch(host: &str, id: &str) -> std::sync::mpsc::Receiver<Result<Str
     rx
 }
 
+/// Spawn a background thread that opens a Server-Sent Events connection to
+/// `http://{host}:7433/stream/{id}`, parses SSE events, and sends them over
+/// the returned `Receiver`.
+///
+/// ## Resume support
+/// Pass `last_event_id > 0` to resume from a previous byte-offset by sending
+/// the `Last-Event-Id` header.  The agent's `/stream/{id}` endpoint uses the
+/// byte offset as the event id, so the stream resumes from that position.
+///
+/// ## Cancellation
+/// Drop the returned `Receiver` to signal the thread to exit.  The thread
+/// detects this on the next `tx.send()` call (which returns `Err`).  Under
+/// normal conditions this happens within 15 s (SSE keepalive interval); a
+/// 20-second read timeout acts as a safety net if keepalives stop.
+fn spawn_sse_watch(host: &str, id: &str, last_event_id: u64) -> std::sync::mpsc::Receiver<SseWatchMsg> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = format!("http://{}:7433/stream/{}", host, id);
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            // 20 s read timeout. The server sends SSE keepalives every 15 s so
+            // this fires only when the connection is genuinely dead.
+            .timeout_read(std::time::Duration::from_secs(20))
+            .build();
+
+        let mut builder = agent.get(&url);
+        if last_event_id > 0 {
+            builder = builder.set("Last-Event-Id", &last_event_id.to_string());
+        }
+
+        let resp = match builder.call() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(SseWatchMsg::Error(e.to_string()));
+                return;
+            }
+        };
+
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(resp.into_reader());
+
+        let mut current_id = last_event_id;
+        let mut current_event = String::new();
+        let mut current_data: Vec<String> = Vec::new();
+
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    // Read error (timeout, connection reset, etc.).
+                    let _ = tx.send(SseWatchMsg::Error(e.to_string()));
+                    return;
+                }
+            };
+
+            // Empty line = dispatch the current accumulated event.
+            if line.is_empty() {
+                if !current_event.is_empty() || !current_data.is_empty() {
+                    let text = current_data.join("\n");
+                    let keep_going = match current_event.as_str() {
+                        "log" => tx
+                            .send(SseWatchMsg::Lines { last_id: current_id, text })
+                            .is_ok(),
+                        "end" => {
+                            let _ = tx.send(SseWatchMsg::Done { last_id: current_id });
+                            return;
+                        }
+                        _ => true, // unknown event type — ignore
+                    };
+                    if !keep_going {
+                        return; // receiver was dropped; exit cleanly
+                    }
+                    current_event.clear();
+                    current_data.clear();
+                }
+                continue;
+            }
+
+            // SSE comment / keepalive — send a Heartbeat so the thread
+            // discovers a dropped receiver (cancel) within one keepalive period.
+            if line.starts_with(':') {
+                if tx.send(SseWatchMsg::Heartbeat).is_err() {
+                    return;
+                }
+                continue;
+            }
+
+            // SSE field lines.
+            if let Some(v) = line.strip_prefix("id: ") {
+                current_id = v.trim().parse().unwrap_or(current_id);
+            } else if let Some(v) = line.strip_prefix("event: ") {
+                current_event = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("data: ") {
+                current_data.push(v.to_string());
+            }
+            // retry: lines are ignored — the main thread owns reconnect logic.
+        }
+
+        // EOF: connection closed without an explicit `end` event.
+        let _ = tx.send(SseWatchMsg::Done { last_id: current_id });
+    });
+    rx
+}
+
 /// Width of one arrow connector between stages, in TUI cells. Mirrors the
 /// constant used by quadraui's `tui_pipeline_view_layout` so host
 /// hit-testing matches the painted geometry.
@@ -1410,8 +1553,8 @@ pub struct CoordApp {
     /// Each `Receiver` yields `Ok(raw_content)` or `Err(error_message)`.
     /// `RefCell` allows mutation from `&self` render methods.
     pending_log_fetches: std::cell::RefCell<std::collections::HashMap<String, std::sync::mpsc::Receiver<Result<String, String>>>>,
-    /// Pending purge confirmation state.  `Some(n)` means we are waiting for
-    /// the user to confirm a purge of `n` rows; `None` means not pending.
+    /// Pending purge confirmation state.  `Some((assignments, issues))` means
+    /// we are waiting for the user to confirm; `None` means not pending.
     ///
     /// Triggered by pressing 'P' when the Board sidebar selection is in the
     /// Completed (done/merged) group.  Any key other than 'y'/'Y' cancels.
@@ -1422,6 +1565,12 @@ pub struct CoordApp {
     /// TODO: wire from coordinator.yml `purge_days` key (e.g. under a top-level
     /// `tui:` section) once the Python config layer supports it.
     purge_days: u32,
+    /// Background SSE log-stream state for the watch overlay.
+    ///
+    /// `Some` while the overlay is open; `None` when closed.  Dropping this
+    /// field drops the `Receiver`, which signals the background thread to exit
+    /// (it detects the disconnect on the next `tx.send()` call).
+    watch_sse: Option<WatchSseState>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -1492,6 +1641,7 @@ impl CoordApp {
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             purge_days: 7,
+            watch_sse: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
@@ -1650,6 +1800,23 @@ impl CoordApp {
                         .unwrap_or_else(|| "work".to_string()),
                     scroll: usize::MAX,
                 });
+                // Open an SSE log stream for remote machines.
+                self.watch_sse = None; // clear any previous
+                if let Some(m) = self.data.machines.iter().find(|m| m.name == a.machine) {
+                    if !m.host.is_empty() {
+                        let rx = spawn_sse_watch(&m.host, &a.id, 0);
+                        self.watch_sse = Some(WatchSseState {
+                            rx,
+                            lines: Vec::new(),
+                            last_event_id: 0,
+                            fail_count: 0,
+                            first_fail_at: None,
+                            done: false,
+                            host: m.host.clone(),
+                            assignment_id: a.id.clone(),
+                        });
+                    }
+                }
                 true
             }
             None => {
@@ -1662,9 +1829,36 @@ impl CoordApp {
         }
     }
 
-    /// Close the watch overlay.
+    /// Close the watch overlay and cancel the background SSE thread.
     fn close_watch(&mut self) {
         self.watch = None;
+        // Dropping watch_sse drops the Receiver; the background thread detects
+        // the disconnect on its next tx.send() and exits cleanly.
+        self.watch_sse = None;
+    }
+
+    /// Force a fresh SSE connection for the watch overlay (manual refresh, R key).
+    ///
+    /// Drops the current SSE state (if any) and spawns a new connection from
+    /// byte offset 0, so the full log is streamed from the start.
+    fn reset_sse_watch(&mut self) {
+        let Some(w) = self.watch.as_ref() else { return; };
+        let host = match self.data.machines.iter().find(|m| m.name == w.machine) {
+            Some(m) if !m.host.is_empty() => m.host.clone(),
+            _ => return,
+        };
+        let id = w.assignment_id.clone();
+        let rx = spawn_sse_watch(&host, &id, 0);
+        self.watch_sse = Some(WatchSseState {
+            rx,
+            lines: Vec::new(),
+            last_event_id: 0,
+            fail_count: 0,
+            first_fail_at: None,
+            done: false,
+            host,
+            assignment_id: id,
+        });
     }
 
     /// Accept the plan being watched: dispatches `coord approve-plan <id>`.
@@ -1720,19 +1914,45 @@ impl CoordApp {
     /// Build the body `ListView` for the watch overlay — the raw log lines
     /// from the worker.  Title carries the repo/issue/machine context.
     /// Inject prompt (when open) is rendered as the last list row.
+    ///
+    /// Log content is driven by the SSE stream when `watch_sse` is `Some`;
+    /// falls back to the polling path (`get_activity_log`) when SSE is
+    /// unavailable (e.g. machine host unknown or local assignment).
     fn watch_log_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
         let title = match &self.watch {
             None => " WATCH ".to_string(),
             Some(w) => {
-                items.extend(self.get_activity_log(&w.assignment_id, &w.machine));
+                // Prefer SSE-accumulated lines when available.
+                if let Some(sse) = &self.watch_sse {
+                    if sse.lines.is_empty() && !sse.done {
+                        items.push(kv_item(
+                            "",
+                            "  Connecting to log stream…",
+                            Some(Color::rgb(140, 140, 140)),
+                        ));
+                    } else {
+                        let content = sse.lines.join("\n");
+                        items.extend(parse_log_content(&content));
+                    }
+                    if sse.done {
+                        items.push(kv_item(
+                            "",
+                            "  ── stream ended ──",
+                            Some(Color::rgb(90, 90, 90)),
+                        ));
+                    }
+                } else {
+                    // Fallback: polling path (local file or remote HTTP GET).
+                    items.extend(self.get_activity_log(&w.assignment_id, &w.machine));
+                }
                 let extra_keys = if w.assignment_type == "plan" {
                     "  A=accept"
                 } else {
                     ""
                 };
                 format!(
-                    " WATCH — {} #{} → {} ({}) (b=ask{}  K=kill  q=close) ",
+                    " WATCH — {} #{} → {} ({}) (b=ask{}  K=kill  R=refresh  q=close) ",
                     w.repo, w.issue_number, w.machine, w.assignment_type, extra_keys
                 )
             }
@@ -4649,13 +4869,123 @@ impl CoordApp {
             self.last_notify = Instant::now();
         }
 
-        // When the Watch overlay is open, ensure a periodic redraw so the
-        // cached log gets re-fetched (2s TTL) without the user typing.
-        if self.watch.is_some() {
-            needs_redraw = true;
+        // Drain the SSE watch channel when the overlay is open. Any new lines
+        // arriving from the background thread trigger a redraw so the UI
+        // updates within one tick period without requiring user input.
+        if self.watch_sse.is_some() {
+            needs_redraw |= self.drain_sse_watch();
         }
 
         needs_redraw
+    }
+
+    /// Drain pending messages from the SSE watch channel, accumulate lines,
+    /// and handle reconnect/error logic.  Returns `true` when new data
+    /// arrived and a redraw is needed.
+    ///
+    /// Reconnect strategy: on transient errors, reopen the stream using
+    /// `Last-Event-Id` so replay starts from the last received byte offset.
+    /// After **3 failures within 10 seconds**, a toast is shown and
+    /// reconnection stops — the user must press `R` to retry manually.
+    fn drain_sse_watch(&mut self) -> bool {
+        let mut got_new = false;
+        let mut needs_reconnect = false;
+        let mut fail_limit_hit = false;
+
+        // Drain all pending messages — borrow watch_sse mutably.
+        if let Some(sse) = &mut self.watch_sse {
+            if sse.done {
+                return false;
+            }
+            loop {
+                use std::sync::mpsc::TryRecvError;
+                let msg = match sse.rx.try_recv() {
+                    Ok(m) => m,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        // Background thread exited without sending; treat as error.
+                        sse.fail_count += 1;
+                        match sse.first_fail_at {
+                            None => sse.first_fail_at = Some(Instant::now()),
+                            Some(t) if t.elapsed() > Duration::from_secs(10) => {
+                                sse.first_fail_at = Some(Instant::now());
+                                sse.fail_count = 1;
+                            }
+                            _ => {}
+                        }
+                        if sse.fail_count >= 3 {
+                            sse.done = true;
+                            fail_limit_hit = true;
+                        } else {
+                            needs_reconnect = true;
+                        }
+                        got_new = true;
+                        break;
+                    }
+                };
+
+                match msg {
+                    SseWatchMsg::Lines { last_id, text } => {
+                        sse.last_event_id = last_id;
+                        for line in text.lines() {
+                            sse.lines.push(line.to_string());
+                        }
+                        got_new = true;
+                    }
+                    SseWatchMsg::Done { last_id } => {
+                        sse.last_event_id = last_id;
+                        sse.done = true;
+                        got_new = true;
+                        break;
+                    }
+                    SseWatchMsg::Error(_) => {
+                        // Connection failure. Update the failure window.
+                        sse.fail_count += 1;
+                        match sse.first_fail_at {
+                            None => sse.first_fail_at = Some(Instant::now()),
+                            Some(t) if t.elapsed() > Duration::from_secs(10) => {
+                                // Window expired: reset to a fresh 10-second window.
+                                sse.first_fail_at = Some(Instant::now());
+                                sse.fail_count = 1;
+                            }
+                            _ => {}
+                        }
+                        if sse.fail_count >= 3 {
+                            sse.done = true;
+                            fail_limit_hit = true;
+                        } else {
+                            needs_reconnect = true;
+                        }
+                        got_new = true;
+                        break;
+                    }
+                    SseWatchMsg::Heartbeat => {
+                        // No-op: the thread just confirmed the channel is alive.
+                    }
+                }
+            }
+        }
+
+        // Post-drain: reconnect or show error toast (no watch_sse borrow held).
+        if fail_limit_hit {
+            self.push_toast(
+                "SSE stream error",
+                "Lost connection 3× in 10 s — press R to reconnect",
+                ToastSeverity::Error,
+            );
+        } else if needs_reconnect {
+            // Clone what we need before taking a new mutable borrow.
+            let (host, assignment_id, last_id) = match &self.watch_sse {
+                Some(s) => (s.host.clone(), s.assignment_id.clone(), s.last_event_id),
+                None => return got_new,
+            };
+            let new_rx = spawn_sse_watch(&host, &assignment_id, last_id);
+            if let Some(sse) = &mut self.watch_sse {
+                sse.rx = new_rx;
+            }
+        }
+
+        got_new
     }
 }
 
@@ -4881,17 +5211,22 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── Watch overlay (no input active): control keys ────
-                    Key::Char('b') if self.watch.is_some() => {
+                    Key::Char('b') if self.watch.is_some() && !self.inject_focused => {
                         self.inject_focused = true;
                         self.inject_input.clear();
                         needs_redraw = true;
                     }
-                    Key::Char('K') if self.watch.is_some() => {
+                    Key::Char('K') if self.watch.is_some() && !self.inject_focused => {
                         self.kill_watched();
                         needs_redraw = true;
                     }
-                    Key::Char('A') if self.watch.is_some() => {
+                    Key::Char('A') if self.watch.is_some() && !self.inject_focused => {
                         self.approve_watched_plan();
+                        needs_redraw = true;
+                    }
+                    // R = force a fresh SSE connection from byte 0.
+                    Key::Char('R') if self.watch.is_some() && !self.inject_focused => {
+                        self.reset_sse_watch();
                         needs_redraw = true;
                     }
                     Key::Char('q') | Key::Named(NamedKey::Escape)
@@ -4900,14 +5235,18 @@ impl ShellApp for CoordApp {
                         self.close_watch();
                         needs_redraw = true;
                     }
-                    Key::Char('j') | Key::Named(NamedKey::Down) if self.watch.is_some() => {
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.watch.is_some() && !self.inject_focused =>
+                    {
                         if let Some(w) = self.watch.as_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
                             w.scroll = current.saturating_add(1);
                         }
                         needs_redraw = true;
                     }
-                    Key::Char('k') | Key::Named(NamedKey::Up) if self.watch.is_some() => {
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.watch.is_some() && !self.inject_focused =>
+                    {
                         if let Some(w) = self.watch.as_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
                             w.scroll = current.saturating_sub(1);
@@ -5514,6 +5853,7 @@ mod tests {
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             purge_days: 7,
+            watch_sse: None,
         }
     }
 
@@ -7304,5 +7644,236 @@ mod tests {
     fn purge_guard_false_when_no_section_active() {
         let app = make_app_default();
         assert!(!app.board_selection_in_completed_group());
+    }
+
+    // ── SSE watch overlay ────────────────────────────────────────────────────
+
+    /// Build a `WatchSseState` with a test sender and receiver pair.
+    fn make_sse_state_pair() -> (WatchSseState, std::sync::mpsc::Sender<SseWatchMsg>) {
+        let (tx, rx) = std::sync::mpsc::channel::<SseWatchMsg>();
+        let state = WatchSseState {
+            rx,
+            lines: Vec::new(),
+            last_event_id: 0,
+            fail_count: 0,
+            first_fail_at: None,
+            done: false,
+            host: "localhost".to_string(),
+            assignment_id: "test-id".to_string(),
+        };
+        (state, tx)
+    }
+
+    #[test]
+    fn drain_sse_watch_accumulates_lines() {
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        // Send two log chunks.
+        tx.send(SseWatchMsg::Lines { last_id: 100, text: "line one\nline two".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Lines { last_id: 200, text: "line three".to_string() }).unwrap();
+
+        let changed = app.drain_sse_watch();
+        assert!(changed, "new lines should trigger redraw");
+
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert_eq!(sse.last_event_id, 200);
+        assert_eq!(sse.lines, vec!["line one", "line two", "line three"]);
+        assert!(!sse.done);
+    }
+
+    #[test]
+    fn drain_sse_watch_marks_done_on_end_event() {
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        tx.send(SseWatchMsg::Lines { last_id: 50, text: "some output".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Done { last_id: 99 }).unwrap();
+
+        let changed = app.drain_sse_watch();
+        assert!(changed);
+
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert!(sse.done, "done should be set after End event");
+        assert_eq!(sse.last_event_id, 99);
+        assert_eq!(sse.lines, vec!["some output"]);
+    }
+
+    #[test]
+    fn drain_sse_watch_heartbeat_is_silent() {
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        // Only heartbeat — channel still live.
+        tx.send(SseWatchMsg::Heartbeat).unwrap();
+        // Drain; no new content should be reported.
+        let _ = app.drain_sse_watch();
+
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert!(sse.lines.is_empty());
+        assert!(!sse.done);
+        assert_eq!(sse.fail_count, 0);
+    }
+
+    #[test]
+    fn drain_sse_watch_reconnects_on_first_error() {
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        // One error — should schedule reconnect but not set done.
+        tx.send(SseWatchMsg::Error("connection refused".to_string())).unwrap();
+        let changed = app.drain_sse_watch();
+        assert!(changed);
+
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert_eq!(sse.fail_count, 1);
+        assert!(!sse.done, "one error should not permanently stop reconnect");
+        // A new rx should have been installed (fail_count < 3 → reconnect).
+        // We can't inspect the new thread, but we can verify watch_sse is Some.
+        assert!(app.watch_sse.is_some());
+    }
+
+    #[test]
+    fn drain_sse_watch_stops_after_three_errors() {
+        let mut app = make_app_default();
+        let (state, _tx) = make_sse_state_pair(); // tx unused; rx gets replaced below
+        app.watch_sse = Some(state);
+
+        // First two errors — reconnect each time.
+        for _ in 0..2 {
+            // Re-fetch the sender for the new rx installed by reconnect.
+            // Since we can't, we'll drive via Error on the *original* tx as
+            // long as it's still connected. The reconnect installs a new rx,
+            // but the old tx becomes orphaned. So subsequent drains on the
+            // new rx will eventually see Disconnected (which also counts as
+            // error). To keep the test simple, we manipulate fail_count
+            // directly for errors 2 and 3.
+            if let Some(sse) = &mut app.watch_sse {
+                sse.fail_count += 1;
+                sse.first_fail_at = Some(Instant::now());
+            }
+        }
+        // Now fail_count = 2; send one more error to push it to 3.
+        let (state2, tx2) = make_sse_state_pair();
+        if let Some(sse) = &mut app.watch_sse {
+            sse.rx = state2.rx;
+            sse.fail_count = 2;
+        }
+        tx2.send(SseWatchMsg::Error("third failure".to_string())).unwrap();
+
+        let changed = app.drain_sse_watch();
+        assert!(changed);
+
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert!(sse.done, "three errors should set done");
+        assert_eq!(sse.fail_count, 3);
+        // A toast should have been pushed.
+        assert!(!app.toasts.is_empty(), "error toast should be pushed on fail limit");
+    }
+
+    #[test]
+    fn drain_sse_watch_noop_when_done() {
+        let mut app = make_app_default();
+        let (mut state, tx) = make_sse_state_pair();
+        state.done = true;
+        app.watch_sse = Some(state);
+
+        // Send lines — should be ignored because done=true.
+        tx.send(SseWatchMsg::Lines { last_id: 10, text: "ignored".to_string() }).unwrap();
+        let changed = app.drain_sse_watch();
+        assert!(!changed, "done state should not trigger redraw");
+        assert!(app.watch_sse.as_ref().unwrap().lines.is_empty());
+    }
+
+    #[test]
+    fn close_watch_drops_sse_state() {
+        let mut app = make_app_default();
+        let (state, _tx) = make_sse_state_pair();
+        app.watch = Some(WatchState {
+            assignment_id: "x".to_string(),
+            machine: "m".to_string(),
+            repo: "r".to_string(),
+            issue_number: 1,
+            assignment_type: "work".to_string(),
+            scroll: usize::MAX,
+        });
+        app.watch_sse = Some(state);
+
+        app.close_watch();
+
+        assert!(app.watch.is_none(), "watch should be cleared");
+        assert!(app.watch_sse.is_none(), "watch_sse should be dropped on close");
+    }
+
+    #[test]
+    fn watch_log_list_shows_connecting_when_lines_empty() {
+        let mut app = make_app_default();
+        app.watch = Some(WatchState {
+            assignment_id: "abc".to_string(),
+            machine: "remote".to_string(),
+            repo: "myrepo".to_string(),
+            issue_number: 42,
+            assignment_type: "work".to_string(),
+            scroll: usize::MAX,
+        });
+        let (state, _tx) = make_sse_state_pair();
+        // No lines yet, not done → "Connecting…" placeholder.
+        app.watch_sse = Some(state);
+
+        let list = app.watch_log_list();
+        let first_text: String = list.items.iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(first_text.contains("Connecting"), "got: {}", first_text);
+    }
+
+    #[test]
+    fn watch_log_list_shows_stream_ended_when_done() {
+        let mut app = make_app_default();
+        app.watch = Some(WatchState {
+            assignment_id: "abc".to_string(),
+            machine: "remote".to_string(),
+            repo: "myrepo".to_string(),
+            issue_number: 42,
+            assignment_type: "work".to_string(),
+            scroll: usize::MAX,
+        });
+        let (mut state, _tx) = make_sse_state_pair();
+        state.lines.push("STATUS: done → done → confidence: high".to_string());
+        state.done = true;
+        app.watch_sse = Some(state);
+
+        let list = app.watch_log_list();
+        let all_text: String = list.items.iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(all_text.contains("stream ended"), "got: {}", all_text);
+    }
+
+    #[test]
+    fn watch_log_list_title_includes_refresh_hint() {
+        let mut app = make_app_default();
+        app.watch = Some(WatchState {
+            assignment_id: "abc".to_string(),
+            machine: "remote".to_string(),
+            repo: "myrepo".to_string(),
+            issue_number: 42,
+            assignment_type: "work".to_string(),
+            scroll: usize::MAX,
+        });
+        let (state, _tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        let list = app.watch_log_list();
+        let title = list.title.as_ref().map(|t| {
+            t.spans.iter().map(|s| s.text.clone()).collect::<String>()
+        }).unwrap_or_default();
+        assert!(title.contains("R=refresh"), "title should show R=refresh hint, got: {}", title);
     }
 }
