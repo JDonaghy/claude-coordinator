@@ -1431,7 +1431,7 @@ pub struct CoordApp {
     ///
     /// Triggered by pressing 'P' when the Board sidebar selection is in the
     /// Completed (done/merged) group.  Any key other than 'y'/'Y' cancels.
-    pending_purge: Option<usize>,
+    pending_purge: Option<(usize, usize)>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -2441,29 +2441,6 @@ impl CoordApp {
         };
         let groups = self.board_grouped_for_repo(&self.board_issues_cache, repo);
         matches!(groups.get(group_idx), Some(("completed", _)))
-    }
-
-    /// Count how many assignment rows in the currently loaded data would be
-    /// deleted by a purge with the current [`purge_days`] cutoff.
-    ///
-    /// Only `done` and `failed` assignments with a `finished_at` timestamp
-    /// older than `purge_days` days are counted.  Running and pending
-    /// assignments are never purgeable.
-    fn count_purgeable(&self) -> usize {
-        let cutoff_secs = self.purge_days as f64 * 86_400.0;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let cutoff = now - cutoff_secs;
-        self.data
-            .assignments
-            .iter()
-            .filter(|a| {
-                matches!(a.status.as_str(), "done" | "failed")
-                    && a.finished_at.map_or(false, |t| t < cutoff)
-            })
-            .count()
     }
 
     /// Try to select a specific issue in the sidebar by repo and issue number.
@@ -4651,11 +4628,13 @@ impl CoordApp {
             }
         }
         let proposals = self.data.proposals.len();
-        let hints = if let Some(n) = self.pending_purge {
+        let hints = if let Some((a, i)) = self.pending_purge {
             // Confirm prompt overrides the normal hints while purge is pending.
             format!(
-                " Purge {} rows older than {}d? y=confirm  Esc=cancel ",
-                n, self.purge_days
+                " Purge {} assignment{} + {} closed issue{} older than {}d? y=confirm  Esc=cancel ",
+                a, if a == 1 { "" } else { "s" },
+                i, if i == 1 { "" } else { "s" },
+                self.purge_days
             )
         } else if proposals > 0 {
             format!(" p=plan  a=approve({})  m=merge  R=retry  P=purge  q=quit ", proposals)
@@ -4868,12 +4847,20 @@ impl ShellApp for CoordApp {
                 match key {
                     Key::Char('y') | Key::Char('Y') => {
                         let secs = self.purge_days as f64 * 86_400.0;
-                        let count = purge_done_assignments_db(secs);
-                        self.push_toast(
-                            "Purge complete",
-                            &format!("{} rows removed", count),
-                            ToastSeverity::Info,
-                        );
+                        match purge_done_assignments_db(secs) {
+                            Ok((a, i)) => self.push_toast(
+                                "Purge complete",
+                                &format!("Removed {} assignment{} + {} closed issue{}",
+                                    a, if a == 1 { "" } else { "s" },
+                                    i, if i == 1 { "" } else { "s" }),
+                                ToastSeverity::Info,
+                            ),
+                            Err(e) => self.push_toast(
+                                "Purge failed",
+                                &format!("{}", e),
+                                ToastSeverity::Error,
+                            ),
+                        }
                         self.pending_purge = None;
                         self.refresh();
                     }
@@ -5343,8 +5330,9 @@ impl ShellApp for CoordApp {
                             && !self.board_search_focused
                             && self.board_selection_in_completed_group() =>
                     {
-                        let n = self.count_purgeable();
-                        self.pending_purge = Some(n);
+                        let secs = self.purge_days as f64 * 86_400.0;
+                        let counts = count_purgeable_db(secs).unwrap_or((0, 0));
+                        self.pending_purge = Some(counts);
                         needs_redraw = true;
                     }
 
@@ -5431,39 +5419,84 @@ fn pipeline_detail_pv_rect(main: Rect, lh: f32) -> Rect {
 /// A separate read-write connection is used because the main data-load
 /// connection is opened with `SQLITE_OPEN_READ_ONLY`.  SQLite WAL mode
 /// serialises concurrent writers, so this is safe.
-fn purge_done_assignments_db(older_than_secs: f64) -> usize {
-    let db_path = coord_dir().join("coord.db");
-    let conn = match Connection::open(&db_path) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
+/// Compute the cutoff timestamp for purge predicates.
+fn purge_cutoff(older_than_secs: f64) -> f64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    let cutoff = now - older_than_secs;
+    now - older_than_secs
+}
 
-    let assignments_deleted = conn
-        .execute(
-            "DELETE FROM assignments \
-             WHERE status IN ('done', 'failed') \
-             AND finished_at IS NOT NULL \
-             AND finished_at < ?1",
-            rusqlite::params![cutoff],
-        )
-        .unwrap_or(0);
+/// Open a writer connection with a 5s busy timeout so a brief lock from
+/// the coordinator doesn't make purge silently no-op.
+fn open_purge_conn() -> rusqlite::Result<Connection> {
+    let db_path = coord_dir().join("coord.db");
+    let conn = Connection::open(&db_path)?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    Ok(conn)
+}
 
-    let issues_deleted = conn
-        .execute(
-            "DELETE FROM issues \
-             WHERE state = 'closed' \
-             AND synced_at IS NOT NULL \
-             AND synced_at < ?1",
-            rusqlite::params![cutoff],
-        )
-        .unwrap_or(0);
+/// Count rows that would be deleted by [`purge_done_assignments_conn`].
+/// Inner helper that takes an explicit connection so tests can run against
+/// an in-memory DB without touching the real coord.db.
+fn count_purgeable_conn(conn: &Connection, cutoff: f64) -> rusqlite::Result<(usize, usize)> {
+    let a: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM assignments \
+         WHERE status IN ('done', 'failed') \
+         AND finished_at IS NOT NULL \
+         AND finished_at < ?1",
+        rusqlite::params![cutoff],
+        |r| r.get(0),
+    )?;
+    let i: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM issues \
+         WHERE state = 'closed' \
+         AND synced_at IS NOT NULL \
+         AND synced_at < ?1",
+        rusqlite::params![cutoff],
+        |r| r.get(0),
+    )?;
+    Ok((a as usize, i as usize))
+}
 
-    assignments_deleted + issues_deleted
+/// Delete old `done`/`failed` assignments and old closed issues.
+/// Inner helper — see [`count_purgeable_conn`].
+fn purge_done_assignments_conn(conn: &Connection, cutoff: f64) -> rusqlite::Result<(usize, usize)> {
+    let assignments_deleted = conn.execute(
+        "DELETE FROM assignments \
+         WHERE status IN ('done', 'failed') \
+         AND finished_at IS NOT NULL \
+         AND finished_at < ?1",
+        rusqlite::params![cutoff],
+    )?;
+    let issues_deleted = conn.execute(
+        "DELETE FROM issues \
+         WHERE state = 'closed' \
+         AND synced_at IS NOT NULL \
+         AND synced_at < ?1",
+        rusqlite::params![cutoff],
+    )?;
+    Ok((assignments_deleted, issues_deleted))
+}
+
+/// Count rows that would be deleted by [`purge_done_assignments_db`].
+///
+/// Returns `(assignments, closed_issues)` so the confirmation prompt and the
+/// completion toast show matching numbers — the user is never surprised by
+/// a "47 rows removed" toast after confirming "Purge 3 rows".
+fn count_purgeable_db(older_than_secs: f64) -> rusqlite::Result<(usize, usize)> {
+    let conn = open_purge_conn()?;
+    count_purgeable_conn(&conn, purge_cutoff(older_than_secs))
+}
+
+/// Delete old `done`/`failed` assignments and old closed issues.
+/// Returns `(assignments_deleted, issues_deleted)`; errors propagate to the
+/// caller for a visible error toast (silent `.unwrap_or(0)` previously hid
+/// SQLITE_BUSY).
+fn purge_done_assignments_db(older_than_secs: f64) -> rusqlite::Result<(usize, usize)> {
+    let conn = open_purge_conn()?;
+    purge_done_assignments_conn(&conn, purge_cutoff(older_than_secs))
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -7039,112 +7072,110 @@ mod tests {
 
     // ── Purge helpers ─────────────────────────────────────────────────────────
 
-    /// Build an Assignment with an explicit `finished_at` timestamp so that
-    /// `count_purgeable` can evaluate the age-based cutoff.
-    fn make_assignment_with_age(status: &str, age_days: f64) -> Assignment {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let finished_at = now - age_days * 86_400.0;
-        Assignment {
-            id: format!("id-{}-{}", status, age_days as u64),
-            repo: "test-repo".to_string(),
-            issue_number: 42,
-            issue_title: "Test issue".to_string(),
-            machine: "testmachine".to_string(),
-            status: status.to_string(),
-            branch: None,
-            model: None,
-            dispatched_at: Some(finished_at - 3_600.0),
-            finished_at: Some(finished_at),
-            exit_code: None,
-            assignment_type: None,
-        }
+    /// Build an in-memory DB with the columns the purge predicates read.
+    /// Only the columns referenced by the SQL need to exist; this keeps the
+    /// fixture small and decoupled from the production schema migrations.
+    fn make_purge_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE assignments (
+                assignment_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                finished_at REAL
+             );
+             CREATE TABLE issues (
+                number INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                synced_at REAL
+             );",
+        )
+        .unwrap();
+        conn
     }
 
-    // ── count_purgeable ────────────────────────────────────────────────────────
+    fn insert_assignment(conn: &Connection, id: &str, status: &str, finished_at: Option<f64>) {
+        conn.execute(
+            "INSERT INTO assignments (assignment_id, status, finished_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, status, finished_at],
+        )
+        .unwrap();
+    }
+
+    fn insert_issue(conn: &Connection, number: i64, state: &str, synced_at: Option<f64>) {
+        conn.execute(
+            "INSERT INTO issues (number, state, synced_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![number, state, synced_at],
+        )
+        .unwrap();
+    }
+
+    // ── count_purgeable_conn ──────────────────────────────────────────────────
 
     #[test]
     fn count_purgeable_counts_done_rows_older_than_cutoff() {
-        let app = make_test_app(BoardData {
-            assignments: vec![
-                make_assignment_with_age("done", 10.0), // 10 days old → older than 7 → purgeable
-                make_assignment_with_age("done", 3.0),  // 3 days old  → newer than 7 → NOT purgeable
-            ],
-            ..BoardData::default()
-        });
-        // purge_days defaults to 7
-        assert_eq!(app.count_purgeable(), 1);
+        let conn = make_purge_db();
+        insert_assignment(&conn, "old", "done", Some(100.0));   // older than cutoff
+        insert_assignment(&conn, "new", "done", Some(500.0));   // newer than cutoff
+        let (a, i) = count_purgeable_conn(&conn, 300.0).unwrap();
+        assert_eq!(a, 1);
+        assert_eq!(i, 0);
     }
 
     #[test]
-    fn count_purgeable_excludes_running_assignments() {
-        // Running rows must never be counted regardless of age.
-        let app = make_test_app(BoardData {
-            assignments: vec![make_assignment_with_age("running", 30.0)],
-            ..BoardData::default()
-        });
-        assert_eq!(app.count_purgeable(), 0);
-    }
-
-    #[test]
-    fn count_purgeable_excludes_pending_assignments() {
-        let app = make_test_app(BoardData {
-            assignments: vec![make_assignment_with_age("pending", 30.0)],
-            ..BoardData::default()
-        });
-        assert_eq!(app.count_purgeable(), 0);
+    fn count_purgeable_excludes_running_and_pending() {
+        let conn = make_purge_db();
+        insert_assignment(&conn, "r", "running", Some(0.0));
+        insert_assignment(&conn, "p", "pending", Some(0.0));
+        let (a, _) = count_purgeable_conn(&conn, 300.0).unwrap();
+        assert_eq!(a, 0);
     }
 
     #[test]
     fn count_purgeable_includes_old_failed_rows() {
-        // Failed rows older than the cutoff are also purgeable.
-        let app = make_test_app(BoardData {
-            assignments: vec![make_assignment_with_age("failed", 8.0)],
-            ..BoardData::default()
-        });
-        assert_eq!(app.count_purgeable(), 1);
-    }
-
-    #[test]
-    fn count_purgeable_returns_zero_when_all_fresh() {
-        // Neither done nor failed rows are old enough.
-        let app = make_test_app(BoardData {
-            assignments: vec![
-                make_assignment_with_age("done", 1.0),
-                make_assignment_with_age("failed", 2.0),
-            ],
-            ..BoardData::default()
-        });
-        assert_eq!(app.count_purgeable(), 0);
-    }
-
-    #[test]
-    fn count_purgeable_respects_custom_purge_days() {
-        let mut app = make_test_app(BoardData {
-            assignments: vec![
-                make_assignment_with_age("done", 4.0), // 4 days old
-            ],
-            ..BoardData::default()
-        });
-        // Default (7 days): 4-day-old row is newer → not purgeable.
-        assert_eq!(app.count_purgeable(), 0);
-        // Override to 3 days: 4-day-old row is older → purgeable.
-        app.purge_days = 3;
-        assert_eq!(app.count_purgeable(), 1);
+        let conn = make_purge_db();
+        insert_assignment(&conn, "f", "failed", Some(100.0));
+        let (a, _) = count_purgeable_conn(&conn, 300.0).unwrap();
+        assert_eq!(a, 1);
     }
 
     #[test]
     fn count_purgeable_excludes_rows_with_no_finished_at() {
-        // Rows without a finished_at timestamp must never be purged.
-        let mut a = make_assignment_with_age("done", 30.0);
-        a.finished_at = None;
-        let app = make_test_app(BoardData {
-            assignments: vec![a],
-            ..BoardData::default()
-        });
-        assert_eq!(app.count_purgeable(), 0);
+        let conn = make_purge_db();
+        insert_assignment(&conn, "d", "done", None);
+        let (a, _) = count_purgeable_conn(&conn, 300.0).unwrap();
+        assert_eq!(a, 0);
+    }
+
+    #[test]
+    fn count_purgeable_counts_closed_issues_older_than_cutoff() {
+        let conn = make_purge_db();
+        insert_issue(&conn, 1, "closed", Some(100.0));   // purgeable
+        insert_issue(&conn, 2, "closed", Some(500.0));   // too fresh
+        insert_issue(&conn, 3, "open", Some(50.0));      // open: never purged
+        insert_issue(&conn, 4, "closed", None);          // no synced_at: never purged
+        let (_, i) = count_purgeable_conn(&conn, 300.0).unwrap();
+        assert_eq!(i, 1);
+    }
+
+    // ── count vs delete symmetry ─────────────────────────────────────────────
+
+    #[test]
+    fn count_matches_delete_for_mixed_data() {
+        // The reviewer's bug #2: prompt showed one number, toast showed another
+        // because count_purgeable saw assignments-only and the SQL also deleted
+        // issues. This test guards against future drift between the two helpers.
+        let conn = make_purge_db();
+        insert_assignment(&conn, "a1", "done", Some(100.0));
+        insert_assignment(&conn, "a2", "failed", Some(100.0));
+        insert_assignment(&conn, "a3", "done", Some(500.0));  // too fresh
+        insert_issue(&conn, 1, "closed", Some(100.0));
+        insert_issue(&conn, 2, "closed", Some(200.0));
+        insert_issue(&conn, 3, "open", Some(100.0));
+
+        let counted = count_purgeable_conn(&conn, 300.0).unwrap();
+        let deleted = purge_done_assignments_conn(&conn, 300.0).unwrap();
+        assert_eq!(counted, deleted, "count and delete must agree exactly");
+        assert_eq!(counted, (2, 2));
     }
 
     // ── board_selection_in_completed_group ────────────────────────────────────
