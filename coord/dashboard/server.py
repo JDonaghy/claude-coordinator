@@ -329,6 +329,29 @@ def build_app(config: Config) -> Starlette:
                 }
             )
 
+        elif action == "post_findings":
+            # Find the review assignment linked to this work assignment and
+            # attempt to post its findings.
+            all_assignments = list(board.active) + list(board.completed)
+            review_assignment = next(
+                (
+                    a for a in all_assignments
+                    if a.review_of_assignment_id == assignment_id and a.type == "review"
+                ),
+                None,
+            )
+            if review_assignment is None:
+                return JSONResponse({"error": "no review assignment found"}, status_code=404)
+            if review_assignment.review_posted_at is not None:
+                return JSONResponse({"ok": True, "detail": "already posted"})
+            from coord.notify import post_orphaned_review_findings  # noqa: PLC0415
+
+            posted = post_orphaned_review_findings(config)
+            ok = review_assignment.assignment_id in posted
+            return JSONResponse(
+                {"ok": ok, "detail": "posted" if ok else "not posted (agent offline or no structured findings)"}
+            )
+
         elif action in ("retry", "dispatch_fix"):
             return JSONResponse(
                 {"ok": False, "error": f"{action!r} is not yet implemented in the dashboard"},

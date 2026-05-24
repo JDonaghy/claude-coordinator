@@ -73,6 +73,7 @@ def _row_to_assignment(row: object) -> Assignment:
         plan=_json_loads(d.get("plan")),
         unreachable_count=d.get("unreachable_count") or 0,
         review_iteration=d.get("review_iteration") or 0,
+        review_posted_at=d.get("review_posted_at"),
     )
 
 
@@ -103,6 +104,7 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         json.dumps(a.plan) if a.plan is not None else None,
         a.unreachable_count,
         a.review_iteration,
+        a.review_posted_at,
     )
 
 
@@ -112,13 +114,15 @@ _UPSERT_SQL = """
         status, type, branch, pr_url, briefing,
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
-        review_target, required_gates, plan, unreachable_count, review_iteration
+        review_target, required_gates, plan, unreachable_count, review_iteration,
+        review_posted_at
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
-        ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?,
+        ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         status             = excluded.status,
@@ -137,7 +141,8 @@ _UPSERT_SQL = """
         files_allowed      = excluded.files_allowed,
         files_forbidden    = excluded.files_forbidden,
         required_gates     = excluded.required_gates,
-        review_iteration   = excluded.review_iteration
+        review_iteration   = excluded.review_iteration,
+        review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at)
 """
 
 
@@ -508,6 +513,54 @@ def mark_notified(
             (now, assignment_id),
         )
     conn.commit()
+
+
+# ── Review-findings tracking ──────────────────────────────────────────────────
+
+def mark_review_posted(assignment_id: str) -> None:
+    """Record that this review assignment's findings have been successfully posted.
+
+    Sets ``review_posted_at`` on the assignment row.  Idempotent — calling
+    it again after it's already set is harmless (the timestamp won't change
+    because the UPDATE only fires when the row exists).
+    """
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET review_posted_at=? WHERE assignment_id=?",
+        (time.time(), assignment_id),
+    )
+    conn.commit()
+
+
+def load_done_reviews_needing_post(repo_name: str | None = None) -> list[dict]:
+    """Return done review assignments whose findings have not yet been posted.
+
+    A review assignment needs posting when:
+    - ``type = 'review'``
+    - ``status = 'done'``
+    - ``review_posted_at IS NULL``
+
+    Optionally filtered to a single repo by *repo_name*.
+
+    Returns dicts in the same format as :func:`load_dispatched` (keyed by
+    ``assignment_id``, ``machine_name``, ``repo_github``, ``issue_number``,
+    ``review_target``, etc.).
+    """
+    conn = get_connection()
+    if repo_name:
+        rows = conn.execute(
+            "SELECT * FROM assignments "
+            "WHERE type='review' AND status='done' AND review_posted_at IS NULL "
+            "AND repo_name=? ORDER BY finished_at",
+            (repo_name,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM assignments "
+            "WHERE type='review' AND status='done' AND review_posted_at IS NULL "
+            "ORDER BY finished_at",
+        ).fetchall()
+    return [_row_to_dispatched_dict(row) for row in rows]
 
 
 # ── Plan persistence ────────────────────────────────────────────────────────────

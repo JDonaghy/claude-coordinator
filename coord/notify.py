@@ -21,7 +21,14 @@ from coord.comments import (
 from coord.config import Config
 from coord.dispatch import AGENT_PORT, post_completion, post_failure
 from coord.progress import parse_progress
-from coord.state import load_dispatched, load_notified, mark_notified, save_plan
+from coord.state import (
+    load_dispatched,
+    load_done_reviews_needing_post,
+    load_notified,
+    mark_notified,
+    mark_review_posted,
+    save_plan,
+)
 
 
 @dataclass
@@ -267,6 +274,7 @@ def _try_parse_and_post_review(
     if pr_number is not None:
         try:
             github_ops.post_pr_review(repo_github, pr_number, findings.verdict, findings.body)
+            mark_review_posted(transition.assignment_id)
             return True
         except Exception as exc:  # noqa: BLE001
             # GitHub rejects self-reviews (same user who opened the PR can't
@@ -300,6 +308,7 @@ def _try_parse_and_post_review(
     )
     try:
         github_ops.post_issue_comment(repo_github, transition.issue_number, body)
+        mark_review_posted(transition.assignment_id)
         return True
     except Exception as exc:  # noqa: BLE001
         log.warning(
@@ -421,6 +430,146 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         )
 
 
+def post_orphaned_review_findings(
+    config: Config,
+    repo_name: str | None = None,
+) -> list[str]:
+    """Walk done-review assignments with unposted findings and attempt to post.
+
+    Handles two scenarios that cause findings to be lost:
+
+    1. The agent reported the assignment as 'done' but notify never ran (or
+       ran at the wrong time) — no notification record in the DB at all.
+    2. Notify ran and posted a fallback completion comment (because the log
+       couldn't be parsed at that time), but findings were never extracted.
+
+    In both cases ``review_posted_at`` is NULL on the assignment row.
+
+    The function queries each relevant agent server to discover the log path,
+    then re-parses and re-posts.  If the agent is offline or its completed
+    list no longer contains the assignment, the entry is silently skipped
+    so ``coord notify`` stays non-fatal.
+
+    Returns a list of assignment_ids for which findings were successfully posted.
+    Optionally filter to a single *repo_name*.
+    """
+    from coord.review import parse_review_from_log  # noqa: PLC0415
+
+    candidates = load_done_reviews_needing_post(repo_name=repo_name)
+    if not candidates:
+        return []
+
+    notified = load_notified()
+    machines_by_name = {m.name: m for m in config.machines}
+
+    # Group by machine so we query each agent server once.
+    by_machine: dict[str, list[dict]] = {}
+    for row in candidates:
+        by_machine.setdefault(row["machine_name"], []).append(row)
+
+    posted_ids: list[str] = []
+    for machine_name, rows in by_machine.items():
+        machine = machines_by_name.get(machine_name)
+        if machine is None:
+            log.debug("post_orphaned: unknown machine %r — skipping %d assignment(s)", machine_name, len(rows))
+            continue
+
+        status = _agent_status(machine.host)
+        log_by_id: dict[str, str] = {}
+        if status:
+            for entry in status.get("completed", []):
+                eid = entry.get("id")
+                lp = entry.get("log_path")
+                if eid and lp:
+                    log_by_id[eid] = lp
+
+        for row in rows:
+            aid = row["assignment_id"]
+            log_path = log_by_id.get(aid)
+            if not log_path:
+                log.debug(
+                    "post_orphaned: no log_path for %s on %s (agent offline or entry reaped)",
+                    aid, machine_name,
+                )
+                continue
+
+            try:
+                findings = parse_review_from_log(log_path)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("post_orphaned: failed to parse log for %s: %s", aid, exc)
+                continue
+
+            if findings is None:
+                log.debug("post_orphaned: no structured findings in log for %s", aid)
+                continue
+
+            review_target = row.get("review_target")
+            repo_github = row.get("repo_github") or ""
+            issue_number = row.get("issue_number", 0)
+
+            pr_number: int | None = None
+            if review_target:
+                try:
+                    pr_number = int(review_target)
+                except (ValueError, TypeError):
+                    pr_number = None
+
+            # Build a preamble that distinguishes retroactive posts from fresh ones.
+            already_notified = aid in notified
+            if already_notified:
+                retro_note = (
+                    "\n\n*Note: a completion comment was posted earlier but findings "
+                    "could not be extracted at that time. These are the retroactive findings.*"
+                )
+            else:
+                retro_note = ""
+
+            posted = False
+            if pr_number is not None:
+                try:
+                    github_ops.post_pr_review(repo_github, pr_number, findings.verdict, findings.body + retro_note)
+                    posted = True
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "post_orphaned: failed gh pr review for %s PR#%s: %s — "
+                        "falling back to issue comment",
+                        aid, pr_number, exc,
+                    )
+
+            if not posted:
+                verdict_label = "✅ Approved" if findings.verdict == "approve" else "⚠️ Changes Requested"
+                if pr_number is not None:
+                    preamble = (
+                        f"*Reviewer findings could not be posted directly to PR #{pr_number} "
+                        f"(gh pr review was rejected — likely a self-review restriction). "
+                        f"Findings are reproduced here.*"
+                    )
+                else:
+                    preamble = (
+                        "*Reviewer could not post directly to a PR (no PR number available). "
+                        "Findings are reproduced here.*"
+                    )
+                body = (
+                    f"## Review Complete — {verdict_label}\n\n"
+                    f"{preamble}{retro_note}\n\n"
+                    f"{findings.body}"
+                )
+                try:
+                    github_ops.post_issue_comment(repo_github, issue_number, body)
+                    posted = True
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("post_orphaned: failed to post comment for %s: %s", aid, exc)
+
+            if posted:
+                mark_review_posted(aid)
+                if not already_notified:
+                    mark_notified(aid, EVENT_COMPLETION)
+                posted_ids.append(aid)
+                log.info("post_orphaned: posted findings for review %s", aid)
+
+    return posted_ids
+
+
 def _dispatch_board_pending_reviews(config: Config) -> None:
     """Load the board, dispatch any pending reviews, and save.
 
@@ -491,6 +640,14 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
         _dispatch_board_pending_reviews(config)
     except Exception:  # noqa: BLE001
         pass
+
+    # Post findings for done-review assignments that were never processed
+    # (e.g. agent reported 'cancelled', user manually marked done, or notify
+    # ran at the wrong time).  Best-effort, non-fatal.
+    try:
+        post_orphaned_review_findings(config)
+    except Exception:  # noqa: BLE001
+        log.exception("post_orphaned_review_findings: unexpected error")
 
     # Auto-loop: for each completed review, optionally dispatch a fix worker.
     # Runs after notify posts the completion comment so GitHub has the full

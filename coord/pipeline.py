@@ -59,6 +59,10 @@ class PipelineView:
     current_stage: str
     available_gates: list[PipelineGate]
     progress_pct: int   # 0-100
+    # True when the review assignment completed but its findings have not yet
+    # been posted to GitHub (review_posted_at is None on the review assignment).
+    # The dashboard shows a ⚠ indicator and a "Post Findings" retry button.
+    review_findings_pending: bool = False
 
 
 # ── Stage progression constants ──────────────────────────────────────────────
@@ -243,6 +247,8 @@ def compute_pipeline(
         available_gates.append(PipelineGate("dispatch_review", "Dispatch Review", _EP))
     elif current_stage == "review_done":
         available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
+        if review_assignment is not None and review_assignment.review_posted_at is None:
+            available_gates.append(PipelineGate("post_findings", "Post Findings", _EP))
     elif current_stage == "smoke_passed":
         available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
     elif current_stage == "merge_ready":
@@ -254,6 +260,13 @@ def compute_pipeline(
 
     progress_pct = _PROGRESS.get(current_stage, 0)
 
+    # Determine whether review findings need to be posted.
+    review_findings_pending = (
+        review_assignment is not None
+        and review_assignment.status == "done"
+        and review_assignment.review_posted_at is None
+    )
+
     return PipelineView(
         assignment_id=aid,
         issue_number=assignment.issue_number,
@@ -262,4 +275,5 @@ def compute_pipeline(
         current_stage=current_stage,
         available_gates=available_gates,
         progress_pct=progress_pct,
+        review_findings_pending=review_findings_pending,
     )
