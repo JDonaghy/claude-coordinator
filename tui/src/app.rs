@@ -66,7 +66,6 @@ const TOAST_TTL: Duration = Duration::from_secs(4);
 
 // ─── Detail panel tabs ────────────────────────────────────────────────────────
 
-/// The two tabs shown in the Board view detail panel.
 /// Per-assignment context for the live watch overlay (Pipeline > Stages
 /// > Enter).  The overlay takes over the main panel, auto-refreshes the
 /// worker log every render, and accepts K/q/scroll keys.
@@ -2702,7 +2701,7 @@ impl CoordApp {
         }
     }
 
-/// Return log items for `id`, reading locally or fetching from the remote agent.
+    /// Return log items for `id`, reading locally or fetching from the remote agent.
     ///
     /// This method **never blocks** the UI thread:
     ///
@@ -2786,7 +2785,7 @@ impl CoordApp {
         vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))]
     }
 
-/// Detail panel for the selected machine: status + job history.
+    /// Detail panel for the selected machine: status + job history.
     fn machine_detail_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
 
@@ -4265,9 +4264,9 @@ impl CoordApp {
         }
     }
 
-    /// Click in the main panel — in Board view this handles the tab bar
-    /// (first row of the panel).  In Pipeline view this hit-tests the
-    /// PipelineView primitive and dispatches the "Go" action.
+    /// Click in the main panel — in Pipeline view this handles the tab
+    /// bar and the PipelineView primitive hit-test (Go action). Board
+    /// and Machines views are no-ops.
     fn mouse_main_click(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
         if self.active_view == SidebarView::Pipeline {
             // Tab bar occupies the first `lh * 1.4` row of the main panel.
