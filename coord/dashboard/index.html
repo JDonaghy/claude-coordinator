@@ -81,6 +81,28 @@ a { color: #58a6ff; }
 .dispatch-err-detail { margin-top: 6px; padding: 6px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; white-space: pre-wrap; word-break: break-all; font-size: 0.9em; max-height: 150px; overflow-y: auto; display: none; }
 .dispatch-err-detail.open { display: block; }
 
+/* ── Toast notifications ─────────────────────────────────────────────── */
+#toast-container { position: fixed; top: 16px; right: 16px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; max-width: 440px; pointer-events: none; }
+.toast { padding: 12px 16px; border-radius: 8px; font-size: 0.88em; font-weight: 500; cursor: pointer; pointer-events: all; border-left: 4px solid; line-height: 1.4; box-shadow: 0 4px 12px rgba(0,0,0,0.4); animation: toast-slide-in 0.2s ease; }
+.toast-done  { background: #0d2b16; color: #3fb950; border-color: #238636; }
+.toast-failed { background: #2d0e0e; color: #ff7b72; border-color: #da3633; }
+.toast-stuck { background: #2b1a00; color: #e3b341; border-color: #d29922; }
+.toast-dismiss { float: right; opacity: 0.6; margin-left: 12px; font-size: 1.1em; line-height: 1; }
+.toast-dismiss:hover { opacity: 1; }
+@keyframes toast-slide-in { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+.toast.toast-fade-out { animation: toast-fade-out 0.4s ease forwards; }
+@keyframes toast-fade-out { to { opacity: 0; transform: translateX(20px); } }
+
+/* ── Possibly-stuck warning on active cards ──────────────────────────── */
+.stuck-banner { margin-top: 8px; padding: 8px 10px; background: #2b1a00; border: 1px solid #d29922; border-radius: 6px; color: #e3b341; font-size: 0.82em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.stuck-banner .stuck-msg { flex: 1; }
+.btn-unstick { padding: 3px 10px; min-height: 26px; font-size: 0.78em; border-radius: 4px; border: none; color: #000; background: #d29922; cursor: pointer; }
+.btn-unstick:hover { background: #e3b341; }
+
+/* ── SSE connection status indicator ─────────────────────────────────── */
+.sse-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #484f58; margin-right: 4px; vertical-align: middle; title: "events disconnected"; }
+.sse-dot.connected { background: #238636; }
+
 @media (max-width: 600px) {
   .chat-msg.user { margin-left: 10%; }
   .chat-msg.assistant { margin-right: 10%; }
@@ -88,8 +110,9 @@ a { color: #58a6ff; }
 </style>
 </head>
 <body>
+<div id="toast-container"></div>
 <div class="container">
-  <h1>coord dashboard <span class="meta" id="round-info"></span></h1>
+  <h1>coord dashboard <span class="meta" id="round-info"></span> <span class="sse-dot" id="sse-dot" title="Live events disconnected"></span></h1>
 
   <div class="tabs">
     <div class="tab active" data-pane="board">Board</div>
@@ -255,6 +278,134 @@ async function doPipelineAction(assignmentId, action, issueNum) {
   await loadBoard();
 }
 
+// ── Toast notifications ────────────────────────────────────────────────
+function showToast(message, kind, autoDismissMs) {
+  if (autoDismissMs === undefined) autoDismissMs = kind === 'failed' ? 0 : 8000;
+  const container = document.getElementById('toast-container');
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${kind}`;
+  const dismiss = document.createElement('span');
+  dismiss.className = 'toast-dismiss';
+  dismiss.textContent = '×';
+  dismiss.onclick = e => { e.stopPropagation(); _dismissToast(toast); };
+  const text = document.createElement('span');
+  text.textContent = message;
+  toast.appendChild(dismiss);
+  toast.appendChild(text);
+  toast.addEventListener('click', () => _dismissToast(toast));
+  container.appendChild(toast);
+  if (autoDismissMs > 0) {
+    setTimeout(() => _dismissToast(toast), autoDismissMs);
+  }
+}
+
+function _dismissToast(toast) {
+  if (!toast.parentNode) return;
+  toast.classList.add('toast-fade-out');
+  setTimeout(() => { if (toast.parentNode) toast.parentNode.removeChild(toast); }, 400);
+}
+
+// ── Audio bell ─────────────────────────────────────────────────────────
+let bellEnabled = true;
+function playBell(freq, duration) {
+  if (!bellEnabled) return;
+  freq = freq || 440;
+  duration = duration || 0.35;
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    gain.gain.setValueAtTime(0.25, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + duration);
+    ctx.close();
+  } catch(e) {}
+}
+
+// ── Possibly-stuck tracking ────────────────────────────────────────────
+// Maps assignment_id → { repo_name, issue_number, machine_name, dispatched_ago_seconds }
+const possiblyStuck = {};
+
+function updatePossiblyStuck(items) {
+  // Clear old entries not present in the latest poll
+  const fresh = new Set(items.map(x => x.assignment_id));
+  for (const aid of Object.keys(possiblyStuck)) {
+    if (!fresh.has(aid)) delete possiblyStuck[aid];
+  }
+  for (const item of items) {
+    if (!possiblyStuck[item.assignment_id]) {
+      // First time we see it — show a toast too
+      const mins = Math.round((item.dispatched_ago_seconds || 0) / 60);
+      showToast(
+        `⚠ #${item.issue_number} ${item.repo_name} on ${item.machine_name} may be stuck (${mins}m, agent has no record)`,
+        'stuck', 20000
+      );
+    }
+    possiblyStuck[item.assignment_id] = item;
+  }
+}
+
+function renderStuckBanner(aid, issueNum) {
+  const info = possiblyStuck[aid];
+  if (!info) return '';
+  const mins = info.dispatched_ago_seconds ? Math.round(info.dispatched_ago_seconds / 60) : '?';
+  return `<div class="stuck-banner">
+    <span class="stuck-msg">⚠ Agent has no record of this assignment (${mins}m). Possibly stuck or orphaned.</span>
+    <button class="btn-unstick" onclick="doPipelineAction(${JSON.stringify(aid)},'unstick',${JSON.stringify(issueNum || null)})">Cancel &amp; Unstick</button>
+  </div>`;
+}
+
+// ── SSE live-events connection ─────────────────────────────────────────
+let _sse = null;
+let _sseReconnectTimer = null;
+
+function connectSSE() {
+  if (_sse) return;
+  _sse = new EventSource('/events');
+
+  _sse.addEventListener('open', () => {
+    const dot = document.getElementById('sse-dot');
+    if (dot) { dot.classList.add('connected'); dot.title = 'Live events connected'; }
+    if (_sseReconnectTimer) { clearTimeout(_sseReconnectTimer); _sseReconnectTimer = null; }
+  });
+
+  _sse.addEventListener('assignment_completed', e => {
+    const d = JSON.parse(e.data || '{}');
+    const turns = d.stats && d.stats.num_turns ? `, turns=${d.stats.num_turns}` : '';
+    const cost  = d.stats && d.stats.total_cost_usd ? `, cost=$${d.stats.total_cost_usd.toFixed(2)}` : '';
+    showToast(`✓ #${d.issue_number} ${E(d.repo_name)} on ${E(d.machine_name)}: DONE${turns}${cost}`, 'done');
+    loadBoard();
+  });
+
+  _sse.addEventListener('assignment_failed', e => {
+    const d = JSON.parse(e.data || '{}');
+    const exit    = d.exit_code != null ? `, exit=${d.exit_code}` : '';
+    const last    = d.stats && d.stats.last_tool ? `, last_tool=${d.stats.last_tool}` : '';
+    showToast(`✗ #${d.issue_number} ${E(d.repo_name)} on ${E(d.machine_name)}: FAILED${exit}${last}`, 'failed');
+    playBell(220, 0.5);  // Low tone for failures
+    loadBoard();
+  });
+
+  _sse.addEventListener('board_updated', e => {
+    const d = JSON.parse(e.data || '{}');
+    if (Array.isArray(d.possibly_stuck)) updatePossiblyStuck(d.possibly_stuck);
+    loadBoard();
+  });
+
+  _sse.onerror = () => {
+    const dot = document.getElementById('sse-dot');
+    if (dot) { dot.classList.remove('connected'); dot.title = 'Live events disconnected — reconnecting'; }
+    _sse.close();
+    _sse = null;
+    _sseReconnectTimer = setTimeout(connectSSE, 5000);
+  };
+}
+
 // ── Board ──────────────────────────────────────────────────────────────
 async function loadBoard() {
   await loadPipeline();
@@ -272,11 +423,13 @@ async function loadBoard() {
       const pv = isWork ? pipelineCache[a.assignment_id] : null;
       const cardId = a.assignment_id ? ` id="card-${E(a.assignment_id)}"` : '';
       const pipelineHtml = pv ? `<div class="pipeline-area">${renderPipelineBar(pv, a.issue_number)}</div>` : '';
+      const stuckHtml = a.assignment_id ? renderStuckBanner(a.assignment_id, a.issue_number) : '';
       return `
         <div class="card"${cardId}>
           <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}${typeTag}</div>
           <div class="meta">${badge('running', a.status)} on ${E(a.machine_name)}</div>
           ${pipelineHtml}
+          ${stuckHtml}
         </div>
       `;
     }).join('');
@@ -473,6 +626,7 @@ async function sendChat() {
 document.getElementById('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
 
 loadBoard();
+connectSSE();
 </script>
 </body>
 </html>
