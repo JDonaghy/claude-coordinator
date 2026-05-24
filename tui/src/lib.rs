@@ -6,4 +6,5 @@
 
 mod app;
 mod commands;
+pub mod settings;
 pub use app::CoordApp;
