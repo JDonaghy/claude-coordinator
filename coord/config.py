@@ -175,7 +175,7 @@ class PipelineConfig:
     Default is 3.
     """
 
-    default_gates: list[str] = field(default_factory=lambda: ["review", "merge"])
+    default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
     labels: dict[str, list[str]] = field(default_factory=dict)
     auto_loop: bool = True
     max_review_iterations: int = 3

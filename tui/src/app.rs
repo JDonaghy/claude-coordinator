@@ -175,6 +175,9 @@ struct Assignment {
     finished_at: Option<f64>,
     exit_code: Option<i32>,
     assignment_type: Option<String>,
+    /// #200: human-driven Test gate verdict for type="work" assignments.
+    /// None | "passed" | "failed" | "skipped".
+    test_state: Option<String>,
 }
 
 impl Assignment {
@@ -825,7 +828,8 @@ fn load_data() -> BoardData {
     let mut assignments: Vec<Assignment> = {
         let mut stmt = match conn.prepare(
             "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
-             status, branch, model, type, dispatched_at, finished_at, exit_code \
+             status, branch, model, type, dispatched_at, finished_at, exit_code, \
+             test_state \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -845,6 +849,7 @@ fn load_data() -> BoardData {
                 dispatched_at: row.get::<_, Option<f64>>(9)?,
                 finished_at: row.get::<_, Option<f64>>(10)?,
                 exit_code: row.get::<_, Option<i32>>(11)?,
+                test_state: row.get::<_, Option<String>>(12)?,
             })
         }) {
             Ok(r) => r,
@@ -1559,6 +1564,11 @@ pub struct CoordApp {
     /// Triggered by pressing 'P' when the Board sidebar selection is in the
     /// Completed (done/merged) group.  Any key other than 'y'/'Y' cancels.
     pending_purge: Option<(usize, usize)>,
+    /// #200: inline reason input for Test gate failure. `Some(buf)` means we
+    /// are accumulating the reason; Enter submits, Esc cancels. The carried
+    /// `usize` is the work-assignment index in `self.data.assignments` that
+    /// the verdict will be applied to.
+    pending_test_fail: Option<(usize, String)>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -1640,6 +1650,7 @@ impl CoordApp {
             fetch_error: None,
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
+            pending_test_fail: None,
             purge_days: 7,
             watch_sse: None,
         };
@@ -3469,6 +3480,9 @@ impl CoordApp {
         if stage == "merge" {
             return self.merge_stage_status_for(issue);
         }
+        if stage == "test" {
+            return self.test_stage_status_for(issue);
+        }
         let matching = self.assignments_for_stage(issue, stage);
         if matching.iter().any(|a| a.status == "running") {
             return StageStatus::Active;
@@ -3581,6 +3595,58 @@ impl CoordApp {
             Some("failed") => StageStatus::Failed,
             _ => if issue.is_closed { StageStatus::Skipped } else { StageStatus::Pending },
         }
+    }
+
+    /// #200: Resolve the Test gate status from `test_state` on the latest
+    /// Work assignment for `issue`.
+    ///
+    /// `passed`/`skipped` → Done; `failed` → Failed; otherwise Pending while
+    /// Work is settled and Pending/Skipped while Work isn't done yet.
+    /// Note: Test is a human gate — there is no Active state because nothing
+    /// runs.
+    fn test_stage_status_for(&self, issue: &PipelineIssue) -> StageStatus {
+        // Test is gated on Work; if Work hasn't finished, Test isn't actionable.
+        let work_status = self.stage_status_for_internal_work(issue);
+        if work_status != StageStatus::Done {
+            // Work is still Active/Pending/Failed/Stale — Test inherits Pending
+            // (or Skipped for closed issues that bypassed Work).
+            return if issue.is_closed { StageStatus::Skipped } else { StageStatus::Pending };
+        }
+        // Work is done — read the verdict off the latest Work assignment.
+        let work = self.assignments_for_stage(issue, "work");
+        let latest = work.iter().max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        match latest.and_then(|a| a.test_state.as_deref()) {
+            Some("passed") | Some("skipped") => StageStatus::Done,
+            Some("failed") => StageStatus::Failed,
+            _ => StageStatus::Pending,
+        }
+    }
+
+    /// Compute the Work stage status without going through the dispatch in
+    /// `stage_status_for` (which would special-case "test" too). Used by
+    /// `test_stage_status_for` to decide whether Test is actionable yet.
+    fn stage_status_for_internal_work(&self, issue: &PipelineIssue) -> StageStatus {
+        let matching = self.assignments_for_stage(issue, "work");
+        if matching.iter().any(|a| a.status == "running") {
+            return StageStatus::Active;
+        }
+        let latest = matching.iter().max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some(latest) = latest {
+            match latest.status.as_str() {
+                "done" => return StageStatus::Done,
+                "failed" => return StageStatus::Failed,
+                _ => {}
+            }
+        }
+        if issue.is_closed { StageStatus::Skipped } else { StageStatus::Pending }
     }
 
     /// Returns the *display* current stage for the sidebar badge — the
@@ -3698,6 +3764,72 @@ impl CoordApp {
             .iter()
             .filter(|m| m.reachable && m.repos.iter().any(|r| r == coord_repo))
             .min_by_key(|m| m.active_count)
+    }
+
+    /// #200: Find the latest Work assignment id for the currently-selected
+    /// pipeline issue. Returns None if no issue is selected or no work assignment
+    /// exists yet.
+    fn pipeline_selected_work_id(&self) -> Option<String> {
+        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let work = self.assignments_for_stage(issue, "work");
+        let latest = work.iter().max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        Some(latest.id.clone())
+    }
+
+    /// #200: Apply a Test gate verdict to the selected issue's latest Work
+    /// assignment. Toasts the outcome. Returns true on success (a redraw is
+    /// needed regardless).
+    fn record_test_verdict(&mut self, verdict: &str, reason: Option<&str>) -> bool {
+        let Some(work_id) = self.pipeline_selected_work_id() else {
+            self.push_toast(
+                "Test verdict skipped",
+                "No work assignment to mark — dispatch Work first.",
+                ToastSeverity::Error,
+            );
+            return false;
+        };
+        match record_test_verdict_db(&work_id, verdict, reason) {
+            Ok(()) => {
+                let verb = match verdict {
+                    "passed" => "PASSED",
+                    "failed" => "FAILED",
+                    "skipped" => "SKIPPED",
+                    _ => verdict,
+                };
+                self.push_toast(
+                    "Test gate",
+                    &format!("Marked {} (work {})", verb, &work_id[..8.min(work_id.len())]),
+                    ToastSeverity::Info,
+                );
+                self.refresh();
+                true
+            }
+            Err(e) => {
+                self.push_toast(
+                    "Test verdict failed",
+                    &format!("{}", e),
+                    ToastSeverity::Error,
+                );
+                false
+            }
+        }
+    }
+
+    /// #200: True when the selected issue's Test stage is pending and ready
+    /// for a verdict (Work is Done, no verdict yet).
+    fn test_gate_actionable(&self) -> bool {
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
+        else { return false; };
+        let stages = self.pipeline_stage_names();
+        if !stages.iter().any(|s| s == "test") {
+            return false;
+        }
+        self.test_stage_status_for(issue) == StageStatus::Pending
+            && self.stage_status_for_internal_work(issue) == StageStatus::Done
     }
 
     /// Dispatch the action button (`[Go]` or `[Retry]`) attached to a
@@ -4842,7 +4974,11 @@ impl CoordApp {
             }
         }
         let proposals = self.data.proposals.len();
-        let hints = if let Some((a, i)) = self.pending_purge {
+        let hints = if let Some((_, ref buf)) = self.pending_test_fail {
+            // #200: inline reason input takes precedence over the purge prompt
+            // and normal hints.
+            format!(" Test failure reason: {}_  Enter=submit  Esc=cancel ", buf)
+        } else if let Some((a, i)) = self.pending_purge {
             // Confirm prompt overrides the normal hints while purge is pending.
             format!(
                 " Purge {} assignment{} + {} closed issue{} older than {}d? y=confirm  Esc=cancel ",
@@ -4850,6 +4986,10 @@ impl CoordApp {
                 i, if i == 1 { "" } else { "s" },
                 self.purge_days
             )
+        } else if self.active_view == SidebarView::Pipeline && self.test_gate_actionable() {
+            // #200: surface the Test gate keybinds when actionable for the
+            // currently-selected pipeline issue.
+            " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
         } else if proposals > 0 {
             format!(" p=plan  a=approve({})  m=merge  R=retry  P=purge  q=quit ", proposals)
         } else {
@@ -5149,6 +5289,41 @@ impl ShellApp for CoordApp {
         // ── Pre-compute panel bounds for keyboard visible-row estimates ───────
         let list_b = ctx.sidebar_bounds().unwrap_or(ctx.main_bounds());
         let lh = backend.line_height();
+
+        // ── #200 Pending test-fail reason: intercept all keys until submit ────
+        // Enter submits and records test_state=failed. Esc cancels. Backspace
+        // edits. Any printable char appends. Same pattern as inject_focused.
+        if self.pending_test_fail.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        let reason = self
+                            .pending_test_fail
+                            .as_ref()
+                            .map(|(_, b)| b.trim().to_string())
+                            .unwrap_or_default();
+                        let reason_opt = if reason.is_empty() { None } else { Some(reason.as_str()) };
+                        self.record_test_verdict("failed", reason_opt);
+                        self.pending_test_fail = None;
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_test_fail = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some((_, ref mut buf)) = self.pending_test_fail {
+                            buf.pop();
+                        }
+                    }
+                    Key::Char(ch) => {
+                        if let Some((_, ref mut buf)) = self.pending_test_fail {
+                            buf.push(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
 
         // ── Pending purge confirmation: intercept ALL key presses ─────────────
         // While a purge is pending, 'y'/'Y' executes it; every other key
@@ -5627,6 +5802,41 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── #200 Test gate: P = Pass, F = Fail (reason), S = Skip ──
+                    // Active in the Pipeline view when the selected issue's Test
+                    // stage is Pending (Work is Done, no verdict yet).
+                    Key::Char('P')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pending_test_fail.is_none()
+                            && self.test_gate_actionable() =>
+                    {
+                        self.record_test_verdict("passed", None);
+                        needs_redraw = true;
+                    }
+                    Key::Char('S')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pending_test_fail.is_none()
+                            && self.test_gate_actionable() =>
+                    {
+                        self.record_test_verdict("skipped", None);
+                        needs_redraw = true;
+                    }
+                    Key::Char('F')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pending_test_fail.is_none()
+                            && self.test_gate_actionable() =>
+                    {
+                        // Open inline reason input. We need a stable handle for
+                        // the work assignment in case the list reshuffles.
+                        if let Some(_work_id) = self.pipeline_selected_work_id() {
+                            // We carry an unused 0 as the first tuple slot —
+                            // pipeline_selected_work_id() is re-resolved at
+                            // submit time, so we don't need to cache the index.
+                            self.pending_test_fail = Some((0, String::new()));
+                            needs_redraw = true;
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -5790,6 +6000,22 @@ fn purge_done_assignments_db(older_than_secs: f64) -> rusqlite::Result<(usize, u
     purge_done_assignments_conn(&conn, purge_cutoff(older_than_secs))
 }
 
+/// #200: Record a Test gate verdict on the given work assignment id.
+/// `verdict` is "passed" | "failed" | "skipped". `reason` is only stored for
+/// failures (ignored otherwise).
+fn record_test_verdict_db(
+    assignment_id: &str,
+    verdict: &str,
+    reason: Option<&str>,
+) -> rusqlite::Result<()> {
+    let conn = open_purge_conn()?;
+    conn.execute(
+        "UPDATE assignments SET test_state = ?1, test_reason = ?2 WHERE assignment_id = ?3",
+        rusqlite::params![verdict, reason, assignment_id],
+    )?;
+    Ok(())
+}
+
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -5900,6 +6126,7 @@ mod tests {
             fetch_error: None,
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
+            pending_test_fail: None,
             purge_days: 7,
             watch_sse: None,
         }
@@ -6046,6 +6273,7 @@ mod tests {
             finished_at: None,
             exit_code: None,
             assignment_type: atype.map(|s| s.to_string()),
+            test_state: None,
         }
     }
 
@@ -6099,6 +6327,7 @@ mod tests {
             finished_at: None,
             exit_code: None,
             assignment_type: None,
+            test_state: None,
         }
     }
 
@@ -6647,6 +6876,7 @@ mod tests {
             finished_at: None,
             exit_code: None,
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -6678,6 +6908,7 @@ mod tests {
             finished_at: None,
             exit_code: None,
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -6716,6 +6947,7 @@ mod tests {
             finished_at: Some(dispatched_at + 60.0),
             exit_code: if status == "failed" { Some(1) } else { Some(0) },
             assignment_type: Some(kind.to_string()),
+            test_state: None,
         }
     }
 
@@ -6829,6 +7061,117 @@ mod tests {
         assert_eq!(review.action, None);
     }
 
+    // ── #200: Test gate ──────────────────────────────────────────────────────
+
+    /// Build a pipeline app whose default gates include "test" (the production
+    /// default). The make_pipeline_app fixture uses ["review", "merge"] which
+    /// predates #200; this helper inserts the Test gate.
+    fn make_pipeline_app_with_test_gate() -> CoordApp {
+        let mut app = make_pipeline_app();
+        app.data.pipeline_default_gates =
+            vec!["test".to_string(), "review".to_string(), "merge".to_string()];
+        app
+    }
+
+    fn _work_assignment(
+        id: &str,
+        dispatched_at: f64,
+        status: &str,
+        test_state: Option<&str>,
+    ) -> Assignment {
+        let mut a = _stage_assignment(id, "work", dispatched_at, status);
+        a.test_state = test_state.map(String::from);
+        a
+    }
+
+    #[test]
+    fn test_stage_pending_when_work_done_no_verdict() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Pending);
+    }
+
+    #[test]
+    fn test_stage_done_when_passed() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Done);
+    }
+
+    #[test]
+    fn test_stage_done_when_skipped() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("skipped")));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Done);
+    }
+
+    #[test]
+    fn test_stage_failed_when_failed_verdict() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Failed);
+    }
+
+    #[test]
+    fn test_stage_pending_when_work_not_done() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "running", None));
+        let issue = &app.pipeline_issues[0];
+        // Work is Active → Test inherits Pending (nothing to gate yet).
+        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Pending);
+    }
+
+    #[test]
+    fn test_stage_uses_latest_work_verdict() {
+        // If Work is re-dispatched, the new Work's test_state controls.
+        // The stale older Work's verdict must not leak through.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data.assignments.push(_work_assignment("w2", 300.0, "done", None));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Pending);
+    }
+
+    #[test]
+    fn test_gate_actionable_only_when_pending_and_work_done() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        // Empty board → no work yet → not actionable.
+        assert!(!app.test_gate_actionable());
+        // Add running work → still not actionable.
+        app.data.assignments.push(_work_assignment("w1", 100.0, "running", None));
+        assert!(!app.test_gate_actionable());
+        // Work done, no verdict → actionable.
+        app.data.assignments[0].status = "done".into();
+        assert!(app.test_gate_actionable());
+        // Pass it → no longer actionable.
+        app.data.assignments[0].test_state = Some("passed".into());
+        assert!(!app.test_gate_actionable());
+    }
+
+    #[test]
+    fn test_gate_not_actionable_when_no_test_in_pipeline() {
+        // make_pipeline_app (no test gate configured) → never actionable.
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        assert!(!app.test_gate_actionable());
+    }
+
+    #[test]
+    fn pipeline_selected_work_id_returns_latest() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        assert_eq!(app.pipeline_selected_work_id(), None);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments.push(_work_assignment("w2", 300.0, "done", None));
+        assert_eq!(app.pipeline_selected_work_id(), Some("w2".to_string()));
+    }
+
     // ── Issue #212: closed-without-pipeline fixes ─────────────────────────
 
     #[test]
@@ -6854,6 +7197,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -6888,6 +7232,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -6922,6 +7267,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -6953,6 +7299,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -7024,6 +7371,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -7058,6 +7406,7 @@ mod tests {
             finished_at: None,
             exit_code: None,
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -7079,6 +7428,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7105,6 +7455,7 @@ mod tests {
             finished_at: Some(1.5),
             exit_code: Some(1),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -7120,6 +7471,7 @@ mod tests {
             finished_at: Some(11.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7143,6 +7495,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -7191,6 +7544,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -7221,6 +7575,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -7235,6 +7590,7 @@ mod tests {
             finished_at: Some(4.0),
             exit_code: Some(0),
             assignment_type: Some("review".to_string()),
+            test_state: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -7292,6 +7648,7 @@ mod tests {
                 finished_at: Some(2.0),
                 exit_code: Some(0),
                 assignment_type: Some(stage_name.to_string()),
+                test_state: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -7325,6 +7682,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(1),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -7354,6 +7712,7 @@ mod tests {
                 finished_at: Some(2.0),
                 exit_code: Some(0),
                 assignment_type: Some(stage_name.to_string()),
+                test_state: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -7387,6 +7746,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(1),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -7456,6 +7816,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("plan".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -7485,6 +7846,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("plan".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -7508,6 +7870,7 @@ mod tests {
             finished_at: None,
             exit_code: None,
             assignment_type: Some("plan".to_string()),
+            test_state: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -7531,6 +7894,7 @@ mod tests {
             finished_at: Some(2.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
+            test_state: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
