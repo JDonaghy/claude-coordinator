@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from typing import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,51 +79,104 @@ def _parse_review_text(text: str) -> ReviewFindings | None:
     return ReviewFindings(verdict=verdict, body=body)
 
 
+def _parse_review_from_lines(
+    lines: Iterable[str],
+    *,
+    stream_json: bool,
+) -> ReviewFindings | None:
+    """Shared core: extract review findings from log lines.
+
+    `lines` may be any iterable of strings (file iterator, ``str.splitlines()``,
+    ``httpx.Response.text.splitlines()``). Used by both `parse_review_from_log`
+    (local file) and `parse_review_from_agent` (HTTP fetch).
+    """
+    from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+
+    if not stream_json:
+        text = "\n".join(lines)
+        return _parse_review_text(text)
+
+    all_texts: list[str] = []
+    for line in lines:
+        event = parse_event(line.rstrip("\n"))
+        if event is None:
+            continue
+        if event.type == "assistant":
+            text = _assistant_text(event)
+            if text:
+                all_texts.append(text)
+    # Search from the end — the reviewer emits the verdict last.
+    for text in reversed(all_texts):
+        findings = _parse_review_text(text)
+        if findings is not None:
+            return findings
+    # Fallback: search the full concatenated text (handles multi-turn output).
+    return _parse_review_text("\n".join(all_texts))
+
+
 def parse_review_from_log(log_path: str | Path) -> ReviewFindings | None:
     """Parse review findings from a completed reviewer worker log.
 
     Handles both stream-json (``--output-format stream-json``) and plain-text
-    log formats.  Searches the last assistant message first (most likely to
-    contain the final verdict), then falls back to scanning the full
-    concatenated text in case the block was split across turns.
-
-    Returns ``None`` if the file does not exist or contains no structured
-    review output.
+    log formats. Returns ``None`` if the file does not exist or contains no
+    structured review output.
     """
-    from coord.worker_events import _assistant_text, is_stream_json, parse_event  # noqa: PLC0415
+    from coord.worker_events import is_stream_json  # noqa: PLC0415
 
     p = Path(log_path)
     if not p.exists():
         return None
 
     if is_stream_json(p):
-        all_texts: list[str] = []
         try:
             with open(p, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    event = parse_event(line.rstrip("\n"))
-                    if event is None:
-                        continue
-                    if event.type == "assistant":
-                        text = _assistant_text(event)
-                        if text:
-                            all_texts.append(text)
+                return _parse_review_from_lines(f, stream_json=True)
         except OSError:
             return None
-        # Search from the end — the reviewer emits the verdict last.
-        for text in reversed(all_texts):
-            findings = _parse_review_text(text)
-            if findings is not None:
-                return findings
-        # Fallback: search the full concatenated text (handles multi-turn output).
-        return _parse_review_text("\n".join(all_texts))
     else:
-        # Plain-text log (legacy workers or test fixtures).
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
-        return _parse_review_text(text)
+        return _parse_review_from_lines(text.splitlines(), stream_json=False)
+
+
+def parse_review_from_agent(
+    host: str,
+    assignment_id: str,
+    port: int = 7433,
+    timeout: float = 15.0,
+) -> ReviewFindings | None:
+    """Fetch a reviewer worker's log via the agent's ``/logs/<id>`` endpoint
+    and parse the verdict.
+
+    Use this instead of `parse_review_from_log` when the worker ran on a
+    remote agent and the log file isn't on the coordinator's local
+    filesystem. Returns ``None`` on network failure, empty log, or no
+    structured review output.
+    """
+    import httpx  # noqa: PLC0415
+
+    url = f"http://{host}:{port}/logs/{assignment_id}"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        text = resp.text
+    except (httpx.HTTPError, httpx.TimeoutException):
+        return None
+    if not text:
+        return None
+    lines = text.splitlines()
+    # Detect format the same way `is_stream_json` does for files: the first
+    # non-comment, non-blank line starts with `{`.
+    stream_json = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or line.startswith("#"):
+            continue
+        stream_json = stripped.startswith("{")
+        break
+    return _parse_review_from_lines(lines, stream_json=stream_json)
 
 
 REVIEWER_SYSTEM_PROMPT = """\

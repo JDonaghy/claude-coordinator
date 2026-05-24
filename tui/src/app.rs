@@ -122,6 +122,13 @@ struct WatchSseState {
     host: String,
     /// Assignment ID, stored here so reconnect doesn't need `self.watch`.
     assignment_id: String,
+    /// Partial trailing line carried over between SSE chunks. The agent reads
+    /// the log in fixed 4 KB chunks (events.LOG_CHUNK_SIZE), so a long JSON
+    /// line (e.g. a `{"type":"result"...}` event with the full review body)
+    /// can be split mid-line. Without reassembly the client would parse two
+    /// broken halves and lose `total_cost_usd` / `stop_reason` from the
+    /// metrics line. Held here until the next chunk arrives.
+    pending_tail: String,
 }
 
 /// The tabs shown in the Pipeline view detail panel.
@@ -519,6 +526,90 @@ fn extract_tool_names(json: &str) -> Vec<String> {
     names
 }
 
+/// Parse the `REVIEW_VERDICT` / `REVIEW_BODY` block embedded in a result event's
+/// `result` string and return it as renderable list items. Returns an empty
+/// Vec when the result isn't a structured review (e.g. a normal work or plan
+/// completion).
+///
+/// The expected format is the one declared in the REVIEWER_SYSTEM_PROMPT:
+///
+/// ```text
+/// REVIEW_VERDICT: approve | request-changes
+/// REVIEW_BODY:
+/// <markdown body lines>
+/// END_REVIEW
+/// ```
+///
+/// The body comes back with `\n` escape sequences (JSON-encoded). We
+/// un-escape `\\n` → `\n` and `\\"` → `"` before splitting into lines so the
+/// rendered output matches the verbatim review.
+fn extract_review_items(line: &str) -> Vec<ListItem> {
+    let mut items: Vec<ListItem> = Vec::new();
+    // Find the verdict marker. The result text is itself JSON-encoded inside
+    // the result field, so `\n` appears as the two-char sequence `\\n`.
+    let verdict_marker = "REVIEW_VERDICT:";
+    let body_marker = "REVIEW_BODY:";
+    let end_marker = "END_REVIEW";
+
+    let v_pos = line.find(verdict_marker);
+    let b_pos = line.find(body_marker);
+    let (Some(v_pos), Some(b_pos)) = (v_pos, b_pos) else { return items; };
+
+    // Verdict word: between the verdict marker and the next newline marker.
+    let verdict_after = &line[v_pos + verdict_marker.len()..];
+    let verdict_end = verdict_after
+        .find("\\n")
+        .or_else(|| verdict_after.find('\n'))
+        .unwrap_or(verdict_after.len());
+    let verdict = verdict_after[..verdict_end].trim().trim_matches(',');
+
+    // Header line, coloured by outcome.
+    let color = if verdict == "approve" {
+        Color::rgb(100, 220, 130)
+    } else if verdict.contains("request-changes") || verdict.contains("fail") {
+        Color::rgb(230, 130, 80)
+    } else {
+        Color::rgb(180, 180, 100)
+    };
+    items.push(activity_item(&format!("[review] {}", verdict), color));
+
+    // Body: between the body marker and END_REVIEW (if present).
+    let body_after = &line[b_pos + body_marker.len()..];
+    let body_end_rel = body_after.find(end_marker).unwrap_or(body_after.len());
+    let raw_body = &body_after[..body_end_rel];
+
+    // Un-escape the JSON-encoded body so newlines / quotes render normally.
+    let mut unescaped = String::with_capacity(raw_body.len());
+    let mut chars = raw_body.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => unescaped.push('\n'),
+                Some('t') => unescaped.push('\t'),
+                Some('"') => unescaped.push('"'),
+                Some('\\') => unescaped.push('\\'),
+                Some(other) => {
+                    unescaped.push('\\');
+                    unescaped.push(other);
+                }
+                None => unescaped.push('\\'),
+            }
+        } else {
+            unescaped.push(c);
+        }
+    }
+    // Skip the leading newline(s) right after `REVIEW_BODY:` so the first
+    // rendered line is meaningful content rather than a blank row.
+    let body = unescaped.trim_start_matches('\n');
+    for body_line in body.lines() {
+        items.push(activity_item(
+            &format!("  {}", body_line),
+            Color::rgb(200, 200, 210),
+        ));
+    }
+    items
+}
+
 /// Extract the first non-empty text block from an assistant message.
 ///
 /// Looks for `"type":"text"` content blocks and returns the `"text"` field.
@@ -616,6 +707,8 @@ fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
                 "[result] {} turns  ${:.2}  {}  stop={}",
                 turns, cost, dur, stop
             );
+            // Review-verdict body extraction happens in parse_log_content so
+            // it can emit multiple list items below the metrics line.
             Some(activity_item(&text, Color::rgb(200, 200, 100)))
         }
 
@@ -652,6 +745,13 @@ fn parse_log_content(content: &str) -> Vec<ListItem> {
         if is_json {
             if let Some(item) = parse_json_event(line, &mut turn_n) {
                 items.push(item);
+            }
+            // After the metrics line, surface the structured review verdict
+            // (REVIEW_VERDICT / REVIEW_BODY) embedded in the `result` field
+            // of result events so reviewers don't have to leave the TUI to
+            // see what the reviewer said.
+            if line.contains("\"type\":\"result\"") {
+                items.extend(extract_review_items(line));
             }
         } else {
             // Plain-text log: surface STATUS: / STUCK: lines.
@@ -1727,6 +1827,12 @@ pub struct CoordApp {
     /// `usize` is the work-assignment index in `self.data.assignments` that
     /// the verdict will be applied to.
     pending_test_fail: Option<(usize, String)>,
+    /// Cached visible-row count for the main panel, updated on scroll events
+    /// and tick. Used by `watch_log_list` to compute a stick-to-bottom scroll
+    /// offset that actually keeps the latest lines on screen (the previous
+    /// hard-coded `items.len() - 40` cut off latest lines when the terminal
+    /// viewport was under 40 rows).
+    last_main_visible_rows: std::cell::Cell<usize>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -1812,6 +1918,7 @@ impl CoordApp {
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
+            last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
         };
@@ -1986,6 +2093,7 @@ impl CoordApp {
                             done: false,
                             host: m.host.clone(),
                             assignment_id: a.id.clone(),
+                            pending_tail: String::new(),
                         });
                     }
                 }
@@ -2030,6 +2138,7 @@ impl CoordApp {
             done: false,
             host,
             assignment_id: id,
+            pending_tail: String::new(),
         });
     }
 
@@ -2157,15 +2266,20 @@ impl CoordApp {
                 Some(Color::rgb(140, 140, 140)),
             ));
         }
-        // Stick-to-bottom default: position the viewport ~40 rows from the
-        // end so the latest log lines + prompt are visible. Any explicit
-        // scroll wins.
+        // Stick-to-bottom default: position the viewport so the LAST item
+        // is the last visible row. The viewport-row count is cached during
+        // the most recent mouse_main_scroll / tick (see
+        // `last_main_visible_rows`); on the very first frame it defaults to
+        // 40 so this fits a typical terminal. The hard-coded 40 used to be
+        // a literal `items.len() - 40`, which clipped the latest lines on
+        // smaller terminals.
+        let visible_rows = self.last_main_visible_rows.get().max(1);
         let scroll = self
             .watch
             .as_ref()
             .map(|w| {
                 if w.scroll == usize::MAX {
-                    items.len().saturating_sub(40)
+                    items.len().saturating_sub(visible_rows)
                 } else {
                     w.scroll
                 }
@@ -5162,6 +5276,39 @@ impl CoordApp {
     /// Scroll wheel in the main panel (detail / machine detail).
     fn mouse_main_scroll(&mut self, delta: ScrollDelta, main_b: Rect, lh: f32) -> bool {
         let visible = content_visible_rows(main_b, lh);
+        // Stash the live viewport size — `watch_log_list` uses this to compute
+        // a stick-to-bottom offset that keeps the last line on screen.
+        self.last_main_visible_rows.set(visible.max(1));
+        // Watch overlay takes over the main panel; route scrollwheel to it
+        // regardless of which view is active underneath.
+        if self.watch.is_some() {
+            // SSE log lines drive the count when present; fall back to the
+            // remote-log cache when SSE isn't yet connected.
+            let items = self
+                .watch_sse
+                .as_ref()
+                .map(|s| s.lines.len())
+                .unwrap_or_else(|| self.watch_log_list().items.len());
+            let max = items.saturating_sub(visible.saturating_sub(1));
+            if let Some(w) = self.watch.as_mut() {
+                // Anchor the current scroll position: a usize::MAX sentinel
+                // means stick-to-bottom; convert that to the explicit max
+                // before applying the wheel delta so wheel-up actually moves.
+                if w.scroll == usize::MAX {
+                    w.scroll = max;
+                }
+                if delta.y > 0.0 {
+                    // Wheel up → older lines.
+                    w.scroll = w.scroll.saturating_sub(3);
+                } else if delta.y < 0.0 {
+                    // Wheel down → newer; once at the bottom, re-enable
+                    // stick-to-bottom so future appends keep auto-scrolling.
+                    let new_scroll = (w.scroll + 3).min(max);
+                    w.scroll = if new_scroll >= max { usize::MAX } else { new_scroll };
+                }
+            }
+            return true;
+        }
         match self.active_view {
             SidebarView::Board => {
                 // Use the active tab's actual list so the scroll max matches
@@ -5423,10 +5570,44 @@ impl CoordApp {
                 match msg {
                     SseWatchMsg::Lines { last_id, text } => {
                         sse.last_event_id = last_id;
-                        for line in text.lines() {
+                        // Reassemble lines split across SSE chunks. The agent
+                        // emits whatever it read from the log file (up to
+                        // LOG_CHUNK_SIZE=4096 bytes), so a JSON line longer
+                        // than that arrives in pieces. If the chunk doesn't
+                        // end with `\n`, hold the trailing partial line until
+                        // the next chunk completes it. Without this, broken
+                        // half-lines reach parse_json_event and we lose
+                        // fields like total_cost_usd / stop_reason that come
+                        // after the split point.
+                        let mut payload = std::mem::take(&mut sse.pending_tail);
+                        payload.push_str(&text);
+                        let (complete, tail) = if payload.ends_with('\n') {
+                            (payload.clone(), String::new())
+                        } else if let Some(last_nl) = payload.rfind('\n') {
+                            let (a, b) = payload.split_at(last_nl + 1);
+                            (a.to_string(), b.to_string())
+                        } else {
+                            (String::new(), payload.clone())
+                        };
+                        for line in complete.lines() {
                             sse.lines.push(line.to_string());
                         }
+                        sse.pending_tail = tail;
                         got_new = true;
+                    }
+                    SseWatchMsg::Done { last_id } if !sse.pending_tail.is_empty() => {
+                        // Stream is ending — flush any trailing partial line
+                        // before transitioning to done. Without this, a final
+                        // result line whose terminating `\n` never reached us
+                        // (worker exited mid-write) would be invisible.
+                        let tail = std::mem::take(&mut sse.pending_tail);
+                        for line in tail.lines() {
+                            sse.lines.push(line.to_string());
+                        }
+                        sse.last_event_id = last_id;
+                        sse.done = true;
+                        got_new = true;
+                        break;
                     }
                     SseWatchMsg::Done { last_id } => {
                         sse.last_event_id = last_id;
@@ -5524,6 +5705,10 @@ impl ShellApp for CoordApp {
 
         // ── Main: detail panel only (full main_content_bounds) ───────
         let m = layout.main_content_bounds;
+        // Keep watch_log_list's stick-to-bottom math in sync with the live
+        // viewport on every frame (not just when the user scrolls).
+        self.last_main_visible_rows
+            .set(content_visible_rows(m, lh).max(1));
         match self.active_view {
             SidebarView::Board => {
                 // Tab bar (Board / Issue), then the active tab's content.
@@ -6556,6 +6741,7 @@ mod tests {
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
+            last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
         }
@@ -6880,6 +7066,35 @@ mod tests {
         // The inner tool_use should be found and its name extracted.
         let names = extract_tool_names(&json);
         assert!(names.contains(&"Edit".to_string()));
+    }
+
+    // ── extract_review_items ──────────────────────────────────────────────────
+
+    #[test]
+    fn extract_review_items_renders_verdict_and_body_lines() {
+        // Result event with the structured REVIEW_VERDICT/REVIEW_BODY block
+        // the way the reviewer system prompt asks workers to emit it. Body
+        // text is JSON-encoded (`\n` → `\\n`).
+        let line = r#"{"type":"result","result":"REVIEW_VERDICT: approve\nREVIEW_BODY:\n## Summary\n\nLGTM.\nEND_REVIEW"}"#;
+        let items = extract_review_items(line);
+        let texts: Vec<String> = items
+            .iter()
+            .map(|i| i.text.spans[0].text.clone())
+            .collect();
+        // First item is the verdict header.
+        assert!(texts[0].contains("[review]"));
+        assert!(texts[0].contains("approve"));
+        // Subsequent items are the unescaped body lines.
+        assert!(texts.iter().any(|t| t.contains("Summary")));
+        assert!(texts.iter().any(|t| t.contains("LGTM.")));
+    }
+
+    #[test]
+    fn extract_review_items_empty_when_no_verdict() {
+        // Plain work-completion result event — no review block, no items.
+        let line = r#"{"type":"result","result":"work done"}"#;
+        let items = extract_review_items(line);
+        assert!(items.is_empty());
     }
 
     // ── parse_json_event ──────────────────────────────────────────────────────
@@ -8701,6 +8916,7 @@ mod tests {
             done: false,
             host: "localhost".to_string(),
             assignment_id: "test-id".to_string(),
+            pending_tail: String::new(),
         };
         (state, tx)
     }
@@ -8711,9 +8927,10 @@ mod tests {
         let (state, tx) = make_sse_state_pair();
         app.watch_sse = Some(state);
 
-        // Send two log chunks.
-        tx.send(SseWatchMsg::Lines { last_id: 100, text: "line one\nline two".to_string() }).unwrap();
-        tx.send(SseWatchMsg::Lines { last_id: 200, text: "line three".to_string() }).unwrap();
+        // Each chunk's text has a trailing `\n` — that's what the agent
+        // emits when the source bytes ended at a line boundary.
+        tx.send(SseWatchMsg::Lines { last_id: 100, text: "line one\nline two\n".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Lines { last_id: 200, text: "line three\n".to_string() }).unwrap();
 
         let changed = app.drain_sse_watch();
         assert!(changed, "new lines should trigger redraw");
@@ -8725,12 +8942,47 @@ mod tests {
     }
 
     #[test]
+    fn drain_sse_watch_reassembles_partial_line_split_across_chunks() {
+        // Regression: the agent reads the log in 4 KB chunks, so a long JSON
+        // line (e.g. `{"type":"result", ..., "total_cost_usd":...}`) arrives
+        // in pieces. Without reassembly the broken halves reach the parser
+        // and we lose fields after the split point — surfaced as $0.00 /
+        // stop=? in the watch overlay.
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        // Chunk 1 has the first half of a JSON line (NO trailing newline).
+        tx.send(SseWatchMsg::Lines {
+            last_id: 100,
+            text: "{\"type\":\"result\",\"num_turns\":37".to_string(),
+        }).unwrap();
+        // Chunk 2 has the rest plus the terminating newline.
+        tx.send(SseWatchMsg::Lines {
+            last_id: 200,
+            text: ",\"total_cost_usd\":1.75}\n".to_string(),
+        }).unwrap();
+
+        app.drain_sse_watch();
+
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert_eq!(sse.last_event_id, 200);
+        assert_eq!(
+            sse.lines,
+            vec!["{\"type\":\"result\",\"num_turns\":37,\"total_cost_usd\":1.75}"],
+            "the two chunks must have been joined into one line, not two"
+        );
+        assert!(sse.pending_tail.is_empty(), "tail should be flushed after the second chunk");
+    }
+
+    #[test]
     fn drain_sse_watch_marks_done_on_end_event() {
         let mut app = make_app_default();
         let (state, tx) = make_sse_state_pair();
         app.watch_sse = Some(state);
 
-        tx.send(SseWatchMsg::Lines { last_id: 50, text: "some output".to_string() }).unwrap();
+        // Trailing `\n` so the chunk is complete (no partial line to flush).
+        tx.send(SseWatchMsg::Lines { last_id: 50, text: "some output\n".to_string() }).unwrap();
         tx.send(SseWatchMsg::Done { last_id: 99 }).unwrap();
 
         let changed = app.drain_sse_watch();
@@ -8740,6 +8992,24 @@ mod tests {
         assert!(sse.done, "done should be set after End event");
         assert_eq!(sse.last_event_id, 99);
         assert_eq!(sse.lines, vec!["some output"]);
+    }
+
+    #[test]
+    fn drain_sse_watch_flushes_pending_tail_on_done() {
+        // If the stream ends without the writer's final newline, the partial
+        // line should still surface (don't silently drop the worker's last
+        // result line).
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        tx.send(SseWatchMsg::Lines { last_id: 10, text: "trailing partial".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Done { last_id: 11 }).unwrap();
+
+        app.drain_sse_watch();
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert!(sse.done);
+        assert_eq!(sse.lines, vec!["trailing partial"]);
     }
 
     #[test]

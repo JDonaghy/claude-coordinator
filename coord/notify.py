@@ -9,6 +9,15 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+# Cache: machine_name → host. Populated by `run(config)` so post_transition →
+# _try_parse_and_post_review can fetch a remote agent's log via /logs/<id>
+# without threading the Config through every helper.
+_AGENT_HOSTS: dict[str, str] = {}
+
+
+def _agent_host(machine_name: str) -> str | None:
+    return _AGENT_HOSTS.get(machine_name)
+
 from coord import github_ops
 from coord.comments import (
     EVENT_COMPLETION,
@@ -245,17 +254,29 @@ def _try_parse_and_post_review(
     or as an issue comment when no PR number is available), False on any failure.
     Silently swallows all errors so callers can fall back gracefully.
     """
-    from coord.review import parse_review_from_log  # noqa: PLC0415
+    from coord.review import parse_review_from_log, parse_review_from_agent  # noqa: PLC0415
 
     log_path = entry.get("log_path")
-    if not log_path:
-        return False
+    findings = None
+    if log_path:
+        try:
+            findings = parse_review_from_log(log_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to parse review log for %s: %s", transition.assignment_id, exc)
 
-    try:
-        findings = parse_review_from_log(log_path)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Failed to parse review log for %s: %s", transition.assignment_id, exc)
-        return False
+    # Local file unavailable (worker ran on a remote agent whose log isn't on
+    # this filesystem) — fetch via the agent's /logs endpoint and parse the
+    # same way. Agents never use gh; the coordinator pulls + posts.
+    if findings is None:
+        host = _agent_host(transition.machine_name)
+        if host:
+            try:
+                findings = parse_review_from_agent(host, transition.assignment_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Failed to fetch review log from agent %s for %s: %s",
+                    host, transition.assignment_id, exc,
+                )
 
     if findings is None:
         return False
@@ -486,21 +507,26 @@ def post_orphaned_review_findings(
         for row in rows:
             aid = row["assignment_id"]
             log_path = log_by_id.get(aid)
-            if not log_path:
-                log.debug(
-                    "post_orphaned: no log_path for %s on %s (agent offline or entry reaped)",
-                    aid, machine_name,
-                )
-                continue
-
-            try:
-                findings = parse_review_from_log(log_path)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("post_orphaned: failed to parse log for %s: %s", aid, exc)
-                continue
-
+            findings = None
+            # Try local file first (cheap) — works when notify runs on the
+            # same host as the agent. Falls back to fetching via HTTP so the
+            # coordinator can post reviews from any machine.
+            if log_path:
+                try:
+                    findings = parse_review_from_log(log_path)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("post_orphaned: failed to parse local log for %s: %s", aid, exc)
+            if findings is None and machine.host:
+                from coord.review import parse_review_from_agent  # noqa: PLC0415
+                try:
+                    findings = parse_review_from_agent(machine.host, aid)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "post_orphaned: failed to fetch log from agent %s for %s: %s",
+                        machine.host, aid, exc,
+                    )
             if findings is None:
-                log.debug("post_orphaned: no structured findings in log for %s", aid)
+                log.debug("post_orphaned: no findings (local + agent both missed) for %s", aid)
                 continue
 
             review_target = row.get("review_target")
@@ -607,6 +633,12 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
 
     Returns (posted_transitions, posted_stuck).
     """
+    # Refresh the agent-host cache so _try_parse_and_post_review (and any
+    # other helper using _agent_host) can resolve hostnames without
+    # threading config through every call.
+    global _AGENT_HOSTS
+    _AGENT_HOSTS = {m.name: m.host for m in config.machines}
+
     # Collect (transition, record, entry) tuples for review completions so we
     # can feed them to the auto-loop after all notifications are posted.
     review_completions: list[tuple[Transition, dict, dict]] = []
