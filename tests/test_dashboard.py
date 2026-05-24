@@ -285,6 +285,155 @@ class TestChatAPI:
         assert r.status_code == 400
 
 
+class TestPipelineAction:
+    """Tests for /api/pipeline/action — dispatch feedback fields."""
+
+    def _board_with_done(self) -> "Board":
+        return Board(
+            active=[],
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="work001", status="done",
+                    branch="issue-42-fix-auth",
+                    finished_at=1.0,
+                ),
+            ],
+        )
+
+    def test_dispatch_review_returns_machine_and_id(self) -> None:
+        review_assignment = Assignment(
+            machine_name="desktop", repo_name="api",
+            issue_number=42, issue_title="Fix auth",
+            assignment_id="rev00001", status="running", type="review",
+        )
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.review.dispatch_review", return_value=review_assignment) as mock_dr,
+            patch("coord.dashboard.server.save_board"),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "dispatch_review",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["machine_name"] == "desktop"
+        assert data["assignment_id"] == "rev00001"
+
+    def test_dispatch_review_none_returns_error(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.review.dispatch_review", return_value=None),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "dispatch_review",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is False
+        assert "error" in data
+        assert len(data["error"]) > 0
+
+    def test_dispatch_review_exception_returns_500(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.review.dispatch_review", side_effect=RuntimeError("agent down")),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "dispatch_review",
+            })
+        assert r.status_code == 500
+        data = r.json()
+        assert data["ok"] is False
+        assert "agent down" in data["error"]
+
+    def test_dispatch_smoke_returns_machine_and_id(self) -> None:
+        smoke_assignment = Assignment(
+            machine_name="gpu-box", repo_name="api",
+            issue_number=42, issue_title="Fix auth",
+            assignment_id="smk00001", status="running", type="smoke",
+        )
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.smoke.dispatch_smoke", return_value=smoke_assignment),
+            patch("coord.dashboard.server.save_board"),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "dispatch_smoke",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["machine_name"] == "gpu-box"
+        assert data["assignment_id"] == "smk00001"
+
+    def test_dispatch_smoke_none_returns_error(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.smoke.dispatch_smoke", return_value=None),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "dispatch_smoke",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is False
+        assert "error" in data
+
+    def test_pipeline_action_unknown_assignment(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=Board()):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "doesnotexist",
+                "action": "dispatch_review",
+            })
+        assert r.status_code == 404
+
+    def test_pipeline_action_missing_fields(self) -> None:
+        client = _client()
+        r = client.post("/api/pipeline/action", json={"action": "dispatch_review"})
+        assert r.status_code == 400
+
+
+class TestDashboardDispatchUI:
+    """Tests confirming the HTML includes the new dispatch-feedback elements."""
+
+    def test_dispatch_status_css_present(self) -> None:
+        client = _client()
+        r = client.get("/")
+        assert "dispatch-status" in r.text
+        assert "dispatch-pending" in r.text
+        assert "dispatch-ok" in r.text
+        assert "dispatch-err" in r.text
+
+    def test_pipeline_area_wrapper_in_source(self) -> None:
+        client = _client()
+        r = client.get("/")
+        assert "pipeline-area" in r.text
+
+    def test_dispatch_status_js_in_source(self) -> None:
+        client = _client()
+        r = client.get("/")
+        assert "dispatchStatus" in r.text
+        assert "renderDispatchStatus" in r.text
+        assert "updateCardPipeline" in r.text
+        assert "Dispatching #" in r.text
+        assert "✓ Dispatched" in r.text
+        assert "✗ Dispatch failed" in r.text
+
+
 class TestXSSSafety:
     def test_html_served_has_escape_function(self) -> None:
         client = _client()
