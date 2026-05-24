@@ -3056,6 +3056,23 @@ impl CoordApp {
         "new"
     }
 
+    /// Return true when any assignment in the DB touches this issue.
+    ///
+    /// Used to distinguish "closed via coord pipeline" (has assignment rows) from
+    /// "closed externally / implemented in-session" (zero assignment rows ever
+    /// created).  Matches by issue number and coord repo (or repo_slug when no
+    /// local mapping exists).
+    fn issue_has_any_assignment(&self, issue: &PipelineIssue) -> bool {
+        self.data.assignments.iter().any(|a| {
+            a.issue_number == issue.number
+                && if let Some(local) = &issue.coord_repo {
+                    a.repo == *local
+                } else {
+                    true
+                }
+        })
+    }
+
     /// Return the coord_repo name for an issue, falling back to the repo_slug.
     fn pipeline_repo_key(issue: &PipelineIssue) -> &str {
         issue.coord_repo.as_deref().unwrap_or(&issue.repo_slug)
@@ -3331,13 +3348,22 @@ impl CoordApp {
                 _ => {}
             }
         }
-        StageStatus::Pending
+        // No matching assignment found.  For closed issues this means the stage
+        // was never run through coord — use Skipped so the UI can distinguish
+        // "waiting to run" (Pending) from "never ran, issue already closed"
+        // (Skipped).
+        if issue.is_closed {
+            StageStatus::Skipped
+        } else {
+            StageStatus::Pending
+        }
     }
 
     /// Resolve the merge stage status from `merge_queue` entries.
     ///
     /// `merged` → Done, `open`/`queued` → Active, `failed` → Failed, anything
-    /// else (or no entry) → Pending.
+    /// else (or no entry) → Pending for open issues, Skipped for closed issues
+    /// (the merge never ran through coord).
     fn merge_stage_status_for(&self, issue: &PipelineIssue) -> StageStatus {
         let entry = self
             .data
@@ -3348,17 +3374,22 @@ impl CoordApp {
             Some("merged") => StageStatus::Done,
             Some("open") | Some("queued") => StageStatus::Active,
             Some("failed") => StageStatus::Failed,
-            _ => StageStatus::Pending,
+            _ => if issue.is_closed { StageStatus::Skipped } else { StageStatus::Pending },
         }
     }
 
     /// Returns the *display* current stage for the sidebar badge — the
-    /// first non-Done stage, or "merged" once every stage is Done.
+    /// first non-Done/non-Skipped stage, or "done" once every meaningful
+    /// stage is Done or Skipped.
+    ///
+    /// Skipped stages (closed-issue stages that never ran through coord) are
+    /// treated the same as Done for badge purposes: they don't represent a
+    /// meaningful "current" action and should not halt the badge at "work".
     fn derive_current_stage(&self, issue: &PipelineIssue) -> String {
         let stages = self.pipeline_stage_names();
         for s in &stages {
             let st = self.stage_status_for(issue, s);
-            if st != StageStatus::Done {
+            if st != StageStatus::Done && st != StageStatus::Skipped {
                 return s.clone();
             }
         }
@@ -3371,9 +3402,20 @@ impl CoordApp {
     /// (a) Pending, (b) dispatchable from the TUI (work, review, merge),
     /// (c) preceded only by Done stages, and (d) for an issue we can map
     /// back to a coordinator-local repo.
+    ///
+    /// Returns `None` for closed issues that have zero assignment rows in the
+    /// DB — these were resolved outside the coord pipeline, so showing an
+    /// all-Skipped stage widget would be misleading. The caller will render
+    /// the "closed without coord pipeline" placeholder instead.
     fn build_pipeline_widget(&self) -> Option<QuiPipelineView> {
         let idx = self.pipeline_sel?;
         let issue = self.pipeline_issues.get(idx)?;
+
+        // Closed with no assignment rows → suppress widget; placeholder message shown.
+        if issue.is_closed && !self.issue_has_any_assignment(issue) {
+            return None;
+        }
+
         let stage_names = self.pipeline_stage_names();
 
         // Precompute every stage's status once so we can check predecessors
@@ -3837,6 +3879,21 @@ impl CoordApp {
                 "  Press 'r' to refresh, or label issues with 'coord' on GitHub.",
                 Some(Color::rgb(100, 100, 100)),
             ));
+        } else if let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) {
+            // An issue is selected but the widget was suppressed (closed-no-pipeline).
+            if issue.is_closed && !self.issue_has_any_assignment(issue) {
+                items.push(kv_item(
+                    "",
+                    "  Closed without coord pipeline — no stages tracked.",
+                    Some(Color::rgb(120, 180, 120)),
+                ));
+            } else {
+                items.push(kv_item(
+                    "",
+                    "  Select an issue on the left to see its pipeline.",
+                    Some(Color::rgb(140, 140, 140)),
+                ));
+            }
         } else {
             items.push(kv_item(
                 "",
@@ -3981,6 +4038,25 @@ impl CoordApp {
                 bordered: false,
             };
         };
+
+        // Closed issue with no assignment rows → no stage rows to show.
+        if issue.is_closed && !self.issue_has_any_assignment(&issue) {
+            items.push(kv_item(
+                "",
+                "  Closed without coord pipeline — no stages tracked.",
+                Some(Color::rgb(120, 180, 120)),
+            ));
+            return ListView {
+                id: WidgetId::new("pipeline-stages"),
+                title: None,
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: false,
+            };
+        }
+
         for name in self.pipeline_stage_names() {
             let status = self.stage_status_for(&issue, &name);
             let (icon, color) = match status {
@@ -6235,10 +6311,224 @@ mod tests {
 
     #[test]
     fn stage_status_for_pending_when_no_assignment_exists() {
+        // Open issue with no assignments → Pending (waiting to be dispatched).
         let app = make_pipeline_app();
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Pending);
         assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Pending);
+    }
+
+    // ── Issue #212: closed-without-pipeline fixes ─────────────────────────
+
+    #[test]
+    fn issue_has_any_assignment_false_when_no_assignments() {
+        let app = make_pipeline_app();
+        let issue = &app.pipeline_issues[0];
+        assert!(!app.issue_has_any_assignment(issue));
+    }
+
+    #[test]
+    fn issue_has_any_assignment_true_when_assignment_exists() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(Assignment {
+            id: "a1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert!(app.issue_has_any_assignment(issue));
+    }
+
+    #[test]
+    fn stage_status_for_skipped_when_closed_and_no_assignment() {
+        // Closed issue with no assignments → Skipped (not Pending).
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Skipped);
+        assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Skipped);
+        assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Skipped);
+    }
+
+    #[test]
+    fn stage_status_for_done_overrides_skipped_when_assignment_exists() {
+        // Closed issue WITH a done work assignment → work stage is Done, not Skipped.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        app.data.assignments.push(Assignment {
+            id: "w1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
+        // Review has no assignment — closed → Skipped.
+        assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Skipped);
+    }
+
+    #[test]
+    fn derive_current_stage_done_for_closed_no_pipeline() {
+        // Closed with zero assignment rows → badge should say "done".
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.derive_current_stage(issue), "done");
+    }
+
+    #[test]
+    fn derive_current_stage_done_for_closed_partial_pipeline() {
+        // Closed with work done but review/merge skipped → badge still "done".
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        app.data.assignments.push(Assignment {
+            id: "w1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.derive_current_stage(issue), "done");
+    }
+
+    #[test]
+    fn build_pipeline_widget_none_for_closed_no_pipeline() {
+        // Closed issue with zero assignment rows → no pipeline widget.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        assert!(app.build_pipeline_widget().is_none());
+    }
+
+    #[test]
+    fn build_pipeline_widget_some_for_closed_with_assignments() {
+        // Closed issue that DID go through coord → widget is still shown.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        app.data.assignments.push(Assignment {
+            id: "w1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let view = app.build_pipeline_widget().unwrap();
+        // Work stage ran → Done.
+        assert_eq!(view.stages[0].status, StageStatus::Done);
+        // Review/merge not run but issue is closed → Skipped (not Pending).
+        assert_eq!(view.stages[1].status, StageStatus::Skipped);
+        assert_eq!(view.stages[2].status, StageStatus::Skipped);
+        // No Go/Retry actions on any stage (issue is closed).
+        for s in &view.stages {
+            assert!(s.action.is_none(), "stage {} should have no action", s.label);
+        }
+    }
+
+    #[test]
+    fn pipeline_placeholder_closed_without_pipeline_message() {
+        // Selecting a closed issue with no assignments shows the "closed without
+        // coord pipeline" message in the placeholder list.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        // pipeline_sel is already 0 from make_pipeline_app.
+        let list = app.pipeline_placeholder_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("Closed without coord pipeline"),
+            "expected closed-without-pipeline message, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_stages_list_closed_no_pipeline_shows_message() {
+        // Closed issue with no assignment rows → Stages tab shows message, no stage rows.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        let list = app.pipeline_stages_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("Closed without coord pipeline"),
+            "expected closed-without-pipeline message, got: {text:?}"
+        );
+        // No stage headers (Work / Review / Merge) should appear.
+        assert!(!text.contains("Work"), "Work stage row should be suppressed");
+    }
+
+    #[test]
+    fn pipeline_stages_list_closed_with_assignments_shows_stages() {
+        // Closed issue that went through coord → Stages tab still shows stages.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        app.data.assignments.push(Assignment {
+            id: "w1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let list = app.pipeline_stages_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Stage headers must appear.
+        assert!(text.contains("Work"), "Work header missing");
+        assert!(text.contains("Review"), "Review header missing");
+        // No "closed without coord pipeline" message when there are assignments.
+        assert!(
+            !text.contains("Closed without coord pipeline"),
+            "should not show closed-no-pipeline message when assignments exist"
+        );
     }
 
     #[test]
