@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -445,6 +446,229 @@ class TestXSSSafety:
         r = client.get("/")
         assert "${a.issue_title}" not in r.text
         assert "E(a.issue_title)" in r.text
+
+
+# ── _poll_once unit tests ────────────────────────────────────────────────────
+
+
+class TestPollOnce:
+    """Unit tests for the module-level _poll_once function.
+
+    Each test drives _poll_once directly with a fake board and mocked
+    _fetch_agent_status so no real network calls are made.
+    """
+
+    def _make_config(self) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        )
+
+    def _running_board(self, aid: str = "abc") -> Board:
+        return Board(
+            active=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id=aid, status="running",
+                    dispatched_at=1.0,
+                ),
+            ],
+        )
+
+    def _agent_resp(self, aid: str, status: str) -> dict:
+        return {
+            "active": [],
+            "completed": [{"id": aid, "status": status}],
+        }
+
+    def test_running_to_done_fires_assignment_completed(self) -> None:
+        from coord.dashboard.server import _poll_once
+        from coord.events import ASSIGNMENT_COMPLETED, EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        seen: set[str] = set()
+        orphaned: dict[str, float] = {}
+        board = self._running_board("abc")
+
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+            return_value=self._agent_resp("abc", "done"),
+        ):
+            asyncio.run(_poll_once(config, es, seen, orphaned, board=board, now=1000.0))
+
+        assert len(es._history) == 1
+        assert es._history[0].type == ASSIGNMENT_COMPLETED
+        assert "abc" in seen
+
+    def test_running_to_failed_fires_assignment_failed(self) -> None:
+        from coord.dashboard.server import _poll_once
+        from coord.events import ASSIGNMENT_FAILED, EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        seen: set[str] = set()
+        orphaned: dict[str, float] = {}
+        board = self._running_board("xyz")
+
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+            return_value=self._agent_resp("xyz", "failed"),
+        ):
+            asyncio.run(_poll_once(config, es, seen, orphaned, board=board, now=1000.0))
+
+        assert len(es._history) == 1
+        assert es._history[0].type == ASSIGNMENT_FAILED
+
+    def test_running_to_cancelled_fires_assignment_cancelled(self) -> None:
+        """Bug 1 regression: cancelled must not fire ASSIGNMENT_FAILED."""
+        from coord.dashboard.server import ASSIGNMENT_CANCELLED, _poll_once
+        from coord.events import EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        seen: set[str] = set()
+        orphaned: dict[str, float] = {}
+        board = self._running_board("ccc")
+
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+            return_value=self._agent_resp("ccc", "cancelled"),
+        ):
+            asyncio.run(_poll_once(config, es, seen, orphaned, board=board, now=1000.0))
+
+        assert len(es._history) == 1
+        assert es._history[0].type == ASSIGNMENT_CANCELLED
+
+    def test_absent_over_threshold_appears_in_possibly_stuck(self) -> None:
+        """An assignment absent from agent data past the threshold is stuck."""
+        from coord.dashboard.server import _poll_once
+        from coord.events import EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        seen: set[str] = set()
+        orphaned: dict[str, float] = {}
+        board = self._running_board("stuck1")
+
+        # Agent is reachable but knows nothing about "stuck1".
+        agent_resp = {"active": [], "completed": []}
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+            return_value=agent_resp,
+        ):
+            # dispatched_at=1.0, now=1000.0 → 999 s > _STUCK_THRESHOLD (300 s)
+            result = asyncio.run(
+                _poll_once(config, es, seen, orphaned, board=board, now=1000.0)
+            )
+
+        ids = [r["assignment_id"] for r in result]
+        assert "stuck1" in ids
+
+    def test_absent_under_threshold_not_in_possibly_stuck(self) -> None:
+        """An assignment absent from agent data under the threshold is not stuck."""
+        from coord.dashboard.server import _poll_once
+        from coord.events import EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        seen: set[str] = set()
+        orphaned: dict[str, float] = {}
+        board = self._running_board("fresh1")
+
+        agent_resp = {"active": [], "completed": []}
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+            return_value=agent_resp,
+        ):
+            # dispatched_at=1.0, now=100.0 → 99 s < _STUCK_THRESHOLD (300 s)
+            result = asyncio.run(
+                _poll_once(config, es, seen, orphaned, board=board, now=100.0)
+            )
+
+        ids = [r["assignment_id"] for r in result]
+        assert "fresh1" not in ids
+
+    def test_seen_terminal_prevents_refiring(self) -> None:
+        """An assignment already in seen_terminal must not query the agent again."""
+        from coord.dashboard.server import _poll_once
+        from coord.events import EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        # Pre-populate seen_terminal with the assignment's id.
+        seen: set[str] = {"abc"}
+        orphaned: dict[str, float] = {}
+        board = self._running_board("abc")
+
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+        ) as mock_fetch:
+            asyncio.run(_poll_once(config, es, seen, orphaned, board=board, now=1000.0))
+
+        # running set will be empty because aid is in seen_terminal → early return
+        mock_fetch.assert_not_called()
+        assert len(es._history) == 0
+
+
+# ── Bug regression tests (HTML/JS) ──────────────────────────────────────────
+
+
+class TestBugFixes:
+    """Regression tests that ensure the HTML/JS bug fixes stay in place."""
+
+    def test_bug2_toast_uses_textcontent_not_e(self) -> None:
+        """Bug 2: showToast uses textContent so E() in toast strings double-encodes."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        # The fixed code passes plain d.repo_name / d.machine_name, not E(...).
+        assert "E(d.repo_name)" not in r.text
+        assert "E(d.machine_name)" not in r.text
+
+    def test_bug3_cost_null_guard(self) -> None:
+        """Bug 3: a cost of $0 was hidden by the falsy check; fix uses != null."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        # The fixed code uses optional-chain + != null for both stats fields.
+        assert "!= null" in r.text
+
+    def test_bug4_no_invalid_css_title_property(self) -> None:
+        """Bug 4: `title:` is not a valid CSS property — must not appear in <style>."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        # Extract the style block and confirm `title:` is absent.
+        import re
+        style_blocks = re.findall(r"<style[^>]*>(.*?)</style>", r.text, re.DOTALL)
+        for block in style_blocks:
+            assert "title:" not in block, (
+                f"Found invalid CSS `title:` property in <style> block"
+            )
+
+    def test_bug6_bell_toggle_present(self) -> None:
+        """Bug 6: bell toggle button, function, and localStorage persistence."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "bell-btn" in r.text
+        assert "toggleBell" in r.text
+        assert "bellEnabled" in r.text
+        assert "localStorage" in r.text
+
+    def test_bug1_cancelled_event_handled_in_html(self) -> None:
+        """Bug 1: client-side listener for assignment_cancelled must exist."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "assignment_cancelled" in r.text
+
+    def test_bug1_assignment_cancelled_constant_exported(self) -> None:
+        """Bug 1: ASSIGNMENT_CANCELLED must be importable from server module."""
+        from coord.dashboard.server import ASSIGNMENT_CANCELLED
+        assert ASSIGNMENT_CANCELLED == "assignment_cancelled"
 
 
 class TestCLI:

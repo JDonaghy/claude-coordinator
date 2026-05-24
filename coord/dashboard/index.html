@@ -100,7 +100,11 @@ a { color: #58a6ff; }
 .btn-unstick:hover { background: #e3b341; }
 
 /* ── SSE connection status indicator ─────────────────────────────────── */
-.sse-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #484f58; margin-right: 4px; vertical-align: middle; title: "events disconnected"; }
+/* Bug 6: audio bell toggle button */
+.bell-btn { background: none; border: none; cursor: pointer; font-size: 0.9em; padding: 0 2px; vertical-align: middle; opacity: 0.7; line-height: 1; }
+.bell-btn:hover { opacity: 1; }
+/* Bug 4 fix: `title` is an HTML attribute, not a CSS property — removed. */
+.sse-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #484f58; margin-right: 4px; vertical-align: middle; }
 .sse-dot.connected { background: #238636; }
 
 @media (max-width: 600px) {
@@ -112,7 +116,7 @@ a { color: #58a6ff; }
 <body>
 <div id="toast-container"></div>
 <div class="container">
-  <h1>coord dashboard <span class="meta" id="round-info"></span> <span class="sse-dot" id="sse-dot" title="Live events disconnected"></span></h1>
+  <h1>coord dashboard <span class="meta" id="round-info"></span> <span class="sse-dot" id="sse-dot" title="Live events disconnected"></span><button class="bell-btn" id="bell-btn" onclick="toggleBell()" title="Toggle audio notifications on failure"></button></h1>
 
   <div class="tabs">
     <div class="tab active" data-pane="board">Board</div>
@@ -306,7 +310,18 @@ function _dismissToast(toast) {
 }
 
 // ── Audio bell ─────────────────────────────────────────────────────────
-let bellEnabled = true;
+// Bug 6: persist bell preference across page loads via localStorage.
+let bellEnabled = localStorage.getItem('bellEnabled') !== 'false';
+function _updateBellBtn() {
+  const btn = document.getElementById('bell-btn');
+  if (btn) btn.textContent = bellEnabled ? '🔔' : '🔕';
+}
+function toggleBell() {
+  bellEnabled = !bellEnabled;
+  localStorage.setItem('bellEnabled', String(bellEnabled));
+  _updateBellBtn();
+}
+_updateBellBtn();
 function playBell(freq, duration) {
   if (!bellEnabled) return;
   freq = freq || 440;
@@ -376,9 +391,11 @@ function connectSSE() {
 
   _sse.addEventListener('assignment_completed', e => {
     const d = JSON.parse(e.data || '{}');
-    const turns = d.stats && d.stats.num_turns ? `, turns=${d.stats.num_turns}` : '';
-    const cost  = d.stats && d.stats.total_cost_usd ? `, cost=$${d.stats.total_cost_usd.toFixed(2)}` : '';
-    showToast(`✓ #${d.issue_number} ${E(d.repo_name)} on ${E(d.machine_name)}: DONE${turns}${cost}`, 'done');
+    // Bug 3 fix: use != null so a cost of $0 still shows (falsy check hid it).
+    // Bug 2 fix: showToast uses textContent — no E() needed (would double-encode).
+    const turns = d.stats?.num_turns != null ? `, turns=${d.stats.num_turns}` : '';
+    const cost  = d.stats?.total_cost_usd != null ? `, cost=$${Number(d.stats.total_cost_usd).toFixed(2)}` : '';
+    showToast(`✓ #${d.issue_number} ${d.repo_name} on ${d.machine_name}: DONE${turns}${cost}`, 'done');
     loadBoard();
   });
 
@@ -386,8 +403,17 @@ function connectSSE() {
     const d = JSON.parse(e.data || '{}');
     const exit    = d.exit_code != null ? `, exit=${d.exit_code}` : '';
     const last    = d.stats && d.stats.last_tool ? `, last_tool=${d.stats.last_tool}` : '';
-    showToast(`✗ #${d.issue_number} ${E(d.repo_name)} on ${E(d.machine_name)}: FAILED${exit}${last}`, 'failed');
+    // Bug 2 fix: showToast uses textContent — no E() needed.
+    showToast(`✗ #${d.issue_number} ${d.repo_name} on ${d.machine_name}: FAILED${exit}${last}`, 'failed');
     playBell(220, 0.5);  // Low tone for failures
+    loadBoard();
+  });
+
+  // Bug 1 fix: cancelled assignments get their own event type so they are not
+  // displayed as FAILED on the client.
+  _sse.addEventListener('assignment_cancelled', e => {
+    const d = JSON.parse(e.data || '{}');
+    showToast(`⊘ #${d.issue_number} ${d.repo_name} on ${d.machine_name}: CANCELLED`, 'stuck');
     loadBoard();
   });
 
