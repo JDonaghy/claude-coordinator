@@ -2775,11 +2775,13 @@ impl CoordApp {
             }
         }
 
-        // 3. Cache hit (within 30-second TTL).
+        // 3. Cache hit (within 2-second TTL). Short TTL makes the Watch
+        // overlay feel like tail -f rather than a periodic poll. Cost is
+        // negligible — at most one HTTP request every 2 s per visible log.
         {
             let cache = self.remote_log_cache.borrow();
             if let Some((fetched_at, items)) = cache.get(id) {
-                if fetched_at.elapsed() < Duration::from_secs(30) {
+                if fetched_at.elapsed() < Duration::from_secs(2) {
                     return items.clone();
                 }
             }
@@ -3190,12 +3192,20 @@ impl CoordApp {
             }
         };
 
-        // Most recent first (assignments are pre-sorted by dispatched_at desc).
+        // The outer board sort orders by status bucket first
+        // (running → failed → done), then dispatched_at desc within bucket.
+        // That means a failed retry-target from yesterday sorts BEFORE a done
+        // retry from today. Pick the actual latest by dispatched_at instead.
         let matching: Vec<&Assignment> = related.into_iter().filter(stage_match).collect();
         if matching.iter().any(|a| a.status == "running") {
             return StageStatus::Active;
         }
-        if let Some(latest) = matching.first() {
+        let latest = matching.iter().max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some(latest) = latest {
             match latest.status.as_str() {
                 "done" => return StageStatus::Done,
                 "failed" => return StageStatus::Failed,
@@ -4256,16 +4266,27 @@ impl CoordApp {
                 }
                 return false;
             }
-            // Below the tab row → the active tab's content.
-            if let Some(view) = self.build_pipeline_widget() {
-                let pv_rect = pipeline_detail_pv_rect(main_b, lh);
-                let layout = tui_pipeline_layout(&view, pv_rect);
-                match layout.hit_test(pos.x, pos.y) {
-                    PipelineHit::Action(stage_idx) => {
-                        self.dispatch_pipeline_stage(stage_idx);
-                        return true;
+            // Below the tab row → the active tab's content. The PipelineView
+            // is rendered into the content area (main_b minus tab row), so
+            // we must hit-test against that rect — not main_b directly, or
+            // the y-coordinates are off by tab_h.
+            if self.pipeline_detail_tab == PipelineDetailTab::Pipeline {
+                if let Some(view) = self.build_pipeline_widget() {
+                    let content_rect = Rect::new(
+                        main_b.x,
+                        main_b.y + tab_h,
+                        main_b.width,
+                        (main_b.height - tab_h).max(0.0),
+                    );
+                    let pv_rect = pipeline_detail_pv_rect(content_rect, lh);
+                    let layout = tui_pipeline_layout(&view, pv_rect);
+                    match layout.hit_test(pos.x, pos.y) {
+                        PipelineHit::Action(stage_idx) => {
+                            self.dispatch_pipeline_stage(stage_idx);
+                            return true;
+                        }
+                        PipelineHit::Body(_) | PipelineHit::Empty => return false,
                     }
-                    PipelineHit::Body(_) | PipelineHit::Empty => return false,
                 }
             }
             return false;
@@ -4462,6 +4483,64 @@ impl CoordApp {
     }
 }
 
+// ─── Shared periodic work (called from both handle() and tick()) ─────────────
+
+impl CoordApp {
+    /// Time-based housekeeping that must run regardless of whether a UI
+    /// event arrived: toast pruning, data auto-refresh, background command
+    /// runner draining, pipeline loader polling, and auto-notify when
+    /// running assignments exist. Returns true if anything changed and a
+    /// redraw is required.
+    fn run_periodic_work(&mut self) -> bool {
+        let mut needs_redraw = false;
+
+        // Toast pruning
+        let before = self.toasts.len();
+        self.prune_toasts();
+        if self.toasts.len() != before {
+            needs_redraw = true;
+        }
+
+        // Auto-refresh: kick off background data load when interval elapses.
+        if self.refreshed_at.elapsed() >= REFRESH_EVERY && self.pending_data.is_none() {
+            self.pending_data = Some(start_data_load());
+            if self.active_view == SidebarView::Pipeline {
+                self.maybe_kick_pipeline_loader();
+            }
+            needs_redraw = true;
+        }
+
+        // Poll background command runner
+        if self.command_runner.poll() {
+            self.refresh();
+            needs_redraw = true;
+        }
+
+        // Poll background gh issue loader
+        if self.poll_pipeline_loader() {
+            needs_redraw = true;
+        }
+
+        // Auto-notify: run `coord notify` when running assignments exist
+        let has_running = self.data.assignments.iter().any(|a| a.status == "running");
+        if has_running
+            && self.last_notify.elapsed() >= NOTIFY_EVERY
+            && !self.command_runner.is_running()
+        {
+            self.command_runner.spawn(&["notify"]);
+            self.last_notify = Instant::now();
+        }
+
+        // When the Watch overlay is open, ensure a periodic redraw so the
+        // cached log gets re-fetched (2s TTL) without the user typing.
+        if self.watch.is_some() {
+            needs_redraw = true;
+        }
+
+        needs_redraw
+    }
+}
+
 // ─── ShellApp implementation ──────────────────────────────────────────────────
 
 impl ShellApp for CoordApp {
@@ -4579,42 +4658,7 @@ impl ShellApp for CoordApp {
         }
 
         // ── Expire stale toasts ─────────────────────────────────────────
-        let before = self.toasts.len();
-        self.prune_toasts();
-        if self.toasts.len() != before {
-            needs_redraw = true;
-        }
-
-        // ── Auto-refresh: kick off background load when interval elapses ─
-        // (ShellApp has no tick(); check elapsed on every UI event.)
-        if self.refreshed_at.elapsed() >= REFRESH_EVERY && self.pending_data.is_none() {
-            self.pending_data = Some(start_data_load());
-            if self.active_view == SidebarView::Pipeline {
-                self.maybe_kick_pipeline_loader();
-            }
-            needs_redraw = true;
-        }
-
-        // ── Poll background command runner ──────────────────────────────
-        if self.command_runner.poll() {
-            self.refresh();
-            needs_redraw = true;
-        }
-
-        // ── Poll background gh issue loader ─────────────────────────────
-        if self.poll_pipeline_loader() {
-            needs_redraw = true;
-        }
-
-        // ── Auto-notify: run `coord notify` when running assignments exist ─
-        let has_running = self.data.assignments.iter().any(|a| a.status == "running");
-        if has_running
-            && self.last_notify.elapsed() >= NOTIFY_EVERY
-            && !self.command_runner.is_running()
-        {
-            self.command_runner.spawn(&["notify"]);
-            self.last_notify = Instant::now();
-        }
+        needs_redraw |= self.run_periodic_work();
 
         // ── Mouse / scroll dispatch (before consuming the event) ─────────────
         needs_redraw |= self.handle_mouse(&event, backend, ctx);
@@ -5099,6 +5143,18 @@ impl ShellApp for CoordApp {
                 }
                 _ => return,
             };
+        }
+    }
+
+    /// Periodic callback driven by the quadraui runner (~60Hz on TUI).
+    /// Does the same time-based work as `handle()` so background refreshes,
+    /// command-runner draining, and watch-log polling proceed even when the
+    /// user isn't typing.
+    fn tick(&mut self, _backend: &mut dyn Backend) -> Reaction {
+        if self.run_periodic_work() {
+            Reaction::Redraw
+        } else {
+            Reaction::Continue
         }
     }
 }
@@ -6015,6 +6071,47 @@ mod tests {
             model: None,
             dispatched_at: Some(1.0),
             finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
+    }
+
+    /// When a Work stage fails and is then retried successfully, the stage
+    /// must reflect the LATEST attempt (Done), not the older Failed one. The
+    /// board-level sort puts failed before done, so stage_status_for can't
+    /// just take the first match — it must pick the latest by dispatched_at.
+    #[test]
+    fn stage_status_for_failed_then_retried_done_is_done() {
+        let mut app = make_pipeline_app();
+        // Older failed attempt.
+        app.data.assignments.push(Assignment {
+            id: "old-failed".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "failed".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(1.5),
+            exit_code: Some(1),
+            assignment_type: Some("work".to_string()),
+        });
+        // Newer successful retry.
+        app.data.assignments.push(Assignment {
+            id: "new-done".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m2".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(10.0),
+            finished_at: Some(11.0),
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
         });
