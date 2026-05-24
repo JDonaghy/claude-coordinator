@@ -743,18 +743,38 @@ class AgentServer:
                     if spec_default is None or head != spec_default:
                         captured_branch = head
 
-            # Push the branch from worktree before cleanup
+            # Best-effort push of the worktree branch.  The worker is
+            # responsible for pushing per its briefing, so this is a
+            # belt-and-suspenders safety net only.  We use a generous
+            # timeout (60 s) but MUST NOT let a hung push block the
+            # status update — so we catch both _GitError *and*
+            # subprocess.TimeoutExpired and treat both as non-fatal.
             if assignment.worktree_path:
                 wt_path = Path(assignment.worktree_path)
                 if wt_path.exists() and exit_code == 0:
                     try:
-                        _git(wt_path, "push", "-u", "origin", "HEAD")
-                    except _GitError as e:
+                        with open(assignment.log_path, "a") as reopen:
+                            reopen.write("\n# reap: push starting\n")
+                        _git(wt_path, "push", "-u", "origin", "HEAD", timeout=60.0)
                         try:
                             with open(assignment.log_path, "a") as reopen:
-                                reopen.write(f"\n# push failed: {e}\n")
+                                reopen.write("# reap: push completed\n")
                         except OSError:
                             pass
+                    except (_GitError, subprocess.TimeoutExpired) as e:
+                        try:
+                            with open(assignment.log_path, "a") as reopen:
+                                reopen.write(f"# reap: push failed ({e})\n")
+                        except OSError:
+                            pass
+
+        # This block MUST always run regardless of push outcome so that
+        # the assignment transitions out of 'running'.
+        try:
+            with open(assignment.log_path, "a") as reopen:
+                reopen.write("# reap: updating status\n")
+        except (OSError, AttributeError):
+            pass
 
         with self._lock:
             assignment = self._assignments.get(assignment_id)
@@ -769,6 +789,12 @@ class AgentServer:
                 assignment.status = DONE if exit_code == 0 else FAILED
             self._processes.pop(assignment_id, None)
         self._persist()
+        try:
+            with open(assignment.log_path, "a") as reopen:
+                final_status = assignment.status if assignment else "unknown"
+                reopen.write(f"# reap: done (exit_code={exit_code} status={final_status})\n")
+        except (OSError, AttributeError):
+            pass
 
         # Clean up worktree AFTER updating status
         if assignment is not None:

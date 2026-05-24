@@ -250,6 +250,42 @@ class TestWorktreeWithRemote:
         assert "issue-6-fail-no-push" not in refs
         server.shutdown()
 
+    def test_push_timeout_does_not_block_status_update(
+        self, tmp_path: Path, repo_with_remote: tuple[Path, Path]
+    ) -> None:
+        """If the reap-time push times out, the assignment must still reach DONE.
+
+        This is the regression test for the hang described in issue #204: a
+        subprocess.TimeoutExpired raised by _git was not caught by the
+        ``except _GitError`` handler, killing the reap thread before the status
+        update ran and leaving the assignment permanently stuck in 'running'.
+        """
+        import unittest.mock as mock
+        from coord import agent as agent_mod
+
+        local, _remote = repo_with_remote
+        original_git = agent_mod._git
+
+        def _git_push_timeout(cwd: Path, *args: str, **kwargs) -> str:
+            if "push" in args:
+                raise subprocess.TimeoutExpired(["git", "push"], 60.0)
+            return original_git(cwd, *args, **kwargs)
+
+        server = _server(
+            tmp_path, local,
+            argv=["/bin/sh", "-c",
+                  "echo change >> README && git add README && git commit -m 'work'"],
+        )
+        with mock.patch.object(agent_mod, "_git", side_effect=_git_push_timeout):
+            a = server.assign(_spec(local, issue_number=8, issue_title="push timeout"))
+            final = server.wait_for(a.id, timeout=10)
+
+        assert final.status == DONE, (
+            f"Assignment stuck in '{final.status}' after push timeout — "
+            "reap thread did not complete status update"
+        )
+        server.shutdown()
+
     def test_retry_reuses_existing_remote_branch(
         self, tmp_path: Path, repo_with_remote: tuple[Path, Path]
     ) -> None:
