@@ -315,6 +315,37 @@ smoke_tests:
 
 `coordinator.yml` is gitignored. Use `coordinator.example.yml` as the checked-in reference.
 
+## Pipeline Lifecycle (`status:*` labels)
+
+The `coord-tui` Pipeline panel organises GitHub issues into five lifecycle sections based on their labels and assignment state:
+
+| Section | Condition |
+|---|---|
+| **New** | Open issue, no `status:*` label |
+| **Refining** | Label `status:refining` on the issue |
+| **Pending** | Label `status:ready`, no assignment yet |
+| **In-progress** | Has at least one assignment row in the DB (any status) |
+| **Done** | Issue is closed on GitHub |
+
+### Transitions
+
+- **New → Refining**: Add label `status:refining` (human or Claude) to mark an issue under active specification
+- **Refining → Pending**: Swap label to `status:ready` once the spec is stable enough to dispatch
+- **Pending → In-progress**: Press `[Go]` in the TUI (or `coord assign`) — automatic once an assignment row exists
+- **In-progress → Done**: Merge the PR; include `Closes #N` in the PR body so GitHub auto-closes the issue
+
+### TUI keyboard shortcuts (Pipeline panel)
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Navigate issues |
+| `Enter` | Fire the active pipeline action (`[Go]` / `[Retry]`) |
+| `R` | Immediate refresh from GitHub (force poll) |
+| `D` | Dismiss a Done-section issue from the panel (session-only) |
+| `h` / `l` | Cycle detail tabs (Pipeline → Issue → Stages) |
+
+The background GitHub poll runs every **60 seconds**; press `R` to refresh on demand.
+
 ## Features
 
 - **No API key** — uses `claude -p` on your Max/Pro subscription; billing stays per-seat

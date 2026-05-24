@@ -1581,6 +1581,14 @@ pub struct CoordApp {
     /// field drops the `Receiver`, which signals the background thread to exit
     /// (it detects the disconnect on the next `tx.send()` call).
     watch_sse: Option<WatchSseState>,
+    /// Pipeline issues dismissed from the Done section by the user pressing 'D'.
+    ///
+    /// Keyed by `(repo_slug, issue_number)`.  Dismissed issues are hidden from
+    /// the sidebar for the lifetime of the current session; they reappear on
+    /// the next startup (or can be re-fetched if the user clears the set).
+    /// This is intentionally in-memory: for MVP, hiding accumulation is
+    /// sufficient — no persistence needed.
+    pipeline_dismissed: std::collections::HashSet<(String, u64)>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -1653,6 +1661,7 @@ impl CoordApp {
             pending_test_fail: None,
             purge_days: 7,
             watch_sse: None,
+            pipeline_dismissed: std::collections::HashSet::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
@@ -3264,6 +3273,7 @@ impl CoordApp {
     /// Returns `(lifecycle_key, Vec<pipeline_issues index>)` in display
     /// order (New → Refining → Pending → In-progress → Done), skipping
     /// any lifecycle section that contains no issues for this repo.
+    /// Issues that the user has dismissed via 'D' are excluded.
     fn pipeline_groups_for_repo(&self, repo_key: &str) -> Vec<(&'static str, Vec<usize>)> {
         const LIFECYCLE: [&str; 5] = ["new", "refining", "pending", "in-progress", "done"];
         let mut result: Vec<(&'static str, Vec<usize>)> = Vec::new();
@@ -3275,6 +3285,9 @@ impl CoordApp {
                 .filter(|(_, issue)| {
                     Self::pipeline_repo_key(issue) == repo_key
                         && self.pipeline_lifecycle_section(issue) == lc
+                        && !self
+                            .pipeline_dismissed
+                            .contains(&(issue.repo_slug.clone(), issue.number))
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -4152,13 +4165,13 @@ impl CoordApp {
     }
 
     /// Kick off a background `gh search issues` poll (no-op if one is
-    /// already in flight or we polled less than 15 s ago).
+    /// already in flight or we polled less than 60 s ago).
     fn maybe_kick_pipeline_loader(&mut self) {
         if self.pipeline_loader.is_some() {
             return;
         }
         if let Some(t) = self.pipeline_last_load {
-            if t.elapsed() < Duration::from_secs(15) {
+            if t.elapsed() < Duration::from_secs(60) {
                 return;
             }
         }
@@ -4995,6 +5008,9 @@ impl CoordApp {
             // #200: surface the Test gate keybinds when actionable for the
             // currently-selected pipeline issue.
             " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
+        } else if self.active_view == SidebarView::Pipeline {
+            // #194: Pipeline-specific hints: refresh, navigate, go, dismiss done.
+            " j/k=nav  Enter=go  R=refresh  D=dismiss-done  h/l=tabs  q=quit ".to_string()
         } else if proposals > 0 {
             format!(" p=plan  a=approve({})  m=merge  R=retry  P=purge  q=quit ", proposals)
         } else {
@@ -5780,10 +5796,11 @@ impl ShellApp for CoordApp {
                     }
                     Key::Char('R') => {
                         if self.active_view == SidebarView::Pipeline {
-                            // In the Pipeline panel, R fires the active
-                            // stage button — Retry on a Failed stage, or
-                            // Go on a Pending one (same as Enter).
-                            self.dispatch_pipeline_active_go();
+                            // Issue #194: R = immediate refresh of pipeline issues
+                            // from GitHub. Reset the last-load timestamp so
+                            // maybe_kick_pipeline_loader() bypasses the 60 s guard.
+                            self.pipeline_last_load = None;
+                            self.maybe_kick_pipeline_loader();
                             needs_redraw = true;
                         } else if let Some(a) = self.board_selected_failed_assignment() {
                             let id = a.id.clone();
@@ -5805,6 +5822,37 @@ impl ShellApp for CoordApp {
                         let counts = count_purgeable_db(secs).unwrap_or((0, 0));
                         self.pending_purge = Some(counts);
                         needs_redraw = true;
+                    }
+
+                    // ── D — Dismiss a Done-section pipeline issue (session-only) ──
+                    // Hides the selected issue from the Done section for the lifetime
+                    // of the current TUI session.  The issue reappears after a restart
+                    // or if the user manually re-runs `gh` (i.e. this is in-memory only).
+                    // Only fires when the selected issue is in the Done lifecycle section,
+                    // preventing accidental dismissal of active work.
+                    Key::Char('D')
+                        if self.active_view == SidebarView::Pipeline =>
+                    {
+                        if let Some(idx) = self.pipeline_sel {
+                            if let Some(issue) = self.pipeline_issues.get(idx).cloned() {
+                                if self.pipeline_lifecycle_section(&issue) == "done" {
+                                    self.pipeline_dismissed
+                                        .insert((issue.repo_slug.clone(), issue.number));
+                                    self.rebuild_pipeline_sidebar();
+                                    needs_redraw = true;
+                                } else {
+                                    self.pipeline_status = Some((
+                                        format!(
+                                            "D only dismisses Done issues (#{} is {})",
+                                            issue.number,
+                                            self.pipeline_lifecycle_section(&issue)
+                                        ),
+                                        Instant::now(),
+                                    ));
+                                    needs_redraw = true;
+                                }
+                            }
+                        }
                     }
 
                     // ── #200 Test gate: P = Pass, F = Fail (reason), S = Skip ──
@@ -6134,6 +6182,7 @@ mod tests {
             pending_test_fail: None,
             purge_days: 7,
             watch_sse: None,
+            pipeline_dismissed: std::collections::HashSet::new(),
         }
     }
 
