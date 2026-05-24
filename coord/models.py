@@ -100,6 +100,11 @@ class Assignment:
     # yet — either the review is still running, the worker produced no
     # structured output, or notify never saw the completion event.
     review_posted_at: float | None = None
+    # #200: human-driven Test gate verdict for type="work" assignments.
+    # None | "passed" | "failed" | "skipped". Review auto-dispatch is gated on
+    # this being passed/skipped (or no Test stage configured).
+    test_state: str | None = None
+    test_reason: str | None = None
 
 
 @dataclass

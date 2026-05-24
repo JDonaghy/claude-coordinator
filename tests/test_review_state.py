@@ -85,7 +85,11 @@ def _work_assignment(
     assignment_id: str = "work-001",
     review_state: str | None = None,
     status: str = "running",
+    test_state: str | None = "passed",
 ) -> Assignment:
+    # Default test_state="passed" so review-dispatch tests can use the helper
+    # without each having to explicitly clear the #200 Test gate. Tests that
+    # need to exercise the pre-gate path pass test_state=None explicitly.
     return Assignment(
         machine_name=machine,
         repo_name="api",
@@ -96,6 +100,7 @@ def _work_assignment(
         branch=branch,
         type="work",
         review_state=review_state,
+        test_state=test_state,
     )
 
 
@@ -266,6 +271,83 @@ class TestDispatchedTransition:
             reconcile(board, two_machine_config)
 
         mock_dispatch.assert_not_called()
+        assert completed_work.review_state == "dispatched"
+
+    # ── #200: Test gate blocks review auto-dispatch ──
+
+    def test_review_held_when_test_gate_pending(
+        self, two_machine_config: Config
+    ) -> None:
+        """With "test" in default_gates, a work assignment without a test_state
+        verdict must NOT auto-dispatch review."""
+        completed_work = _work_assignment(
+            status="done", branch="issue-1-fix",
+            review_state="pending", test_state=None,
+        )
+        board = Board(completed=[completed_work])
+        mock_dispatch = MagicMock(return_value=None)
+
+        with patch("coord.reconcile._query_agent", return_value={"active": [], "completed": []}), \
+             patch("coord.review.dispatch_review", mock_dispatch):
+            reconcile(board, two_machine_config)
+
+        mock_dispatch.assert_not_called()
+        # Still pending — once a verdict is set, the next reconcile will dispatch.
+        assert completed_work.review_state == "pending"
+
+    def test_review_held_when_test_gate_failed(
+        self, two_machine_config: Config
+    ) -> None:
+        """A failed Test verdict blocks review until Work is redispatched."""
+        completed_work = _work_assignment(
+            status="done", branch="issue-1-fix",
+            review_state="pending", test_state="failed",
+        )
+        board = Board(completed=[completed_work])
+        mock_dispatch = MagicMock(return_value=None)
+
+        with patch("coord.reconcile._query_agent", return_value={"active": [], "completed": []}), \
+             patch("coord.review.dispatch_review", mock_dispatch):
+            reconcile(board, two_machine_config)
+
+        mock_dispatch.assert_not_called()
+        assert completed_work.review_state == "pending"
+
+    def test_review_dispatches_when_test_gate_skipped(
+        self, two_machine_config: Config
+    ) -> None:
+        """A skipped Test verdict allows review to dispatch."""
+        completed_work = _work_assignment(
+            status="done", branch="issue-1-fix",
+            review_state="pending", test_state="skipped",
+        )
+        board = Board(completed=[completed_work])
+        review_result = self._make_review_assignment()
+
+        with patch("coord.reconcile._query_agent", return_value={"active": [], "completed": []}), \
+             patch("coord.review.dispatch_review", return_value=review_result):
+            reconcile(board, two_machine_config)
+
+        assert completed_work.review_state == "dispatched"
+
+    def test_review_dispatches_immediately_when_no_test_gate_configured(
+        self, two_machine_config: Config
+    ) -> None:
+        """When the pipeline has no Test gate, review auto-dispatches on Work
+        done as before."""
+        # Override the default gates on the config to skip Test.
+        two_machine_config.pipeline.default_gates = ["review", "merge"]
+        completed_work = _work_assignment(
+            status="done", branch="issue-1-fix",
+            review_state="pending", test_state=None,
+        )
+        board = Board(completed=[completed_work])
+        review_result = self._make_review_assignment()
+
+        with patch("coord.reconcile._query_agent", return_value={"active": [], "completed": []}), \
+             patch("coord.review.dispatch_review", return_value=review_result):
+            reconcile(board, two_machine_config)
+
         assert completed_work.review_state == "dispatched"
 
 

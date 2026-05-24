@@ -92,7 +92,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             unreachable_count INTEGER DEFAULT 0,
             exit_code INTEGER,
             review_iteration INTEGER DEFAULT 0,
-            review_posted_at REAL
+            review_posted_at REAL,
+            test_state TEXT,
+            test_reason TEXT
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -208,6 +210,9 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
     migrations = [
         "ALTER TABLE assignments ADD COLUMN review_iteration INTEGER DEFAULT 0",
         "ALTER TABLE assignments ADD COLUMN review_posted_at REAL",
+        # #200: human-driven Test gate between Work and Review.
+        "ALTER TABLE assignments ADD COLUMN test_state TEXT",
+        "ALTER TABLE assignments ADD COLUMN test_reason TEXT",
     ]
     for sql in migrations:
         try:

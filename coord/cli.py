@@ -2448,11 +2448,12 @@ def resume(config_path: Path) -> None:
             click.echo(f"  {a.machine_name} → {a.repo_name} #{a.issue_number}: {a.issue_title}")
 
 
-@main.command(help="Pull a worker's branch locally for smoke testing.")
+@main.command(help="Pull a worker's branch locally for testing, or record a Test gate verdict.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION
-@click.option("--passed", "verdict", flag_value="pass", help="Mark smoke test as passed.")
-@click.option("--fail", "verdict", flag_value="fail", help="Mark smoke test as failed.")
+@click.option("--passed", "verdict", flag_value="pass", help="Mark Test gate as passed.")
+@click.option("--fail", "verdict", flag_value="fail", help="Mark Test gate as failed.")
+@click.option("--skipped", "verdict", flag_value="skip", help="Mark Test gate as skipped (trivial change).")
 @click.option("--reason", default="", help="Reason for failure (used with --fail).")
 @click.option("--output", "output_file", type=click.Path(), default=None,
               help="File with test output to store (used with --fail).")
@@ -2471,8 +2472,16 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
 
     # ── Record verdict ──────────────────────────────────────────────────
     if verdict:
-        assignment.smoke_test = verdict
-        assignment.smoke_test_reason = reason if verdict == "fail" else None
+        # Map CLI verdict flags to the canonical test_state values used by the
+        # TUI's Test stage and the reconcile review-gating logic.
+        test_state_map = {"pass": "passed", "fail": "failed", "skip": "skipped"}
+        assignment.test_state = test_state_map[verdict]
+        assignment.test_reason = reason if verdict == "fail" else None
+        # Mirror to legacy smoke_test for the existing smoke-stage scoring in
+        # pipeline.py (which predates the human Test gate).
+        if verdict in ("pass", "fail"):
+            assignment.smoke_test = verdict
+            assignment.smoke_test_reason = reason if verdict == "fail" else None
 
         # Store test output when --fail --output is provided
         if verdict == "fail" and output_file:
@@ -2485,21 +2494,22 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
                 stored = test_output_dir / f"{assignment_id}.txt"
                 stored.write_text(output_path.read_text())
                 # Record the stored path so coord fix can find it
-                assignment.smoke_test_reason = (
+                reason_with_output = (
                     f"{reason} [output: {stored}]" if reason else f"[output: {stored}]"
                 )
+                assignment.test_reason = reason_with_output
+                assignment.smoke_test_reason = reason_with_output
                 click.echo(f"  test output stored: {stored}")
             else:
                 click.echo(f"  warning: output file not found: {output_file}", err=True)
 
         save_board(board)
-        if verdict == "pass":
-            click.echo(f"Smoke test PASSED for {assignment.repo_name} #{assignment.issue_number}")
+        verdict_word = {"pass": "PASSED", "fail": "FAILED", "skip": "SKIPPED"}[verdict]
+        click.echo(f"Test gate {verdict_word} for {assignment.repo_name} #{assignment.issue_number}")
+        if verdict == "fail" and reason:
+            click.echo(f"  reason: {reason}")
+        elif verdict == "pass":
             click.echo(f"  Run: coord pr {assignment_id} to create the PR")
-        else:
-            click.echo(f"Smoke test FAILED for {assignment.repo_name} #{assignment.issue_number}")
-            if reason:
-                click.echo(f"  reason: {reason}")
         return
 
     # ── Checkout and build ──────────────────────────────────────────────

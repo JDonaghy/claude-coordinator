@@ -74,6 +74,8 @@ def _row_to_assignment(row: object) -> Assignment:
         unreachable_count=d.get("unreachable_count") or 0,
         review_iteration=d.get("review_iteration") or 0,
         review_posted_at=d.get("review_posted_at"),
+        test_state=d.get("test_state"),
+        test_reason=d.get("test_reason"),
     )
 
 
@@ -105,6 +107,8 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.unreachable_count,
         a.review_iteration,
         a.review_posted_at,
+        a.test_state,
+        a.test_reason,
     )
 
 
@@ -115,14 +119,14 @@ _UPSERT_SQL = """
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
-        review_posted_at
+        review_posted_at, test_state, test_reason
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?
+        ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         status             = excluded.status,
@@ -142,7 +146,9 @@ _UPSERT_SQL = """
         files_forbidden    = excluded.files_forbidden,
         required_gates     = excluded.required_gates,
         review_iteration   = excluded.review_iteration,
-        review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at)
+        review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at),
+        test_state         = excluded.test_state,
+        test_reason        = excluded.test_reason
 """
 
 

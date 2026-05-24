@@ -199,8 +199,18 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # dispatch on a previous reconcile pass is retried here automatically.
     from coord.review import dispatch_review
 
+    # #200: gate review auto-dispatch on the Test stage verdict. If the pipeline
+    # includes a "test" gate, hold off on review until the user records a
+    # passed/skipped verdict (test_state). A failed verdict blocks review until
+    # the user redispatches Work to produce a new candidate.
+    test_gate_active = "test" in (config.pipeline.default_gates or [])
+
     for completed in board.completed:
         if completed.review_state != "pending":
+            continue
+        if test_gate_active and completed.test_state not in ("passed", "skipped"):
+            # Either no verdict yet, or verdict was "failed" — either way the
+            # work is not ready for review. The next reconcile pass will re-check.
             continue
         review = dispatch_review(completed, board, config)
         if review is not None:
