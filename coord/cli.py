@@ -100,10 +100,48 @@ def _load_config(path: Path) -> Config:
     return cfg
 
 
+def _warn_if_source_install_drift() -> None:
+    """Warn when the CLI is running from a non-editable install of a package
+    whose source checkout is the current working directory.
+
+    Root cause of #222: ``pip install .`` (without ``-e``) copies a snapshot
+    into site-packages. Subsequent edits in the source tree don't reach the
+    CLI, while ``python -c "from coord.... import ..."`` from the source dir
+    DOES pick them up (cwd shadows site-packages on import). Result: the same
+    workflow gives different answers depending on entry path.
+
+    Heuristic: ``coord.__file__`` lives in ``site-packages`` AND the cwd has
+    a sibling ``coord/`` package — that's exactly the drift case.
+    """
+    import os  # noqa: PLC0415
+
+    try:
+        import coord as _coord  # noqa: PLC0415
+
+        coord_file = _coord.__file__ or ""
+        if "site-packages" not in coord_file:
+            return  # Editable install — source IS the import path, no drift.
+        local_init = Path(os.getcwd()) / "coord" / "__init__.py"
+        if not local_init.exists():
+            return  # Not running from a source checkout.
+        # Inside a source checkout but CLI uses snapshot copy → drift possible.
+        click.echo(
+            "warning: coord CLI is running from a non-editable install "
+            "(site-packages snapshot) but a source checkout exists at "
+            f"{local_init.parent}.\n"
+            "         Edits to the source tree will NOT reach the CLI.  "
+            "Fix:  pip install -e .",
+            err=True,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never break the CLI
+        pass
+
+
 @click.group(help="Multi-agent coordinator for Claude Code workers.")
 @click.version_option(__version__, prog_name="coord")
 def main() -> None:
     """coord — coordinate Claude Code workers across machines and repos."""
+    _warn_if_source_install_drift()
 
 
 @main.command(help="Print the coord version.")
