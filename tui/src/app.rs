@@ -508,8 +508,15 @@ fn extract_tool_names(json: &str) -> Vec<String> {
     let mut pos = 0;
     while let Some(found) = json[pos..].find(marker) {
         let after = pos + found + marker.len();
-        // "name" should appear within the next ~200 chars of the same object.
-        let window_end = (after + 200).min(json.len());
+        // "name" should appear within the next ~200 bytes of the same object.
+        // Round window_end up to the next UTF-8 char boundary so we don't slice
+        // through a multi-byte glyph like `─` (3 bytes) and panic. Crash repro
+        // was a worker for #218 whose Edit tool input contained box-drawing
+        // characters that landed exactly on the 200-byte boundary.
+        let mut window_end = (after + 200).min(json.len());
+        while window_end < json.len() && !json.is_char_boundary(window_end) {
+            window_end += 1;
+        }
         let window = &json[after..window_end];
         if let Some(name) = json_str(window, "name") {
             if !name.is_empty() && !names.contains(&name) {
@@ -6857,6 +6864,27 @@ mod tests {
     fn extract_tool_names_empty_if_no_tool_use() {
         let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}"#;
         assert!(extract_tool_names(json).is_empty());
+    }
+
+    #[test]
+    fn extract_tool_names_handles_multibyte_glyph_at_window_boundary() {
+        // Regression for the #218 watch-overlay crash: an Edit tool input
+        // contained box-drawing glyphs (`─`, 3 UTF-8 bytes each) whose third
+        // byte happened to land on the 200-byte slice boundary.
+        // extract_tool_names took `&json[..200]` and panicked at the char
+        // boundary. The fix rounds up to the next valid boundary.
+        let prefix = r#"{"type":"tool_use","id":"x","name":"Edit","input":{"old_string":""#;
+        // Pad with `─` repeated so byte 200 (relative to after the marker)
+        // lands inside one of them.
+        let payload: String = std::iter::repeat('─').take(80).collect();
+        let suffix = r#""}}"#;
+        let json = format!(r#"{{"type":"tool_use","irrelevant":"{}","#, "x".repeat(10))
+            + prefix
+            + &payload
+            + suffix;
+        // The inner tool_use should be found and its name extracted.
+        let names = extract_tool_names(&json);
+        assert!(names.contains(&"Edit".to_string()));
     }
 
     // ── parse_json_event ──────────────────────────────────────────────────────
