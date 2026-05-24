@@ -67,8 +67,17 @@ a { color: #58a6ff; }
 .gate-row { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
 .btn-gate { padding: 4px 10px; min-height: 28px; font-size: 0.78em; border-radius: 4px; border: none; color: #fff; cursor: pointer; background: #1f6feb; }
 .btn-gate:hover { opacity: 0.85; }
+.btn-gate:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn-gate-danger { background: #da3633; }
 .btn-gate-green { background: #238636; }
+
+.dispatch-status { margin-top: 6px; padding: 4px 8px; border-radius: 4px; font-size: 0.82em; font-family: monospace; word-break: break-word; }
+.dispatch-pending { background: #161b22; color: #8b949e; border: 1px solid #30363d; }
+.dispatch-ok { background: #0d2b16; color: #3fb950; border: 1px solid #238636; }
+.dispatch-err { background: #2d0e0e; color: #ff7b72; border: 1px solid #da3633; }
+.dispatch-err-toggle { cursor: pointer; color: #58a6ff; font-size: 0.85em; margin-left: 8px; font-style: italic; }
+.dispatch-err-detail { margin-top: 6px; padding: 6px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; white-space: pre-wrap; word-break: break-all; font-size: 0.9em; max-height: 150px; overflow-y: auto; display: none; }
+.dispatch-err-detail.open { display: block; }
 
 @media (max-width: 600px) {
   .chat-msg.user { margin-left: 10%; }
@@ -133,7 +142,34 @@ function badge(cls, text) {
 }
 
 // ── Pipeline ───────────────────────────────────────────────────────────
-let pipelineCache = {};  // assignment_id → PipelineView
+let pipelineCache = {};     // assignment_id → PipelineView
+const dispatchStatus = {};  // assignment_id → {phase:'pending'|'ok'|'err', msg, detail?}
+
+function renderDispatchStatus(aid) {
+  const ds = dispatchStatus[aid];
+  if (!ds) return '';
+  const clsMap = {pending: 'dispatch-pending', ok: 'dispatch-ok', err: 'dispatch-err'};
+  const cls = clsMap[ds.phase] || '';
+  let html = `<div class="dispatch-status ${cls}">${E(ds.msg)}`;
+  if (ds.detail) {
+    const detailId = 'dsdetail-' + aid;
+    html += `<span class="dispatch-err-toggle" onclick="toggleDispatchDetail(${JSON.stringify(aid)})">show details</span><div class="dispatch-err-detail" id="${detailId}">${E(ds.detail)}</div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+function toggleDispatchDetail(aid) {
+  const el = document.getElementById('dsdetail-' + aid);
+  if (el) el.classList.toggle('open');
+}
+
+function updateCardPipeline(aid, issueNum) {
+  const area = document.querySelector('#card-' + aid + ' .pipeline-area');
+  if (!area) return;
+  const pv = pipelineCache[aid];
+  area.innerHTML = pv ? renderPipelineBar(pv, issueNum) : renderDispatchStatus(aid);
+}
 
 async function loadPipeline() {
   try {
@@ -146,7 +182,7 @@ async function loadPipeline() {
   } catch(e) { /* fail silently — board still renders without pipeline data */ }
 }
 
-function renderPipelineBar(pv) {
+function renderPipelineBar(pv, issueNum) {
   if (!pv) return '';
   const pills = pv.stages.map(s => {
     let cls = 'pill-waiting';
@@ -156,20 +192,29 @@ function renderPipelineBar(pv) {
     return `<span class="pipeline-pill ${cls}">${E(s.name)}</span>`;
   }).join('<span class="pipeline-arrow">›</span>');
 
+  const isPending = dispatchStatus[pv.assignment_id]?.phase === 'pending';
   const gates = pv.available_gates.map(g => {
     let extra = '';
     if (g.action === 'retry' || g.action === 'dispatch_fix') extra = 'btn-gate-danger';
     else if (g.action === 'merge') extra = 'btn-gate-green';
-    return `<button class="btn-gate ${extra}" onclick="doPipelineAction(${JSON.stringify(pv.assignment_id)},${JSON.stringify(g.action)})">${E(g.label)}</button>`;
+    const dis = isPending ? ' disabled' : '';
+    return `<button class="btn-gate ${extra}"${dis} onclick="doPipelineAction(${JSON.stringify(pv.assignment_id)},${JSON.stringify(g.action)},${JSON.stringify(issueNum || null)})">${E(g.label)}</button>`;
   }).join('');
 
   const pct = Math.max(0, Math.min(100, pv.progress_pct || 0));
   const progress = `<div class="pipeline-progress"><div class="pipeline-progress-fill" style="width:${pct}%"></div></div>`;
 
-  return `<div class="pipeline-bar">${pills}</div>${gates ? `<div class="gate-row">${gates}</div>` : ''}${progress}`;
+  return `<div class="pipeline-bar">${pills}</div>${gates ? `<div class="gate-row">${gates}</div>` : ''}${renderDispatchStatus(pv.assignment_id)}${progress}`;
 }
 
-async function doPipelineAction(assignmentId, action) {
+async function doPipelineAction(assignmentId, action, issueNum) {
+  // Show "Dispatching…" immediately — persistent, not a toast.
+  dispatchStatus[assignmentId] = {
+    phase: 'pending',
+    msg: issueNum ? `Dispatching #${issueNum}…` : 'Dispatching…',
+  };
+  updateCardPipeline(assignmentId, issueNum);
+
   try {
     const r = await fetch('/api/pipeline/action', {
       method: 'POST',
@@ -178,10 +223,29 @@ async function doPipelineAction(assignmentId, action) {
     });
     const data = await r.json();
     if (!r.ok || data.ok === false) {
-      alert('Action failed: ' + (data.error || JSON.stringify(data)));
+      const errText = data.error || JSON.stringify(data, null, 2);
+      const summary = errText.length > 120 ? errText.slice(0, 120) + '…' : errText;
+      dispatchStatus[assignmentId] = {
+        phase: 'err',
+        msg: `✗ Dispatch failed: ${summary}`,
+        detail: errText,
+      };
+    } else {
+      let msg = '✓ Dispatched';
+      if (issueNum) msg += ` #${issueNum}`;
+      if (data.machine_name) msg += ` → ${data.machine_name}`;
+      if (data.assignment_id) msg += ` (assignment ${String(data.assignment_id).slice(0, 8)})`;
+      if (data.events && data.events.length) {
+        const last = data.events[data.events.length - 1];
+        if (last.message) msg += ` — ${last.message}`;
+      }
+      dispatchStatus[assignmentId] = {phase: 'ok', msg};
     }
-    loadBoard();
-  } catch(e) { alert('Error: ' + e.message); }
+  } catch(e) {
+    dispatchStatus[assignmentId] = {phase: 'err', msg: `✗ Dispatch failed: ${e.message}`};
+  }
+
+  await loadBoard();
 }
 
 // ── Board ──────────────────────────────────────────────────────────────
@@ -199,11 +263,13 @@ async function loadBoard() {
       const isWork = !a.type || a.type === 'work';
       const typeTag = (a.type && a.type !== 'work') ? ` <span class="meta">[${E(a.type)}]</span>` : '';
       const pv = isWork ? pipelineCache[a.assignment_id] : null;
+      const cardId = a.assignment_id ? ` id="card-${E(a.assignment_id)}"` : '';
+      const pipelineHtml = pv ? `<div class="pipeline-area">${renderPipelineBar(pv, a.issue_number)}</div>` : '';
       return `
-        <div class="card">
+        <div class="card"${cardId}>
           <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}${typeTag}</div>
           <div class="meta">${badge('running', a.status)} on ${E(a.machine_name)}</div>
-          ${renderPipelineBar(pv)}
+          ${pipelineHtml}
         </div>
       `;
     }).join('');
@@ -226,11 +292,13 @@ async function loadBoard() {
       const isWork = !a.type || a.type === 'work';
       const typeTag = (a.type && a.type !== 'work') ? ` <span class="meta">[${E(a.type)}]</span>` : '';
       const pv = isWork ? pipelineCache[a.assignment_id] : null;
+      const cardId = a.assignment_id ? ` id="card-${E(a.assignment_id)}"` : '';
+      const pipelineHtml = pv ? `<div class="pipeline-area">${renderPipelineBar(pv, a.issue_number)}</div>` : '';
       return `
-        <div class="card">
+        <div class="card"${cardId}>
           <div class="card-header">${E(a.repo_name)} #${a.issue_number}: ${E(a.issue_title)}${typeTag}</div>
           <div class="meta">${badge(cls, a.status)} on ${E(a.machine_name)}${branchInfo}${prLink}</div>
-          ${renderPipelineBar(pv)}
+          ${pipelineHtml}
           ${diffToggle}
         </div>
       `;

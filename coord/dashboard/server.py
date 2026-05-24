@@ -279,18 +279,40 @@ def build_app(config: Config) -> Starlette:
         if action == "dispatch_review":
             from coord.review import dispatch_review
 
-            result = dispatch_review(assignment, board, config)
+            try:
+                result = dispatch_review(assignment, board, config)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if result:
                 save_board(board)
-            return JSONResponse({"ok": result is not None})
+                return JSONResponse({
+                    "ok": True,
+                    "machine_name": result.machine_name,
+                    "assignment_id": result.assignment_id,
+                })
+            return JSONResponse({
+                "ok": False,
+                "error": "could not find a suitable reviewer machine (check reviews config and machine availability)",
+            })
 
         elif action == "dispatch_smoke":
             from coord.smoke import dispatch_smoke
 
-            result = dispatch_smoke(assignment, board, config)
+            try:
+                result = dispatch_smoke(assignment, board, config)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if result:
                 save_board(board)
-            return JSONResponse({"ok": result is not None})
+                return JSONResponse({
+                    "ok": True,
+                    "machine_name": result.machine_name,
+                    "assignment_id": result.assignment_id,
+                })
+            return JSONResponse({
+                "ok": False,
+                "error": "no smoke test needed or no capable machine matched the diff",
+            })
 
         elif action == "enqueue":
             repo = config.repo(assignment.repo_name)
@@ -298,8 +320,13 @@ def build_app(config: Config) -> Starlette:
                 return JSONResponse({"error": "unknown repo"}, status_code=404)
             from coord.merge_queue import enqueue
 
-            entry = enqueue(assignment, repo.github, repo.default_branch)
-            return JSONResponse({"ok": entry is not None})
+            try:
+                entry = enqueue(assignment, repo.github, repo.default_branch)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            if entry is None:
+                return JSONResponse({"ok": False, "error": "could not enqueue (already in queue?)"})
+            return JSONResponse({"ok": True})
 
         elif action == "merge":
             from coord import github_ops as _gh_ops
