@@ -67,15 +67,6 @@ const TOAST_TTL: Duration = Duration::from_secs(4);
 // ─── Detail panel tabs ────────────────────────────────────────────────────────
 
 /// The two tabs shown in the Board view detail panel.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-enum DetailTab {
-    /// Static assignment info (ID, machine, status, branch, etc.).
-    #[default]
-    Summary,
-    /// Live feed of worker events parsed from the log file.
-    Activity,
-}
-
 /// Per-assignment context for the live watch overlay (Pipeline > Stages
 /// > Enter).  The overlay takes over the main panel, auto-refreshes the
 /// worker log every render, and accepts K/q/scroll keys.
@@ -1345,14 +1336,8 @@ pub struct CoordApp {
     /// Scroll offset for the machines list.
     machine_scroll: usize,
     refreshed_at: Instant,
-    /// Which tab is active in the Board detail panel.
-    detail_tab: DetailTab,
     /// Scroll offset for the Board Summary detail panel (right side).
     detail_scroll: usize,
-    /// Scroll offset for the Board Activity panel.
-    /// `None` = auto-scroll to the most-recent entries (default).
-    /// `Some(n)` = user has manually scrolled; preserve `n`.
-    activity_scroll: Option<usize>,
     /// Scroll offset for the Machine detail panel.
     machine_detail_scroll: usize,
     /// Background command runner for `coord` CLI subcommands.
@@ -1466,9 +1451,7 @@ impl CoordApp {
             machine_scroll: 0,
             // Use a far-past instant so the "↻ Xs" counter starts at 0.
             refreshed_at: Instant::now(),
-            detail_tab: DetailTab::default(),
             detail_scroll: 0,
-            activity_scroll: None,
             machine_detail_scroll: 0,
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
@@ -2719,33 +2702,7 @@ impl CoordApp {
         }
     }
 
-    /// Build the `TabBar` that sits at the top of the Board detail panel.
-    fn detail_tab_bar(&self) -> TabBar {
-        TabBar {
-            id: WidgetId::new("detail-tabs"),
-            tabs: vec![
-                TabItem {
-                    label: " Summary ".to_string(),
-                    is_active: self.detail_tab == DetailTab::Summary,
-                    is_dirty: false,
-                    is_preview: false,
-                },
-                TabItem {
-                    label: " Activity ".to_string(),
-                    is_active: self.detail_tab == DetailTab::Activity,
-                    is_dirty: false,
-                    is_preview: false,
-                },
-            ],
-            scroll_offset: 0,
-            right_segments: vec![],
-            active_accent: None,
-            show_tab_close: false,
-            compact: true,
-        }
-    }
-
-    /// Return log items for `id`, reading locally or fetching from the remote agent.
+/// Return log items for `id`, reading locally or fetching from the remote agent.
     ///
     /// This method **never blocks** the UI thread:
     ///
@@ -2829,58 +2786,7 @@ impl CoordApp {
         vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))]
     }
 
-    /// Activity tab: live feed of worker events parsed from the log file.
-    /// Shows the log for the most recent (or running) assignment in the group.
-    fn activity_list(&self) -> ListView {
-        let (title, items) = match self.board_selected_issue_group() {
-            None => (
-                " ACTIVITY ".to_string(),
-                vec![kv_item("", " No issue selected", None)],
-            ),
-            Some(group) => {
-                // Pick the most interesting assignment: running > failed > last done.
-                let best = group
-                    .assignments
-                    .iter()
-                    .find(|a| a.status == "running")
-                    .or_else(|| group.assignments.iter().rev().find(|a| a.status == "failed"))
-                    .or_else(|| group.assignments.last());
-                match best {
-                    Some(a) => {
-                        let log_items = self.get_activity_log(&a.id, &a.machine);
-                        let repo = self.board_active_repo().unwrap_or("?");
-                        (
-                            format!(" ACTIVITY — {} #{} ", repo, group.issue_number),
-                            log_items,
-                        )
-                    }
-                    None => (
-                        " ACTIVITY ".to_string(),
-                        vec![kv_item("", " No assignment data", None)],
-                    ),
-                }
-            }
-        };
-
-        // Scroll to show the most-recent entries (bottom of the list) unless
-        // the user has manually scrolled to a specific position.
-        let scroll_offset = match self.activity_scroll {
-            Some(n) => n,
-            None => items.len().saturating_sub(40),
-        };
-
-        ListView {
-            id: WidgetId::new("activity"),
-            title: Some(StyledText::plain(&title)),
-            items,
-            selected_idx: 0,
-            scroll_offset,
-            has_focus: false,
-            bordered: false,
-        }
-    }
-
-    /// Detail panel for the selected machine: status + job history.
+/// Detail panel for the selected machine: status + job history.
     fn machine_detail_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
 
@@ -4288,7 +4194,6 @@ impl CoordApp {
                             }
                         } else {
                             self.detail_scroll = 0;
-                            self.activity_scroll = None;
                         }
                         true
                     }
@@ -4313,7 +4218,6 @@ impl CoordApp {
                             }
                         } else {
                             self.detail_scroll = 0;
-                            self.activity_scroll = None;
                         }
                         true
                     }
@@ -4410,24 +4314,6 @@ impl CoordApp {
             }
             return false;
         }
-        if self.active_view != SidebarView::Board {
-            return false;
-        }
-        // The tab bar occupies the first `lh` pixels/cells of the panel.
-        if pos.y - main_b.y < lh {
-            // " Summary " is 9 chars; " Activity " is 10 chars (compact tabs,
-            // no separator). Anything in the first 9 columns → Summary tab.
-            let x_off = pos.x - main_b.x;
-            let new_tab = if x_off < 9.0 {
-                DetailTab::Summary
-            } else {
-                DetailTab::Activity
-            };
-            if new_tab != self.detail_tab {
-                self.detail_tab = new_tab;
-                return true;
-            }
-        }
         false
     }
 
@@ -4466,32 +4352,17 @@ impl CoordApp {
         }
     }
 
-    /// Scroll wheel in the main panel (detail / activity / machine detail).
+    /// Scroll wheel in the main panel (detail / machine detail).
     fn mouse_main_scroll(&mut self, delta: ScrollDelta, main_b: Rect, lh: f32) -> bool {
         let visible = content_visible_rows(main_b, lh);
         match self.active_view {
             SidebarView::Board => {
-                match self.detail_tab {
-                    DetailTab::Summary => {
-                        let items = self.detail_list().items.len();
-                        let max = items.saturating_sub(visible.saturating_sub(1));
-                        if delta.y > 0.0 {
-                            self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                        } else if delta.y < 0.0 {
-                            self.detail_scroll = (self.detail_scroll + 1).min(max);
-                        }
-                    }
-                    DetailTab::Activity => {
-                        let list = self.activity_list();
-                        let items = list.items.len();
-                        let current = self.activity_scroll.unwrap_or(list.scroll_offset);
-                        let max = items.saturating_sub(visible.saturating_sub(1));
-                        if delta.y > 0.0 {
-                            self.activity_scroll = Some(current.saturating_sub(1));
-                        } else if delta.y < 0.0 {
-                            self.activity_scroll = Some((current + 1).min(max));
-                        }
-                    }
+                let items = self.detail_list().items.len();
+                let max = items.saturating_sub(visible.saturating_sub(1));
+                if delta.y > 0.0 {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                } else if delta.y < 0.0 {
+                    self.detail_scroll = (self.detail_scroll + 1).min(max);
                 }
                 true
             }
@@ -4697,20 +4568,7 @@ impl ShellApp for CoordApp {
         let m = layout.main_content_bounds;
         match self.active_view {
             SidebarView::Board => {
-                // Tab bar (1 line) + tab content below.
-                let tab_h = lh;
-                let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
-                let content_rect =
-                    Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
-                backend.draw_tab_bar(tab_rect, &self.detail_tab_bar(), None);
-                match self.detail_tab {
-                    DetailTab::Summary => {
-                        backend.draw_list(content_rect, &self.detail_list());
-                    }
-                    DetailTab::Activity => {
-                        backend.draw_list(content_rect, &self.activity_list());
-                    }
-                }
+                backend.draw_list(m, &self.detail_list());
             }
             SidebarView::Machines => {
                 backend.draw_list(m, &self.machine_detail_list());
@@ -4922,7 +4780,6 @@ impl ShellApp for CoordApp {
                             let new_sel = self.board_selected_issue();
                             if new_sel != prev_sel {
                                 self.detail_scroll = 0;
-                                self.activity_scroll = None;
                             }
                             needs_redraw = true;
                         }
@@ -4954,7 +4811,6 @@ impl ShellApp for CoordApp {
                                     let new_sel = self.board_selected_issue();
                                     if new_sel != prev_sel {
                                         self.detail_scroll = 0;
-                                        self.activity_scroll = None;
                                     }
                                 }
                             }
@@ -4988,7 +4844,6 @@ impl ShellApp for CoordApp {
                                     let new_sel = self.board_selected_issue();
                                     if new_sel != prev_sel {
                                         self.detail_scroll = 0;
-                                        self.activity_scroll = None;
                                     }
                                 }
                             }
@@ -5045,7 +4900,6 @@ impl ShellApp for CoordApp {
                                 let new_sel = self.board_selected_issue();
                                 if new_sel != prev_sel {
                                     self.detail_scroll = 0;
-                                    self.activity_scroll = None;
                                 }
                             }
                             SidebarView::Machines => {
@@ -5070,7 +4924,6 @@ impl ShellApp for CoordApp {
                                 let new_sel = self.board_selected_issue();
                                 if new_sel != prev_sel {
                                     self.detail_scroll = 0;
-                                    self.activity_scroll = None;
                                 }
                             }
                             SidebarView::Machines => {
@@ -5112,7 +4965,6 @@ impl ShellApp for CoordApp {
                         let new_sel = self.board_selected_issue();
                         if new_sel != prev_sel {
                             self.detail_scroll = 0;
-                            self.activity_scroll = None;
                         }
                         needs_redraw = true;
                     }
@@ -5126,7 +4978,6 @@ impl ShellApp for CoordApp {
                         let new_sel = self.board_selected_issue();
                         if new_sel != prev_sel {
                             self.detail_scroll = 0;
-                            self.activity_scroll = None;
                         }
                         needs_redraw = true;
                     }
@@ -5160,28 +5011,6 @@ impl ShellApp for CoordApp {
                         }
                         self.rebuild_board_sidebar();
                         needs_redraw = true;
-                    }
-
-                    // ── Left / h — switch to Summary tab (Board only) ─────
-                    Key::Named(NamedKey::Left) | Key::Char('h')
-                        if self.active_view == SidebarView::Board
-                            && !self.board_search_focused =>
-                    {
-                        if self.detail_tab != DetailTab::Summary {
-                            self.detail_tab = DetailTab::Summary;
-                            needs_redraw = true;
-                        }
-                    }
-
-                    // ── Right / l — switch to Activity tab (Board only) ───
-                    Key::Named(NamedKey::Right) | Key::Char('l')
-                        if self.active_view == SidebarView::Board
-                            && !self.board_search_focused =>
-                    {
-                        if self.detail_tab != DetailTab::Activity {
-                            self.detail_tab = DetailTab::Activity;
-                            needs_redraw = true;
-                        }
                     }
 
                     Key::Char('r') => {
@@ -5384,9 +5213,7 @@ mod tests {
             machine_sel: 0,
             machine_scroll: 0,
             refreshed_at: Instant::now(),
-            detail_tab: DetailTab::default(),
             detail_scroll: 0,
-            activity_scroll: None,
             machine_detail_scroll: 0,
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
@@ -5634,19 +5461,6 @@ mod tests {
         assert_eq!(make_assignment("pending").status_label(), "PEND");
     }
 
-    // ── DetailTab ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn detail_tab_default_is_summary() {
-        assert_eq!(DetailTab::default(), DetailTab::Summary);
-    }
-
-    #[test]
-    fn detail_tab_summary_active_in_new_app() {
-        let app = make_app_default();
-        assert_eq!(app.detail_tab, DetailTab::Summary);
-    }
-
     // ── json_str ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -5842,26 +5656,16 @@ mod tests {
 
     // ── Mouse helpers ─────────────────────────────────────────────────────────
 
-    #[test]
-    fn mouse_main_click_tab_summary() {
-        let mut app = make_app_default();
-        app.detail_tab = DetailTab::Activity;
-        let main_b = Rect::new(50.0, 0.0, 40.0, 40.0);
-        // Click at x=51 → offset 1 < 9 → Summary tab.
-        let changed = app.mouse_main_click(Point::new(51.0, 0.0), main_b, 1.0);
-        assert!(changed);
-        assert_eq!(app.detail_tab, DetailTab::Summary);
-    }
+    // The Board view no longer has a tab bar — all clicks in the Board main
+    // panel return false (no-op) because there's nothing tab-switchable.
 
     #[test]
-    fn mouse_main_click_tab_activity() {
+    fn mouse_main_click_board_always_returns_false() {
         let mut app = make_app_default();
-        assert_eq!(app.detail_tab, DetailTab::Summary);
         let main_b = Rect::new(50.0, 0.0, 40.0, 40.0);
-        // Click at x=60 → offset 10 ≥ 9 → Activity tab.
-        let changed = app.mouse_main_click(Point::new(60.0, 0.0), main_b, 1.0);
-        assert!(changed);
-        assert_eq!(app.detail_tab, DetailTab::Activity);
+        // Click anywhere in the Board main panel should not change state.
+        let changed = app.mouse_main_click(Point::new(51.0, 0.0), main_b, 1.0);
+        assert!(!changed);
     }
 
     #[test]
@@ -5893,20 +5697,6 @@ mod tests {
         // The scroll offset must not be clamped to zero by refresh().
         app.refresh();
         assert_eq!(app.detail_scroll, 3);
-    }
-
-    #[test]
-    fn activity_scroll_none_means_auto() {
-        let app = make_app_default();
-        assert!(app.activity_scroll.is_none());
-    }
-
-    #[test]
-    fn activity_scroll_manual_value_preserved() {
-        let mut app = make_app_default();
-        app.activity_scroll = Some(7);
-        app.refresh();
-        assert_eq!(app.activity_scroll, Some(7));
     }
 
     #[test]
