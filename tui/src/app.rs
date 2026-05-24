@@ -1145,54 +1145,56 @@ fn fetch_pipeline_issues(
     // ignores label:/state: qualifiers in the positional query argument).
     // Scope to the configured repos to avoid noise from unrelated repos that
     // happen to share the same label name (e.g. gcc-postcommit-ci uses "coord").
-    // Fetch both open and closed so the Done lifecycle section is populated.
-    let mut args: Vec<String> = vec![
-        "search".into(),
-        "issues".into(),
-        "--state".into(),
-        "all".into(),
-        "--json".into(),
-        "number,title,body,labels,repository,url,state".into(),
-        "--limit".into(),
-        "200".into(),
-    ];
-    for label in labels {
-        args.push("--label".into());
-        args.push(label.clone());
-    }
-    for (_local, slug) in repos {
-        args.push("--repo".into());
-        args.push(slug.clone());
-    }
-
-    let output = std::process::Command::new("gh")
-        .args(&args)
-        .output();
-
-    let stdout = match output {
-        Ok(o) if o.status.success() => o.stdout,
-        Ok(o) => {
-            return PipelineLoaderResult::Err(
-                String::from_utf8_lossy(&o.stderr).trim().to_string(),
-            );
-        }
-        Err(e) => return PipelineLoaderResult::Err(format!("could not run gh: {}", e)),
-    };
-
-    let value: serde_json::Value = match serde_json::from_slice(&stdout) {
-        Ok(v) => v,
-        Err(e) => return PipelineLoaderResult::Err(format!("gh JSON parse: {}", e)),
-    };
-
-    let arr = match value.as_array() {
-        Some(a) => a,
-        None => return PipelineLoaderResult::Ok(Vec::new()),
-    };
-
+    //
+    // `gh search issues --state` only accepts "open" or "closed" (not "all"
+    // — that's a `gh issue list` flag). To populate the Done lifecycle
+    // section we have to query both states and merge.
     let label_set: std::collections::HashSet<&str> =
         labels.iter().map(|s| s.as_str()).collect();
     let mut issues: Vec<PipelineIssue> = Vec::new();
-    for item in arr {
+    for state in ["open", "closed"] {
+        let mut args: Vec<String> = vec![
+            "search".into(),
+            "issues".into(),
+            "--state".into(),
+            state.into(),
+            "--json".into(),
+            "number,title,body,labels,repository,url,state".into(),
+            "--limit".into(),
+            "200".into(),
+        ];
+        for label in labels {
+            args.push("--label".into());
+            args.push(label.clone());
+        }
+        for (_local, slug) in repos {
+            args.push("--repo".into());
+            args.push(slug.clone());
+        }
+
+        let output = std::process::Command::new("gh").args(&args).output();
+
+        let stdout = match output {
+            Ok(o) if o.status.success() => o.stdout,
+            Ok(o) => {
+                return PipelineLoaderResult::Err(
+                    String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                );
+            }
+            Err(e) => return PipelineLoaderResult::Err(format!("could not run gh: {}", e)),
+        };
+
+        let value: serde_json::Value = match serde_json::from_slice(&stdout) {
+            Ok(v) => v,
+            Err(e) => return PipelineLoaderResult::Err(format!("gh JSON parse: {}", e)),
+        };
+
+        let arr = match value.as_array() {
+            Some(a) => a.clone(),
+            None => continue,
+        };
+
+        for item in &arr {
         let number = item
             .get("number")
             .and_then(|n| n.as_u64())
@@ -1264,6 +1266,7 @@ fn fetch_pipeline_issues(
             all_labels,
             is_closed,
         });
+        }
     }
     // Stable order: by repo, then by issue number.
     issues.sort_by(|a, b| a.repo_slug.cmp(&b.repo_slug).then(a.number.cmp(&b.number)));
