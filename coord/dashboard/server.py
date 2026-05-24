@@ -34,6 +34,11 @@ _POLL_INTERVAL = 30.0
 # it is flagged as possibly stuck.
 _STUCK_THRESHOLD = 300.0  # 5 minutes
 
+# Bug 1 fix: distinct event type for cancelled assignments so they are not
+# bucketed as FAILED on the client.  Not yet in coord.events — defined here
+# until a shared constants refactor can move it.
+ASSIGNMENT_CANCELLED = "assignment_cancelled"
+
 
 def _fetch_agent_status(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
     """Synchronous agent /status fetch — safe to call from a thread executor."""
@@ -45,6 +50,124 @@ def _fetch_agent_status(host: str, port: int = AGENT_PORT, timeout: float = 5.0)
         return None
 
 
+async def _poll_once(
+    config: Config,
+    event_source: EventSource,
+    seen_terminal: set[str],
+    orphaned_since: dict[str, float],
+    *,
+    board=None,
+    now: float | None = None,
+    stuck_threshold: float = _STUCK_THRESHOLD,
+) -> list[dict]:
+    """One iteration of the background agent poller.
+
+    Queries each machine's agent server, publishes ``assignment_completed`` /
+    ``assignment_failed`` / ``assignment_cancelled`` SSE events on transitions,
+    and returns a list of possibly-stuck assignment info dicts.
+
+    Extracted to module level so unit tests can drive it directly without
+    standing up a full HTTP server.
+    """
+    if board is None:
+        board = load_board() or build_board()
+    if now is None:
+        now = time.time()
+
+    running = {
+        a.assignment_id: a
+        for a in board.active
+        if a.status == "running"
+        and a.assignment_id
+        and a.assignment_id not in seen_terminal
+    }
+    if not running:
+        return []
+
+    machines_by_name = {m.name: m for m in config.machines}
+    needed_machines = {a.machine_name for a in running.values()}
+
+    loop = asyncio.get_running_loop()
+    agent_data: dict[str, dict] = {}
+    for mname in needed_machines:
+        machine = machines_by_name.get(mname)
+        if machine:
+            data = await loop.run_in_executor(
+                None, _fetch_agent_status, machine.host
+            )
+            if data:
+                agent_data[mname] = data
+
+    possibly_stuck: list[dict] = []
+
+    for aid, assignment in running.items():
+        mname = assignment.machine_name
+        data = agent_data.get(mname)
+        if data is None:
+            # Agent unreachable — don't flag as stuck yet.
+            orphaned_since.pop(aid, None)
+            continue
+
+        active_ids = {e.get("id") for e in data.get("active", []) if e.get("id")}
+        completed_by_id = {
+            e.get("id"): e
+            for e in data.get("completed", [])
+            if e.get("id")
+        }
+
+        if aid in active_ids:
+            # Still running — clear any orphaned flag.
+            orphaned_since.pop(aid, None)
+        elif aid in completed_by_id:
+            # Terminal transition detected.
+            seen_terminal.add(aid)
+            orphaned_since.pop(aid, None)
+            entry = completed_by_id[aid]
+            stats: dict = {}
+            for k in ("num_turns", "total_cost_usd", "exit_code", "last_tool", "stop_reason"):
+                v = entry.get(k)
+                if v is not None:
+                    stats[k] = v
+            payload = {
+                "assignment_id": aid,
+                "repo_name": assignment.repo_name,
+                "issue_number": assignment.issue_number,
+                "issue_title": assignment.issue_title,
+                "machine_name": mname,
+                "stats": stats,
+                "status": entry.get("status"),  # attached so client can inspect
+            }
+            status = entry.get("status")
+            # Bug 1 fix: three-way branch — cancelled must not fire FAILED.
+            if status == "done":
+                event_source.publish(ASSIGNMENT_COMPLETED, payload)
+            elif status == "cancelled":
+                event_source.publish(ASSIGNMENT_CANCELLED, payload)
+            else:  # "failed" and any other unexpected terminal status
+                payload["exit_code"] = entry.get("exit_code")
+                event_source.publish(ASSIGNMENT_FAILED, payload)
+        else:
+            # Not in active OR completed on the agent.
+            dispatched_ago = now - (assignment.dispatched_at or 0)
+            if dispatched_ago > stuck_threshold:
+                if aid not in orphaned_since:
+                    orphaned_since[aid] = now
+                possibly_stuck.append({
+                    "assignment_id": aid,
+                    "repo_name": assignment.repo_name,
+                    "issue_number": assignment.issue_number,
+                    "machine_name": mname,
+                    "dispatched_ago_seconds": int(dispatched_ago),
+                })
+
+    # Prune orphaned_since entries that are no longer in the running set.
+    for aid in list(orphaned_since):
+        if aid not in running:
+            del orphaned_since[aid]
+
+    return possibly_stuck
+
+
 def build_app(config: Config) -> Starlette:
     """Build the dashboard Starlette app bound to a Config."""
 
@@ -54,119 +177,21 @@ def build_app(config: Config) -> Starlette:
     # Assignments whose terminal transition has already been published via SSE
     # so that repeated polls don't re-fire the same toast.
     _seen_terminal: set[str] = set()
-    # assignment_id → timestamp when we first noticed it orphaned (running in
-    # the board but absent from both the agent's active and completed lists).
+    # assignment_id → timestamp when we first noticed it orphaned.
     _orphaned_since: dict[str, float] = {}
-
-    async def _poll_once() -> None:
-        """One iteration of the background agent poller.
-
-        Loads the board, queries each machine's agent server, and publishes
-        ``assignment_completed`` / ``assignment_failed`` SSE events on
-        transitions.  Also maintains a ``possibly_stuck`` list published with
-        every ``board_updated`` event.
-        """
-        board = load_board() or build_board()
-        running = {
-            a.assignment_id: a
-            for a in board.active
-            if a.status == "running"
-            and a.assignment_id
-            and a.assignment_id not in _seen_terminal
-        }
-        if not running:
-            return
-
-        machines_by_name = {m.name: m for m in config.machines}
-        needed_machines = {a.machine_name for a in running.values()}
-
-        loop = asyncio.get_running_loop()
-        agent_data: dict[str, dict] = {}
-        for mname in needed_machines:
-            machine = machines_by_name.get(mname)
-            if machine:
-                data = await loop.run_in_executor(
-                    None, _fetch_agent_status, machine.host
-                )
-                if data:
-                    agent_data[mname] = data
-
-        now = time.time()
-        possibly_stuck: list[dict] = []
-
-        for aid, assignment in running.items():
-            mname = assignment.machine_name
-            data = agent_data.get(mname)
-            if data is None:
-                # Agent unreachable — don't flag as stuck yet.
-                _orphaned_since.pop(aid, None)
-                continue
-
-            active_ids = {e.get("id") for e in data.get("active", []) if e.get("id")}
-            completed_by_id = {
-                e.get("id"): e
-                for e in data.get("completed", [])
-                if e.get("id")
-            }
-
-            if aid in active_ids:
-                # Still running — clear any orphaned flag.
-                _orphaned_since.pop(aid, None)
-            elif aid in completed_by_id:
-                # Transition detected.
-                _seen_terminal.add(aid)
-                _orphaned_since.pop(aid, None)
-                entry = completed_by_id[aid]
-                stats: dict = {}
-                for k in ("num_turns", "total_cost_usd", "exit_code", "last_tool", "stop_reason"):
-                    v = entry.get(k)
-                    if v is not None:
-                        stats[k] = v
-                payload = {
-                    "assignment_id": aid,
-                    "repo_name": assignment.repo_name,
-                    "issue_number": assignment.issue_number,
-                    "issue_title": assignment.issue_title,
-                    "machine_name": mname,
-                    "stats": stats,
-                }
-                if entry.get("status") == "done":
-                    event_source.publish(ASSIGNMENT_COMPLETED, payload)
-                else:
-                    payload["exit_code"] = entry.get("exit_code")
-                    event_source.publish(ASSIGNMENT_FAILED, payload)
-            else:
-                # Not in active OR completed on the agent.
-                dispatched_ago = now - (assignment.dispatched_at or 0)
-                if dispatched_ago > _STUCK_THRESHOLD:
-                    if aid not in _orphaned_since:
-                        _orphaned_since[aid] = now
-                    possibly_stuck.append({
-                        "assignment_id": aid,
-                        "repo_name": assignment.repo_name,
-                        "issue_number": assignment.issue_number,
-                        "machine_name": mname,
-                        "dispatched_ago_seconds": int(dispatched_ago),
-                    })
-
-        # Prune _orphaned_since entries that are no longer in the running set.
-        for aid in list(_orphaned_since):
-            if aid not in running:
-                del _orphaned_since[aid]
-
-        # Always publish board_updated so the browser can refresh its view and
-        # update the possibly_stuck display.
-        event_source.publish(BOARD_UPDATED, {
-            "possibly_stuck": possibly_stuck,
-            "timestamp": now,
-        })
 
     async def _background_poller() -> None:
         """Runs forever; polls agents every _POLL_INTERVAL seconds."""
         await asyncio.sleep(10)  # Short initial delay so the server is ready
         while True:
             try:
-                await _poll_once()
+                possibly_stuck = await _poll_once(
+                    config, event_source, _seen_terminal, _orphaned_since
+                )
+                event_source.publish(BOARD_UPDATED, {
+                    "possibly_stuck": possibly_stuck,
+                    "timestamp": time.time(),
+                })
             except Exception:
                 pass
             await asyncio.sleep(_POLL_INTERVAL)
