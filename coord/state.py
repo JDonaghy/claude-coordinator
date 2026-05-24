@@ -765,3 +765,42 @@ def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
             ),
         )
     conn.commit()
+
+
+# ── Purge ──────────────────────────────────────────────────────────────────────
+
+def purge_done_assignments(older_than_days: float = 7.0) -> int:
+    """Delete old done/failed assignments and closed issues from the database.
+
+    Removes from two tables:
+
+    * ``assignments`` — rows where ``status IN ('done', 'failed')`` and
+      ``finished_at < now - older_than_days * 86400``.
+    * ``issues`` — rows where ``state = 'closed'`` and
+      ``synced_at < now - older_than_days * 86400``.
+
+    Returns the total number of rows deleted across both tables.
+
+    This is the Python-side equivalent of the TUI's 'P' purge action, which
+    performs the same DELETE directly via a short-lived Rust rusqlite
+    connection.  Exposed here so a future ``coord purge`` CLI command or
+    maintenance hook can call it without duplicating the SQL.
+    """
+    cutoff = time.time() - older_than_days * 86_400
+    conn = get_connection()
+    deleted_assignments = conn.execute(
+        "DELETE FROM assignments "
+        "WHERE status IN ('done', 'failed') "
+        "AND finished_at IS NOT NULL "
+        "AND finished_at < ?",
+        (cutoff,),
+    ).rowcount
+    deleted_issues = conn.execute(
+        "DELETE FROM issues "
+        "WHERE state = 'closed' "
+        "AND synced_at IS NOT NULL "
+        "AND synced_at < ?",
+        (cutoff,),
+    ).rowcount
+    conn.commit()
+    return deleted_assignments + deleted_issues

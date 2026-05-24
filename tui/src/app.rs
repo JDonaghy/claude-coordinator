@@ -1426,6 +1426,18 @@ pub struct CoordApp {
     /// Each `Receiver` yields `Ok(raw_content)` or `Err(error_message)`.
     /// `RefCell` allows mutation from `&self` render methods.
     pending_log_fetches: std::cell::RefCell<std::collections::HashMap<String, std::sync::mpsc::Receiver<Result<String, String>>>>,
+    /// Pending purge confirmation state.  `Some(n)` means we are waiting for
+    /// the user to confirm a purge of `n` rows; `None` means not pending.
+    ///
+    /// Triggered by pressing 'P' when the Board sidebar selection is in the
+    /// Completed (done/merged) group.  Any key other than 'y'/'Y' cancels.
+    pending_purge: Option<usize>,
+    /// Minimum age in days for a done/failed assignment row to be eligible
+    /// for the 'P' purge action.  Default 7.
+    ///
+    /// TODO: wire from coordinator.yml `purge_days` key (e.g. under a top-level
+    /// `tui:` section) once the Python config layer supports it.
+    purge_days: u32,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -1496,6 +1508,8 @@ impl CoordApp {
             pending_data: Some(start_data_load()),
             fetch_error: None,
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_purge: None,
+            purge_days: 7,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
@@ -2396,6 +2410,60 @@ impl CoordApp {
             .iter()
             .find(|a| a.status == "failed")?;
         Some(failed)
+    }
+
+    /// Return `true` when the currently selected row in the Board sidebar is
+    /// within the "Completed" (done/merged) status group.
+    ///
+    /// Used as the guard condition for the 'P' purge keybind: the action is
+    /// only available when the user has navigated into the Done section,
+    /// preventing accidental purges from other views.
+    fn board_selection_in_completed_group(&self) -> bool {
+        let section = match self.board_sidebar.active_section() {
+            Some(s) => s,
+            None => return false,
+        };
+        let offset = self.board_repo_offset();
+        if section < offset {
+            return false;
+        }
+        let path = match self.board_sidebar.selected_path(section) {
+            Some(p) => p,
+            None => return false,
+        };
+        if path.is_empty() {
+            return false;
+        }
+        let group_idx = path[0] as usize;
+        let repo = match self.board_repo_names.get(section - offset) {
+            Some(r) => r,
+            None => return false,
+        };
+        let groups = self.board_grouped_for_repo(&self.board_issues_cache, repo);
+        matches!(groups.get(group_idx), Some(("completed", _)))
+    }
+
+    /// Count how many assignment rows in the currently loaded data would be
+    /// deleted by a purge with the current [`purge_days`] cutoff.
+    ///
+    /// Only `done` and `failed` assignments with a `finished_at` timestamp
+    /// older than `purge_days` days are counted.  Running and pending
+    /// assignments are never purgeable.
+    fn count_purgeable(&self) -> usize {
+        let cutoff_secs = self.purge_days as f64 * 86_400.0;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let cutoff = now - cutoff_secs;
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| {
+                matches!(a.status.as_str(), "done" | "failed")
+                    && a.finished_at.map_or(false, |t| t < cutoff)
+            })
+            .count()
     }
 
     /// Try to select a specific issue in the sidebar by repo and issue number.
@@ -4583,10 +4651,16 @@ impl CoordApp {
             }
         }
         let proposals = self.data.proposals.len();
-        let hints = if proposals > 0 {
-            format!(" p=plan  a=approve({})  m=merge  R=retry  q=quit ", proposals)
+        let hints = if let Some(n) = self.pending_purge {
+            // Confirm prompt overrides the normal hints while purge is pending.
+            format!(
+                " Purge {} rows older than {}d? y=confirm  Esc=cancel ",
+                n, self.purge_days
+            )
+        } else if proposals > 0 {
+            format!(" p=plan  a=approve({})  m=merge  R=retry  P=purge  q=quit ", proposals)
         } else {
-            " p=plan  n=notify  m=merge  R=retry  q=quit ".to_string()
+            " p=plan  n=notify  m=merge  R=retry  P=purge  q=quit ".to_string()
         };
         StatusBar {
             id: WidgetId::new("statusbar"),
@@ -4785,6 +4859,32 @@ impl ShellApp for CoordApp {
         // ── Pre-compute panel bounds for keyboard visible-row estimates ───────
         let list_b = ctx.sidebar_bounds().unwrap_or(ctx.main_bounds());
         let lh = backend.line_height();
+
+        // ── Pending purge confirmation: intercept ALL key presses ─────────────
+        // While a purge is pending, 'y'/'Y' executes it; every other key
+        // cancels.  We return early so the normal key dispatch never fires.
+        if self.pending_purge.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        let secs = self.purge_days as f64 * 86_400.0;
+                        let count = purge_done_assignments_db(secs);
+                        self.push_toast(
+                            "Purge complete",
+                            &format!("{} rows removed", count),
+                            ToastSeverity::Info,
+                        );
+                        self.pending_purge = None;
+                        self.refresh();
+                    }
+                    _ => {
+                        // Any other key cancels — Escape, 'n', 'N', or anything else.
+                        self.pending_purge = None;
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
 
         // ── Keyboard and window events ────────────────────────────────────────
         match &event {
@@ -5234,6 +5334,20 @@ impl ShellApp for CoordApp {
                         }
                     }
 
+                    // ── P — Purge done/failed assignments older than purge_days ──
+                    // Only fires in the Board view when the cursor is in the
+                    // Completed (done/merged) status group.  Opens a confirm
+                    // prompt; the early-intercept block above handles 'y'/cancel.
+                    Key::Char('P')
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search_focused
+                            && self.board_selection_in_completed_group() =>
+                    {
+                        let n = self.count_purgeable();
+                        self.pending_purge = Some(n);
+                        needs_redraw = true;
+                    }
+
                     _ => {}
                 }
             }
@@ -5301,6 +5415,55 @@ fn pipeline_detail_pv_rect(main: Rect, lh: f32) -> Rect {
     let max_h = (main.height * 0.55).max(lh);
     let h = (want_rows * lh).min(max_h);
     Rect::new(main.x, main.y, main.width, h)
+}
+
+// ─── Purge helper ─────────────────────────────────────────────────────────────
+
+/// Open a short-lived read-write connection to `coord.db` and delete:
+///
+/// * `assignments` rows where `status IN ('done', 'failed')` and
+///   `finished_at < now - older_than_secs`
+/// * `issues` rows where `state = 'closed'` and
+///   `synced_at < now - older_than_secs`
+///
+/// Returns the total number of rows deleted across both tables.
+///
+/// A separate read-write connection is used because the main data-load
+/// connection is opened with `SQLITE_OPEN_READ_ONLY`.  SQLite WAL mode
+/// serialises concurrent writers, so this is safe.
+fn purge_done_assignments_db(older_than_secs: f64) -> usize {
+    let db_path = coord_dir().join("coord.db");
+    let conn = match Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let cutoff = now - older_than_secs;
+
+    let assignments_deleted = conn
+        .execute(
+            "DELETE FROM assignments \
+             WHERE status IN ('done', 'failed') \
+             AND finished_at IS NOT NULL \
+             AND finished_at < ?1",
+            rusqlite::params![cutoff],
+        )
+        .unwrap_or(0);
+
+    let issues_deleted = conn
+        .execute(
+            "DELETE FROM issues \
+             WHERE state = 'closed' \
+             AND synced_at IS NOT NULL \
+             AND synced_at < ?1",
+            rusqlite::params![cutoff],
+        )
+        .unwrap_or(0);
+
+    assignments_deleted + issues_deleted
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -5414,6 +5577,8 @@ mod tests {
             pending_data: None,
             fetch_error: None,
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_purge: None,
+            purge_days: 7,
         }
     }
 
@@ -6872,4 +7037,162 @@ mod tests {
         assert!(require_plan);
     }
 
+    // ── Purge helpers ─────────────────────────────────────────────────────────
+
+    /// Build an Assignment with an explicit `finished_at` timestamp so that
+    /// `count_purgeable` can evaluate the age-based cutoff.
+    fn make_assignment_with_age(status: &str, age_days: f64) -> Assignment {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let finished_at = now - age_days * 86_400.0;
+        Assignment {
+            id: format!("id-{}-{}", status, age_days as u64),
+            repo: "test-repo".to_string(),
+            issue_number: 42,
+            issue_title: "Test issue".to_string(),
+            machine: "testmachine".to_string(),
+            status: status.to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(finished_at - 3_600.0),
+            finished_at: Some(finished_at),
+            exit_code: None,
+            assignment_type: None,
+        }
+    }
+
+    // ── count_purgeable ────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_purgeable_counts_done_rows_older_than_cutoff() {
+        let app = make_test_app(BoardData {
+            assignments: vec![
+                make_assignment_with_age("done", 10.0), // 10 days old → older than 7 → purgeable
+                make_assignment_with_age("done", 3.0),  // 3 days old  → newer than 7 → NOT purgeable
+            ],
+            ..BoardData::default()
+        });
+        // purge_days defaults to 7
+        assert_eq!(app.count_purgeable(), 1);
+    }
+
+    #[test]
+    fn count_purgeable_excludes_running_assignments() {
+        // Running rows must never be counted regardless of age.
+        let app = make_test_app(BoardData {
+            assignments: vec![make_assignment_with_age("running", 30.0)],
+            ..BoardData::default()
+        });
+        assert_eq!(app.count_purgeable(), 0);
+    }
+
+    #[test]
+    fn count_purgeable_excludes_pending_assignments() {
+        let app = make_test_app(BoardData {
+            assignments: vec![make_assignment_with_age("pending", 30.0)],
+            ..BoardData::default()
+        });
+        assert_eq!(app.count_purgeable(), 0);
+    }
+
+    #[test]
+    fn count_purgeable_includes_old_failed_rows() {
+        // Failed rows older than the cutoff are also purgeable.
+        let app = make_test_app(BoardData {
+            assignments: vec![make_assignment_with_age("failed", 8.0)],
+            ..BoardData::default()
+        });
+        assert_eq!(app.count_purgeable(), 1);
+    }
+
+    #[test]
+    fn count_purgeable_returns_zero_when_all_fresh() {
+        // Neither done nor failed rows are old enough.
+        let app = make_test_app(BoardData {
+            assignments: vec![
+                make_assignment_with_age("done", 1.0),
+                make_assignment_with_age("failed", 2.0),
+            ],
+            ..BoardData::default()
+        });
+        assert_eq!(app.count_purgeable(), 0);
+    }
+
+    #[test]
+    fn count_purgeable_respects_custom_purge_days() {
+        let mut app = make_test_app(BoardData {
+            assignments: vec![
+                make_assignment_with_age("done", 4.0), // 4 days old
+            ],
+            ..BoardData::default()
+        });
+        // Default (7 days): 4-day-old row is newer → not purgeable.
+        assert_eq!(app.count_purgeable(), 0);
+        // Override to 3 days: 4-day-old row is older → purgeable.
+        app.purge_days = 3;
+        assert_eq!(app.count_purgeable(), 1);
+    }
+
+    #[test]
+    fn count_purgeable_excludes_rows_with_no_finished_at() {
+        // Rows without a finished_at timestamp must never be purged.
+        let mut a = make_assignment_with_age("done", 30.0);
+        a.finished_at = None;
+        let app = make_test_app(BoardData {
+            assignments: vec![a],
+            ..BoardData::default()
+        });
+        assert_eq!(app.count_purgeable(), 0);
+    }
+
+    // ── board_selection_in_completed_group ────────────────────────────────────
+
+    #[test]
+    fn purge_guard_true_when_completed_group_header_selected() {
+        // Single done assignment → only group is "Completed" at group_idx 0.
+        let assignments = vec![make_assignment_typed("done", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+        // Section 1 = repo-a (section 0 is the search form).
+        // Path [0] selects the Completed group header.
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0]));
+        assert!(app.board_selection_in_completed_group());
+    }
+
+    #[test]
+    fn purge_guard_true_when_issue_row_in_completed_group_selected() {
+        // Issue row within Completed group (path [group_idx, issue_idx]).
+        let assignments = vec![make_assignment_typed("done", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+        assert!(app.board_selection_in_completed_group());
+    }
+
+    #[test]
+    fn purge_guard_false_when_running_group_selected() {
+        // Running group only — group_idx 0 is "Running", not "Completed".
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0]));
+        assert!(!app.board_selection_in_completed_group());
+    }
+
+    #[test]
+    fn purge_guard_false_when_failed_group_selected() {
+        let assignments = vec![make_assignment_typed("failed", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0]));
+        assert!(!app.board_selection_in_completed_group());
+    }
+
+    #[test]
+    fn purge_guard_false_when_no_section_active() {
+        let app = make_app_default();
+        assert!(!app.board_selection_in_completed_group());
+    }
 }
