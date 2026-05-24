@@ -38,6 +38,124 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 
 
+# ── Reap tuning ───────────────────────────────────────────────────────────────
+# claude-cli sometimes does not exit after emitting its final
+# `{"type":"result"}` message — a child process (MCP server, tool subprocess)
+# holds the session's process group open and proc.wait() blocks indefinitely.
+# The reap thread detects logical completion from the log and force-kills the
+# group after a grace period. See #228 for the underlying bug.
+_REAP_POLL_INTERVAL = 5.0        # seconds between proc.wait timeout attempts
+_REAP_GRACE_AFTER_RESULT = 30.0  # grace period after result line before SIGTERM
+_REAP_MAX_WAIT = 2 * 60 * 60.0   # absolute max wait (2 hours) — last-resort safety net
+_RESULT_LINE_MARKER = b'"type":"result"'
+
+
+def _append_log_line(log_path: str, line: str) -> None:
+    """Best-effort append of a single line to the assignment log. Never raises."""
+    try:
+        with open(log_path, "a") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
+def _killpg_safe(pid: int, sig: int) -> None:
+    """`os.killpg` that swallows already-gone/permission errors."""
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _log_has_result(log_path: str) -> bool:
+    """Return True if the worker's stream-json log contains a final result event."""
+    try:
+        with open(log_path, "rb") as f:
+            return _RESULT_LINE_MARKER in f.read()
+    except OSError:
+        return False
+
+
+def _wait_for_proc_or_result(
+    proc: subprocess.Popen,
+    log_path: str,
+    *,
+    poll_interval: float = _REAP_POLL_INTERVAL,
+    grace_after_result: float = _REAP_GRACE_AFTER_RESULT,
+    max_wait: float = _REAP_MAX_WAIT,
+    killpg: Callable[[int, int], None] = _killpg_safe,
+    log_has_result: Callable[[str], bool] = _log_has_result,
+    clock: Callable[[], float] = time.monotonic,
+) -> int:
+    """Wait for `proc` to exit; force-kill its process group if it hangs after
+    the worker emitted its final result event.
+
+    Returns the worker's exit code. Always returns within roughly `max_wait`
+    seconds even if the process group refuses to die. If the worker's result
+    line was observed before we killed it, returns 0 — the work is logically
+    complete, only the runtime is being torn down.
+
+    The keyword-only parameters exist for tests to inject short timeouts and
+    mock kill/clock behavior.
+    """
+    start = clock()
+    result_seen_at: float | None = None
+
+    while True:
+        try:
+            return proc.wait(timeout=poll_interval)
+        except subprocess.TimeoutExpired:
+            pass
+
+        elapsed = clock() - start
+
+        # Detect logical completion: worker emitted its final result event.
+        if result_seen_at is None and log_has_result(log_path):
+            result_seen_at = clock()
+            _append_log_line(
+                log_path,
+                "# reap: worker emitted result; awaiting clean exit\n",
+            )
+
+        if result_seen_at is not None and clock() - result_seen_at >= grace_after_result:
+            # Worker logically done but process group still alive — force-kill.
+            _append_log_line(
+                log_path,
+                f"# reap: SIGTERM process group after {grace_after_result:.0f}s grace\n",
+            )
+            killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _append_log_line(
+                    log_path,
+                    "# reap: SIGKILL process group (SIGTERM ignored)\n",
+                )
+                killpg(proc.pid, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _append_log_line(
+                        log_path,
+                        "# reap: process group survived SIGKILL; abandoning wait\n",
+                    )
+            return 0  # Worker's work was complete before we killed the runtime.
+
+        if elapsed >= max_wait:
+            # Absolute safety net: worker never emitted a result and ran past
+            # the max-wait cap. Treat as failed and kill the group.
+            _append_log_line(
+                log_path,
+                f"# reap: SIGKILL after {max_wait:.0f}s max-wait without result line\n",
+            )
+            killpg(proc.pid, signal.SIGKILL)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return 137  # SIGKILL convention
+
+
 @dataclass
 class AssignmentSpec:
     """What the coordinator hands to an agent. Stable shape on the wire."""
@@ -456,15 +574,18 @@ class AgentServer:
             return assignment
 
         if proc is not None and proc.poll() is None:
+            # Kill the whole process group (proc was spawned with
+            # start_new_session=True so proc.pid is the pgid). proc.terminate()
+            # alone leaves MCP subprocess children alive and the cancel hangs.
+            _killpg_safe(proc.pid, signal.SIGTERM)
             try:
-                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _killpg_safe(proc.pid, signal.SIGKILL)
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-            except ProcessLookupError:
-                pass
+                    pass
 
         with self._lock:
             assignment.status = CANCELLED
@@ -706,7 +827,7 @@ class AgentServer:
 
         thread = threading.Thread(
             target=self._reap,
-            args=(assignment.id, proc, log_fh),
+            args=(assignment.id, proc, log_fh, assignment.log_path),
             daemon=True,
             name=f"agent-reap-{assignment.id}",
         )
@@ -715,8 +836,17 @@ class AgentServer:
         thread.start()
         self._persist()
 
-    def _reap(self, assignment_id: str, proc: subprocess.Popen, log_fh) -> None:
-        exit_code = proc.wait()
+    def _reap(
+        self,
+        assignment_id: str,
+        proc: subprocess.Popen,
+        log_fh,
+        log_path: str,
+    ) -> None:
+        # Use a polling wait that handles claude-cli's well-known habit of
+        # not exiting after emitting its final result event (a child of the
+        # process group keeps the session alive). See #228.
+        exit_code = _wait_for_proc_or_result(proc, log_path)
         log_fh.close()
 
         # Capture the branch the worker left the repo on. For worktree-based
