@@ -368,6 +368,7 @@ def _row_to_dispatched_dict(row: object) -> dict:
         "dispatched_at": d.get("dispatched_at"),
         "review_of_assignment_id": d.get("review_of_assignment_id"),
         "review_target": d.get("review_target"),
+        "status": d.get("status"),
     }
 
 
