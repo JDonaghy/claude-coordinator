@@ -3469,40 +3469,7 @@ impl CoordApp {
         if stage == "merge" {
             return self.merge_stage_status_for(issue);
         }
-        // Collect assignments for this issue (matching repo or repo_slug).
-        let related: Vec<&Assignment> = self
-            .data
-            .assignments
-            .iter()
-            .filter(|a| a.issue_number == issue.number)
-            .filter(|a| {
-                if let Some(local) = &issue.coord_repo {
-                    a.repo == *local
-                } else {
-                    // No local mapping known — match by issue # alone.
-                    true
-                }
-            })
-            .collect();
-
-        let stage_match = |a: &&Assignment| -> bool {
-            let t = a.assignment_type.as_deref().unwrap_or("work");
-            // Each stage matches only its own assignment type. When the
-            // pipeline has no Plan gate (the common case), plan-typed
-            // assignments don't appear at all — but if one was produced
-            // ad-hoc, count it as Work so the stage advances normally.
-            if stage == "work" && !self.data.pipeline_require_plan {
-                t == "work" || t == "plan"
-            } else {
-                t == stage
-            }
-        };
-
-        // The outer board sort orders by status bucket first
-        // (running → failed → done), then dispatched_at desc within bucket.
-        // That means a failed retry-target from yesterday sorts BEFORE a done
-        // retry from today. Pick the actual latest by dispatched_at instead.
-        let matching: Vec<&Assignment> = related.into_iter().filter(stage_match).collect();
+        let matching = self.assignments_for_stage(issue, stage);
         if matching.iter().any(|a| a.status == "running") {
             return StageStatus::Active;
         }
@@ -3512,10 +3479,25 @@ impl CoordApp {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         if let Some(latest) = latest {
-            match latest.status.as_str() {
-                "done" => return StageStatus::Done,
-                "failed" => return StageStatus::Failed,
-                _ => {}
+            let verdict = match latest.status.as_str() {
+                "done" => Some(StageStatus::Done),
+                "failed" => Some(StageStatus::Failed),
+                _ => None,
+            };
+            if let Some(v) = verdict {
+                // #193: a Done/Failed verdict is only trustworthy if no upstream
+                // stage has been re-dispatched since. If any upstream's latest
+                // dispatched_at is newer than this stage's latest, the verdict
+                // is against an older revision — render as Stale.
+                if let Some(this_dispatched) = latest.dispatched_at {
+                    if self
+                        .upstream_max_dispatched_at(issue, stage)
+                        .map_or(false, |u| u > this_dispatched)
+                    {
+                        return StageStatus::Stale;
+                    }
+                }
+                return v;
             }
         }
         // No matching assignment found.  For closed issues this means the stage
@@ -3527,6 +3509,59 @@ impl CoordApp {
         } else {
             StageStatus::Pending
         }
+    }
+
+    /// Return all assignments for `issue` whose `assignment_type` matches
+    /// `stage`. When pipeline has no Plan gate, plan-typed assignments also
+    /// count as Work so the stage advances correctly.
+    fn assignments_for_stage<'a>(
+        &'a self,
+        issue: &PipelineIssue,
+        stage: &str,
+    ) -> Vec<&'a Assignment> {
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| {
+                if let Some(local) = &issue.coord_repo {
+                    a.repo == *local
+                } else {
+                    true
+                }
+            })
+            .filter(|a| {
+                let t = a.assignment_type.as_deref().unwrap_or("work");
+                if stage == "work" && !self.data.pipeline_require_plan {
+                    t == "work" || t == "plan"
+                } else {
+                    t == stage
+                }
+            })
+            .collect()
+    }
+
+    /// Return the max `dispatched_at` across all stages strictly upstream of
+    /// `stage`, or None if no upstream stage has an assignment.
+    ///
+    /// Used by `stage_status_for` to detect stale downstream verdicts.
+    fn upstream_max_dispatched_at(
+        &self,
+        issue: &PipelineIssue,
+        stage: &str,
+    ) -> Option<f64> {
+        let names = self.pipeline_stage_names();
+        let idx = names.iter().position(|s| s == stage)?;
+        if idx == 0 {
+            return None;
+        }
+        names[..idx]
+            .iter()
+            .flat_map(|s| self.assignments_for_stage(issue, s))
+            .filter_map(|a| a.dispatched_at)
+            .fold(None, |acc, t| {
+                Some(acc.map_or(t, |x: f64| x.max(t)))
+            })
     }
 
     /// Resolve the merge stage status from `merge_queue` entries.
@@ -3611,8 +3646,11 @@ impl CoordApp {
                         s
                     }
                 };
-                let prior_all_done =
-                    statuses[..i].iter().all(|s| *s == StageStatus::Done);
+                // Skipped counts as "settled" for prior_all_done: a closed-issue
+                // stage that never ran is logically done.
+                let prior_all_done = statuses[..i].iter().all(|s| {
+                    *s == StageStatus::Done || *s == StageStatus::Skipped
+                });
                 let action = if !go_attached
                     && status == StageStatus::Pending
                     && prior_all_done
@@ -3621,10 +3659,15 @@ impl CoordApp {
                 {
                     go_attached = true;
                     Some("Go".to_string())
-                } else if status == StageStatus::Failed
+                } else if (status == StageStatus::Failed || status == StageStatus::Stale)
+                    && prior_all_done
                     && is_dispatchable_stage(name)
                     && issue.coord_repo.is_some()
                 {
+                    // Failed → user-initiated retry of the failed dispatch.
+                    // Stale → re-dispatch because an upstream stage was re-run.
+                    // In both cases the user has to act; only show Retry when
+                    // predecessors are settled so we don't race a running upstream.
                     Some("Retry".to_string())
                 } else {
                     None
@@ -3669,7 +3712,11 @@ impl CoordApp {
         };
         let Some(sel) = self.pipeline_sel else { return false; };
         let Some(issue) = self.pipeline_issues.get(sel).cloned() else { return false; };
-        let is_retry = self.stage_status_for(&issue, &stage_name) == StageStatus::Failed;
+        // Failed AND Stale both use the retry path — Failed re-dispatches
+        // because the prior attempt errored; Stale re-dispatches because an
+        // upstream stage was re-run after this stage's last successful run.
+        let stage_status = self.stage_status_for(&issue, &stage_name);
+        let is_retry = stage_status == StageStatus::Failed || stage_status == StageStatus::Stale;
         match stage_name.as_str() {
             "plan" => {
                 if is_retry {
@@ -4235,6 +4282,7 @@ impl CoordApp {
                 StageStatus::Failed => ("✗", Color::rgb(220, 70, 70)),
                 StageStatus::Skipped => ("─", Color::rgb(140, 140, 140)),
                 StageStatus::Pending => ("·", Color::rgb(140, 140, 140)),
+                StageStatus::Stale => ("↻", Color::rgb(140, 140, 140)),
             };
             let header = format!(" {} {}", icon, capitalize(&name));
             items.push(ListItem {
@@ -6643,6 +6691,142 @@ mod tests {
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Pending);
         assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Pending);
+    }
+
+    // ── #193: stale downstream stages ─────────────────────────────────────────
+
+    /// Helper: an assignment of `kind` (work/review/etc.) for issue 42 on `api`
+    /// at the given dispatched_at, terminal status `done` unless overridden.
+    fn _stage_assignment(
+        id: &str,
+        kind: &str,
+        dispatched_at: f64,
+        status: &str,
+    ) -> Assignment {
+        Assignment {
+            id: id.to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: status.to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(dispatched_at),
+            finished_at: Some(dispatched_at + 60.0),
+            exit_code: if status == "failed" { Some(1) } else { Some(0) },
+            assignment_type: Some(kind.to_string()),
+        }
+    }
+
+    #[test]
+    fn stage_status_stale_when_upstream_redispatched_after_done() {
+        // The user's #214 case: Work was re-dispatched after a request-changes
+        // review. Previously Review showed Done (green); should now show Stale.
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        // Work re-dispatched (later than the review).
+        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
+        assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Stale);
+    }
+
+    #[test]
+    fn stage_status_stale_when_upstream_redispatched_after_failed() {
+        // A Failed review against an older Work is still Stale once Work re-runs:
+        // the failure was about a diff that no longer exists.
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "failed"));
+        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Stale);
+    }
+
+    #[test]
+    fn stage_status_done_when_no_upstream_redispatch() {
+        // Same setup minus the re-dispatch → Review stays Done (still trustworthy).
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Done);
+    }
+
+    #[test]
+    fn stage_status_first_stage_never_stale() {
+        // Work is the first dispatchable stage; there's no upstream to invalidate
+        // it. Even with multiple dispatched_at values, latest wins as Done.
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
+    }
+
+    #[test]
+    fn stage_status_active_beats_staleness_when_upstream_running() {
+        // If a stage has a Running assignment, that wins over any verdict —
+        // staleness only matters for terminal states.
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "running"));
+        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Active);
+    }
+
+    #[test]
+    fn upstream_max_dispatched_at_returns_none_for_first_stage() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.upstream_max_dispatched_at(issue, "work"), None);
+    }
+
+    #[test]
+    fn upstream_max_dispatched_at_aggregates_across_all_prior_stages() {
+        // Pipeline is work → review → merge. Querying upstream of merge should
+        // see the latest dispatch across BOTH work AND review.
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 250.0, "done"));
+        app.data.assignments.push(_stage_assignment("w2", "work", 150.0, "done"));
+        let issue = &app.pipeline_issues[0];
+        // Max across {work,review} prior to merge = 250 (the review).
+        assert_eq!(app.upstream_max_dispatched_at(issue, "merge"), Some(250.0));
+    }
+
+    #[test]
+    fn pipeline_widget_attaches_retry_to_stale_stage_when_prior_settled() {
+        // Stale + upstream Done → [Retry] button so the user can re-run.
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        app.pipeline_sel = Some(0);
+        let view = app.build_pipeline_widget().expect("widget");
+        // Stage layout: work, review, merge.
+        let review = &view.stages[1];
+        assert_eq!(review.status, StageStatus::Stale);
+        assert_eq!(review.action.as_deref(), Some("Retry"));
+    }
+
+    #[test]
+    fn pipeline_widget_no_retry_on_stale_when_upstream_still_active() {
+        // Stale + upstream Running → no button (waiting for upstream to settle
+        // before user can act).
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "running"));
+        app.pipeline_sel = Some(0);
+        let view = app.build_pipeline_widget().expect("widget");
+        let review = &view.stages[1];
+        assert_eq!(review.status, StageStatus::Stale);
+        assert_eq!(review.action, None);
     }
 
     // ── Issue #212: closed-without-pipeline fixes ─────────────────────────
