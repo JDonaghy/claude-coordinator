@@ -455,3 +455,131 @@ class TestCLI:
         result = runner.invoke(main, ["web", "--help"])
         assert result.exit_code == 0
         assert "7434" in result.output
+
+
+class TestSSEEvents:
+    """Tests for /events SSE endpoint (issue #214)."""
+
+    def test_events_route_is_registered(self) -> None:
+        """The /events route must exist in the dashboard app.
+
+        We verify by inspecting the Starlette app routes directly — streaming
+        the body would block the test because SSE never closes on the server.
+        """
+        from coord.dashboard.server import build_app as _build_app
+        app = _build_app(_config())
+        route_paths = [
+            getattr(r, "path", None)
+            for r in getattr(app, "routes", [])
+        ]
+        assert "/events" in route_paths, f"Expected /events in routes, got: {route_paths}"
+
+    def test_events_html_includes_sse_connection(self) -> None:
+        """The HTML must include the SSE connection code."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "connectSSE" in r.text
+        assert "EventSource" in r.text
+        assert "/events" in r.text
+
+    def test_html_includes_toast_system(self) -> None:
+        """The HTML must include toast notification elements."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "toast-container" in r.text
+        assert "showToast" in r.text
+        assert "toast-done" in r.text
+        assert "toast-failed" in r.text
+
+    def test_html_includes_audio_bell(self) -> None:
+        """The HTML must include audio bell code."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "playBell" in r.text
+        assert "AudioContext" in r.text
+
+    def test_html_includes_sse_dot_indicator(self) -> None:
+        """The HTML must show a live-events connection status indicator."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "sse-dot" in r.text
+
+    def test_html_includes_stuck_detection(self) -> None:
+        """The HTML must show possibly-stuck warning and unstick button."""
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "possibly_stuck" in r.text
+        assert "stuck-banner" in r.text
+        assert "btn-unstick" in r.text
+        assert "Cancel" in r.text
+
+
+class TestUnstickAction:
+    """Tests for the 'unstick' pipeline action (issue #214)."""
+
+    def _board_with_running(self) -> "Board":
+        import time as _t
+        return Board(
+            active=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="run001", status="running",
+                    dispatched_at=_t.time() - 600,  # 10 min ago
+                ),
+            ],
+        )
+
+    def test_unstick_marks_failed_and_returns_ok(self) -> None:
+        client = _client()
+        board = self._board_with_running()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.httpx.post", side_effect=Exception("unreachable")),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "run001",
+                "action": "unstick",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["cancelled_on_agent"] is False
+        # Assignment should be marked failed in the board
+        a = board.find_by_id("run001")
+        assert a is not None
+        assert a.status == "failed"
+
+    def test_unstick_cancelled_on_agent_when_reachable(self) -> None:
+        client = _client()
+        board = self._board_with_running()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        with (
+            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.httpx.post", return_value=mock_response),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "run001",
+                "action": "unstick",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["cancelled_on_agent"] is True
+
+    def test_unstick_unknown_assignment_returns_404(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=Board()):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "doesnotexist",
+                "action": "unstick",
+            })
+        assert r.status_code == 404
