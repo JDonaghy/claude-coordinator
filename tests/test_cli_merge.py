@@ -144,6 +144,43 @@ class TestMergeCommand:
         assert states["a"] == mq.CONFLICT
         assert states["b"] == mq.PENDING  # halted
 
+    def test_human_classified_conflict_persists_as_human_required(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Permission / branch-protection errors must persist as HUMAN_REQUIRED.
+
+        Regression test for the review of #243: the original code mutated a
+        copy loaded from the DB, but the final save block then re-loaded the
+        queue and merged ``items`` (still ``CONFLICT``) over the top,
+        clobbering ``HUMAN_REQUIRED``.  The TUI's ``human_required`` paths
+        never lit up for this code path as a result.
+        """
+        from coord.models import Board
+        from coord.state import save_board
+        save_board(Board())  # the conflict-event block is gated on load_board() != None
+        _seed_queue([_entry("p1")])
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 999, "url": "u/999", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            # gh emits "permission denied" — classify_conflict()'s _HUMAN_SIGNALS
+            # picks this up and the merge command should mark HUMAN_REQUIRED.
+            return False, "permission denied — branch protection enabled"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+        assert result.exit_code == 0, result.output
+        assert "manual resolution required" in result.output
+
+        persisted = mq.load_queue()
+        assert len(persisted) == 1
+        assert persisted[0].state == mq.HUMAN_REQUIRED, (
+            f"expected HUMAN_REQUIRED, got {persisted[0].state!r}"
+        )
+
     def test_order_override(self, config_file: Path, coord_dir: Path) -> None:
         _seed_queue([_entry("a"), _entry("b"), _entry("c")])
 
