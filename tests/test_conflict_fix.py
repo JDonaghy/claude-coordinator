@@ -257,6 +257,50 @@ class TestDispatch:
         )
         assert result is None
 
+    def test_payload_includes_deny_commands(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """gh and force-push must be in the dispatch payload's deny_commands.
+
+        Regression test for review of #243: CLAUDE.md claims `gh` is denied
+        for conflict-fix workers but the payload had no deny_commands key.
+        Enforcement was prompt-only; now it's enforced by the agent harness.
+        """
+        client = _FakeHTTPClient({"id": "fix-id-deny"})
+        result = dispatch_conflict_fix(
+            _entry(), Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+        assert result is not None
+        _, payload = client.calls[0]
+        deny = payload.get("deny_commands", [])
+        assert "Bash(gh *)" in deny
+        assert "Bash(git push --force *)" in deny
+        assert "Bash(git push -f *)" in deny
+
+    def test_payload_deny_commands_merge_with_repo_config(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """Repo-level worker_permissions.deny entries are preserved alongside
+        the conflict-fix-specific deny patterns (no clobbering)."""
+        from coord.models import WorkerPermissionsConfig
+        cfg = two_machine_config
+        cfg.repos[0].worker_permissions = WorkerPermissionsConfig(
+            deny=["Bash(rm -rf *)", "Bash(curl *)"],
+        )
+        client = _FakeHTTPClient({"id": "fix-id-merge"})
+        dispatch_conflict_fix(
+            _entry(), Board(), cfg, http_client=client, prefer_machine="laptop",
+        )
+        _, payload = client.calls[0]
+        deny = payload["deny_commands"]
+        assert "Bash(rm -rf *)" in deny
+        assert "Bash(curl *)" in deny
+        assert "Bash(gh *)" in deny
+        assert "Bash(git push --force *)" in deny
+        # Dedup: no repeats even if repo config happened to include one.
+        assert len(deny) == len(set(deny))
+
     def test_retry_cap_blocks_second_dispatch_when_prior_completed(
         self, two_machine_config: Config, coord_db,
     ) -> None:
@@ -382,3 +426,60 @@ class TestReconcileHook:
             ),
             succeeded=True,
         )
+
+    def test_failure_posts_issue_comment(self, coord_db) -> None:
+        """The coordinator posts a HUMAN_REQUIRED comment on failure.
+
+        Replaces the worker's previous "post a comment on the issue"
+        instruction (which contradicted the "don't use gh" rule). The
+        comment is best-effort: the test asserts the post is attempted
+        with the right repo/issue and a non-empty body.
+        """
+        from coord.reconcile import _on_conflict_fix_done
+
+        self._populate_queue(error="Merge conflict in foo.py")
+        fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="fix-id", status="failed",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        )
+        with patch("coord.github_ops.post_issue_comment") as post:
+            _on_conflict_fix_done(fix, succeeded=False)
+        post.assert_called_once()
+        repo_arg, issue_arg, body_arg = post.call_args[0]
+        assert repo_arg == "acme/api"
+        assert issue_arg == 1
+        assert "HUMAN_REQUIRED" in body_arg
+        assert "fix-id" in body_arg
+        assert "laptop" in body_arg
+
+    def test_failure_swallows_github_post_errors(self, coord_db) -> None:
+        """A failing gh post must not raise out of the reconcile hook."""
+        from coord.reconcile import _on_conflict_fix_done
+
+        self._populate_queue(error="Merge conflict")
+        fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="fix-id", status="failed",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        )
+        with patch(
+            "coord.github_ops.post_issue_comment",
+            side_effect=RuntimeError("gh unauthenticated"),
+        ):
+            # Must not raise — comment posting is best-effort.
+            _on_conflict_fix_done(fix, succeeded=False)
+
+    def test_success_does_not_post_comment(self, coord_db) -> None:
+        """Only failure triggers the HUMAN_REQUIRED comment."""
+        from coord.reconcile import _on_conflict_fix_done
+
+        self._populate_queue()
+        fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="fix-id", status="done",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        )
+        with patch("coord.github_ops.post_issue_comment") as post:
+            _on_conflict_fix_done(fix, succeeded=True)
+        post.assert_not_called()

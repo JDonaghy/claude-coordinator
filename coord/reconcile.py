@@ -7,9 +7,14 @@ import uuid
 
 import httpx
 
+from typing import TYPE_CHECKING
+
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord.models import Assignment, Board
+
+if TYPE_CHECKING:
+    from coord.merge_queue import QueuedMerge
 
 
 def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
@@ -274,7 +279,10 @@ def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> Non
 
     On *succeeded*: the merge entry is reset to PENDING so the next
     ``coord merge`` retries.  On failure: marked HUMAN_REQUIRED so the TUI
-    can surface "manual resolution required".
+    can surface "manual resolution required", and a comment is posted on
+    the underlying issue so the user is notified outside the TUI too
+    (#243-review-2 — the worker briefing no longer asks the worker to post
+    this comment, so the coordinator owns it).
 
     Looking up the parent entry by ``review_of_assignment_id`` (the original
     work assignment's id) — that's the column conflict-fix reuses to link
@@ -287,6 +295,7 @@ def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> Non
 
     items = mq.load_queue()
     changed = False
+    failed_entry: mq.QueuedMerge | None = None
     for entry in items:
         if entry.assignment_id != parent_id:
             continue
@@ -301,6 +310,43 @@ def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> Non
                 f"{existing_error}; conflict-fix worker did not resolve. "
                 "Manual rebase required."
             )
+            failed_entry = entry
         changed = True
     if changed:
         mq.save_queue(items)
+
+    if failed_entry is not None:
+        _post_human_required_comment(failed_entry, fix_assignment)
+
+
+def _post_human_required_comment(
+    entry: QueuedMerge, fix_assignment: Assignment,
+) -> None:
+    """Notify the user on GitHub that a conflict-fix worker gave up.
+
+    Best-effort: errors are swallowed (logged) since the TUI also surfaces
+    HUMAN_REQUIRED via the merge stage substate — the comment is a
+    convenience, not the only notification channel.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    body = (
+        "## Conflict-fix worker could not auto-resolve\n\n"
+        f"Worker `{fix_assignment.assignment_id}` on "
+        f"`{fix_assignment.machine_name}` attempted to rebase "
+        f"`{entry.branch}` onto `{entry.target_branch}` and exited "
+        "non-zero. The merge queue entry is now `HUMAN_REQUIRED`.\n\n"
+        f"**Last error:** `{entry.error or 'unknown'}`\n\n"
+        "Manual resolution required: rebase the branch locally and "
+        "`git push --force-with-lease`, then re-run `coord merge`. The "
+        "coordinator will not re-dispatch a conflict-fix for this entry "
+        "in the current session."
+    )
+    try:
+        github_ops.post_issue_comment(entry.repo_github, entry.issue_number, body)
+    except Exception as exc:  # noqa: BLE001 — best-effort notification
+        import logging  # noqa: PLC0415
+        logging.warning(
+            "could not post HUMAN_REQUIRED comment on %s#%d: %s",
+            entry.repo_github, entry.issue_number, exc,
+        )
