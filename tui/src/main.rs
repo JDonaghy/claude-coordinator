@@ -7,6 +7,31 @@
 use coord_tui::CoordApp;
 
 fn main() {
+    // Force non-interactive mode on every subprocess the TUI (or any tool
+    // it spawns) launches.  Without these, an SSH passphrase or HTTPS
+    // credential prompt from a child git/ssh process can grab the TTY,
+    // corrupting the TUI display or hanging silently waiting for input
+    // that never arrives.
+    //
+    // - GIT_TERMINAL_PROMPT=0       — git itself never asks for credentials
+    // - GIT_SSH_COMMAND BatchMode   — ssh fails fast instead of prompting
+    //   (10 s ConnectTimeout keeps a misconfigured remote from hanging)
+    // - SSH_ASKPASS=/bin/false      — any GUI password helper fails too
+    //
+    // The user can still load their key into ssh-agent before launching
+    // the TUI for normal workflows; these env vars just guarantee the
+    // failure mode is "fast and visible" instead of "frozen TTY".
+    // SAFETY: set_var is `unsafe` in recent stdlib — single-threaded
+    // setup before any work begins, so no data race.
+    unsafe {
+        std::env::set_var("GIT_TERMINAL_PROMPT", "0");
+        std::env::set_var(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=10",
+        );
+        std::env::set_var("SSH_ASKPASS", "/bin/false");
+    }
+
     // Persist any panic to ~/.coord/coord-tui-panic.log before the shell
     // restores the terminal and the message scrolls offscreen. The previous
     // hook (Rust's default) writes to stderr inside the alternate screen,

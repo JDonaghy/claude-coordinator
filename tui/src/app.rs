@@ -4570,13 +4570,19 @@ impl CoordApp {
         let work_id_thread = work_id.clone();
         let log_path_thread = log_path.clone();
         std::thread::spawn(move || {
-            use std::process::Command;
+            use std::process::{Command, Stdio};
             let mut cmd = Command::new("coord");
             cmd.arg("test");
             if let Some(cfg) = &cfg_path {
                 cmd.arg("--config").arg(cfg);
             }
             cmd.arg(&work_id_thread);
+            // Belt-and-braces: even though main.rs sets GIT_TERMINAL_PROMPT=0
+            // and BatchMode=yes, explicitly null-out stdin so no descendant
+            // can grab the TUI's TTY for a prompt.  Combined with main.rs's
+            // env vars this guarantees the build either succeeds against
+            // ssh-agent-loaded keys or fails fast with a clear error.
+            cmd.stdin(Stdio::null());
             let (exit_code, first_error) = match cmd.output() {
                 Ok(out) => {
                     let mut buf = Vec::with_capacity(out.stdout.len() + out.stderr.len() + 64);

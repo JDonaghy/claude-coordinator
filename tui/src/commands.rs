@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -140,7 +140,14 @@ impl CommandRunner {
         let label_clone = label.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let output = Command::new("coord").args(&full_args).output();
+            // Belt-and-braces: main.rs sets GIT_TERMINAL_PROMPT=0 and
+            // ssh BatchMode=yes so descendants can't prompt, but explicitly
+            // null-out stdin here so even a directly-invoked credential
+            // helper can't grab the TUI's TTY.
+            let output = Command::new("coord")
+                .args(&full_args)
+                .stdin(Stdio::null())
+                .output();
             let result = match output {
                 Ok(out) => CommandResult {
                     label: label_clone,
