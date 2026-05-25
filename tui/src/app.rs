@@ -131,6 +131,37 @@ struct WatchSseState {
     pending_tail: String,
 }
 
+/// #235 Phase 1: in-flight `coord test <work_id>` build job spawned from
+/// the TUI's local machine. Re-uses the existing CLI which does git fetch +
+/// checkout + `repo.build_command`, so no Rust-side git/build logic is
+/// duplicated here. Job state lives in-memory only — restarting the TUI
+/// drops it; the user can re-press `B` to retrigger.
+struct TestBuildJob {
+    /// Work assignment id this build is verifying. Also the HashMap key.
+    #[allow(dead_code)]
+    work_id: String,
+    /// Issue number, for friendlier toast titles (work_ids are uuids).
+    issue_number: u64,
+    /// Branch passed to `coord test` (carried for the completion toast).
+    branch: String,
+    /// `~/.coord/test-build-<id>.log` — stdout+stderr from the subprocess.
+    /// Surfaced in failure toasts so the user can `tail` it.
+    log_path: PathBuf,
+    /// Wall-clock start; reported in the success toast as "took Ns".
+    started_at: Instant,
+    /// Receiver for the completion message; `try_recv` polled each tick.
+    rx: std::sync::mpsc::Receiver<TestBuildOutcome>,
+}
+
+/// Outcome of a Phase 1 build. Sent once from the worker thread.
+struct TestBuildOutcome {
+    exit_code: i32,
+    /// First non-empty stderr line (truncated). Surfaced in the failure
+    /// toast so the user doesn't have to `cat` the log to see the cause.
+    /// Empty string on success, since we don't bother capturing.
+    first_error: String,
+}
+
 /// The tabs shown in the Pipeline view detail panel.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum PipelineDetailTab {
@@ -1845,6 +1876,10 @@ pub struct CoordApp {
     /// field drops the `Receiver`, which signals the background thread to exit
     /// (it detects the disconnect on the next `tx.send()` call).
     watch_sse: Option<WatchSseState>,
+    /// #235 Phase 1: in-flight Test-stage build jobs keyed by work_id.
+    /// Drained by `poll_test_build_jobs` each tick — completed entries are
+    /// removed and surfaced as toasts. Empty in the steady state.
+    test_build_jobs: std::collections::HashMap<String, TestBuildJob>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -1921,6 +1956,7 @@ impl CoordApp {
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
+            test_build_jobs: std::collections::HashMap::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
@@ -3880,8 +3916,9 @@ impl CoordApp {
     ///
     /// `passed`/`skipped` → Done; `failed` → Failed; otherwise Pending while
     /// Work is settled and Pending/Skipped while Work isn't done yet.
-    /// Note: Test is a human gate — there is no Active state because nothing
-    /// runs.
+    /// #235: When a Phase 1 build is in flight for the latest Work
+    /// assignment, the badge goes Active ("Building") even though Test is
+    /// still a human gate — the user needs to know something is running.
     fn test_stage_status_for(&self, issue: &PipelineIssue) -> StageStatus {
         // Test is gated on Work; if Work hasn't finished, Test isn't actionable.
         let work_status = self.stage_status_for_internal_work(issue);
@@ -3897,6 +3934,13 @@ impl CoordApp {
                 .partial_cmp(&b.dispatched_at)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // #235: Phase 1 build in flight beats any prior verdict — the user
+        // pressed `B` to re-test, so the old verdict is no longer current.
+        if let Some(a) = latest.as_ref() {
+            if self.test_build_in_flight(&a.id) {
+                return StageStatus::Active;
+            }
+        }
         match latest.and_then(|a| a.test_state.as_deref()) {
             Some("passed") | Some("skipped") => StageStatus::Done,
             Some("failed") => StageStatus::Failed,
@@ -3980,7 +4024,7 @@ impl CoordApp {
             .enumerate()
             .map(|(i, name)| {
                 let status = statuses[i].clone();
-                let label = match name.as_str() {
+                let mut label = match name.as_str() {
                     "work" => "Work".to_string(),
                     other => {
                         let mut s = other.to_string();
@@ -3990,6 +4034,21 @@ impl CoordApp {
                         s
                     }
                 };
+                // #235: When Phase 1 is mid-build for this issue, swap the
+                // Test label to "Building" so the Active badge has meaningful
+                // text (otherwise it'd just say "Test" while running).
+                if name == "test" && status == StageStatus::Active {
+                    if let Some(work_id) = self.assignments_for_stage(issue, "work")
+                        .iter()
+                        .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
+                            .unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|a| a.id.clone())
+                    {
+                        if self.test_build_in_flight(&work_id) {
+                            label = "Building".to_string();
+                        }
+                    }
+                }
                 // Skipped counts as "settled" for prior_all_done: a closed-issue
                 // stage that never ran is logically done.
                 let prior_all_done = statuses[..i].iter().all(|s| {
@@ -4108,6 +4167,199 @@ impl CoordApp {
         }
         self.test_stage_status_for(issue) == StageStatus::Pending
             && self.stage_status_for_internal_work(issue) == StageStatus::Done
+    }
+
+    /// #235: True when a Phase 1 build for the given work assignment is
+    /// currently running (entry present in `test_build_jobs`).  Removed when
+    /// `poll_test_build_jobs` drains the completion message.
+    fn test_build_in_flight(&self, work_id: &str) -> bool {
+        self.test_build_jobs.contains_key(work_id)
+    }
+
+    /// #235: Gate for the `B` keybind.  True when:
+    /// - the Pipeline view is active,
+    /// - the Test gate is actionable (Work Done, no verdict yet),
+    /// - the latest Work assignment has a branch recorded, and
+    /// - no Phase 1 build is already in flight for this work id.
+    ///
+    /// We do NOT check `repo.build_command` here: `coord test` handles a
+    /// missing build_command by just doing the checkout, which is still
+    /// useful (the user gets the branch locally for manual inspection).
+    fn can_trigger_test_build(&self) -> bool {
+        if self.active_view != SidebarView::Pipeline {
+            return false;
+        }
+        if !self.test_gate_actionable() {
+            return false;
+        }
+        let Some(work_id) = self.pipeline_selected_work_id() else {
+            return false;
+        };
+        if self.test_build_in_flight(&work_id) {
+            return false;
+        }
+        let work = self.data.assignments.iter().find(|a| a.id == work_id);
+        work.and_then(|a| a.branch.as_ref()).is_some()
+    }
+
+    /// #235 Phase 1 trigger: spawn `coord test <work_id>` on the local
+    /// machine in a background thread, capturing combined stdout+stderr to
+    /// `~/.coord/test-build-<work_id>.log`.  Returns `true` when a job was
+    /// scheduled (a redraw is warranted for the new "Building" badge).
+    ///
+    /// Idempotent: a no-op when a build for `work_id` is already in flight.
+    fn spawn_test_build(&mut self, work_id: String, branch: String, issue_number: u64) -> bool {
+        if self.test_build_jobs.contains_key(&work_id) {
+            return false;
+        }
+        let log_dir = coord_dir();
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            self.push_toast(
+                "Build setup failed",
+                &format!("create {} failed: {}", log_dir.display(), e),
+                ToastSeverity::Error,
+            );
+            return false;
+        }
+        let log_path = log_dir.join(format!("test-build-{}.log", work_id));
+        let cfg_path = self.command_runner.config_path.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel::<TestBuildOutcome>();
+        let work_id_thread = work_id.clone();
+        let log_path_thread = log_path.clone();
+        std::thread::spawn(move || {
+            use std::process::Command;
+            let mut cmd = Command::new("coord");
+            cmd.arg("test");
+            if let Some(cfg) = &cfg_path {
+                cmd.arg("--config").arg(cfg);
+            }
+            cmd.arg(&work_id_thread);
+            let (exit_code, first_error) = match cmd.output() {
+                Ok(out) => {
+                    let mut buf = Vec::with_capacity(out.stdout.len() + out.stderr.len() + 64);
+                    buf.extend_from_slice(b"--- stdout ---\n");
+                    buf.extend_from_slice(&out.stdout);
+                    buf.extend_from_slice(b"\n--- stderr ---\n");
+                    buf.extend_from_slice(&out.stderr);
+                    let _ = std::fs::write(&log_path_thread, buf);
+                    let code = out.status.code().unwrap_or(-1);
+                    // On failure, grab the first non-empty stderr line (or
+                    // stdout if stderr is empty) for the toast.  Strip the
+                    // "error: " prefix that `coord` prepends so the user
+                    // sees the actual diagnostic.
+                    let first = if code != 0 {
+                        let pick = |bytes: &[u8]| -> Option<String> {
+                            String::from_utf8_lossy(bytes)
+                                .lines()
+                                .map(|l| l.trim())
+                                .find(|l| !l.is_empty())
+                                .map(|l| l.trim_start_matches("error: ").to_string())
+                        };
+                        pick(&out.stderr)
+                            .or_else(|| pick(&out.stdout))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    (code, first)
+                }
+                Err(e) => {
+                    let msg = format!("failed to spawn coord test: {}", e);
+                    let _ = std::fs::write(&log_path_thread, format!("{}\n", msg));
+                    (-1, msg)
+                }
+            };
+            let _ = tx.send(TestBuildOutcome { exit_code, first_error });
+        });
+
+        self.push_toast(
+            "Phase 1 build started",
+            &format!(
+                "#{} on {} — fetching and building…",
+                issue_number, branch
+            ),
+            ToastSeverity::Info,
+        );
+        self.test_build_jobs.insert(
+            work_id.clone(),
+            TestBuildJob {
+                work_id,
+                issue_number,
+                branch,
+                log_path,
+                started_at: Instant::now(),
+                rx,
+            },
+        );
+        true
+    }
+
+    /// #235: Drain completed Phase 1 build jobs, toast their outcome, and
+    /// remove them from the in-flight map.  Returns `true` when at least
+    /// one job finished (a redraw is needed so the "Building" badge clears).
+    fn poll_test_build_jobs(&mut self) -> bool {
+        if self.test_build_jobs.is_empty() {
+            return false;
+        }
+        use std::sync::mpsc::TryRecvError;
+        let mut done: Vec<(String, Result<TestBuildOutcome, ()>)> = Vec::new();
+        for (id, job) in self.test_build_jobs.iter() {
+            match job.rx.try_recv() {
+                Ok(outcome) => done.push((id.clone(), Ok(outcome))),
+                Err(TryRecvError::Disconnected) => done.push((id.clone(), Err(()))),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if done.is_empty() {
+            return false;
+        }
+        for (id, result) in done {
+            let job = self.test_build_jobs.remove(&id).expect("just observed");
+            let dur_secs = job.started_at.elapsed().as_secs();
+            match result {
+                Ok(TestBuildOutcome { exit_code: 0, .. }) => {
+                    self.push_toast(
+                        "Phase 1 build ✓",
+                        &format!(
+                            "#{} ready to test on {} ({}s) — press P / F / S",
+                            job.issue_number, job.branch, dur_secs
+                        ),
+                        ToastSeverity::Info,
+                    );
+                }
+                Ok(TestBuildOutcome { exit_code: code, first_error }) => {
+                    // Truncate the error to ~120 chars so the toast stays
+                    // readable; the full log is at log_path for details.
+                    let snippet = if first_error.is_empty() {
+                        format!("see {}", job.log_path.display())
+                    } else {
+                        let trimmed: String = first_error.chars().take(120).collect();
+                        if first_error.chars().count() > 120 {
+                            format!("{}… (see {})", trimmed, job.log_path.display())
+                        } else {
+                            format!("{} (see {})", trimmed, job.log_path.display())
+                        }
+                    };
+                    self.push_toast(
+                        "Phase 1 build ✗",
+                        &format!("#{} exit {}: {}", job.issue_number, code, snippet),
+                        ToastSeverity::Error,
+                    );
+                }
+                Err(()) => {
+                    self.push_toast(
+                        "Phase 1 build ✗",
+                        &format!(
+                            "#{} build worker disappeared — see {}",
+                            job.issue_number, job.log_path.display()
+                        ),
+                        ToastSeverity::Error,
+                    );
+                }
+            }
+        }
+        true
     }
 
     /// Dispatch the action button (`[Go]` or `[Retry]`) attached to a
@@ -5444,7 +5696,13 @@ impl CoordApp {
         } else if self.active_view == SidebarView::Pipeline && self.test_gate_actionable() {
             // #200: surface the Test gate keybinds when actionable for the
             // currently-selected pipeline issue.
-            " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
+            // #235: include B (Phase 1 build) when no build is already in
+            // flight for this work id.
+            if self.can_trigger_test_build() {
+                " Test gate: B=build  P=pass  F=fail  S=skip  q=quit ".to_string()
+            } else {
+                " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
+            }
         } else if proposals > 0 {
             format!(" p=plan  a=approve({})  m=merge  R=retry  P=purge  q=quit ", proposals)
         } else {
@@ -5518,6 +5776,10 @@ impl CoordApp {
         if self.watch_sse.is_some() {
             needs_redraw |= self.drain_sse_watch();
         }
+
+        // #235: Drain Phase 1 build completions and toast the outcome.
+        // Cheap no-op when no jobs are in flight.
+        needs_redraw |= self.poll_test_build_jobs();
 
         needs_redraw
     }
@@ -6392,6 +6654,29 @@ impl ShellApp for CoordApp {
                         }
                     }
 
+                    // ── #235 Phase 1: B = build (fetch + checkout +
+                    //              build_command on the local machine) ──
+                    // Spawns `coord test <work_id>` in a background thread
+                    // and toasts the outcome. Manual trigger by design —
+                    // auto-on-completion would clobber the user's working
+                    // copy mid-edit.
+                    Key::Char('B')
+                        if self.pending_test_fail.is_none()
+                            && self.can_trigger_test_build() =>
+                    {
+                        if let Some(work_id) = self.pipeline_selected_work_id() {
+                            let (branch, issue_number) = self
+                                .data
+                                .assignments
+                                .iter()
+                                .find(|a| a.id == work_id)
+                                .and_then(|a| a.branch.clone().map(|b| (b, a.issue_number)))
+                                .unwrap_or_else(|| (String::from("?"), 0));
+                            self.spawn_test_build(work_id, branch, issue_number);
+                            needs_redraw = true;
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -6744,6 +7029,7 @@ mod tests {
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
+            test_build_jobs: std::collections::HashMap::new(),
         }
     }
 
@@ -7878,6 +8164,197 @@ mod tests {
         app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
         app.data.assignments.push(_work_assignment("w2", 300.0, "done", None));
         assert_eq!(app.pipeline_selected_work_id(), Some("w2".to_string()));
+    }
+
+    // ── #235: Phase 1 Test-stage build ────────────────────────────────────
+
+    /// Synthetic build job that never receives a completion message. The
+    /// `_tx` is dropped at the end of the call site, which would normally
+    /// turn the channel into "Disconnected", so callers MUST keep the
+    /// returned `Sender` alive for the duration of the assertion.
+    fn _inject_test_build_job(
+        app: &mut CoordApp,
+        work_id: &str,
+        issue_number: u64,
+        branch: &str,
+    ) -> std::sync::mpsc::Sender<TestBuildOutcome> {
+        let (tx, rx) = std::sync::mpsc::channel::<TestBuildOutcome>();
+        app.test_build_jobs.insert(
+            work_id.to_string(),
+            TestBuildJob {
+                work_id: work_id.to_string(),
+                issue_number,
+                branch: branch.to_string(),
+                log_path: PathBuf::from("/tmp/test-build-fixture.log"),
+                started_at: Instant::now(),
+                rx,
+            },
+        );
+        tx
+    }
+
+    #[test]
+    fn can_trigger_test_build_requires_pipeline_view_and_branch() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        // Empty board → no work → not actionable → false.
+        assert!(!app.can_trigger_test_build());
+
+        // Work done, no branch → still false (the user has nothing local
+        // to check out).
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.active_view = SidebarView::Pipeline;
+        assert!(!app.can_trigger_test_build(), "no branch → no B");
+
+        // Add a branch → now actionable.
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+        assert!(app.can_trigger_test_build());
+
+        // Wrong view → false even with everything else set.
+        app.active_view = SidebarView::Board;
+        assert!(!app.can_trigger_test_build());
+    }
+
+    #[test]
+    fn can_trigger_test_build_false_while_build_in_flight() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+        assert!(app.can_trigger_test_build());
+
+        // Inject an in-flight build for the same work id → no double-trigger.
+        let _tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        assert!(!app.can_trigger_test_build());
+    }
+
+    #[test]
+    fn can_trigger_test_build_false_after_verdict_recorded() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+        // Verdict recorded → Test stage is Done → gate not actionable → no B.
+        assert!(!app.can_trigger_test_build());
+    }
+
+    #[test]
+    fn test_stage_active_with_building_label_when_build_in_flight() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        // Before build: Test is Pending.
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Pending);
+
+        // Inject in-flight build → Test goes Active.
+        let _tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Active);
+
+        // build_pipeline_widget swaps the Test stage label to "Building".
+        let view = app.build_pipeline_widget().expect("widget");
+        let test_stage = view.stages.iter().find(|s| s.label == "Building")
+            .expect("Test stage label should be Building while job in flight");
+        assert_eq!(test_stage.status, StageStatus::Active);
+    }
+
+    #[test]
+    fn test_stage_active_supersedes_prior_verdict_while_rebuilding() {
+        // After a Pass verdict, the user might press B again to re-test —
+        // e.g. to validate after a worker re-dispatch.  While the new build
+        // is in flight, the badge should be Active+Building, not Done
+        // (the old verdict is stale relative to the in-flight build).
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Done);
+
+        let _tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Active);
+    }
+
+    #[test]
+    fn poll_test_build_jobs_clears_completed_and_pushes_toast() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        assert_eq!(app.test_build_jobs.len(), 1);
+        assert!(app.toasts.is_empty());
+
+        // Worker thread reports success.
+        tx.send(TestBuildOutcome { exit_code: 0, first_error: String::new() }).unwrap();
+        // Empty channel & non-empty queue: nothing happens until we poll.
+        assert!(app.poll_test_build_jobs());
+        assert_eq!(app.test_build_jobs.len(), 0);
+        assert_eq!(app.toasts.len(), 1);
+    }
+
+    #[test]
+    fn poll_test_build_jobs_reports_failure_toast_on_nonzero_exit() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        tx.send(TestBuildOutcome {
+            exit_code: 2,
+            first_error: "checkout aborted: local changes".to_string(),
+        })
+        .unwrap();
+        assert!(app.poll_test_build_jobs());
+        assert_eq!(app.toasts.len(), 1);
+        let (item, _, severity) = &app.toasts[0];
+        assert_eq!(*severity, ToastSeverity::Error);
+        // Failure toast must include the first error line so the user
+        // doesn't have to cat the log to see what happened.
+        assert!(
+            item.body.contains("checkout aborted: local changes"),
+            "toast body should include first_error; got: {}",
+            item.body
+        );
+    }
+
+    #[test]
+    fn poll_test_build_jobs_reports_failure_when_worker_disappears() {
+        // Dropping the Sender without a send turns the channel into
+        // Disconnected — we must surface that as a failure toast so the
+        // job doesn't sit in the map forever showing Building.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        drop(tx); // simulate the worker thread panicking before sending
+        assert!(app.poll_test_build_jobs());
+        assert_eq!(app.test_build_jobs.len(), 0);
+        assert_eq!(app.toasts.len(), 1);
+        let severity = &app.toasts[0].2;
+        assert_eq!(*severity, ToastSeverity::Error);
+    }
+
+    #[test]
+    fn poll_test_build_jobs_noop_when_empty() {
+        let mut app = make_pipeline_app_with_test_gate();
+        assert!(!app.poll_test_build_jobs());
     }
 
     // ── Issue #212: closed-without-pipeline fixes ─────────────────────────
