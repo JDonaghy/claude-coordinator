@@ -99,6 +99,30 @@ def build_conflict_fix_briefing(
     return "\n".join(lines)
 
 
+# ── Retry-cap guard ─────────────────────────────────────────────────────────
+
+
+def has_prior_conflict_fix(board: Board, merge_entry_id: str | None) -> bool:
+    """True if a conflict-fix worker has already been dispatched for *merge_entry_id*
+    in this session — looking at both active and completed assignments.
+
+    The original :func:`coord.claim.has_active_followup` only scans
+    ``board.active``, which lets a second conflict-fix dispatch fire once the
+    first moves to ``board.completed`` (e.g. after a successful rebase that
+    nevertheless leaves a fresh conflict on the next ``coord merge``).  The
+    spec caps retries at one per session, so the dispatcher and the
+    ``coord merge`` caller both consult this combined predicate.
+    """
+    if merge_entry_id is None:
+        return False
+    for a in list(board.active) + list(board.completed):
+        if a.type != "conflict-fix":
+            continue
+        if a.review_of_assignment_id == merge_entry_id:
+            return True
+    return False
+
+
 # ── Machine selection ───────────────────────────────────────────────────────
 
 def pick_conflict_fix_machine(
@@ -153,18 +177,13 @@ def dispatch_conflict_fix(
     (no capable machine, no ``repo_path`` configured, agent unreachable, …).
     The caller is responsible for persisting the board.
 
-    Concurrency cap: if a conflict-fix is already in flight for this entry's
-    ``assignment_id``, the call is a no-op (returns None).  This mirrors the
-    review/smoke dedupe path — re-running ``coord merge`` shouldn't spawn a
-    second fixer.
+    Retry cap: if a conflict-fix has *ever* been dispatched for this entry's
+    ``assignment_id`` in the current session — active OR completed — the call
+    is a no-op (returns None).  Per the spec, we cap at one conflict-fix
+    attempt per merge entry; the caller is responsible for marking the entry
+    HUMAN_REQUIRED when this guard fires, so the user takes over.
     """
-    from coord.claim import has_active_followup  # noqa: PLC0415
-
-    if has_active_followup(
-        board,
-        of_assignment_id=entry.assignment_id,
-        assignment_type="conflict-fix",
-    ):
+    if has_prior_conflict_fix(board, entry.assignment_id):
         return None
 
     repo = config.repo(entry.repo_name)

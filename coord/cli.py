@@ -2604,55 +2604,58 @@ def merge(
         click.echo(f"{prefix}: {ev.kind} — {ev.message}")
 
     # #241: classify any conflict events and dispatch a conflict-fix worker
-    # for the eligible ones.  Only on a real merge run (not --dry-run) and
-    # after the queue is saved below — the dispatch path mutates the board,
-    # not the merge queue.
+    # for the eligible ones.  Mutates ev.entry.state in place — ev.entry IS
+    # items[i] from process() — so the final save block below picks up
+    # HUMAN_REQUIRED naturally without a separate save_queue call.
     conflict_events = [ev for ev in events if ev.kind == "conflict"]
     if conflict_events and not dry_run:
-        from coord.conflict_fix import dispatch_conflict_fix
+        from coord.conflict_fix import dispatch_conflict_fix, has_prior_conflict_fix
         from coord.merge_queue import HUMAN_REQUIRED, classify_conflict
         from coord.state import load_board, save_board
 
         fix_board = load_board()
         if fix_board is not None:
             dispatched_any = False
-            queue_changed = False
-            queue_items = mq.load_queue()
-            entries_by_id = {x.assignment_id: x for x in queue_items}
             for ev in conflict_events:
                 kind = classify_conflict(ev.entry.error)
-                live_entry = entries_by_id.get(ev.entry.assignment_id, ev.entry)
                 if kind == "rebaseable":
+                    # Retry cap (#241): if a conflict-fix already ran for this
+                    # entry in this session, don't loop — mark HUMAN_REQUIRED
+                    # so the user takes over.
+                    if has_prior_conflict_fix(fix_board, ev.entry.assignment_id):
+                        ev.entry.state = HUMAN_REQUIRED
+                        click.echo(
+                            f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
+                            "conflict-fix retry cap hit — manual resolution required"
+                        )
+                        continue
                     fix = dispatch_conflict_fix(
-                        live_entry,
+                        ev.entry,
                         fix_board,
                         cfg,
                         prefer_machine=_machine_for_assignment(
-                            fix_board, live_entry.assignment_id,
+                            fix_board, ev.entry.assignment_id,
                         ),
                     )
                     if fix is not None:
                         click.echo(
-                            f"  {live_entry.repo_name} #{live_entry.issue_number}: "
+                            f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                             f"conflict-fix dispatched to {fix.machine_name}"
                         )
                         dispatched_any = True
                     else:
                         click.echo(
-                            f"  {live_entry.repo_name} #{live_entry.issue_number}: "
+                            f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                             "conflict-fix not dispatched (no machine / already in flight)"
                         )
                 elif kind == "human":
-                    live_entry.state = HUMAN_REQUIRED
-                    queue_changed = True
+                    ev.entry.state = HUMAN_REQUIRED
                     click.echo(
-                        f"  {live_entry.repo_name} #{live_entry.issue_number}: "
+                        f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                         "permission/protection error — manual resolution required"
                     )
             if dispatched_any:
                 save_board(fix_board)
-            if queue_changed:
-                mq.save_queue(queue_items)
 
     # Save state only when we actually moved
     if not dry_run:

@@ -257,6 +257,77 @@ class TestDispatch:
         )
         assert result is None
 
+    def test_retry_cap_blocks_second_dispatch_when_prior_completed(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """A conflict-fix in ``board.completed`` must block a second dispatch.
+
+        Without this guard the dispatcher would re-fire after every
+        ``coord merge`` retry, because :func:`coord.claim.has_active_followup`
+        only scans ``board.active`` — the original bug from the review of
+        #243.
+        """
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="prev-fix", status="done",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        client = _FakeHTTPClient({"id": "would-not-fire"})
+        result = dispatch_conflict_fix(
+            _entry(), board, two_machine_config, http_client=client,
+        )
+        assert result is None
+        assert client.calls == [], "HTTP should not be called when retry cap hit"
+
+
+class TestHasPriorConflictFix:
+    """Cover the retry-cap predicate directly so the cli.py guard is exercised."""
+
+    def test_false_on_empty_board(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        assert has_prior_conflict_fix(Board(), "abc123") is False
+
+    def test_false_when_assignment_id_is_none(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        assert has_prior_conflict_fix(Board(), None) is False
+
+    def test_true_when_active_has_matching_conflict_fix(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.active.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        assert has_prior_conflict_fix(board, "abc123") is True
+
+    def test_true_when_completed_has_matching_conflict_fix(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        assert has_prior_conflict_fix(board, "abc123") is True
+
+    def test_ignores_non_conflict_fix_types(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="x",
+            type="review", review_of_assignment_id="abc123",
+        ))
+        assert has_prior_conflict_fix(board, "abc123") is False
+
+    def test_ignores_other_merge_entries(self) -> None:
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="x",
+            type="conflict-fix", review_of_assignment_id="other-entry",
+        ))
+        assert has_prior_conflict_fix(board, "abc123") is False
+
 
 # ── Reconcile hook ──────────────────────────────────────────────────────────
 
