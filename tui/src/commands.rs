@@ -38,26 +38,58 @@ pub struct CommandRunner {
     pub(crate) config_path: Option<PathBuf>,
 }
 
-/// Search for `coordinator.yml` starting from the current working directory,
-/// walking up to the filesystem root. Returns the absolute path of the first
-/// match, or `None` if no `coordinator.yml` exists in any ancestor directory.
+/// Search for `coordinator.yml` in three places, in order:
 ///
-/// Walking upward mirrors how `git` finds `.git/` and makes the TUI robust
-/// when launched from a subdirectory of the project or from a shell that
-/// inherited an unexpected working directory (e.g. a `.desktop` launcher or
-/// an IDE terminal that opens in `$HOME`).
+/// 1. The path in the `COORD_CONFIG` env var (when set and existing).
+///    Lets the user launch from anywhere — e.g. when the binary is
+///    installed to `~/.local/bin` and they want to drive their primary
+///    config from `$HOME` or `/tmp`.
+/// 2. The first ancestor of `cwd` that contains `coordinator.yml`.
+///    Mirrors how `git` finds `.git/` and stays robust when launched
+///    from a subdirectory of the project.
+/// 3. `~/.coord/coordinator.yml` — a symlink-friendly default for
+///    users with a single primary config.
+///
+/// Returns `None` only when none of the three resolve.
 fn find_config() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join("coordinator.yml");
+    find_config_with(
+        std::env::var_os("COORD_CONFIG").map(PathBuf::from),
+        std::env::current_dir().ok(),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// Pure resolver used by [`find_config`].  Split out so tests can exercise
+/// the precedence order without mutating process env state.
+fn find_config_with(
+    env_override: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(path) = env_override {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    if let Some(mut dir) = cwd {
+        loop {
+            let candidate = dir.join("coordinator.yml");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // `pop()` returns false when we've reached the root.
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    if let Some(home) = home_dir {
+        let candidate = home.join(".coord").join("coordinator.yml");
         if candidate.exists() {
             return Some(candidate);
         }
-        // `pop()` returns false when we've reached the root and cannot go further.
-        if !dir.pop() {
-            return None;
-        }
     }
+    None
 }
 
 impl CommandRunner {
@@ -267,5 +299,89 @@ mod tests {
         let result = runner.last_result().unwrap();
         // coord --version should succeed regardless of the config path.
         assert_eq!(result.exit_code, 0);
+    }
+
+    /// Helper: build an isolated temp directory tree for resolver tests.
+    /// Returns `(root, cwd, home)` where `cwd` is a nested subdir under
+    /// `root` and `home` is a sibling.  None of the three contain a
+    /// `coordinator.yml` — tests create those as needed.
+    fn make_resolver_tmp() -> (PathBuf, PathBuf, PathBuf) {
+        let unique = format!(
+            "coord-find-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(unique);
+        let cwd = root.join("project").join("sub");
+        let home = root.join("home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(home.join(".coord")).unwrap();
+        (root, cwd, home)
+    }
+
+    #[test]
+    fn find_config_env_override_wins() {
+        // COORD_CONFIG should beat both the ancestor walk and the home fallback.
+        let (root, cwd, home) = make_resolver_tmp();
+        let env_path = root.join("override.yml");
+        std::fs::write(&env_path, "repos: []").unwrap();
+        // Also create competing candidates in the lower-priority slots.
+        std::fs::write(cwd.join("coordinator.yml"), "repos: []").unwrap();
+        std::fs::write(home.join(".coord").join("coordinator.yml"), "repos: []").unwrap();
+
+        let found = find_config_with(Some(env_path.clone()), Some(cwd.clone()), Some(home.clone()));
+        assert_eq!(found.as_deref(), Some(env_path.as_path()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_config_env_override_ignored_when_missing() {
+        // A nonexistent COORD_CONFIG must NOT shadow the ancestor walk —
+        // otherwise a stale env var would brick the resolver.
+        let (root, cwd, home) = make_resolver_tmp();
+        let ancestor_yml = cwd.parent().unwrap().join("coordinator.yml");
+        std::fs::write(&ancestor_yml, "repos: []").unwrap();
+
+        let found = find_config_with(
+            Some(PathBuf::from("/nonexistent/override.yml")),
+            Some(cwd),
+            Some(home),
+        );
+        assert_eq!(found.as_deref(), Some(ancestor_yml.as_path()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_config_walks_up_to_ancestor() {
+        let (root, cwd, home) = make_resolver_tmp();
+        let ancestor_yml = cwd.parent().unwrap().join("coordinator.yml");
+        std::fs::write(&ancestor_yml, "repos: []").unwrap();
+
+        let found = find_config_with(None, Some(cwd), Some(home));
+        assert_eq!(found.as_deref(), Some(ancestor_yml.as_path()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_config_home_fallback_when_no_ancestor_match() {
+        // No env override, no ancestor coordinator.yml → home fallback wins.
+        let (root, cwd, home) = make_resolver_tmp();
+        let home_yml = home.join(".coord").join("coordinator.yml");
+        std::fs::write(&home_yml, "repos: []").unwrap();
+
+        let found = find_config_with(None, Some(cwd), Some(home));
+        assert_eq!(found.as_deref(), Some(home_yml.as_path()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn find_config_returns_none_when_nothing_resolves() {
+        let (root, cwd, home) = make_resolver_tmp();
+        let found = find_config_with(None, Some(cwd), Some(home));
+        assert_eq!(found, None);
+        std::fs::remove_dir_all(&root).ok();
     }
 }
