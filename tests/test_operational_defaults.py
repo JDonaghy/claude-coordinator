@@ -32,6 +32,21 @@ def test_worker_system_prompt_contains_forbidden_files_instruction() -> None:
     assert "do NOT read or modify them" in WORKER_SYSTEM_PROMPT
 
 
+def test_worker_system_prompt_requires_clean_build_before_done() -> None:
+    """Workers must run the build, fix warnings, and not silently ship them.
+
+    Motivated by smoke testing quadraui#233 — the build emitted warnings the
+    worker should have fixed before declaring done, but the prompt didn't
+    require it.  The human ended up cleaning up after the worker.
+    """
+    assert "Before declaring done" in WORKER_SYSTEM_PROMPT
+    assert "warnings" in WORKER_SYSTEM_PROMPT
+    assert "FIX THEM" in WORKER_SYSTEM_PROMPT
+    # Escape hatch for genuinely unfixable warnings — workers must call them
+    # out explicitly, not silently leave them.
+    assert "explicitly call it out" in WORKER_SYSTEM_PROMPT
+
+
 # ── Default ReviewsConfig checklist ─────────────────────────────────────────
 
 

@@ -257,7 +257,24 @@ output a status line in exactly this format:
   STATUS: [what you just did] → [what you're about to do] → [confidence: high/medium/low]
 - If you've tried 2 approaches and neither worked, STOP and output:
   STUCK: [what you tried] [why it failed] [what you think the blocker is]
-  Then wait for guidance rather than trying a third approach.\
+  Then wait for guidance rather than trying a third approach.
+
+Before declaring done:
+- Run the project's build command (detect it from the repo: \
+`cargo build` for Cargo.toml, `pytest` for pyproject.toml with pytest, \
+`make` for Makefile, `npm run build` for package.json, etc.).
+- If the build emits warnings — unused vars, dead code, deprecated APIs, \
+ambiguous lifetimes, missing docs on public items — FIX THEM. \
+Compiler warnings are part of the diff you're shipping; the human \
+shouldn't have to clean up after you. Treat warnings as failures for \
+the purposes of "done".
+- If a warning genuinely can't be fixed in scope (third-party crate, \
+intentional `#[allow]` with reason, a deferred refactor flagged \
+elsewhere), explicitly call it out in your final message with the \
+reason. Don't silently ship warnings.
+- Re-run the build after fixes to confirm clean output.
+- Run the project's test command (`cargo test`, `pytest`, etc.) and \
+confirm it passes before declaring done.\
 """
 
 WORKER_PLAN_PROMPT = """\
