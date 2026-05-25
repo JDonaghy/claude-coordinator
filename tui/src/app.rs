@@ -2114,7 +2114,7 @@ impl CoordApp {
             pipeline_ci_loader: std::collections::HashMap::new(),
         };
         app.rebuild_board_sidebar();
-        app.rebuild_pipeline_sidebar();
+        app.rebuild_pipeline_sidebar(None);
         // Sync issues from GitHub on startup so the board backlog is fresh.
         app.kick_issue_sync();
         app
@@ -2570,7 +2570,9 @@ impl CoordApp {
                     self.machine_sel = 0;
                 }
                 self.rebuild_board_sidebar();
-                self.rebuild_pipeline_sidebar();
+                // apply_pending_data doesn't touch pipeline_issues — the
+                // internal capture in rebuild is correct here.  Pass None.
+                self.rebuild_pipeline_sidebar(None);
 
                 // Ring the terminal bell (BEL) when an assignment that was
                 // running is now done or failed, if the user enabled audio.
@@ -3797,18 +3799,42 @@ impl CoordApp {
         result
     }
 
+    /// Capture the (repo_slug, issue_number) of the currently-selected
+    /// pipeline issue.  Callers that are about to replace
+    /// `self.pipeline_issues` MUST call this first, then pass the result
+    /// into `rebuild_pipeline_sidebar` — otherwise the rebuild's own
+    /// internal lookup reads the stale `pipeline_sel` index against the
+    /// fresh `pipeline_issues` list and gets either the wrong issue or
+    /// `None`, defaulting the selection to issue #0.  That's the bug
+    /// behind "the 15-second refresh keeps jumping me back to the top".
+    fn capture_pipeline_selection_id(&self) -> Option<(String, u64)> {
+        self.pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .map(|i| (i.repo_slug.clone(), i.number))
+    }
+
     /// Build the SidebarSystem entries for the Pipeline panel.
     ///
     /// One section per repo; within each repo, issues are bucketed into
     /// five lifecycle sub-groups (New → Refining → Pending → In-progress →
     /// Done).  Empty sub-groups collapse automatically.  Re-runs after every
     /// successful `gh` poll.
-    fn rebuild_pipeline_sidebar(&mut self) {
-        // Preserve selection across rebuilds by (repo_slug, issue#).
-        let prev_sel = self
-            .pipeline_sel
-            .and_then(|i| self.pipeline_issues.get(i))
-            .map(|i| (i.repo_slug.clone(), i.number));
+    ///
+    /// `prev_sel_override` carries the (repo_slug, issue#) of the
+    /// previously-selected issue when the caller has just replaced
+    /// `self.pipeline_issues` (and thus the internal capture below would
+    /// read garbage).  When `None`, the function captures from the current
+    /// in-memory state — that's correct for callers that haven't swapped
+    /// `pipeline_issues`.  See [`capture_pipeline_selection_id`].
+    fn rebuild_pipeline_sidebar(
+        &mut self,
+        prev_sel_override: Option<(String, u64)>,
+    ) {
+        // Preserve selection across rebuilds by (repo_slug, issue#).  Use
+        // the caller-provided value when available (it captured before any
+        // pipeline_issues swap) and only fall back to the internal capture
+        // when the caller didn't touch the list.
+        let prev_sel = prev_sel_override.or_else(|| self.capture_pipeline_selection_id());
 
         // Collect unique repo keys in stable order (issues are already sorted
         // by repo_slug within fetch_pipeline_issues).
@@ -4351,9 +4377,21 @@ impl CoordApp {
                     "skipped" => "SKIPPED",
                     _ => verdict,
                 };
+                // #236: include the next-action hint so the user doesn't
+                // have to read the status bar to find what to press.
+                let suffix = match verdict {
+                    "failed" => " — press R to re-dispatch Work",
+                    "passed" | "skipped" => " — press R to dispatch review",
+                    _ => "",
+                };
                 self.push_toast(
                     "Test gate",
-                    &format!("Marked {} (work {})", verb, &work_id[..8.min(work_id.len())]),
+                    &format!(
+                        "Marked {} (work {}){}",
+                        verb,
+                        &work_id[..8.min(work_id.len())],
+                        suffix,
+                    ),
                     ToastSeverity::Info,
                 );
                 self.refresh();
@@ -4381,6 +4419,65 @@ impl CoordApp {
         }
         self.test_stage_status_for(issue) == StageStatus::Pending
             && self.stage_status_for_internal_work(issue) == StageStatus::Done
+    }
+
+    /// #236: True when the Test gate just passed (or was skipped) and the
+    /// Review stage is Pending — the user can press `R` to dispatch the
+    /// review immediately instead of waiting for the reconcile auto-dispatch.
+    ///
+    /// Drives the status-bar hint swap so the affordance is discoverable.
+    /// The R keybind's existing `dispatch_pipeline_active_go` path already
+    /// targets the Pending Review stage in this state; this predicate just
+    /// surfaces it.
+    fn can_dispatch_review_after_test_done(&self) -> bool {
+        if self.active_view != SidebarView::Pipeline {
+            return false;
+        }
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
+        else { return false; };
+        let stages = self.pipeline_stage_names();
+        if !stages.iter().any(|s| s == "review") {
+            return false;
+        }
+        // Test must be Done (passed/skipped) — Skipped (closed-issue path)
+        // is not a "fresh pass" the user is acting on, so exclude it.
+        let test_done = stages.iter().any(|s| s == "test")
+            && self.test_stage_status_for(issue) == StageStatus::Done;
+        if !test_done {
+            return false;
+        }
+        // Review must be Pending and dispatchable (we have a coord_repo).
+        let review_pending = self.stage_status_for(issue, "review") == StageStatus::Pending;
+        review_pending && issue.coord_repo.is_some()
+    }
+
+    /// #236: True when the Test gate just failed and the user needs to
+    /// bounce back to Work — fix the code, re-dispatch.
+    ///
+    /// The Pipeline widget's button-attachment logic does NOT attach a
+    /// `[Retry]` to a Failed Test stage (test isn't dispatchable via the
+    /// worker pipeline — it's a human gate), and Work shows as Done
+    /// (the prior Work succeeded against the agent's own check; Test is
+    /// what's failed).  So without this, the user has no in-TUI keybind
+    /// to "send Work back for another iteration based on the test
+    /// failure feedback".  When this returns true, the `R` keybind
+    /// short-circuits and calls `dispatch_pipeline_work()` for a fresh
+    /// Work attempt.
+    fn can_bounce_work_after_test_fail(&self) -> bool {
+        if self.active_view != SidebarView::Pipeline {
+            return false;
+        }
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
+        else { return false; };
+        let stages = self.pipeline_stage_names();
+        if !stages.iter().any(|s| s == "test") {
+            return false;
+        }
+        // Test must be Failed and the failure must apply to a Done Work
+        // (otherwise the user's next step isn't "re-dispatch Work").
+        let test_failed = self.test_stage_status_for(issue) == StageStatus::Failed;
+        let work_done = self.stage_status_for_internal_work(issue) == StageStatus::Done;
+        test_failed && work_done && issue.coord_repo.is_some()
     }
 
     /// #235: True when a Phase 1 build for the given work assignment is
@@ -5037,9 +5134,15 @@ impl CoordApp {
         };
         match rx.try_recv() {
             Ok(PipelineLoaderResult::Ok(issues)) => {
+                // Capture the currently-selected issue's identity BEFORE
+                // we replace pipeline_issues — otherwise the old pipeline_sel
+                // index is looked up against the new list and resolves to
+                // the wrong issue (or None), defaulting the selection back
+                // to issue #0 on every 15s refresh.
+                let prev_sel = self.capture_pipeline_selection_id();
                 self.pipeline_issues = issues;
                 self.pipeline_loader = None;
-                self.rebuild_pipeline_sidebar();
+                self.rebuild_pipeline_sidebar(prev_sel);
                 true
             }
             Ok(PipelineLoaderResult::Err(msg)) => {
@@ -6162,6 +6265,14 @@ impl CoordApp {
             } else {
                 " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
             }
+        } else if self.can_bounce_work_after_test_fail() {
+            // #236: Test just failed — the user's next step is to fix the
+            // code and re-dispatch Work. Make the affordance obvious.
+            " Test failed — R=re-dispatch Work  q=quit ".to_string()
+        } else if self.can_dispatch_review_after_test_done() {
+            // #236: Test passed — Review can be dispatched immediately
+            // instead of waiting for the reconcile auto-dispatch tick.
+            " Test passed — R=dispatch review  q=quit ".to_string()
         } else if self.active_view == SidebarView::Pipeline
             && self
                 .ci_summary_for_selected_issue()
@@ -7436,10 +7547,18 @@ impl ShellApp for CoordApp {
                     }
                     Key::Char('R') => {
                         if self.active_view == SidebarView::Pipeline {
-                            // In the Pipeline panel, R fires the active
-                            // stage button — Retry on a Failed stage, or
-                            // Go on a Pending one (same as Enter).
-                            self.dispatch_pipeline_active_go();
+                            // #236: Test failed → R bounces back to a fresh
+                            // Work dispatch (the Pipeline widget can't attach
+                            // a [Retry] to a Failed Test, so without this the
+                            // R keybind has no actionable target).
+                            if self.can_bounce_work_after_test_fail() {
+                                self.dispatch_pipeline_work();
+                            } else {
+                                // In the Pipeline panel, R fires the active
+                                // stage button — Retry on a Failed stage, or
+                                // Go on a Pending one (same as Enter).
+                                self.dispatch_pipeline_active_go();
+                            }
                             needs_redraw = true;
                         } else if let Some(a) = self.board_selected_failed_assignment() {
                             let id = a.id.clone();
@@ -8648,7 +8767,7 @@ mod tests {
                 is_closed: false,
             },
         ];
-        app.rebuild_pipeline_sidebar();
+        app.rebuild_pipeline_sidebar(None);
         app
     }
 
@@ -8773,6 +8892,107 @@ mod tests {
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "done");
+    }
+
+    // ── Pipeline selection preservation across pipeline_issues swaps ──────
+
+    /// The canonical regression test for "the 15-second refresh keeps
+    /// jumping me back to the top".  Reproduces the poll_pipeline_loader
+    /// pattern: capture the selection identity, swap pipeline_issues,
+    /// rebuild with the captured identity.
+    #[test]
+    fn rebuild_pipeline_sidebar_preserves_selection_when_prev_sel_captured_before_swap() {
+        let mut app = make_pipeline_app();
+        // Default selection lands on #42 (api).
+        assert_eq!(app.pipeline_sel, Some(0));
+        assert_eq!(app.pipeline_issues[0].number, 42);
+
+        // Capture BEFORE the swap (the fix).
+        let prev_sel = app.capture_pipeline_selection_id();
+        assert_eq!(prev_sel, Some(("acme/api".to_string(), 42)));
+
+        // Simulate a refresh that prepends a new issue, shifting #42 to index 1.
+        let mut new_issues = vec![PipelineIssue {
+            number: 7,
+            title: "New backlog item".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        new_issues.extend(app.pipeline_issues.clone());
+        app.pipeline_issues = new_issues;
+
+        app.rebuild_pipeline_sidebar(prev_sel);
+
+        let selected_number = app
+            .pipeline_sel
+            .and_then(|i| app.pipeline_issues.get(i))
+            .map(|i| i.number);
+        assert_eq!(
+            selected_number,
+            Some(42),
+            "selection must follow #42 even though its index moved from 0 to 1",
+        );
+    }
+
+    /// Documents the BUG path: callers that swap pipeline_issues without
+    /// capturing prev_sel first end up restoring the wrong issue.  Locks
+    /// in the expectation so a future regression in poll_pipeline_loader
+    /// (e.g. someone removing the capture call) shows up as a failing
+    /// test rather than a silent selection-jump.
+    #[test]
+    fn rebuild_pipeline_sidebar_without_prev_sel_reads_stale_index() {
+        let mut app = make_pipeline_app();
+        assert_eq!(app.pipeline_sel, Some(0));
+        assert_eq!(app.pipeline_issues[0].number, 42);
+
+        // Swap WITHOUT capturing prev_sel first — the buggy pattern.
+        let mut new_issues = vec![PipelineIssue {
+            number: 7,
+            title: "New backlog item".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        new_issues.extend(app.pipeline_issues.clone());
+        app.pipeline_issues = new_issues;
+
+        // No override → internal fallback reads pipeline_sel(=Some(0))
+        // against the new list → captures #7 (not #42) → restores #7.
+        app.rebuild_pipeline_sidebar(None);
+
+        let selected_number = app
+            .pipeline_sel
+            .and_then(|i| app.pipeline_issues.get(i))
+            .map(|i| i.number);
+        assert_eq!(
+            selected_number,
+            Some(7),
+            "documents the bug: stale index reads the wrong issue from the new list",
+        );
+    }
+
+    #[test]
+    fn capture_pipeline_selection_id_returns_none_when_no_selection() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = None;
+        assert_eq!(app.capture_pipeline_selection_id(), None);
+    }
+
+    #[test]
+    fn capture_pipeline_selection_id_returns_repo_and_number() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(1); // #99 / other/repo
+        assert_eq!(
+            app.capture_pipeline_selection_id(),
+            Some(("other/repo".to_string(), 99)),
+        );
     }
 
     #[test]
@@ -9030,6 +9250,110 @@ mod tests {
         app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
         app.data.assignments.push(_work_assignment("w2", 300.0, "done", None));
         assert_eq!(app.pipeline_selected_work_id(), Some("w2".to_string()));
+    }
+
+    // ── #236: Test → Review / Work-bounce handoffs ─────────────────────────
+
+    #[test]
+    fn can_dispatch_review_after_test_done_false_outside_pipeline_view() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        // Default view is Board — predicate must refuse.
+        assert!(!app.can_dispatch_review_after_test_done());
+    }
+
+    #[test]
+    fn can_dispatch_review_after_test_done_true_when_test_passed_review_pending() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        // No review assignment yet → Review is Pending → predicate true.
+        assert!(app.can_dispatch_review_after_test_done());
+    }
+
+    #[test]
+    fn can_dispatch_review_after_test_done_false_when_test_pending() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        // Work done but no verdict → Test=Pending, not Done.
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        assert!(!app.can_dispatch_review_after_test_done());
+    }
+
+    #[test]
+    fn can_dispatch_review_after_test_done_false_when_test_failed() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        // Test=Failed is the bounce-back-to-Work case, not the Review one.
+        assert!(!app.can_dispatch_review_after_test_done());
+    }
+
+    #[test]
+    fn can_dispatch_review_after_test_done_false_when_review_already_done() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        // Review already done → no need for R=dispatch review affordance.
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        assert!(!app.can_dispatch_review_after_test_done());
+    }
+
+    #[test]
+    fn can_dispatch_review_after_test_done_false_when_no_coord_repo() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        // Issue #99 in the fixture has coord_repo=None — can't dispatch.
+        app.pipeline_sel = Some(1);
+        // Synthesise a passed Work for issue #99 by cloning the helper
+        // (the helper hard-codes issue_number=42, so adjust by hand).
+        let mut a = _work_assignment("w1", 100.0, "done", Some("passed"));
+        a.issue_number = 99;
+        a.repo = "other/repo".to_string();
+        app.data.assignments.push(a);
+        assert!(!app.can_dispatch_review_after_test_done());
+    }
+
+    #[test]
+    fn can_bounce_work_after_test_fail_true_when_test_failed_work_done() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        assert!(app.can_bounce_work_after_test_fail());
+    }
+
+    #[test]
+    fn can_bounce_work_after_test_fail_false_when_test_passed() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        assert!(!app.can_bounce_work_after_test_fail());
+    }
+
+    #[test]
+    fn can_bounce_work_after_test_fail_false_outside_pipeline_view() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        // Default view is Board — predicate refuses regardless of state.
+        assert!(!app.can_bounce_work_after_test_fail());
+    }
+
+    #[test]
+    fn can_bounce_work_after_test_fail_false_when_no_test_gate_configured() {
+        let mut app = make_pipeline_app(); // no "test" in default_gates
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        // No test stage in the pipeline → predicate refuses (nothing to gate on).
+        assert!(!app.can_bounce_work_after_test_fail());
     }
 
     // ── #235: Phase 1 Test-stage build ────────────────────────────────────
