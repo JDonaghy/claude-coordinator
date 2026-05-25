@@ -2157,9 +2157,11 @@ impl CoordApp {
                 },
             ],
         )
-        .with_status_bar()
-        .with_bottom_panel(6.0)
-        .with_bottom_panel_limits(3.0, 20.0);
+        .with_status_bar();
+        // Bottom COMMANDS panel removed — it carved sidebar height in half
+        // and made the lower sidebar rows fall outside sidebar_content_bounds
+        // when many issues were shown. Toasts cover completion notifications;
+        // running-command status can move to the status bar in a follow-up.
         config.default_sidebar_width = 35.0;
         config.min_sidebar_width = 20.0;
         config.max_sidebar_width = 55.0;
