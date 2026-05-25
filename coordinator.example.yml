@@ -20,8 +20,14 @@ repos:
     github: JDonaghy/claude-coordinator
     depends_on: []
     default_branch: main
-    build_command: "pip install -e ."
-    test_command: "pytest"
+    # Pin to ~/.coord-venv so the build works regardless of PATH —
+    # without this, modern Debian/Ubuntu hits PEP 668 "externally-
+    # managed-environment" when pip resolves to /usr/bin/pip. The agent
+    # install script (install-agent.sh) creates this venv on every
+    # machine that runs `coord agent`.
+    build_command: "~/.coord-venv/bin/pip install -e ."
+    # test_command omitted: pytest isn't installed in ~/.coord-venv
+    # (runtime-only) and the human Test gate (#200) handles verification.
 
 machines:
   # Desktop A — Dell Precision, full GTK builds

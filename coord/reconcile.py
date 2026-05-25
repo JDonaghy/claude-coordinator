@@ -206,7 +206,15 @@ def reconcile(board: Board, config: Config) -> list[str]:
     test_gate_active = "test" in (config.pipeline.default_gates or [])
 
     for completed in board.completed:
-        if completed.review_state != "pending":
+        # Treat NULL the same as "pending" — a done-work assignment whose
+        # review_state was never set (e.g. because the done-transition was
+        # picked up by notify rather than reconcile) is still un-reviewed
+        # and should be dispatched.  Without this, work that reaches "done"
+        # outside this loop's transition path stays forever un-reviewed.
+        if completed.review_state not in (None, "pending"):
+            continue
+        # Only work assignments get reviewed.
+        if completed.type != "work":
             continue
         if test_gate_active and completed.test_state not in ("passed", "skipped"):
             # Either no verdict yet, or verdict was "failed" — either way the

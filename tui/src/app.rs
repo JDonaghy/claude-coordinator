@@ -122,6 +122,44 @@ struct WatchSseState {
     host: String,
     /// Assignment ID, stored here so reconnect doesn't need `self.watch`.
     assignment_id: String,
+    /// Partial trailing line carried over between SSE chunks. The agent reads
+    /// the log in fixed 4 KB chunks (events.LOG_CHUNK_SIZE), so a long JSON
+    /// line (e.g. a `{"type":"result"...}` event with the full review body)
+    /// can be split mid-line. Without reassembly the client would parse two
+    /// broken halves and lose `total_cost_usd` / `stop_reason` from the
+    /// metrics line. Held here until the next chunk arrives.
+    pending_tail: String,
+}
+
+/// #235 Phase 1: in-flight `coord test <work_id>` build job spawned from
+/// the TUI's local machine. Re-uses the existing CLI which does git fetch +
+/// checkout + `repo.build_command`, so no Rust-side git/build logic is
+/// duplicated here. Job state lives in-memory only — restarting the TUI
+/// drops it; the user can re-press `B` to retrigger.
+struct TestBuildJob {
+    /// Work assignment id this build is verifying. Also the HashMap key.
+    #[allow(dead_code)]
+    work_id: String,
+    /// Issue number, for friendlier toast titles (work_ids are uuids).
+    issue_number: u64,
+    /// Branch passed to `coord test` (carried for the completion toast).
+    branch: String,
+    /// `~/.coord/test-build-<id>.log` — stdout+stderr from the subprocess.
+    /// Surfaced in failure toasts so the user can `tail` it.
+    log_path: PathBuf,
+    /// Wall-clock start; reported in the success toast as "took Ns".
+    started_at: Instant,
+    /// Receiver for the completion message; `try_recv` polled each tick.
+    rx: std::sync::mpsc::Receiver<TestBuildOutcome>,
+}
+
+/// Outcome of a Phase 1 build. Sent once from the worker thread.
+struct TestBuildOutcome {
+    exit_code: i32,
+    /// First non-empty stderr line (truncated). Surfaced in the failure
+    /// toast so the user doesn't have to `cat` the log to see the cause.
+    /// Empty string on success, since we don't bother capturing.
+    first_error: String,
 }
 
 /// The tabs shown in the Pipeline view detail panel.
@@ -522,6 +560,90 @@ fn extract_tool_names(json: &str) -> Vec<String> {
     names
 }
 
+/// Parse the `REVIEW_VERDICT` / `REVIEW_BODY` block embedded in a result event's
+/// `result` string and return it as renderable list items. Returns an empty
+/// Vec when the result isn't a structured review (e.g. a normal work or plan
+/// completion).
+///
+/// The expected format is the one declared in the REVIEWER_SYSTEM_PROMPT:
+///
+/// ```text
+/// REVIEW_VERDICT: approve | request-changes
+/// REVIEW_BODY:
+/// <markdown body lines>
+/// END_REVIEW
+/// ```
+///
+/// The body comes back with `\n` escape sequences (JSON-encoded). We
+/// un-escape `\\n` → `\n` and `\\"` → `"` before splitting into lines so the
+/// rendered output matches the verbatim review.
+fn extract_review_items(line: &str) -> Vec<ListItem> {
+    let mut items: Vec<ListItem> = Vec::new();
+    // Find the verdict marker. The result text is itself JSON-encoded inside
+    // the result field, so `\n` appears as the two-char sequence `\\n`.
+    let verdict_marker = "REVIEW_VERDICT:";
+    let body_marker = "REVIEW_BODY:";
+    let end_marker = "END_REVIEW";
+
+    let v_pos = line.find(verdict_marker);
+    let b_pos = line.find(body_marker);
+    let (Some(v_pos), Some(b_pos)) = (v_pos, b_pos) else { return items; };
+
+    // Verdict word: between the verdict marker and the next newline marker.
+    let verdict_after = &line[v_pos + verdict_marker.len()..];
+    let verdict_end = verdict_after
+        .find("\\n")
+        .or_else(|| verdict_after.find('\n'))
+        .unwrap_or(verdict_after.len());
+    let verdict = verdict_after[..verdict_end].trim().trim_matches(',');
+
+    // Header line, coloured by outcome.
+    let color = if verdict == "approve" {
+        Color::rgb(100, 220, 130)
+    } else if verdict.contains("request-changes") || verdict.contains("fail") {
+        Color::rgb(230, 130, 80)
+    } else {
+        Color::rgb(180, 180, 100)
+    };
+    items.push(activity_item(&format!("[review] {}", verdict), color));
+
+    // Body: between the body marker and END_REVIEW (if present).
+    let body_after = &line[b_pos + body_marker.len()..];
+    let body_end_rel = body_after.find(end_marker).unwrap_or(body_after.len());
+    let raw_body = &body_after[..body_end_rel];
+
+    // Un-escape the JSON-encoded body so newlines / quotes render normally.
+    let mut unescaped = String::with_capacity(raw_body.len());
+    let mut chars = raw_body.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => unescaped.push('\n'),
+                Some('t') => unescaped.push('\t'),
+                Some('"') => unescaped.push('"'),
+                Some('\\') => unescaped.push('\\'),
+                Some(other) => {
+                    unescaped.push('\\');
+                    unescaped.push(other);
+                }
+                None => unescaped.push('\\'),
+            }
+        } else {
+            unescaped.push(c);
+        }
+    }
+    // Skip the leading newline(s) right after `REVIEW_BODY:` so the first
+    // rendered line is meaningful content rather than a blank row.
+    let body = unescaped.trim_start_matches('\n');
+    for body_line in body.lines() {
+        items.push(activity_item(
+            &format!("  {}", body_line),
+            Color::rgb(200, 200, 210),
+        ));
+    }
+    items
+}
+
 /// Extract the first non-empty text block from an assistant message.
 ///
 /// Looks for `"type":"text"` content blocks and returns the `"text"` field.
@@ -619,6 +741,8 @@ fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
                 "[result] {} turns  ${:.2}  {}  stop={}",
                 turns, cost, dur, stop
             );
+            // Review-verdict body extraction happens in parse_log_content so
+            // it can emit multiple list items below the metrics line.
             Some(activity_item(&text, Color::rgb(200, 200, 100)))
         }
 
@@ -655,6 +779,13 @@ fn parse_log_content(content: &str) -> Vec<ListItem> {
         if is_json {
             if let Some(item) = parse_json_event(line, &mut turn_n) {
                 items.push(item);
+            }
+            // After the metrics line, surface the structured review verdict
+            // (REVIEW_VERDICT / REVIEW_BODY) embedded in the `result` field
+            // of result events so reviewers don't have to leave the TUI to
+            // see what the reviewer said.
+            if line.contains("\"type\":\"result\"") {
+                items.extend(extract_review_items(line));
             }
         } else {
             // Plain-text log: surface STATUS: / STUCK: lines.
@@ -1730,6 +1861,12 @@ pub struct CoordApp {
     /// `usize` is the work-assignment index in `self.data.assignments` that
     /// the verdict will be applied to.
     pending_test_fail: Option<(usize, String)>,
+    /// Cached visible-row count for the main panel, updated on scroll events
+    /// and tick. Used by `watch_log_list` to compute a stick-to-bottom scroll
+    /// offset that actually keeps the latest lines on screen (the previous
+    /// hard-coded `items.len() - 40` cut off latest lines when the terminal
+    /// viewport was under 40 rows).
+    last_main_visible_rows: std::cell::Cell<usize>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -1760,6 +1897,10 @@ pub struct CoordApp {
     /// refresh.  Used to detect running→done/failed transitions so we can
     /// ring the terminal bell when `audio_on_completion` is enabled.
     audio_prev_running: std::collections::HashSet<String>,
+    /// #235 Phase 1: in-flight Test-stage build jobs keyed by work_id.
+    /// Drained by `poll_test_build_jobs` each tick — completed entries are
+    /// removed and surfaced as toasts. Empty in the steady state.
+    test_build_jobs: std::collections::HashMap<String, TestBuildJob>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -1833,6 +1974,7 @@ impl CoordApp {
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
+            last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
             settings: TuiSettings::load(),
@@ -1840,6 +1982,7 @@ impl CoordApp {
             settings_category_sel: 0,
             settings_field_sel: 0,
             audio_prev_running: std::collections::HashSet::new(),
+            test_build_jobs: std::collections::HashMap::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
@@ -2019,6 +2162,7 @@ impl CoordApp {
                             done: false,
                             host: m.host.clone(),
                             assignment_id: a.id.clone(),
+                            pending_tail: String::new(),
                         });
                     }
                 }
@@ -2063,6 +2207,7 @@ impl CoordApp {
             done: false,
             host,
             assignment_id: id,
+            pending_tail: String::new(),
         });
     }
 
@@ -2190,15 +2335,20 @@ impl CoordApp {
                 Some(Color::rgb(140, 140, 140)),
             ));
         }
-        // Stick-to-bottom default: position the viewport ~40 rows from the
-        // end so the latest log lines + prompt are visible. Any explicit
-        // scroll wins.
+        // Stick-to-bottom default: position the viewport so the LAST item
+        // is the last visible row. The viewport-row count is cached during
+        // the most recent mouse_main_scroll / tick (see
+        // `last_main_visible_rows`); on the very first frame it defaults to
+        // 40 so this fits a typical terminal. The hard-coded 40 used to be
+        // a literal `items.len() - 40`, which clipped the latest lines on
+        // smaller terminals.
+        let visible_rows = self.last_main_visible_rows.get().max(1);
         let scroll = self
             .watch
             .as_ref()
             .map(|w| {
                 if w.scroll == usize::MAX {
-                    items.len().saturating_sub(40)
+                    items.len().saturating_sub(visible_rows)
                 } else {
                     w.scroll
                 }
@@ -3835,8 +3985,9 @@ impl CoordApp {
     ///
     /// `passed`/`skipped` → Done; `failed` → Failed; otherwise Pending while
     /// Work is settled and Pending/Skipped while Work isn't done yet.
-    /// Note: Test is a human gate — there is no Active state because nothing
-    /// runs.
+    /// #235: When a Phase 1 build is in flight for the latest Work
+    /// assignment, the badge goes Active ("Building") even though Test is
+    /// still a human gate — the user needs to know something is running.
     fn test_stage_status_for(&self, issue: &PipelineIssue) -> StageStatus {
         // Test is gated on Work; if Work hasn't finished, Test isn't actionable.
         let work_status = self.stage_status_for_internal_work(issue);
@@ -3852,6 +4003,13 @@ impl CoordApp {
                 .partial_cmp(&b.dispatched_at)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // #235: Phase 1 build in flight beats any prior verdict — the user
+        // pressed `B` to re-test, so the old verdict is no longer current.
+        if let Some(a) = latest.as_ref() {
+            if self.test_build_in_flight(&a.id) {
+                return StageStatus::Active;
+            }
+        }
         match latest.and_then(|a| a.test_state.as_deref()) {
             Some("passed") | Some("skipped") => StageStatus::Done,
             Some("failed") => StageStatus::Failed,
@@ -3935,7 +4093,7 @@ impl CoordApp {
             .enumerate()
             .map(|(i, name)| {
                 let status = statuses[i].clone();
-                let label = match name.as_str() {
+                let mut label = match name.as_str() {
                     "work" => "Work".to_string(),
                     other => {
                         let mut s = other.to_string();
@@ -3945,6 +4103,21 @@ impl CoordApp {
                         s
                     }
                 };
+                // #235: When Phase 1 is mid-build for this issue, swap the
+                // Test label to "Building" so the Active badge has meaningful
+                // text (otherwise it'd just say "Test" while running).
+                if name == "test" && status == StageStatus::Active {
+                    if let Some(work_id) = self.assignments_for_stage(issue, "work")
+                        .iter()
+                        .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
+                            .unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|a| a.id.clone())
+                    {
+                        if self.test_build_in_flight(&work_id) {
+                            label = "Building".to_string();
+                        }
+                    }
+                }
                 // Skipped counts as "settled" for prior_all_done: a closed-issue
                 // stage that never ran is logically done.
                 let prior_all_done = statuses[..i].iter().all(|s| {
@@ -4063,6 +4236,199 @@ impl CoordApp {
         }
         self.test_stage_status_for(issue) == StageStatus::Pending
             && self.stage_status_for_internal_work(issue) == StageStatus::Done
+    }
+
+    /// #235: True when a Phase 1 build for the given work assignment is
+    /// currently running (entry present in `test_build_jobs`).  Removed when
+    /// `poll_test_build_jobs` drains the completion message.
+    fn test_build_in_flight(&self, work_id: &str) -> bool {
+        self.test_build_jobs.contains_key(work_id)
+    }
+
+    /// #235: Gate for the `B` keybind.  True when:
+    /// - the Pipeline view is active,
+    /// - the Test gate is actionable (Work Done, no verdict yet),
+    /// - the latest Work assignment has a branch recorded, and
+    /// - no Phase 1 build is already in flight for this work id.
+    ///
+    /// We do NOT check `repo.build_command` here: `coord test` handles a
+    /// missing build_command by just doing the checkout, which is still
+    /// useful (the user gets the branch locally for manual inspection).
+    fn can_trigger_test_build(&self) -> bool {
+        if self.active_view != SidebarView::Pipeline {
+            return false;
+        }
+        if !self.test_gate_actionable() {
+            return false;
+        }
+        let Some(work_id) = self.pipeline_selected_work_id() else {
+            return false;
+        };
+        if self.test_build_in_flight(&work_id) {
+            return false;
+        }
+        let work = self.data.assignments.iter().find(|a| a.id == work_id);
+        work.and_then(|a| a.branch.as_ref()).is_some()
+    }
+
+    /// #235 Phase 1 trigger: spawn `coord test <work_id>` on the local
+    /// machine in a background thread, capturing combined stdout+stderr to
+    /// `~/.coord/test-build-<work_id>.log`.  Returns `true` when a job was
+    /// scheduled (a redraw is warranted for the new "Building" badge).
+    ///
+    /// Idempotent: a no-op when a build for `work_id` is already in flight.
+    fn spawn_test_build(&mut self, work_id: String, branch: String, issue_number: u64) -> bool {
+        if self.test_build_jobs.contains_key(&work_id) {
+            return false;
+        }
+        let log_dir = coord_dir();
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            self.push_toast(
+                "Build setup failed",
+                &format!("create {} failed: {}", log_dir.display(), e),
+                ToastSeverity::Error,
+            );
+            return false;
+        }
+        let log_path = log_dir.join(format!("test-build-{}.log", work_id));
+        let cfg_path = self.command_runner.config_path.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel::<TestBuildOutcome>();
+        let work_id_thread = work_id.clone();
+        let log_path_thread = log_path.clone();
+        std::thread::spawn(move || {
+            use std::process::Command;
+            let mut cmd = Command::new("coord");
+            cmd.arg("test");
+            if let Some(cfg) = &cfg_path {
+                cmd.arg("--config").arg(cfg);
+            }
+            cmd.arg(&work_id_thread);
+            let (exit_code, first_error) = match cmd.output() {
+                Ok(out) => {
+                    let mut buf = Vec::with_capacity(out.stdout.len() + out.stderr.len() + 64);
+                    buf.extend_from_slice(b"--- stdout ---\n");
+                    buf.extend_from_slice(&out.stdout);
+                    buf.extend_from_slice(b"\n--- stderr ---\n");
+                    buf.extend_from_slice(&out.stderr);
+                    let _ = std::fs::write(&log_path_thread, buf);
+                    let code = out.status.code().unwrap_or(-1);
+                    // On failure, grab the first non-empty stderr line (or
+                    // stdout if stderr is empty) for the toast.  Strip the
+                    // "error: " prefix that `coord` prepends so the user
+                    // sees the actual diagnostic.
+                    let first = if code != 0 {
+                        let pick = |bytes: &[u8]| -> Option<String> {
+                            String::from_utf8_lossy(bytes)
+                                .lines()
+                                .map(|l| l.trim())
+                                .find(|l| !l.is_empty())
+                                .map(|l| l.trim_start_matches("error: ").to_string())
+                        };
+                        pick(&out.stderr)
+                            .or_else(|| pick(&out.stdout))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    (code, first)
+                }
+                Err(e) => {
+                    let msg = format!("failed to spawn coord test: {}", e);
+                    let _ = std::fs::write(&log_path_thread, format!("{}\n", msg));
+                    (-1, msg)
+                }
+            };
+            let _ = tx.send(TestBuildOutcome { exit_code, first_error });
+        });
+
+        self.push_toast(
+            "Phase 1 build started",
+            &format!(
+                "#{} on {} — fetching and building…",
+                issue_number, branch
+            ),
+            ToastSeverity::Info,
+        );
+        self.test_build_jobs.insert(
+            work_id.clone(),
+            TestBuildJob {
+                work_id,
+                issue_number,
+                branch,
+                log_path,
+                started_at: Instant::now(),
+                rx,
+            },
+        );
+        true
+    }
+
+    /// #235: Drain completed Phase 1 build jobs, toast their outcome, and
+    /// remove them from the in-flight map.  Returns `true` when at least
+    /// one job finished (a redraw is needed so the "Building" badge clears).
+    fn poll_test_build_jobs(&mut self) -> bool {
+        if self.test_build_jobs.is_empty() {
+            return false;
+        }
+        use std::sync::mpsc::TryRecvError;
+        let mut done: Vec<(String, Result<TestBuildOutcome, ()>)> = Vec::new();
+        for (id, job) in self.test_build_jobs.iter() {
+            match job.rx.try_recv() {
+                Ok(outcome) => done.push((id.clone(), Ok(outcome))),
+                Err(TryRecvError::Disconnected) => done.push((id.clone(), Err(()))),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if done.is_empty() {
+            return false;
+        }
+        for (id, result) in done {
+            let job = self.test_build_jobs.remove(&id).expect("just observed");
+            let dur_secs = job.started_at.elapsed().as_secs();
+            match result {
+                Ok(TestBuildOutcome { exit_code: 0, .. }) => {
+                    self.push_toast(
+                        "Phase 1 build ✓",
+                        &format!(
+                            "#{} ready to test on {} ({}s) — press P / F / S",
+                            job.issue_number, job.branch, dur_secs
+                        ),
+                        ToastSeverity::Info,
+                    );
+                }
+                Ok(TestBuildOutcome { exit_code: code, first_error }) => {
+                    // Truncate the error to ~120 chars so the toast stays
+                    // readable; the full log is at log_path for details.
+                    let snippet = if first_error.is_empty() {
+                        format!("see {}", job.log_path.display())
+                    } else {
+                        let trimmed: String = first_error.chars().take(120).collect();
+                        if first_error.chars().count() > 120 {
+                            format!("{}… (see {})", trimmed, job.log_path.display())
+                        } else {
+                            format!("{} (see {})", trimmed, job.log_path.display())
+                        }
+                    };
+                    self.push_toast(
+                        "Phase 1 build ✗",
+                        &format!("#{} exit {}: {}", job.issue_number, code, snippet),
+                        ToastSeverity::Error,
+                    );
+                }
+                Err(()) => {
+                    self.push_toast(
+                        "Phase 1 build ✗",
+                        &format!(
+                            "#{} build worker disappeared — see {}",
+                            job.issue_number, job.log_path.display()
+                        ),
+                        ToastSeverity::Error,
+                    );
+                }
+            }
+        }
+        true
     }
 
     /// Dispatch the action button (`[Go]` or `[Retry]`) attached to a
@@ -5332,6 +5698,39 @@ impl CoordApp {
     /// Scroll wheel in the main panel (detail / machine detail).
     fn mouse_main_scroll(&mut self, delta: ScrollDelta, main_b: Rect, lh: f32) -> bool {
         let visible = content_visible_rows(main_b, lh);
+        // Stash the live viewport size — `watch_log_list` uses this to compute
+        // a stick-to-bottom offset that keeps the last line on screen.
+        self.last_main_visible_rows.set(visible.max(1));
+        // Watch overlay takes over the main panel; route scrollwheel to it
+        // regardless of which view is active underneath.
+        if self.watch.is_some() {
+            // SSE log lines drive the count when present; fall back to the
+            // remote-log cache when SSE isn't yet connected.
+            let items = self
+                .watch_sse
+                .as_ref()
+                .map(|s| s.lines.len())
+                .unwrap_or_else(|| self.watch_log_list().items.len());
+            let max = items.saturating_sub(visible.saturating_sub(1));
+            if let Some(w) = self.watch.as_mut() {
+                // Anchor the current scroll position: a usize::MAX sentinel
+                // means stick-to-bottom; convert that to the explicit max
+                // before applying the wheel delta so wheel-up actually moves.
+                if w.scroll == usize::MAX {
+                    w.scroll = max;
+                }
+                if delta.y > 0.0 {
+                    // Wheel up → older lines.
+                    w.scroll = w.scroll.saturating_sub(3);
+                } else if delta.y < 0.0 {
+                    // Wheel down → newer; once at the bottom, re-enable
+                    // stick-to-bottom so future appends keep auto-scrolling.
+                    let new_scroll = (w.scroll + 3).min(max);
+                    w.scroll = if new_scroll >= max { usize::MAX } else { new_scroll };
+                }
+            }
+            return true;
+        }
         match self.active_view {
             SidebarView::Board => {
                 // Use the active tab's actual list so the scroll max matches
@@ -5477,7 +5876,13 @@ impl CoordApp {
         } else if self.active_view == SidebarView::Pipeline && self.test_gate_actionable() {
             // #200: surface the Test gate keybinds when actionable for the
             // currently-selected pipeline issue.
-            " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
+            // #235: include B (Phase 1 build) when no build is already in
+            // flight for this work id.
+            if self.can_trigger_test_build() {
+                " Test gate: B=build  P=pass  F=fail  S=skip  q=quit ".to_string()
+            } else {
+                " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
+            }
         } else if proposals > 0 {
             format!(" p=plan  a=approve({})  m=merge  R=retry  P=purge  q=quit ", proposals)
         } else {
@@ -5558,6 +5963,10 @@ impl CoordApp {
             needs_redraw |= self.drain_sse_watch();
         }
 
+        // #235: Drain Phase 1 build completions and toast the outcome.
+        // Cheap no-op when no jobs are in flight.
+        needs_redraw |= self.poll_test_build_jobs();
+
         needs_redraw
     }
 
@@ -5609,10 +6018,44 @@ impl CoordApp {
                 match msg {
                     SseWatchMsg::Lines { last_id, text } => {
                         sse.last_event_id = last_id;
-                        for line in text.lines() {
+                        // Reassemble lines split across SSE chunks. The agent
+                        // emits whatever it read from the log file (up to
+                        // LOG_CHUNK_SIZE=4096 bytes), so a JSON line longer
+                        // than that arrives in pieces. If the chunk doesn't
+                        // end with `\n`, hold the trailing partial line until
+                        // the next chunk completes it. Without this, broken
+                        // half-lines reach parse_json_event and we lose
+                        // fields like total_cost_usd / stop_reason that come
+                        // after the split point.
+                        let mut payload = std::mem::take(&mut sse.pending_tail);
+                        payload.push_str(&text);
+                        let (complete, tail) = if payload.ends_with('\n') {
+                            (payload.clone(), String::new())
+                        } else if let Some(last_nl) = payload.rfind('\n') {
+                            let (a, b) = payload.split_at(last_nl + 1);
+                            (a.to_string(), b.to_string())
+                        } else {
+                            (String::new(), payload.clone())
+                        };
+                        for line in complete.lines() {
                             sse.lines.push(line.to_string());
                         }
+                        sse.pending_tail = tail;
                         got_new = true;
+                    }
+                    SseWatchMsg::Done { last_id } if !sse.pending_tail.is_empty() => {
+                        // Stream is ending — flush any trailing partial line
+                        // before transitioning to done. Without this, a final
+                        // result line whose terminating `\n` never reached us
+                        // (worker exited mid-write) would be invisible.
+                        let tail = std::mem::take(&mut sse.pending_tail);
+                        for line in tail.lines() {
+                            sse.lines.push(line.to_string());
+                        }
+                        sse.last_event_id = last_id;
+                        sse.done = true;
+                        got_new = true;
+                        break;
                     }
                     SseWatchMsg::Done { last_id } => {
                         sse.last_event_id = last_id;
@@ -5980,6 +6423,10 @@ impl ShellApp for CoordApp {
 
         // ── Main: detail panel only (full main_content_bounds) ───────
         let m = layout.main_content_bounds;
+        // Keep watch_log_list's stick-to-bottom math in sync with the live
+        // viewport on every frame (not just when the user scrolls).
+        self.last_main_visible_rows
+            .set(content_visible_rows(m, lh).max(1));
         match self.active_view {
             SidebarView::Board => {
                 // Tab bar (Board / Issue), then the active tab's content.
@@ -6749,6 +7196,29 @@ impl ShellApp for CoordApp {
                         }
                     }
 
+                    // ── #235 Phase 1: B = build (fetch + checkout +
+                    //              build_command on the local machine) ──
+                    // Spawns `coord test <work_id>` in a background thread
+                    // and toasts the outcome. Manual trigger by design —
+                    // auto-on-completion would clobber the user's working
+                    // copy mid-edit.
+                    Key::Char('B')
+                        if self.pending_test_fail.is_none()
+                            && self.can_trigger_test_build() =>
+                    {
+                        if let Some(work_id) = self.pipeline_selected_work_id() {
+                            let (branch, issue_number) = self
+                                .data
+                                .assignments
+                                .iter()
+                                .find(|a| a.id == work_id)
+                                .and_then(|a| a.branch.clone().map(|b| (b, a.issue_number)))
+                                .unwrap_or_else(|| (String::from("?"), 0));
+                            self.spawn_test_build(work_id, branch, issue_number);
+                            needs_redraw = true;
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -7113,6 +7583,7 @@ mod tests {
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
+            last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
             settings: TuiSettings::default(),
@@ -7120,6 +7591,7 @@ mod tests {
             settings_category_sel: 0,
             settings_field_sel: 0,
             audio_prev_running: std::collections::HashSet::new(),
+            test_build_jobs: std::collections::HashMap::new(),
         }
     }
 
@@ -7442,6 +7914,35 @@ mod tests {
         // The inner tool_use should be found and its name extracted.
         let names = extract_tool_names(&json);
         assert!(names.contains(&"Edit".to_string()));
+    }
+
+    // ── extract_review_items ──────────────────────────────────────────────────
+
+    #[test]
+    fn extract_review_items_renders_verdict_and_body_lines() {
+        // Result event with the structured REVIEW_VERDICT/REVIEW_BODY block
+        // the way the reviewer system prompt asks workers to emit it. Body
+        // text is JSON-encoded (`\n` → `\\n`).
+        let line = r#"{"type":"result","result":"REVIEW_VERDICT: approve\nREVIEW_BODY:\n## Summary\n\nLGTM.\nEND_REVIEW"}"#;
+        let items = extract_review_items(line);
+        let texts: Vec<String> = items
+            .iter()
+            .map(|i| i.text.spans[0].text.clone())
+            .collect();
+        // First item is the verdict header.
+        assert!(texts[0].contains("[review]"));
+        assert!(texts[0].contains("approve"));
+        // Subsequent items are the unescaped body lines.
+        assert!(texts.iter().any(|t| t.contains("Summary")));
+        assert!(texts.iter().any(|t| t.contains("LGTM.")));
+    }
+
+    #[test]
+    fn extract_review_items_empty_when_no_verdict() {
+        // Plain work-completion result event — no review block, no items.
+        let line = r#"{"type":"result","result":"work done"}"#;
+        let items = extract_review_items(line);
+        assert!(items.is_empty());
     }
 
     // ── parse_json_event ──────────────────────────────────────────────────────
@@ -8225,6 +8726,197 @@ mod tests {
         app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
         app.data.assignments.push(_work_assignment("w2", 300.0, "done", None));
         assert_eq!(app.pipeline_selected_work_id(), Some("w2".to_string()));
+    }
+
+    // ── #235: Phase 1 Test-stage build ────────────────────────────────────
+
+    /// Synthetic build job that never receives a completion message. The
+    /// `_tx` is dropped at the end of the call site, which would normally
+    /// turn the channel into "Disconnected", so callers MUST keep the
+    /// returned `Sender` alive for the duration of the assertion.
+    fn _inject_test_build_job(
+        app: &mut CoordApp,
+        work_id: &str,
+        issue_number: u64,
+        branch: &str,
+    ) -> std::sync::mpsc::Sender<TestBuildOutcome> {
+        let (tx, rx) = std::sync::mpsc::channel::<TestBuildOutcome>();
+        app.test_build_jobs.insert(
+            work_id.to_string(),
+            TestBuildJob {
+                work_id: work_id.to_string(),
+                issue_number,
+                branch: branch.to_string(),
+                log_path: PathBuf::from("/tmp/test-build-fixture.log"),
+                started_at: Instant::now(),
+                rx,
+            },
+        );
+        tx
+    }
+
+    #[test]
+    fn can_trigger_test_build_requires_pipeline_view_and_branch() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        // Empty board → no work → not actionable → false.
+        assert!(!app.can_trigger_test_build());
+
+        // Work done, no branch → still false (the user has nothing local
+        // to check out).
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.active_view = SidebarView::Pipeline;
+        assert!(!app.can_trigger_test_build(), "no branch → no B");
+
+        // Add a branch → now actionable.
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+        assert!(app.can_trigger_test_build());
+
+        // Wrong view → false even with everything else set.
+        app.active_view = SidebarView::Board;
+        assert!(!app.can_trigger_test_build());
+    }
+
+    #[test]
+    fn can_trigger_test_build_false_while_build_in_flight() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+        assert!(app.can_trigger_test_build());
+
+        // Inject an in-flight build for the same work id → no double-trigger.
+        let _tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        assert!(!app.can_trigger_test_build());
+    }
+
+    #[test]
+    fn can_trigger_test_build_false_after_verdict_recorded() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+        // Verdict recorded → Test stage is Done → gate not actionable → no B.
+        assert!(!app.can_trigger_test_build());
+    }
+
+    #[test]
+    fn test_stage_active_with_building_label_when_build_in_flight() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        // Before build: Test is Pending.
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Pending);
+
+        // Inject in-flight build → Test goes Active.
+        let _tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Active);
+
+        // build_pipeline_widget swaps the Test stage label to "Building".
+        let view = app.build_pipeline_widget().expect("widget");
+        let test_stage = view.stages.iter().find(|s| s.label == "Building")
+            .expect("Test stage label should be Building while job in flight");
+        assert_eq!(test_stage.status, StageStatus::Active);
+    }
+
+    #[test]
+    fn test_stage_active_supersedes_prior_verdict_while_rebuilding() {
+        // After a Pass verdict, the user might press B again to re-test —
+        // e.g. to validate after a worker re-dispatch.  While the new build
+        // is in flight, the badge should be Active+Building, not Done
+        // (the old verdict is stale relative to the in-flight build).
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Done);
+
+        let _tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Active);
+    }
+
+    #[test]
+    fn poll_test_build_jobs_clears_completed_and_pushes_toast() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        assert_eq!(app.test_build_jobs.len(), 1);
+        assert!(app.toasts.is_empty());
+
+        // Worker thread reports success.
+        tx.send(TestBuildOutcome { exit_code: 0, first_error: String::new() }).unwrap();
+        // Empty channel & non-empty queue: nothing happens until we poll.
+        assert!(app.poll_test_build_jobs());
+        assert_eq!(app.test_build_jobs.len(), 0);
+        assert_eq!(app.toasts.len(), 1);
+    }
+
+    #[test]
+    fn poll_test_build_jobs_reports_failure_toast_on_nonzero_exit() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        tx.send(TestBuildOutcome {
+            exit_code: 2,
+            first_error: "checkout aborted: local changes".to_string(),
+        })
+        .unwrap();
+        assert!(app.poll_test_build_jobs());
+        assert_eq!(app.toasts.len(), 1);
+        let (item, _, severity) = &app.toasts[0];
+        assert_eq!(*severity, ToastSeverity::Error);
+        // Failure toast must include the first error line so the user
+        // doesn't have to cat the log to see what happened.
+        assert!(
+            item.body.contains("checkout aborted: local changes"),
+            "toast body should include first_error; got: {}",
+            item.body
+        );
+    }
+
+    #[test]
+    fn poll_test_build_jobs_reports_failure_when_worker_disappears() {
+        // Dropping the Sender without a send turns the channel into
+        // Disconnected — we must surface that as a failure toast so the
+        // job doesn't sit in the map forever showing Building.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.assignments[0].branch = Some("issue-42-x".into());
+
+        let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
+        drop(tx); // simulate the worker thread panicking before sending
+        assert!(app.poll_test_build_jobs());
+        assert_eq!(app.test_build_jobs.len(), 0);
+        assert_eq!(app.toasts.len(), 1);
+        let severity = &app.toasts[0].2;
+        assert_eq!(*severity, ToastSeverity::Error);
+    }
+
+    #[test]
+    fn poll_test_build_jobs_noop_when_empty() {
+        let mut app = make_pipeline_app_with_test_gate();
+        assert!(!app.poll_test_build_jobs());
     }
 
     // ── Issue #212: closed-without-pipeline fixes ─────────────────────────
@@ -9263,6 +9955,7 @@ mod tests {
             done: false,
             host: "localhost".to_string(),
             assignment_id: "test-id".to_string(),
+            pending_tail: String::new(),
         };
         (state, tx)
     }
@@ -9273,9 +9966,10 @@ mod tests {
         let (state, tx) = make_sse_state_pair();
         app.watch_sse = Some(state);
 
-        // Send two log chunks.
-        tx.send(SseWatchMsg::Lines { last_id: 100, text: "line one\nline two".to_string() }).unwrap();
-        tx.send(SseWatchMsg::Lines { last_id: 200, text: "line three".to_string() }).unwrap();
+        // Each chunk's text has a trailing `\n` — that's what the agent
+        // emits when the source bytes ended at a line boundary.
+        tx.send(SseWatchMsg::Lines { last_id: 100, text: "line one\nline two\n".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Lines { last_id: 200, text: "line three\n".to_string() }).unwrap();
 
         let changed = app.drain_sse_watch();
         assert!(changed, "new lines should trigger redraw");
@@ -9287,12 +9981,47 @@ mod tests {
     }
 
     #[test]
+    fn drain_sse_watch_reassembles_partial_line_split_across_chunks() {
+        // Regression: the agent reads the log in 4 KB chunks, so a long JSON
+        // line (e.g. `{"type":"result", ..., "total_cost_usd":...}`) arrives
+        // in pieces. Without reassembly the broken halves reach the parser
+        // and we lose fields after the split point — surfaced as $0.00 /
+        // stop=? in the watch overlay.
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        // Chunk 1 has the first half of a JSON line (NO trailing newline).
+        tx.send(SseWatchMsg::Lines {
+            last_id: 100,
+            text: "{\"type\":\"result\",\"num_turns\":37".to_string(),
+        }).unwrap();
+        // Chunk 2 has the rest plus the terminating newline.
+        tx.send(SseWatchMsg::Lines {
+            last_id: 200,
+            text: ",\"total_cost_usd\":1.75}\n".to_string(),
+        }).unwrap();
+
+        app.drain_sse_watch();
+
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert_eq!(sse.last_event_id, 200);
+        assert_eq!(
+            sse.lines,
+            vec!["{\"type\":\"result\",\"num_turns\":37,\"total_cost_usd\":1.75}"],
+            "the two chunks must have been joined into one line, not two"
+        );
+        assert!(sse.pending_tail.is_empty(), "tail should be flushed after the second chunk");
+    }
+
+    #[test]
     fn drain_sse_watch_marks_done_on_end_event() {
         let mut app = make_app_default();
         let (state, tx) = make_sse_state_pair();
         app.watch_sse = Some(state);
 
-        tx.send(SseWatchMsg::Lines { last_id: 50, text: "some output".to_string() }).unwrap();
+        // Trailing `\n` so the chunk is complete (no partial line to flush).
+        tx.send(SseWatchMsg::Lines { last_id: 50, text: "some output\n".to_string() }).unwrap();
         tx.send(SseWatchMsg::Done { last_id: 99 }).unwrap();
 
         let changed = app.drain_sse_watch();
@@ -9302,6 +10031,24 @@ mod tests {
         assert!(sse.done, "done should be set after End event");
         assert_eq!(sse.last_event_id, 99);
         assert_eq!(sse.lines, vec!["some output"]);
+    }
+
+    #[test]
+    fn drain_sse_watch_flushes_pending_tail_on_done() {
+        // If the stream ends without the writer's final newline, the partial
+        // line should still surface (don't silently drop the worker's last
+        // result line).
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        app.watch_sse = Some(state);
+
+        tx.send(SseWatchMsg::Lines { last_id: 10, text: "trailing partial".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Done { last_id: 11 }).unwrap();
+
+        app.drain_sse_watch();
+        let sse = app.watch_sse.as_ref().unwrap();
+        assert!(sse.done);
+        assert_eq!(sse.lines, vec!["trailing partial"]);
     }
 
     #[test]

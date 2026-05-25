@@ -729,3 +729,88 @@ END_REVIEW
         result = parse_review_from_log(log)
         assert result is not None
         assert result.verdict == "request-changes"
+
+
+class TestParseReviewFromAgent:
+    """Cover the HTTP-fetch path used when the worker's log file lives on a
+    remote agent and notify can't open it directly.
+    """
+
+    def test_fetches_log_via_agent_and_parses_verdict(self, monkeypatch) -> None:
+        """Plain-text log served by the agent → verdict extracted."""
+        from coord.review import parse_review_from_agent
+
+        body = (
+            "REVIEW_VERDICT: approve\n"
+            "REVIEW_BODY:\n"
+            "Diff looks clean.\n"
+            "END_REVIEW\n"
+        )
+
+        class FakeResponse:
+            text = body
+            def raise_for_status(self): pass
+
+        def fake_get(url, timeout):
+            assert url == "http://elitebook:7433/logs/abc123"
+            return FakeResponse()
+
+        monkeypatch.setattr("coord.review.httpx.get", fake_get)
+        result = parse_review_from_agent("elitebook", "abc123")
+        assert result is not None
+        assert result.verdict == "approve"
+        assert "Diff looks clean" in result.body
+
+    def test_stream_json_log_from_agent(self, monkeypatch) -> None:
+        """Stream-json log fetched over HTTP → verdict still extracted."""
+        from coord.review import parse_review_from_agent
+        import json
+
+        assistant_text = (
+            "Reviewing...\n\n"
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "Missing test coverage on the auth path.\n"
+            "END_REVIEW"
+        )
+        body = (
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": assistant_text}]},
+            }) + "\n"
+        )
+
+        class FakeResponse:
+            text = body
+            def raise_for_status(self): pass
+
+        def fake_get(url, timeout):
+            return FakeResponse()
+
+        monkeypatch.setattr("coord.review.httpx.get", fake_get)
+        result = parse_review_from_agent("dellserver", "xyz789")
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "Missing test coverage" in result.body
+
+    def test_returns_none_on_http_error(self, monkeypatch) -> None:
+        """Agent unreachable → None (caller falls back gracefully)."""
+        from coord.review import parse_review_from_agent
+        import httpx
+
+        def fake_get(url, timeout):
+            raise httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr("coord.review.httpx.get", fake_get)
+        assert parse_review_from_agent("offline-host", "any") is None
+
+    def test_returns_none_on_empty_log(self, monkeypatch) -> None:
+        """Agent returns an empty body → None."""
+        from coord.review import parse_review_from_agent
+
+        class FakeResponse:
+            text = ""
+            def raise_for_status(self): pass
+
+        monkeypatch.setattr("coord.review.httpx.get", lambda *a, **kw: FakeResponse())
+        assert parse_review_from_agent("any-host", "any") is None
