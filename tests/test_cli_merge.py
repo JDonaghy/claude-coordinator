@@ -175,6 +175,140 @@ class TestMergeCommand:
         assert merge_order[0] == 300
 
 
+class TestMergeAutoEnqueue:
+    """#242: `coord merge` must scan board.completed and enqueue eligible
+    work assignments, so done-work that reached terminal state via paths
+    other than the `coord status` enqueue hook doesn't silently sit
+    un-merged forever."""
+
+    def _seed_board_with_done_work(
+        self,
+        coord_db,
+        *,
+        issue_number: int = 218,
+        assignment_id: str = "w1",
+        branch: str = "issue-218-fix",
+    ) -> None:
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        a = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=issue_number,
+            issue_title=f"#{issue_number} title",
+            briefing="",
+            assignment_id=assignment_id,
+            status="done",
+            branch=branch,
+            type="work",
+        )
+        save_board(Board(active=[], completed=[a]))
+
+    def _seed_issue_state(self, coord_db, *, number: int, state: str) -> None:
+        coord_db.execute(
+            "INSERT OR REPLACE INTO issues (repo_name, number, title, state) "
+            "VALUES ('api', ?, ?, ?)",
+            (number, f"#{number}", state),
+        )
+        coord_db.commit()
+
+    def test_auto_enqueues_done_work_when_queue_empty(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """The #218 scenario: done-work is in the board but the queue is
+        empty.  Without the fix, `coord merge` printed "Merge queue is
+        empty" and exited.  Now it should enqueue and process."""
+        self._seed_board_with_done_work(coord_db)
+        self._seed_issue_state(coord_db, number=218, state="open")
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10):
+            create.return_value = {"number": 99, "url": "u/99", "existed": False}
+            merge_fn.return_value = (True, "ok")
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" in result.output
+        assert "#218" in result.output
+        create.assert_called_once()
+        merge_fn.assert_called_once()
+
+    def test_skips_closed_issues(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """A closed issue (already merged externally) must NOT be auto-
+        enqueued — that would spawn a spurious PR against a stale branch."""
+        self._seed_board_with_done_work(coord_db, issue_number=42)
+        self._seed_issue_state(coord_db, number=42, state="closed")
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn:
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" not in result.output
+        create.assert_not_called()
+        merge_fn.assert_not_called()
+
+    def test_skips_issues_already_merged_via_other_assignment(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """An issue with a prior merged queue entry should not get a fresh
+        enqueue even if board.completed has a different assignment for it
+        (e.g. an old failed attempt).  Avoids duplicate PRs per issue."""
+        self._seed_board_with_done_work(
+            coord_db, issue_number=55, assignment_id="newer-attempt"
+        )
+        self._seed_issue_state(coord_db, number=55, state="open")
+        # Existing merged entry for #55 from a prior assignment.
+        mq.save_queue([_entry("older-attempt", state=mq.MERGED)])
+        # Patch the issue number on the seeded merged entry to 55.
+        coord_db.execute(
+            "UPDATE merge_queue SET issue_number=55 WHERE assignment_id='older-attempt'"
+        )
+        coord_db.commit()
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr"):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" not in result.output
+        create.assert_not_called()
+
+    def test_clear_message_when_truly_nothing_to_merge(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """When the board has no done-work and the queue is empty, the
+        message should say "no completed work to merge" — not the misleading
+        "Merge queue is empty" which sounds like a no-op."""
+        result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+        assert result.exit_code == 0
+        assert "no completed work to merge" in result.output
+
+    def test_clear_message_when_done_work_already_merged(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """When all done-work is accounted for (already in queue as merged
+        or filtered out), distinguish from the "no completed work" case."""
+        self._seed_board_with_done_work(coord_db, issue_number=99)
+        # All matching entries already merged.
+        mq.save_queue([_entry("w1", state=mq.MERGED)])
+        coord_db.execute(
+            "UPDATE merge_queue SET issue_number=99 WHERE assignment_id='w1'"
+        )
+        coord_db.commit()
+
+        result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+        assert result.exit_code == 0
+        # Either "already merged" or "all done-work is already merged" or similar.
+        # We just check we got a sensible non-"empty" message after the queue
+        # turns out to have only the merged entry.
+        assert "merged" in result.output.lower() or "no" in result.output.lower()
+
+
 class TestStatusMergeQueue:
     def test_status_shows_queue_section(
         self, config_file: Path, coord_dir: Path

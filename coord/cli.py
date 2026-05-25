@@ -2415,6 +2415,42 @@ def post_pending_reviews(config_path: Path, repo_name: str | None) -> None:
             )
 
 
+def _load_issue_states() -> tuple[dict[str, set[int]], set[str]]:
+    """Return ``(open_by_repo, repos_with_data)``.
+
+    - ``open_by_repo[repo]`` = set of issue numbers with state='open'.
+    - ``repos_with_data`` = set of repos for which the issues table has
+      at least one row (any state).
+
+    Used by the `coord merge` auto-enqueue path (#242).  Filter logic:
+
+    - issue is in ``open_by_repo`` → allow (open issue, fine to enqueue)
+    - issue is NOT in ``open_by_repo`` AND repo is in ``repos_with_data``
+      → deny (we know about this repo's issues and this one is closed)
+    - issue is NOT in ``open_by_repo`` AND repo is NOT in ``repos_with_data``
+      → allow (the issues table has no data for this repo at all; default
+      to legacy behavior of letting the user re-attempt)
+    """
+    try:
+        from coord.db import get_connection
+
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT repo_name, number, state FROM issues"
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — caller treats empty as "unknown"
+        return {}, set()
+
+    open_by_repo: dict[str, set[int]] = {}
+    repos_with_data: set[str] = set()
+    for row in rows:
+        repo_name = row[0]
+        repos_with_data.add(repo_name)
+        if row[2] == "open":
+            open_by_repo.setdefault(repo_name, set()).add(int(row[1]))
+    return open_by_repo, repos_with_data
+
+
 @main.command(help="Process the merge queue: open PRs and merge in sequence.")
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Show the plan without opening or merging PRs.")
@@ -2440,13 +2476,86 @@ def merge(
     from coord import github_ops as gh_ops
     from coord import merge_queue as mq
     from coord.merge_queue import CONFLICT, MERGED, PENDING
+    from coord.state import load_board
 
-    _load_config(config_path)  # validate
+    cfg = _load_config(config_path)
+
+    # #242: Before processing, scan board.completed for done work assignments
+    # that should be queued but aren't.  Without this, `coord merge` silently
+    # no-ops when a work assignment reached "done" via a path that didn't
+    # also trigger the `coord status` enqueue hook (restart, notify-driven
+    # mark_done, etc.).  enqueue() is idempotent — by assignment_id — so this
+    # is safe to call on every invocation.
+    #
+    # Filter on issue.state == 'open': a closed issue was almost certainly
+    # already merged externally (or won't-fix'd) and re-attempting a merge
+    # for it would open spurious PRs against branches that may not even
+    # exist anymore.  When the issues table has no row for an issue (cache
+    # miss), default to OPEN — that matches the prior coord status enqueue
+    # path which had no such check.
+    board = load_board()
+    open_by_repo, repos_with_issue_data = _load_issue_states()
+    # Set of (repo_name, issue_number) for which a `merged` entry already
+    # exists.  Avoids spawning a fresh PR for an issue that was already
+    # merged via a prior work attempt (multiple work assignments per issue
+    # can happen with retries / fix iterations).
+    already_merged: set[tuple[str, int]] = set()
+    for existing in mq.load_queue():
+        if existing.state == MERGED:
+            already_merged.add((existing.repo_name, existing.issue_number))
+
+    auto_enqueued: list[str] = []
+    if board is not None:
+        for a in board.completed:
+            if a.type != "work" or a.status != "done":
+                continue
+            if not a.branch or not a.assignment_id:
+                continue
+            if repo_filter and a.repo_name != repo_filter:
+                continue
+            repo_cfg = cfg.repo(a.repo_name)
+            if repo_cfg is None:
+                continue
+            # Issue-state filter: skip closed issues (probably merged elsewhere).
+            # Distinguish "we have no data for this repo" (allow, legacy) from
+            # "we have data for this repo but this issue isn't in the open
+            # set" (closed → deny).
+            if a.repo_name in repos_with_issue_data:
+                open_issues = open_by_repo.get(a.repo_name, set())
+                if a.issue_number not in open_issues:
+                    continue
+            # Skip issues whose latest work was already merged (via any
+            # prior assignment_id).
+            if (a.repo_name, a.issue_number) in already_merged:
+                continue
+            entry = mq.enqueue(
+                a,
+                repo_github=repo_cfg.github,
+                target_branch=repo_cfg.default_branch,
+            )
+            if entry is not None:
+                auto_enqueued.append(
+                    f"  auto-enqueued: {a.repo_name} #{a.issue_number} "
+                    f"({a.branch} → {repo_cfg.default_branch})"
+                )
+    for line in auto_enqueued:
+        click.echo(line)
+
     items = mq.load_queue()
     if repo_filter:
         items = [x for x in items if x.repo_name == repo_filter]
     if not items:
-        click.echo("Merge queue is empty.")
+        # Distinguish "nothing in the queue" from "nothing to do because
+        # there's no completed work to merge" — the latter is the common
+        # case before #242 was fixed and was the silent-fail symptom.
+        if board is not None and any(
+            a.type == "work" and a.status == "done" and a.branch
+            for a in board.completed
+            if (not repo_filter or a.repo_name == repo_filter)
+        ):
+            click.echo("Merge queue is empty (all done-work is already merged or has no branch).")
+        else:
+            click.echo("Merge queue is empty (no completed work to merge).")
         return
 
     presorted = False
