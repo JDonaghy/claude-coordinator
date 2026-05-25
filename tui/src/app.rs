@@ -4077,11 +4077,14 @@ impl CoordApp {
         };
         let Some(sel) = self.pipeline_sel else { return false; };
         let Some(issue) = self.pipeline_issues.get(sel).cloned() else { return false; };
-        // Failed AND Stale both use the retry path — Failed re-dispatches
-        // because the prior attempt errored; Stale re-dispatches because an
-        // upstream stage was re-run after this stage's last successful run.
+        // Failed → retry the failed assignment (re-dispatch via `coord retry`).
+        // Stale → fall through to fresh dispatch: the previous attempt SUCCEEDED
+        //         against an older revision, so there is no failed-row to retry;
+        //         we want a brand-new assignment against the new upstream.
+        //         (Routing Stale into the retry path produces a misleading
+        //         "no failed assignment found" error.)
         let stage_status = self.stage_status_for(&issue, &stage_name);
-        let is_retry = stage_status == StageStatus::Failed || stage_status == StageStatus::Stale;
+        let is_retry = stage_status == StageStatus::Failed;
         match stage_name.as_str() {
             "plan" => {
                 if is_retry {
