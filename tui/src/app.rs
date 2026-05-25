@@ -3835,6 +3835,11 @@ impl CoordApp {
         // pipeline_issues swap) and only fall back to the internal capture
         // when the caller didn't touch the list.
         let prev_sel = prev_sel_override.or_else(|| self.capture_pipeline_selection_id());
+        // Preserve panel scroll across rebuilds — without this, every 15 s
+        // refresh resets the sidebar's scroll to 0 and yanks the visible
+        // area back to the top, even when the selection itself is restored
+        // correctly. The user wants "the view should not change on refresh".
+        let prev_panel_scroll = self.pipeline_sidebar.panel_scroll();
 
         // Collect unique repo keys in stable order (issues are already sorted
         // by repo_slug within fetch_pipeline_issues).
@@ -3984,6 +3989,12 @@ impl CoordApp {
         }
         // Sync `pipeline_sel` to the sidebar's actual selection.
         self.pipeline_sel = self.selected_pipeline_index();
+        // Restore panel scroll so the visible area doesn't jump back to the
+        // top on every refresh.  Done after selection restore so the active-
+        // section's keyboard nav state is set up correctly before scroll is
+        // applied (scroll_to_active_section calls in handle_key_selection
+        // assume an active section).
+        self.pipeline_sidebar.set_panel_scroll(prev_panel_scroll);
     }
 
     /// Resolve the SidebarSystem's current selection to a `pipeline_issues`
@@ -8992,6 +9003,66 @@ mod tests {
         assert_eq!(
             app.capture_pipeline_selection_id(),
             Some(("other/repo".to_string(), 99)),
+        );
+    }
+
+    /// The 15s pipeline refresh used to reset the sidebar's panel scroll
+    /// to 0, which yanked the visible area to the top even when the
+    /// selection itself was restored.  Test that the scroll offset is
+    /// preserved across a rebuild_pipeline_sidebar call.
+    #[test]
+    fn rebuild_pipeline_sidebar_preserves_panel_scroll() {
+        let mut app = make_pipeline_app();
+        // Set a non-zero panel scroll (simulating the user having scrolled).
+        app.pipeline_sidebar.set_panel_scroll(42.0);
+        assert_eq!(app.pipeline_sidebar.panel_scroll(), 42.0);
+
+        // Simulate a refresh that doesn't change the issue list.
+        app.rebuild_pipeline_sidebar(None);
+
+        assert_eq!(
+            app.pipeline_sidebar.panel_scroll(),
+            42.0,
+            "panel scroll must survive rebuild — otherwise the view yanks to top on refresh",
+        );
+    }
+
+    /// The combined scenario from the user's report: refresh swaps
+    /// pipeline_issues, selection is restored via the explicit override,
+    /// AND the scroll offset is preserved so the visible area doesn't move.
+    #[test]
+    fn rebuild_pipeline_sidebar_preserves_both_selection_and_scroll() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.pipeline_sidebar.set_panel_scroll(17.5);
+
+        let prev_sel = app.capture_pipeline_selection_id();
+        let mut new_issues = vec![PipelineIssue {
+            number: 7,
+            title: "Just appeared".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        new_issues.extend(app.pipeline_issues.clone());
+        app.pipeline_issues = new_issues;
+
+        app.rebuild_pipeline_sidebar(prev_sel);
+
+        assert_eq!(
+            app.pipeline_sel
+                .and_then(|i| app.pipeline_issues.get(i))
+                .map(|i| i.number),
+            Some(42),
+            "selection still on the original issue",
+        );
+        assert_eq!(
+            app.pipeline_sidebar.panel_scroll(),
+            17.5,
+            "scroll preserved alongside selection",
         );
     }
 
