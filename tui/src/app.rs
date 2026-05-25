@@ -305,6 +305,52 @@ struct MergeQueueEntry {
     state: String,
     pr_number: Option<i64>,
     pr_url: Option<String>,
+    /// Repo slug (owner/name) — needed to call `gh pr checks --repo <slug>`.
+    /// Joined from the `merge_queue.repo_github` column.
+    repo_github: String,
+}
+
+/// CI check status for one PR, fetched in the background via `gh pr checks`.
+///
+/// Populated from `fetch_ci_checks_summary` and stored on `CoordApp` keyed by
+/// `(repo_github, pr_number)`. Drives the "Checks: 2✓ 1✗" line under the
+/// Merge stage in the Pipeline detail tab and the "Checks failed" status bar
+/// hint when Merge is actionable.
+#[derive(Clone, Debug)]
+struct CiCheckSummary {
+    passed: usize,
+    failed: usize,
+    running: usize,
+    /// Names of failed checks (for the status-bar hint and detail row).
+    failed_names: Vec<String>,
+    /// URL of the first failed check — surfaced as a clickable link target
+    /// in the detail row. We only show one in the terse summary; the user
+    /// can press Enter to open the PR for the full list.
+    first_failed_url: Option<String>,
+    /// When this summary was fetched. Used to TTL the cache.
+    fetched_at: Instant,
+}
+
+impl CiCheckSummary {
+    fn has_failures(&self) -> bool {
+        self.failed > 0
+    }
+
+    /// One-line summary like `2✓ 1✗ 1⋯`. Empty string when no checks at all
+    /// (caller can suppress the row in that case).
+    fn terse(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.passed > 0 {
+            parts.push(format!("{}✓", self.passed));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{}✗", self.failed));
+        }
+        if self.running > 0 {
+            parts.push(format!("{}⋯", self.running));
+        }
+        parts.join(" ")
+    }
 }
 
 #[derive(Clone)]
@@ -924,6 +970,7 @@ fn pipeline_merge_item(entry: Option<&MergeQueueEntry>) -> ListItem {
                 "merged" => ("  ✓", Color::rgb(120, 200, 120), pr_label),
                 "open" | "queued" => ("  ~", Color::rgb(80, 220, 80), pr_label),
                 "failed" => ("  ✗", Color::rgb(220, 70, 70), pr_label),
+                "human_required" => ("  !", Color::rgb(220, 100, 100), "needs manual rebase".to_string()),
                 _ => ("  -", Color::rgb(100, 100, 100), pr_label),
             }
         }
@@ -938,10 +985,9 @@ fn pipeline_merge_item(entry: Option<&MergeQueueEntry>) -> ListItem {
         },
         icon: None,
         detail: None,
-        decoration: if entry.map(|e| e.state.as_str()) == Some("failed") {
-            Decoration::Error
-        } else {
-            Decoration::Normal
+        decoration: match entry.map(|e| e.state.as_str()) {
+            Some("failed") | Some("human_required") => Decoration::Error,
+            _ => Decoration::Normal,
         },
     }
 }
@@ -1116,7 +1162,7 @@ fn load_data() -> BoardData {
     // Join to assignments to resolve issue_number (merge_queue may not have it).
     let merge_queue: Vec<MergeQueueEntry> = {
         let mut stmt = match conn.prepare(
-            "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url \
+            "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url, mq.repo_github \
              FROM merge_queue mq \
              LEFT JOIN assignments a ON mq.assignment_id = a.assignment_id",
         ) {
@@ -1140,6 +1186,7 @@ fn load_data() -> BoardData {
                 state: row.get::<_, String>(2)?,
                 pr_number: row.get::<_, Option<i64>>(3)?,
                 pr_url: row.get::<_, Option<String>>(4)?,
+                repo_github: row.get::<_, String>(5)?,
             })
         }) {
             Ok(r) => r,
@@ -1691,6 +1738,75 @@ fn fetch_pipeline_issues(
     PipelineLoaderResult::Ok(issues)
 }
 
+/// Fetch CI check summary for one PR by shelling out to `gh pr checks`.
+///
+/// Mirrors what `coord/ci_github.py::GitHubCi.list_checks_for_pr` does on the
+/// Python side, but only computes the rolled-up counts the TUI needs. The
+/// returned `String` error is surfaced as a one-line status hint; the TUI
+/// silently retries on the next refresh.
+fn fetch_ci_check_summary(repo_slug: &str, pr_number: i64) -> Result<CiCheckSummary, String> {
+    let args = [
+        "pr".to_string(), "checks".to_string(), pr_number.to_string(),
+        "--repo".to_string(), repo_slug.to_string(),
+        "--json".to_string(), "name,state,conclusion,link".to_string(),
+    ];
+    let output = std::process::Command::new("gh")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("could not run gh: {}", e))?;
+    // `gh pr checks` exits non-zero when any check has failed but stdout is
+    // still valid JSON — only treat empty stdout as a real lookup failure.
+    let stdout = &output.stdout;
+    if stdout.is_empty() && !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|e| format!("gh JSON parse: {}", e))?;
+    let arr = value.as_array().cloned().unwrap_or_default();
+
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut running = 0usize;
+    let mut failed_names: Vec<String> = Vec::new();
+    let mut first_failed_url: Option<String> = None;
+    for item in &arr {
+        let state = item.get("state").and_then(|s| s.as_str()).unwrap_or("").to_lowercase();
+        let conclusion = item
+            .get("conclusion")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let name = item.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let link = item.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let is_completed = state == "completed" || state == "complete";
+        if !is_completed {
+            running += 1;
+            continue;
+        }
+        match conclusion.as_str() {
+            "success" => passed += 1,
+            "failure" | "cancelled" | "timed_out" | "action_required" => {
+                failed += 1;
+                failed_names.push(name);
+                if first_failed_url.is_none() && !link.is_empty() {
+                    first_failed_url = Some(link);
+                }
+            }
+            // skipped / neutral — count as passing for gate purposes
+            _ => passed += 1,
+        }
+    }
+
+    Ok(CiCheckSummary {
+        passed,
+        failed,
+        running,
+        failed_names,
+        first_failed_url,
+        fetched_at: Instant::now(),
+    })
+}
+
 /// Read pipeline-related entries from the `board_meta` table.
 ///
 /// Returns ``(default_gates, tracked_labels, repos, require_plan)`` with
@@ -1901,6 +2017,17 @@ pub struct CoordApp {
     /// Drained by `poll_test_build_jobs` each tick — completed entries are
     /// removed and surfaced as toasts. Empty in the steady state.
     test_build_jobs: std::collections::HashMap<String, TestBuildJob>,
+    /// #240: CI check summaries for PRs in the merge queue, keyed by
+    /// `(repo_github, pr_number)`. Populated by background `gh pr checks`
+    /// fetches when the Pipeline view is focused. Cached entries with
+    /// `fetched_at.elapsed() > 30s` are refetched on the next kick.
+    pipeline_ci_checks: std::collections::HashMap<(String, i64), CiCheckSummary>,
+    /// #240: in-flight CI-check fetches keyed by `(repo_github, pr_number)`.
+    /// Drained each tick by `poll_ci_check_loaders`.
+    pipeline_ci_loader: std::collections::HashMap<
+        (String, i64),
+        std::sync::mpsc::Receiver<Result<CiCheckSummary, String>>,
+    >,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -1983,6 +2110,8 @@ impl CoordApp {
             settings_field_sel: 0,
             audio_prev_running: std::collections::HashSet::new(),
             test_build_jobs: std::collections::HashMap::new(),
+            pipeline_ci_checks: std::collections::HashMap::new(),
+            pipeline_ci_loader: std::collections::HashMap::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar();
@@ -3967,6 +4096,11 @@ impl CoordApp {
     /// else (or no entry) → Pending for open issues, Skipped for closed issues
     /// (the merge never ran through coord).
     fn merge_stage_status_for(&self, issue: &PipelineIssue) -> StageStatus {
+        // #241: a running conflict-fix worker keeps the Merge stage Active —
+        // the auto-rebase is part of the merge phase, not a separate stage.
+        if self.has_active_conflict_fix(issue) {
+            return StageStatus::Active;
+        }
         let entry = self
             .data
             .merge_queue
@@ -3975,9 +4109,20 @@ impl CoordApp {
         match entry.map(|e| e.state.as_str()) {
             Some("merged") => StageStatus::Done,
             Some("open") | Some("queued") => StageStatus::Active,
-            Some("failed") => StageStatus::Failed,
+            // #241: HUMAN_REQUIRED (failed conflict-fix) — the merge needs a
+            // human, so Failed.  `failed` (legacy / direct) is also Failed.
+            Some("failed") | Some("human_required") => StageStatus::Failed,
             _ => if issue.is_closed { StageStatus::Skipped } else { StageStatus::Pending },
         }
+    }
+
+    /// #241: is there a conflict-fix worker currently in flight for *issue*?
+    fn has_active_conflict_fix(&self, issue: &PipelineIssue) -> bool {
+        self.data.assignments.iter().any(|a| {
+            a.issue_number == issue.number
+                && a.assignment_type.as_deref() == Some("conflict-fix")
+                && (a.status == "running" || a.status == "pending")
+        })
     }
 
     /// #200: Resolve the Test gate status from `test_state` on the latest
@@ -4803,6 +4948,86 @@ impl CoordApp {
         self.pipeline_last_load = Some(Instant::now());
     }
 
+    /// Kick off background `gh pr checks` polls for any PR in the merge
+    /// queue without a fresh CI summary on hand.  No-op outside the Pipeline
+    /// view; entries fetched within the last 30 s are skipped.  Each poll
+    /// runs in its own thread so the UI is never blocked on `gh`.
+    fn maybe_kick_ci_check_loaders(&mut self) {
+        if self.active_view != SidebarView::Pipeline {
+            return;
+        }
+        let stale = Duration::from_secs(30);
+        // Snapshot the queue so we don't hold a borrow across mutable self.
+        let targets: Vec<(String, i64)> = self
+            .data
+            .merge_queue
+            .iter()
+            .filter_map(|m| {
+                let pr = m.pr_number?;
+                if m.repo_github.is_empty() {
+                    return None;
+                }
+                Some((m.repo_github.clone(), pr))
+            })
+            .collect();
+        for key in targets {
+            if self.pipeline_ci_loader.contains_key(&key) {
+                continue;
+            }
+            if let Some(existing) = self.pipeline_ci_checks.get(&key) {
+                if existing.fetched_at.elapsed() < stale {
+                    continue;
+                }
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let repo = key.0.clone();
+            let pr = key.1;
+            std::thread::spawn(move || {
+                let _ = tx.send(fetch_ci_check_summary(&repo, pr));
+            });
+            self.pipeline_ci_loader.insert(key, rx);
+        }
+    }
+
+    /// Drain completed CI-check fetches into `pipeline_ci_checks`.  Returns
+    /// `true` when at least one summary changed (caller redraws).
+    fn poll_ci_check_loaders(&mut self) -> bool {
+        let keys: Vec<(String, i64)> = self.pipeline_ci_loader.keys().cloned().collect();
+        let mut changed = false;
+        for key in keys {
+            let result = self
+                .pipeline_ci_loader
+                .get(&key)
+                .and_then(|rx| rx.try_recv().ok());
+            let Some(result) = result else {
+                continue;
+            };
+            self.pipeline_ci_loader.remove(&key);
+            if let Ok(summary) = result {
+                self.pipeline_ci_checks.insert(key, summary);
+                changed = true;
+            }
+            // On error we leave any prior summary in place — a transient
+            // `gh` failure shouldn't blank the row.
+        }
+        changed
+    }
+
+    /// Look up the CI summary for the currently-selected pipeline issue's
+    /// merge queue entry.  Returns `None` when no PR is queued for the
+    /// selected issue, or when no summary has been fetched yet.
+    fn ci_summary_for_selected_issue(&self) -> Option<&CiCheckSummary> {
+        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let entry = self
+            .data
+            .merge_queue
+            .iter()
+            .find(|m| m.issue_number == Some(issue.number))?;
+        let pr = entry.pr_number?;
+        self.pipeline_ci_checks
+            .get(&(entry.repo_github.clone(), pr))
+    }
+
     /// Drain the in-flight poll channel without blocking. Returns `true`
     /// when results were received and the issue list/sidebar changed.
     fn poll_pipeline_loader(&mut self) -> bool {
@@ -5260,16 +5485,70 @@ impl CoordApp {
             items.push(kv_item("Assignment", id_short, Some(Color::rgb(160, 200, 220))));
             let state_color = match e.state.as_str() {
                 "merged" => Color::rgb(120, 200, 120),
-                "failed" => Color::rgb(220, 70, 70),
+                "failed" | "human_required" => Color::rgb(220, 70, 70),
                 "open" | "queued" => Color::rgb(220, 180, 100),
                 _ => Color::rgb(180, 180, 180),
             };
             items.push(kv_item("State", &e.state, Some(state_color)));
+            // #241: if a conflict-fix is in flight or the entry is now
+            // human_required, surface a one-line substate row so the user
+            // doesn't have to guess what's happening.
+            if let Some(cf) = self.data.assignments.iter().find(|a| {
+                a.issue_number == issue.number
+                    && a.assignment_type.as_deref() == Some("conflict-fix")
+                    && (a.status == "running" || a.status == "pending")
+            }) {
+                items.push(kv_item(
+                    "Conflict-fix",
+                    &format!("Fixing on {} (assignment {})", cf.machine, cf.id),
+                    Some(Color::rgb(220, 180, 100)),
+                ));
+            } else if e.state == "human_required" {
+                items.push(kv_item(
+                    "Conflict-fix",
+                    "auto-fix did not resolve — manual rebase required",
+                    Some(Color::rgb(220, 100, 100)),
+                ));
+            }
             if let Some(pr) = e.pr_number {
                 items.push(kv_item("PR", &format!("#{}", pr), Some(Color::rgb(160, 200, 220))));
             }
             if let Some(url) = &e.pr_url {
                 items.push(kv_item("URL", url, Some(Color::rgb(140, 170, 210))));
+            }
+            // #240: surface CI check status under the Merge stage when a PR
+            // exists.  Loading state is implicit — the row only renders once
+            // the background fetch returns.
+            if let Some(pr) = e.pr_number {
+                if let Some(summary) = self
+                    .pipeline_ci_checks
+                    .get(&(e.repo_github.clone(), pr))
+                {
+                    let terse = summary.terse();
+                    let line = if summary.failed > 0 {
+                        let names = summary.failed_names.join(", ");
+                        let url = summary.first_failed_url.as_deref().unwrap_or("");
+                        if url.is_empty() {
+                            format!("{} — {} failed", terse, names)
+                        } else {
+                            format!("{} — {} failed ({})", terse, names, url)
+                        }
+                    } else if summary.running > 0 {
+                        format!("{} — checks still running", terse)
+                    } else if !terse.is_empty() {
+                        terse
+                    } else {
+                        "no checks".to_string()
+                    };
+                    let color = if summary.failed > 0 {
+                        Color::rgb(220, 100, 100)
+                    } else if summary.running > 0 {
+                        Color::rgb(220, 180, 100)
+                    } else {
+                        Color::rgb(120, 200, 120)
+                    };
+                    items.push(kv_item("Checks", &line, Some(color)));
+                }
             }
         }
     }
@@ -5883,6 +6162,23 @@ impl CoordApp {
             } else {
                 " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
             }
+        } else if self.active_view == SidebarView::Pipeline
+            && self
+                .ci_summary_for_selected_issue()
+                .map(|s| s.has_failures())
+                .unwrap_or(false)
+        {
+            // #240: when the selected pipeline issue's PR has failed CI
+            // checks, swap the default hint so the user can't merge without
+            // seeing it. coord merge will refuse by default; --force-merge
+            // bypasses.
+            let summary = self.ci_summary_for_selected_issue().unwrap();
+            let names = if summary.failed_names.len() > 2 {
+                format!("{} +{}", summary.failed_names[..2].join(", "), summary.failed_names.len() - 2)
+            } else {
+                summary.failed_names.join(", ")
+            };
+            format!(" Checks failed: {}  m=merge anyway  q=quit ", names)
         } else if proposals > 0 {
             format!(" p=plan  a=approve({})  m=merge  R=retry  P=purge  q=quit ", proposals)
         } else {
@@ -5943,6 +6239,12 @@ impl CoordApp {
 
         // Poll background gh issue loader
         if self.poll_pipeline_loader() {
+            needs_redraw = true;
+        }
+
+        // #240: keep merge-queue CI check summaries fresh on the Pipeline view.
+        self.maybe_kick_ci_check_loaders();
+        if self.poll_ci_check_loaders() {
             needs_redraw = true;
         }
 
@@ -7592,6 +7894,8 @@ mod tests {
             settings_field_sel: 0,
             audio_prev_running: std::collections::HashSet::new(),
             test_build_jobs: std::collections::HashMap::new(),
+            pipeline_ci_checks: std::collections::HashMap::new(),
+            pipeline_ci_loader: std::collections::HashMap::new(),
         }
     }
 
@@ -9357,6 +9661,7 @@ mod tests {
             state: "merged".to_string(),
             pr_number: Some(7),
             pr_url: Some("https://example/pr/7".to_string()),
+            repo_github: "acme/api".to_string(),
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Done);
@@ -9372,6 +9677,7 @@ mod tests {
             state: "open".to_string(),
             pr_number: Some(7),
             pr_url: None,
+            repo_github: "acme/api".to_string(),
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Active);
@@ -9404,6 +9710,7 @@ mod tests {
             state: "merged".to_string(),
             pr_number: Some(7),
             pr_url: None,
+            repo_github: "acme/api".to_string(),
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -9468,6 +9775,7 @@ mod tests {
             state: "failed".to_string(),
             pr_number: None,
             pr_url: None,
+            repo_github: "acme/api".to_string(),
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[2].status, StageStatus::Failed);

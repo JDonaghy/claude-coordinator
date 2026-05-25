@@ -64,10 +64,13 @@ class Assignment:
     finished_at: float | None = None
     smoke_test: str | None = None  # None | pass | fail
     smoke_test_reason: str | None = None
-    # "work" (default), "review", or "plan". Review assignments target an
-    # existing PR rather than implementing a fresh issue. Plan assignments
-    # are read-only: the worker analyses the codebase and outputs a structured
-    # plan without writing any code.
+    # "work" (default), "review", "plan", "smoke", or "conflict-fix".
+    # Review assignments target an existing PR rather than implementing a
+    # fresh issue. Plan assignments are read-only: the worker analyses the
+    # codebase and outputs a structured plan without writing any code.
+    # conflict-fix is dispatched when a merge fails with a mechanical
+    # (non-semantic) conflict — the worker rebases, resolves obvious
+    # additive merges, and force-pushes; the coordinator owns the retry.
     type: str = "work"
     review_target: str | None = None
     review_of_assignment_id: str | None = None

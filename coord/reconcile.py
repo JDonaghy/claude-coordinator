@@ -178,6 +178,9 @@ def reconcile(board: Board, config: Config) -> list[str]:
                         orig = board.find_by_id(orig_id)
                         if orig is not None:
                             orig.review_state = "done"
+                elif done.type == "conflict-fix":
+                    # #241: re-enqueue the parent merge entry for retry.
+                    _on_conflict_fix_done(done, succeeded=True)
         else:
             # Defensive: don't downgrade a DB-done assignment to failed when
             # the agent reports cancelled (e.g. after POST /cancel cleanup
@@ -192,6 +195,9 @@ def reconcile(board: Board, config: Config) -> list[str]:
             )
             if failed is not None:
                 newly_failed.append(failed)
+                if failed.type == "conflict-fix":
+                    # #241: the auto-fix didn't work — escalate to the user.
+                    _on_conflict_fix_done(failed, succeeded=False)
         changed.append(a.assignment_id)
 
     # Dispatch pending reviews for all completed work assignments.
@@ -261,3 +267,40 @@ def reconcile(board: Board, config: Config) -> list[str]:
             changed.append(a.assignment_id)
 
     return changed
+
+
+def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> None:
+    """Update the parent merge entry after a conflict-fix worker finishes.
+
+    On *succeeded*: the merge entry is reset to PENDING so the next
+    ``coord merge`` retries.  On failure: marked HUMAN_REQUIRED so the TUI
+    can surface "manual resolution required".
+
+    Looking up the parent entry by ``review_of_assignment_id`` (the original
+    work assignment's id) — that's the column conflict-fix reuses to link
+    back to its target.
+    """
+    parent_id = fix_assignment.review_of_assignment_id
+    if not parent_id:
+        return
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    items = mq.load_queue()
+    changed = False
+    for entry in items:
+        if entry.assignment_id != parent_id:
+            continue
+        if succeeded:
+            entry.state = mq.PENDING
+            entry.error = None
+            entry.last_attempt = None
+        else:
+            entry.state = mq.HUMAN_REQUIRED
+            existing_error = entry.error or "conflict-fix failed"
+            entry.error = (
+                f"{existing_error}; conflict-fix worker did not resolve. "
+                "Manual rebase required."
+            )
+        changed = True
+    if changed:
+        mq.save_queue(items)

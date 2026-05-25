@@ -983,6 +983,19 @@ def _fetch_pre_started_at(machines: list) -> dict[str, float | None]:
     return out
 
 
+def _machine_for_assignment(board, assignment_id: str | None) -> str | None:
+    """Return the machine name that ran *assignment_id*, or None.
+
+    Used by ``coord merge`` (#241) to prefer dispatching a conflict-fix to
+    the original worker's machine — that machine already has the repo
+    checked out, the branch present, and the test deps installed.
+    """
+    if assignment_id is None or board is None:
+        return None
+    target = board.find_by_id(assignment_id)
+    return target.machine_name if target is not None else None
+
+
 def _resolve_machine(cfg: Config, explicit_name: str | None):
     if explicit_name:
         m = next((m for m in cfg.machines if m.name == explicit_name), None)
@@ -2466,15 +2479,22 @@ def _load_issue_states() -> tuple[dict[str, set[int]], set[str]]:
     default="rebase",
     show_default=True,
 )
+@click.option(
+    "--force-merge",
+    is_flag=True,
+    help="Skip the CI check gate — merge even if checks failed or are still running.",
+)
 def merge(
     config_path: Path,
     dry_run: bool,
     order: str | None,
     repo_filter: str | None,
     method: str,
+    force_merge: bool,
 ) -> None:
     from coord import github_ops as gh_ops
     from coord import merge_queue as mq
+    from coord.ci_store import build_ci_store
     from coord.merge_queue import CONFLICT, MERGED, PENDING
     from coord.state import load_board
 
@@ -2571,12 +2591,68 @@ def merge(
             click.echo(f"  [{x.state}] {x.repo_name} #{x.issue_number} ({x.branch})")
         return
 
-    events = mq.process(items, gh_ops, method=method, dry_run=dry_run, presorted=presorted)
+    ci_store = build_ci_store(cfg.ci_store.type)
+    events = mq.process(
+        items, gh_ops,
+        method=method, dry_run=dry_run, presorted=presorted,
+        ci_store=ci_store, force_merge=force_merge,
+    )
 
     for ev in events:
         e = ev.entry
         prefix = f"  {e.repo_name} #{e.issue_number} ({e.branch})"
         click.echo(f"{prefix}: {ev.kind} — {ev.message}")
+
+    # #241: classify any conflict events and dispatch a conflict-fix worker
+    # for the eligible ones.  Only on a real merge run (not --dry-run) and
+    # after the queue is saved below — the dispatch path mutates the board,
+    # not the merge queue.
+    conflict_events = [ev for ev in events if ev.kind == "conflict"]
+    if conflict_events and not dry_run:
+        from coord.conflict_fix import dispatch_conflict_fix
+        from coord.merge_queue import HUMAN_REQUIRED, classify_conflict
+        from coord.state import load_board, save_board
+
+        fix_board = load_board()
+        if fix_board is not None:
+            dispatched_any = False
+            queue_changed = False
+            queue_items = mq.load_queue()
+            entries_by_id = {x.assignment_id: x for x in queue_items}
+            for ev in conflict_events:
+                kind = classify_conflict(ev.entry.error)
+                live_entry = entries_by_id.get(ev.entry.assignment_id, ev.entry)
+                if kind == "rebaseable":
+                    fix = dispatch_conflict_fix(
+                        live_entry,
+                        fix_board,
+                        cfg,
+                        prefer_machine=_machine_for_assignment(
+                            fix_board, live_entry.assignment_id,
+                        ),
+                    )
+                    if fix is not None:
+                        click.echo(
+                            f"  {live_entry.repo_name} #{live_entry.issue_number}: "
+                            f"conflict-fix dispatched to {fix.machine_name}"
+                        )
+                        dispatched_any = True
+                    else:
+                        click.echo(
+                            f"  {live_entry.repo_name} #{live_entry.issue_number}: "
+                            "conflict-fix not dispatched (no machine / already in flight)"
+                        )
+                elif kind == "human":
+                    live_entry.state = HUMAN_REQUIRED
+                    queue_changed = True
+                    click.echo(
+                        f"  {live_entry.repo_name} #{live_entry.issue_number}: "
+                        "permission/protection error — manual resolution required"
+                    )
+            if dispatched_any:
+                save_board(fix_board)
+            if queue_changed:
+                mq.save_queue(queue_items)
 
     # Save state only when we actually moved
     if not dry_run:

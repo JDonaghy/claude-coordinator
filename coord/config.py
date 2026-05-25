@@ -207,6 +207,20 @@ class PipelineConfig:
 
 
 @dataclass
+class CiStoreConfig:
+    """Backend selection for CI check visibility (#240).
+
+    ``type`` is one of ``github`` (shell out to ``gh pr checks``) or
+    ``none`` (always-empty :class:`coord.ci_store.NoOpCi`).  When the block
+    is absent we default to ``github`` since it's a no-op upgrade for users
+    who already have ``gh`` configured.  Future backends (GitLab, Buildkite)
+    add new ``type`` values without breaking existing configs.
+    """
+
+    type: str = "github"
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
@@ -217,6 +231,7 @@ class Config:
     models: ModelsConfig = field(default_factory=ModelsConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
+    ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -249,6 +264,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     models = _parse_models(raw.get("models"))
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
+    ci_store = _parse_ci_store(raw.get("ci_store"))
 
     return Config(
         repos=repos,
@@ -260,6 +276,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
         models=models,
         pipeline=pipeline,
         dispatch=dispatch,
+        ci_store=ci_store,
         path=p,
     )
 
@@ -672,6 +689,21 @@ def _parse_dispatch(raw: Any) -> DispatchConfig:
             raise ConfigError("dispatch.require_plan must be a boolean")
         cfg.require_plan = value
 
+    return cfg
+
+
+def _parse_ci_store(raw: Any) -> CiStoreConfig:
+    if raw is None:
+        return CiStoreConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'ci_store' must be a mapping")
+
+    cfg = CiStoreConfig()
+    if "type" in raw:
+        value = raw["type"]
+        if not isinstance(value, str) or value not in ("github", "none"):
+            raise ConfigError("ci_store.type must be one of: github, none")
+        cfg.type = value
     return cfg
 
 

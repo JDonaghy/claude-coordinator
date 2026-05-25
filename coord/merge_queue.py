@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Protocol
 
+from coord.ci_store import CiStore, NoOpCi, failed_checks, in_flight_checks, summarize
 from coord.db import get_connection
 from coord.models import Assignment
 from coord.state import COORD_DIR
@@ -27,6 +28,48 @@ MERGING = "merging"
 MERGED = "merged"
 CONFLICT = "conflict"
 SKIPPED = "skipped"
+# Set on a merge entry whose conflict-fix attempt also failed — the user must
+# resolve the conflict by hand.  See #241.
+HUMAN_REQUIRED = "human_required"
+
+
+# ── Conflict classification ─────────────────────────────────────────────────
+
+_REBASEABLE_SIGNALS = (
+    "could not be rebased",
+    "merge conflict",
+    "not up to date",
+    "non-fast-forward",
+    "behind the base branch",
+)
+
+_HUMAN_SIGNALS = (
+    "required status check",
+    "review required",
+    "permission",
+    "protected branch",
+    "branch protection",
+)
+
+
+def classify_conflict(error: str | None) -> str:
+    """Decide what kind of merge failure ``error`` represents.
+
+    Returns ``"rebaseable"`` (a mechanical rebase conflict an agent can
+    attempt), ``"human"`` (permission / branch protection — surface to the
+    user), or ``"unknown"`` (don't auto-dispatch; let the user inspect).
+
+    Used by ``coord merge`` (#241) to decide whether to spawn a
+    ``type="conflict-fix"`` assignment or surface the failure as-is.
+    """
+    if not error:
+        return "unknown"
+    text = error.lower()
+    if any(sig in text for sig in _HUMAN_SIGNALS):
+        return "human"
+    if any(sig in text for sig in _REBASEABLE_SIGNALS):
+        return "rebaseable"
+    return "unknown"
 
 
 @dataclass
@@ -181,6 +224,8 @@ def process(
     method: str = "rebase",
     dry_run: bool = False,
     presorted: bool = False,
+    ci_store: CiStore | None = None,
+    force_merge: bool = False,
 ) -> list[MergeEvent]:
     """Open PRs, size them, then merge each pending item.
 
@@ -189,9 +234,16 @@ def process(
     order — call `sequence(group)` first if you want size-based ordering.
     Set `presorted=True` to make that explicit at call sites.
 
+    When ``ci_store`` is provided and available, each PR is checked against
+    its CI status before merge.  A failed check produces a ``checks_failed``
+    event and halts the group; a still-running check produces ``checks_pending``
+    and halts the group.  ``force_merge=True`` skips this gate (the user has
+    already seen the failures and chosen to merge anyway).
+
     Mutates `items` in place; the caller saves the queue after.
     """
     events: list[MergeEvent] = []
+    ci: CiStore = ci_store if ci_store is not None else NoOpCi()
 
     groups: dict[tuple[str, str], list[QueuedMerge]] = {}
     for entry in items:
@@ -239,6 +291,27 @@ def process(
         for entry in ordered:
             if entry.pr_number is None:
                 continue
+            # CI gate (#240): refuse to merge when checks are failed or
+            # still running.  --force-merge overrides for the case where the
+            # user has seen the failures and wants to merge anyway.
+            if not force_merge and ci.is_available:
+                checks = ci.list_checks_for_pr(entry.repo_github, entry.pr_number)
+                failed = failed_checks(checks)
+                if failed:
+                    summary = ", ".join(
+                        f"{c.name} ({c.conclusion})" for c in failed
+                    )
+                    msg = f"checks failed: {summary}"
+                    entry.error = msg
+                    events.append(MergeEvent(entry, "checks_failed", msg))
+                    break  # halt this (repo, target) group
+                pending = in_flight_checks(checks)
+                if pending:
+                    summary = ", ".join(c.name for c in pending)
+                    msg = f"checks still running: {summary}"
+                    entry.error = msg
+                    events.append(MergeEvent(entry, "checks_pending", msg))
+                    break
             entry.last_attempt = time.time()
             entry.state = MERGING
             ok, msg = gh_ops.merge_pr(entry.repo_github, entry.pr_number, method=method)
