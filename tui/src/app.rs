@@ -40,11 +40,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags};
 
 use quadraui::compose::app_shell::{AppShellEvent, AppShellLayout, PanelDefinition};
+use quadraui::compose::form_controller::{FormController, FormControllerEvent};
 use quadraui::compose::sidebar_system::{
     NavigationMode, SidebarEvent, SidebarSectionDef, SidebarSystem,
 };
 use quadraui::primitives::form::{FieldKind, Form, FormEvent, FormField};
 use quadraui::primitives::toast::{ToastCorner, ToastItem, ToastSeverity, ToastStack};
+
+use crate::settings::{LogCacheTtl, ModelPref, RefreshCadence, Theme, TuiSettings};
 use quadraui::{
     Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
@@ -54,9 +57,6 @@ use quadraui::{
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
-
-/// Reload board data every 5 seconds.
-const REFRESH_EVERY: Duration = Duration::from_secs(5);
 
 /// Auto-run `coord notify` every 30 seconds when assignments are running.
 const NOTIFY_EVERY: Duration = Duration::from_secs(30);
@@ -196,6 +196,8 @@ enum SidebarView {
     Machines,
     /// Pipeline panel: tracked-issue list + horizontal stage view per issue.
     Pipeline,
+    /// Settings panel: category nav on the left, form controls on the right.
+    Settings,
 }
 
 impl SidebarView {
@@ -204,6 +206,7 @@ impl SidebarView {
             SidebarView::Board => "Board",
             SidebarView::Machines => "Machines",
             SidebarView::Pipeline => "Pipeline",
+            SidebarView::Settings => "Settings",
         }
     }
 }
@@ -1876,6 +1879,24 @@ pub struct CoordApp {
     /// field drops the `Receiver`, which signals the background thread to exit
     /// (it detects the disconnect on the next `tx.send()` call).
     watch_sse: Option<WatchSseState>,
+
+    // ── Settings panel ───────────────────────────────────────────────────
+    /// Persisted user settings loaded from `~/.coord/settings.toml`.
+    settings: TuiSettings,
+    /// FormController backing the settings form (right pane).
+    ///
+    /// `RefCell` is used so the form can be rebuilt and rendered from the
+    /// `&self` render path (same pattern as `remote_log_cache`).
+    settings_form: std::cell::RefCell<FormController>,
+    /// Which category row is selected in the settings sidebar (left pane).
+    settings_category_sel: usize,
+    /// Which interactive field is focused within the current category's form.
+    /// Reset to 0 when the category changes.
+    settings_field_sel: usize,
+    /// Assignment IDs that were in `running` state at the most recent data
+    /// refresh.  Used to detect running→done/failed transitions so we can
+    /// ring the terminal bell when `audio_on_completion` is enabled.
+    audio_prev_running: std::collections::HashSet<String>,
     /// #235 Phase 1: in-flight Test-stage build jobs keyed by work_id.
     /// Drained by `poll_test_build_jobs` each tick — completed entries are
     /// removed and surfaced as toasts. Empty in the steady state.
@@ -1956,6 +1977,11 @@ impl CoordApp {
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
+            settings: TuiSettings::load(),
+            settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
+            settings_category_sel: 0,
+            settings_field_sel: 0,
+            audio_prev_running: std::collections::HashSet::new(),
             test_build_jobs: std::collections::HashMap::new(),
         };
         app.rebuild_board_sidebar();
@@ -1992,6 +2018,13 @@ impl CoordApp {
                     icon: "▶".into(),
                     tooltip: "Pipeline".into(),
                     title: "PIPELINE".into(),
+                },
+                PanelDefinition {
+                    id: WidgetId::new("panel:settings"),
+                    // ⚙ gear icon for settings.
+                    icon: "⚙".into(),
+                    tooltip: "Settings".into(),
+                    title: "SETTINGS".into(),
                 },
             ],
         )
@@ -2387,6 +2420,16 @@ impl CoordApp {
         };
         match rx.try_recv() {
             Ok(data) => {
+                // Snapshot which assignments were running before the update so
+                // we can detect running→done/failed transitions for the audio bell.
+                let prev_running: std::collections::HashSet<String> = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.status == "running")
+                    .map(|a| a.id.clone())
+                    .collect();
+
                 self.data = data;
                 self.pending_data = None;
                 self.refreshed_at = Instant::now();
@@ -2399,6 +2442,32 @@ impl CoordApp {
                 }
                 self.rebuild_board_sidebar();
                 self.rebuild_pipeline_sidebar();
+
+                // Ring the terminal bell (BEL) when an assignment that was
+                // running is now done or failed, if the user enabled audio.
+                if self.settings.audio_on_completion && !prev_running.is_empty() {
+                    let newly_finished = self
+                        .data
+                        .assignments
+                        .iter()
+                        .any(|a| {
+                            (a.status == "done" || a.status == "failed")
+                                && prev_running.contains(&a.id)
+                        });
+                    if newly_finished {
+                        // BEL character — rings the terminal bell or triggers
+                        // a system notification depending on terminal settings.
+                        eprint!("\x07");
+                    }
+                }
+                self.audio_prev_running = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.status == "running")
+                    .map(|a| a.id.clone())
+                    .collect();
+
                 true
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
@@ -3342,13 +3411,13 @@ impl CoordApp {
             }
         }
 
-        // 3. Cache hit (within 2-second TTL). Short TTL makes the Watch
-        // overlay feel like tail -f rather than a periodic poll. Cost is
-        // negligible — at most one HTTP request every 2 s per visible log.
+        // 3. Cache hit (within the configured TTL). Short TTL makes the Watch
+        // overlay feel like tail -f rather than a periodic poll. TTL is
+        // user-configurable in the Settings panel (default 2 s).
         {
             let cache = self.remote_log_cache.borrow();
             if let Some((fetched_at, items)) = cache.get(id) {
-                if fetched_at.elapsed() < Duration::from_secs(2) {
+                if fetched_at.elapsed() < self.settings.log_cache_ttl.as_duration() {
                     return items.clone();
                 }
             }
@@ -4542,12 +4611,25 @@ impl CoordApp {
         };
         let machine_name = machine.name.clone();
         let issue_str = issue.number.to_string();
-        let spawned = self.command_runner.spawn(&[
-            "assign",
-            &machine_name,
-            &coord_repo,
-            &issue_str,
-        ]);
+        // Inject session-level model override when the user configured one for
+        // this machine in Settings → Dispatch → Per-Machine Model Overrides.
+        let model_str = self
+            .settings
+            .machine_model
+            .get(&machine_name)
+            .map(|p| p.as_str().to_string());
+        let mut cmd: Vec<String> = vec![
+            "assign".into(),
+            machine_name.clone(),
+            coord_repo.clone(),
+            issue_str.clone(),
+        ];
+        if let Some(ref m) = model_str {
+            cmd.push("--model".into());
+            cmd.push(m.clone());
+        }
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let spawned = self.command_runner.spawn(&cmd_refs);
         if spawned {
             self.pipeline_status = Some((
                 format!("dispatched #{} → {}", issue.number, machine_name),
@@ -4588,13 +4670,25 @@ impl CoordApp {
         };
         let machine_name = machine.name.clone();
         let issue_str = issue.number.to_string();
-        let spawned = self.command_runner.spawn(&[
-            "assign",
-            "--plan-only",
-            &machine_name,
-            &coord_repo,
-            &issue_str,
-        ]);
+        // Inject session-level model override when configured for this machine.
+        let model_str = self
+            .settings
+            .machine_model
+            .get(&machine_name)
+            .map(|p| p.as_str().to_string());
+        let mut cmd: Vec<String> = vec![
+            "assign".into(),
+            "--plan-only".into(),
+            machine_name.clone(),
+            coord_repo.clone(),
+            issue_str.clone(),
+        ];
+        if let Some(ref m) = model_str {
+            cmd.push("--model".into());
+            cmd.push(m.clone());
+        }
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let spawned = self.command_runner.spawn(&cmd_refs);
         if spawned {
             self.pipeline_status = Some((
                 format!("plan dispatched for #{} → {}", issue.number, machine_name),
@@ -5419,13 +5513,72 @@ impl CoordApp {
                     _ => false,
                 }
             }
+            SidebarView::Settings => {
+                // Hit-test the category list: row 0 is the title strip;
+                // category i starts at row 1+i.
+                let lh = backend.line_height();
+                if lh > 0.0 {
+                    let row = ((pos.y - sidebar_b.y) / lh).floor() as usize;
+                    if row >= 1 {
+                        let cat_idx = row - 1;
+                        let max = Self::settings_categories().len();
+                        if cat_idx < max && cat_idx != self.settings_category_sel {
+                            self.settings_category_sel = cat_idx;
+                            self.settings_field_sel = 0;
+                            self.settings_form.borrow_mut().set_scroll_offset(0);
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
         }
     }
 
-    /// Click in the main panel — in Pipeline view this handles the tab
-    /// bar and the PipelineView primitive hit-test (Go action). In Board
-    /// view this handles the Board/Issue tab bar. Machines is a no-op.
+    /// Handle a left-click in the main panel.
+    ///
+    /// Routes the click to the right handler depending on the active view:
+    /// - **Settings** — delegates to the `FormController` (field clicks, toggle, segmented control).
+    /// - **Board** — handles the Board/Issue tab bar.
+    /// - **Pipeline** — handles the tab bar and the `PipelineView` primitive
+    ///   hit-test (dispatches the Go action when a stage button is clicked).
+    /// - **Machines** — no-op (no interactive elements in the main panel).
     fn mouse_main_click(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
+        if self.active_view == SidebarView::Settings {
+            // Route click to FormController. FormController::handle_cached
+            // uses metrics cached by render_and_cache().
+            use quadraui::Modifiers;
+            let click_event = UiEvent::MouseDown {
+                widget: None,
+                button: MouseButton::Left,
+                position: pos,
+                modifiers: Modifiers::default(),
+            };
+            let result = self.settings_form.borrow_mut().handle_cached(&click_event, main_b);
+            match result {
+                FormControllerEvent::FormAction(ref form_event) => {
+                    // Sync keyboard focus indicator to the clicked field so
+                    // keyboard navigation picks up from where the mouse clicked.
+                    let clicked_id = match form_event {
+                        FormEvent::SegmentedControlChanged { id, .. }
+                        | FormEvent::ToggleChanged { id, .. } => Some(id.clone()),
+                        _ => None,
+                    };
+                    let changed = self.apply_settings_event(form_event);
+                    if changed {
+                        if let Some(id) = clicked_id {
+                            let field_ids = self.settings_interactive_field_ids();
+                            if let Some(pos) = field_ids.iter().position(|fid| fid == &id) {
+                                self.settings_field_sel = pos;
+                            }
+                        }
+                    }
+                    return changed;
+                }
+                FormControllerEvent::ScrollChanged | FormControllerEvent::Consumed => return true,
+                FormControllerEvent::Ignored => return false,
+            }
+        }
         if self.active_view == SidebarView::Board {
             // Tab bar: " Board " (7 chars) ~ x_off < 7, then " Issue ".
             let tab_h = lh * 1.4;
@@ -5525,6 +5678,20 @@ impl CoordApp {
                 self.pipeline_sidebar.handle(event, backend, sidebar_b);
                 true
             }
+            SidebarView::Settings => {
+                // Scroll the category list.
+                let max = Self::settings_categories().len().saturating_sub(1);
+                if delta.y > 0.0 && self.settings_category_sel > 0 {
+                    self.settings_category_sel -= 1;
+                    self.settings_field_sel = 0;
+                    self.settings_form.borrow_mut().set_scroll_offset(0);
+                } else if delta.y < 0.0 && self.settings_category_sel < max {
+                    self.settings_category_sel += 1;
+                    self.settings_field_sel = 0;
+                    self.settings_form.borrow_mut().set_scroll_offset(0);
+                }
+                true
+            }
         }
     }
 
@@ -5608,6 +5775,16 @@ impl CoordApp {
                 let _ = visible;
                 true
             }
+            SidebarView::Settings => {
+                // Forward scroll to FormController (scrolls through form fields).
+                let scroll_event = UiEvent::Scroll {
+                    widget: None,
+                    position: Point::new(0.0, 0.0),
+                    delta,
+                };
+                self.settings_form.borrow_mut().handle_cached(&scroll_event, main_b);
+                true
+            }
         }
     }
 
@@ -5638,7 +5815,7 @@ impl CoordApp {
             // (now wired to mouse clicks) are unreachable for users who don't
             // know about the activity-bar key shortcuts.
             StatusBarSegment {
-                text: format!(" {}  [1=Board 2=Machines 3=Pipeline] ", view_label),
+                text: format!(" {}  [1=Board 2=Machines 3=Pipeline 4=Settings] ", view_label),
                 fg: Color::rgb(200, 220, 255),
                 bg: Color::rgb(40, 60, 90),
                 bold: false,
@@ -5744,7 +5921,13 @@ impl CoordApp {
         }
 
         // Auto-refresh: kick off background data load when interval elapses.
-        if self.refreshed_at.elapsed() >= REFRESH_EVERY && self.pending_data.is_none() {
+        // Uses the user-configured cadence from settings (default 5 s); when
+        // the cadence is "Off" no automatic reload happens (manual `r` still works).
+        let should_refresh = match self.settings.refresh_cadence.as_duration() {
+            Some(cadence) => self.refreshed_at.elapsed() >= cadence,
+            None => false,
+        };
+        if should_refresh && self.pending_data.is_none() {
             self.pending_data = Some(start_data_load());
             if self.active_view == SidebarView::Pipeline {
                 self.maybe_kick_pipeline_loader();
@@ -5933,6 +6116,273 @@ impl CoordApp {
 
         got_new
     }
+
+    // ─── Settings panel ───────────────────────────────────────────────────────
+
+    /// Category labels shown in the settings sidebar (left nav).
+    fn settings_categories() -> &'static [&'static str] {
+        &[
+            "Display",
+            "Refresh",
+            "Notifications",
+            "Watch Overlay",
+            "Machine Models",
+        ]
+    }
+
+    /// Build a `ListView` for the settings category nav (sidebar left pane).
+    fn settings_category_list(&self) -> ListView {
+        let cats = Self::settings_categories();
+        let n = cats.len();
+        let items: Vec<ListItem> = cats
+            .iter()
+            .map(|label| {
+                ListItem {
+                    text: StyledText::plain(format!("  {}", label)),
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Normal,
+                }
+            })
+            .collect();
+        ListView {
+            id: WidgetId::new("settings-categories"),
+            title: Some(StyledText::plain(format!(" SETTINGS ({}) ", n))),
+            items,
+            selected_idx: self.settings_category_sel,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: false,
+        }
+    }
+
+    /// Build the `Form` for the currently-selected settings category.
+    ///
+    /// Each category maps to a set of `FormField`s.  Field IDs are stable
+    /// across renders so the `FormController` can match events correctly.
+    fn build_settings_form(&self) -> Form {
+        let mut fields: Vec<FormField> = Vec::new();
+
+        match self.settings_category_sel {
+            // ── Display ────────────────────────────────────────────────
+            0 => {
+                fields.push(settings_label("Theme"));
+                fields.push(FormField {
+                    id: WidgetId::new("settings:theme"),
+                    label: StyledText::plain("Theme"),
+                    kind: FieldKind::SegmentedControl {
+                        options: Theme::LABELS.iter().map(|s| s.to_string()).collect(),
+                        selected_idx: self.settings.theme.to_idx(),
+                    },
+                    hint: StyledText::plain("Visual style (Light/High Contrast coming soon)"),
+                    disabled: false,
+                    validation: None,
+                });
+            }
+
+            // ── Refresh ────────────────────────────────────────────────
+            1 => {
+                fields.push(settings_label("Auto-Refresh"));
+                fields.push(FormField {
+                    id: WidgetId::new("settings:cadence"),
+                    label: StyledText::plain("Cadence"),
+                    kind: FieldKind::SegmentedControl {
+                        options: RefreshCadence::LABELS.iter().map(|s| s.to_string()).collect(),
+                        selected_idx: self.settings.refresh_cadence.to_idx(),
+                    },
+                    hint: StyledText::plain("How often the board is reloaded from the database"),
+                    disabled: false,
+                    validation: None,
+                });
+            }
+
+            // ── Notifications ──────────────────────────────────────────
+            2 => {
+                fields.push(settings_label("Notifications"));
+                fields.push(FormField {
+                    id: WidgetId::new("settings:audio"),
+                    label: StyledText::plain("Audio on completion"),
+                    kind: FieldKind::Toggle { value: self.settings.audio_on_completion },
+                    hint: StyledText::plain("Ring a bell when an assignment finishes"),
+                    disabled: false,
+                    validation: None,
+                });
+            }
+
+            // ── Watch Overlay ──────────────────────────────────────────
+            3 => {
+                fields.push(settings_label("Watch Overlay"));
+                fields.push(FormField {
+                    id: WidgetId::new("settings:log-ttl"),
+                    label: StyledText::plain("Log cache TTL"),
+                    kind: FieldKind::SegmentedControl {
+                        options: LogCacheTtl::LABELS.iter().map(|s| s.to_string()).collect(),
+                        selected_idx: self.settings.log_cache_ttl.to_idx(),
+                    },
+                    hint: StyledText::plain("How long a fetched log is reused before re-requesting"),
+                    disabled: false,
+                    validation: None,
+                });
+            }
+
+            // ── Machine Models ─────────────────────────────────────────
+            _ => {
+                fields.push(settings_label("Per-Machine Model Overrides"));
+                if self.data.machines.is_empty() {
+                    fields.push(FormField {
+                        id: WidgetId::new("settings:no-machines"),
+                        label: StyledText::plain("No machines available"),
+                        kind: FieldKind::ReadOnly {
+                            value: StyledText::plain("—"),
+                        },
+                        hint: StyledText::plain("Machines are discovered from coordinator.yml"),
+                        disabled: true,
+                        validation: None,
+                    });
+                }
+                for machine in &self.data.machines {
+                    let current_pref = self
+                        .settings
+                        .machine_model
+                        .get(&machine.name)
+                        .copied()
+                        .unwrap_or_default();
+                    fields.push(FormField {
+                        id: WidgetId::new(format!("settings:model:{}", machine.name)),
+                        label: StyledText::plain(machine.name.clone()),
+                        kind: FieldKind::SegmentedControl {
+                            options: ModelPref::LABELS.iter().map(|s| s.to_string()).collect(),
+                            selected_idx: current_pref.to_idx(),
+                        },
+                        hint: StyledText::plain("Session-level override; coordinator.yml is the project default"),
+                        disabled: false,
+                        validation: None,
+                    });
+                }
+            }
+        }
+
+        // Compute focused_field from settings_field_sel, skipping label fields.
+        let interactive: Vec<WidgetId> = fields
+            .iter()
+            .filter(|f| !matches!(f.kind, FieldKind::Label | FieldKind::ReadOnly { .. }))
+            .map(|f| f.id.clone())
+            .collect();
+        let focused_field = interactive.get(self.settings_field_sel).cloned();
+
+        Form {
+            id: WidgetId::new("settings-form"),
+            fields,
+            focused_field,
+            scroll_offset: self.settings_form.borrow().scroll_offset(),
+            has_focus: true,
+        }
+    }
+
+    /// Return the IDs of the interactive (non-label, non-read-only) fields
+    /// for the current settings category, in form order.
+    ///
+    /// Used to map `settings_field_sel` to a concrete field when handling
+    /// keyboard events.
+    fn settings_interactive_field_ids(&self) -> Vec<WidgetId> {
+        let form = self.build_settings_form();
+        form.fields
+            .iter()
+            .filter(|f| !matches!(f.kind, FieldKind::Label | FieldKind::ReadOnly { .. }))
+            .map(|f| f.id.clone())
+            .collect()
+    }
+
+    /// Handle a directional key (h/l or Left/Right) against the focused
+    /// settings form field.  Returns `true` when a setting changed.
+    ///
+    /// Builds the form only once to avoid the double-rebuild that occurred
+    /// when `settings_interactive_field_ids` and the field-kind lookup both
+    /// called `build_settings_form` separately.
+    fn settings_change_focused(&mut self, direction: i32) -> bool {
+        // Build once; extract both the interactive-field list and the kind.
+        let form = self.build_settings_form();
+        let interactive: Vec<_> = form
+            .fields
+            .iter()
+            .filter(|f| !matches!(f.kind, FieldKind::Label | FieldKind::ReadOnly { .. }))
+            .collect();
+        let Some(field) = interactive.get(self.settings_field_sel) else {
+            return false;
+        };
+        let field_id = field.id.clone();
+
+        let event = match &field.kind {
+            FieldKind::SegmentedControl { options, selected_idx } => {
+                let n = options.len();
+                if n == 0 {
+                    return false;
+                }
+                let new_idx = if direction > 0 {
+                    (selected_idx + 1) % n
+                } else {
+                    selected_idx.checked_sub(1).unwrap_or(n - 1)
+                };
+                FormEvent::SegmentedControlChanged {
+                    id: field_id,
+                    selected_idx: new_idx,
+                }
+            }
+            FieldKind::Toggle { value } => {
+                FormEvent::ToggleChanged {
+                    id: field_id,
+                    value: !value,
+                }
+            }
+            _ => return false,
+        };
+        self.apply_settings_event(&event)
+    }
+
+    /// Apply a `FormEvent` from the settings form to the settings state,
+    /// save to disk, and return `true` if something changed.
+    ///
+    /// When the save fails (e.g. read-only home directory), a non-fatal
+    /// error toast is shown so the user is aware without interrupting their
+    /// workflow.
+    fn apply_settings_event(&mut self, event: &FormEvent) -> bool {
+        match event {
+            FormEvent::SegmentedControlChanged { id, selected_idx } => {
+                match id.as_str() {
+                    "settings:theme" => {
+                        self.settings.theme = Theme::from_idx(*selected_idx);
+                    }
+                    "settings:cadence" => {
+                        self.settings.refresh_cadence = RefreshCadence::from_idx(*selected_idx);
+                    }
+                    "settings:log-ttl" => {
+                        self.settings.log_cache_ttl = LogCacheTtl::from_idx(*selected_idx);
+                    }
+                    field_id if field_id.starts_with("settings:model:") => {
+                        let machine = field_id["settings:model:".len()..].to_string();
+                        self.settings.machine_model.insert(machine, ModelPref::from_idx(*selected_idx));
+                    }
+                    _ => return false,
+                }
+                if let Err(e) = self.settings.save() {
+                    self.push_toast("Settings", &format!("could not persist settings: {e}"), ToastSeverity::Error);
+                }
+                true
+            }
+            FormEvent::ToggleChanged { id, value } => {
+                if id.as_str() == "settings:audio" {
+                    self.settings.audio_on_completion = *value;
+                    if let Err(e) = self.settings.save() {
+                        self.push_toast("Settings", &format!("could not persist settings: {e}"), ToastSeverity::Error);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
 }
 
 // ─── ShellApp implementation ──────────────────────────────────────────────────
@@ -5965,6 +6415,9 @@ impl ShellApp for CoordApp {
                 SidebarView::Pipeline => {
                     self.pipeline_sidebar.render(backend, sidebar_rect);
                 }
+                SidebarView::Settings => {
+                    backend.draw_list(sidebar_rect, &self.settings_category_list());
+                }
             }
         }
 
@@ -5994,6 +6447,14 @@ impl ShellApp for CoordApp {
             }
             SidebarView::Machines => {
                 backend.draw_list(m, &self.machine_detail_list());
+            }
+            SidebarView::Settings => {
+                // Build form for the current category and render via
+                // FormController (handles scrollbar + layout).
+                let form = self.build_settings_form();
+                let mut fc = self.settings_form.borrow_mut();
+                fc.set_form(form);
+                fc.render_and_cache(backend, m);
             }
             SidebarView::Pipeline => {
                 // Watch overlay takes over the entire main panel when active —
@@ -6269,6 +6730,69 @@ impl ShellApp for CoordApp {
                         self.maybe_kick_pipeline_loader();
                         needs_redraw = true;
                     }
+                    Key::Char('4') => {
+                        self.active_view = SidebarView::Settings;
+                        needs_redraw = true;
+                    }
+
+                    // ── Settings panel keyboard nav ──────────────────────
+                    // j/Down — next category
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Settings =>
+                    {
+                        let max = Self::settings_categories().len().saturating_sub(1);
+                        if self.settings_category_sel < max {
+                            self.settings_category_sel += 1;
+                            self.settings_field_sel = 0;
+                            self.settings_form.borrow_mut().set_scroll_offset(0);
+                        }
+                        needs_redraw = true;
+                    }
+                    // k/Up — previous category
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Settings =>
+                    {
+                        if self.settings_category_sel > 0 {
+                            self.settings_category_sel -= 1;
+                            self.settings_field_sel = 0;
+                            self.settings_form.borrow_mut().set_scroll_offset(0);
+                        }
+                        needs_redraw = true;
+                    }
+                    // Tab — next interactive field within the form
+                    Key::Named(NamedKey::Tab)
+                        if self.active_view == SidebarView::Settings =>
+                    {
+                        let count = self.settings_interactive_field_ids().len();
+                        if count > 1 {
+                            self.settings_field_sel = (self.settings_field_sel + 1) % count;
+                        }
+                        needs_redraw = true;
+                    }
+                    // l/Right — next option (SegmentedControl) or toggle (Toggle)
+                    Key::Char('l') | Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Settings =>
+                    {
+                        if self.settings_change_focused(1) {
+                            needs_redraw = true;
+                        }
+                    }
+                    // h/Left — previous option
+                    Key::Char('h') | Key::Named(NamedKey::Left)
+                        if self.active_view == SidebarView::Settings =>
+                    {
+                        if self.settings_change_focused(-1) {
+                            needs_redraw = true;
+                        }
+                    }
+                    // Space/Enter — toggle or select current field
+                    Key::Char(' ') | Key::Named(NamedKey::Enter)
+                        if self.active_view == SidebarView::Settings =>
+                    {
+                        if self.settings_change_focused(1) {
+                            needs_redraw = true;
+                        }
+                    }
 
                     // ── Tab — cycle sections within Board SidebarSystem ──
                     Key::Named(NamedKey::Tab)
@@ -6330,6 +6854,8 @@ impl ShellApp for CoordApp {
                                     self.pipeline_detail_scroll = 0;
                                 }
                             }
+                            // Settings: handled by the earlier guarded arm.
+                            SidebarView::Settings => {}
                         }
                         needs_redraw = true;
                     }
@@ -6362,6 +6888,8 @@ impl ShellApp for CoordApp {
                                     self.pipeline_detail_scroll = 0;
                                 }
                             }
+                            // Settings: handled by the earlier guarded arm.
+                            SidebarView::Settings => {}
                         }
                         needs_redraw = true;
                     }
@@ -6427,6 +6955,11 @@ impl ShellApp for CoordApp {
                                 self.pipeline_sidebar.handle(&event, backend, list_b);
                                 self.pipeline_sel = self.selected_pipeline_index();
                             }
+                            SidebarView::Settings => {
+                                self.settings_category_sel = 0;
+                                self.settings_field_sel = 0;
+                                self.settings_form.borrow_mut().set_scroll_offset(0);
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -6453,6 +6986,12 @@ impl ShellApp for CoordApp {
                             SidebarView::Pipeline => {
                                 self.pipeline_sidebar.handle(&event, backend, list_b);
                                 self.pipeline_sel = self.selected_pipeline_index();
+                            }
+                            SidebarView::Settings => {
+                                let last = Self::settings_categories().len().saturating_sub(1);
+                                self.settings_category_sel = last;
+                                self.settings_field_sel = 0;
+                                self.settings_form.borrow_mut().set_scroll_offset(0);
                             }
                         }
                         needs_redraw = true;
@@ -6706,6 +7245,7 @@ impl ShellApp for CoordApp {
                     self.maybe_kick_pipeline_loader();
                     SidebarView::Pipeline
                 }
+                "panel:settings" => SidebarView::Settings,
                 _ => return,
             };
         }
@@ -6802,6 +7342,20 @@ fn issue_body_list(
         scroll_offset,
         has_focus: false,
         bordered: false,
+    }
+}
+
+// ─── Settings helpers ─────────────────────────────────────────────────────────
+
+/// Build a non-interactive category label `FormField` for the settings form.
+fn settings_label(text: &str) -> FormField {
+    FormField {
+        id: WidgetId::new(format!("settings-label:{}", text.to_lowercase().replace(' ', "-"))),
+        label: StyledText::plain(text.to_string()),
+        kind: FieldKind::Label,
+        hint: StyledText::default(),
+        disabled: false,
+        validation: None,
     }
 }
 
@@ -7032,6 +7586,11 @@ mod tests {
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
+            settings: TuiSettings::default(),
+            settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
+            settings_category_sel: 0,
+            settings_field_sel: 0,
+            audio_prev_running: std::collections::HashSet::new(),
             test_build_jobs: std::collections::HashMap::new(),
         }
     }
@@ -9666,5 +10225,120 @@ mod tests {
             t.spans.iter().map(|s| s.text.clone()).collect::<String>()
         }).unwrap_or_default();
         assert!(title.contains("R=refresh"), "title should show R=refresh hint, got: {}", title);
+    }
+
+    // ── Settings: apply_settings_event ────────────────────────────────────────
+
+    #[test]
+    fn apply_settings_event_theme_mutates_and_returns_true() {
+        use crate::settings::Theme;
+        let mut app = make_app_default();
+        app.settings.theme = Theme::Dark;
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:theme"),
+            selected_idx: Theme::Light.to_idx(),
+        };
+        let changed = app.apply_settings_event(&ev);
+        assert!(changed, "should return true on theme change");
+        assert_eq!(app.settings.theme, Theme::Light);
+    }
+
+    #[test]
+    fn apply_settings_event_cadence_mutates_and_returns_true() {
+        use crate::settings::RefreshCadence;
+        let mut app = make_app_default();
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:cadence"),
+            selected_idx: RefreshCadence::ThirtySec.to_idx(),
+        };
+        assert!(app.apply_settings_event(&ev));
+        assert_eq!(app.settings.refresh_cadence, RefreshCadence::ThirtySec);
+    }
+
+    #[test]
+    fn apply_settings_event_log_ttl_mutates_and_returns_true() {
+        use crate::settings::LogCacheTtl;
+        let mut app = make_app_default();
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:log-ttl"),
+            selected_idx: LogCacheTtl::FiveSec.to_idx(),
+        };
+        assert!(app.apply_settings_event(&ev));
+        assert_eq!(app.settings.log_cache_ttl, LogCacheTtl::FiveSec);
+    }
+
+    #[test]
+    fn apply_settings_event_audio_toggle_mutates_and_returns_true() {
+        let mut app = make_app_default();
+        assert!(!app.settings.audio_on_completion);
+        let ev = FormEvent::ToggleChanged {
+            id: WidgetId::new("settings:audio"),
+            value: true,
+        };
+        assert!(app.apply_settings_event(&ev));
+        assert!(app.settings.audio_on_completion);
+    }
+
+    #[test]
+    fn apply_settings_event_machine_model_mutates_and_returns_true() {
+        use crate::settings::ModelPref;
+        let mut app = make_app_default();
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:model:mybox"),
+            selected_idx: ModelPref::Opus.to_idx(),
+        };
+        assert!(app.apply_settings_event(&ev));
+        assert_eq!(app.settings.machine_model.get("mybox"), Some(&ModelPref::Opus));
+    }
+
+    #[test]
+    fn apply_settings_event_unknown_id_returns_false() {
+        let mut app = make_app_default();
+        let ev = FormEvent::SegmentedControlChanged {
+            id: WidgetId::new("settings:nonexistent"),
+            selected_idx: 0,
+        };
+        assert!(!app.apply_settings_event(&ev), "unknown ID should return false");
+    }
+
+    #[test]
+    fn apply_settings_event_unknown_toggle_id_returns_false() {
+        let mut app = make_app_default();
+        let ev = FormEvent::ToggleChanged {
+            id: WidgetId::new("settings:not-audio"),
+            value: true,
+        };
+        assert!(!app.apply_settings_event(&ev), "unknown toggle ID should return false");
+    }
+
+    // ── Settings: settings_change_focused ─────────────────────────────────────
+
+    #[test]
+    fn settings_change_focused_wraps_forward_from_last_to_first() {
+        use crate::settings::Theme;
+        // Category 0 (Appearance) has a theme SegmentedControl with 3 options.
+        let mut app = make_app_default();
+        app.settings_category_sel = 0;
+        app.settings.theme = Theme::HighContrast; // last option (idx 2)
+        app.settings_field_sel = 0; // the theme field is the first interactive field
+
+        // Forward from last option → wraps to first.
+        let changed = app.settings_change_focused(1);
+        assert!(changed, "should change when wrapping");
+        assert_eq!(app.settings.theme, Theme::Dark, "should wrap from HighContrast → Dark");
+    }
+
+    #[test]
+    fn settings_change_focused_wraps_backward_from_first_to_last() {
+        use crate::settings::Theme;
+        let mut app = make_app_default();
+        app.settings_category_sel = 0;
+        app.settings.theme = Theme::Dark; // first option (idx 0)
+        app.settings_field_sel = 0;
+
+        // Backward from first option → wraps to last.
+        let changed = app.settings_change_focused(-1);
+        assert!(changed, "should change when wrapping backward");
+        assert_eq!(app.settings.theme, Theme::HighContrast, "should wrap from Dark → HighContrast");
     }
 }

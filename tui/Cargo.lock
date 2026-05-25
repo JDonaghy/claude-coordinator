@@ -178,7 +178,9 @@ dependencies = [
  "gethostname",
  "quadraui",
  "rusqlite",
+ "serde",
  "serde_json",
+ "toml",
  "ureq",
 ]
 
