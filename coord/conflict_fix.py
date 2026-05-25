@@ -39,14 +39,16 @@ into the project's target branch failed because the branch is out of date \
 or has a conflict. Your job is to rebase the branch and push it back.
 
 Rules:
-- Do NOT run gh commands. The coordinator handles the merge retry.
+- The coordinator denies `gh` and `git push --force` for this worker. \
+Don't try to use them — the harness will reject the call.
 - Stay on the worker's branch — do NOT push to main / develop / target.
 - Use git push --force-with-lease (NOT --force).
 - If conflicts are mechanical (non-overlapping struct fields, list entries, \
 imports, separate functions), resolve them additively — keep both sides.
 - If conflicts are SEMANTIC (same function modified two ways, contradictory \
-logic), DO NOT GUESS. Post a comment on the issue describing the conflict \
-regions and exit non-zero. The user will resolve manually.
+logic), DO NOT GUESS. Exit non-zero with a clear STUCK: line describing the \
+conflict regions. The coordinator will surface this on the issue and the \
+user resolves manually.
 
 Progress reporting:
 - After each significant step (rebase started, conflicts resolved, tests \
@@ -56,6 +58,16 @@ passed, pushed), output:
   STUCK: [what you tried] [why it failed]
   Then stop and wait for guidance.\
 """
+
+# Denied for conflict-fix workers. The agent's deny_commands enforcement
+# (coord/agent.py:build_deny_prompt + harness gate) refuses these patterns
+# regardless of what the prompt asks for. Keeps CLAUDE.md's "gh is denied"
+# claim honest (#243-review-2).
+CONFLICT_FIX_DENY_COMMANDS = [
+    "Bash(gh *)",
+    "Bash(git push --force *)",
+    "Bash(git push -f *)",
+]
 
 
 def build_conflict_fix_briefing(
@@ -91,10 +103,13 @@ def build_conflict_fix_briefing(
         "",
         "If the conflict is **semantic** — the same function modified two",
         "different ways, contradictory logic, an API rename that the other",
-        "side doesn't know about — DO NOT guess. Post a comment on issue",
-        f"#{entry.issue_number} describing the conflict regions and exit non-zero.",
+        "side doesn't know about — DO NOT guess. Exit non-zero with a",
+        "`STUCK:` line that names the file(s) and line ranges in conflict.",
+        f"The coordinator will post that on issue #{entry.issue_number} and",
+        "mark the merge entry as needing human resolution.",
         "",
-        "You will NOT use `gh`. The coordinator owns PR retries.",
+        "You will NOT use `gh` or `git push --force` — both are denied by",
+        "the harness. The coordinator owns PR retries and issue posting.",
     ]
     return "\n".join(lines)
 
@@ -206,6 +221,15 @@ def dispatch_conflict_fix(
         test_command=repo.test_command,
     )
 
+    # Merge repo-level deny rules with the conflict-fix-specific ones so
+    # `gh` and `git push --force` are actually denied (not just discouraged
+    # by the system prompt).  Dedupe by simple set conversion — patterns
+    # are exact strings on the agent side, so collisions are safe to fold.
+    repo_deny = (
+        list(repo.worker_permissions.deny) if repo.worker_permissions else []
+    )
+    deny_commands = list(dict.fromkeys(repo_deny + CONFLICT_FIX_DENY_COMMANDS))
+
     payload = {
         "repo_name": entry.repo_name,
         "repo_path": repo_path,
@@ -215,6 +239,7 @@ def dispatch_conflict_fix(
         "files_allowed": [],
         "files_forbidden": [],
         "pull_repos": [],
+        "deny_commands": deny_commands,
         "type": "conflict-fix",
         "system_prompt": CONFLICT_FIX_SYSTEM_PROMPT,
         "review_target": entry.branch,
