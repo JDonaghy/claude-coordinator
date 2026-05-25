@@ -3840,6 +3840,16 @@ impl CoordApp {
         // area back to the top, even when the selection itself is restored
         // correctly. The user wants "the view should not change on refresh".
         let prev_panel_scroll = self.pipeline_sidebar.panel_scroll();
+        // Preserve per-section collapse state by repo name (section indices
+        // may shift if repos are added/removed between rebuilds, so we key
+        // by the repo identifier rather than the section index).  Mirrors
+        // the pattern already used by rebuild_board_sidebar.
+        let prev_collapsed: std::collections::HashMap<String, bool> = self
+            .pipeline_repo_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), self.pipeline_sidebar.is_collapsed(i)))
+            .collect();
 
         // Collect unique repo keys in stable order (issues are already sorted
         // by repo_slug within fetch_pipeline_issues).
@@ -3989,6 +3999,14 @@ impl CoordApp {
         }
         // Sync `pipeline_sel` to the sidebar's actual selection.
         self.pipeline_sel = self.selected_pipeline_index();
+        // Restore per-section collapse state by repo name.  Sections that
+        // didn't exist before stay expanded by default (a new repo
+        // appearing shouldn't be hidden from the user).
+        for (i, name) in self.pipeline_repo_names.iter().enumerate() {
+            if let Some(&was_collapsed) = prev_collapsed.get(name) {
+                self.pipeline_sidebar.set_collapsed(i, was_collapsed);
+            }
+        }
         // Restore panel scroll so the visible area doesn't jump back to the
         // top on every refresh.  Done after selection restore so the active-
         // section's keyboard nav state is set up correctly before scroll is
@@ -9024,6 +9042,71 @@ mod tests {
             app.pipeline_sidebar.panel_scroll(),
             42.0,
             "panel scroll must survive rebuild — otherwise the view yanks to top on refresh",
+        );
+    }
+
+    /// Section collapse state must survive a rebuild — without this, the
+    /// user collapses the large claude-coordinator section and watches it
+    /// re-expand on every 15 s refresh.
+    #[test]
+    fn rebuild_pipeline_sidebar_preserves_section_collapsed_state() {
+        let mut app = make_pipeline_app();
+        // make_pipeline_app has two sections: "api" (index 0) and "other/repo"
+        // (index 1). Collapse the first one.
+        app.pipeline_sidebar.set_collapsed(0, true);
+        assert!(app.pipeline_sidebar.is_collapsed(0));
+        assert!(!app.pipeline_sidebar.is_collapsed(1));
+
+        // Rebuild — without the fix this resets collapse state to default
+        // (expanded) for every section.
+        app.rebuild_pipeline_sidebar(None);
+
+        assert!(
+            app.pipeline_sidebar.is_collapsed(0),
+            "section 0 collapse state must survive rebuild",
+        );
+        assert!(
+            !app.pipeline_sidebar.is_collapsed(1),
+            "section 1 stays expanded as it was",
+        );
+    }
+
+    /// Collapse state is keyed by repo name, not section index — when the
+    /// section order changes (e.g. a new repo appears at index 0), the
+    /// existing repos' collapse state must follow them to their new
+    /// indices.
+    #[test]
+    fn rebuild_pipeline_sidebar_collapse_state_follows_repo_through_reorder() {
+        let mut app = make_pipeline_app();
+        // Collapse "api" (index 0 in the fixture).
+        app.pipeline_sidebar.set_collapsed(0, true);
+
+        // Inject a new repo's issue at the front so its section becomes index 0.
+        app.pipeline_issues.insert(0, PipelineIssue {
+            number: 1,
+            title: "New repo issue".to_string(),
+            body: String::new(),
+            repo_slug: "new/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+
+        app.rebuild_pipeline_sidebar(None);
+
+        // After rebuild: pipeline_repo_names should be [new/repo, api, other/repo].
+        // The new repo at index 0 stays expanded; "api" (now index 1) keeps its
+        // collapsed=true; "other/repo" (now index 2) stays expanded.
+        let names = &app.pipeline_repo_names;
+        assert_eq!(names.iter().position(|n| n == "api"), Some(1));
+        assert!(
+            app.pipeline_sidebar.is_collapsed(1),
+            "api's collapsed state followed it from index 0 to index 1",
+        );
+        assert!(
+            !app.pipeline_sidebar.is_collapsed(0),
+            "new section is not retroactively collapsed",
         );
     }
 
