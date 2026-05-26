@@ -885,3 +885,80 @@ def test_assignment_save_load_roundtrips_cost_usd(coord_db) -> None:
     save_board(Board(completed=[a]))
     board = load_board()
     assert board.completed[0].cost_usd == 1.23
+
+
+# ── #252: smoke_tests column + update_assignment_smoke_tests ────────────────
+
+
+def test_assignment_save_load_roundtrips_smoke_tests(coord_db) -> None:
+    """Assignment.smoke_tests survives the upsert + ORM mapping —
+    distinguish None / empty list / populated list cleanly."""
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="sm1", status="done",
+        smoke_tests=["one — trigger — outcome", "two — trigger — outcome"],
+    )
+    save_board(Board(completed=[a]))
+    board = load_board()
+    assert board.completed[0].smoke_tests == [
+        "one — trigger — outcome",
+        "two — trigger — outcome",
+    ]
+
+
+def test_smoke_tests_empty_list_distinguished_from_none(coord_db) -> None:
+    """[] (worker said "change is internal") must NOT collapse to None
+    on roundtrip — the TUI uses the distinction to render different
+    messages."""
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="sm2", status="done",
+        smoke_tests=[],
+    )
+    save_board(Board(completed=[a]))
+    board = load_board()
+    # Explicit empty list, not None.
+    assert board.completed[0].smoke_tests == []
+    assert board.completed[0].smoke_tests is not None
+
+
+def test_smoke_tests_none_stays_null(coord_db) -> None:
+    """Default Assignment with smoke_tests=None (no block was emitted)
+    persists as SQL NULL and loads back as None."""
+    from coord.db import get_connection
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="sm3", status="done",
+    )
+    save_board(Board(completed=[a]))
+    row = get_connection().execute(
+        "SELECT smoke_tests FROM assignments WHERE assignment_id='sm3'"
+    ).fetchone()
+    assert row["smoke_tests"] is None
+
+    board = load_board()
+    assert board.completed[0].smoke_tests is None
+
+
+def test_update_assignment_smoke_tests_persists_list(coord_db) -> None:
+    """The notify-side helper writes the JSON-encoded list to the row."""
+    from coord.db import get_connection
+    from coord.state import update_assignment_smoke_tests
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="sm4", status="done",
+    )
+    save_board(Board(completed=[a]))
+    update_assignment_smoke_tests("sm4", ["item one", "item two"])
+
+    row = get_connection().execute(
+        "SELECT smoke_tests FROM assignments WHERE assignment_id='sm4'"
+    ).fetchone()
+    import json as _json
+    assert _json.loads(row["smoke_tests"]) == ["item one", "item two"]
+
+
+def test_update_assignment_smoke_tests_unknown_id_silent_noop(coord_db) -> None:
+    from coord.state import update_assignment_smoke_tests
+    # Just must not raise.
+    update_assignment_smoke_tests("ghost", ["x"])

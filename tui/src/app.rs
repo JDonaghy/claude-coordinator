@@ -269,6 +269,14 @@ struct Assignment {
     /// #208: worker cost captured from the final stream-json result event.
     /// `None` for in-flight workers and for pre-#208 rows.
     cost_usd: Option<f64>,
+    /// #252: worker-emitted smoke-test list, parsed from the SMOKE_TESTS
+    /// block in the worker's log.
+    ///
+    /// * `None`     — no block found (graceful degradation: TUI shows
+    ///                "inspect the diff" placeholder).
+    /// * `Some([])` — explicit "(none — change is internal)" form.
+    /// * `Some(vec)` — bullets to render under the Test stage.
+    smoke_tests: Option<Vec<String>>,
 }
 
 impl Assignment {
@@ -1369,7 +1377,8 @@ fn load_data() -> BoardData {
         let mut stmt = match conn.prepare(
             "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
              status, branch, model, type, dispatched_at, finished_at, exit_code, \
-             test_state, review_verdict, review_of_assignment_id, cost_usd \
+             test_state, review_verdict, review_of_assignment_id, cost_usd, \
+             smoke_tests \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1393,6 +1402,9 @@ fn load_data() -> BoardData {
                 review_verdict: row.get::<_, Option<String>>(13)?,
                 review_of_assignment_id: row.get::<_, Option<String>>(14)?,
                 cost_usd: row.get::<_, Option<f64>>(15)?,
+                smoke_tests: row
+                    .get::<_, Option<String>>(16)?
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok()),
             })
         }) {
             Ok(r) => r,
@@ -6414,6 +6426,41 @@ impl CoordApp {
             }
         }
 
+        // #252: worker-emitted smoke tests.  Three states (see
+        // Assignment.smoke_tests doc): None → graceful placeholder,
+        // empty list → "change is internal", non-empty → bullets.
+        items.push(kv_item("", "", None));
+        match latest.smoke_tests.as_deref() {
+            Some(tests) if !tests.is_empty() => {
+                items.push(kv_item(
+                    "Smoke tests",
+                    "(from worker)",
+                    Some(Color::rgb(160, 200, 220)),
+                ));
+                for t in tests {
+                    items.push(kv_item(
+                        "",
+                        &format!("  • {t}"),
+                        Some(Color::rgb(220, 220, 220)),
+                    ));
+                }
+            }
+            Some(_empty) => {
+                items.push(kv_item(
+                    "Smoke tests",
+                    "(none — worker reported change is internal)",
+                    Some(Color::rgb(160, 160, 180)),
+                ));
+            }
+            None => {
+                items.push(kv_item(
+                    "Smoke tests",
+                    "(worker did not provide a list — inspect the diff)",
+                    Some(Color::rgb(160, 160, 180)),
+                ));
+            }
+        }
+
         // Suggested next steps.
         let test_label = match test_status {
             StageStatus::Failed => "previously failed — press R to re-dispatch Work, or P/F/S to re-record",
@@ -10428,6 +10475,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         }
     }
 
@@ -10485,6 +10533,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         }
     }
 
@@ -11545,6 +11594,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -11580,6 +11630,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -11850,6 +11901,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         }
     }
 
@@ -12539,6 +12591,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -12577,6 +12630,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12615,6 +12669,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -12650,6 +12705,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -12725,6 +12781,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -12763,6 +12820,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -12788,6 +12846,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12818,6 +12877,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -12837,6 +12897,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12864,6 +12925,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -12916,6 +12978,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -12950,6 +13013,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -12968,6 +13032,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -13031,6 +13096,7 @@ mod tests {
                 review_verdict: None,
                 review_of_assignment_id: None,
                 cost_usd: None,
+                smoke_tests: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -13069,6 +13135,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -13102,6 +13169,7 @@ mod tests {
                 review_verdict: None,
                 review_of_assignment_id: None,
                 cost_usd: None,
+                smoke_tests: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -13140,6 +13208,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -13213,6 +13282,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -13246,6 +13316,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -13273,6 +13344,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -13300,6 +13372,7 @@ mod tests {
             review_verdict: None,
             review_of_assignment_id: None,
             cost_usd: None,
+            smoke_tests: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list

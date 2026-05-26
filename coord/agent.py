@@ -274,7 +274,28 @@ elsewhere), explicitly call it out in your final message with the \
 reason. Don't silently ship warnings.
 - Re-run the build after fixes to confirm clean output.
 - Run the project's test command (`cargo test`, `pytest`, etc.) and \
-confirm it passes before declaring done.\
+confirm it passes before declaring done.
+
+#252: before exiting, emit a SMOKE_TESTS block telling the human what to \
+manually verify.  You changed the code; you know what's worth poking.
+
+  SMOKE_TESTS:
+  - [scenario] — [how to trigger] — [what to look for]
+  - [scenario] — [how to trigger] — [what to look for]
+  END_SMOKE_TESTS
+
+Keep it to 2-5 items, one bullet per line.  Each bullet has three \
+em-dash-separated parts: the scenario, the trigger, and the success \
+signal.  Prefer scenarios that exercise the changed code paths, not \
+generic app sanity.  Include any commands the human should re-run on \
+their hardware (e.g. `cargo test --features gtk` when only that build \
+exercises the changed delegation).
+
+If the change is purely internal — no user-visible behaviour, no new \
+codepaths the existing test suite already covered — emit exactly:
+
+  SMOKE_TESTS: (none — change is internal)
+  END_SMOKE_TESTS\
 """
 
 WORKER_PLAN_PROMPT = """\

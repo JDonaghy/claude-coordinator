@@ -311,3 +311,121 @@ class TestHelpText:
         result = runner.invoke(main, ["stop", "--help"])
         assert result.exit_code == 0
         assert "Cancel" in result.output
+
+
+# ── #252: SMOKE_TESTS block parsing ─────────────────────────────────────────
+
+
+class TestSmokeTestsParser:
+    """Parse coord/progress.py::parse_smoke_tests_from_log handles the
+    three states described in the docstring: missing block (None),
+    explicit "(none — internal)" (empty list), or a populated list."""
+
+    def test_extract_three_bullet_list(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_tests_from_log
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "STATUS: writing test\n"
+            "SMOKE_TESTS:\n"
+            "- Pipeline right-click — click any Refined row — context menu appears\n"
+            "- GTK backend coverage — cargo test --features gtk — passes\n"
+            "- Theme switch — backend.set_theme(dark) then (light) — render reflects both\n"
+            "END_SMOKE_TESTS\n"
+            "STATUS: done\n",
+            encoding="utf-8",
+        )
+        result = parse_smoke_tests_from_log(log)
+        assert result is not None
+        assert len(result) == 3
+        assert "Pipeline right-click" in result[0]
+        assert "cargo test --features gtk" in result[1]
+        assert "backend.set_theme(dark)" in result[2]
+
+    def test_none_form_returns_empty_list(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_tests_from_log
+        log = tmp_path / "internal.log"
+        log.write_text(
+            "STATUS: refactor only\n"
+            "SMOKE_TESTS: (none — change is internal)\n"
+            "END_SMOKE_TESTS\n",
+            encoding="utf-8",
+        )
+        result = parse_smoke_tests_from_log(log)
+        assert result == []
+
+    def test_none_form_on_separate_line(self, tmp_path: Path) -> None:
+        """Some workers put the "(none — ...)" on the line after the
+        SMOKE_TESTS: header — the parser must tolerate both layouts."""
+        from coord.progress import parse_smoke_tests_from_log
+        log = tmp_path / "internal2.log"
+        log.write_text(
+            "SMOKE_TESTS:\n"
+            "(none — change is internal)\n"
+            "END_SMOKE_TESTS\n",
+            encoding="utf-8",
+        )
+        result = parse_smoke_tests_from_log(log)
+        assert result == []
+
+    def test_missing_block_returns_none(self, tmp_path: Path) -> None:
+        """Graceful degradation: a log with no SMOKE_TESTS block at all
+        returns None so the TUI can show a "inspect the diff" placeholder
+        rather than a misleading empty list."""
+        from coord.progress import parse_smoke_tests_from_log
+        log = tmp_path / "no-block.log"
+        log.write_text(
+            "STATUS: built\n"
+            "STATUS: tests passing\n"
+            "Done.\n",
+            encoding="utf-8",
+        )
+        assert parse_smoke_tests_from_log(log) is None
+
+    def test_empty_block_returns_none(self, tmp_path: Path) -> None:
+        """Worker emitted SMOKE_TESTS:/END_SMOKE_TESTS with nothing
+        between — treated the same as a missing block (graceful
+        degradation) so we don't show "(none — internal)" when the
+        worker just forgot."""
+        from coord.progress import parse_smoke_tests_from_log
+        log = tmp_path / "empty.log"
+        log.write_text(
+            "SMOKE_TESTS:\n"
+            "\n"
+            "END_SMOKE_TESTS\n",
+            encoding="utf-8",
+        )
+        assert parse_smoke_tests_from_log(log) is None
+
+    def test_picks_last_block_when_multiple(self, tmp_path: Path) -> None:
+        """Workers occasionally redo their summary if they reconsider
+        the change.  Take the LAST emitted block."""
+        from coord.progress import parse_smoke_tests_from_log
+        log = tmp_path / "multi.log"
+        log.write_text(
+            "SMOKE_TESTS:\n- old item\nEND_SMOKE_TESTS\n"
+            "STATUS: reconsidering\n"
+            "SMOKE_TESTS:\n- new item\nEND_SMOKE_TESTS\n",
+            encoding="utf-8",
+        )
+        result = parse_smoke_tests_from_log(log)
+        assert result == ["new item"]
+
+    def test_handles_star_bullets(self, tmp_path: Path) -> None:
+        """Workers may use `* ` instead of `- ` for bullets.  Both
+        styles parse identically."""
+        from coord.progress import parse_smoke_tests_from_log
+        log = tmp_path / "stars.log"
+        log.write_text(
+            "SMOKE_TESTS:\n"
+            "* one — trigger — outcome\n"
+            "* two — trigger — outcome\n"
+            "END_SMOKE_TESTS\n",
+            encoding="utf-8",
+        )
+        result = parse_smoke_tests_from_log(log)
+        assert result is not None
+        assert len(result) == 2
+
+    def test_nonexistent_log_returns_none(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_tests_from_log
+        assert parse_smoke_tests_from_log(tmp_path / "ghost.log") is None

@@ -727,3 +727,102 @@ class TestCostCapture:
         ).fetchone()
         assert row is not None
         assert row["cost_usd"] == 1.50
+
+
+# ── #252: smoke-test list capture on completion ──────────────────────────────
+
+
+def _make_log_with_smoke_tests(tmp_path: Path, tests: list[str]) -> str:
+    """Write a plain-text log carrying a SMOKE_TESTS block."""
+    log = tmp_path / "smoke.log"
+    bullets = "\n".join(f"- {t}" for t in tests)
+    log.write_text(
+        "STATUS: built\n"
+        "STATUS: tests passing\n"
+        f"SMOKE_TESTS:\n{bullets}\nEND_SMOKE_TESTS\n",
+        encoding="utf-8",
+    )
+    return str(log)
+
+
+class TestSmokeTestsCapture:
+    def test_list_persists_to_assignment_row(
+        self, coord_dir: Path, config: Config, tmp_path: Path,
+    ) -> None:
+        """A SMOKE_TESTS block in the log → JSON list in the row."""
+        _record("sm-cap1")
+        log_path = _make_log_with_smoke_tests(
+            tmp_path,
+            ["GTK build — cargo test --features gtk — passes",
+             "Theme switch — set_theme(dark)/light — render reflects both"],
+        )
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("sm-cap1", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        import json as _json
+        row = get_connection().execute(
+            "SELECT smoke_tests FROM assignments WHERE assignment_id='sm-cap1'"
+        ).fetchone()
+        assert row is not None
+        tests = _json.loads(row["smoke_tests"])
+        assert len(tests) == 2
+        assert "GTK build" in tests[0]
+        assert "Theme switch" in tests[1]
+
+    def test_missing_block_leaves_null(
+        self, coord_dir: Path, config: Config, tmp_path: Path,
+    ) -> None:
+        """No SMOKE_TESTS block → smoke_tests stays NULL (graceful
+        degradation for the TUI placeholder)."""
+        _record("sm-cap2")
+        log = tmp_path / "no-smoke.log"
+        log.write_text("STATUS: built\nSTATUS: done\n", encoding="utf-8")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("sm-cap2", "done", log_path=str(log))],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        row = get_connection().execute(
+            "SELECT smoke_tests FROM assignments WHERE assignment_id='sm-cap2'"
+        ).fetchone()
+        assert row is not None
+        assert row["smoke_tests"] is None
+
+    def test_internal_form_persists_as_empty_list(
+        self, coord_dir: Path, config: Config, tmp_path: Path,
+    ) -> None:
+        """Explicit "(none — change is internal)" → JSON "[]" so the
+        TUI shows "change is internal" rather than the inspect-the-diff
+        placeholder."""
+        _record("sm-cap3")
+        log = tmp_path / "internal.log"
+        log.write_text(
+            "SMOKE_TESTS: (none — change is internal)\n"
+            "END_SMOKE_TESTS\n",
+            encoding="utf-8",
+        )
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("sm-cap3", "done", log_path=str(log))],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        import json as _json
+        row = get_connection().execute(
+            "SELECT smoke_tests FROM assignments WHERE assignment_id='sm-cap3'"
+        ).fetchone()
+        assert row is not None
+        assert _json.loads(row["smoke_tests"]) == []

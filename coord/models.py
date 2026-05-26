@@ -130,6 +130,10 @@ class Assignment:
     # workers whose log lacked usage data).  Set on completion by
     # notify.py / reconcile via coord.usage.parse_usage_from_log.
     cost_usd: float | None = None
+    # #252: worker-emitted smoke-test list parsed from the SMOKE_TESTS
+    # block.  None = no block emitted (graceful TUI placeholder); [] =
+    # explicit "(none — change is internal)"; non-empty list = bullets.
+    smoke_tests: list[str] | None = None
 
 
 @dataclass

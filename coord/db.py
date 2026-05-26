@@ -95,7 +95,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             review_posted_at REAL,
             test_state TEXT,
             test_reason TEXT,
-            cost_usd REAL
+            cost_usd REAL,
+            smoke_tests TEXT
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -219,6 +220,9 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         "ALTER TABLE assignments ADD COLUMN review_verdict TEXT",
         # #208: worker cost captured from the final stream-json result event.
         "ALTER TABLE assignments ADD COLUMN cost_usd REAL",
+        # #252: worker-emitted smoke-test list (JSON array of strings;
+        # NULL = not emitted, '[]' = explicit "(none — internal)").
+        "ALTER TABLE assignments ADD COLUMN smoke_tests TEXT",
     ]
     for sql in migrations:
         try:

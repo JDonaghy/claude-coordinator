@@ -78,7 +78,31 @@ def _row_to_assignment(row: object) -> Assignment:
         test_reason=d.get("test_reason"),
         review_verdict=d.get("review_verdict"),
         cost_usd=d.get("cost_usd"),
+        # #252: stored as JSON; absent column → None (not parsed yet).
+        smoke_tests=_decode_smoke_tests(d.get("smoke_tests")),
     )
+
+
+def _decode_smoke_tests(raw: str | None) -> list[str] | None:
+    """#252: decode the smoke_tests JSON column.
+
+    SQLite stores ``None`` (column missing or unset), ``"[]"`` (explicit
+    "no smoke tests — change internal"), or ``'["item1", "item2", ...]'``
+    (bullets).  Anything else (malformed JSON, unexpected shape) folds
+    back to ``None`` so the TUI shows the graceful-degradation
+    placeholder instead of crashing.
+    """
+    if raw is None:
+        return None
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, list):
+        return None
+    return [str(item) for item in value]
 
 
 def _assignment_upsert_params(a: Assignment) -> tuple:
@@ -113,6 +137,8 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.test_reason,
         a.review_verdict,
         a.cost_usd,
+        # #252: encode list as JSON; None → NULL.
+        (json.dumps(a.smoke_tests) if a.smoke_tests is not None else None),
     )
 
 
@@ -123,14 +149,16 @@ _UPSERT_SQL = """
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
-        review_posted_at, test_state, test_reason, review_verdict, cost_usd
+        review_posted_at, test_state, test_reason, review_verdict, cost_usd,
+        smoke_tests
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?,
+        ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         status             = excluded.status,
@@ -157,7 +185,11 @@ _UPSERT_SQL = """
         -- #208: cost_usd is set once at completion.  COALESCE so a re-load
         -- of the same row from an agent that doesn't know the cost
         -- doesn't blow away a previously-captured value.
-        cost_usd           = COALESCE(excluded.cost_usd, cost_usd)
+        cost_usd           = COALESCE(excluded.cost_usd, cost_usd),
+        -- #252: same pattern — once a worker has emitted a smoke-test
+        -- list, a later upsert without one (e.g. agent reload) can't
+        -- erase it.
+        smoke_tests        = COALESCE(excluded.smoke_tests, smoke_tests)
 """
 
 
@@ -531,6 +563,26 @@ def mark_notified(
 
 
 # ── Review-findings tracking ──────────────────────────────────────────────────
+
+def update_assignment_smoke_tests(
+    assignment_id: str, smoke_tests: list[str],
+) -> None:
+    """#252: persist the worker's parsed SMOKE_TESTS list on the row.
+
+    ``smoke_tests=[]`` (the explicit "no tests — change is internal"
+    form) is stored as the JSON literal ``"[]"`` so the TUI can
+    distinguish it from "no block emitted" (NULL).  Silently no-ops
+    when the row doesn't exist — callers don't have to coordinate.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET smoke_tests=? WHERE assignment_id=?",
+        (json.dumps(smoke_tests), assignment_id),
+    )
+    conn.commit()
+
 
 def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     """#208: record the worker's final cost on an existing assignment row.

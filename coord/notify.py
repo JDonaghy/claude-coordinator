@@ -243,6 +243,38 @@ def post_stuck(detection: StuckDetection, record: dict) -> None:
     mark_notified(_stuck_notified_key(detection.assignment_id), EVENT_STUCK)
 
 
+def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
+    """#252: parse the worker's SMOKE_TESTS block and persist it on the row.
+
+    Only works from a local log — the agent's status entry doesn't
+    carry the block.  Silent on failure.
+    """
+    log_path = entry.get("log_path")
+    if not log_path:
+        return
+    try:
+        from coord.progress import parse_smoke_tests_from_log  # noqa: PLC0415
+        from coord.state import update_assignment_smoke_tests  # noqa: PLC0415
+        parsed = parse_smoke_tests_from_log(Path(log_path))
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "_capture_smoke_tests: failed to parse log for %s: %s",
+            transition.assignment_id, exc,
+        )
+        return
+    if parsed is None:
+        # No SMOKE_TESTS block in the log — leave smoke_tests NULL so the
+        # TUI shows the graceful-degradation placeholder.
+        return
+    try:
+        update_assignment_smoke_tests(transition.assignment_id, parsed)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "_capture_smoke_tests: failed to persist list for %s: %s",
+            transition.assignment_id, exc,
+        )
+
+
 def _capture_cost(transition: Transition, entry: dict) -> None:
     """#208: parse the worker's final cost and persist it on the assignment.
 
@@ -506,6 +538,10 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     # otherwise be lost when the agent prunes the log.  Best-effort:
     # local log → remote agent entry → skip.
     _capture_cost(transition, entry)
+    # #252: capture the worker-emitted SMOKE_TESTS block at the same
+    # moment so the TUI can render it under the Test stage.  Same
+    # best-effort discipline — failure is silent.
+    _capture_smoke_tests(transition, entry)
     common = dict(
         assignment_id=transition.assignment_id,
         machine_name=transition.machine_name,

@@ -21,6 +21,19 @@ STATUS_RE = re.compile(r"^STATUS:\s*(.+)$", re.MULTILINE)
 STUCK_RE = re.compile(r"^STUCK:\s*(.+)$", re.MULTILINE)
 CONFIDENCE_RE = re.compile(r"confidence:\s*(high|medium|low)", re.IGNORECASE)
 
+# #252: workers emit a SMOKE_TESTS block before exiting.  The whole block
+# is captured (greedy across newlines) and parsed below.  Optional `(none
+# — change is internal)` form folds to an empty list.
+_SMOKE_BLOCK_RE = re.compile(
+    r"SMOKE_TESTS:\s*(.*?)\s*END_SMOKE_TESTS",
+    re.DOTALL | re.IGNORECASE,
+)
+_SMOKE_NONE_RE = re.compile(
+    r"^\(?\s*none\b.*?(?:internal|change)?\s*\)?\s*$",
+    re.IGNORECASE,
+)
+_SMOKE_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
+
 
 @dataclass
 class WorkerProgress:
@@ -94,6 +107,97 @@ def parse_progress(log_path: str | Path, tail_bytes: int = 32_768) -> WorkerProg
     _detect_warnings(progress, updates)
 
     return progress
+
+
+def _extract_smoke_tests_from_text(text: str) -> list[str] | None:
+    """#252: pull the SMOKE_TESTS block out of *text*.
+
+    Returns:
+      * ``None`` — no block emitted (graceful degradation; the TUI shows
+        a "no smoke tests provided" placeholder).
+      * ``[]`` — explicit "(none — change is internal)" form.
+      * ``list[str]`` — one entry per bullet, stripped of leading "- "/"* ".
+
+    Tolerant of leading/trailing whitespace and stray empty lines.  Picks
+    the LAST block in the text — workers occasionally redo their summary
+    if they reconsider the change.
+    """
+    matches = list(_SMOKE_BLOCK_RE.finditer(text))
+    if not matches:
+        return None
+    block = matches[-1].group(1)
+
+    # Try the "(none — change is internal)" short form on the first
+    # non-empty line of the captured block.
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _SMOKE_NONE_RE.match(stripped):
+            return []
+        break
+
+    bullets: list[str] = []
+    for line in block.splitlines():
+        m = _SMOKE_BULLET_RE.match(line)
+        if m:
+            item = m.group(1).strip()
+            if item:
+                bullets.append(item)
+    # If the block existed but had no bullets and wasn't the "none" form
+    # either, treat as "no smoke tests provided" (None) — the worker
+    # didn't actually fill in the template.
+    if not bullets:
+        return None
+    return bullets
+
+
+def parse_smoke_tests_from_log(
+    log_path: str | Path, tail_bytes: int = 65_536,
+) -> list[str] | None:
+    """#252: read the tail of *log_path* and extract any SMOKE_TESTS block.
+
+    Handles both stream-json logs (decodes assistant text events first)
+    and legacy plain-text logs.  Returns the same three-state result as
+    :func:`_extract_smoke_tests_from_text`.
+    """
+    p = Path(log_path)
+    if not p.exists():
+        return None
+
+    from coord.worker_events import is_stream_json  # noqa: PLC0415
+
+    if is_stream_json(p):
+        # Collect assistant text from the structured events.  Workers may
+        # emit the block in a single assistant turn, so concatenating all
+        # of them is enough.
+        from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+        texts: list[str] = []
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    event = parse_event(line.rstrip("\n"))
+                    if event is None or event.type != "assistant":
+                        continue
+                    t = _assistant_text(event)
+                    if t:
+                        texts.append(t)
+        except OSError:
+            return None
+        return _extract_smoke_tests_from_text("\n".join(texts))
+
+    # Plain-text path: read the tail (large enough to catch the block
+    # even when followed by many turns of build output).
+    try:
+        size = p.stat().st_size
+        with open(p, encoding="utf-8", errors="replace") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()  # skip partial line
+            text = f.read()
+    except OSError:
+        return None
+    return _extract_smoke_tests_from_text(text)
 
 
 def _detect_warnings(progress: WorkerProgress, all_updates: list[str]) -> None:
