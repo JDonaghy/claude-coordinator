@@ -94,7 +94,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             review_iteration INTEGER DEFAULT 0,
             review_posted_at REAL,
             test_state TEXT,
-            test_reason TEXT
+            test_reason TEXT,
+            cost_usd REAL
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -216,6 +217,8 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # #253: persisted adversarial-review verdict so the merge gate can
         # check approval without re-parsing logs after restart.
         "ALTER TABLE assignments ADD COLUMN review_verdict TEXT",
+        # #208: worker cost captured from the final stream-json result event.
+        "ALTER TABLE assignments ADD COLUMN cost_usd REAL",
     ]
     for sql in migrations:
         try:

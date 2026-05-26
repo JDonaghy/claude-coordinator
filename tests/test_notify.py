@@ -623,3 +623,107 @@ class TestPostOrphanedReviewFindings:
 
         assert all(r["assignment_id"] == "rp1" for r in api_only)
         assert len(all_repos) == 2
+
+
+# ── #208: cost capture on completion ────────────────────────────────────────
+
+
+def _make_log_with_cost(tmp_path: Path, cost: float) -> str:
+    """Write a minimal stream-json log whose final `result` event carries
+    *cost*.  Mirrors the format `claude -p --output-format stream-json`
+    emits — coord.usage.parse_usage_from_log knows how to pick out the
+    `total_cost_usd` field.
+    """
+    log = tmp_path / "cost.log"
+    # Header line is non-JSON (coord.worker_events.is_stream_json starts
+    # reading from the first `{` line, so a comment is fine).  The result
+    # event is the canonical place workers report final usage.
+    import json
+    payload = {
+        "type": "result",
+        "subtype": "success",
+        "result": "done",
+        "total_cost_usd": cost,
+        "num_turns": 3,
+        "duration_ms": 12345,
+        "session_id": "test-session",
+    }
+    log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    return str(log)
+
+
+class TestCostCapture:
+    def test_cost_persists_to_assignment_row(
+        self, coord_dir: Path, config: Config, tmp_path: Path,
+    ) -> None:
+        """When a worker completes and its log carries `total_cost_usd`,
+        the value lands in assignments.cost_usd alongside the standard
+        completion notify path."""
+        _record("cost1")
+        log_path = _make_log_with_cost(tmp_path, 0.34)
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("cost1", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd FROM assignments WHERE assignment_id='cost1'"
+        ).fetchone()
+        assert row is not None
+        assert row["cost_usd"] == 0.34
+
+    def test_no_cost_when_log_lacks_field(
+        self, coord_dir: Path, config: Config, tmp_path: Path,
+    ) -> None:
+        """When the log has no usable cost data, cost_usd stays NULL —
+        the notify path still completes normally."""
+        _record("cost2")
+        log = tmp_path / "no-cost.log"
+        log.write_text("not a stream-json log\n", encoding="utf-8")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("cost2", "done", log_path=str(log))],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd FROM assignments WHERE assignment_id='cost2'"
+        ).fetchone()
+        assert row is not None
+        assert row["cost_usd"] is None
+
+    def test_cost_falls_back_to_agent_status_total(
+        self, coord_dir: Path, config: Config, tmp_path: Path,
+    ) -> None:
+        """When the local log is unavailable (worker ran on a remote
+        agent and the coordinator can't reach the log file), the
+        coordinator falls back to the live cost the agent reported in
+        its status entry."""
+        _record("cost3")
+        # log_path points to a file that doesn't exist on this machine;
+        # the agent status carries the live value.
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed(
+                "cost3", "done",
+                log_path="/var/log/does-not-exist.log",
+                total_cost_usd=1.50,
+            )],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd FROM assignments WHERE assignment_id='cost3'"
+        ).fetchone()
+        assert row is not None
+        assert row["cost_usd"] == 1.50

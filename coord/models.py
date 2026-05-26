@@ -125,6 +125,11 @@ class Assignment:
     # by the merge-queue gate (`has_approved_review`) to refuse merging work
     # whose review has not approved.
     review_verdict: str | None = None
+    # #208: parsed worker cost from the final stream-json `result` event.
+    # None means "not yet captured" (older rows, in-flight workers, or
+    # workers whose log lacked usage data).  Set on completion by
+    # notify.py / reconcile via coord.usage.parse_usage_from_log.
+    cost_usd: float | None = None
 
 
 @dataclass

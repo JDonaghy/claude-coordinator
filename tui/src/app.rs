@@ -266,6 +266,9 @@ struct Assignment {
     /// #253: links a review assignment back to the work assignment it
     /// reviews — needed to pair review_verdict with the merge entry.
     review_of_assignment_id: Option<String>,
+    /// #208: worker cost captured from the final stream-json result event.
+    /// `None` for in-flight workers and for pre-#208 rows.
+    cost_usd: Option<f64>,
 }
 
 impl Assignment {
@@ -794,6 +797,19 @@ fn format_unix_time(ts: f64) -> String {
         .as_secs_f64();
     let delta = (now - ts).max(0.0) as u64;
     format!("{} ago", fmt_dur(delta))
+}
+
+/// #208: format a worker cost in USD with two decimals.  Below 1¢ shows
+/// "< $0.01" so the rendering doesn't read as $0.00 (mathematically true
+/// but misleading — the worker did some non-zero work).
+fn format_cost_usd(cost: f64) -> String {
+    if cost <= 0.0 {
+        "$0.00".to_string()
+    } else if cost < 0.01 {
+        "< $0.01".to_string()
+    } else {
+        format!("${cost:.2}")
+    }
 }
 
 fn trunc(s: &str, max_chars: usize) -> &str {
@@ -1353,7 +1369,7 @@ fn load_data() -> BoardData {
         let mut stmt = match conn.prepare(
             "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
              status, branch, model, type, dispatched_at, finished_at, exit_code, \
-             test_state, review_verdict, review_of_assignment_id \
+             test_state, review_verdict, review_of_assignment_id, cost_usd \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1376,6 +1392,7 @@ fn load_data() -> BoardData {
                 test_state: row.get::<_, Option<String>>(12)?,
                 review_verdict: row.get::<_, Option<String>>(13)?,
                 review_of_assignment_id: row.get::<_, Option<String>>(14)?,
+                cost_usd: row.get::<_, Option<f64>>(15)?,
             })
         }) {
             Ok(r) => r,
@@ -6556,6 +6573,15 @@ impl CoordApp {
                 };
                 items.push(kv_item("Exit code", &ec.to_string(), Some(ec_color)));
             }
+            // #208: surface captured worker cost so the user can spot
+            // unusually expensive runs without leaving the TUI.
+            if let Some(cost) = a.cost_usd {
+                items.push(kv_item(
+                    "Cost",
+                    &format_cost_usd(cost),
+                    Some(Color::rgb(180, 180, 180)),
+                ));
+            }
             items.push(kv_item("", "", None));
         }
     }
@@ -10401,6 +10427,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         }
     }
 
@@ -10457,6 +10484,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         }
     }
 
@@ -11516,6 +11544,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -11550,6 +11579,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -11819,6 +11849,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         }
     }
 
@@ -12507,6 +12538,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -12544,6 +12576,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12581,6 +12614,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -12615,6 +12649,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -12689,6 +12724,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -12726,6 +12762,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -12750,6 +12787,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12779,6 +12817,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -12797,6 +12836,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12823,6 +12863,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -12874,6 +12915,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -12907,6 +12949,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -12924,6 +12967,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -12986,6 +13030,7 @@ mod tests {
                 test_state: None,
                 review_verdict: None,
                 review_of_assignment_id: None,
+                cost_usd: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -13023,6 +13068,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -13055,6 +13101,7 @@ mod tests {
                 test_state: None,
                 review_verdict: None,
                 review_of_assignment_id: None,
+                cost_usd: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -13092,6 +13139,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -13164,6 +13212,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -13196,6 +13245,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -13222,6 +13272,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -13248,6 +13299,7 @@ mod tests {
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
+            cost_usd: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -15189,6 +15241,31 @@ mod tests {
         )
         .expect("header present");
         assert_eq!(h.verdict.as_deref(), Some("approve"));
+    }
+
+    // ── #208: format_cost_usd ────────────────────────────────────────────
+
+    #[test]
+    fn format_cost_usd_two_decimal_places() {
+        assert_eq!(format_cost_usd(0.34), "$0.34");
+        assert_eq!(format_cost_usd(1.50), "$1.50");
+        assert_eq!(format_cost_usd(42.00), "$42.00");
+    }
+
+    #[test]
+    fn format_cost_usd_sub_cent_shows_lt_one_cent() {
+        // Half a cent of cost is real work — render it that way instead of
+        // rounding to $0.00 which reads as "free".
+        assert_eq!(format_cost_usd(0.005), "< $0.01");
+        assert_eq!(format_cost_usd(0.001), "< $0.01");
+    }
+
+    #[test]
+    fn format_cost_usd_zero_or_negative_renders_as_zero() {
+        // Defensive: should never see negative, but don't surface a
+        // misleading negative dollar amount in the UI.
+        assert_eq!(format_cost_usd(0.0), "$0.00");
+        assert_eq!(format_cost_usd(-1.0), "$0.00");
     }
 
     #[test]

@@ -807,3 +807,81 @@ def test_update_issue_labels_dedups_and_sorts(coord_db) -> None:
         "SELECT labels FROM issues WHERE repo_name='repo' AND number=8"
     ).fetchone()
     assert json.loads(row["labels"]) == ["alpha", "beta", "zeta"]
+
+
+# ── #208: cost_usd column + update_assignment_cost ──────────────────────────
+
+
+def test_update_assignment_cost_sets_value_when_null(coord_db) -> None:
+    """First-time capture: cost_usd is null, the helper sets it."""
+    from coord.db import get_connection
+    from coord.state import update_assignment_cost
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="cost1", status="done",
+        dispatched_at=10.0, finished_at=20.0,
+    )
+    save_board(Board(completed=[a]))
+    update_assignment_cost("cost1", 0.42)
+
+    row = get_connection().execute(
+        "SELECT cost_usd FROM assignments WHERE assignment_id='cost1'"
+    ).fetchone()
+    assert row["cost_usd"] == 0.42
+
+
+def test_update_assignment_cost_keeps_higher_value(coord_db) -> None:
+    """Subsequent updates only overwrite when the new value is larger.
+
+    Guards against an agent that lost its session state and reports a
+    lower live `cost_so_far` than the finalised log-parsed total.
+    """
+    from coord.db import get_connection
+    from coord.state import update_assignment_cost
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="cost2", status="done",
+        cost_usd=0.50,
+    )
+    save_board(Board(completed=[a]))
+    update_assignment_cost("cost2", 0.30)  # lower → ignored
+
+    row = get_connection().execute(
+        "SELECT cost_usd FROM assignments WHERE assignment_id='cost2'"
+    ).fetchone()
+    assert row["cost_usd"] == 0.50
+
+    update_assignment_cost("cost2", 0.75)  # higher → applied
+
+    row = get_connection().execute(
+        "SELECT cost_usd FROM assignments WHERE assignment_id='cost2'"
+    ).fetchone()
+    assert row["cost_usd"] == 0.75
+
+
+def test_update_assignment_cost_unknown_id_is_silent_noop(coord_db) -> None:
+    """The helper doesn't raise when the assignment doesn't exist —
+    callers shouldn't have to coordinate row existence with cost capture."""
+    from coord.db import get_connection
+    from coord.state import update_assignment_cost
+    # No save_board, no row exists.
+    update_assignment_cost("ghost", 1.23)  # must not raise
+
+    row = get_connection().execute(
+        "SELECT COUNT(*) AS n FROM assignments WHERE assignment_id='ghost'"
+    ).fetchone()
+    assert row["n"] == 0
+
+
+def test_assignment_save_load_roundtrips_cost_usd(coord_db) -> None:
+    """Assignment.cost_usd survives a save/load cycle through the upsert
+    + ORM mapping.  This is the basic "the column is plumbed correctly"
+    smoke test."""
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="rt1", status="done",
+        cost_usd=1.23,
+    )
+    save_board(Board(completed=[a]))
+    board = load_board()
+    assert board.completed[0].cost_usd == 1.23

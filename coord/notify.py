@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -242,6 +243,49 @@ def post_stuck(detection: StuckDetection, record: dict) -> None:
     mark_notified(_stuck_notified_key(detection.assignment_id), EVENT_STUCK)
 
 
+def _capture_cost(transition: Transition, entry: dict) -> None:
+    """#208: parse the worker's final cost and persist it on the assignment.
+
+    Preferred source is the local stream-json log (cheap, no network).
+    Falls back to the agent's status entry, which carries ``cost_so_far``
+    / ``total_cost_usd`` reported live by the worker.  Either path is
+    best-effort — failure is silent so it can't block the comment post.
+    """
+    from coord.state import update_assignment_cost  # noqa: PLC0415
+    from coord.usage import parse_usage_from_log  # noqa: PLC0415
+
+    cost: float | None = None
+    log_path = entry.get("log_path")
+    if log_path:
+        try:
+            parsed = parse_usage_from_log(Path(log_path))
+            if parsed is not None and parsed.total_cost_usd > 0:
+                cost = parsed.total_cost_usd
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_capture_cost: failed to parse log for %s: %s",
+                transition.assignment_id, exc,
+            )
+
+    if cost is None:
+        # Fall back to the live value the agent had at reap time.
+        remote_cost = entry.get("total_cost_usd") or entry.get("cost_so_far")
+        if remote_cost is not None:
+            try:
+                cost = float(remote_cost)
+            except (TypeError, ValueError):
+                cost = None
+
+    if cost is not None and cost > 0:
+        try:
+            update_assignment_cost(transition.assignment_id, cost)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "_capture_cost: failed to persist cost for %s: %s",
+                transition.assignment_id, exc,
+            )
+
+
 def _persist_review_verdict(assignment_id: str, verdict: str) -> None:
     """Store the parsed reviewer verdict on the review assignment row.
 
@@ -457,6 +501,11 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     started = entry.get("started_at")
     finished = entry.get("finished_at")
     duration = (finished - started) if (started and finished) else None
+    # #208: capture worker cost as soon as the assignment completes — the
+    # value is in the worker's final stream-json result event and would
+    # otherwise be lost when the agent prunes the log.  Best-effort:
+    # local log → remote agent entry → skip.
+    _capture_cost(transition, entry)
     common = dict(
         assignment_id=transition.assignment_id,
         machine_name=transition.machine_name,

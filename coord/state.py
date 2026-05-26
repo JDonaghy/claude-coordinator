@@ -77,6 +77,7 @@ def _row_to_assignment(row: object) -> Assignment:
         test_state=d.get("test_state"),
         test_reason=d.get("test_reason"),
         review_verdict=d.get("review_verdict"),
+        cost_usd=d.get("cost_usd"),
     )
 
 
@@ -111,6 +112,7 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.test_state,
         a.test_reason,
         a.review_verdict,
+        a.cost_usd,
     )
 
 
@@ -121,14 +123,14 @@ _UPSERT_SQL = """
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
-        review_posted_at, test_state, test_reason, review_verdict
+        review_posted_at, test_state, test_reason, review_verdict, cost_usd
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?, ?
+        ?, ?, ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         status             = excluded.status,
@@ -151,7 +153,11 @@ _UPSERT_SQL = """
         review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at),
         test_state         = excluded.test_state,
         test_reason        = excluded.test_reason,
-        review_verdict     = COALESCE(excluded.review_verdict, review_verdict)
+        review_verdict     = COALESCE(excluded.review_verdict, review_verdict),
+        -- #208: cost_usd is set once at completion.  COALESCE so a re-load
+        -- of the same row from an agent that doesn't know the cost
+        -- doesn't blow away a previously-captured value.
+        cost_usd           = COALESCE(excluded.cost_usd, cost_usd)
 """
 
 
@@ -525,6 +531,24 @@ def mark_notified(
 
 
 # ── Review-findings tracking ──────────────────────────────────────────────────
+
+def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
+    """#208: record the worker's final cost on an existing assignment row.
+
+    Idempotent: COALESCE-based UPDATE so calling with the same value
+    twice is a no-op.  Silently does nothing when the row doesn't
+    exist — callers shouldn't have to coordinate.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET cost_usd=? WHERE assignment_id=? "
+        "AND (cost_usd IS NULL OR cost_usd < ?)",
+        (cost_usd, assignment_id, cost_usd),
+    )
+    conn.commit()
+
 
 def mark_review_posted(assignment_id: str) -> None:
     """Record that this review assignment's findings have been successfully posted.
