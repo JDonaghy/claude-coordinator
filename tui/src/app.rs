@@ -325,6 +325,53 @@ struct Machine {
     reachable: bool,
     active_count: usize,
     repos: Vec<String>,
+    /// Agent version string from `/health.version`; `None` when unreachable.
+    version: Option<String>,
+    /// Total git-worktree disk usage in bytes, from `/health.worktree_bytes`.
+    worktree_bytes: u64,
+}
+
+/// Parsed fields from a successful `/health` HTTP response.
+struct MachineHealthResult {
+    version: String,
+    worktree_bytes: u64,
+}
+
+/// Spawn a background thread that fetches `/health` from a remote agent and
+/// parses the version + worktree_bytes fields.  Returns a `Receiver` that
+/// yields `Ok(result)` or `Err(error_string)`.
+fn spawn_machine_health(host: &str, port: u16) -> std::sync::mpsc::Receiver<Result<MachineHealthResult, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = format!("http://{}:{}/health", host, port);
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(2))
+            .build();
+        let result = match agent.get(&url).call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(v) => {
+                        let version = v
+                            .get("version")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        let worktree_bytes = v
+                            .get("worktree_bytes")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0);
+                        Ok(MachineHealthResult { version, worktree_bytes })
+                    }
+                    Err(e) => Err(format!("json: {}", e)),
+                },
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 /// An issue grouped with all its assignments and a summary status.
@@ -1485,26 +1532,41 @@ fn load_data() -> BoardData {
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // ── Machine reachability probes ────────────────────────────────────────
+    // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
-    // Spawn all probes concurrently; collect within a 250 ms budget.
-    let probes: Vec<(String, String, Vec<String>, std::sync::mpsc::Receiver<bool>)> = machine_rows
+    // Spawn all TCP probes AND HTTP /health fetches concurrently so total
+    // wall-clock time is bounded by the slowest machine, not N × timeout.
+    let probes: Vec<(
+        String,
+        String,
+        Vec<String>,
+        std::sync::mpsc::Receiver<bool>,
+        std::sync::mpsc::Receiver<Result<MachineHealthResult, String>>,
+    )> = machine_rows
         .iter()
         .map(|(name, host, repos)| {
             use std::sync::mpsc;
             let h = host.clone();
-            let (tx, rx) = mpsc::channel();
+            let (tcp_tx, tcp_rx) = mpsc::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(tcp_probe(&h, 7433));
+                let _ = tcp_tx.send(tcp_probe(&h, 7433));
             });
-            (name.clone(), host.clone(), repos.clone(), rx)
+            let health_rx = spawn_machine_health(host, 7433);
+            (name.clone(), host.clone(), repos.clone(), tcp_rx, health_rx)
         })
         .collect();
 
     let machines: Vec<Machine> = probes
         .into_iter()
-        .map(|(name, host, repos, rx)| {
-            let reachable = rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false);
+        .map(|(name, host, repos, tcp_rx, health_rx)| {
+            let tcp_reachable = tcp_rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false);
+            // Health fetch has a 2 s connect + read timeout baked in; we wait
+            // up to 2.1 s here so we never block past the in-flight deadline.
+            let health = health_rx
+                .recv_timeout(Duration::from_millis(2100))
+                .ok()
+                .and_then(|r| r.ok());
+            let reachable = tcp_reachable || health.is_some();
             let active_count = assignments
                 .iter()
                 .filter(|a| a.machine == name && a.status == "running")
@@ -1515,6 +1577,8 @@ fn load_data() -> BoardData {
                 reachable,
                 active_count,
                 repos,
+                version: health.as_ref().map(|h| h.version.clone()),
+                worktree_bytes: health.as_ref().map(|h| h.worktree_bytes).unwrap_or(0),
             }
         })
         .collect();
@@ -1677,6 +1741,26 @@ fn start_data_load() -> std::sync::mpsc::Receiver<BoardData> {
         let _ = tx.send(load_data());
     });
     rx
+}
+
+/// Return the version string of the local `coord` binary by running
+/// `coord --version` synchronously.  Parses the last whitespace-separated
+/// token from the first output line (e.g. "coord 0.4.1" → "0.4.1").
+/// Returns `None` when `coord` is not found, exits non-zero, or returns
+/// unparseable output.
+fn fetch_local_coord_version() -> Option<String> {
+    let out = std::process::Command::new("coord")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().last())
+        .map(|s| s.to_string())
 }
 
 /// Spawn a background thread that fetches a remote agent log over HTTP.
@@ -2436,6 +2520,17 @@ pub struct CoordApp {
     /// render path (same pattern as `settings_form`), populated on every
     /// frame while a menu is open and cleared when it dismisses.
     context_menu_layout: std::cell::RefCell<Option<ContextMenuLayout>>,
+    /// Machines panel: name of machine awaiting restart confirmation.
+    /// While `Some`, 'y'/'Y' fires `coord agent restart --machine <name>`;
+    /// any other key cancels.
+    pending_restart: Option<String>,
+    /// Per-machine last time a `/health` HTTP fetch returned successfully.
+    /// Updated from `apply_pending_data()`.  Used to show "Xs ago" in the
+    /// Machines panel even across multiple load cycles.
+    machine_last_contact: std::collections::HashMap<String, Instant>,
+    /// Version of the local `coord` binary, fetched once at startup.
+    /// Used to flag remote agents that are running an older version.
+    local_coord_version: Option<String>,
     /// Cached visible-row count for the main panel, updated on scroll events
     /// and tick. Used by `watch_log_list` to compute a stick-to-bottom scroll
     /// offset that actually keeps the latest lines on screen (the previous
@@ -2611,6 +2706,9 @@ impl CoordApp {
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
+            pending_restart: None,
+            machine_last_contact: std::collections::HashMap::new(),
+            local_coord_version: fetch_local_coord_version(),
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
@@ -3172,6 +3270,13 @@ impl CoordApp {
                     self.machine_sel = self.machine_sel.min(m - 1);
                 } else {
                     self.machine_sel = 0;
+                }
+                // Update last-contact timestamps for machines whose health
+                // fetch succeeded this cycle (version is Some).
+                for machine in &self.data.machines {
+                    if machine.version.is_some() {
+                        self.machine_last_contact.insert(machine.name.clone(), Instant::now());
+                    }
                 }
                 self.rebuild_board_sidebar();
                 // apply_pending_data doesn't touch pipeline_issues — the
@@ -3940,26 +4045,52 @@ impl CoordApp {
                 };
                 let is_local = m.name == self.data.local_machine;
                 let display_name = if is_local {
-                    format!("{} (local)", trunc(&m.name, 13))
+                    format!("{} (local)", trunc(&m.name, 12))
                 } else {
-                    trunc(&m.name, 20).to_string()
+                    trunc(&m.name, 18).to_string()
                 };
-                let text = StyledText {
-                    spans: vec![
-                        StyledSpan::with_fg(bullet, col),
-                        StyledSpan::plain(&display_name),
-                    ],
+
+                // Version badge: green if same as local, red if older/different, gray if unknown.
+                let (ver_str, ver_col) = match (&m.version, &self.local_coord_version) {
+                    (Some(v), Some(local)) if v != local => {
+                        (format!(" v{}", v), Color::rgb(220, 80, 80))
+                    }
+                    (Some(v), _) => (format!(" v{}", v), Color::rgb(80, 160, 80)),
+                    (None, _) => ("".to_string(), Color::rgb(90, 90, 90)),
                 };
-                let (active_str, active_col) = if m.active_count > 0 {
-                    (
-                        format!("{} active", m.active_count),
-                        Color::rgb(80, 210, 80),
-                    )
+
+                // Last-contact age ("12s ago") when we have a recorded time.
+                let contact_str = self.machine_last_contact.get(&m.name).map(|t| {
+                    let secs = t.elapsed().as_secs();
+                    format!(" {}ago", fmt_dur(secs))
+                });
+
+                let mut spans = vec![
+                    StyledSpan::with_fg(bullet, col),
+                    StyledSpan::plain(&display_name),
+                ];
+                if !ver_str.is_empty() {
+                    spans.push(StyledSpan::with_fg(&ver_str, ver_col));
+                }
+
+                let text = StyledText { spans };
+
+                let detail_str = if let Some(ref age) = contact_str {
+                    age.clone()
+                } else if m.active_count > 0 {
+                    format!("{} active", m.active_count)
                 } else {
-                    ("idle".to_string(), Color::rgb(90, 90, 90))
+                    "idle".to_string()
+                };
+                let detail_col = if m.active_count > 0 {
+                    Color::rgb(80, 210, 80)
+                } else if contact_str.is_some() {
+                    Color::rgb(90, 110, 90)
+                } else {
+                    Color::rgb(90, 90, 90)
                 };
                 let detail = Some(StyledText {
-                    spans: vec![StyledSpan::with_fg(&active_str, active_col)],
+                    spans: vec![StyledSpan::with_fg(&detail_str, detail_col)],
                 });
                 ListItem {
                     text,
@@ -4266,7 +4397,7 @@ impl CoordApp {
         vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))]
     }
 
-    /// Detail panel for the selected machine: status + job history.
+    /// Detail panel for the selected machine: status, version, workers, disk, history.
     fn machine_detail_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
 
@@ -4275,7 +4406,7 @@ impl CoordApp {
                 items.push(kv_item("", " No machine selected", None));
             }
             Some(m) => {
-                // Section header
+                // ── Header ──────────────────────────────────────────────
                 let header_text = format!(" {} ", m.name);
                 items.push(ListItem {
                     text: StyledText {
@@ -4288,35 +4419,117 @@ impl CoordApp {
 
                 items.push(kv_item("", "", None)); // blank
 
+                // ── Status + last-contact age ────────────────────────────
+                let last_contact_str = self.machine_last_contact.get(&m.name).map(|t| {
+                    format!("  ({} ago)", fmt_dur(t.elapsed().as_secs()))
+                });
                 let (reach_str, reach_col) = if m.reachable {
-                    ("reachable", Color::rgb(80, 210, 80))
+                    ("reachable".to_string(), Color::rgb(80, 210, 80))
                 } else {
-                    ("unreachable", Color::rgb(220, 70, 70))
+                    ("unreachable".to_string(), Color::rgb(220, 70, 70))
                 };
-                items.push(kv_item("Status", reach_str, Some(reach_col)));
+                let reach_val = if let Some(ref age) = last_contact_str {
+                    format!("{}{}", reach_str, age)
+                } else {
+                    reach_str
+                };
+                items.push(kv_item("Status", &reach_val, Some(reach_col)));
 
+                // ── Agent version (red if older than local) ──────────────
+                let (ver_val, ver_col) = match (&m.version, &self.local_coord_version) {
+                    (Some(v), Some(local)) if v != local => (
+                        format!("{}  ← local is {}", v, local),
+                        Color::rgb(220, 80, 80),
+                    ),
+                    (Some(v), Some(_)) => (v.clone(), Color::rgb(80, 160, 80)),
+                    (Some(v), None) => (v.clone(), Color::rgb(150, 150, 150)),
+                    (None, _) => ("unknown".to_string(), Color::rgb(90, 90, 90)),
+                };
+                items.push(kv_item("Version", &ver_val, Some(ver_col)));
+
+                // ── Worktree disk usage ──────────────────────────────────
+                let wt_mb = m.worktree_bytes as f64 / (1024.0 * 1024.0);
+                let wt_str = if m.worktree_bytes == 0 && !m.reachable {
+                    "—".to_string()
+                } else {
+                    format!("{:.1} MB", wt_mb)
+                };
+                items.push(kv_item("Worktrees", &wt_str, None));
+
+                // ── Local indicator ──────────────────────────────────────
                 let is_local = m.name == self.data.local_machine;
                 if is_local {
-                    items.push(kv_item(
-                        "Location",
-                        "local",
-                        Some(Color::rgb(100, 180, 240)),
-                    ));
+                    items.push(kv_item("Location", "local", Some(Color::rgb(100, 180, 240))));
                 }
-
-                let (active_str, active_col) = if m.active_count > 0 {
-                    (
-                        format!("{} running", m.active_count),
-                        Color::rgb(80, 210, 80),
-                    )
-                } else {
-                    ("idle".to_string(), Color::rgb(90, 90, 90))
-                };
-                items.push(kv_item("Jobs", &active_str, Some(active_col)));
 
                 items.push(kv_item("", "", None)); // blank
 
-                // Job history sub-header
+                // ── Active workers ───────────────────────────────────────
+                let active_workers: Vec<&Assignment> = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.machine == m.name && a.status == "running")
+                    .collect();
+
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            format!(
+                                " ACTIVE WORKERS ({}) ",
+                                active_workers.len()
+                            ),
+                            Color::rgb(130, 130, 150),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+
+                if active_workers.is_empty() {
+                    items.push(kv_item("", "  idle", Some(Color::rgb(80, 80, 80))));
+                } else {
+                    for a in &active_workers {
+                        let id8 = trunc(&a.id, 8);
+                        let type_label = a.assignment_type.as_deref().unwrap_or("work");
+                        let text = StyledText {
+                            spans: vec![
+                                StyledSpan::with_fg(
+                                    format!("  {} ", id8),
+                                    Color::rgb(100, 100, 180),
+                                ),
+                                StyledSpan::with_fg(
+                                    format!("#{:<6}", a.issue_number),
+                                    Color::rgb(150, 150, 240),
+                                ),
+                                StyledSpan::with_fg(
+                                    format!("{:<8}", type_label),
+                                    Color::rgb(150, 180, 150),
+                                ),
+                                StyledSpan::with_fg(
+                                    format!("  {}", trunc(&a.repo, 18)),
+                                    Color::rgb(110, 110, 110),
+                                ),
+                            ],
+                        };
+                        items.push(ListItem {
+                            text,
+                            icon: None,
+                            detail: Some(StyledText {
+                                spans: vec![StyledSpan::with_fg(
+                                    a.age_str(),
+                                    Color::rgb(90, 90, 90),
+                                )],
+                            }),
+                            decoration: Decoration::Normal,
+                        });
+                    }
+                }
+
+                items.push(kv_item("", "", None)); // blank
+
+                // ── Job history ──────────────────────────────────────────
                 items.push(ListItem {
                     text: StyledText {
                         spans: vec![StyledSpan::with_fg(
@@ -4369,6 +4582,16 @@ impl CoordApp {
                             },
                         });
                     }
+                }
+
+                // ── Action hints ─────────────────────────────────────────
+                if m.reachable {
+                    items.push(kv_item("", "", None));
+                    items.push(kv_item(
+                        "",
+                        "  r=restart  u=update  c=clean worktrees",
+                        Some(Color::rgb(140, 140, 100)),
+                    ));
                 }
             }
         }
@@ -8133,6 +8356,21 @@ impl CoordApp {
                 " Force-merge{} despite failed CI checks? y=confirm  Esc=cancel ",
                 scope
             )
+        } else if let Some(ref name) = self.pending_restart {
+            // Restart confirmation — show active worker count in the prompt.
+            let active = self
+                .data
+                .machines
+                .iter()
+                .find(|m| &m.name == name)
+                .map(|m| m.active_count)
+                .unwrap_or(0);
+            format!(
+                " Restart {} ({} active worker{})? y=confirm  Esc=cancel ",
+                name,
+                active,
+                if active == 1 { "" } else { "s" },
+            )
         } else if let Some((a, i)) = self.pending_purge {
             // Confirm prompt overrides the normal hints while purge is pending.
             format!(
@@ -8141,6 +8379,9 @@ impl CoordApp {
                 i, if i == 1 { "" } else { "s" },
                 self.purge_days
             )
+        } else if self.active_view == SidebarView::Machines {
+            // Machines panel action hints.
+            " r=restart  u=update  c=clean worktrees  q=quit ".to_string()
         } else if self.active_view == SidebarView::Pipeline && self.test_gate_actionable() {
             // #200: surface the Test gate keybinds when actionable for the
             // currently-selected pipeline issue.
@@ -10128,6 +10369,25 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── Pending restart confirmation: intercept ALL key presses ──────────
+        // While a restart is pending, 'y'/'Y' fires the restart; every other
+        // key cancels.  We return early so normal key dispatch never fires.
+        if self.pending_restart.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        if let Some(name) = self.pending_restart.take() {
+                            self.command_runner.spawn(&["agent", "restart", "--machine", &name]);
+                        }
+                    }
+                    _ => {
+                        self.pending_restart = None;
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── Pending purge confirmation: intercept ALL key presses ─────────────
         // While a purge is pending, 'y'/'Y' executes it; every other key
         // cancels.  We return early so the normal key dispatch never fires.
@@ -10817,6 +11077,44 @@ impl ShellApp for CoordApp {
                         self.command_runner.spawn(&["merge", "--skip-review"]);
                         needs_redraw = true;
                     }
+                    // ── r — Machines: restart selected agent ─────────────
+                    Key::Char('r') if self.active_view == SidebarView::Machines => {
+                        if let Some(m) = self.data.machines.get(self.machine_sel) {
+                            if m.active_count > 0 {
+                                // Has active workers — require confirmation.
+                                self.pending_restart = Some(m.name.clone());
+                            } else {
+                                let name = m.name.clone();
+                                self.command_runner.spawn(&[
+                                    "agent", "restart", "--machine", &name,
+                                ]);
+                            }
+                            needs_redraw = true;
+                        }
+                    }
+
+                    // ── u — Machines: update selected agent ───────────────
+                    Key::Char('u') if self.active_view == SidebarView::Machines => {
+                        if let Some(m) = self.data.machines.get(self.machine_sel) {
+                            let name = m.name.clone();
+                            self.command_runner.spawn(&[
+                                "agent", "update", "--machine", &name,
+                            ]);
+                            needs_redraw = true;
+                        }
+                    }
+
+                    // ── c — Machines: clean stale worktrees ───────────────
+                    Key::Char('c') if self.active_view == SidebarView::Machines => {
+                        if let Some(m) = self.data.machines.get(self.machine_sel) {
+                            let name = m.name.clone();
+                            self.command_runner.spawn(&[
+                                "agent", "clean-worktrees", "--machine", &name,
+                            ]);
+                            needs_redraw = true;
+                        }
+                    }
+
                     Key::Char('R') => {
                         if self.active_view == SidebarView::Pipeline {
                             // #236: Test failed → R bounces back to a fresh
@@ -11369,6 +11667,9 @@ mod tests {
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
+            pending_restart: None,
+            machine_last_contact: std::collections::HashMap::new(),
+            local_coord_version: None,
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,

@@ -24,6 +24,27 @@ from typing import Callable, Iterable
 DEFAULT_STATE_DIR = Path.home() / ".coord"
 DEFAULT_WORKER_BINARY = "claude"
 
+
+def _dir_size(path: Path) -> int:
+    """Return total bytes consumed by all regular files under *path*.
+
+    Silently skips entries that can't be stat'd (deleted mid-walk, permission
+    errors, etc.).  Returns 0 when *path* does not exist.
+    """
+    import stat as _stat_mod
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            try:
+                st = p.stat()
+                if _stat_mod.S_ISREG(st.st_mode):
+                    total += st.st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
 # Stamp captured at module import so `health()` can report when THIS
 # process started. exec_restart() replaces the image, so the new
 # process re-imports this module and the stamp updates — letting the
@@ -442,6 +463,8 @@ class AgentServer:
                 for a in self._assignments.values()
                 if a.status in (DONE, FAILED, CANCELLED)
             )
+        worktree_base = self.state_dir / "worktrees"
+        worktree_bytes = _dir_size(worktree_base)
         return {
             "machine": self.machine_name,
             "capabilities": self.capabilities,
@@ -453,7 +476,84 @@ class AgentServer:
             # /update — letting the CLI distinguish "old agent still
             # responding" from "new agent has come back online".
             "agent_started_at": _PROCESS_STARTED_AT,
+            # Total disk usage of all git worktrees managed by this agent.
+            "worktree_bytes": worktree_bytes,
         }
+
+    def clean_worktrees(self, *, recent_secs: float = 300.0) -> dict:
+        """Remove git worktrees for assignments in terminal states.
+
+        Idempotent — safe to call multiple times.  Skips worktrees for:
+        - Running or pending assignments (still in use by a worker).
+        - Assignments whose ``finished_at`` timestamp is within
+          *recent_secs* seconds of now (default 5 min) — protects against
+          racing with a worker that just finished/was cancelled.
+
+        Returns ``{"cleaned": N, "kept": M, "bytes_freed": B}``.
+        """
+        worktree_base = self.state_dir / "worktrees"
+        if not worktree_base.exists():
+            return {"cleaned": 0, "kept": 0, "bytes_freed": 0}
+
+        now = time.time()
+
+        with self._lock:
+            assignments = dict(self._assignments)
+
+        cleaned = 0
+        kept = 0
+        bytes_freed = 0
+
+        for entry in worktree_base.iterdir():
+            if not entry.is_dir():
+                continue
+            assignment_id = entry.name
+            a = assignments.get(assignment_id)
+
+            # Never touch worktrees for running/pending assignments.
+            if a is not None and a.status in (RUNNING, PENDING):
+                kept += 1
+                continue
+
+            # Skip recently-finished assignments — the worker process may
+            # still be tearing down and have open file handles in the tree.
+            if a is not None and a.finished_at is not None:
+                age = now - a.finished_at
+                if age < recent_secs:
+                    kept += 1
+                    continue
+
+            # Compute size before removal so the caller knows bytes freed.
+            dir_size = _dir_size(entry)
+
+            # Try a proper git worktree remove first (updates the main
+            # repo's worktree bookkeeping).  Fall back to brute-force rmtree
+            # if git isn't available or the main repo has moved.
+            removed = False
+            if a is not None:
+                repo_path_str = self.repo_paths.get(a.spec.repo_name)
+                if repo_path_str:
+                    repo_path = Path(repo_path_str)
+                    try:
+                        _git(repo_path, "worktree", "remove", str(entry), "--force")
+                        removed = True
+                    except (_GitError, OSError):
+                        pass
+
+            if not removed:
+                try:
+                    shutil.rmtree(entry, ignore_errors=True)
+                    removed = True
+                except OSError:
+                    pass
+
+            if removed:
+                bytes_freed += dir_size
+                cleaned += 1
+            else:
+                kept += 1
+
+        return {"cleaned": cleaned, "kept": kept, "bytes_freed": bytes_freed}
 
     def list_assignments(self) -> dict:
         from coord.worker_events import is_stream_json, parse_log
