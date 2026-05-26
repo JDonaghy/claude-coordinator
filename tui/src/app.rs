@@ -2824,6 +2824,91 @@ impl CoordApp {
         spawned
     }
 
+    /// Find a running or non-done assignment for the currently-selected
+    /// Pipeline row and dispatch `coord stop <id>` for it.  Returns
+    /// `true` when a stop was dispatched, `false` when no candidate
+    /// assignment was found (the caller toasts the user).
+    fn dispatch_stop_for_selected_pipeline_row(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let local_repo = issue.coord_repo.as_deref();
+        // Prefer a running worker; fall back to any non-done assignment
+        // (matches `open_watch_for_selected_issue`'s ordering so
+        // Watch and Stop target the same worker).
+        let pick = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .find(|a| a.status == "running")
+            .or_else(|| {
+                self.data
+                    .assignments
+                    .iter()
+                    .filter(|a| a.issue_number == issue.number)
+                    .filter(|a| match local_repo {
+                        Some(r) => a.repo == r,
+                        None => true,
+                    })
+                    .find(|a| a.status != "done")
+            });
+        let Some(a) = pick else { return false; };
+        let aid = a.id.clone();
+        let issue_n = a.issue_number;
+        let spawned = self.command_runner.spawn(&["stop", &aid]);
+        if spawned {
+            self.pipeline_status = Some((
+                format!("stop dispatched for #{}", issue_n),
+                Instant::now(),
+            ));
+        } else {
+            self.pipeline_status = Some((
+                "another command is running — try again in a moment".to_string(),
+                Instant::now(),
+            ));
+        }
+        spawned
+    }
+
+    /// Open the PR for the currently-selected Pipeline row in the user's
+    /// default browser via `gh pr view --web`.  Returns `true` when the
+    /// child was spawned; `false` when no PR has been opened yet (the
+    /// merge_queue entry has no `pr_number`).
+    fn dispatch_open_pr_for_selected_pipeline_row(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(pr_number) = self.pipeline_pr_number(&issue) else {
+            return false;
+        };
+        // gh handles xdg-open / open / start cross-platform.  Fire and
+        // forget — we don't care about exit code (the user sees the
+        // browser open, not a coord-tui status).
+        let _ = std::process::Command::new("gh")
+            .args([
+                "pr", "view",
+                &pr_number.to_string(),
+                "--repo", &issue.repo_slug,
+                "--web",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        self.pipeline_status = Some((
+            format!("opening PR #{} in browser…", pr_number),
+            Instant::now(),
+        ));
+        true
+    }
+
     /// Stop the assignment being watched: dispatches `coord stop <id>`.
     /// Pushes a toast on success or when another command is running.
     fn kill_watched(&mut self) -> bool {
@@ -7621,16 +7706,37 @@ impl CoordApp {
         lifecycle: &PipelineRowLifecycle,
     ) -> Vec<ContextMenuItem> {
         let mut items: Vec<ContextMenuItem> = Vec::new();
-        if matches!(lifecycle, PipelineRowLifecycle::New) {
-            items.push(ContextMenuItem::action(
-                "start-with-plan",
-                "Start with Plan",
-            ));
-            items.push(ContextMenuItem::action(
-                "start-skip-plan",
-                "Skip Plan, start Work",
-            ));
-            items.push(ContextMenuItem::separator());
+        match lifecycle {
+            PipelineRowLifecycle::New => {
+                items.push(ContextMenuItem::action(
+                    "start-with-plan",
+                    "Start with Plan",
+                ));
+                items.push(ContextMenuItem::action(
+                    "start-skip-plan",
+                    "Skip Plan, start Work",
+                ));
+                items.push(ContextMenuItem::separator());
+            }
+            PipelineRowLifecycle::InProgress => {
+                // Watch is also reachable via Enter on the row; surfacing
+                // it here gives the no-right-click / Android-over-SSH
+                // path a clickable affordance.
+                items.push(
+                    ContextMenuItem::action("watch", "Watch")
+                        .with_shortcut("Enter"),
+                );
+                items.push(ContextMenuItem::action("stop", "Stop"));
+                items.push(ContextMenuItem::separator());
+            }
+            PipelineRowLifecycle::Done => {
+                // Only meaningful when a PR exists (merge_queue entry
+                // with a pr_number).  When no PR is open yet the
+                // dispatcher toasts a "no PR" warning.
+                items.push(ContextMenuItem::action("open-pr", "Open PR"));
+                items.push(ContextMenuItem::separator());
+            }
+            PipelineRowLifecycle::Other => {}
         }
         if let Some(num) = issue_number {
             items.push(ContextMenuItem::action(
@@ -7911,6 +8017,50 @@ impl CoordApp {
                     self.push_toast(
                         "Start with Plan",
                         "Couldn't dispatch — see status bar for details.",
+                        ToastSeverity::Warning,
+                    );
+                }
+                true
+            }
+            // Pipeline:InProgress — Watch opens the live log overlay.
+            // Same behaviour as Enter on a Pipeline row; the menu /
+            // action-bar entry is for users without right-click or who
+            // prefer mousing to keyboard shortcuts.
+            "watch" => {
+                let opened = self.open_watch_for_selected_issue();
+                if !opened {
+                    self.push_toast(
+                        "Watch",
+                        "No active assignment to watch for this issue.",
+                        ToastSeverity::Warning,
+                    );
+                }
+                true
+            }
+            // Pipeline:InProgress — Stop cancels the running worker.
+            // Mirrors `kill_watched` but works from outside the watch
+            // overlay (which is the whole point — you shouldn't have
+            // to open the overlay to kill a worker).
+            "stop" => {
+                let stopped = self.dispatch_stop_for_selected_pipeline_row();
+                if !stopped {
+                    self.push_toast(
+                        "Stop",
+                        "No running assignment to stop for this issue.",
+                        ToastSeverity::Warning,
+                    );
+                }
+                true
+            }
+            // Pipeline:Done — Open PR launches the PR in a browser via
+            // `gh pr view --web`, which handles cross-platform browser
+            // opening (xdg-open / open / start) on our behalf.
+            "open-pr" => {
+                let opened = self.dispatch_open_pr_for_selected_pipeline_row();
+                if !opened {
+                    self.push_toast(
+                        "Open PR",
+                        "No PR open yet for this issue.",
                         ToastSeverity::Warning,
                     );
                 }
@@ -15200,6 +15350,107 @@ mod tests {
             .collect();
         assert!(!action_ids.contains(&"start-with-plan"));
         assert!(!action_ids.contains(&"start-skip-plan"));
+    }
+
+    #[test]
+    fn pipeline_in_progress_row_offers_watch_and_stop() {
+        // Closes the action-bar coverage gap that left In-progress rows
+        // with an empty bar (only Copy + Refresh, both filtered out).
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::InProgress,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            action_ids.contains(&"watch"),
+            "Pipeline:InProgress menu must offer Watch; got {:?}",
+            action_ids,
+        );
+        assert!(
+            action_ids.contains(&"stop"),
+            "Pipeline:InProgress menu must offer Stop; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn pipeline_done_row_offers_open_pr() {
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::Done,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            action_ids.contains(&"open-pr"),
+            "Pipeline:Done menu must offer Open PR; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn pipeline_in_progress_row_action_bar_is_not_empty() {
+        // Regression for the "I saw Refine on the board but didn't see
+        // anything yet in pipelines" report: an in-flight Pipeline row
+        // must produce a non-empty action bar.
+        let mut app = make_pipeline_app();
+        // Put issue #42 into InProgress by attaching a running work
+        // assignment.
+        app.data.assignments.push(_work_assignment("w1", 100.0, "running", None));
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        let bar = app
+            .sidebar_action_bar()
+            .expect("In-progress row must produce an action bar");
+        let labels = toolbar_action_labels(&bar);
+        assert!(
+            labels.iter().any(|l| l == "Watch"),
+            "expected Watch in action bar; got {:?}",
+            labels,
+        );
+        assert!(
+            labels.iter().any(|l| l == "Stop"),
+            "expected Stop in action bar; got {:?}",
+            labels,
+        );
+    }
+
+    #[test]
+    fn pipeline_done_row_action_bar_offers_open_pr() {
+        // pipeline_lifecycle_section classifies "Done" as is_closed=true,
+        // so we close the issue + attach a merged PR to mirror the
+        // post-merge state the user actually sees.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        let bar = app
+            .sidebar_action_bar()
+            .expect("Done row must produce an action bar");
+        let labels = toolbar_action_labels(&bar);
+        assert!(
+            labels.iter().any(|l| l == "Open PR"),
+            "expected Open PR in action bar; got {:?}",
+            labels,
+        );
     }
 
     #[test]
