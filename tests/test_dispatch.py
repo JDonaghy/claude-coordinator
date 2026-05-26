@@ -60,6 +60,43 @@ class TestDispatch:
         assert payload["files_allowed"] == ["auth.py"]
         assert "files_likely" not in payload
 
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_default_branch(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        """#255: the dispatch payload must include the repo's configured
+        default_branch so the agent doesn't fall back to a hardcoded "main"
+        and silently route around `default_branch: develop` repos."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="develop")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        dispatch(proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["branch"] == "develop", (
+            f"#255: expected branch=develop in payload, got {payload.get('branch')!r}"
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_branch_falls_back_to_main_when_unset(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """When a repo doesn't specify default_branch, the payload still
+        carries an explicit "main" so the agent never sees branch=None."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["branch"] == "main"
+
     def test_unknown_machine_raises(self, config: Config) -> None:
         bad = Proposal(
             id=1, machine_name="ghost", repo_name="api",

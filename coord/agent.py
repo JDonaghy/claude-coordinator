@@ -694,20 +694,73 @@ class AgentServer:
 
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Fetch latest
+        # Determine if `origin` is configured.  In production it always is;
+        # only test fixtures + local-only repos lack a remote.  When origin
+        # is present we MUST branch from a concrete `origin/<default>` SHA
+        # to prevent unpushed local commits on `<default>` from riding into
+        # the worker's branch (issue #255).
         try:
-            _git(repo_path, "fetch", "origin")
+            _git(repo_path, "remote", "get-url", "origin")
+            has_origin = True
         except _GitError:
-            pass  # offline is OK, work from local state
+            has_origin = False
 
-        # Determine start point — prefer origin/<branch>, fall back to local
+        # Fetch latest only when we have a remote — keeps the offline /
+        # test path silent.
+        if has_origin:
+            try:
+                _git(repo_path, "fetch", "origin")
+            except _GitError:
+                pass  # transient — falls through to the rev-parse check below
+
         default_branch = assignment.spec.branch or "main"
-        start_point = f"origin/{default_branch}"
-        try:
-            _git(repo_path, "rev-parse", "--verify", start_point)
-        except _GitError:
-            # No remote tracking branch — use local branch as start point
+        if has_origin:
+            # #255: resolve to a concrete SHA from origin so unpushed local
+            # commits on `<default>` can't sneak into the worker's branch.
+            # If fetch failed AND origin/<default> isn't already known
+            # locally, this raises — surfacing a real "couldn't reach
+            # origin" condition rather than papering over it.
+            try:
+                start_point = _git(
+                    repo_path, "rev-parse", f"origin/{default_branch}",
+                ).strip()
+            except _GitError as exc:
+                raise _GitError(
+                    f"_setup_worktree: cannot resolve origin/{default_branch} "
+                    f"in {repo_path}. The remote is configured but the ref "
+                    f"is missing — check network connectivity and that the "
+                    f"repo's default_branch in coordinator.yml matches the "
+                    f"actual branch on origin. ({exc})"
+                ) from exc
+        else:
+            # No remote — fall back to the local branch (test fixtures, etc.)
             start_point = default_branch
+
+        # #255: warn (in the assignment log) if local `<default>` has commits
+        # that aren't on origin.  Those commits are NOT in the worker's
+        # branch — that's the whole point of #255 — but the user should know
+        # they have unpushed WIP sitting on this machine so they don't lose it.
+        if has_origin and assignment.log_path:
+            try:
+                ahead = _git(
+                    repo_path, "rev-list", "--count",
+                    f"origin/{default_branch}..{default_branch}",
+                ).strip()
+                if ahead and ahead != "0":
+                    msg = (
+                        f"# warning: {default_branch} on this machine has {ahead} "
+                        f"commit(s) ahead of origin/{default_branch}.  Those "
+                        f"commits are NOT in the worker's branch (#255).  "
+                        f"Push them when convenient so they aren't lost.\n"
+                    )
+                    try:
+                        with open(assignment.log_path, "a") as fh:
+                            fh.write(msg)
+                    except OSError:
+                        pass
+            except _GitError:
+                # Local `<default>` may not exist (fresh clone) — silent.
+                pass
 
         # Branch name for this assignment
         branch_name = f"issue-{assignment.spec.issue_number}-{_slugify(assignment.spec.issue_title)}"

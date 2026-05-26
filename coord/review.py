@@ -544,6 +544,10 @@ def dispatch_review(
         "type": "review",
         "system_prompt": REVIEWER_SYSTEM_PROMPT,
         "review_target": str(pr["number"]) if pr else completed.branch,
+        # #255: review checkout uses the PR branch, but the agent's worktree
+        # setup still consults `branch` as the integration base when no PR
+        # branch exists locally yet.  Match the work-dispatch path.
+        "branch": repo.default_branch or "main",
     }
 
     url = f"http://{choice.machine.host}:{AGENT_PORT}/assign"

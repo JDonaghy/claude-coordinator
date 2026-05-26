@@ -341,6 +341,9 @@ def dispatch_smoke(
         "type": "smoke",
         "system_prompt": SMOKE_SYSTEM_PROMPT,
         "review_target": completed.branch,
+        # #255: smoke checks out the worker's PR branch but the agent still
+        # consults `branch` as the integration base.
+        "branch": repo.default_branch or "main",
     }
 
     url = f"http://{choice.machine.host}:{AGENT_PORT}/assign"

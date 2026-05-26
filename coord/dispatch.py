@@ -58,6 +58,13 @@ def dispatch(
     # Resolve model: proposal override → config default → None (let claude pick).
     model = proposal.model if proposal.model else config.models.default
 
+    # #255: pin the worker's branch base to the repo's configured default
+    # branch.  Without this the agent fell back to a hardcoded "main", which
+    # silently routed around `default_branch: develop` repos like quadraui
+    # and let local-only commits on the default branch slip into worker
+    # branches.
+    default_branch = (repo.default_branch if repo is not None else None) or "main"
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
         "repo_name": proposal.repo_name,
@@ -71,6 +78,7 @@ def dispatch(
         "deny_commands": deny_commands,
         "model": model,
         "type": proposal.type,
+        "branch": default_branch,
     }
     # Only send fresh_branch when True — older agents don't have this field
     # and will reject the payload with a 400.

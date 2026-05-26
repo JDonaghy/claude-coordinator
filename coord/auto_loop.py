@@ -299,6 +299,10 @@ def _dispatch_fix(
         "files_forbidden": work.files_forbidden,
         "pull_repos": [],
         "type": "work",
+        # #255: fix-loop dispatches inherit the repo's configured default
+        # branch so the agent branches from origin/<default> rather than
+        # any local-only ref.
+        "branch": repo.default_branch or "main",
     }
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"

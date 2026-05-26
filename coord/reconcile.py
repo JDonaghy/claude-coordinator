@@ -60,6 +60,7 @@ def _reassign(
 
     retry_model = model if model is not None else failed.model
 
+    repo_cfg = config.repo(failed.repo_name)
     payload = {
         "repo_name": failed.repo_name,
         "repo_path": repo_path,
@@ -71,6 +72,9 @@ def _reassign(
         "pull_repos": [],
         "type": "work",
         "model": retry_model,
+        # #255: retry inherits the repo's configured default branch as the
+        # worker's integration base.
+        "branch": (repo_cfg.default_branch if repo_cfg is not None else None) or "main",
     }
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
