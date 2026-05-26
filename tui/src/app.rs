@@ -57,7 +57,8 @@ use quadraui::{
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
     ShellConfig, ShellContext, StageStatus, StatusBar, StatusBarSegment, StyledSpan, StyledText,
-    TabBar, TabItem, TreeRow, UiEvent, WidgetId,
+    TabBar, TabItem, Toolbar, ToolbarButton, ToolbarHit, ToolbarItemMeasure, TreeRow, UiEvent,
+    WidgetId,
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
@@ -8031,12 +8032,10 @@ impl CoordApp {
     /// same `dispatch_context_menu_action` code path the right-click
     /// already uses.  This is the no-mouse path for SSH / Termux / GTK
     /// users where right-click isn't available.
-    fn sidebar_action_bar(&self) -> Option<StatusBar> {
+    fn sidebar_action_bar(&self) -> Option<Toolbar> {
         // Reuse the right-click target builder so the action set is the
-        // same data the menu shows.  `_target_for_selected_sidebar_row`
-        // returns None when no row is selected; in that case render an
-        // empty bar (a hint segment) so the user still sees "where the
-        // actions go" rather than a missing row.
+        // same data the menu shows.  Returns None when no row is
+        // selected — the caller renders nothing in that case.
         let target = self.target_for_selected_sidebar_row()?;
         let menu_items = match &target {
             ContextMenuTarget::BoardRow { issue_number, lifecycle, .. } => {
@@ -8060,29 +8059,36 @@ impl CoordApp {
         if interesting.is_empty() {
             return None;
         }
-        let segments: Vec<StatusBarSegment> = interesting
+        let buttons: Vec<ToolbarButton> = interesting
             .iter()
-            .map(|it| {
-                let label = match &it.shortcut {
-                    Some(k) => format!(" {} ({}) ", it.label, k),
-                    None => format!(" {} ", it.label),
-                };
-                StatusBarSegment {
-                    text: label,
-                    fg: Color::rgb(220, 220, 230),
-                    bg: Color::rgb(45, 60, 80),
-                    bold: true,
-                    action_id: it
-                        .action_id
-                        .as_ref()
-                        .map(|id| WidgetId::new(format!("sidebar-action:{}", id))),
-                }
+            .filter_map(|it| {
+                // Items without an action_id are non-clickable headers
+                // (none used by the row menus today) — skip them rather
+                // than render an unclickable placeholder.
+                let id_raw = it.action_id.as_ref()?;
+                Some(ToolbarButton::Action {
+                    id: WidgetId::new(format!("sidebar-action:{}", id_raw)),
+                    label: it.label.clone(),
+                    icon: None,
+                    key_hint: it.shortcut.clone(),
+                    // The right-click menu only surfaces actions when
+                    // they apply to the current row state, so every
+                    // item here is enabled.  When that changes (#272
+                    // first-class wins), pipe per-item enabled state
+                    // through ContextMenuItem instead.
+                    enabled: true,
+                    is_active: false,
+                    tooltip: String::new(),
+                })
             })
             .collect();
-        Some(StatusBar {
+        if buttons.is_empty() {
+            return None;
+        }
+        Some(Toolbar {
             id: WidgetId::new("sidebar-action-bar"),
-            left_segments: segments,
-            right_segments: Vec::new(),
+            buttons,
+            bg: None,
         })
     }
 
@@ -8138,26 +8144,27 @@ impl CoordApp {
         if pos.y < bar_rect.y || pos.y >= bar_rect.y + bar_rect.height {
             return (content_rect, false);
         }
-        let mut cursor_x = bar_rect.x;
-        for seg in &bar.left_segments {
-            let w = seg.text.chars().count() as f32;
-            let next_x = cursor_x + w;
-            if pos.x >= cursor_x && pos.x < next_x {
-                if let Some(id) = &seg.action_id {
-                    let raw = id.as_str();
-                    if let Some(action_id) = raw.strip_prefix("sidebar-action:") {
-                        let action = action_id.to_string();
-                        if let Some(target) = self.target_for_selected_sidebar_row() {
-                            self.dispatch_context_menu_action(&action, &target);
-                        }
+        let layout = bar.layout(
+            bar_rect.x,
+            bar_rect.y,
+            bar_rect.width,
+            bar_rect.height,
+            toolbar_tui_measure,
+        );
+        match layout.hit_test(pos.x, pos.y) {
+            ToolbarHit::Button(id) => {
+                if let Some(action) = id.as_str().strip_prefix("sidebar-action:") {
+                    let action = action.to_string();
+                    if let Some(target) = self.target_for_selected_sidebar_row() {
+                        self.dispatch_context_menu_action(&action, &target);
                     }
                 }
-                return (content_rect, true);
+                (content_rect, true)
             }
-            cursor_x = next_x;
+            // Click landed in the bar but on a gap / disabled action —
+            // swallow it so it doesn't fall through to the tree.
+            ToolbarHit::Empty => (content_rect, true),
         }
-        // Click landed in the bar row but past the last button — swallow it.
-        (content_rect, true)
     }
 }
 
@@ -8175,14 +8182,13 @@ impl CoordApp {
     /// Build the toolbar (a row of clickable verb buttons) for the current
     /// view, or `None` for views where no panel-level verbs apply.
     ///
-    /// Each button is a [`StatusBarSegment`] with an `action_id` of the
-    /// form `"toolbar:<verb>"`.  Hit-testing returns those IDs to
-    /// [`dispatch_toolbar_action`].  Buttons whose precondition is unmet
-    /// (no failed assignment to retry, no proposals to approve, etc.)
-    /// render dimmed with `action_id = None` so the click hit-test
-    /// declines them — the user sees the affordance but isn't misled into
-    /// clicking a no-op.
-    fn panel_toolbar(&self) -> Option<StatusBar> {
+    /// Backed by the quadraui [`Toolbar`] primitive — each button carries
+    /// an `action_id` of the form `"toolbar:<verb>"` resolved by
+    /// [`dispatch_toolbar_action`].  Disabled buttons set
+    /// [`ToolbarButton::Action::enabled = false`] so the primitive dims
+    /// them and the hit-test declines clicks; the affordance stays
+    /// visible without misleading the user.
+    fn panel_toolbar(&self) -> Option<Toolbar> {
         // Toolbar suppressed while the watch overlay or any inline confirm
         // prompt has the keyboard — these modes consume every keystroke
         // and a clickable toolbar above them would be misleading.
@@ -8199,18 +8205,18 @@ impl CoordApp {
         // row-level actions live on the action bar (#270) or right-
         // click menu (#259-#262, #266); the panel toolbar is reserved
         // for genuine panel-wide ops.
-        let segments: Vec<StatusBarSegment> = match self.active_view {
+        let buttons: Vec<ToolbarButton> = match self.active_view {
             SidebarView::Board => {
                 vec![
-                    toolbar_button("notify", " [N]otify ", true),
+                    toolbar_button("notify", "[N]otify", true),
                     toolbar_button(
                         "retry",
-                        " [R]etry ",
+                        "[R]etry",
                         self.board_selected_failed_assignment().is_some(),
                     ),
                     toolbar_button(
                         "purge",
-                        " [P]urge ",
+                        "[P]urge",
                         self.board_selection_in_completed_group(),
                     ),
                 ]
@@ -8232,20 +8238,20 @@ impl CoordApp {
                         .map(|w| w.stages.iter().any(|s| s.action.is_some()))
                         .unwrap_or(false);
                 vec![
-                    toolbar_button("notify", " [N]otify ", true),
-                    toolbar_button("ready", " [r]eady ", ready_enabled),
-                    toolbar_button("merge", " [M]erge ", true),
-                    toolbar_button("retry", " [R]etry ", retry_enabled),
+                    toolbar_button("notify", "[N]otify", true),
+                    toolbar_button("ready", "[r]eady", ready_enabled),
+                    toolbar_button("merge", "[M]erge", true),
+                    toolbar_button("retry", "[R]etry", retry_enabled),
                 ]
             }
             // Machines and Settings have no panel-level verbs.
             SidebarView::Machines | SidebarView::Settings => return None,
         };
 
-        Some(StatusBar {
+        Some(Toolbar {
             id: WidgetId::new("panel-toolbar"),
-            left_segments: segments,
-            right_segments: Vec::new(),
+            buttons,
+            bg: None,
         })
     }
 
@@ -8279,30 +8285,27 @@ impl CoordApp {
         if pos.y < tb_rect.y || pos.y >= tb_rect.y + tb_rect.height {
             return (content_rect, false);
         }
-        // Manual hit-test: walk segments left-to-right, summing each
-        // segment's visible char width (each `text` is already padded
-        // with a leading/trailing space).  We use 1-char advance per
-        // visible char which matches the TUI status-bar rasteriser.
-        let mut cursor_x = tb_rect.x;
-        for seg in &toolbar.left_segments {
-            let w = seg.text.chars().count() as f32;
-            let next_x = cursor_x + w;
-            if pos.x >= cursor_x && pos.x < next_x {
-                if let Some(id) = &seg.action_id {
-                    let action_id = id.as_str().to_string();
-                    self.dispatch_toolbar_action(&action_id);
-                    return (content_rect, true);
-                }
-                // Disabled segment (no action_id) — swallow the click so
-                // it doesn't fall through to the panel body.
-                return (content_rect, true);
+        // Resolve the click through the primitive's own layout/hit_test
+        // so the math stays in one place — matches the TUI rasteriser's
+        // measurement (`[ label (key) ]` cells).
+        let layout = toolbar.layout(
+            tb_rect.x,
+            tb_rect.y,
+            tb_rect.width,
+            tb_rect.height,
+            toolbar_tui_measure,
+        );
+        match layout.hit_test(pos.x, pos.y) {
+            ToolbarHit::Button(id) => {
+                let action_id = id.as_str().to_string();
+                self.dispatch_toolbar_action(&action_id);
+                (content_rect, true)
             }
-            cursor_x = next_x;
+            // Empty hit (gap, separator, label, or disabled action) —
+            // swallow the click so it doesn't fall through to the panel
+            // body or surprise the user.
+            ToolbarHit::Empty => (content_rect, true),
         }
-        // Click landed in the toolbar row but past the last segment —
-        // still swallow it (the empty trailing space shouldn't fall
-        // through to body hit-testing or the user gets surprises).
-        (content_rect, true)
     }
 
     /// Resolve a toolbar `action_id` (e.g. `"toolbar:plan"`) to the same
@@ -8420,25 +8423,52 @@ impl CoordApp {
     }
 }
 
-/// Helper that builds a toolbar [`StatusBarSegment`].  Disabled buttons
-/// render dimmer and have no `action_id` so clicks fall through
-/// (preserves the visible affordance without misleading the user).
-fn toolbar_button(verb: &str, label: &str, enabled: bool) -> StatusBarSegment {
-    let (fg, bg, bold) = if enabled {
-        (Color::rgb(220, 220, 230), Color::rgb(45, 45, 60), true)
-    } else {
-        (Color::rgb(120, 120, 130), Color::rgb(35, 35, 45), false)
+/// Cell-width measure used to lay out a [`Toolbar`] for hit-testing.
+///
+/// Mirrors `quadraui::tui::toolbar::tui_item_width` exactly — that
+/// helper is `pub(crate)` so we can't import it.  Keep in sync with
+/// upstream when the rasteriser's framing changes (currently
+/// `"[ icon? label (hint)? ]"` for actions, 2 cells for separators,
+/// raw char width for labels).
+fn toolbar_tui_measure(btn: &ToolbarButton) -> ToolbarItemMeasure {
+    let w = match btn {
+        ToolbarButton::Action {
+            label,
+            icon,
+            key_hint,
+            ..
+        } => {
+            let icon_w = icon.as_ref().map(|s| s.chars().count() + 1).unwrap_or(0);
+            // " (xxx)" — 3 cells of decoration ("()" + leading space)
+            // plus the hint's own char width.
+            let hint_w = key_hint
+                .as_ref()
+                .map(|s| s.chars().count() + 3)
+                .unwrap_or(0);
+            // "[ " + content + " ]"
+            (4 + icon_w + label.chars().count() + hint_w) as f32
+        }
+        ToolbarButton::Separator => 2.0,
+        ToolbarButton::Label { text, .. } => text.chars().count() as f32,
     };
-    StatusBarSegment {
-        text: label.to_string(),
-        fg,
-        bg,
-        bold,
-        action_id: if enabled {
-            Some(WidgetId::new(format!("toolbar:{}", verb)))
-        } else {
-            None
-        },
+    ToolbarItemMeasure::new(w)
+}
+
+/// Helper that builds one `ToolbarButton::Action` for the panel toolbar.
+/// Action id is always `toolbar:<verb>` — disabled buttons keep the id
+/// (so the layout still records them for hover tooltips) but the
+/// primitive's `enabled` flag prevents click dispatch.
+fn toolbar_button(verb: &str, label: &str, enabled: bool) -> ToolbarButton {
+    ToolbarButton::Action {
+        id: WidgetId::new(format!("toolbar:{}", verb)),
+        // Strip the surrounding spaces — the primitive adds its own
+        // padding via `[ ... ]` framing in the TUI rasteriser.
+        label: label.trim().to_string(),
+        icon: None,
+        key_hint: None,
+        enabled,
+        is_active: false,
+        tooltip: String::new(),
     }
 }
 
@@ -8943,7 +8973,7 @@ impl ShellApp for CoordApp {
                     full_sidebar_rect.width,
                     ab_h,
                 );
-                backend.draw_status_bar(ab_rect, &action_bar, None, None);
+                backend.draw_toolbar(ab_rect, &action_bar, None, None);
                 Rect::new(
                     full_sidebar_rect.x,
                     full_sidebar_rect.y + ab_h,
@@ -8983,7 +9013,7 @@ impl ShellApp for CoordApp {
         let m = if let Some(toolbar) = self.panel_toolbar() {
             let tb_h = self.toolbar_height(lh);
             let tb_rect = Rect::new(full_m.x, full_m.y, full_m.width, tb_h);
-            backend.draw_status_bar(tb_rect, &toolbar, None, None);
+            backend.draw_toolbar(tb_rect, &toolbar, None, None);
             Rect::new(
                 full_m.x,
                 full_m.y + tb_h,
@@ -10203,6 +10233,30 @@ fn record_test_verdict_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Collect every `ToolbarButton::Action` label from a toolbar.
+    /// Test-only convenience for assertions that previously walked
+    /// `bar.left_segments` on the StatusBar shape.
+    fn toolbar_action_labels(bar: &Toolbar) -> Vec<String> {
+        bar.buttons
+            .iter()
+            .filter_map(|b| match b {
+                ToolbarButton::Action { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collect every action_id (as raw string) from a toolbar.
+    fn toolbar_action_ids(bar: &Toolbar) -> Vec<String> {
+        bar.buttons
+            .iter()
+            .filter_map(|b| match b {
+                ToolbarButton::Action { id, .. } => Some(id.as_str().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
 
     // ── fmt_dur ────────────────────────────────────────────────────────────────
 
@@ -14523,7 +14577,7 @@ mod tests {
         app.select_issue("repo-a", 88);
 
         let bar = app.sidebar_action_bar().expect("Backlog selection → action bar");
-        let labels: Vec<&str> = bar.left_segments.iter().map(|s| s.text.as_str()).collect();
+        let labels = toolbar_action_labels(&bar);
         assert!(
             labels.iter().any(|l| l.contains("Refine")),
             "expected Refine button on a Backlog row; got {:?}",
@@ -14550,7 +14604,7 @@ mod tests {
         app.select_issue("repo-a", 89);
 
         let bar = app.sidebar_action_bar().expect("Refining selection → action bar");
-        let labels: Vec<&str> = bar.left_segments.iter().map(|s| s.text.as_str()).collect();
+        let labels = toolbar_action_labels(&bar);
         assert!(labels.iter().any(|l| l.contains("Mark Refined")));
         assert!(labels.iter().any(|l| l.contains("Drop to Backlog")));
     }
@@ -14573,14 +14627,10 @@ mod tests {
         app.select_issue("repo-a", 90);
 
         let bar = app.sidebar_action_bar().expect("backlog bar");
-        let ids: Vec<&str> = bar
-            .left_segments
-            .iter()
-            .filter_map(|s| s.action_id.as_ref().map(|i| i.as_str()))
-            .collect();
+        let ids = toolbar_action_ids(&bar);
         assert!(
             ids.iter().all(|id| id.starts_with("sidebar-action:")),
-            "every clickable segment must carry the sidebar-action prefix; got {:?}",
+            "every clickable action must carry the sidebar-action prefix; got {:?}",
             ids,
         );
     }
@@ -14594,11 +14644,7 @@ mod tests {
         // Proposals; Merge is Pipeline-only).
         let app = make_app_default();
         let bar = app.panel_toolbar().expect("Board has a toolbar");
-        let labels: Vec<&str> = bar
-            .left_segments
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect();
+        let labels = toolbar_action_labels(&bar);
         for expected in &["[N]otify", "[R]etry", "[P]urge"] {
             assert!(
                 labels.iter().any(|l| l.contains(expected)),
@@ -14627,11 +14673,7 @@ mod tests {
         let mut app = app;
         app.active_view = SidebarView::Pipeline;
         let bar = app.panel_toolbar().expect("Pipeline has a toolbar");
-        let labels: Vec<&str> = bar
-            .left_segments
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect();
+        let labels = toolbar_action_labels(&bar);
         for expected in &["[N]otify", "[r]eady", "[M]erge", "[R]etry"] {
             assert!(
                 labels.iter().any(|l| l.contains(expected)),
@@ -14660,21 +14702,37 @@ mod tests {
     }
 
     #[test]
-    fn panel_toolbar_disabled_button_drops_action_id() {
+    fn panel_toolbar_disabled_button_keeps_id_but_marks_disabled() {
         // The Retry button on the Board panel is disabled when there's
-        // no failed assignment to retry; disabled buttons must not carry
-        // an action_id so a click on them falls through.
+        // no failed assignment to retry.  Under #272 the toolbar
+        // primitive carries first-class `enabled: false` — the button
+        // still has its id (for hover tooltips) but the layout's
+        // `hit_test` declines clicks.  This is the behavioural upgrade
+        // over the old "drop the action_id" workaround.
         let app = make_app_default();
         let bar = app.panel_toolbar().expect("Board toolbar");
         let retry = bar
-            .left_segments
+            .buttons
             .iter()
-            .find(|s| s.text.contains("[R]etry"))
-            .expect("Retry segment present");
-        assert!(
-            retry.action_id.is_none(),
-            "Retry should be disabled (no failed assignments)",
-        );
+            .find_map(|b| match b {
+                ToolbarButton::Action { id, label, enabled, .. }
+                    if label.contains("[R]etry") =>
+                {
+                    Some((id.clone(), *enabled))
+                }
+                _ => None,
+            })
+            .expect("Retry button present");
+        assert!(!retry.1, "Retry should be disabled (no failed assignments)");
+        // Layout records the button so hover state can fire, but the
+        // hit-test must refuse clicks landing on it.
+        let layout = bar.layout(0.0, 0.0, 200.0, 1.0, toolbar_tui_measure);
+        let visible = layout
+            .visible_items
+            .iter()
+            .find(|v| v.action_id.as_ref() == Some(&retry.0))
+            .expect("Retry visible entry");
+        assert!(!visible.clickable, "Disabled action must not be clickable");
     }
 
     #[test]
