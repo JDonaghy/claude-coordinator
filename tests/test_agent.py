@@ -248,3 +248,84 @@ def test_orphaned_running_assignments_marked_failed_on_load(tmp_path: Path) -> N
     assert recovered is not None
     assert recovered.status == FAILED
     assert "restarted" in recovered.error
+
+
+# ── Tests for health().worktree_bytes and clean_worktrees() ──────────────────
+
+def test_health_includes_worktree_bytes(tmp_path: Path) -> None:
+    """health() always includes worktree_bytes (0 when no worktrees exist)."""
+    server = _server(tmp_path)
+    h = server.health()
+    assert "worktree_bytes" in h
+    assert h["worktree_bytes"] == 0
+
+
+def test_health_worktree_bytes_reflects_disk_usage(tmp_path: Path) -> None:
+    """health() worktree_bytes increases when files exist under worktrees/."""
+    server = _server(tmp_path)
+    wt_dir = server.state_dir / "worktrees" / "fake-id"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "big.bin").write_bytes(b"X" * 4096)
+
+    h = server.health()
+    assert h["worktree_bytes"] >= 4096
+
+
+def test_clean_worktrees_empty_base(tmp_path: Path) -> None:
+    """clean_worktrees returns zero counts when no worktrees directory exists."""
+    server = _server(tmp_path)
+    result = server.clean_worktrees()
+    assert result == {"cleaned": 0, "kept": 0, "bytes_freed": 0}
+
+
+def test_clean_worktrees_removes_orphan(tmp_path: Path) -> None:
+    """Orphaned worktrees (no matching assignment) are removed."""
+    server = _server(tmp_path)
+    orphan = server.state_dir / "worktrees" / "no-such-assignment"
+    orphan.mkdir(parents=True)
+    (orphan / "file.txt").write_text("data")
+
+    result = server.clean_worktrees()
+    assert result["cleaned"] == 1
+    assert result["bytes_freed"] > 0
+    assert not orphan.exists()
+
+
+def test_clean_worktrees_keeps_running(tmp_path: Path) -> None:
+    """Worktrees for running assignments are never touched."""
+    repo = _init_repo(tmp_path / "repo")
+    # Use a worker that sleeps long enough for us to inspect state.
+    server = _server(tmp_path, argv=["/bin/sh", "-c", "sleep 10"], repo_path=repo)
+    a = server.assign(_spec(repo))
+
+    # Give the worker a moment to start and create its worktree.
+    time.sleep(0.5)
+
+    result = server.clean_worktrees()
+    assert result["kept"] >= 1
+    assert result["cleaned"] == 0
+    server.shutdown()
+
+
+def test_clean_worktrees_removes_stale_done(tmp_path: Path) -> None:
+    """Worktrees whose assignment is done and old (> recent_secs) are removed.
+
+    Simulates a crash-recovery scenario: the agent recorded the assignment
+    as done but the worktree directory was not cleaned up before the crash.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+    a = server.assign(_spec(repo))
+    final = server.wait_for(a.id)
+
+    # The agent's normal cleanup already removed the worktree.  Re-create it
+    # to simulate an unclean shutdown where cleanup didn't run.
+    stale_wt = server.state_dir / "worktrees" / final.id
+    stale_wt.mkdir(parents=True, exist_ok=True)
+    (stale_wt / "leftover.txt").write_text("stale data")
+
+    # recent_secs=0 means even a just-finished assignment is eligible.
+    result = server.clean_worktrees(recent_secs=0)
+    assert result["cleaned"] >= 1
+    assert not stale_wt.exists()
+    server.shutdown()

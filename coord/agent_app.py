@@ -377,6 +377,25 @@ def build_app(
         threading.Thread(target=_do_update, daemon=False, name="agent-update").start()
         return JSONResponse({"status": "updating", "mode": mode}, status_code=202)
 
+    async def worktree_clean(request: Request) -> JSONResponse:
+        """Remove stale git worktrees managed by this agent.
+
+        Idempotent POST — skips worktrees for running/pending assignments
+        and those finished within the last 5 minutes.  Returns a JSON
+        summary: ``{"cleaned": N, "kept": M, "bytes_freed": B}``.
+
+        Optional JSON body: ``{"recent_secs": 300}`` to override the
+        recency window (default 300 s).
+        """
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        recent_secs = float(body.get("recent_secs", 300.0))
+        result = server.clean_worktrees(recent_secs=recent_secs)
+        return JSONResponse(result)
+
     async def restart(request: Request) -> JSONResponse:
         """Gracefully restart the agent process.
 
@@ -456,5 +475,6 @@ def build_app(
         Route("/stream/{id}", stream, methods=["GET"]),
         Route("/update", update, methods=["POST"]),
         Route("/restart", restart, methods=["POST"]),
+        Route("/worktree-clean", worktree_clean, methods=["POST"]),
     ]
     return Starlette(routes=routes)

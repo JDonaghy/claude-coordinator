@@ -316,3 +316,51 @@ def test_status_returns_200_with_truncated_log(tmp_path: Path) -> None:
     assert "active" in body
 
     server.shutdown(kill_running=True)
+
+
+# ── /health includes worktree_bytes ──────────────────────────────────────────
+
+def test_health_includes_worktree_bytes(tmp_path: Path) -> None:
+    """GET /health must include worktree_bytes."""
+    client, _ = _client(tmp_path)
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert "worktree_bytes" in body
+    assert isinstance(body["worktree_bytes"], int)
+
+
+# ── /worktree-clean endpoint ──────────────────────────────────────────────────
+
+def test_worktree_clean_empty(tmp_path: Path) -> None:
+    """POST /worktree-clean returns JSON with cleaned/kept/bytes_freed."""
+    client, _ = _client(tmp_path)
+    r = client.post("/worktree-clean")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cleaned"] == 0
+    assert body["kept"] == 0
+    assert body["bytes_freed"] == 0
+
+
+def test_worktree_clean_removes_orphan(tmp_path: Path) -> None:
+    """POST /worktree-clean removes orphaned worktrees (no matching assignment)."""
+    client, server = _client(tmp_path)
+    orphan = server.state_dir / "worktrees" / "no-such-id"
+    orphan.mkdir(parents=True)
+    (orphan / "data.txt").write_text("hello")
+
+    r = client.post("/worktree-clean")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cleaned"] == 1
+    assert not orphan.exists()
+
+
+def test_worktree_clean_respects_recent_secs(tmp_path: Path) -> None:
+    """POST /worktree-clean with recent_secs body parameter is accepted."""
+    client, _ = _client(tmp_path)
+    r = client.post("/worktree-clean", json={"recent_secs": 600})
+    assert r.status_code == 200
+    body = r.json()
+    assert "cleaned" in body

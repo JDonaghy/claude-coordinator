@@ -873,6 +873,76 @@ def agent_restart(
             sys.exit(1)
 
 
+@agent.command(
+    "clean-worktrees",
+    help=(
+        "POST /worktree-clean to one or all agent servers.  Each agent "
+        "removes git worktrees whose assignment is in a terminal state "
+        "(done/failed/cancelled) and finished more than --recent-secs ago.  "
+        "Running/pending worktrees are never touched."
+    ),
+)
+@_CONFIG_OPTION
+@click.option(
+    "--machine",
+    "machine_filter",
+    default=None,
+    help="Name of a single machine to clean (from coordinator.yml).",
+)
+@click.option(
+    "--all",
+    "all_machines",
+    is_flag=True,
+    help="Clean all machines (mutually exclusive with --machine).",
+)
+@click.option(
+    "--recent-secs",
+    default=300,
+    show_default=True,
+    type=int,
+    help=(
+        "Minimum age in seconds for a terminal assignment's worktree to be "
+        "eligible for removal (guards against racing with a just-finished worker)."
+    ),
+)
+def agent_clean_worktrees(
+    config_path: Path,
+    machine_filter: str | None,
+    all_machines: bool,
+    recent_secs: int,
+) -> None:
+    cfg = _load_config(config_path)
+    targets = _resolve_agent_targets(cfg, machine_filter, all_machines)
+    if not targets:
+        click.echo("No machines to clean.", err=True)
+        sys.exit(2)
+
+    any_error = False
+    for machine in targets:
+        url = f"http://{machine.host}:{AGENT_PORT}/worktree-clean"
+        click.echo(f"  {machine.name}: POST {url} ...", nl=False)
+        try:
+            resp = httpx.post(url, json={"recent_secs": recent_secs}, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                cleaned = data.get("cleaned", 0)
+                kept = data.get("kept", 0)
+                freed = data.get("bytes_freed", 0)
+                freed_mb = freed / (1024 * 1024)
+                click.echo(
+                    f" cleaned={cleaned} kept={kept} freed={freed_mb:.1f} MB"
+                )
+            else:
+                click.echo(f" HTTP {resp.status_code}")
+                any_error = True
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            click.echo(f" error: {e}")
+            any_error = True
+
+    if any_error:
+        sys.exit(1)
+
+
 def _resolve_agent_targets(cfg, machine_filter: str | None, all_machines: bool):
     """Return the list of Machine objects to target for update/restart.
 
