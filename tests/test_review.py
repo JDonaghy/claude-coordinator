@@ -814,3 +814,143 @@ class TestParseReviewFromAgent:
 
         monkeypatch.setattr("coord.review.httpx.get", lambda *a, **kw: FakeResponse())
         assert parse_review_from_agent("any-host", "any") is None
+
+
+# ── #248: machine-readable review header ────────────────────────────────────
+
+
+class TestReviewHeader:
+    """Coverage for format_review_header / parse_review_header /
+    estimate_review_counts — the helpers that let the coordinator embed
+    a verdict + counts in posted review bodies so the TUI / coordinator
+    session can surface them without re-ingesting prose."""
+
+    def test_format_header_carries_verdict_only_by_default(self) -> None:
+        from coord.review import format_review_header
+        out = format_review_header(verdict="approve")
+        assert out == "<!-- coord:review verdict=approve -->"
+
+    def test_format_header_emits_all_provided_tokens(self) -> None:
+        from coord.review import format_review_header
+        out = format_review_header(
+            verdict="request-changes",
+            reviewer_machine="elitebook",
+            assignment_id="144ffa027a31",
+            blocking=2,
+            nonblocking=5,
+            nits=2,
+        )
+        # Order is stable and counts come before identity fields, matching
+        # the example in #248's issue body.
+        assert (
+            out
+            == "<!-- coord:review verdict=request-changes blocking=2 "
+            "nonblocking=5 nits=2 reviewer=elitebook "
+            "assignment=144ffa027a31 -->"
+        )
+
+    def test_parse_header_round_trips(self) -> None:
+        from coord.review import format_review_header, parse_review_header
+        header = format_review_header(
+            verdict="approve",
+            reviewer_machine="precision",
+            assignment_id="abc123",
+            blocking=0,
+            nonblocking=3,
+            nits=1,
+        )
+        parsed = parse_review_header(header)
+        assert parsed == {
+            "verdict": "approve",
+            "blocking": 0,
+            "nonblocking": 3,
+            "nits": 1,
+            "reviewer": "precision",
+            "assignment": "abc123",
+        }
+
+    def test_parse_header_from_full_body(self) -> None:
+        """The parser must find the header even when it's followed by
+        a full prose body — that's the normal case after the coordinator
+        prepends it to findings.body."""
+        from coord.review import parse_review_header
+        body = (
+            "<!-- coord:review verdict=approve blocking=0 reviewer=dellserver -->\n"
+            "\n"
+            "## Review Complete — ✅ Approved\n"
+            "\n"
+            "Looks good — all tests pass and the diff stays in scope.\n"
+        )
+        parsed = parse_review_header(body)
+        assert parsed is not None
+        assert parsed["verdict"] == "approve"
+        assert parsed["blocking"] == 0
+        assert parsed["reviewer"] == "dellserver"
+
+    def test_parse_returns_none_when_header_missing(self) -> None:
+        from coord.review import parse_review_header
+        assert parse_review_header("## Review\n\nLooks fine.") is None
+
+    def test_parse_returns_none_when_verdict_missing(self) -> None:
+        """A coord:review HTML comment without a verdict is invalid —
+        the parser refuses to return a partial result."""
+        from coord.review import parse_review_header
+        assert parse_review_header("<!-- coord:review reviewer=x -->") is None
+
+    def test_parse_ignores_unknown_tokens(self) -> None:
+        from coord.review import parse_review_header
+        parsed = parse_review_header(
+            "<!-- coord:review verdict=approve future-token=hello extra=42 -->"
+        )
+        assert parsed is not None
+        assert parsed["verdict"] == "approve"
+        # Unknown tokens land as strings; never raise.
+        assert parsed["future-token"] == "hello"
+        assert parsed["extra"] == "42"
+
+    def test_estimate_counts_picks_up_section_bullets(self) -> None:
+        from coord.review import estimate_review_counts
+        body = (
+            "## Required changes\n"
+            "- HUMAN_REQUIRED never persists (coord/cli.py:2616-2663)\n"
+            "- retry cap not enforced (coord/conflict_fix.py:161-167)\n"
+            "\n"
+            "## Non-blocking concerns\n"
+            "- Consider extracting the helper into a shared module\n"
+            "* And another point that's not blocking\n"
+            "\n"
+            "## Polish / nits\n"
+            "- Trailing whitespace at coord/agent.py:42\n"
+        )
+        b, nb, nits = estimate_review_counts(body)
+        assert (b, nb, nits) == (2, 2, 1)
+
+    def test_estimate_counts_returns_none_when_no_recognised_sections(
+        self,
+    ) -> None:
+        """When the prose doesn't use the conventional headings, the
+        heuristic refuses to guess — better an absent count than a
+        misleading one."""
+        from coord.review import estimate_review_counts
+        body = "Looks fine to me — approving.\n"
+        assert estimate_review_counts(body) == (None, None, None)
+
+    def test_estimate_counts_empty_section_records_zero(self) -> None:
+        """Reaching a recognised heading sets the bucket to 0 even when
+        no bullets follow — distinguishes 'no items found' from 'didn't
+        check that section'."""
+        from coord.review import estimate_review_counts
+        body = (
+            "## Blocking\n"
+            "\n"
+            "(none — diff is clean)\n"
+            "\n"
+            "## Nits\n"
+            "- One trailing space at line 42\n"
+        )
+        b, nb, nits = estimate_review_counts(body)
+        # blocking section was visited (set to 0); no Non-blocking
+        # heading appears (stays None); nits has one bullet.
+        assert b == 0
+        assert nb is None
+        assert nits == 1

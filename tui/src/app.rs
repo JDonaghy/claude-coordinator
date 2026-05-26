@@ -664,6 +664,60 @@ struct FetchedReview {
     body: String,
 }
 
+/// #248: parsed `<!-- coord:review ... -->` header.  The coordinator
+/// prepends this to every review body so the TUI can surface the
+/// verdict + counts without ingesting the prose.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CoordReviewHeader {
+    verdict: Option<String>,
+    blocking: Option<u32>,
+    nonblocking: Option<u32>,
+    nits: Option<u32>,
+    reviewer: Option<String>,
+    assignment: Option<String>,
+}
+
+/// Extract the `<!-- coord:review ... -->` header from a review body.
+/// Returns `None` when the header is missing or malformed.  Tolerates
+/// extra whitespace and unknown tokens — only `verdict` is required.
+fn parse_coord_review_header(body: &str) -> Option<CoordReviewHeader> {
+    let start = body.find("<!--").and_then(|s| {
+        // Find a `coord:review` token within the same comment.
+        let rest = &body[s..];
+        let end = rest.find("-->")?;
+        let inside = &rest[4..end];
+        let trimmed = inside.trim();
+        if !trimmed.starts_with("coord:review") && !trimmed.starts_with("coord: review") {
+            return None;
+        }
+        let body_after = trimmed.split_once("coord:review").map(|(_, b)| b)?;
+        Some(body_after.trim().to_string())
+    })?;
+
+    let mut header = CoordReviewHeader::default();
+    for token in start.split_whitespace() {
+        let (k, v) = match token.split_once('=') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let k_lower = k.to_ascii_lowercase();
+        match k_lower.as_str() {
+            "verdict" => header.verdict = Some(v.to_string()),
+            "blocking" => header.blocking = v.parse().ok(),
+            "nonblocking" => header.nonblocking = v.parse().ok(),
+            "nits" => header.nits = v.parse().ok(),
+            "reviewer" => header.reviewer = Some(v.to_string()),
+            "assignment" => header.assignment = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    if header.verdict.is_some() {
+        Some(header)
+    } else {
+        None
+    }
+}
+
 /// An open issue from the local `issues` table (synced from GitHub on coord plan).
 #[derive(Clone)]
 struct OpenIssue {
@@ -6280,11 +6334,39 @@ impl CoordApp {
                             other => (other, Color::rgb(200, 200, 200)),
                         };
                         items.push(kv_item("  Review", state_label, Some(state_color)));
-                        // Skip leading whitespace so the preview is
-                        // dense.  Cap to 10 lines.
+                        // #248: surface the coord:review header counts as a
+                        // single dense line when the coordinator embedded
+                        // one.  Lets the user see "2 blocking, 5 polish"
+                        // without scrolling the prose body.
+                        if let Some(header) = parse_coord_review_header(&rev.body) {
+                            let mut parts: Vec<String> = Vec::new();
+                            if let Some(b) = header.blocking {
+                                parts.push(format!("{b} blocking"));
+                            }
+                            if let Some(n) = header.nonblocking {
+                                parts.push(format!("{n} non-blocking"));
+                            }
+                            if let Some(n) = header.nits {
+                                parts.push(format!("{n} nits"));
+                            }
+                            if let Some(r) = header.reviewer.as_deref() {
+                                parts.push(format!("reviewer: {r}"));
+                            }
+                            if !parts.is_empty() {
+                                items.push(kv_item(
+                                    "",
+                                    &format!("    ({})", parts.join(", ")),
+                                    Some(Color::rgb(160, 160, 180)),
+                                ));
+                            }
+                        }
+                        // Skip leading whitespace and the coord:review
+                        // header HTML comment so the preview is dense
+                        // and human-readable.
                         let body_lines: Vec<&str> = rev
                             .body
                             .lines()
+                            .filter(|l| !l.trim_start().starts_with("<!-- coord:review"))
                             .skip_while(|l| l.trim().is_empty())
                             .take(10)
                             .collect();
@@ -15054,5 +15136,71 @@ mod tests {
         let app = make_app_default();
         let list = app.settings_sidebar_placeholder();
         assert!(list.items.is_empty());
+    }
+
+    // ── #248: parse_coord_review_header ──────────────────────────────────
+
+    #[test]
+    fn parse_review_header_full_payload() {
+        let body = "<!-- coord:review verdict=request-changes blocking=2 \
+                    nonblocking=5 nits=1 reviewer=elitebook \
+                    assignment=144ffa027a31 -->\n\n## Review\n\n…";
+        let h = parse_coord_review_header(body).expect("header present");
+        assert_eq!(h.verdict.as_deref(), Some("request-changes"));
+        assert_eq!(h.blocking, Some(2));
+        assert_eq!(h.nonblocking, Some(5));
+        assert_eq!(h.nits, Some(1));
+        assert_eq!(h.reviewer.as_deref(), Some("elitebook"));
+        assert_eq!(h.assignment.as_deref(), Some("144ffa027a31"));
+    }
+
+    #[test]
+    fn parse_review_header_verdict_only() {
+        let h = parse_coord_review_header(
+            "<!-- coord:review verdict=approve -->",
+        )
+        .expect("header present");
+        assert_eq!(h.verdict.as_deref(), Some("approve"));
+        assert_eq!(h.blocking, None);
+        assert_eq!(h.reviewer, None);
+    }
+
+    #[test]
+    fn parse_review_header_returns_none_without_verdict() {
+        // A coord:review HTML comment without a verdict token is invalid.
+        // Refusing to return a partial header keeps the renderer from
+        // showing "verdict: None" badges.
+        assert!(parse_coord_review_header(
+            "<!-- coord:review reviewer=elitebook -->"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_review_header_returns_none_when_header_missing() {
+        assert!(parse_coord_review_header("## Review\n\nLooks fine.").is_none());
+    }
+
+    #[test]
+    fn parse_review_header_ignores_unknown_tokens() {
+        // Future-token tolerance: unknown keys are skipped, never panic.
+        let h = parse_coord_review_header(
+            "<!-- coord:review verdict=approve cost-usd=0.34 -->",
+        )
+        .expect("header present");
+        assert_eq!(h.verdict.as_deref(), Some("approve"));
+    }
+
+    #[test]
+    fn parse_review_header_ignores_non_integer_counts() {
+        // If the count token can't be parsed (e.g. corrupt header), keep
+        // going rather than rejecting the whole header — verdict is still
+        // useful on its own.
+        let h = parse_coord_review_header(
+            "<!-- coord:review verdict=approve blocking=many -->",
+        )
+        .expect("header present");
+        assert_eq!(h.verdict.as_deref(), Some("approve"));
+        assert_eq!(h.blocking, None);
     }
 }

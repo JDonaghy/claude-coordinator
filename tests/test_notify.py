@@ -240,7 +240,12 @@ class TestReviewNotify:
             posted, _stuck = notify_mod.run(config)
 
         assert len(posted) == 1
-        mock_review.assert_called_once_with("acme/api", 99, "approve", "LGTM — all good.")
+        # #248: the body is now prefixed with a machine-readable header.
+        mock_review.assert_called_once()
+        repo_arg, pr_arg, verdict_arg, body_arg = mock_review.call_args.args
+        assert (repo_arg, pr_arg, verdict_arg) == ("acme/api", 99, "approve")
+        assert body_arg.startswith("<!-- coord:review verdict=approve")
+        assert "LGTM — all good." in body_arg
         assert "rev1" in state_mod.load_notified()
 
     def test_review_request_changes_posts_pr_review(
@@ -259,7 +264,12 @@ class TestReviewNotify:
             posted, _stuck = notify_mod.run(config)
 
         assert len(posted) == 1
-        mock_review.assert_called_once_with("acme/api", 77, "request-changes", "Bug at line 42.")
+        # #248: header is prefixed; verdict + prose preserved.
+        mock_review.assert_called_once()
+        _, _, verdict_arg, body_arg = mock_review.call_args.args
+        assert verdict_arg == "request-changes"
+        assert body_arg.startswith("<!-- coord:review verdict=request-changes")
+        assert "Bug at line 42." in body_arg
 
     def test_review_fallback_when_log_parse_fails(
         self, coord_dir: Path, config: Config, tmp_path: Path
@@ -365,13 +375,20 @@ class TestReviewNotify:
             posted, _stuck = notify_mod.run(config)
 
         assert len(posted) == 1
-        # PR review was attempted then failed.
-        mock_pr_review.assert_called_once_with("acme/api", 173, "request-changes", "Bug at line 42.")
+        # PR review was attempted then failed.  #248: body carries the header.
+        mock_pr_review.assert_called_once()
+        _, _, verdict_arg, pr_body = mock_pr_review.call_args.args
+        assert verdict_arg == "request-changes"
+        assert pr_body.startswith("<!-- coord:review verdict=request-changes")
+        assert "Bug at line 42." in pr_body
         # Findings posted to the issue as a comment instead.
         mock_post.assert_called_once()
         body = mock_post.call_args.args[2]
         assert "Bug at line 42." in body
         assert "Changes Requested" in body
+        # The fallback issue comment also carries the header so coord/TUI
+        # can surface the verdict without re-ingesting prose.
+        assert "<!-- coord:review verdict=request-changes" in body
         # Fallback message should reference the PR number so the reader knows context.
         assert "173" in body
 
@@ -447,7 +464,12 @@ class TestPostOrphanedReviewFindings:
             posted = notify_mod.post_orphaned_review_findings(config)
 
         assert "orphan1" in posted
-        mock_review.assert_called_once_with("acme/api", 50, "approve", "Orphaned LGTM.")
+        # #248: header prefixed onto the orphan-path body as well.
+        mock_review.assert_called_once()
+        _, _, verdict_arg, body_arg = mock_review.call_args.args
+        assert verdict_arg == "approve"
+        assert body_arg.startswith("<!-- coord:review verdict=approve")
+        assert "Orphaned LGTM." in body_arg
 
         # review_posted_at should now be set
         from coord.state import load_done_reviews_needing_post
@@ -566,7 +588,12 @@ class TestPostOrphanedReviewFindings:
             notify_mod.run(config)
 
         # Findings should have been posted via the orphaned path inside run()
-        mock_review.assert_called_once_with("acme/api", 90, "approve", "All clear.")
+        # #248: header is prefixed; preserve original prose.
+        mock_review.assert_called_once()
+        _, _, verdict_arg, body_arg = mock_review.call_args.args
+        assert verdict_arg == "approve"
+        assert body_arg.startswith("<!-- coord:review verdict=approve")
+        assert "All clear." in body_arg
 
     def test_load_done_reviews_needing_post_filters_by_repo(
         self, coord_dir: Path, config: Config

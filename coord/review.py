@@ -64,6 +64,132 @@ _VERDICT_ALIASES: dict[str, str] = {
 }
 
 
+# ── #248: machine-readable review header ────────────────────────────────────
+#
+# When the coordinator posts a review comment back to GitHub it prepends a
+# short HTML comment carrying the verdict in machine-readable form.  The
+# header is invisible to humans on the PR but lets the TUI render a verdict
+# badge and lets the coordinator session check the verdict without reading
+# the full prose body (which can be several KB).
+#
+# Format:
+#     <!-- coord:review verdict=request-changes blocking=2 nonblocking=5 \
+#          nits=2 reviewer=elitebook assignment=144ffa027a31 -->
+#
+# `verdict` is always present.  Counts are best-effort: when the prose
+# body uses recognisable section headings, the coordinator counts items
+# under each; when it can't, those tokens are omitted (parser tolerates
+# missing tokens).
+_REVIEW_HEADER_RE = re.compile(
+    r"<!--\s*coord:review\s+([^>]+?)\s*-->",
+    re.IGNORECASE,
+)
+
+# Maps human section-heading keywords (case-insensitive) to the count
+# category they belong to.  The heuristic walks the prose body, splits
+# on markdown headings, and bucketises bullet-list items under each.
+_SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "blocking": ("blocking", "required change", "must fix", "must-fix",
+                 "changes required"),
+    "nonblocking": ("non-blocking", "non blocking", "concerns",
+                    "should fix", "should-fix", "observations"),
+    "nits": ("nits", "nit:", "polish", "minor", "style"),
+}
+
+
+def format_review_header(
+    *,
+    verdict: str,
+    reviewer_machine: str | None = None,
+    assignment_id: str | None = None,
+    blocking: int | None = None,
+    nonblocking: int | None = None,
+    nits: int | None = None,
+) -> str:
+    """Build the HTML-comment header that machines parse.
+
+    `verdict` is required; everything else is optional and only emitted
+    when provided.  Returns a single line (no trailing newline).
+    """
+    parts = [f"verdict={verdict}"]
+    if blocking is not None:
+        parts.append(f"blocking={blocking}")
+    if nonblocking is not None:
+        parts.append(f"nonblocking={nonblocking}")
+    if nits is not None:
+        parts.append(f"nits={nits}")
+    if reviewer_machine:
+        parts.append(f"reviewer={reviewer_machine}")
+    if assignment_id:
+        parts.append(f"assignment={assignment_id}")
+    return f"<!-- coord:review {' '.join(parts)} -->"
+
+
+def parse_review_header(body: str) -> dict[str, str | int] | None:
+    """Extract the coord:review header from *body*, or ``None`` when missing.
+
+    Numeric tokens (``blocking``, ``nonblocking``, ``nits``) are returned as
+    ``int``; everything else stays a ``str``.  Tolerates extra whitespace
+    and unknown tokens.
+    """
+    m = _REVIEW_HEADER_RE.search(body)
+    if not m:
+        return None
+    out: dict[str, str | int] = {}
+    for token in m.group(1).split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        key = key.lower()
+        if key in ("blocking", "nonblocking", "nits"):
+            try:
+                out[key] = int(value)
+            except ValueError:
+                continue
+        else:
+            out[key] = value
+    return out if "verdict" in out else None
+
+
+def estimate_review_counts(
+    body: str,
+) -> tuple[int | None, int | None, int | None]:
+    """Best-effort count of (blocking, nonblocking, nits) bullets in *body*.
+
+    Walks markdown sections.  A section is recognised when its heading
+    contains one of `_SECTION_KEYWORDS`; counts are the number of `- ` /
+    `* ` / `1. ` bullets directly under that section (until the next
+    heading).  Returns ``(None, None, None)`` when no recognised
+    sections appear — the heuristic refuses to guess.
+    """
+    counts: dict[str, int | None] = {"blocking": None, "nonblocking": None, "nits": None}
+    current: str | None = None
+    bullet_re = re.compile(r"^\s*(?:[-*]|\d+\.)\s+\S")
+    # Check buckets in order of keyword specificity so that "Non-blocking
+    # concerns" doesn't accidentally match the `blocking` bucket first.
+    ordered_buckets = ("nonblocking", "nits", "blocking")
+
+    for raw in body.splitlines():
+        line = raw.rstrip()
+        if line.startswith("#"):
+            # Found a heading — figure out which bucket (if any) it maps to.
+            heading_text = line.lstrip("#").strip().lower()
+            current = None
+            for bucket in ordered_buckets:
+                if any(kw in heading_text for kw in _SECTION_KEYWORDS[bucket]):
+                    current = bucket
+                    # Initialise the count for this bucket so it shows as 0
+                    # (not None) even when the section is empty.
+                    if counts[current] is None:
+                        counts[current] = 0
+                    break
+            continue
+        if current is not None and bullet_re.match(line):
+            counts[current] = (counts[current] or 0) + 1
+
+    return counts["blocking"], counts["nonblocking"], counts["nits"]
+
+
 def _parse_review_text(text: str) -> ReviewFindings | None:
     """Extract the last ReviewFindings block from *text*, or None."""
     matches = list(_REVIEW_BLOCK_RE.finditer(text))

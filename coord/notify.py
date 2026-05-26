@@ -322,9 +322,18 @@ def _try_parse_and_post_review(
         except (ValueError, TypeError):
             pr_number = None
 
+    # #248: prepend a machine-readable header so the TUI / coordinator can
+    # surface the verdict + counts without re-ingesting the prose body.
+    body_with_header = _attach_review_header(
+        findings.body,
+        verdict=findings.verdict,
+        reviewer_machine=transition.machine_name,
+        assignment_id=transition.assignment_id,
+    )
+
     if pr_number is not None:
         try:
-            github_ops.post_pr_review(repo_github, pr_number, findings.verdict, findings.body)
+            github_ops.post_pr_review(repo_github, pr_number, findings.verdict, body_with_header)
             mark_review_posted(transition.assignment_id)
             return True
         except Exception as exc:  # noqa: BLE001
@@ -355,7 +364,7 @@ def _try_parse_and_post_review(
     body = (
         f"## Review Complete — {verdict_label}\n\n"
         f"{preamble}\n\n"
-        f"{findings.body}"
+        f"{body_with_header}"
     )
     try:
         github_ops.post_issue_comment(repo_github, transition.issue_number, body)
@@ -366,6 +375,34 @@ def _try_parse_and_post_review(
             "Failed to post review comment for %s: %s", transition.assignment_id, exc
         )
         return False
+
+
+def _attach_review_header(
+    body: str,
+    *,
+    verdict: str,
+    reviewer_machine: str | None = None,
+    assignment_id: str | None = None,
+) -> str:
+    """#248: prepend the machine-readable header line to a review *body*.
+
+    Counts are derived heuristically from the body's markdown sections.
+    The header always carries the verdict; counts/identity fields are
+    omitted when unavailable.
+    """
+    from coord.review import (  # noqa: PLC0415 — local import keeps import graph clean
+        estimate_review_counts, format_review_header,
+    )
+    blocking, nonblocking, nits = estimate_review_counts(body)
+    header = format_review_header(
+        verdict=verdict,
+        reviewer_machine=reviewer_machine,
+        assignment_id=assignment_id,
+        blocking=blocking,
+        nonblocking=nonblocking,
+        nits=nits,
+    )
+    return f"{header}\n\n{body}"
 
 
 def _try_parse_and_post_plan(
@@ -580,10 +617,18 @@ def post_orphaned_review_findings(
             else:
                 retro_note = ""
 
+            # #248: same header injection as the live path.
+            body_with_header = _attach_review_header(
+                findings.body,
+                verdict=findings.verdict,
+                reviewer_machine=machine.name,
+                assignment_id=aid,
+            )
+
             posted = False
             if pr_number is not None:
                 try:
-                    github_ops.post_pr_review(repo_github, pr_number, findings.verdict, findings.body + retro_note)
+                    github_ops.post_pr_review(repo_github, pr_number, findings.verdict, body_with_header + retro_note)
                     posted = True
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
@@ -608,7 +653,7 @@ def post_orphaned_review_findings(
                 body = (
                     f"## Review Complete — {verdict_label}\n\n"
                     f"{preamble}{retro_note}\n\n"
-                    f"{findings.body}"
+                    f"{body_with_header}"
                 )
                 try:
                     github_ops.post_issue_comment(repo_github, issue_number, body)
