@@ -2218,8 +2218,6 @@ pub struct CoordApp {
     command_runner: crate::commands::CommandRunner,
     /// Last time `coord notify` was auto-triggered.
     last_notify: Instant,
-    /// Scroll offset for the bottom (command output) panel.
-    command_scroll: usize,
     // ── Issue sync state ─────────────────────────────────────────────────
     /// Last time `coord sync --quiet` was spawned (to rate-limit kicks).
     issue_sync_last: Option<Instant>,
@@ -2437,7 +2435,6 @@ impl CoordApp {
             machine_detail_scroll: 0,
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
-            command_scroll: 0,
             issue_sync_last: None,
             board_search: String::new(),
             board_search_cursor: 0,
@@ -6567,87 +6564,6 @@ impl CoordApp {
     }
 
 
-    // ── Bottom panel: command output ──────────────────────────────────────
-
-    fn command_output_list(&self) -> ListView {
-        let mut items: Vec<ListItem> = Vec::new();
-
-        // Persistent warning when coordinator.yml could not be located at
-        // startup. The commands panel is shown regardless so the user can see
-        // the message even before pressing any key.
-        if self.command_runner.config_path.is_none() {
-            items.push(ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(
-                        " coordinator.yml not found — run coord-tui from your project directory ",
-                        Color::rgb(220, 100, 60),
-                    )],
-                },
-                icon: None,
-                detail: None,
-                decoration: Decoration::Error,
-            });
-        }
-
-        if let Some((label, elapsed)) = self.command_runner.running_info() {
-            items.push(ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(
-                        format!(" {} ({:.0}s)... ", label, elapsed.as_secs_f64()),
-                        Color::rgb(255, 220, 100),
-                    )],
-                },
-                icon: None,
-                detail: None,
-                decoration: Decoration::Normal,
-            });
-        } else if let Some(result) = self.command_runner.last_result() {
-            let color = if result.exit_code == 0 {
-                Color::rgb(120, 200, 120)
-            } else {
-                Color::rgb(220, 100, 100)
-            };
-            items.push(ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(
-                        format!(
-                            " {} (exit {}, {:.1}s) ",
-                            result.label, result.exit_code, result.duration.as_secs_f64()
-                        ),
-                        color,
-                    )],
-                },
-                icon: None,
-                detail: None,
-                decoration: Decoration::Header,
-            });
-            for line in result.stdout.lines().take(50) {
-                items.push(kv_item("", &format!(" {}", line), None));
-            }
-            if !result.stderr.is_empty() {
-                for line in result.stderr.lines().take(20) {
-                    items.push(kv_item("", &format!(" {}", line), Some(Color::rgb(220, 100, 100))));
-                }
-            }
-        } else {
-            items.push(kv_item(
-                "",
-                " No commands run yet. p=plan  n=notify  a=approve  m=merge",
-                Some(Color::rgb(100, 100, 120)),
-            ));
-        }
-
-        ListView {
-            id: WidgetId::new("command-output"),
-            title: Some(StyledText::plain(" COMMANDS ")),
-            items,
-            selected_idx: 0,
-            scroll_offset: self.command_scroll,
-            has_focus: false,
-            bordered: false,
-        }
-    }
-
     // ── Mouse dispatch ────────────────────────────────────────────────────
 
     /// Dispatch one mouse event. Called from `handle()` before the keyboard
@@ -7215,6 +7131,18 @@ impl CoordApp {
                     action_id: None,
                 });
             }
+        }
+        // #251: persistent warning when coordinator.yml was not located at
+        // startup.  Previously surfaced at the top of the bottom COMMANDS
+        // panel; the status bar carries it now that the panel is gone.
+        if self.command_runner.config_path.is_none() {
+            left.push(StatusBarSegment {
+                text: " ⚠ coordinator.yml not found ".to_string(),
+                fg: Color::rgb(255, 255, 255),
+                bg: Color::rgb(140, 60, 30),
+                bold: true,
+                action_id: None,
+            });
         }
         if let Some((label, elapsed)) = self.command_runner.running_info() {
             left.push(StatusBarSegment {
@@ -8985,11 +8913,6 @@ impl ShellApp for CoordApp {
             }
         }
 
-        // ── Bottom panel: command output ─────────────────────────────────
-        if let Some(bp) = layout.bottom_panel_bounds {
-            backend.draw_list(bp, &self.command_output_list());
-        }
-
         // ── Toast overlay (bottom-right of main content) ────────────────
         if let Some(stack) = self.toast_stack() {
             backend.draw_toast_stack(layout.main_content_bounds, &stack);
@@ -10205,7 +10128,6 @@ mod tests {
             machine_detail_scroll: 0,
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
-            command_scroll: 0,
             issue_sync_last: None,
             board_search: String::new(),
             board_search_cursor: 0,
