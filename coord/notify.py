@@ -242,6 +242,31 @@ def post_stuck(detection: StuckDetection, record: dict) -> None:
     mark_notified(_stuck_notified_key(detection.assignment_id), EVENT_STUCK)
 
 
+def _persist_review_verdict(assignment_id: str, verdict: str) -> None:
+    """Store the parsed reviewer verdict on the review assignment row.
+
+    #253: consumed by ``coord.merge_queue.has_approved_review`` so the merge
+    gate can refuse to merge work whose review hasn't approved.  Best-effort;
+    a DB error is logged and swallowed (the merge gate falls back to "no
+    approval found" which is the safe answer).
+    """
+    if verdict not in ("approve", "request-changes"):
+        return
+    try:
+        from coord.db import get_connection  # noqa: PLC0415
+
+        conn = get_connection()
+        with conn:
+            conn.execute(
+                "UPDATE assignments SET review_verdict = ? WHERE assignment_id = ?",
+                (verdict, assignment_id),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Failed to persist review_verdict for %s: %s", assignment_id, exc
+        )
+
+
 def _try_parse_and_post_review(
     transition: Transition,
     record: dict,
@@ -280,6 +305,11 @@ def _try_parse_and_post_review(
 
     if findings is None:
         return False
+
+    # #253: persist the parsed verdict on the review assignment so the merge
+    # gate can refuse to merge work whose review hasn't approved.  Independent
+    # of auto_loop (which may be disabled in config).
+    _persist_review_verdict(transition.assignment_id, findings.verdict)
 
     review_target = record.get("review_target")
     repo_github = record["repo_github"]

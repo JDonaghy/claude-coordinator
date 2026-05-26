@@ -228,6 +228,7 @@ class TestAssignDispatch:
         _, kwargs = mock_dispatch.call_args
         assert kwargs.get("fresh_branch") is True
 
+
     def test_dispatch_http_error(self, config_file: Path, coord_dir: Path) -> None:
         import httpx
 
@@ -390,3 +391,112 @@ class TestAssignLabelGateResolution:
         assert result.exit_code == 0
         proposal = disp.call_args[0][0]
         assert proposal.required_gates == ["review", "merge"]
+
+
+class TestAssignFreshness:
+    """#267: coord assign must run the dependency freshness check that
+    coord approve already does — otherwise TUI right-click → Start
+    silently dispatches against stale dep checkouts."""
+
+    @pytest.fixture
+    def config_with_dep(self, tmp_path: Path) -> Path:
+        """Config where `api` depends on `lib` so freshness has something
+        non-trivial to compare against."""
+        p = tmp_path / "coordinator.yml"
+        p.write_text("""\
+repos:
+  - name: lib
+    github: acme/lib
+    default_branch: main
+  - name: api
+    github: acme/api
+    default_branch: main
+    depends_on: [lib]
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api, lib]
+    repo_paths:
+      api: /tmp/api
+      lib: /tmp/lib
+""")
+        return p
+
+    def test_freshness_pulls_stale_dep_by_default(
+        self, config_with_dep: Path, coord_dir: Path
+    ) -> None:
+        """Default behaviour: stale dep triggers an auto-pull on dispatch."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "f-1"}) as mock_dispatch, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None), \
+             patch(
+                 "coord.network.fetch_repos",
+                 return_value={"lib": {"sha": "OLD", "branch": "main", "dirty": False}},
+             ), \
+             patch(
+                 "coord.github_ops.get_default_branch_head",
+                 side_effect=lambda repo, branch: "NEW" if "lib" in repo else "NEW2",
+             ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_with_dep)],
+            )
+        assert result.exit_code == 0, result.output
+        # The freshness output names the stale dep.
+        assert "dependency lib: stale" in result.output
+        # And auto-pull is the default, so pull_repos is set.
+        _, kwargs = mock_dispatch.call_args
+        assert "lib" in kwargs.get("pull_repos", [])
+
+    def test_no_pull_flag_emits_briefing_addendum_instead(
+        self, config_with_dep: Path, coord_dir: Path
+    ) -> None:
+        """--no-pull leaves the briefing carrying a 'pull these' addendum
+        but doesn't request the agent to pull."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "f-1"}) as mock_dispatch, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None), \
+             patch(
+                 "coord.network.fetch_repos",
+                 return_value={"lib": {"sha": "OLD", "branch": "main", "dirty": False}},
+             ), \
+             patch(
+                 "coord.github_ops.get_default_branch_head",
+                 return_value="NEW",
+             ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_with_dep), "--no-pull"],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_dispatch.call_args
+        assert kwargs.get("pull_repos") == []
+        proposal = mock_dispatch.call_args[0][0]
+        assert "Stale dependencies" in proposal.briefing
+
+    def test_skip_freshness_flag_bypasses_check_entirely(
+        self, config_with_dep: Path, coord_dir: Path
+    ) -> None:
+        """--skip-freshness should make no network calls for HEADs or repo
+        states — fastest path, used for hot-path / offline dispatches."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "f-1"}) as mock_dispatch, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None), \
+             patch("coord.network.fetch_repos") as fetch, \
+             patch("coord.github_ops.get_default_branch_head") as get_head:
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1",
+                 "--config", str(config_with_dep), "--skip-freshness"],
+            )
+        assert result.exit_code == 0, result.output
+        fetch.assert_not_called()
+        get_head.assert_not_called()
+        _, kwargs = mock_dispatch.call_args
+        assert kwargs.get("pull_repos") == []

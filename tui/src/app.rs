@@ -44,6 +44,10 @@ use quadraui::compose::form_controller::{FormController, FormControllerEvent};
 use quadraui::compose::sidebar_system::{
     NavigationMode, SidebarEvent, SidebarSectionDef, SidebarSystem,
 };
+use quadraui::primitives::context_menu::{
+    ContextMenu, ContextMenuHit, ContextMenuItem as QuiContextMenuItem,
+    ContextMenuItemMeasure, ContextMenuLayout, ContextMenuPlacement,
+};
 use quadraui::primitives::form::{FieldKind, Form, FormEvent, FormField};
 use quadraui::primitives::toast::{ToastCorner, ToastItem, ToastSeverity, ToastStack};
 
@@ -162,6 +166,31 @@ struct TestBuildOutcome {
     first_error: String,
 }
 
+/// #271 part 2: persisted record of the most-recent Phase 1 build for
+/// a work assignment.  Survives long after the 4-second toast expires,
+/// so the user who walked away during a 5-minute `cargo build` returns
+/// to a visible "Last build: ✓ 2m 30s" or "✗ exit 101: <first error>"
+/// line in the Pipeline detail panel.
+///
+/// Stored on `CoordApp.last_test_builds` keyed by `work_id`.  A new
+/// `spawn_test_build` for the same work id replaces the prior entry.
+#[derive(Clone)]
+struct TestBuildResult {
+    branch: String,
+    issue_number: u64,
+    /// Exit code from `coord test`.  0 = success.
+    exit_code: i32,
+    /// First non-empty stderr line — useful one-liner for the failure
+    /// case.  Empty on success.
+    first_error: String,
+    log_path: PathBuf,
+    /// Wall-clock duration of the build.
+    duration_secs: u64,
+    /// When the build finished, used by the renderer to format an
+    /// "Xs ago" hint.
+    finished_at: Instant,
+}
+
 /// The tabs shown in the Pipeline view detail panel.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum PipelineDetailTab {
@@ -230,6 +259,13 @@ struct Assignment {
     /// #200: human-driven Test gate verdict for type="work" assignments.
     /// None | "passed" | "failed" | "skipped".
     test_state: Option<String>,
+    /// #253: parsed adversarial-review verdict for type="review" assignments.
+    /// None | "approve" | "request-changes".  Drives the merge-gate hint
+    /// swap so the user sees the block before pressing m.
+    review_verdict: Option<String>,
+    /// #253: links a review assignment back to the work assignment it
+    /// reviews — needed to pair review_verdict with the merge entry.
+    review_of_assignment_id: Option<String>,
 }
 
 impl Assignment {
@@ -283,6 +319,27 @@ struct IssueGroup {
     assignments: Vec<Assignment>,
     /// Derived summary: "running", "failed", "done", "merged", "pending"
     status_summary: String,
+    /// #265: whether the underlying GitHub issue is closed.  Populated
+    /// from `data.open_issues` (which carries both `open` and `closed`
+    /// states).  Drives the In-flight vs Completed section split.
+    /// Defaults to false when the issue isn't in the cache.
+    is_closed: bool,
+    /// #265 / #257 fix: whether the brain has the issue as currently
+    /// `state="open"` in the local cache.  Distinguishes "open and
+    /// known active" from "not in cache at all" (the latter typically
+    /// means the issue was closed long enough ago that the brain has
+    /// pruned its row — see `coord/state.py::upsert_open_issues`,
+    /// which only retains closed rows for 7 days).
+    ///
+    /// Without this distinction, every historical merged/done
+    /// assignment on a long-closed issue routes to In-flight, swamping
+    /// the lifecycle ledger with ancient work.
+    has_open_record: bool,
+    /// #226: GitHub labels (e.g. `status:refining`, `status:ready`,
+    /// `coord`).  Populated from `data.open_issues`.  Empty for issues
+    /// that aren't in the cache.  Drives the Backlog / Refining /
+    /// Refined split inside the Pending bucket.
+    labels: Vec<String>,
 }
 
 impl IssueGroup {
@@ -295,6 +352,172 @@ impl IssueGroup {
             _ => Color::rgb(140, 140, 160),
         }
     }
+
+    /// #256 / #226 lifecycle bucketing.  Returns the section key the
+    /// row belongs in:
+    /// - `"backlog"` — no assignments, no `status:*` label
+    /// - `"refining"` — no assignments, `status:refining` label
+    /// - `"refined"` — no assignments, `status:ready` label
+    /// - `"in-flight"` — has at least one open assignment
+    /// - `"completed"` — closed issue + assignments (or stale settled
+    ///   assignment with no open cache record)
+    ///
+    /// Rules (in order):
+    /// - No assignments → split into Backlog/Refining/Refined by label.
+    /// - Issue cache says closed → **Completed**.
+    /// - Issue is `merged` (PR closed the issue via `fixes #N`) →
+    ///   **Completed**, even when the brain hasn't synced yet.
+    /// - Issue has no open-cache record AND assignment is settled
+    ///   (`done`/`merged`) → **Completed**.
+    /// - Otherwise (with assignments) → **In-flight**.
+    fn lifecycle_section(&self) -> &'static str {
+        if self.assignments.is_empty() {
+            // #226: split Pending by `status:*` label.
+            if self.labels.iter().any(|l| l == "status:refining") {
+                return "refining";
+            }
+            if self.labels.iter().any(|l| l == "status:ready") {
+                return "refined";
+            }
+            return "backlog";
+        }
+        if self.is_closed {
+            return "completed";
+        }
+        if self.status_summary == "merged" {
+            return "completed";
+        }
+        if !self.has_open_record
+            && matches!(self.status_summary.as_str(), "done" | "merged")
+        {
+            return "completed";
+        }
+        "in-flight"
+    }
+}
+
+/// #259: identifies what kind of sidebar row a context menu was opened
+/// against.  Lets `dispatch_context_menu_action` route the action with
+/// row-specific context (e.g. which issue number to copy, which repo
+/// to scope a `gh issue edit` call against, etc.).
+///
+/// `repo_name` carries the **coord-local** name (matches `coordinator.yml`),
+/// which is what `coord refine` / `coord ready` / etc. take as their
+/// `<repo>` arg — the GH slug is looked up internally on the Python side.
+#[derive(Clone, Debug)]
+enum ContextMenuTarget {
+    /// Right-click on a Board sidebar row.
+    BoardRow {
+        /// Issue under the cursor, or `None` when the click landed on
+        /// a section header / empty space.
+        issue_number: Option<u64>,
+        /// Coord-local repo name for the row.
+        repo_name: Option<String>,
+        /// #260: lifecycle classification of the row at right-click
+        /// time.  Drives which menu items appear (e.g. Refine only on
+        /// Backlog rows).  See `Self::lifecycle_for_target` for how
+        /// this is computed.
+        lifecycle: BoardRowLifecycle,
+    },
+    /// Right-click on a Pipeline sidebar row.
+    PipelineRow {
+        issue_number: Option<u64>,
+        /// #262: lifecycle classification of the row at right-click
+        /// time.  Drives which menu items appear (e.g. Start with
+        /// Plan / Skip Plan only on New rows).
+        lifecycle: PipelineRowLifecycle,
+    },
+}
+
+/// #262: lifecycle bucket for a Pipeline sidebar row at right-click
+/// time.  Mirrors the umbrella's three Pipeline sections (New /
+/// In-progress / Done) plus a catch-all for the existing classifier's
+/// "refining" / "new" rows (coord-labelled but not dispatch-ready),
+/// where Start is not yet appropriate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PipelineRowLifecycle {
+    /// `coord` + `status:ready`, no assignments — ready to dispatch.
+    New,
+    /// Has at least one assignment.
+    InProgress,
+    /// Closed issue with assignments.
+    Done,
+    /// Other state (e.g. coord-labelled but `status:refining`, or
+    /// coord-labelled without a `status:*` label — still needs
+    /// scoping before Start is meaningful).
+    Other,
+}
+
+/// #260: lifecycle bucket for a Board sidebar row at right-click time.
+/// Different from `IssueGroup::lifecycle_section()` because this also
+/// distinguishes Pending into Backlog / Refining / Refined based on
+/// labels — `#226` will eventually surface those as separate sections,
+/// but right-click actions need the distinction now so they can offer
+/// the right next-step verb.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BoardRowLifecycle {
+    /// Open issue, no `status:*` label, no assignments.
+    Backlog,
+    /// Open issue with `status:refining` label.
+    Refining,
+    /// Open issue with `status:ready` label, no `coord` label yet.
+    Refined,
+    /// Has at least one assignment, issue still open.
+    InFlight,
+    /// Closed issue with at least one assignment.
+    Completed,
+    /// Couldn't classify (no row focused / row not in any known state).
+    Unknown,
+}
+
+/// #259: one item in an open context menu.  Lightweight engine-side
+/// shape converted to `quadraui::ContextMenuItem` at render time.
+#[derive(Clone, Debug)]
+struct ContextMenuItem {
+    /// Action identifier dispatched on click / Enter.  `None` ⇒ separator.
+    action_id: Option<String>,
+    label: String,
+    /// Optional right-aligned shortcut hint (e.g. `"r"`).
+    shortcut: Option<String>,
+    disabled: bool,
+}
+
+impl ContextMenuItem {
+    fn action(id: &str, label: &str) -> Self {
+        Self {
+            action_id: Some(id.to_string()),
+            label: label.to_string(),
+            shortcut: None,
+            disabled: false,
+        }
+    }
+    fn separator() -> Self {
+        Self {
+            action_id: None,
+            label: String::new(),
+            shortcut: None,
+            disabled: false,
+        }
+    }
+    fn with_shortcut(mut self, s: &str) -> Self {
+        self.shortcut = Some(s.to_string());
+        self
+    }
+}
+
+/// #259: state of an open right-click context menu.  `None` on
+/// `CoordApp.pending_context_menu` means no menu is showing.
+#[derive(Clone, Debug)]
+struct ContextMenuState {
+    items: Vec<ContextMenuItem>,
+    /// Anchor point — where the right-click landed.
+    anchor: Point,
+    /// Keyboard-selected item index.  Maintained skipping separators by
+    /// `quadraui::ContextMenu::move_selection`.
+    selected_idx: usize,
+    /// What the menu is "about" — used by `dispatch_context_menu_action`
+    /// to route the action with row-specific data.
+    target: ContextMenuTarget,
 }
 
 #[derive(Clone)]
@@ -405,6 +628,40 @@ struct FetchedIssue {
     /// "open" | "closed".  Carried so the DB upsert mirrors what `coord sync`
     /// would have written.
     state: String,
+}
+
+/// #271 part 2 follow-up: cached `gh pr view` snapshot for a Pipeline
+/// PR.  Surfaces the worker's PR description (which typically explains
+/// what they did, including any new sample apps / demo binaries / entry
+/// points) plus the list of files touched and the latest review's
+/// verdict + body, so the user testing the branch has in-TUI context
+/// instead of having to ask Claude or click out to GitHub.
+#[derive(Clone, Debug)]
+struct FetchedPr {
+    title: String,
+    /// Markdown body of the PR.  May be empty when the worker / merge
+    /// command didn't write one.
+    body: String,
+    /// File paths touched by the PR.  Sorted by gh's default ordering.
+    files: Vec<String>,
+    /// Reviews posted on this PR, in the order gh returns them
+    /// (chronological).  The latest one is what the user typically
+    /// cares about (was it an approve or request-changes?).  When the
+    /// adversarial reviewer posted via `coord notify`, the body is the
+    /// full review text the reviewer wrote.
+    reviews: Vec<FetchedReview>,
+}
+
+/// One row from `gh pr view --json reviews`.  `state` is gh's verbatim
+/// status string: `"APPROVED"`, `"CHANGES_REQUESTED"`, `"COMMENTED"`,
+/// or `"PENDING"`.
+#[derive(Clone, Debug)]
+struct FetchedReview {
+    /// gh status string (uppercase).
+    state: String,
+    /// Markdown review body.  Empty when the reviewer left only a
+    /// status change with no comment.
+    body: String,
 }
 
 /// An open issue from the local `issues` table (synced from GitHub on coord plan).
@@ -1042,7 +1299,7 @@ fn load_data() -> BoardData {
         let mut stmt = match conn.prepare(
             "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
              status, branch, model, type, dispatched_at, finished_at, exit_code, \
-             test_state \
+             test_state, review_verdict, review_of_assignment_id \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1063,6 +1320,8 @@ fn load_data() -> BoardData {
                 finished_at: row.get::<_, Option<f64>>(10)?,
                 exit_code: row.get::<_, Option<i32>>(11)?,
                 test_state: row.get::<_, Option<String>>(12)?,
+                review_verdict: row.get::<_, Option<String>>(13)?,
+                review_of_assignment_id: row.get::<_, Option<String>>(14)?,
             })
         }) {
             Ok(r) => r,
@@ -1387,6 +1646,78 @@ fn spawn_issue_fetch(
                         // of the session.
                         let _ = upsert_issue_db(&repo_name, &issue);
                         Ok(issue)
+                    }
+                    Err(e) => Err(format!("gh json parse failed: {}", e)),
+                }
+            }
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(format!("could not run gh: {}", e)),
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// #271 part 2 follow-up: spawn a background `gh pr view` to fetch the
+/// PR title, body, and files-changed list for a single PR.  Mirrors
+/// `spawn_issue_fetch`: same channel-receiver shape, same lifecycle in
+/// the caching maps on `CoordApp` (`pending_pr_fetches` →
+/// `fetched_prs_cache`).
+fn spawn_pr_fetch(
+    repo_slug: String,
+    pr_number: i64,
+) -> std::sync::mpsc::Receiver<Result<FetchedPr, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let output = std::process::Command::new("gh")
+            .args([
+                "pr", "view",
+                &pr_number.to_string(),
+                "--repo", &repo_slug,
+                "--json", "title,body,files,reviews",
+            ])
+            .output();
+        let result = match output {
+            Ok(o) if o.status.success() => {
+                match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                    Ok(v) => {
+                        let files: Vec<String> = v
+                            .get("files")
+                            .and_then(|f| f.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|f| {
+                                        f.get("path").and_then(|n| n.as_str()).map(String::from)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let reviews: Vec<FetchedReview> = v
+                            .get("reviews")
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|r| FetchedReview {
+                                        state: r
+                                            .get("state")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        body: r
+                                            .get("body")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Ok(FetchedPr {
+                            title: v.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            body: v.get("body").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            files,
+                            reviews,
+                        })
                     }
                     Err(e) => Err(format!("gh json parse failed: {}", e)),
                 }
@@ -1977,6 +2308,23 @@ pub struct CoordApp {
     /// `usize` is the work-assignment index in `self.data.assignments` that
     /// the verdict will be applied to.
     pending_test_fail: Option<(usize, String)>,
+    /// #245: pending `coord merge --force-merge` confirmation.  `Some(repo)`
+    /// means the user pressed `m` while the "Checks failed" hint was visible
+    /// and we're waiting for one-key confirmation before bypassing the CI
+    /// gate.  `repo` is the coord-local repo name to scope the force-merge
+    /// to (empty string ⇒ no scope, force-merge the whole queue).  Any key
+    /// other than `y`/`Y` cancels; the early-intercept block consumes the
+    /// keypress so the normal `y`-as-prefix paths can't fire.
+    pending_force_merge: Option<String>,
+    /// #259: open right-click context menu, or `None` if no menu is showing.
+    /// Opened by right-click on a Board / Pipeline sidebar row; dismissed by
+    /// click-outside, Escape, or item activation.
+    pending_context_menu: Option<ContextMenuState>,
+    /// #259: cached `ContextMenuLayout` from the last render — required for
+    /// click hit-testing on the menu items.  Borrowed from the `&self`
+    /// render path (same pattern as `settings_form`), populated on every
+    /// frame while a menu is open and cleared when it dismisses.
+    context_menu_layout: std::cell::RefCell<Option<ContextMenuLayout>>,
     /// Cached visible-row count for the main panel, updated on scroll events
     /// and tick. Used by `watch_log_list` to compute a stick-to-bottom scroll
     /// offset that actually keeps the latest lines on screen (the previous
@@ -2005,7 +2353,8 @@ pub struct CoordApp {
     /// `&self` render path (same pattern as `remote_log_cache`).
     settings_form: std::cell::RefCell<FormController>,
     /// Which category row is selected in the settings sidebar (left pane).
-    settings_category_sel: usize,
+    // #237: removed `settings_category_sel` — settings render as one
+    // unified scrollable form; there are no categories to select.
     /// Which interactive field is focused within the current category's form.
     /// Reset to 0 when the category changes.
     settings_field_sel: usize,
@@ -2017,6 +2366,22 @@ pub struct CoordApp {
     /// Drained by `poll_test_build_jobs` each tick — completed entries are
     /// removed and surfaced as toasts. Empty in the steady state.
     test_build_jobs: std::collections::HashMap<String, TestBuildJob>,
+    /// #271 part 2: persisted outcomes from completed Phase 1 builds.
+    /// Keyed by `work_id`.  Drives the persistent "Last build: …" line
+    /// in the Pipeline detail panel so the user who missed the 4 s
+    /// toast can still see the result.
+    last_test_builds: std::collections::HashMap<String, TestBuildResult>,
+    /// #271 part 2 follow-up: in-flight `gh pr view` background fetches
+    /// keyed by `(repo_slug, pr_number)`.  Drained by
+    /// `poll_pending_pr_fetches` each tick; results land in
+    /// `fetched_prs_cache`.
+    pending_pr_fetches: std::cell::RefCell<
+        std::collections::HashMap<(String, i64), std::sync::mpsc::Receiver<Result<FetchedPr, String>>>,
+    >,
+    /// In-memory cache of the latest `gh pr view` snapshot per PR.
+    /// Populated by completed `pending_pr_fetches` rounds; consumed by
+    /// the Pipeline detail panel's Test guidance block.
+    fetched_prs_cache: std::cell::RefCell<std::collections::HashMap<(String, i64), FetchedPr>>,
     /// #240: CI check summaries for PRs in the merge queue, keyed by
     /// `(repo_github, pr_number)`. Populated by background `gh pr checks`
     /// fetches when the Pipeline view is focused. Cached entries with
@@ -2101,15 +2466,20 @@ impl CoordApp {
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
+            pending_force_merge: None,
+            pending_context_menu: None,
+            context_menu_layout: std::cell::RefCell::new(None),
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
             settings: TuiSettings::load(),
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
-            settings_category_sel: 0,
             settings_field_sel: 0,
             audio_prev_running: std::collections::HashSet::new(),
             test_build_jobs: std::collections::HashMap::new(),
+            last_test_builds: std::collections::HashMap::new(),
+            pending_pr_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fetched_prs_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pipeline_ci_checks: std::collections::HashMap::new(),
             pipeline_ci_loader: std::collections::HashMap::new(),
         };
@@ -2644,6 +3014,9 @@ impl CoordApp {
                     issue_title: a.issue_title.clone(),
                     assignments: Vec::new(),
                     status_summary: String::new(),
+                    is_closed: false,
+                    has_open_record: false,
+                    labels: Vec::new(),
                 });
             group.assignments.push(a.clone());
         }
@@ -2684,6 +3057,31 @@ impl CoordApp {
             }
         }
 
+        // #265 / #257 fix: stamp both `is_closed` (cache says closed)
+        // and `has_open_record` (cache says open) on every IssueGroup
+        // that came from assignments.  Groups whose issue has no cache
+        // row stay with both flags `false` — the bucketing treats that
+        // as "brain has forgotten about this issue", which is the
+        // typical state for historical merged/done assignments whose
+        // rows got pruned (the brain only retains closed rows for 7d).
+        //
+        // #226: also copy the issue's labels onto the group so the
+        // Backlog/Refining/Refined classification has data to read.
+        for oi in self.data.open_issues.iter() {
+            if let Some(groups) = repo_issues.get_mut(&oi.repo_name) {
+                if let Some(group) = groups.get_mut(&oi.number) {
+                    match oi.state.as_str() {
+                        "closed" => group.is_closed = true,
+                        "open" => group.has_open_record = true,
+                        _ => {}
+                    }
+                    if group.labels.is_empty() {
+                        group.labels = oi.labels.clone();
+                    }
+                }
+            }
+        }
+
         // Inject open issues with no assignment as Pending entries.
         // `data.open_issues` now also carries closed issues (for the Board
         // Issue tab's body lookup), so we must filter to state="open" here
@@ -2699,6 +3097,9 @@ impl CoordApp {
                 issue_title: oi.title.clone(),
                 assignments: Vec::new(),
                 status_summary: "pending".to_string(),
+                is_closed: false,
+                has_open_record: true,
+                labels: oi.labels.clone(),
             });
         }
 
@@ -2783,7 +3184,14 @@ impl CoordApp {
             map
         };
 
-        self.has_proposals_section = !self.data.proposals.is_empty();
+        // #192: the PROPOSALS section is retired.  Right-click → Send
+        // to Pipeline (#261) is the canonical path from Refined →
+        // Pipeline:New; `coord plan` proposals are a parallel system
+        // we no longer surface.  Force the flag false so the section
+        // never renders and all the offset arithmetic still adds 0.
+        // The `coord plan` CLI keeps working for backwards-compat;
+        // its output just doesn't appear in the TUI any more.
+        self.has_proposals_section = false;
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
 
         // Section 0: search/filter form.
@@ -2888,34 +3296,45 @@ impl CoordApp {
         for (cache_idx, (repo, issues)) in grouped.iter().enumerate() {
             let section_idx = cache_idx + offset;
 
-            // Bucket issues by status group; apply filter.
-            let mut running: Vec<(usize, &IssueGroup)> = Vec::new();
-            let mut failed: Vec<(usize, &IssueGroup)> = Vec::new();
+            // #256 / #226 lifecycle model: bucket issues into the
+            // five sections.  Classifier must stay in sync with
+            // `board_grouped_for_repo` / `select_issue` so click
+            // hit-testing and visual rendering agree.
+            let mut backlog: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut refining: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut refined: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut in_flight: Vec<(usize, &IssueGroup)> = Vec::new();
             let mut completed: Vec<(usize, &IssueGroup)> = Vec::new();
-            let mut pending: Vec<(usize, &IssueGroup)> = Vec::new();
             for (flat_idx, g) in issues.iter().enumerate() {
                 if !issue_matches(g.issue_number, &g.issue_title) {
                     continue;
                 }
-                match g.status_summary.as_str() {
-                    "running" => running.push((flat_idx, g)),
-                    "failed" => failed.push((flat_idx, g)),
-                    "done" | "merged" => completed.push((flat_idx, g)),
-                    _ => pending.push((flat_idx, g)),
+                match g.lifecycle_section() {
+                    "backlog" => backlog.push((flat_idx, g)),
+                    "refining" => refining.push((flat_idx, g)),
+                    "refined" => refined.push((flat_idx, g)),
+                    "in-flight" => in_flight.push((flat_idx, g)),
+                    "completed" => completed.push((flat_idx, g)),
+                    _ => backlog.push((flat_idx, g)),
                 }
             }
 
             let groups: Vec<(&str, &str, &Vec<(usize, &IssueGroup)>)> = [
-                ("Running",   "running",   &running),
-                ("Failed",    "failed",    &failed),
+                ("Backlog",   "backlog",   &backlog),
+                ("Refining",  "refining",  &refining),
+                ("Refined",   "refined",   &refined),
+                ("In-flight", "in-flight", &in_flight),
                 ("Completed", "completed", &completed),
-                ("Pending",   "pending",   &pending),
             ]
             .into_iter()
             .filter(|(_, _, v)| !v.is_empty())
             .collect();
 
-            let total: usize = running.len() + failed.len() + completed.len() + pending.len();
+            let total: usize = backlog.len()
+                + refining.len()
+                + refined.len()
+                + in_flight.len()
+                + completed.len();
             if total > 0 {
                 self.board_sidebar.set_section_badge(
                     section_idx,
@@ -2923,8 +3342,11 @@ impl CoordApp {
                 );
             }
 
-            // Auto-collapse repos with no running/failed issues and no filter.
-            let has_active = !running.is_empty() || !failed.is_empty();
+            // Auto-collapse repos with no In-flight work and an empty
+            // search.  A user dropping in mid-session cares about
+            // running / failed work first; the Pending and Completed
+            // backlogs stay one click away behind the chevron.
+            let has_active = !in_flight.is_empty();
             if !has_active && total == 0 {
                 self.board_sidebar.set_collapsed(section_idx, true);
             }
@@ -2937,9 +3359,17 @@ impl CoordApp {
                     .get(&(repo.clone(), key.to_string()))
                     .unwrap_or(&true);
 
+                // #256 / #226 lifecycle palette.  In-flight is the
+                // attention-worthy green (running / failed / done-but-
+                // open all fold here); Completed is the muted "done"
+                // green.  Backlog / Refining / Refined ramp from
+                // unscoped grey → warm yellow (active scoping) → cool
+                // blue (scope-locked, ready to dispatch).
                 let header_color = match *key {
-                    "running" => Color::rgb(80, 220, 80),
-                    "failed" => Color::rgb(220, 70, 70),
+                    "backlog" => Color::rgb(140, 140, 160),
+                    "refining" => Color::rgb(220, 180, 100),
+                    "refined" => Color::rgb(140, 180, 220),
+                    "in-flight" => Color::rgb(80, 220, 80),
                     "completed" => Color::rgb(120, 180, 120),
                     _ => Color::rgb(140, 140, 160),
                 };
@@ -3047,8 +3477,18 @@ impl CoordApp {
             .map(|s| s.as_str())
     }
 
-    /// Reconstruct the status groups for a repo using the current search filter.
-    /// Returns `(flat_idx, &IssueGroup)` vecs ordered Running / Failed / Completed / Pending.
+    /// Reconstruct the lifecycle groups for a repo using the current
+    /// search filter.  Returns `(key, [(flat_idx, &IssueGroup)…])` in
+    /// display order: **Backlog → Refining → Refined → In-flight → Completed**.
+    ///
+    /// Section rules (per #256 / #226 lifecycle model):
+    /// - **Backlog**   — open, no assignments, no `status:*` label
+    /// - **Refining**  — open, no assignments, `status:refining` label
+    /// - **Refined**   — open, no assignments, `status:ready` label
+    /// - **In-flight** — open AND has at least one assignment
+    /// - **Completed** — closed AND has at least one assignment
+    ///
+    /// Empty groups are omitted so the sidebar doesn't show stub headers.
     fn board_grouped_for_repo<'a>(
         &'a self,
         issues: &'a [(String, Vec<IssueGroup>)],
@@ -3059,10 +3499,11 @@ impl CoordApp {
             None => return Vec::new(),
         };
         let query = self.board_search.to_lowercase();
-        let mut running = Vec::new();
-        let mut failed = Vec::new();
+        let mut backlog = Vec::new();
+        let mut refining = Vec::new();
+        let mut refined = Vec::new();
+        let mut in_flight = Vec::new();
         let mut completed = Vec::new();
-        let mut pending = Vec::new();
         for (i, g) in flat.iter().enumerate() {
             if !query.is_empty() {
                 let num_str = g.issue_number.to_string();
@@ -3070,17 +3511,25 @@ impl CoordApp {
                     continue;
                 }
             }
-            match g.status_summary.as_str() {
-                "running" => running.push((i, g)),
-                "failed" => failed.push((i, g)),
-                "done" | "merged" => completed.push((i, g)),
-                _ => pending.push((i, g)),
+            match g.lifecycle_section() {
+                "backlog" => backlog.push((i, g)),
+                "refining" => refining.push((i, g)),
+                "refined" => refined.push((i, g)),
+                "in-flight" => in_flight.push((i, g)),
+                "completed" => completed.push((i, g)),
+                _ => backlog.push((i, g)),
             }
         }
-        [("running", running), ("failed", failed), ("completed", completed), ("pending", pending)]
-            .into_iter()
-            .filter(|(_, v)| !v.is_empty())
-            .collect()
+        [
+            ("backlog", backlog),
+            ("refining", refining),
+            ("refined", refined),
+            ("in-flight", in_flight),
+            ("completed", completed),
+        ]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
     }
 
     /// Return the IssueGroup currently selected in the board sidebar.
@@ -3187,11 +3636,16 @@ impl CoordApp {
             Some((_, v)) => v.clone(),
             None => return,
         };
+        // #256 / #226 lifecycle bucketing — keep in sync with
+        // `board_grouped_for_repo` and `rebuild_board_sidebar` so a
+        // `select_issue` lookup lands on the same `[group, issue]`
+        // path the click handler resolves to.
         let query = self.board_search.to_lowercase();
-        let mut running: Vec<(usize, u64)> = Vec::new();
-        let mut failed: Vec<(usize, u64)> = Vec::new();
+        let mut backlog: Vec<(usize, u64)> = Vec::new();
+        let mut refining: Vec<(usize, u64)> = Vec::new();
+        let mut refined: Vec<(usize, u64)> = Vec::new();
+        let mut in_flight: Vec<(usize, u64)> = Vec::new();
         let mut completed: Vec<(usize, u64)> = Vec::new();
-        let mut pending: Vec<(usize, u64)> = Vec::new();
         for (i, g) in flat.iter().enumerate() {
             if !query.is_empty() {
                 let num_str = g.issue_number.to_string();
@@ -3199,17 +3653,20 @@ impl CoordApp {
                     continue;
                 }
             }
-            match g.status_summary.as_str() {
-                "running" => running.push((i, g.issue_number)),
-                "failed" => failed.push((i, g.issue_number)),
-                "done" | "merged" => completed.push((i, g.issue_number)),
-                _ => pending.push((i, g.issue_number)),
+            match g.lifecycle_section() {
+                "backlog" => backlog.push((i, g.issue_number)),
+                "refining" => refining.push((i, g.issue_number)),
+                "refined" => refined.push((i, g.issue_number)),
+                "in-flight" => in_flight.push((i, g.issue_number)),
+                "completed" => completed.push((i, g.issue_number)),
+                _ => backlog.push((i, g.issue_number)),
             }
         }
-        let groups_ordered: Vec<Vec<(usize, u64)>> = [running, failed, completed, pending]
-            .into_iter()
-            .filter(|v| !v.is_empty())
-            .collect();
+        let groups_ordered: Vec<Vec<(usize, u64)>> =
+            [backlog, refining, refined, in_flight, completed]
+                .into_iter()
+                .filter(|v| !v.is_empty())
+                .collect();
         for (group_idx, group_issues) in groups_ordered.iter().enumerate() {
             for (issue_idx, (_flat_idx, num)) in group_issues.iter().enumerate() {
                 if *num == issue_number {
@@ -3721,6 +4178,37 @@ impl CoordApp {
         stages
     }
 
+    /// Per-issue stage list — prepends a "plan" stage when the issue has
+    /// at least one `type="plan"` assignment, even if `pipeline_require_plan`
+    /// is false globally.
+    ///
+    /// Motivation: the user can right-click → Start with Plan on a
+    /// per-issue basis (#262).  Without this override, the plan-typed
+    /// assignment would get folded into the Work stage (turning it
+    /// green) and the user would see no evidence Plan ever ran.
+    fn pipeline_stage_names_for_issue(&self, issue: &PipelineIssue) -> Vec<String> {
+        let mut stages = self.pipeline_stage_names();
+        let already_has_plan = stages.first().map(|s| s == "plan").unwrap_or(false);
+        if !already_has_plan && self.issue_has_plan_assignment(issue) {
+            stages.insert(0, "plan".to_string());
+        }
+        stages
+    }
+
+    /// True iff at least one assignment with `type="plan"` exists for
+    /// *issue* (matching by issue number and, when set, coord_repo).
+    fn issue_has_plan_assignment(&self, issue: &PipelineIssue) -> bool {
+        self.data.assignments.iter().any(|a| {
+            a.assignment_type.as_deref() == Some("plan")
+                && a.issue_number == issue.number
+                && issue
+                    .coord_repo
+                    .as_deref()
+                    .map(|r| r == a.repo)
+                    .unwrap_or(true)
+        })
+    }
+
     /// Compute the lifecycle section key for a pipeline issue.
     ///
     /// Priority (highest wins):
@@ -3777,13 +4265,23 @@ impl CoordApp {
 
     /// Group pipeline issues under a repo into non-empty lifecycle sections.
     ///
+    /// #225 / #256: the Pipeline panel only displays the three sections
+    /// that actually carry pipeline state — **New** (`coord +
+    /// status:ready`, no assignments), **In-progress**, and **Done**.
+    /// Pre-pipeline states (`backlog` = no `status:*` label / `refining`
+    /// = `status:refining`) live on the Board's sidebar; the Pipeline
+    /// hides them so the panel stays focused on execution.
+    ///
+    /// The internal classifier key for "New" is still the legacy
+    /// `"pending"` — renaming the key would churn every consumer; the
+    /// display label is handled in `LIFECYCLE_META` instead.
+    ///
     /// Returns `(lifecycle_key, Vec<pipeline_issues index>)` in display
-    /// order (New → Refining → Pending → In-progress → Done), skipping
-    /// any lifecycle section that contains no issues for this repo.
+    /// order (New → In-progress → Done), skipping empty sections.
     fn pipeline_groups_for_repo(&self, repo_key: &str) -> Vec<(&'static str, Vec<usize>)> {
-        const LIFECYCLE: [&str; 5] = ["new", "refining", "pending", "in-progress", "done"];
+        const VISIBLE_LIFECYCLE: [&str; 3] = ["pending", "in-progress", "done"];
         let mut result: Vec<(&'static str, Vec<usize>)> = Vec::new();
-        for &lc in &LIFECYCLE {
+        for &lc in &VISIBLE_LIFECYCLE {
             let idxs: Vec<usize> = self
                 .pipeline_issues
                 .iter()
@@ -3878,11 +4376,13 @@ impl CoordApp {
         sidebar.set_allow_collapse(true);
         sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
-        // Lifecycle display labels and header colors.
-        const LIFECYCLE_META: [(&str, &str); 5] = [
-            ("new",         "New"),
-            ("refining",    "Refining"),
-            ("pending",     "Pending"),
+        // Lifecycle display labels.  #225 + #256: Pipeline only renders
+        // three sections (New / In-progress / Done).  The classifier
+        // key `"pending"` corresponds to the umbrella's "New" — keeping
+        // the key avoids churning every consumer for a cosmetic rename;
+        // the display label here is what the user actually sees.
+        const LIFECYCLE_META: [(&str, &str); 3] = [
+            ("pending",     "New"),
             ("in-progress", "In-progress"),
             ("done",        "Done"),
         ];
@@ -3907,12 +4407,15 @@ impl CoordApp {
                     .map(|(_, v)| *v)
                     .unwrap_or(lc_key);
 
+                // #225 / #256: only three sections visible.  Palette
+                // matches the Board's In-flight / Completed / Refined
+                // colours so the same lifecycle stage looks consistent
+                // across the two panels.
                 let header_color = match *lc_key {
                     "in-progress" => Color::rgb(80, 220, 80),
                     "done"        => Color::rgb(120, 180, 120),
-                    "pending"     => Color::rgb(140, 180, 240),
-                    "refining"    => Color::rgb(220, 180, 80),
-                    _             => Color::rgb(140, 140, 160), // new
+                    "pending"     => Color::rgb(140, 180, 240), // "New"
+                    _             => Color::rgb(140, 140, 160),
                 };
 
                 rows.push(TreeRow {
@@ -4115,7 +4618,14 @@ impl CoordApp {
             })
             .filter(|a| {
                 let t = a.assignment_type.as_deref().unwrap_or("work");
-                if stage == "work" && !self.data.pipeline_require_plan {
+                if stage == "work"
+                    && !self.data.pipeline_require_plan
+                    && !self.issue_has_plan_assignment(issue)
+                {
+                    // Legacy fold: when there's no Plan stage in this
+                    // issue's strip, plan-typed assignments are still
+                    // counted as Work so a `--plan-only` dispatch
+                    // without `require_plan` doesn't disappear.
                     t == "work" || t == "plan"
                 } else {
                     t == stage
@@ -4133,7 +4643,7 @@ impl CoordApp {
         issue: &PipelineIssue,
         stage: &str,
     ) -> Option<f64> {
-        let names = self.pipeline_stage_names();
+        let names = self.pipeline_stage_names_for_issue(issue);
         let idx = names.iter().position(|s| s == stage)?;
         if idx == 0 {
             return None;
@@ -4280,7 +4790,10 @@ impl CoordApp {
             return None;
         }
 
-        let stage_names = self.pipeline_stage_names();
+        // Use the per-issue stage list so a plan-typed assignment
+        // shows up as a Plan stage even when `pipeline_require_plan`
+        // is false globally (the #262 right-click → Start with Plan path).
+        let stage_names = self.pipeline_stage_names_for_issue(issue);
 
         // Precompute every stage's status once so we can check predecessors
         // without re-querying.
@@ -4665,6 +5178,33 @@ impl CoordApp {
         for (id, result) in done {
             let job = self.test_build_jobs.remove(&id).expect("just observed");
             let dur_secs = job.started_at.elapsed().as_secs();
+            // #271 part 2: persist the outcome so the Pipeline detail
+            // panel can show "Last build: …" long after the toast
+            // expires.  Pull values out before move-into-toast paths.
+            let persist_exit;
+            let persist_first_error;
+            match &result {
+                Ok(o) => {
+                    persist_exit = o.exit_code;
+                    persist_first_error = o.first_error.clone();
+                }
+                Err(()) => {
+                    persist_exit = -1;
+                    persist_first_error = "build worker disappeared".to_string();
+                }
+            }
+            self.last_test_builds.insert(
+                id.clone(),
+                TestBuildResult {
+                    branch: job.branch.clone(),
+                    issue_number: job.issue_number,
+                    exit_code: persist_exit,
+                    first_error: persist_first_error,
+                    log_path: job.log_path.clone(),
+                    duration_secs: dur_secs,
+                    finished_at: Instant::now(),
+                },
+            );
             match result {
                 Ok(TestBuildOutcome { exit_code: 0, .. }) => {
                     self.push_toast(
@@ -4716,12 +5256,20 @@ impl CoordApp {
     /// dispatch.  Falls back to a status message for stages we don't
     /// know how to dispatch.
     fn dispatch_pipeline_stage(&mut self, stage_idx: usize) -> bool {
-        let stage_name = match self.pipeline_stage_names().get(stage_idx).cloned() {
+        // Per-issue stages must match what `build_pipeline_widget`
+        // rendered — otherwise a click on the Plan stage (visible only
+        // when the issue has a plan assignment) would resolve to the
+        // wrong stage_name.
+        let Some(sel) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(sel).cloned() else { return false; };
+        let stage_name = match self
+            .pipeline_stage_names_for_issue(&issue)
+            .get(stage_idx)
+            .cloned()
+        {
             Some(s) => s,
             None => return false,
         };
-        let Some(sel) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(sel).cloned() else { return false; };
         // Failed → retry the failed assignment (re-dispatch via `coord retry`).
         // Stale → fall through to fresh dispatch: the previous attempt SUCCEEDED
         //         against an older revision, so there is no failed-row to retry;
@@ -4802,7 +5350,9 @@ impl CoordApp {
             .filter(|a| a.issue_number == issue.number && a.repo == coord_repo)
             .filter(|a| {
                 let t = a.assignment_type.as_deref().unwrap_or("work");
-                if stage == "work" {
+                if stage == "work" && !self.issue_has_plan_assignment(issue) {
+                    // Same legacy fold as `assignments_for_stage` — only
+                    // applies when the per-issue strip has no Plan stage.
                     t == "work" || t == "plan"
                 } else {
                     t == stage
@@ -5147,6 +5697,51 @@ impl CoordApp {
         changed
     }
 
+    /// #253: True when the currently-selected pipeline issue has a queued
+    /// merge entry whose work assignment lacks an approved review on the
+    /// board.  Drives the status-bar swap so the user sees the block before
+    /// pressing `m`.
+    ///
+    /// Mirrors the Python `requires_review` + `has_approved_review` logic
+    /// (coord/merge_queue.py) on the data the TUI loads from the local DB.
+    /// Returns false when reviews aren't configured (no review-typed
+    /// assignment ever appeared for this issue) so the hint doesn't appear
+    /// in projects that don't use the review pipeline.
+    fn merge_blocked_on_review_for_selected_issue(&self) -> bool {
+        if self.active_view != SidebarView::Pipeline {
+            return false;
+        }
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
+        else { return false; };
+        // Need a queued merge entry that is not yet merged.
+        let entry = self
+            .data
+            .merge_queue
+            .iter()
+            .find(|m| m.issue_number == Some(issue.number));
+        let Some(entry) = entry else { return false; };
+        if entry.state == "merged" {
+            return false;
+        }
+        // Only consider issues whose pipeline includes a "review" stage —
+        // a project without review gates shouldn't see this hint.
+        let stages = self.pipeline_stage_names();
+        if !stages.iter().any(|s| s == "review") {
+            return false;
+        }
+        // Find the latest work assignment for this issue (matching the
+        // merge entry's assignment_id).  Then look for an approve verdict
+        // on a review-typed assignment whose review_of_assignment_id
+        // matches.  Mirrors coord/merge_queue.py::has_approved_review.
+        let work_id = &entry.assignment_id;
+        let approved = self.data.assignments.iter().any(|a| {
+            a.assignment_type.as_deref() == Some("review")
+                && a.review_of_assignment_id.as_deref() == Some(work_id)
+                && a.review_verdict.as_deref() == Some("approve")
+        });
+        !approved
+    }
+
     /// Look up the CI summary for the currently-selected pipeline issue's
     /// merge queue entry.  Returns `None` when no PR is queued for the
     /// selected issue, or when no summary has been fetched yet.
@@ -5427,7 +6022,10 @@ impl CoordApp {
         )
     }
 
-    /// Pipeline tab: meta strip (repo/labels/gates/status).
+    /// Pipeline tab: meta strip (repo/labels/gates/status) plus
+    /// #271 part 2 test guidance (branch / repo path / suggested
+    /// commands / persisted Phase 1 build result) when Test is
+    /// actionable or has been built.
     fn pipeline_issue_summary(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
         if let Some(idx) = self.pipeline_sel {
@@ -5441,13 +6039,23 @@ impl CoordApp {
                 if !issue.matched_labels.is_empty() {
                     items.push(kv_item("Labels", &issue.matched_labels.join(", "), Some(Color::rgb(160, 160, 180))));
                 }
-                items.push(kv_item("Gates", &self.pipeline_stage_names().join(" → "), Some(Color::rgb(160, 160, 180))));
+                items.push(kv_item(
+                    "Gates",
+                    &self.pipeline_stage_names_for_issue(issue).join(" → "),
+                    Some(Color::rgb(160, 160, 180)),
+                ));
                 if let Some((msg, when)) = &self.pipeline_status {
                     if when.elapsed() < Duration::from_secs(8) {
                         items.push(kv_item("", "", None));
                         items.push(kv_item("", &format!("  {}", msg), Some(Color::rgb(180, 180, 100))));
                     }
                 }
+
+                // #271 part 2: surface test guidance + persisted build
+                // result inline.  Both rely on having a Work assignment
+                // to anchor against; without one there's nothing to
+                // test or build.
+                self.append_test_guidance_rows(&mut items, issue);
             }
         }
         ListView {
@@ -5459,6 +6067,267 @@ impl CoordApp {
             has_focus: false,
             bordered: false,
         }
+    }
+
+    /// #271 part 2: append a "Test guidance" block — branch, local
+    /// path, last-build outcome (persisted), suggested next commands —
+    /// when the user is looking at an issue whose Test stage is in
+    /// play (actionable or recently built).
+    fn append_test_guidance_rows(
+        &self,
+        items: &mut Vec<ListItem>,
+        issue: &PipelineIssue,
+    ) {
+        // Find the latest Work assignment for this issue (the build
+        // hangs off its branch).
+        let work = self.assignments_for_stage(issue, "work");
+        let latest = work.iter().max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let Some(latest) = latest else { return; };
+        // Show this block ONLY when the Test stage is in play (Active
+        // or Pending with Work done).  Skip for issues that aren't at
+        // the test step yet.
+        let test_status = self.test_stage_status_for(issue);
+        let actionable = self.test_gate_actionable();
+        let has_build_record = self.last_test_builds.contains_key(&latest.id);
+        let in_flight = self.test_build_in_flight(&latest.id);
+        if !actionable && !has_build_record && !in_flight {
+            return;
+        }
+
+        items.push(kv_item("", "", None));
+        items.push(kv_item(
+            "Test",
+            "ready for manual verification",
+            Some(Color::rgb(160, 200, 220)),
+        ));
+        if let Some(branch) = &latest.branch {
+            items.push(kv_item(
+                "  Branch",
+                branch,
+                Some(Color::rgb(160, 160, 180)),
+            ));
+        }
+        // Local repo path — only when we have a coord-repo mapping.
+        if let Some(local) = &issue.coord_repo {
+            items.push(kv_item(
+                "  Path",
+                &format!("see coordinator.yml `repos`: {}", local),
+                Some(Color::rgb(160, 160, 180)),
+            ));
+        }
+        // Persistent build status.  Three states surfaced.
+        if in_flight {
+            // The job is still going; show elapsed.
+            if let Some(job) = self.test_build_jobs.get(&latest.id) {
+                let elapsed = job.started_at.elapsed().as_secs();
+                items.push(kv_item(
+                    "  Build",
+                    &format!("running ({elapsed}s elapsed) — log {}", job.log_path.display()),
+                    Some(Color::rgb(220, 180, 100)),
+                ));
+            }
+        } else if let Some(last) = self.last_test_builds.get(&latest.id) {
+            let ago = last.finished_at.elapsed().as_secs();
+            // Show the branch the build was actually run against —
+            // useful when the user has fix-iterated since (the work
+            // assignment's branch may have advanced).
+            let branch_note = if Some(&last.branch) != latest.branch.as_ref() {
+                format!(" on {}", last.branch)
+            } else {
+                String::new()
+            };
+            if last.exit_code == 0 {
+                items.push(kv_item(
+                    "  Build",
+                    &format!(
+                        "✓ succeeded in {}s ({}s ago{}) — log {}",
+                        last.duration_secs, ago, branch_note, last.log_path.display()
+                    ),
+                    Some(Color::rgb(120, 200, 120)),
+                ));
+            } else {
+                let snippet = if last.first_error.is_empty() {
+                    String::new()
+                } else {
+                    let trimmed: String = last.first_error.chars().take(80).collect();
+                    if last.first_error.chars().count() > 80 {
+                        format!("{}…", trimmed)
+                    } else {
+                        trimmed
+                    }
+                };
+                items.push(kv_item(
+                    "  Build",
+                    &format!(
+                        "✗ exit {} ({}s ago{}){} — log {}",
+                        last.exit_code,
+                        ago,
+                        branch_note,
+                        if snippet.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {snippet}")
+                        },
+                        last.log_path.display(),
+                    ),
+                    Some(Color::rgb(220, 100, 100)),
+                ));
+            }
+            // Issue-number breadcrumb, useful when scrolling back via
+            // log files — the issue number is the human-friendly key.
+            let _ = last.issue_number; // anchored in `last` for future use
+        } else {
+            items.push(kv_item(
+                "  Build",
+                "(not run yet — press B)",
+                Some(Color::rgb(160, 160, 180)),
+            ));
+        }
+        // #271 part 2 follow-up: surface the PR description and files
+        // changed inline when a PR exists.  The worker's PR body is
+        // the canonical place they explain new sample apps, demo
+        // binaries, manual test steps — without this the user had to
+        // ask Claude separately.
+        if let Some(pr_number) = self.pipeline_pr_number(issue) {
+            items.push(kv_item(
+                "  PR",
+                &format!("#{}", pr_number),
+                Some(Color::rgb(160, 200, 220)),
+            ));
+            match self.pr_info_for_issue(issue) {
+                Some(pr) => {
+                    if !pr.title.is_empty() {
+                        items.push(kv_item(
+                            "  PR title",
+                            &pr.title,
+                            Some(Color::rgb(220, 220, 220)),
+                        ));
+                    }
+                    // Show up to 6 body lines; the user can open the PR
+                    // for the rest.  Skip empty lines at the head so
+                    // the preview is dense.
+                    let body_lines: Vec<&str> = pr
+                        .body
+                        .lines()
+                        .skip_while(|l| l.trim().is_empty())
+                        .take(6)
+                        .collect();
+                    if !body_lines.is_empty() {
+                        items.push(kv_item(
+                            "  PR notes",
+                            "",
+                            Some(Color::rgb(160, 160, 180)),
+                        ));
+                        for line in body_lines {
+                            // Truncate any wildly long line so the
+                            // single-row list doesn't blow out.
+                            let trimmed: String = line.chars().take(140).collect();
+                            items.push(kv_item(
+                                "",
+                                &format!("    {trimmed}"),
+                                Some(Color::rgb(200, 200, 200)),
+                            ));
+                        }
+                        if pr.body.lines().count() > 6 {
+                            items.push(kv_item(
+                                "",
+                                "    …",
+                                Some(Color::rgb(140, 140, 160)),
+                            ));
+                        }
+                    }
+                    // Files-changed list — useful for "what should I
+                    // test?" — capped at the first 10 entries.
+                    if !pr.files.is_empty() {
+                        items.push(kv_item(
+                            "  Files",
+                            &format!("({} changed)", pr.files.len()),
+                            Some(Color::rgb(160, 160, 180)),
+                        ));
+                        for path in pr.files.iter().take(10) {
+                            items.push(kv_item(
+                                "",
+                                &format!("    {path}"),
+                                Some(Color::rgb(200, 200, 200)),
+                            ));
+                        }
+                        if pr.files.len() > 10 {
+                            items.push(kv_item(
+                                "",
+                                &format!("    … and {} more", pr.files.len() - 10),
+                                Some(Color::rgb(140, 140, 160)),
+                            ));
+                        }
+                    }
+                    // The latest substantive review (state != PENDING,
+                    // non-empty body when possible).  Filters out
+                    // "COMMENTED" reviews with empty bodies that gh
+                    // sometimes returns from sidecar bots.
+                    let latest_review = pr
+                        .reviews
+                        .iter()
+                        .rev()
+                        .find(|r| {
+                            r.state != "PENDING"
+                                && (!r.body.is_empty() || r.state == "APPROVED" || r.state == "CHANGES_REQUESTED")
+                        });
+                    if let Some(rev) = latest_review {
+                        let (state_label, state_color) = match rev.state.as_str() {
+                            "APPROVED" => ("✓ Approved", Color::rgb(120, 200, 120)),
+                            "CHANGES_REQUESTED" => ("✗ Changes Requested", Color::rgb(220, 100, 100)),
+                            "COMMENTED" => ("Commented", Color::rgb(160, 200, 220)),
+                            other => (other, Color::rgb(200, 200, 200)),
+                        };
+                        items.push(kv_item("  Review", state_label, Some(state_color)));
+                        // Skip leading whitespace so the preview is
+                        // dense.  Cap to 10 lines.
+                        let body_lines: Vec<&str> = rev
+                            .body
+                            .lines()
+                            .skip_while(|l| l.trim().is_empty())
+                            .take(10)
+                            .collect();
+                        for line in &body_lines {
+                            let trimmed: String = line.chars().take(140).collect();
+                            items.push(kv_item(
+                                "",
+                                &format!("    {trimmed}"),
+                                Some(Color::rgb(200, 200, 200)),
+                            ));
+                        }
+                        if rev.body.lines().count() > 10 {
+                            items.push(kv_item(
+                                "",
+                                "    …",
+                                Some(Color::rgb(140, 140, 160)),
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    items.push(kv_item(
+                        "  PR notes",
+                        "(loading via gh pr view…)",
+                        Some(Color::rgb(160, 160, 180)),
+                    ));
+                }
+            }
+        }
+
+        // Suggested next steps.
+        let test_label = match test_status {
+            StageStatus::Failed => "previously failed — press R to re-dispatch Work, or P/F/S to re-record",
+            _ => "press P=pass, F=fail, S=skip after manual verification",
+        };
+        items.push(kv_item(
+            "  Next",
+            test_label,
+            Some(Color::rgb(160, 160, 180)),
+        ));
     }
 
     /// Detail list for the Stages tab. One section per stage in the
@@ -5502,7 +6371,7 @@ impl CoordApp {
             };
         }
 
-        for name in self.pipeline_stage_names() {
+        for name in self.pipeline_stage_names_for_issue(&issue) {
             let status = self.stage_status_for(&issue, &name);
             let (icon, color) = match status {
                 StageStatus::Done => ("✓", Color::rgb(120, 200, 120)),
@@ -5550,6 +6419,7 @@ impl CoordApp {
     ) {
         let local_repo = issue.coord_repo.as_deref();
         let plan_gate_on = self.data.pipeline_require_plan;
+        let has_plan_for_issue = self.issue_has_plan_assignment(issue);
         let matching: Vec<&Assignment> = self
             .data
             .assignments
@@ -5561,7 +6431,10 @@ impl CoordApp {
             })
             .filter(|a| {
                 let t = a.assignment_type.as_deref().unwrap_or("work");
-                if stage == "work" && !plan_gate_on {
+                // Legacy fold: plan-typed assignments count as Work only
+                // when this issue's strip has no Plan stage (no plan
+                // gate globally AND no plan-typed assignment exists).
+                if stage == "work" && !plan_gate_on && !has_plan_for_issue {
                     t == "work" || t == "plan"
                 } else {
                     t == stage
@@ -5797,6 +6670,12 @@ impl CoordApp {
             } => {
                 let pos = *position;
                 let lh = backend.line_height();
+                // #259: an open context menu intercepts all clicks first
+                // — outside the menu → dismiss; on an item → activate;
+                // anywhere else inside the menu → swallow (keep open).
+                if let Some(handled) = self.handle_context_menu_click(pos) {
+                    return handled;
+                }
                 if ctx.in_sidebar(pos.x, pos.y) {
                     if let Some(sidebar_b) = ctx.sidebar_bounds() {
                         return self.mouse_sidebar_click(event, pos, sidebar_b, backend);
@@ -5807,6 +6686,75 @@ impl CoordApp {
                 } else {
                     false
                 }
+            }
+            UiEvent::MouseDown {
+                position,
+                button: MouseButton::Right,
+                ..
+            } => {
+                // #259: right-click opens a context menu for the row
+                // under the cursor (Board / Pipeline sidebar only for
+                // MVP).  We synthesise a left-click first so the row
+                // gets focused / selected, then open the menu using the
+                // newly-selected row as the target.
+                let pos = *position;
+                if ctx.in_sidebar(pos.x, pos.y) {
+                    if let Some(sidebar_b) = ctx.sidebar_bounds() {
+                        // Pre-select the row under the cursor by routing
+                        // a left-click; existing handlers already update
+                        // selection state and re-rebuild the sidebar.
+                        let synthetic_left = UiEvent::MouseDown {
+                            widget: None,
+                            button: MouseButton::Left,
+                            position: pos,
+                            modifiers: quadraui::Modifiers::default(),
+                        };
+                        self.mouse_sidebar_click(&synthetic_left, pos, sidebar_b, backend);
+                    }
+                    let target = match self.active_view {
+                        SidebarView::Board => {
+                            let selected = self.board_selected_issue();
+                            let (repo_name, issue_number) = match selected {
+                                Some((r, n)) => (Some(r), Some(n)),
+                                None => (self.board_active_repo().map(|s| s.to_string()), None),
+                            };
+                            // #260: classify the row at right-click time
+                            // so the menu items reflect the current
+                            // lifecycle state (Backlog → Refine, etc.).
+                            let lifecycle = match (&repo_name, issue_number) {
+                                (Some(r), Some(n)) => self.board_row_lifecycle(r, n),
+                                _ => BoardRowLifecycle::Unknown,
+                            };
+                            Some(ContextMenuTarget::BoardRow {
+                                issue_number,
+                                repo_name,
+                                lifecycle,
+                            })
+                        }
+                        SidebarView::Pipeline => {
+                            let sel = self
+                                .pipeline_sel
+                                .and_then(|i| self.pipeline_issues.get(i));
+                            let issue_number = sel.map(|i| i.number);
+                            // #262: classify the row at right-click time
+                            // so the menu offers Start only when New.
+                            let lifecycle = sel
+                                .map(|i| self.pipeline_row_lifecycle(i))
+                                .unwrap_or(PipelineRowLifecycle::Other);
+                            Some(ContextMenuTarget::PipelineRow {
+                                issue_number,
+                                lifecycle,
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        if self.open_context_menu(pos, target) {
+                            return true;
+                        }
+                    }
+                }
+                false
             }
 
             UiEvent::Scroll { position, delta, .. } => {
@@ -5838,6 +6786,15 @@ impl CoordApp {
         sidebar_b: Rect,
         backend: &mut dyn Backend,
     ) -> bool {
+        // #270: action bar (row of contextual verb buttons) sits above
+        // the tree.  Hit-test it first; if the click landed on a button
+        // we've already dispatched the action.  Pass the shrunken rect
+        // to the tree's hit-tester so its math doesn't see the bar row.
+        let lh = backend.line_height();
+        let (sidebar_b, consumed) = self.hit_test_sidebar_action_bar(pos, sidebar_b, lh);
+        if consumed {
+            return true;
+        }
         match self.active_view {
             SidebarView::Board => {
                 let result = self.board_sidebar.handle(event, backend, sidebar_b);
@@ -5933,22 +6890,10 @@ impl CoordApp {
                 }
             }
             SidebarView::Settings => {
-                // Hit-test the category list: row 0 is the title strip;
-                // category i starts at row 1+i.
-                let lh = backend.line_height();
-                if lh > 0.0 {
-                    let row = ((pos.y - sidebar_b.y) / lh).floor() as usize;
-                    if row >= 1 {
-                        let cat_idx = row - 1;
-                        let max = Self::settings_categories().len();
-                        if cat_idx < max && cat_idx != self.settings_category_sel {
-                            self.settings_category_sel = cat_idx;
-                            self.settings_field_sel = 0;
-                            self.settings_form.borrow_mut().set_scroll_offset(0);
-                            return true;
-                        }
-                    }
-                }
+                // #237: the Settings sidebar is now an empty placeholder —
+                // all settings live in the main-panel form.  Clicks land in
+                // the sidebar slot do nothing.
+                let _ = (pos, sidebar_b, backend);
                 false
             }
         }
@@ -5963,6 +6908,19 @@ impl CoordApp {
     ///   hit-test (dispatches the Go action when a stage button is clicked).
     /// - **Machines** — no-op (no interactive elements in the main panel).
     fn mouse_main_click(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
+        // #249 Principle 1: toolbar row at the top of main_content_bounds
+        // is hit-tested first.  A click inside it dispatches the action
+        // bound to the corresponding `toolbar:<verb>` segment.  We
+        // shrink `main_b` for the rest of the handler so existing
+        // tab-bar math (which expects (0..tab_h) from the panel's top)
+        // continues to work unchanged.
+        let (content_main_b, toolbar_consumed) =
+            self.hit_test_panel_toolbar(pos, main_b, lh);
+        if toolbar_consumed {
+            return true;
+        }
+        let main_b = content_main_b;
+
         if self.active_view == SidebarView::Settings {
             // Route click to FormController. FormController::handle_cached
             // uses metrics cached by render_and_cache().
@@ -5999,19 +6957,23 @@ impl CoordApp {
             }
         }
         if self.active_view == SidebarView::Board {
-            // Tab bar: " Board " (7 chars) ~ x_off < 7, then " Issue ".
+            // #269: hit-test from the actual TabBar labels (char widths)
+            // instead of hard-coded offsets.  This stays correct when
+            // tabs are renamed or have a badge appended.
             let tab_h = lh * 1.4;
             if pos.y - main_b.y < tab_h {
-                let x_off = pos.x - main_b.x;
-                let new_tab = if x_off < 7.0 {
-                    BoardDetailTab::Board
-                } else {
-                    BoardDetailTab::Issue
-                };
-                if new_tab != self.board_detail_tab {
-                    self.board_detail_tab = new_tab;
-                    self.detail_scroll = 0;
-                    return true;
+                let bar = self.board_detail_tab_bar();
+                let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
+                if let Some(idx) = hit_tab_index_from_labels(&labels, main_b.x, pos.x) {
+                    let new_tab = match idx {
+                        0 => BoardDetailTab::Board,
+                        _ => BoardDetailTab::Issue,
+                    };
+                    if new_tab != self.board_detail_tab {
+                        self.board_detail_tab = new_tab;
+                        self.detail_scroll = 0;
+                        return true;
+                    }
                 }
                 return false;
             }
@@ -6021,19 +6983,20 @@ impl CoordApp {
             // Tab bar occupies the first `lh * 1.4` row of the main panel.
             let tab_h = lh * 1.4;
             if pos.y - main_b.y < tab_h {
-                let x_off = pos.x - main_b.x;
-                // Tab labels: " Pipeline " (10), " Issue " (7), " Stages " (8).
-                let new_tab = if x_off < 10.0 {
-                    PipelineDetailTab::Pipeline
-                } else if x_off < 17.0 {
-                    PipelineDetailTab::Issue
-                } else {
-                    PipelineDetailTab::Stages
-                };
-                if new_tab != self.pipeline_detail_tab {
-                    self.pipeline_detail_tab = new_tab;
-                    self.pipeline_detail_scroll = 0;
-                    return true;
+                let bar = self.pipeline_detail_tab_bar();
+                let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
+                if let Some(idx) = hit_tab_index_from_labels(&labels, main_b.x, pos.x) {
+                    let new_tab = match idx {
+                        0 => PipelineDetailTab::Pipeline,
+                        1 => PipelineDetailTab::Issue,
+                        _ => PipelineDetailTab::Stages,
+                    };
+                    if new_tab != self.pipeline_detail_tab {
+                        self.pipeline_detail_tab = new_tab;
+                        self.pipeline_detail_scroll = 0;
+                        return true;
+                    }
+                    return false;
                 }
                 return false;
             }
@@ -6098,18 +7061,11 @@ impl CoordApp {
                 true
             }
             SidebarView::Settings => {
-                // Scroll the category list.
-                let max = Self::settings_categories().len().saturating_sub(1);
-                if delta.y > 0.0 && self.settings_category_sel > 0 {
-                    self.settings_category_sel -= 1;
-                    self.settings_field_sel = 0;
-                    self.settings_form.borrow_mut().set_scroll_offset(0);
-                } else if delta.y < 0.0 && self.settings_category_sel < max {
-                    self.settings_category_sel += 1;
-                    self.settings_field_sel = 0;
-                    self.settings_form.borrow_mut().set_scroll_offset(0);
-                }
-                true
+                // #237: sidebar is an empty placeholder.  Forward the wheel
+                // event to the main-panel form so the user can scroll the
+                // settings list even when their cursor lingers on the left.
+                let _ = (delta, sidebar_b, backend);
+                false
             }
         }
     }
@@ -6284,6 +7240,20 @@ impl CoordApp {
             // #200: inline reason input takes precedence over the purge prompt
             // and normal hints.
             format!(" Test failure reason: {}_  Enter=submit  Esc=cancel ", buf)
+        } else if let Some(ref repo) = self.pending_force_merge {
+            // #245: force-merge confirm prompt — overrides every other hint
+            // until the user picks y/Y (confirm) or any other key (cancel).
+            // Scope is shown so the user knows whether this hits one repo or
+            // the whole queue.
+            let scope = if repo.is_empty() {
+                " (whole queue)".to_string()
+            } else {
+                format!(" --repo {}", repo)
+            };
+            format!(
+                " Force-merge{} despite failed CI checks? y=confirm  Esc=cancel ",
+                scope
+            )
         } else if let Some((a, i)) = self.pending_purge {
             // Confirm prompt overrides the normal hints while purge is pending.
             format!(
@@ -6327,10 +7297,18 @@ impl CoordApp {
                 summary.failed_names.join(", ")
             };
             format!(" Checks failed: {}  m=merge anyway  q=quit ", names)
-        } else if proposals > 0 {
-            format!(" p=plan  a=approve({})  m=merge  R=retry  P=purge  q=quit ", proposals)
+        } else if self.merge_blocked_on_review_for_selected_issue() {
+            // #253: the selected merge entry has no approved review on the
+            // board.  Surface the block so the user doesn't press lowercase
+            // `m` and silently merge unreviewed code.  Capital `M` runs
+            // `coord merge --skip-review` for the deliberate override.
+            " Merge blocked: review not yet approved  R=dispatch review  M=merge anyway  q=quit ".to_string()
         } else {
-            " p=plan  n=notify  m=merge  R=retry  P=purge  q=quit ".to_string()
+            // #192: `p` / `a` / `A` retired alongside the PROPOSALS
+            // section.  Right-click → Send to Pipeline (#261) is the
+            // canonical dispatch path now.
+            let _ = proposals;
+            " n=notify  m=merge  R=retry  P=purge  q=quit ".to_string()
         };
         StatusBar {
             id: WidgetId::new("statusbar"),
@@ -6343,6 +7321,1041 @@ impl CoordApp {
                 action_id: None,
             }],
         }
+    }
+}
+
+// ─── Right-click context menu (#259) ─────────────────────────────────────────
+
+impl CoordApp {
+    /// #260: classify a Board row by repo + issue number into a
+    /// lifecycle bucket.  Drives which menu items appear at right-click
+    /// time (Refine on Backlog rows, etc.).
+    ///
+    /// Cross-references both `data.open_issues` (for labels + state)
+    /// and `data.assignments` (for "has assignments → In-flight").
+    fn board_row_lifecycle(
+        &self,
+        repo_name: &str,
+        issue_number: u64,
+    ) -> BoardRowLifecycle {
+        let issue = self
+            .data
+            .open_issues
+            .iter()
+            .find(|oi| oi.repo_name == repo_name && oi.number == issue_number);
+        let has_assignment = self
+            .data
+            .assignments
+            .iter()
+            .any(|a| a.repo == repo_name && a.issue_number == issue_number);
+        let Some(issue) = issue else {
+            // No cache row — fall back on assignment presence; without
+            // either signal we don't know the state.
+            return if has_assignment {
+                BoardRowLifecycle::InFlight
+            } else {
+                BoardRowLifecycle::Unknown
+            };
+        };
+        if issue.state == "closed" && has_assignment {
+            return BoardRowLifecycle::Completed;
+        }
+        if has_assignment {
+            return BoardRowLifecycle::InFlight;
+        }
+        // Open issue with no assignments — classify by labels.
+        let has_refining = issue.labels.iter().any(|l| l == "status:refining");
+        let has_ready = issue.labels.iter().any(|l| l == "status:ready");
+        if has_refining {
+            BoardRowLifecycle::Refining
+        } else if has_ready {
+            BoardRowLifecycle::Refined
+        } else {
+            BoardRowLifecycle::Backlog
+        }
+    }
+
+    /// Build the menu item list for a right-click on a Board sidebar row.
+    ///
+    /// Items vary by lifecycle bucket (#260 onward):
+    /// - **Backlog** → Refine
+    /// - other states → just Copy + Refresh for now (subsequent issues
+    ///   wire #261 Send to Pipeline, #262 Start, etc.).
+    fn context_menu_items_for_board_row(
+        &self,
+        issue_number: Option<u64>,
+        lifecycle: &BoardRowLifecycle,
+    ) -> Vec<ContextMenuItem> {
+        let mut items: Vec<ContextMenuItem> = Vec::new();
+        // #260: Refine is only meaningful for Backlog rows — adding
+        // `status:refining` to a row that's already In-flight or
+        // Completed would be confusing.
+        if matches!(lifecycle, BoardRowLifecycle::Backlog) {
+            items.push(ContextMenuItem::action("refine", "Refine"));
+            items.push(ContextMenuItem::separator());
+        }
+        // #266: Refining rows get the forward path (Mark Refined) and
+        // the backward path (Drop to Backlog).  Without these the
+        // Refining state is a dead-end in the TUI — the user has to
+        // shell out to `coord ready` to move forward.
+        if matches!(lifecycle, BoardRowLifecycle::Refining) {
+            items.push(ContextMenuItem::action("mark-refined", "Mark Refined"));
+            items.push(ContextMenuItem::action("drop-to-backlog", "Drop to Backlog"));
+            items.push(ContextMenuItem::separator());
+        }
+        // #261: Send to Pipeline is only meaningful for Refined rows
+        // (scope locked, ready to dispatch).  Pre-Refined rows still
+        // need scoping work; In-flight / Completed rows already have
+        // the `coord` label.
+        if matches!(lifecycle, BoardRowLifecycle::Refined) {
+            items.push(ContextMenuItem::action(
+                "send-to-pipeline",
+                "Send to Pipeline",
+            ));
+            // #266: symmetric to Mark Refined — let the user walk back
+            // to Refining if they want to re-open scoping.
+            items.push(ContextMenuItem::action("drop-to-refining", "Drop to Refining"));
+            items.push(ContextMenuItem::separator());
+        }
+        if let Some(num) = issue_number {
+            items.push(ContextMenuItem::action(
+                "copy-issue-number",
+                &format!("Copy issue #{}", num),
+            ));
+            items.push(ContextMenuItem::separator());
+        }
+        items.push(
+            ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"),
+        );
+        items
+    }
+
+    /// #262: classify a Pipeline row into the umbrella's three sections
+    /// plus an "Other" catch-all.  Drives the right-click menu so Start
+    /// only appears when the row is genuinely dispatch-ready.
+    ///
+    /// Maps the existing 5-state `pipeline_lifecycle_section` to the
+    /// 4-state lifecycle:
+    /// - `"pending"` (coord + status:ready, no assignments) → **New**
+    /// - `"in-progress"` (has assignments)                   → **InProgress**
+    /// - `"done"`     (closed + assignments)                 → **Done**
+    /// - `"refining"` / `"new"`                              → **Other**
+    /// #271 part 2 follow-up: extract a PR number from a Pipeline
+    /// issue.  Looks up the `merge_queue` entry — it's populated by
+    /// `coord merge` when the PR is opened, and `pr_number` is on the
+    /// entry directly.  Returns `None` when no PR has been opened yet
+    /// (Plan- or Work-stage only, before a merge queue entry exists).
+    fn pipeline_pr_number(&self, issue: &PipelineIssue) -> Option<i64> {
+        self.data
+            .merge_queue
+            .iter()
+            .find(|m| m.issue_number == Some(issue.number))
+            .and_then(|m| m.pr_number)
+    }
+
+    /// #271 part 2 follow-up: cache-aware accessor for a PR's title /
+    /// body / files-changed.  Returns `Some(cached)` on hit; on miss,
+    /// kicks off a background `gh pr view` (only once per key — repeat
+    /// calls coalesce on the in-flight `Receiver`) and returns None
+    /// while the fetch is in flight.  Drained by
+    /// `poll_pending_pr_fetches` each tick.
+    fn pr_info_for_issue(&self, issue: &PipelineIssue) -> Option<FetchedPr> {
+        let pr_number = self.pipeline_pr_number(issue)?;
+        let key = (issue.repo_slug.clone(), pr_number);
+        // Cache hit — done.
+        if let Some(cached) = self.fetched_prs_cache.borrow().get(&key).cloned() {
+            return Some(cached);
+        }
+        // Already fetching — let the poll loop pick it up.
+        if self.pending_pr_fetches.borrow().contains_key(&key) {
+            return None;
+        }
+        // Kick off a fresh background fetch.
+        let rx = spawn_pr_fetch(issue.repo_slug.clone(), pr_number);
+        self.pending_pr_fetches.borrow_mut().insert(key, rx);
+        None
+    }
+
+    /// Drain completed `gh pr view` fetches into the in-memory cache.
+    /// Returns `true` when at least one fetch resolved — caller should
+    /// redraw so the Test guidance block picks up the new info.
+    fn poll_pending_pr_fetches(&self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let mut changed = false;
+        let mut done: Vec<(String, i64)> = Vec::new();
+        let pending = self.pending_pr_fetches.borrow();
+        for (key, rx) in pending.iter() {
+            match rx.try_recv() {
+                Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    done.push(key.clone());
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        drop(pending);
+        for key in done {
+            // Pull the receiver back out and consume the message.
+            let rx = match self.pending_pr_fetches.borrow_mut().remove(&key) {
+                Some(rx) => rx,
+                None => continue,
+            };
+            match rx.try_recv() {
+                Ok(Ok(fp)) => {
+                    self.fetched_prs_cache.borrow_mut().insert(key, fp);
+                    changed = true;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // Fetch failed — leave the cache untouched; the
+                    // next render will trigger a retry.  Worth a
+                    // background poll later (#TBD) instead of
+                    // re-fetching on every render but the cost is
+                    // ~200ms per failure so leave for now.
+                }
+            }
+        }
+        changed
+    }
+
+    fn pipeline_row_lifecycle(&self, issue: &PipelineIssue) -> PipelineRowLifecycle {
+        match self.pipeline_lifecycle_section(issue) {
+            "pending" => PipelineRowLifecycle::New,
+            "in-progress" => PipelineRowLifecycle::InProgress,
+            "done" => PipelineRowLifecycle::Done,
+            _ => PipelineRowLifecycle::Other,
+        }
+    }
+
+    /// Build the menu item list for a right-click on a Pipeline sidebar row.
+    ///
+    /// New rows (coord + status:ready, no assignments) get the two
+    /// Start variants from #262 — Start with Plan (dispatches a Plan
+    /// worker first, gated by `coord approve-plan`) and Skip Plan
+    /// (dispatches Work directly).  Other states omit them.
+    fn context_menu_items_for_pipeline_row(
+        &self,
+        issue_number: Option<u64>,
+        lifecycle: &PipelineRowLifecycle,
+    ) -> Vec<ContextMenuItem> {
+        let mut items: Vec<ContextMenuItem> = Vec::new();
+        if matches!(lifecycle, PipelineRowLifecycle::New) {
+            items.push(ContextMenuItem::action(
+                "start-with-plan",
+                "Start with Plan",
+            ));
+            items.push(ContextMenuItem::action(
+                "start-skip-plan",
+                "Skip Plan, start Work",
+            ));
+            items.push(ContextMenuItem::separator());
+        }
+        if let Some(num) = issue_number {
+            items.push(ContextMenuItem::action(
+                "copy-issue-number",
+                &format!("Copy issue #{}", num),
+            ));
+            items.push(ContextMenuItem::separator());
+        }
+        items.push(
+            ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"),
+        );
+        items
+    }
+
+    /// Open a right-click context menu anchored at `pos` for `target`.
+    /// Pre-builds the item list and picks the first selectable item as the
+    /// keyboard focus.  Returns `true` if a menu was opened (i.e. items
+    /// are non-empty).
+    fn open_context_menu(&mut self, pos: Point, target: ContextMenuTarget) -> bool {
+        let items = match &target {
+            ContextMenuTarget::BoardRow {
+                issue_number,
+                lifecycle,
+                ..
+            } => self.context_menu_items_for_board_row(*issue_number, lifecycle),
+            ContextMenuTarget::PipelineRow {
+                issue_number,
+                lifecycle,
+            } => self.context_menu_items_for_pipeline_row(*issue_number, lifecycle),
+        };
+        if items.is_empty() {
+            return false;
+        }
+        // First non-separator item is the initial selection.
+        let selected_idx = items
+            .iter()
+            .position(|it| it.action_id.is_some() && !it.disabled)
+            .unwrap_or(0);
+        self.pending_context_menu = Some(ContextMenuState {
+            items,
+            anchor: pos,
+            selected_idx,
+            target,
+        });
+        true
+    }
+
+    /// Render the open context menu (if any) on top of the rest of the UI.
+    /// Caches the resolved layout so the click hit-test can match items
+    /// without recomputing.  Pure render — no state mutation.
+    fn render_context_menu(
+        &self,
+        backend: &mut dyn Backend,
+        viewport: Rect,
+    ) {
+        let Some(state) = self.pending_context_menu.as_ref() else {
+            return;
+        };
+        let menu = build_quadraui_context_menu(state);
+        // Width = longest label + longest shortcut + padding (mirrors
+        // vimcode's `render_impl.rs::draw_context_menu` heuristic).
+        let max_label = state
+            .items
+            .iter()
+            .map(|it| it.label.chars().count())
+            .max()
+            .unwrap_or(4);
+        let max_shortcut = state
+            .items
+            .iter()
+            .filter_map(|it| it.shortcut.as_ref())
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(0);
+        let menu_width = (max_label + max_shortcut + 6).clamp(20, 60) as f32;
+        let lh = backend.line_height();
+        let layout = menu.layout(
+            state.anchor.x,
+            state.anchor.y,
+            viewport,
+            menu_width,
+            |_| ContextMenuItemMeasure::new(lh),
+        );
+        backend.draw_context_menu(&menu, &layout);
+        *self.context_menu_layout.borrow_mut() = Some(layout);
+    }
+
+    /// Hit-test a click against the open context menu.  Returns
+    /// `Some(true)` when the click landed on an actionable item (dispatched
+    /// + menu dismissed), `Some(false)` when the click landed on a
+    /// non-actionable cell of the menu (separator / disabled — swallow,
+    /// keep menu open), or `None` when no menu is open.  Click outside the
+    /// menu dismisses it and returns `Some(true)` to signal redraw.
+    fn handle_context_menu_click(&mut self, pos: Point) -> Option<bool> {
+        let layout = self.context_menu_layout.borrow().clone()?;
+        if self.pending_context_menu.is_none() {
+            return None;
+        }
+        match layout.hit_test(pos.x, pos.y) {
+            ContextMenuHit::Item(id) => {
+                let action_id = id.as_str().to_string();
+                let state = self.pending_context_menu.take();
+                *self.context_menu_layout.borrow_mut() = None;
+                if let Some(state) = state {
+                    self.dispatch_context_menu_action(&action_id, &state.target);
+                }
+                Some(true)
+            }
+            ContextMenuHit::Inert => Some(false),
+            ContextMenuHit::Empty => {
+                // Click outside dismisses without firing.
+                self.pending_context_menu = None;
+                *self.context_menu_layout.borrow_mut() = None;
+                Some(true)
+            }
+        }
+    }
+
+    /// Move the keyboard selection within the open context menu, skipping
+    /// separators and disabled items.  No-op when no menu is open.
+    fn context_menu_move_selection(&mut self, delta: i32) {
+        let Some(ref state) = self.pending_context_menu else {
+            return;
+        };
+        // Build a transient quadraui menu just to reuse its move_selection
+        // logic (skips separators + disabled items).
+        let menu = build_quadraui_context_menu(state);
+        let new_idx = menu.move_selection(state.selected_idx, delta);
+        if let Some(ref mut s) = self.pending_context_menu {
+            s.selected_idx = new_idx;
+        }
+    }
+
+    /// Activate the keyboard-selected item (Enter) and dismiss the menu.
+    /// No-op when no menu is open or the selected item is a separator.
+    fn context_menu_activate_selected(&mut self) -> bool {
+        let Some(state) = self.pending_context_menu.take() else {
+            return false;
+        };
+        *self.context_menu_layout.borrow_mut() = None;
+        let Some(item) = state.items.get(state.selected_idx) else {
+            return false;
+        };
+        let Some(action_id) = item.action_id.clone() else {
+            // Selected a separator — shouldn't happen since move_selection
+            // skips them, but defend anyway.
+            return false;
+        };
+        self.dispatch_context_menu_action(&action_id, &state.target);
+        true
+    }
+
+    /// Dismiss the open context menu without firing an action.
+    fn dismiss_context_menu(&mut self) {
+        self.pending_context_menu = None;
+        *self.context_menu_layout.borrow_mut() = None;
+    }
+
+    /// #266: shared helper for board-row context-menu actions that
+    /// spawn a single `coord <subcommand> <repo> <issue>` command.
+    /// `toast_title` and `body_template` (with `{}` for the issue
+    /// number) drive the dispatch toast; on missing target data, the
+    /// helper surfaces a guidance toast and returns `false` without
+    /// spawning anything.
+    fn dispatch_board_row_command(
+        &mut self,
+        target: &ContextMenuTarget,
+        subcommand: &str,
+        toast_title: &str,
+        body_template: &str,
+    ) -> bool {
+        let (repo, num) = match target {
+            ContextMenuTarget::BoardRow {
+                issue_number: Some(num),
+                repo_name: Some(repo),
+                ..
+            } => (repo.clone(), *num),
+            _ => {
+                self.push_toast(
+                    &format!("{} unavailable", toast_title),
+                    "No issue + repo target — focus a row first.",
+                    ToastSeverity::Info,
+                );
+                return false;
+            }
+        };
+        let num_str = num.to_string();
+        if self.command_runner.spawn(&[subcommand, &repo, &num_str]) {
+            let body = body_template.replace("{}", &num.to_string());
+            self.push_toast(toast_title, &body, ToastSeverity::Info);
+        } else {
+            self.push_toast(
+                "Another command is running",
+                "Wait for the current command to finish, then try again.",
+                ToastSeverity::Info,
+            );
+        }
+        true
+    }
+
+    /// Route a context-menu `action_id` to the right behaviour.
+    /// Stub actions for the MVP (#259); subsequent issues replace with
+    /// row-state-specific dispatch.
+    fn dispatch_context_menu_action(
+        &mut self,
+        action_id: &str,
+        target: &ContextMenuTarget,
+    ) -> bool {
+        match action_id {
+            "copy-issue-number" => {
+                let num = match target {
+                    ContextMenuTarget::BoardRow { issue_number, .. } => issue_number.unwrap_or(0),
+                    ContextMenuTarget::PipelineRow { issue_number, .. } => {
+                        issue_number.unwrap_or(0)
+                    }
+                };
+                self.push_toast(
+                    "Copy",
+                    &format!(
+                        "Copy of #{} not yet wired to the clipboard — primitive smoke test only.",
+                        num,
+                    ),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            "refresh" => {
+                self.refresh();
+                true
+            }
+            // #260: Refine — move a Backlog row into the Refining
+            // section by spawning `coord refine <repo> <num>`.
+            "refine" => self.dispatch_board_row_command(
+                target,
+                "refine",
+                "Refine",
+                "#{}: tagging status:refining…",
+            ),
+            // #261: Send to Pipeline — add the `coord` label so the
+            // issue moves Refined → Pipeline:New.  Wraps the new
+            // `coord track <repo> <num>` Python command.
+            "send-to-pipeline" => self.dispatch_board_row_command(
+                target,
+                "track",
+                "Send to Pipeline",
+                "#{} → Pipeline (adding coord label…)",
+            ),
+            // #266: Refining → Refined — wraps existing `coord ready`.
+            "mark-refined" => self.dispatch_board_row_command(
+                target,
+                "ready",
+                "Mark Refined",
+                "#{} → Refined (tagging status:ready…)",
+            ),
+            // #266: Refining → Backlog (strips status:refining).
+            // Refined → Refining is handled by `coord refine` which
+            // also removes status:ready, so `drop-to-refining` reuses
+            // the same command.
+            "drop-to-backlog" => self.dispatch_board_row_command(
+                target,
+                "backlog",
+                "Drop to Backlog",
+                "#{}: stripping status:* label…",
+            ),
+            "drop-to-refining" => self.dispatch_board_row_command(
+                target,
+                "refine",
+                "Drop to Refining",
+                "#{}: tagging status:refining…",
+            ),
+            // #262: Start with Plan — dispatches a `type="plan"` worker
+            // first.  Reuses the existing Pipeline-stage dispatcher so
+            // the click + the [Go] button on the stage strip share one
+            // code path.
+            "start-with-plan" => {
+                let dispatched = self.dispatch_pipeline_plan();
+                if !dispatched {
+                    self.push_toast(
+                        "Start with Plan",
+                        "Couldn't dispatch — see status bar for details.",
+                        ToastSeverity::Warning,
+                    );
+                }
+                true
+            }
+            // #262: Skip Plan, start Work — dispatches a `type="work"`
+            // worker directly.  Same path the existing [Go] button on
+            // the Work stage uses.
+            "start-skip-plan" => {
+                let dispatched = self.dispatch_pipeline_work();
+                if !dispatched {
+                    self.push_toast(
+                        "Start Work",
+                        "Couldn't dispatch — see status bar for details.",
+                        ToastSeverity::Warning,
+                    );
+                }
+                true
+            }
+            _ => {
+                self.push_toast(
+                    "Unknown context-menu action",
+                    &format!("No handler for `{}` — likely a stale id.", action_id),
+                    ToastSeverity::Warning,
+                );
+                false
+            }
+        }
+    }
+}
+
+/// #269: Hit-test a click against a TUI tab bar's labels.  Walks the
+/// labels left-to-right, accumulating character widths to derive each
+/// tab's `start_x..end_x` boundary.  Returns the tab index under the
+/// cursor or `None` if the click landed past the last tab.
+///
+/// Why not `Backend::tab_bar_layout`: that's the rasteriser's authoritative
+/// hit-region map but requires a `&mut Backend` we don't want to plumb
+/// through every test.  In the TUI rasteriser, labels are rendered 1:1
+/// in character cells, so summing label char counts gives the exact
+/// same boundaries the painter used.  GTK rendering uses pixel widths
+/// and would need the layout call — track in a follow-up if that
+/// backend ever has a regression here.
+fn hit_tab_index_from_labels(labels: &[&str], origin_x: f32, click_x: f32) -> Option<usize> {
+    let mut cursor = origin_x;
+    for (i, label) in labels.iter().enumerate() {
+        let width = label.chars().count() as f32;
+        let end = cursor + width;
+        if click_x >= cursor && click_x < end {
+            return Some(i);
+        }
+        cursor = end;
+    }
+    None
+}
+
+/// Union of an optional rect and a required rect.  Used to compute the
+/// context-menu viewport so a menu anchored in the sidebar can extend
+/// rightward into the main panel without being clipped.
+fn union_rects(a: Option<Rect>, b: Rect) -> Rect {
+    let Some(a) = a else { return b; };
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.width).max(b.x + b.width);
+    let bottom = (a.y + a.height).max(b.y + b.height);
+    Rect::new(x, y, right - x, bottom - y)
+}
+
+/// Convert an engine-side `ContextMenuState` into the `quadraui::ContextMenu`
+/// primitive the rasteriser draws.  Separators map to `id: None`; actions
+/// carry `action:<id>` so the hit-test can route back to the engine.
+fn build_quadraui_context_menu(state: &ContextMenuState) -> ContextMenu {
+    let items: Vec<QuiContextMenuItem> = state
+        .items
+        .iter()
+        .map(|it| {
+            if it.action_id.is_none() {
+                // Separator.
+                QuiContextMenuItem::default()
+            } else {
+                QuiContextMenuItem {
+                    id: it.action_id.as_ref().map(WidgetId::new),
+                    label: StyledText::plain(it.label.clone()),
+                    detail: it
+                        .shortcut
+                        .as_ref()
+                        .map(|s| StyledText::plain(s.clone())),
+                    disabled: it.disabled,
+                    ..Default::default()
+                }
+            }
+        })
+        .collect();
+    ContextMenu {
+        id: WidgetId::new("coord-context-menu"),
+        items,
+        selected_idx: state.selected_idx,
+        bg: None,
+        placement: ContextMenuPlacement::AnchorPoint,
+    }
+}
+
+// ─── Selected-item action bar (#270) ─────────────────────────────────────────
+
+impl CoordApp {
+    /// Height of the per-row action bar rendered above the sidebar tree.
+    /// Matches the per-panel toolbar height so the panel chrome lines up
+    /// visually across the activity bar / sidebar / main split.
+    fn sidebar_action_bar_height(&self, lh: f32) -> f32 {
+        lh * 1.4
+    }
+
+    /// #270: build the contextual action bar for the currently-selected
+    /// sidebar row.  `None` for views where the action bar doesn't apply
+    /// (Machines / Settings) or when no row is selected.
+    ///
+    /// Mirrors the right-click context menu — same per-lifecycle item
+    /// sets, same `action_id` strings — so dispatch routes through the
+    /// same `dispatch_context_menu_action` code path the right-click
+    /// already uses.  This is the no-mouse path for SSH / Termux / GTK
+    /// users where right-click isn't available.
+    fn sidebar_action_bar(&self) -> Option<StatusBar> {
+        // Reuse the right-click target builder so the action set is the
+        // same data the menu shows.  `_target_for_selected_sidebar_row`
+        // returns None when no row is selected; in that case render an
+        // empty bar (a hint segment) so the user still sees "where the
+        // actions go" rather than a missing row.
+        let target = self.target_for_selected_sidebar_row()?;
+        let menu_items = match &target {
+            ContextMenuTarget::BoardRow { issue_number, lifecycle, .. } => {
+                self.context_menu_items_for_board_row(*issue_number, lifecycle)
+            }
+            ContextMenuTarget::PipelineRow { issue_number, lifecycle } => {
+                self.context_menu_items_for_pipeline_row(*issue_number, lifecycle)
+            }
+        };
+        // The menu always includes Copy + Refresh — those aren't
+        // interesting in the action bar (Refresh has its own keybind,
+        // Copy isn't wired to a clipboard yet).  Strip them so the bar
+        // shows ONLY the row-state-specific verbs.
+        let interesting: Vec<&ContextMenuItem> = menu_items
+            .iter()
+            .filter(|it| match it.action_id.as_deref() {
+                Some("copy-issue-number") | Some("refresh") | None => false,
+                _ => true,
+            })
+            .collect();
+        if interesting.is_empty() {
+            return None;
+        }
+        let segments: Vec<StatusBarSegment> = interesting
+            .iter()
+            .map(|it| {
+                let label = match &it.shortcut {
+                    Some(k) => format!(" {} ({}) ", it.label, k),
+                    None => format!(" {} ", it.label),
+                };
+                StatusBarSegment {
+                    text: label,
+                    fg: Color::rgb(220, 220, 230),
+                    bg: Color::rgb(45, 60, 80),
+                    bold: true,
+                    action_id: it
+                        .action_id
+                        .as_ref()
+                        .map(|id| WidgetId::new(format!("sidebar-action:{}", id))),
+                }
+            })
+            .collect();
+        Some(StatusBar {
+            id: WidgetId::new("sidebar-action-bar"),
+            left_segments: segments,
+            right_segments: Vec::new(),
+        })
+    }
+
+    /// Build a `ContextMenuTarget` for whichever sidebar row is currently
+    /// selected.  Used by the action bar and (already) by the right-click
+    /// path.  Returns `None` when no row is selected or the active view
+    /// doesn't have row-level actions (Machines / Settings).
+    fn target_for_selected_sidebar_row(&self) -> Option<ContextMenuTarget> {
+        match self.active_view {
+            SidebarView::Board => {
+                let (repo, num) = self.board_selected_issue()?;
+                let lifecycle = self.board_row_lifecycle(&repo, num);
+                Some(ContextMenuTarget::BoardRow {
+                    issue_number: Some(num),
+                    repo_name: Some(repo),
+                    lifecycle,
+                })
+            }
+            SidebarView::Pipeline => {
+                let issue = self
+                    .pipeline_sel
+                    .and_then(|i| self.pipeline_issues.get(i))?;
+                let lifecycle = self.pipeline_row_lifecycle(issue);
+                Some(ContextMenuTarget::PipelineRow {
+                    issue_number: Some(issue.number),
+                    lifecycle,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Hit-test a left-click against the sidebar action bar at the top
+    /// of `sidebar_b`.  Returns `(shrunken_sidebar_b, consumed)` — same
+    /// shape as `hit_test_panel_toolbar`.
+    fn hit_test_sidebar_action_bar(
+        &mut self,
+        pos: Point,
+        sidebar_b: Rect,
+        lh: f32,
+    ) -> (Rect, bool) {
+        let Some(bar) = self.sidebar_action_bar() else {
+            return (sidebar_b, false);
+        };
+        let bar_h = self.sidebar_action_bar_height(lh);
+        let bar_rect = Rect::new(sidebar_b.x, sidebar_b.y, sidebar_b.width, bar_h);
+        let content_rect = Rect::new(
+            sidebar_b.x,
+            sidebar_b.y + bar_h,
+            sidebar_b.width,
+            (sidebar_b.height - bar_h).max(0.0),
+        );
+        if pos.y < bar_rect.y || pos.y >= bar_rect.y + bar_rect.height {
+            return (content_rect, false);
+        }
+        let mut cursor_x = bar_rect.x;
+        for seg in &bar.left_segments {
+            let w = seg.text.chars().count() as f32;
+            let next_x = cursor_x + w;
+            if pos.x >= cursor_x && pos.x < next_x {
+                if let Some(id) = &seg.action_id {
+                    let raw = id.as_str();
+                    if let Some(action_id) = raw.strip_prefix("sidebar-action:") {
+                        let action = action_id.to_string();
+                        if let Some(target) = self.target_for_selected_sidebar_row() {
+                            self.dispatch_context_menu_action(&action, &target);
+                        }
+                    }
+                }
+                return (content_rect, true);
+            }
+            cursor_x = next_x;
+        }
+        // Click landed in the bar row but past the last button — swallow it.
+        (content_rect, true)
+    }
+}
+
+// ─── Per-panel toolbar (#249 Principle 1) ────────────────────────────────────
+
+impl CoordApp {
+    /// Height of the toolbar row at the top of the main panel.
+    ///
+    /// Matches `tab_h` (lh * 1.4) used by the Board / Pipeline detail tab
+    /// bars so the panel chrome lines up visually.
+    fn toolbar_height(&self, lh: f32) -> f32 {
+        lh * 1.4
+    }
+
+    /// Build the toolbar (a row of clickable verb buttons) for the current
+    /// view, or `None` for views where no panel-level verbs apply.
+    ///
+    /// Each button is a [`StatusBarSegment`] with an `action_id` of the
+    /// form `"toolbar:<verb>"`.  Hit-testing returns those IDs to
+    /// [`dispatch_toolbar_action`].  Buttons whose precondition is unmet
+    /// (no failed assignment to retry, no proposals to approve, etc.)
+    /// render dimmed with `action_id = None` so the click hit-test
+    /// declines them — the user sees the affordance but isn't misled into
+    /// clicking a no-op.
+    fn panel_toolbar(&self) -> Option<StatusBar> {
+        // Toolbar suppressed while the watch overlay or any inline confirm
+        // prompt has the keyboard — these modes consume every keystroke
+        // and a clickable toolbar above them would be misleading.
+        if self.watch.is_some()
+            || self.pending_purge.is_some()
+            || self.pending_force_merge.is_some()
+            || self.pending_test_fail.is_some()
+        {
+            return None;
+        }
+
+        // #192 / #263: toolbar revised — Plan and Approve dropped now
+        // that Proposals is retired; Merge moves Pipeline-only.  Most
+        // row-level actions live on the action bar (#270) or right-
+        // click menu (#259-#262, #266); the panel toolbar is reserved
+        // for genuine panel-wide ops.
+        let segments: Vec<StatusBarSegment> = match self.active_view {
+            SidebarView::Board => {
+                vec![
+                    toolbar_button("notify", " [N]otify ", true),
+                    toolbar_button(
+                        "retry",
+                        " [R]etry ",
+                        self.board_selected_failed_assignment().is_some(),
+                    ),
+                    toolbar_button(
+                        "purge",
+                        " [P]urge ",
+                        self.board_selection_in_completed_group(),
+                    ),
+                ]
+            }
+            SidebarView::Pipeline => {
+                // Ready is meaningful when a pipeline issue is selected
+                // and has a coord_repo mapping (otherwise `coord ready`
+                // has nowhere to send the gh call).
+                let ready_enabled = self
+                    .pipeline_sel
+                    .and_then(|i| self.pipeline_issues.get(i))
+                    .map(|i| i.coord_repo.is_some())
+                    .unwrap_or(false);
+                // Retry on Pipeline view requires either an active stage
+                // (Go/Retry button attached) or a Test-failed bounce.
+                let retry_enabled = self.can_bounce_work_after_test_fail()
+                    || self
+                        .build_pipeline_widget()
+                        .map(|w| w.stages.iter().any(|s| s.action.is_some()))
+                        .unwrap_or(false);
+                vec![
+                    toolbar_button("notify", " [N]otify ", true),
+                    toolbar_button("ready", " [r]eady ", ready_enabled),
+                    toolbar_button("merge", " [M]erge ", true),
+                    toolbar_button("retry", " [R]etry ", retry_enabled),
+                ]
+            }
+            // Machines and Settings have no panel-level verbs.
+            SidebarView::Machines | SidebarView::Settings => return None,
+        };
+
+        Some(StatusBar {
+            id: WidgetId::new("panel-toolbar"),
+            left_segments: segments,
+            right_segments: Vec::new(),
+        })
+    }
+
+    /// Hit-test a left-click against the panel toolbar at the top of
+    /// the main content rect.  Returns `(shrunken_main_b, consumed)`:
+    /// `consumed=true` means the click landed on a toolbar segment and
+    /// the action was dispatched; the caller should NOT continue routing
+    /// the click to the panel body.  `shrunken_main_b` is `main_b` with
+    /// the toolbar row carved off the top, ready for downstream tab-bar
+    /// hit-tests (whose math expects `pos.y - main_b.y < tab_h`).
+    fn hit_test_panel_toolbar(
+        &mut self,
+        pos: Point,
+        main_b: Rect,
+        lh: f32,
+    ) -> (Rect, bool) {
+        let Some(toolbar) = self.panel_toolbar() else {
+            return (main_b, false);
+        };
+        let tb_h = self.toolbar_height(lh);
+        let tb_rect = Rect::new(main_b.x, main_b.y, main_b.width, tb_h);
+        // Pre-compute the shrunken rect — we hand it back regardless of
+        // whether the click landed on a segment, since the rest of the
+        // panel rendering uses it.
+        let content_rect = Rect::new(
+            main_b.x,
+            main_b.y + tb_h,
+            main_b.width,
+            (main_b.height - tb_h).max(0.0),
+        );
+        if pos.y < tb_rect.y || pos.y >= tb_rect.y + tb_rect.height {
+            return (content_rect, false);
+        }
+        // Manual hit-test: walk segments left-to-right, summing each
+        // segment's visible char width (each `text` is already padded
+        // with a leading/trailing space).  We use 1-char advance per
+        // visible char which matches the TUI status-bar rasteriser.
+        let mut cursor_x = tb_rect.x;
+        for seg in &toolbar.left_segments {
+            let w = seg.text.chars().count() as f32;
+            let next_x = cursor_x + w;
+            if pos.x >= cursor_x && pos.x < next_x {
+                if let Some(id) = &seg.action_id {
+                    let action_id = id.as_str().to_string();
+                    self.dispatch_toolbar_action(&action_id);
+                    return (content_rect, true);
+                }
+                // Disabled segment (no action_id) — swallow the click so
+                // it doesn't fall through to the panel body.
+                return (content_rect, true);
+            }
+            cursor_x = next_x;
+        }
+        // Click landed in the toolbar row but past the last segment —
+        // still swallow it (the empty trailing space shouldn't fall
+        // through to body hit-testing or the user gets surprises).
+        (content_rect, true)
+    }
+
+    /// Resolve a toolbar `action_id` (e.g. `"toolbar:plan"`) to the same
+    /// behaviour as the matching keybind.  Returns `true` if a redraw is
+    /// required.  Mirrors the action paths in the key-press handler so
+    /// click + keyboard stay in sync.
+    fn dispatch_toolbar_action(&mut self, action_id: &str) -> bool {
+        match action_id {
+            // #192 / #263: `toolbar:plan` and `toolbar:approve` retired
+            // alongside the PROPOSALS section.  The `coord plan` CLI
+            // still works for scripts; the TUI just doesn't surface
+            // it any more.
+            "toolbar:notify" => {
+                self.command_runner.spawn(&["notify"]);
+                self.last_notify = Instant::now();
+                true
+            }
+            "toolbar:merge" => {
+                // #245: in the Pipeline view, route through the same
+                // failed-CI confirm prompt the `m` keybind uses.  Outside
+                // the Pipeline, plain `coord merge` (CI gate stays in
+                // place server-side).
+                if self.active_view == SidebarView::Pipeline
+                    && self
+                        .ci_summary_for_selected_issue()
+                        .map(|s| s.has_failures())
+                        .unwrap_or(false)
+                {
+                    let repo = self
+                        .pipeline_sel
+                        .and_then(|i| self.pipeline_issues.get(i))
+                        .and_then(|issue| issue.coord_repo.clone())
+                        .unwrap_or_default();
+                    self.pending_force_merge = Some(repo);
+                } else {
+                    self.command_runner.spawn(&["merge"]);
+                }
+                true
+            }
+            "toolbar:retry" => {
+                if self.active_view == SidebarView::Pipeline {
+                    if self.can_bounce_work_after_test_fail() {
+                        self.dispatch_pipeline_work();
+                    } else {
+                        let dispatched = self.dispatch_pipeline_active_go();
+                        if !dispatched {
+                            self.push_toast(
+                                "Nothing to retry",
+                                "No pending or failed stage on the selected pipeline issue.",
+                                ToastSeverity::Info,
+                            );
+                        }
+                    }
+                } else if let Some(a) = self.board_selected_failed_assignment() {
+                    let id = a.id.clone();
+                    self.command_runner.spawn(&["retry", &id]);
+                } else {
+                    self.push_toast(
+                        "No failed assignment selected",
+                        "Focus a row with status FAIL in the Board sidebar, then click Retry.",
+                        ToastSeverity::Info,
+                    );
+                }
+                true
+            }
+            "toolbar:purge" => {
+                if self.active_view == SidebarView::Board
+                    && self.board_selection_in_completed_group()
+                {
+                    let secs = self.purge_days as f64 * 86_400.0;
+                    let counts = count_purgeable_db(secs).unwrap_or((0, 0));
+                    self.pending_purge = Some(counts);
+                } else {
+                    self.push_toast(
+                        "Purge only runs on the Completed group",
+                        "Focus a done/merged row in the Board sidebar, then click Purge.",
+                        ToastSeverity::Info,
+                    );
+                }
+                true
+            }
+            "toolbar:ready" => {
+                let selected = self
+                    .pipeline_sel
+                    .and_then(|i| self.pipeline_issues.get(i));
+                match selected {
+                    None => self.push_toast(
+                        "Nothing to mark ready",
+                        "Select an issue in the pipeline first.",
+                        ToastSeverity::Info,
+                    ),
+                    Some(issue) if issue.coord_repo.is_none() => self.push_toast(
+                        "No coord_repo mapping",
+                        &format!(
+                            "{} isn't mapped in coordinator.yml — add a `repos` entry first.",
+                            issue.repo_slug,
+                        ),
+                        ToastSeverity::Warning,
+                    ),
+                    Some(issue) => {
+                        let repo = issue.coord_repo.clone().unwrap();
+                        let num_str = issue.number.to_string();
+                        if self.command_runner.spawn(&["ready", &repo, &num_str]) {
+                            self.pipeline_status = Some((
+                                format!("#{}: marking ready", issue.number),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Helper that builds a toolbar [`StatusBarSegment`].  Disabled buttons
+/// render dimmer and have no `action_id` so clicks fall through
+/// (preserves the visible affordance without misleading the user).
+fn toolbar_button(verb: &str, label: &str, enabled: bool) -> StatusBarSegment {
+    let (fg, bg, bold) = if enabled {
+        (Color::rgb(220, 220, 230), Color::rgb(45, 45, 60), true)
+    } else {
+        (Color::rgb(120, 120, 130), Color::rgb(35, 35, 45), false)
+    };
+    StatusBarSegment {
+        text: label.to_string(),
+        fg,
+        bg,
+        bold,
+        action_id: if enabled {
+            Some(WidgetId::new(format!("toolbar:{}", verb)))
+        } else {
+            None
+        },
     }
 }
 
@@ -6416,6 +8429,12 @@ impl CoordApp {
         // #235: Drain Phase 1 build completions and toast the outcome.
         // Cheap no-op when no jobs are in flight.
         needs_redraw |= self.poll_test_build_jobs();
+
+        // #271 part 2 follow-up: drain completed `gh pr view` fetches
+        // into the cache so the Test guidance block picks them up.
+        if self.poll_pending_pr_fetches() {
+            needs_redraw = true;
+        }
 
         needs_redraw
     }
@@ -6569,147 +8588,121 @@ impl CoordApp {
 
     // ─── Settings panel ───────────────────────────────────────────────────────
 
-    /// Category labels shown in the settings sidebar (left nav).
-    fn settings_categories() -> &'static [&'static str] {
-        &[
-            "Display",
-            "Refresh",
-            "Notifications",
-            "Watch Overlay",
-            "Machine Models",
-        ]
-    }
-
-    /// Build a `ListView` for the settings category nav (sidebar left pane).
-    fn settings_category_list(&self) -> ListView {
-        let cats = Self::settings_categories();
-        let n = cats.len();
-        let items: Vec<ListItem> = cats
-            .iter()
-            .map(|label| {
-                ListItem {
-                    text: StyledText::plain(format!("  {}", label)),
-                    icon: None,
-                    detail: None,
-                    decoration: Decoration::Normal,
-                }
-            })
-            .collect();
+    /// #237: empty sidebar list for the Settings view.  The form lives in
+    /// the main panel and spans the full width; the sidebar shows just a
+    /// header so the overall panel chrome stays consistent across views.
+    fn settings_sidebar_placeholder(&self) -> ListView {
         ListView {
-            id: WidgetId::new("settings-categories"),
-            title: Some(StyledText::plain(format!(" SETTINGS ({}) ", n))),
-            items,
-            selected_idx: self.settings_category_sel,
+            id: WidgetId::new("settings-sidebar-placeholder"),
+            title: Some(StyledText::plain(" SETTINGS ")),
+            items: Vec::new(),
+            selected_idx: 0,
             scroll_offset: 0,
-            has_focus: true,
+            has_focus: false,
             bordered: false,
         }
     }
 
-    /// Build the `Form` for the currently-selected settings category.
+    /// Build the unified settings `Form`.
     ///
-    /// Each category maps to a set of `FormField`s.  Field IDs are stable
-    /// across renders so the `FormController` can match events correctly.
+    /// #237: All categories render as one full-width scrollable form with
+    /// `FieldKind::Label` headers between groups — mirroring vimcode's
+    /// settings layout.  The previous version split the panel into a
+    /// category nav (sidebar) plus a per-category form (main); that split
+    /// caused click hit-test misalignment because `FormController`'s cached
+    /// metrics were sized for a different rect than where it was actually
+    /// drawn.  One rect ⇒ no drift.
+    ///
+    /// Field IDs are stable across renders so the `FormController` can
+    /// match events correctly.
     fn build_settings_form(&self) -> Form {
         let mut fields: Vec<FormField> = Vec::new();
 
-        match self.settings_category_sel {
-            // ── Display ────────────────────────────────────────────────
-            0 => {
-                fields.push(settings_label("Theme"));
-                fields.push(FormField {
-                    id: WidgetId::new("settings:theme"),
-                    label: StyledText::plain("Theme"),
-                    kind: FieldKind::SegmentedControl {
-                        options: Theme::LABELS.iter().map(|s| s.to_string()).collect(),
-                        selected_idx: self.settings.theme.to_idx(),
-                    },
-                    hint: StyledText::plain("Visual style (Light/High Contrast coming soon)"),
-                    disabled: false,
-                    validation: None,
-                });
-            }
+        // ── Display ────────────────────────────────────────────────────
+        fields.push(settings_label("Display"));
+        fields.push(FormField {
+            id: WidgetId::new("settings:theme"),
+            label: StyledText::plain("Theme"),
+            kind: FieldKind::SegmentedControl {
+                options: Theme::LABELS.iter().map(|s| s.to_string()).collect(),
+                selected_idx: self.settings.theme.to_idx(),
+            },
+            hint: StyledText::plain("Visual style (Light/High Contrast coming soon)"),
+            disabled: false,
+            validation: None,
+        });
 
-            // ── Refresh ────────────────────────────────────────────────
-            1 => {
-                fields.push(settings_label("Auto-Refresh"));
-                fields.push(FormField {
-                    id: WidgetId::new("settings:cadence"),
-                    label: StyledText::plain("Cadence"),
-                    kind: FieldKind::SegmentedControl {
-                        options: RefreshCadence::LABELS.iter().map(|s| s.to_string()).collect(),
-                        selected_idx: self.settings.refresh_cadence.to_idx(),
-                    },
-                    hint: StyledText::plain("How often the board is reloaded from the database"),
-                    disabled: false,
-                    validation: None,
-                });
-            }
+        // ── Refresh ────────────────────────────────────────────────────
+        fields.push(settings_label("Auto-Refresh"));
+        fields.push(FormField {
+            id: WidgetId::new("settings:cadence"),
+            label: StyledText::plain("Cadence"),
+            kind: FieldKind::SegmentedControl {
+                options: RefreshCadence::LABELS.iter().map(|s| s.to_string()).collect(),
+                selected_idx: self.settings.refresh_cadence.to_idx(),
+            },
+            hint: StyledText::plain("How often the board is reloaded from the database"),
+            disabled: false,
+            validation: None,
+        });
 
-            // ── Notifications ──────────────────────────────────────────
-            2 => {
-                fields.push(settings_label("Notifications"));
-                fields.push(FormField {
-                    id: WidgetId::new("settings:audio"),
-                    label: StyledText::plain("Audio on completion"),
-                    kind: FieldKind::Toggle { value: self.settings.audio_on_completion },
-                    hint: StyledText::plain("Ring a bell when an assignment finishes"),
-                    disabled: false,
-                    validation: None,
-                });
-            }
+        // ── Notifications ──────────────────────────────────────────────
+        fields.push(settings_label("Notifications"));
+        fields.push(FormField {
+            id: WidgetId::new("settings:audio"),
+            label: StyledText::plain("Audio on completion"),
+            kind: FieldKind::Toggle { value: self.settings.audio_on_completion },
+            hint: StyledText::plain("Ring a bell when an assignment finishes"),
+            disabled: false,
+            validation: None,
+        });
 
-            // ── Watch Overlay ──────────────────────────────────────────
-            3 => {
-                fields.push(settings_label("Watch Overlay"));
-                fields.push(FormField {
-                    id: WidgetId::new("settings:log-ttl"),
-                    label: StyledText::plain("Log cache TTL"),
-                    kind: FieldKind::SegmentedControl {
-                        options: LogCacheTtl::LABELS.iter().map(|s| s.to_string()).collect(),
-                        selected_idx: self.settings.log_cache_ttl.to_idx(),
-                    },
-                    hint: StyledText::plain("How long a fetched log is reused before re-requesting"),
-                    disabled: false,
-                    validation: None,
-                });
-            }
+        // ── Watch Overlay ──────────────────────────────────────────────
+        fields.push(settings_label("Watch Overlay"));
+        fields.push(FormField {
+            id: WidgetId::new("settings:log-ttl"),
+            label: StyledText::plain("Log cache TTL"),
+            kind: FieldKind::SegmentedControl {
+                options: LogCacheTtl::LABELS.iter().map(|s| s.to_string()).collect(),
+                selected_idx: self.settings.log_cache_ttl.to_idx(),
+            },
+            hint: StyledText::plain("How long a fetched log is reused before re-requesting"),
+            disabled: false,
+            validation: None,
+        });
 
-            // ── Machine Models ─────────────────────────────────────────
-            _ => {
-                fields.push(settings_label("Per-Machine Model Overrides"));
-                if self.data.machines.is_empty() {
-                    fields.push(FormField {
-                        id: WidgetId::new("settings:no-machines"),
-                        label: StyledText::plain("No machines available"),
-                        kind: FieldKind::ReadOnly {
-                            value: StyledText::plain("—"),
-                        },
-                        hint: StyledText::plain("Machines are discovered from coordinator.yml"),
-                        disabled: true,
-                        validation: None,
-                    });
-                }
-                for machine in &self.data.machines {
-                    let current_pref = self
-                        .settings
-                        .machine_model
-                        .get(&machine.name)
-                        .copied()
-                        .unwrap_or_default();
-                    fields.push(FormField {
-                        id: WidgetId::new(format!("settings:model:{}", machine.name)),
-                        label: StyledText::plain(machine.name.clone()),
-                        kind: FieldKind::SegmentedControl {
-                            options: ModelPref::LABELS.iter().map(|s| s.to_string()).collect(),
-                            selected_idx: current_pref.to_idx(),
-                        },
-                        hint: StyledText::plain("Session-level override; coordinator.yml is the project default"),
-                        disabled: false,
-                        validation: None,
-                    });
-                }
-            }
+        // ── Machine Models ─────────────────────────────────────────────
+        fields.push(settings_label("Per-Machine Model Overrides"));
+        if self.data.machines.is_empty() {
+            fields.push(FormField {
+                id: WidgetId::new("settings:no-machines"),
+                label: StyledText::plain("No machines available"),
+                kind: FieldKind::ReadOnly {
+                    value: StyledText::plain("—"),
+                },
+                hint: StyledText::plain("Machines are discovered from coordinator.yml"),
+                disabled: true,
+                validation: None,
+            });
+        }
+        for machine in &self.data.machines {
+            let current_pref = self
+                .settings
+                .machine_model
+                .get(&machine.name)
+                .copied()
+                .unwrap_or_default();
+            fields.push(FormField {
+                id: WidgetId::new(format!("settings:model:{}", machine.name)),
+                label: StyledText::plain(machine.name.clone()),
+                kind: FieldKind::SegmentedControl {
+                    options: ModelPref::LABELS.iter().map(|s| s.to_string()).collect(),
+                    selected_idx: current_pref.to_idx(),
+                },
+                hint: StyledText::plain("Session-level override; coordinator.yml is the project default"),
+                disabled: false,
+                validation: None,
+            });
         }
 
         // Compute focused_field from settings_field_sel, skipping label fields.
@@ -6854,7 +8847,29 @@ impl ShellApp for CoordApp {
         }
 
         // ── Sidebar: list content (sidebar system / machines) ────────
-        if let Some(sidebar_rect) = layout.sidebar_content_bounds {
+        if let Some(full_sidebar_rect) = layout.sidebar_content_bounds {
+            // #270: contextual action bar above the tree.  Carves a
+            // row off the top of the sidebar; the tree renders into
+            // the remainder.  None when no row is selected or the
+            // selected row has no row-state-specific verbs.
+            let sidebar_rect = if let Some(action_bar) = self.sidebar_action_bar() {
+                let ab_h = self.sidebar_action_bar_height(lh);
+                let ab_rect = Rect::new(
+                    full_sidebar_rect.x,
+                    full_sidebar_rect.y,
+                    full_sidebar_rect.width,
+                    ab_h,
+                );
+                backend.draw_status_bar(ab_rect, &action_bar, None, None);
+                Rect::new(
+                    full_sidebar_rect.x,
+                    full_sidebar_rect.y + ab_h,
+                    full_sidebar_rect.width,
+                    (full_sidebar_rect.height - ab_h).max(0.0),
+                )
+            } else {
+                full_sidebar_rect
+            };
             match self.active_view {
                 SidebarView::Board => {
                     self.board_sidebar.render(backend, sidebar_rect);
@@ -6866,13 +8881,35 @@ impl ShellApp for CoordApp {
                     self.pipeline_sidebar.render(backend, sidebar_rect);
                 }
                 SidebarView::Settings => {
-                    backend.draw_list(sidebar_rect, &self.settings_category_list());
+                    // #237: settings is one full-width form — no category
+                    // nav.  Render an empty placeholder list so the sidebar
+                    // slot keeps a header (consistent with other views)
+                    // without offering a misleading affordance.
+                    backend.draw_list(sidebar_rect, &self.settings_sidebar_placeholder());
                 }
             }
         }
 
         // ── Main: detail panel only (full main_content_bounds) ───────
-        let m = layout.main_content_bounds;
+        let full_m = layout.main_content_bounds;
+        // #249 Principle 1: draw the per-panel toolbar at the top of
+        // main_content_bounds so every panel verb has a visible
+        // affordance (Plan / Notify / Merge / etc.).  Carve the toolbar
+        // row off the top; everything else renders into the shrunken
+        // rect below it.
+        let m = if let Some(toolbar) = self.panel_toolbar() {
+            let tb_h = self.toolbar_height(lh);
+            let tb_rect = Rect::new(full_m.x, full_m.y, full_m.width, tb_h);
+            backend.draw_status_bar(tb_rect, &toolbar, None, None);
+            Rect::new(
+                full_m.x,
+                full_m.y + tb_h,
+                full_m.width,
+                (full_m.height - tb_h).max(0.0),
+            )
+        } else {
+            full_m
+        };
         // Keep watch_log_list's stick-to-bottom math in sync with the live
         // viewport on every frame (not just when the user scrolls).
         self.last_main_visible_rows
@@ -6957,6 +8994,24 @@ impl ShellApp for CoordApp {
         if let Some(stack) = self.toast_stack() {
             backend.draw_toast_stack(layout.main_content_bounds, &stack);
         }
+
+        // ── #259: open context menu (above everything) ──────────────────
+        // Drawn last so it sits on top of toasts, the panel content, and
+        // the toolbar.  The viewport unions the sidebar + main panel so a
+        // menu anchored in the sidebar can flow rightward into the main
+        // area without being clipped to the (narrow) sidebar width.
+        if self.pending_context_menu.is_some() {
+            let viewport = union_rects(
+                layout.sidebar_content_bounds,
+                layout.main_content_bounds,
+            );
+            self.render_context_menu(backend, viewport);
+        } else {
+            // Keep the cached layout in sync — clear it once the menu
+            // is no longer rendered so a stale layout can't satisfy a
+            // hit-test on the next click.
+            *self.context_menu_layout.borrow_mut() = None;
+        }
     }
 
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend, ctx: &ShellContext) -> Reaction {
@@ -7040,6 +9095,78 @@ impl ShellApp for CoordApp {
                     _ => {
                         // Any other key cancels — Escape, 'n', 'N', or anything else.
                         self.pending_purge = None;
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #259: open context menu intercepts keyboard nav ──────────────
+        // Up/Down/j/k move the keyboard selection (skipping separators);
+        // Enter activates the selected item; Escape (or any other key)
+        // dismisses without firing.
+        if self.pending_context_menu.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Down) | Key::Char('j') => {
+                        self.context_menu_move_selection(1);
+                    }
+                    Key::Named(NamedKey::Up) | Key::Char('k') => {
+                        self.context_menu_move_selection(-1);
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        self.context_menu_activate_selected();
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.dismiss_context_menu();
+                    }
+                    _ => {
+                        // Any other key dismisses to keep the focus model
+                        // simple — typing a global keybind while the menu
+                        // is open shouldn't both dismiss and fire that
+                        // bind, so we just dismiss.
+                        self.dismiss_context_menu();
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #245: Pending --force-merge confirmation: intercept ALL keys ──
+        // The user has pressed `m` while the "Checks failed" hint was visible.
+        // We refuse to bypass the CI gate without an explicit y/Y so a
+        // fat-fingered `m` can't merge a red PR.
+        if let Some(repo) = self.pending_force_merge.clone() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        let scoped = !repo.is_empty();
+                        let mut args: Vec<&str> = vec!["merge", "--force-merge"];
+                        if scoped {
+                            args.push("--repo");
+                            args.push(&repo);
+                        }
+                        self.command_runner.spawn(&args);
+                        let scope_str = if scoped {
+                            format!(" --repo {}", repo)
+                        } else {
+                            String::new()
+                        };
+                        self.push_toast(
+                            "Force-merge dispatched",
+                            &format!("coord merge --force-merge{} — CI gate bypassed", scope_str),
+                            ToastSeverity::Warning,
+                        );
+                        self.pending_force_merge = None;
+                    }
+                    _ => {
+                        // Any other key cancels — Escape, 'n', 'N', anything.
+                        self.pending_force_merge = None;
+                        self.push_toast(
+                            "Force-merge cancelled",
+                            "CI gate stays in place",
+                            ToastSeverity::Info,
+                        );
                     }
                 }
                 return Reaction::Redraw;
@@ -7186,27 +9313,23 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── Settings panel keyboard nav ──────────────────────
-                    // j/Down — next category
+                    // #237: j/k now step through the unified form's
+                    // interactive fields directly — there are no
+                    // categories to navigate any more.
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Settings =>
                     {
-                        let max = Self::settings_categories().len().saturating_sub(1);
-                        if self.settings_category_sel < max {
-                            self.settings_category_sel += 1;
-                            self.settings_field_sel = 0;
-                            self.settings_form.borrow_mut().set_scroll_offset(0);
+                        let count = self.settings_interactive_field_ids().len();
+                        if count > 0 {
+                            self.settings_field_sel =
+                                (self.settings_field_sel + 1).min(count - 1);
                         }
                         needs_redraw = true;
                     }
-                    // k/Up — previous category
                     Key::Char('k') | Key::Named(NamedKey::Up)
                         if self.active_view == SidebarView::Settings =>
                     {
-                        if self.settings_category_sel > 0 {
-                            self.settings_category_sel -= 1;
-                            self.settings_field_sel = 0;
-                            self.settings_form.borrow_mut().set_scroll_offset(0);
-                        }
+                        self.settings_field_sel = self.settings_field_sel.saturating_sub(1);
                         needs_redraw = true;
                     }
                     // Tab — next interactive field within the form
@@ -7406,7 +9529,8 @@ impl ShellApp for CoordApp {
                                 self.pipeline_sel = self.selected_pipeline_index();
                             }
                             SidebarView::Settings => {
-                                self.settings_category_sel = 0;
+                                // #237: jump to the first interactive field
+                                // in the unified form.
                                 self.settings_field_sel = 0;
                                 self.settings_form.borrow_mut().set_scroll_offset(0);
                             }
@@ -7438,10 +9562,10 @@ impl ShellApp for CoordApp {
                                 self.pipeline_sel = self.selected_pipeline_index();
                             }
                             SidebarView::Settings => {
-                                let last = Self::settings_categories().len().saturating_sub(1);
-                                self.settings_category_sel = last;
-                                self.settings_field_sel = 0;
-                                self.settings_form.borrow_mut().set_scroll_offset(0);
+                                // #237: jump to the last interactive field
+                                // in the unified form.
+                                let count = self.settings_interactive_field_ids().len();
+                                self.settings_field_sel = count.saturating_sub(1);
                             }
                         }
                         needs_redraw = true;
@@ -7470,23 +9594,53 @@ impl ShellApp for CoordApp {
                     Key::Char('r')
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        let issue_info = self
+                        // #249 Principle 2: every no-op gives feedback.
+                        // Without these toasts, pressing `r` on an issue
+                        // with no coord_repo mapping (or no selection)
+                        // looks identical to pressing `r` on a working
+                        // issue — both render nothing, and the user is
+                        // left guessing.
+                        let selected = self
                             .pipeline_sel
-                            .and_then(|i| self.pipeline_issues.get(i))
-                            .and_then(|i| {
-                                let coord_repo = i.coord_repo.clone()?;
-                                Some((coord_repo, i.number))
-                            });
-                        if let Some((repo, num)) = issue_info {
-                            let num_str = num.to_string();
-                            if self.command_runner.spawn(&["ready", &repo, &num_str]) {
-                                self.pipeline_status = Some((
-                                    format!("#{}: marking ready", num),
-                                    Instant::now(),
-                                ));
+                            .and_then(|i| self.pipeline_issues.get(i));
+                        match selected {
+                            None => {
+                                self.push_toast(
+                                    "Nothing to mark ready",
+                                    "Select an issue in the pipeline first.",
+                                    ToastSeverity::Info,
+                                );
                             }
-                            needs_redraw = true;
+                            Some(issue) if issue.coord_repo.is_none() => {
+                                self.push_toast(
+                                    "No coord_repo mapping",
+                                    &format!(
+                                        "{} isn't mapped in coordinator.yml — \
+                                         add a `repos` entry so coord can act on it.",
+                                        issue.repo_slug,
+                                    ),
+                                    ToastSeverity::Warning,
+                                );
+                            }
+                            Some(issue) => {
+                                let repo = issue.coord_repo.clone().unwrap();
+                                let num = issue.number;
+                                let num_str = num.to_string();
+                                if self.command_runner.spawn(&["ready", &repo, &num_str]) {
+                                    self.pipeline_status = Some((
+                                        format!("#{}: marking ready", num),
+                                        Instant::now(),
+                                    ));
+                                } else {
+                                    self.push_toast(
+                                        "Another command is running",
+                                        "Wait for the current command to finish before pressing r.",
+                                        ToastSeverity::Info,
+                                    );
+                                }
+                            }
                         }
+                        needs_redraw = true;
                     }
 
                     // ── PageDown (Board only) ─────────────────────────────
@@ -7553,33 +9707,52 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── Coordinator commands ─────────────────────────────
-                    Key::Char('p') => {
-                        self.command_runner.spawn(&["plan"]);
-                        needs_redraw = true;
-                    }
+                    // #192: `p` / `a` / `A` are retired alongside the
+                    // PROPOSALS section.  Right-click → Send to
+                    // Pipeline (#261) is the canonical dispatch path
+                    // now; `coord plan` still exists as a CLI escape
+                    // hatch but doesn't earn a keybind.
                     Key::Char('n') => {
                         self.command_runner.spawn(&["notify"]);
                         self.last_notify = Instant::now();
                         needs_redraw = true;
                     }
-                    Key::Char('a') => {
-                        if let Some(proposal) = self.board_selected_proposal() {
-                            let id_str = proposal.id.to_string();
-                            self.command_runner.spawn(&["approve", &id_str]);
-                            needs_redraw = true;
-                        }
-                    }
-                    Key::Char('A') => {
-                        if !self.data.proposals.is_empty() {
-                            let ids: Vec<String> =
-                                self.data.proposals.iter().map(|p| p.id.to_string()).collect();
-                            let joined = ids.join(",");
-                            self.command_runner.spawn(&["approve", &joined]);
-                            needs_redraw = true;
-                        }
-                    }
                     Key::Char('m') => {
-                        self.command_runner.spawn(&["merge"]);
+                        // #245: when the selected pipeline issue's PR has
+                        // failed CI checks, the status-bar hint reads
+                        // "Checks failed: …  m=merge anyway".  Honour that
+                        // promise by routing `m` to a force-merge — but
+                        // only after a one-key confirm so a fat-finger
+                        // can't merge a red PR.
+                        if self.active_view == SidebarView::Pipeline
+                            && self
+                                .ci_summary_for_selected_issue()
+                                .map(|s| s.has_failures())
+                                .unwrap_or(false)
+                        {
+                            // Scope to the selected issue's coord repo so a
+                            // force-merge against one red PR doesn't blanket
+                            // every queued entry.  Empty string ⇒ no scope.
+                            let repo = self
+                                .pipeline_sel
+                                .and_then(|i| self.pipeline_issues.get(i))
+                                .and_then(|issue| issue.coord_repo.clone())
+                                .unwrap_or_default();
+                            self.pending_force_merge = Some(repo);
+                            needs_redraw = true;
+                        } else {
+                            self.command_runner.spawn(&["merge"]);
+                            needs_redraw = true;
+                        }
+                    }
+                    // #253: Capital M overrides the review-approval gate —
+                    // active only when the selected merge entry is blocked
+                    // on review so the keybind doesn't silently skip review
+                    // on unrelated merges.
+                    Key::Char('M')
+                        if self.merge_blocked_on_review_for_selected_issue() =>
+                    {
+                        self.command_runner.spawn(&["merge", "--skip-review"]);
                         needs_redraw = true;
                     }
                     Key::Char('R') => {
@@ -7593,13 +9766,33 @@ impl ShellApp for CoordApp {
                             } else {
                                 // In the Pipeline panel, R fires the active
                                 // stage button — Retry on a Failed stage, or
-                                // Go on a Pending one (same as Enter).
-                                self.dispatch_pipeline_active_go();
+                                // Go on a Pending one (same as Enter).  When
+                                // there's no actionable stage, surface that
+                                // (#249 Principle 2) instead of falling
+                                // silently out of the handler.
+                                let dispatched = self.dispatch_pipeline_active_go();
+                                if !dispatched {
+                                    self.push_toast(
+                                        "Nothing to retry",
+                                        "No pending or failed stage on the selected pipeline issue.",
+                                        ToastSeverity::Info,
+                                    );
+                                }
                             }
                             needs_redraw = true;
                         } else if let Some(a) = self.board_selected_failed_assignment() {
                             let id = a.id.clone();
                             self.command_runner.spawn(&["retry", &id]);
+                            needs_redraw = true;
+                        } else {
+                            // #249 Principle 2: explain the precondition
+                            // for Board-view R so users don't think the
+                            // keybind is broken.
+                            self.push_toast(
+                                "No failed assignment selected",
+                                "Focus a row with status FAIL in the Board sidebar, then press R.",
+                                ToastSeverity::Info,
+                            );
                             needs_redraw = true;
                         }
                     }
@@ -8041,15 +10234,20 @@ mod tests {
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
+            pending_force_merge: None,
+            pending_context_menu: None,
+            context_menu_layout: std::cell::RefCell::new(None),
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
             settings: TuiSettings::default(),
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
-            settings_category_sel: 0,
             settings_field_sel: 0,
             audio_prev_running: std::collections::HashSet::new(),
             test_build_jobs: std::collections::HashMap::new(),
+            last_test_builds: std::collections::HashMap::new(),
+            pending_pr_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fetched_prs_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pipeline_ci_checks: std::collections::HashMap::new(),
             pipeline_ci_loader: std::collections::HashMap::new(),
         }
@@ -8197,6 +10395,8 @@ mod tests {
             exit_code: None,
             assignment_type: atype.map(|s| s.to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         }
     }
 
@@ -8251,6 +10451,8 @@ mod tests {
             exit_code: None,
             assignment_type: None,
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         }
     }
 
@@ -8526,17 +10728,63 @@ mod tests {
     fn mouse_main_click_board_always_returns_false() {
         let mut app = make_app_default();
         let main_b = Rect::new(50.0, 0.0, 40.0, 40.0);
-        // Click anywhere in the Board main panel should not change state.
-        let changed = app.mouse_main_click(Point::new(51.0, 0.0), main_b, 1.0);
+        // #249 Principle 1: the Board panel now has a toolbar row at the
+        // top (`tb_h = lh * 1.4 = 1.4` with lh=1.0).  Click well below
+        // that — the Board body itself has no clickable widgets so the
+        // click still returns false.
+        let changed = app.mouse_main_click(Point::new(51.0, 10.0), main_b, 1.0);
         assert!(!changed);
+    }
+
+    // ── #269: tab-click hit-test from labels ────────────────────────────
+
+    #[test]
+    fn hit_tab_index_from_labels_resolves_first_tab() {
+        let labels = [" Board ", " Issue "];
+        // Click at x=3 falls inside " Board " (chars 0-6).
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 3.0), Some(0));
+    }
+
+    #[test]
+    fn hit_tab_index_from_labels_resolves_second_tab() {
+        let labels = [" Board ", " Issue "];
+        // " Board " is 7 chars wide, " Issue " covers x=7..14.
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 10.0), Some(1));
+    }
+
+    #[test]
+    fn hit_tab_index_from_labels_resolves_third_tab_with_origin_offset() {
+        // Origin shifted to x=50 (sidebar panel offset).  Labels still
+        // sum left-to-right from the origin.
+        let labels = [" Pipeline ", " Issue ", " Stages "];
+        // " Pipeline " is 10 chars → " Issue " starts at 60.
+        // " Issue " is 7 chars → " Stages " starts at 67.
+        // Click at x=70 should land in " Stages ".
+        assert_eq!(hit_tab_index_from_labels(&labels, 50.0, 70.0), Some(2));
+    }
+
+    #[test]
+    fn hit_tab_index_from_labels_returns_none_past_last_tab() {
+        let labels = [" Board ", " Issue "];
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 100.0), None);
+    }
+
+    #[test]
+    fn hit_tab_index_from_labels_robust_to_label_growth() {
+        // If a tab label gains a badge (e.g. " Stages (3) "), the new
+        // width is honoured automatically — no hard-coded constant
+        // breaks here.
+        let labels = [" Pipeline ", " Issue ", " Stages (3) "];
+        // " Pipeline " (10) + " Issue " (7) = 17 → " Stages (3) " starts at 17.
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 20.0), Some(2));
     }
 
     #[test]
     fn mouse_main_click_below_tab_row_is_ignored() {
         let mut app = make_app_default();
         let main_b = Rect::new(50.0, 0.0, 40.0, 40.0);
-        // Click at row y=2, well below the tab bar at y=0.
-        let changed = app.mouse_main_click(Point::new(55.0, 2.0), main_b, 1.0);
+        // Click well below the toolbar (`tb_h = 1.4`).
+        let changed = app.mouse_main_click(Point::new(55.0, 10.0), main_b, 1.0);
         assert!(!changed);
     }
 
@@ -8565,12 +10813,19 @@ mod tests {
         // Use a large content rect so the layout produces well-separated stages.
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let lh: f32 = 1.0;
-        let tab_h = lh * 1.4;
-        let content_rect = Rect::new(
+        let tb_h = lh * 1.4;  // #249 toolbar at top
+        let tab_h = lh * 1.4; // pipeline detail tab bar below toolbar
+        let after_toolbar = Rect::new(
             main_b.x,
-            main_b.y + tab_h,
+            main_b.y + tb_h,
             main_b.width,
-            (main_b.height - tab_h).max(0.0),
+            (main_b.height - tb_h).max(0.0),
+        );
+        let content_rect = Rect::new(
+            after_toolbar.x,
+            after_toolbar.y + tab_h,
+            after_toolbar.width,
+            (after_toolbar.height - tab_h).max(0.0),
         );
         let pv_rect = pipeline_detail_pv_rect(content_rect, lh);
         let view = app.build_pipeline_widget().expect("widget");
@@ -8724,43 +10979,259 @@ mod tests {
         assert_eq!(groups[0].1[0].1.issue_number, 42);
     }
 
+    /// #257 fix helper: ensure every test issue has an `open` row in the
+    /// open_issues cache.  Without this, `lifecycle_section` treats a
+    /// settled (done/merged) assignment as Completed because the brain
+    /// has no record of the issue being open.
+    fn seed_open_issue_records(app: &mut CoordApp, repo: &str, numbers: &[u64]) {
+        for &n in numbers {
+            app.data.open_issues.push(OpenIssue {
+                repo_name: repo.to_string(),
+                number: n,
+                title: format!("issue #{n}"),
+                body: String::new(),
+                state: "open".to_string(),
+                labels: Vec::new(),
+            });
+        }
+        app.rebuild_board_sidebar();
+    }
+
     #[test]
-    fn board_status_groups_order_running_failed_completed_pending() {
+    fn board_lifecycle_sections_in_flight_when_open_with_assignments() {
+        // #256 lifecycle model: open issues with assignments fold into
+        // a single In-flight bucket — running / failed / done all land
+        // together.  Requires the brain to have the issue cached as
+        // open (otherwise done assignments route to Completed; see the
+        // `stale_done_with_no_cache_record_routes_to_completed` test).
         let assignments = vec![
             make_assignment_typed("done", 1, "repo-a", Some("work")),
             make_assignment_typed("running", 2, "repo-a", Some("work")),
             make_assignment_typed("failed", 3, "repo-a", Some("work")),
         ];
-        let app = make_app_with_assignments(assignments);
+        let mut app = make_app_with_assignments(assignments);
+        seed_open_issue_records(&mut app, "repo-a", &[1, 2, 3]);
         let cache = app.board_issues_cache.clone();
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
-        assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].0, "running");
-        assert_eq!(groups[1].0, "failed");
-        assert_eq!(groups[2].0, "completed");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "in-flight");
+        assert_eq!(
+            groups[0].1.len(),
+            3,
+            "all three open+assigned issues fold into In-flight",
+        );
     }
 
     #[test]
-    fn board_empty_status_groups_are_hidden() {
+    fn stale_done_with_no_cache_record_routes_to_completed() {
+        // #257 fix: a done assignment whose issue isn't in the brain's
+        // cache (typical of historical work — the brain prunes closed
+        // rows after 7d) must NOT pollute In-flight.  Route to
+        // Completed instead.
+        let app = make_app_with_assignments(vec![make_assignment_typed(
+            "done", 42, "repo-a", Some("work"),
+        )]);
+        // No open_issues entry → has_open_record is false.
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].0, "completed",
+            "stale done assignment with no cache record belongs in Completed, not In-flight",
+        );
+    }
+
+    #[test]
+    fn stale_running_with_no_cache_record_stays_in_flight() {
+        // A running assignment with no cache record is most likely a
+        // freshly-dispatched issue the brain hasn't synced yet — must
+        // STAY in In-flight so the user can see it working.
+        let app = make_app_with_assignments(vec![make_assignment_typed(
+            "running", 99, "repo-a", Some("work"),
+        )]);
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        assert_eq!(groups[0].0, "in-flight");
+    }
+
+    #[test]
+    fn merged_assignment_routes_to_completed_regardless_of_cache() {
+        // status_summary == "merged" implies the PR closed the issue
+        // via `fixes #N` even before the brain has synced the close.
+        let mut app = make_app_with_assignments(vec![make_assignment_typed(
+            "done", 7, "repo-a", Some("work"),
+        )]);
+        // Cache says open, but the merge_queue marks the work merged
+        // → status_summary becomes "merged" → Completed.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "id-7-done".to_string(),
+            issue_number: Some(7),
+            state: "merged".to_string(),
+            pr_number: Some(1),
+            pr_url: None,
+            repo_github: "acme/repo-a".to_string(),
+        });
+        seed_open_issue_records(&mut app, "repo-a", &[7]);
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "completed");
+    }
+
+    #[test]
+    fn board_lifecycle_splits_pending_into_backlog_refining_refined() {
+        // #226: open issues without assignments split into three
+        // sections by their `status:*` label set.
+        let mut app = make_app_default();
+        // No labels → Backlog
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 1,
+            title: "raw issue".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+        });
+        // status:refining → Refining
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 2,
+            title: "in scoping".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:refining".to_string()],
+        });
+        // status:ready → Refined
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 3,
+            title: "ready".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:ready".to_string()],
+        });
+        app.rebuild_board_sidebar();
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        let by_key: std::collections::HashMap<&str, usize> = groups
+            .iter()
+            .map(|(k, v)| (*k, v.len()))
+            .collect();
+        assert_eq!(by_key.get("backlog"), Some(&1), "Backlog count");
+        assert_eq!(by_key.get("refining"), Some(&1), "Refining count");
+        assert_eq!(by_key.get("refined"), Some(&1), "Refined count");
+    }
+
+    #[test]
+    fn board_lifecycle_sections_in_display_order() {
+        // #226: section ordering is Backlog → Refining → Refined →
+        // In-flight → Completed.
+        let mut app = make_app_default();
+        // One issue per section that has rows (Backlog, Refining,
+        // Refined, In-flight, Completed).
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(), number: 1,
+            title: "b".to_string(), body: String::new(),
+            state: "open".to_string(), labels: Vec::new(),
+        });
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(), number: 2,
+            title: "r".to_string(), body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:refining".to_string()],
+        });
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(), number: 3,
+            title: "rd".to_string(), body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:ready".to_string()],
+        });
+        // Issue 4: in-flight (open issue with running assignment).
+        app.data.assignments.push(make_assignment_typed(
+            "running", 4, "repo-a", Some("work"),
+        ));
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(), number: 4,
+            title: "if".to_string(), body: String::new(),
+            state: "open".to_string(), labels: Vec::new(),
+        });
+        // Issue 5: completed (closed issue with done assignment).
+        app.data.assignments.push(make_assignment_typed(
+            "done", 5, "repo-a", Some("work"),
+        ));
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(), number: 5,
+            title: "c".to_string(), body: String::new(),
+            state: "closed".to_string(), labels: Vec::new(),
+        });
+        app.rebuild_board_sidebar();
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        let order: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            order,
+            vec!["backlog", "refining", "refined", "in-flight", "completed"],
+        );
+    }
+
+    #[test]
+    fn board_lifecycle_completed_for_closed_issues_with_assignments() {
+        // #265: an assignment whose issue is closed on GitHub lands in
+        // Completed, not In-flight, regardless of the assignment's own
+        // status_summary.
+        let mut app = make_app_with_assignments(vec![make_assignment_typed(
+            "done", 10, "repo-a", Some("work"),
+        )]);
+        // Mark issue #10 as closed in the open_issues cache.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 10,
+            title: "closed one".to_string(),
+            body: String::new(),
+            state: "closed".to_string(),
+            labels: Vec::new(),
+        });
+        app.rebuild_board_sidebar();
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "completed");
+    }
+
+    #[test]
+    fn board_empty_lifecycle_sections_are_hidden() {
+        // A repo with a single running assignment shows only the
+        // In-flight group; empty Pending / Completed buckets stay out
+        // of the sidebar.
         let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
         let app = make_app_with_assignments(assignments);
         let cache = app.board_issues_cache.clone();
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].0, "running");
+        assert_eq!(groups[0].0, "in-flight");
     }
 
     #[test]
     fn board_select_issue_uses_two_level_path() {
+        // Two open issues with assignments → both in the single
+        // In-flight group.  Path [0, 1] selects the second issue.
         let assignments = vec![
             make_assignment_typed("running", 10, "repo-a", Some("work")),
             make_assignment_typed("done", 20, "repo-a", Some("work")),
         ];
         let mut app = make_app_with_assignments(assignments);
+        // Seed open cache records so the `done` assignment doesn't
+        // route to Completed.
+        seed_open_issue_records(&mut app, "repo-a", &[10, 20]);
         app.select_issue("repo-a", 20);
-        // Issue #20 is "done" → Completed group (index 1 after Running), issue index 0.
         let path = app.board_sidebar.selected_path(1).cloned();
-        assert_eq!(path, Some(vec![1u16, 0u16]), "done issue should be at [1,0]");
+        // The flat order inside In-flight is the sorted-by-issue-number
+        // order from `issues_by_repo`; #20 sits at index 1.
+        assert!(
+            path == Some(vec![0u16, 1u16]) || path == Some(vec![0u16, 0u16]),
+            "selected issue must land inside the single In-flight group, got {:?}",
+            path,
+        );
         let sel = app.board_selected_issue();
         assert_eq!(sel, Some(("repo-a".to_string(), 20)));
     }
@@ -8782,6 +11253,10 @@ mod tests {
             ..BoardData::default()
         };
         let mut app = make_test_app(data);
+        // #225: Pipeline only shows New / In-progress / Done.  Fixture
+        // issues carry `status:ready` so they classify as Pipeline:New
+        // (the umbrella's name; classifier key is still legacy
+        // `"pending"`) and stay visible in the sidebar.
         app.pipeline_issues = vec![
             PipelineIssue {
                 number: 42,
@@ -8790,7 +11265,7 @@ mod tests {
                 repo_slug: "acme/api".to_string(),
                 coord_repo: Some("api".to_string()),
                 matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
             },
             PipelineIssue {
@@ -8800,7 +11275,7 @@ mod tests {
                 repo_slug: "other/repo".to_string(),
                 coord_repo: None,
                 matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
                 is_closed: false,
             },
         ];
@@ -8832,6 +11307,55 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_stage_names_for_issue_prepends_plan_when_plan_assignment_exists() {
+        // The motivating bug: user clicks right-click → Start with Plan,
+        // a plan-typed assignment runs, but the stage strip has no
+        // "plan" stage because `require_plan` is false.  The
+        // per-issue helper must prepend "plan" so the user sees the
+        // plan's progress as its own stage.
+        let mut app = make_pipeline_app();
+        assert!(!app.data.pipeline_require_plan);
+        // Issue #42 from the fixture; tag a plan-typed assignment for it.
+        let mut plan = _stage_assignment("p1", "plan", 100.0, "done");
+        plan.issue_number = 42;
+        plan.repo = "api".to_string();
+        app.data.assignments.push(plan);
+        let issue = app.pipeline_issues[0].clone();
+        let stages = app.pipeline_stage_names_for_issue(&issue);
+        assert_eq!(stages.first(), Some(&"plan".to_string()));
+    }
+
+    #[test]
+    fn pipeline_stage_names_for_issue_omits_plan_when_no_plan_assignment() {
+        // No plan-typed assignment, no require_plan → no Plan stage.
+        // Preserves the original behaviour for projects that don't use
+        // Plan workers.
+        let app = make_pipeline_app();
+        let issue = app.pipeline_issues[0].clone();
+        let stages = app.pipeline_stage_names_for_issue(&issue);
+        assert!(!stages.contains(&"plan".to_string()));
+    }
+
+    #[test]
+    fn assignments_for_stage_keeps_plan_in_plan_when_plan_stage_exists() {
+        // With a per-issue Plan stage present, plan-typed assignments
+        // must surface under "plan" — NOT folded into "work".  Without
+        // this fix the Work stage went green on a plan-only dispatch.
+        let mut app = make_pipeline_app();
+        let mut plan = _stage_assignment("p1", "plan", 100.0, "done");
+        plan.issue_number = 42;
+        plan.repo = "api".to_string();
+        app.data.assignments.push(plan);
+        let issue = app.pipeline_issues[0].clone();
+        // Work stage has no assignments (plan one belongs to Plan).
+        let work = app.assignments_for_stage(&issue, "work");
+        assert!(work.is_empty(), "plan must not fold into Work when Plan stage exists");
+        // Plan stage owns the plan-typed assignment.
+        let plan_stage = app.assignments_for_stage(&issue, "plan");
+        assert_eq!(plan_stage.len(), 1);
+    }
+
+    #[test]
     fn rebuild_pipeline_sidebar_groups_issues_by_repo() {
         let app = make_pipeline_app();
         // Two issues from two different repos → two repo sections.
@@ -8852,9 +11376,98 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_groups_for_repo_filters_out_pre_pipeline_sections() {
+        // #225: Pipeline shows only New (status:ready+no assignments),
+        // In-progress (has assignments), and Done (closed+assignments).
+        // Unlabelled (`new`) and `status:refining` rows belong on the
+        // Board, not the Pipeline.
+        let mut app = make_pipeline_app();
+        // Issue #42 has status:ready → New (visible).
+        // Add issue #43 with no labels → "new" classifier → HIDDEN.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 43,
+            title: "Backlog".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        // Issue #44 with status:refining → "refining" classifier → HIDDEN.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 44,
+            title: "Refining".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:refining".to_string()],
+            is_closed: false,
+        });
+
+        let groups = app.pipeline_groups_for_repo("api");
+        // Only the `pending` (= New) section visible — #43 and #44 hidden.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "pending");
+        // Issue #42 is the only one in the New section.
+        assert_eq!(groups[0].1.len(), 1);
+        let visible_numbers: Vec<u64> = groups[0]
+            .1
+            .iter()
+            .map(|i| app.pipeline_issues[*i].number)
+            .collect();
+        assert_eq!(visible_numbers, vec![42]);
+    }
+
+    #[test]
+    fn pipeline_groups_for_repo_visible_section_order() {
+        // #225 / #256: visible sections render in the order New →
+        // In-progress → Done.  Set up one of each.
+        let mut app = make_pipeline_app();
+        // #42 already has status:ready → New.
+        // Add #43 with status:ready + an assignment → In-progress.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 43,
+            title: "Active".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        });
+        app.data.assignments.push(make_assignment_typed(
+            "running", 43, "api", Some("work"),
+        ));
+        // Add #44 as closed with an assignment → Done.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 44,
+            title: "Finished".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: true,
+        });
+        app.data.assignments.push(make_assignment_typed(
+            "done", 44, "api", Some("work"),
+        ));
+
+        let groups = app.pipeline_groups_for_repo("api");
+        let order: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
+        assert_eq!(order, vec!["pending", "in-progress", "done"]);
+    }
+
+    #[test]
     fn rebuild_pipeline_sidebar_lifecycle_new_when_no_labels() {
-        let app = make_pipeline_app();
-        // Issue #42 has no status:* labels and no assignments → "new" section.
+        let mut app = make_pipeline_app();
+        // #225 fixture seeds `status:ready` — strip it for this test
+        // so the classifier sees an unlabelled issue and returns "new".
+        app.pipeline_issues[0]
+            .all_labels
+            .retain(|l| !l.starts_with("status:"));
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
     }
@@ -8862,6 +11475,10 @@ mod tests {
     #[test]
     fn rebuild_pipeline_sidebar_lifecycle_refining() {
         let mut app = make_pipeline_app();
+        // #225 fixture seeds `status:ready` — replace with refining.
+        app.pipeline_issues[0]
+            .all_labels
+            .retain(|l| !l.starts_with("status:"));
         app.pipeline_issues[0].all_labels.push("status:refining".to_string());
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "refining");
@@ -8893,6 +11510,8 @@ mod tests {
             exit_code: None,
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -8925,6 +11544,8 @@ mod tests {
             exit_code: None,
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -8987,6 +11608,8 @@ mod tests {
         assert_eq!(app.pipeline_issues[0].number, 42);
 
         // Swap WITHOUT capturing prev_sel first — the buggy pattern.
+        // #225: include `status:ready` so the new issue lands in the
+        // visible Pipeline:New (formerly "pending") section.
         let mut new_issues = vec![PipelineIssue {
             number: 7,
             title: "New backlog item".to_string(),
@@ -8994,7 +11617,7 @@ mod tests {
             repo_slug: "acme/api".to_string(),
             coord_repo: Some("api".to_string()),
             matched_labels: vec!["coord".to_string()],
-            all_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
         }];
         new_issues.extend(app.pipeline_issues.clone());
@@ -9190,6 +11813,8 @@ mod tests {
             exit_code: if status == "failed" { Some(1) } else { Some(0) },
             assignment_type: Some(kind.to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         }
     }
 
@@ -9518,6 +12143,147 @@ mod tests {
         assert!(!app.can_bounce_work_after_test_fail());
     }
 
+    // ── #245: force-merge confirm prompt ────────────────────────────────
+
+    #[test]
+    fn pending_force_merge_hint_shows_repo_scope() {
+        // When pending_force_merge is Some(repo), the status bar hint
+        // should announce the scoped force-merge and offer y/Esc.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.pending_force_merge = Some("api".to_string());
+
+        let bar = app.status_bar();
+        let hint = bar.right_segments.iter().map(|s| s.text.clone())
+            .collect::<Vec<_>>().join(" ");
+        assert!(
+            hint.contains("Force-merge --repo api"),
+            "expected scoped force-merge hint, got: {hint}",
+        );
+        assert!(hint.contains("y=confirm"));
+        assert!(hint.contains("Esc=cancel"));
+    }
+
+    #[test]
+    fn pending_force_merge_hint_shows_whole_queue_when_no_repo() {
+        // Empty repo string ⇒ no --repo flag, so the prompt warns the user
+        // the override hits the whole queue.
+        let mut app = make_pipeline_app();
+        app.pending_force_merge = Some(String::new());
+        let bar = app.status_bar();
+        let hint = bar.right_segments.iter().map(|s| s.text.clone())
+            .collect::<Vec<_>>().join(" ");
+        assert!(
+            hint.contains("whole queue"),
+            "expected whole-queue warning, got: {hint}",
+        );
+    }
+
+    #[test]
+    fn pending_force_merge_hint_overrides_other_hints() {
+        // The confirm prompt must beat the normal Pipeline/Board hints so
+        // the user isn't shown a stale "m=merge" affordance while we're
+        // already waiting for a y/N.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.pending_force_merge = Some("api".to_string());
+        let bar = app.status_bar();
+        let hint = bar.right_segments.iter().map(|s| s.text.clone())
+            .collect::<Vec<_>>().join(" ");
+        assert!(!hint.contains("p=plan"), "default hint leaked through: {hint}");
+        assert!(!hint.contains("m=merge anyway"), "stale checks-failed hint: {hint}");
+    }
+
+    // ── #253: merge-blocked-on-review predicate ────────────────────────────
+
+    #[test]
+    fn merge_blocked_on_review_false_when_no_merge_entry() {
+        // No entry in merge_queue → nothing to block on.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        assert!(!app.merge_blocked_on_review_for_selected_issue());
+    }
+
+    #[test]
+    fn merge_blocked_on_review_true_when_no_review_for_pending_merge() {
+        // The #233 regression scenario: a pending merge entry but no approved
+        // review on the board → block.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        assert!(app.merge_blocked_on_review_for_selected_issue());
+    }
+
+    #[test]
+    fn merge_blocked_on_review_false_when_approved_review_present() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        // An approved review on the board unblocks the merge.
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+        assert!(!app.merge_blocked_on_review_for_selected_issue());
+    }
+
+    #[test]
+    fn merge_blocked_on_review_true_when_review_requested_changes() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(review);
+        // request-changes is not an approval → still blocked.
+        assert!(app.merge_blocked_on_review_for_selected_issue());
+    }
+
+    #[test]
+    fn merge_blocked_on_review_false_when_merged() {
+        // An already-merged entry shouldn't trigger the hint.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        assert!(!app.merge_blocked_on_review_for_selected_issue());
+    }
+
     // ── #235: Phase 1 Test-stage build ────────────────────────────────────
 
     /// Synthetic build job that never receives a completion message. The
@@ -9735,6 +12501,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -9770,6 +12538,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -9805,6 +12575,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -9837,6 +12609,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -9909,6 +12683,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -9944,6 +12720,8 @@ mod tests {
             exit_code: None,
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -9966,6 +12744,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -9993,6 +12773,8 @@ mod tests {
             exit_code: Some(1),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -10009,6 +12791,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -10033,6 +12817,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -10082,6 +12868,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -10113,6 +12901,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -10128,6 +12918,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("review".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -10188,6 +12980,8 @@ mod tests {
                 exit_code: Some(0),
                 assignment_type: Some(stage_name.to_string()),
                 test_state: None,
+                review_verdict: None,
+                review_of_assignment_id: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -10223,6 +13017,8 @@ mod tests {
             exit_code: Some(1),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -10253,6 +13049,8 @@ mod tests {
                 exit_code: Some(0),
                 assignment_type: Some(stage_name.to_string()),
                 test_state: None,
+                review_verdict: None,
+                review_of_assignment_id: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -10288,6 +13086,8 @@ mod tests {
             exit_code: Some(1),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -10358,6 +13158,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("plan".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -10388,6 +13190,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("plan".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -10412,6 +13216,8 @@ mod tests {
             exit_code: None,
             assignment_type: Some("plan".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -10436,6 +13242,8 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("work".to_string()),
             test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -10688,11 +13496,29 @@ mod tests {
 
     // ── board_selection_in_completed_group ────────────────────────────────────
 
+    /// #265 helper: build an app where issue #10 is closed (on GitHub)
+    /// and has a done assignment, so it lands in the Completed group.
+    fn make_app_with_one_completed_issue() -> CoordApp {
+        let mut app = make_app_with_assignments(vec![make_assignment_typed(
+            "done", 10, "repo-a", Some("work"),
+        )]);
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 10,
+            title: "closed one".to_string(),
+            body: String::new(),
+            state: "closed".to_string(),
+            labels: Vec::new(),
+        });
+        app.rebuild_board_sidebar();
+        app
+    }
+
     #[test]
     fn purge_guard_true_when_completed_group_header_selected() {
-        // Single done assignment → only group is "Completed" at group_idx 0.
-        let assignments = vec![make_assignment_typed("done", 10, "repo-a", Some("work"))];
-        let mut app = make_app_with_assignments(assignments);
+        // #265: a "done" assignment on a *closed* GitHub issue lands
+        // in the Completed group at group_idx 0.
+        let mut app = make_app_with_one_completed_issue();
         // Section 1 = repo-a (section 0 is the search form).
         // Path [0] selects the Completed group header.
         app.board_sidebar.set_active_section(Some(1));
@@ -10703,8 +13529,7 @@ mod tests {
     #[test]
     fn purge_guard_true_when_issue_row_in_completed_group_selected() {
         // Issue row within Completed group (path [group_idx, issue_idx]).
-        let assignments = vec![make_assignment_typed("done", 10, "repo-a", Some("work"))];
-        let mut app = make_app_with_assignments(assignments);
+        let mut app = make_app_with_one_completed_issue();
         app.board_sidebar.set_active_section(Some(1));
         app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
         assert!(app.board_selection_in_completed_group());
@@ -11110,9 +13935,9 @@ mod tests {
     #[test]
     fn settings_change_focused_wraps_forward_from_last_to_first() {
         use crate::settings::Theme;
-        // Category 0 (Appearance) has a theme SegmentedControl with 3 options.
+        // #237: settings is one unified form — Theme is the first
+        // interactive field.
         let mut app = make_app_default();
-        app.settings_category_sel = 0;
         app.settings.theme = Theme::HighContrast; // last option (idx 2)
         app.settings_field_sel = 0; // the theme field is the first interactive field
 
@@ -11126,7 +13951,6 @@ mod tests {
     fn settings_change_focused_wraps_backward_from_first_to_last() {
         use crate::settings::Theme;
         let mut app = make_app_default();
-        app.settings_category_sel = 0;
         app.settings.theme = Theme::Dark; // first option (idx 0)
         app.settings_field_sel = 0;
 
@@ -11134,5 +13958,1179 @@ mod tests {
         let changed = app.settings_change_focused(-1);
         assert!(changed, "should change when wrapping backward");
         assert_eq!(app.settings.theme, Theme::HighContrast, "should wrap from Dark → HighContrast");
+    }
+
+    // ── #237: unified single-form layout ─────────────────────────────────
+
+    #[test]
+    fn settings_form_contains_all_section_headers() {
+        // After #237, all categories collapse into one form with Label
+        // section headers between groups.  The user scrolls instead of
+        // clicking categories on a sidebar nav.
+        let app = make_app_default();
+        let form = app.build_settings_form();
+        let label_texts: Vec<String> = form
+            .fields
+            .iter()
+            .filter(|f| matches!(f.kind, FieldKind::Label))
+            .map(|f| f.label.spans.iter().map(|s| s.text.as_str())
+                .collect::<String>())
+            .collect();
+        // Every previously-separate category must show up as a header.
+        for expected in &[
+            "Display",
+            "Auto-Refresh",
+            "Notifications",
+            "Watch Overlay",
+            "Per-Machine Model Overrides",
+        ] {
+            assert!(
+                label_texts.iter().any(|t: &String| t.contains(expected)),
+                "missing section header {:?} — got {:?}",
+                expected,
+                label_texts,
+            );
+        }
+    }
+
+    #[test]
+    fn settings_form_first_interactive_field_is_theme() {
+        // The "Display" section is first, so its Theme SegmentedControl
+        // is the first interactive field — settings_field_sel=0 must
+        // resolve to it.  Anchors the settings_change_focused_* tests.
+        let app = make_app_default();
+        let ids = app.settings_interactive_field_ids();
+        assert!(!ids.is_empty());
+        assert_eq!(ids[0].as_str(), "settings:theme");
+    }
+
+    // ── #271 part 2: persistent build status + test guidance ────────────
+
+    #[test]
+    fn test_guidance_not_shown_when_work_not_done_and_no_build() {
+        // No Work assignment + no build record + not actionable → no
+        // Test guidance block (would just be noise on a fresh issue).
+        let app = make_pipeline_app();
+        let summary = app.pipeline_issue_summary();
+        let texts: Vec<String> = summary
+            .items
+            .iter()
+            .map(|i| {
+                i.text
+                    .spans
+                    .iter()
+                    .map(|s| s.text.clone())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            !texts.iter().any(|t| t.contains("ready for manual verification")),
+            "test guidance must not appear when there's no Work yet; got rows {:?}",
+            texts,
+        );
+    }
+
+    #[test]
+    fn test_guidance_shows_persisted_success_after_build_completes() {
+        // After a successful Phase 1 build the result is persisted on
+        // `last_test_builds`; the Pipeline summary surfaces "✓
+        // succeeded in Ns" so the user can see the outcome long after
+        // the 4-second toast expired.
+        let mut app = make_pipeline_app();
+        // Set up a done Work assignment so the Test stage is actionable.
+        let mut work = _stage_assignment("w1", "work", 100.0, "done");
+        work.branch = Some("issue-42-fix".to_string());
+        app.data.assignments.push(work);
+        // Persist a successful build outcome for that work id.
+        app.last_test_builds.insert(
+            "w1".to_string(),
+            TestBuildResult {
+                branch: "issue-42-fix".to_string(),
+                issue_number: 42,
+                exit_code: 0,
+                first_error: String::new(),
+                log_path: std::path::PathBuf::from("/tmp/test-build-w1.log"),
+                duration_secs: 150,
+                finished_at: Instant::now(),
+            },
+        );
+
+        let summary = app.pipeline_issue_summary();
+        let texts: Vec<String> = summary
+            .items
+            .iter()
+            .map(|i| {
+                i.text
+                    .spans
+                    .iter()
+                    .map(|s| s.text.clone())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("✓ succeeded"),
+            "persisted success not surfaced; got {:?}",
+            texts,
+        );
+        assert!(
+            joined.contains("150s"),
+            "build duration not surfaced; got {:?}",
+            texts,
+        );
+    }
+
+    #[test]
+    fn test_guidance_shows_persisted_failure_with_log_path() {
+        let mut app = make_pipeline_app();
+        let mut work = _stage_assignment("w2", "work", 100.0, "done");
+        work.branch = Some("issue-42-fix".to_string());
+        app.data.assignments.push(work);
+        app.last_test_builds.insert(
+            "w2".to_string(),
+            TestBuildResult {
+                branch: "issue-42-fix".to_string(),
+                issue_number: 42,
+                exit_code: 101,
+                first_error: "error[E0432]: unresolved import `foo`".to_string(),
+                log_path: std::path::PathBuf::from("/tmp/test-build-w2.log"),
+                duration_secs: 12,
+                finished_at: Instant::now(),
+            },
+        );
+
+        let summary = app.pipeline_issue_summary();
+        let texts: Vec<String> = summary
+            .items
+            .iter()
+            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .collect();
+        let joined = texts.join("\n");
+        assert!(joined.contains("✗ exit 101"), "exit code missing; got {:?}", texts);
+        assert!(joined.contains("/tmp/test-build-w2.log"));
+        // Failure snippet surfaced.
+        assert!(joined.contains("E0432"));
+    }
+
+    #[test]
+    fn test_guidance_surfaces_pr_title_and_body_from_cache() {
+        // The follow-up: when a PR exists and the cache has its title
+        // / body / files, the Test guidance block surfaces them inline
+        // so the user doesn't have to ask Claude what the worker did.
+        let mut app = make_pipeline_app();
+        let mut work = _stage_assignment("w1", "work", 100.0, "done");
+        work.branch = Some("issue-42-fix".to_string());
+        app.data.assignments.push(work);
+        // Trigger the guidance block by recording a build outcome —
+        // the test gate isn't actionable in the default fixture (no
+        // "test" gate configured), but a persisted build record opens
+        // the block too.
+        app.last_test_builds.insert(
+            "w1".to_string(),
+            TestBuildResult {
+                branch: "issue-42-fix".to_string(),
+                issue_number: 42,
+                exit_code: 0,
+                first_error: String::new(),
+                log_path: std::path::PathBuf::from("/tmp/test-build-w1.log"),
+                duration_secs: 150,
+                finished_at: Instant::now(),
+            },
+        );
+        // Plant a merge-queue entry so `pipeline_pr_number` resolves.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(123),
+            pr_url: Some("https://github.com/acme/api/pull/123".to_string()),
+            repo_github: "acme/api".to_string(),
+        });
+        // Seed the cache directly — bypasses the gh subprocess.
+        app.fetched_prs_cache.borrow_mut().insert(
+            ("acme/api".to_string(), 123),
+            FetchedPr {
+                title: "Add folder picker primitive".to_string(),
+                body: "Added a new sample app at examples/folder_picker_demo.rs.\n\nRun `cargo run --example folder_picker_demo` to verify.".to_string(),
+                files: vec![
+                    "src/folder_picker.rs".to_string(),
+                    "examples/folder_picker_demo.rs".to_string(),
+                ],
+                reviews: Vec::new(),
+            },
+        );
+
+        let summary = app.pipeline_issue_summary();
+        let joined: String = summary
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<&str>>()
+            .join("\n");
+
+        assert!(joined.contains("Add folder picker primitive"), "PR title missing: {joined}");
+        assert!(
+            joined.contains("examples/folder_picker_demo.rs"),
+            "sample-app file path missing: {joined}",
+        );
+        assert!(joined.contains("#123"), "PR number missing");
+        assert!(joined.contains("(2 changed)"), "files-changed count missing");
+    }
+
+    #[test]
+    fn test_guidance_surfaces_latest_review_verdict_and_body() {
+        // The user's #166 gripe: Review stage is green but the review
+        // body isn't visible.  With the gh-pr fetch including reviews,
+        // the latest substantive review surfaces inline with its
+        // verdict (Approved / Changes Requested) and body preview.
+        let mut app = make_pipeline_app();
+        let mut work = _stage_assignment("w1", "work", 100.0, "done");
+        work.branch = Some("issue-166-folder-picker".to_string());
+        app.data.assignments.push(work);
+        // Build record opens the guidance block.
+        app.last_test_builds.insert(
+            "w1".to_string(),
+            TestBuildResult {
+                branch: "issue-166-folder-picker".to_string(),
+                issue_number: 166,
+                exit_code: 0,
+                first_error: String::new(),
+                log_path: std::path::PathBuf::from("/tmp/test-build-w1.log"),
+                duration_secs: 22,
+                finished_at: Instant::now(),
+            },
+        );
+        // Merge queue entry → resolves PR number.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(243),
+            pr_url: Some("https://github.com/acme/api/pull/243".to_string()),
+            repo_github: "acme/api".to_string(),
+        });
+        // Seed the cache with a fully populated PR including review.
+        app.fetched_prs_cache.borrow_mut().insert(
+            ("acme/api".to_string(), 243),
+            FetchedPr {
+                title: "Folder picker primitive".to_string(),
+                body: "Added examples/folder_picker_demo.rs.".to_string(),
+                files: vec!["src/folder_picker.rs".to_string()],
+                reviews: vec![
+                    // Older drive-by comment that should be ignored.
+                    FetchedReview {
+                        state: "COMMENTED".to_string(),
+                        body: String::new(),
+                    },
+                    // The substantive approval — what the user wants
+                    // to read to decide if it's safe to merge.
+                    FetchedReview {
+                        state: "APPROVED".to_string(),
+                        body: "Reviewed the diff; all CLAUDE.md rules respected. Tests pass locally. Merge when ready.".to_string(),
+                    },
+                ],
+            },
+        );
+
+        let summary = app.pipeline_issue_summary();
+        let joined: String = summary
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<&str>>()
+            .join("\n");
+
+        // The verdict surfaces with the green ✓ Approved.
+        assert!(joined.contains("✓ Approved"), "approve verdict missing: {joined}");
+        // The body text surfaces so the user can decide if it's safe
+        // to merge without clicking out to GitHub.
+        assert!(
+            joined.contains("CLAUDE.md rules respected"),
+            "review body text missing: {joined}",
+        );
+    }
+
+    #[test]
+    fn test_guidance_surfaces_changes_requested_review() {
+        // Symmetric test: the CHANGES_REQUESTED branch surfaces a
+        // red ✗ verdict with the reviewer's body text.
+        let mut app = make_pipeline_app();
+        let mut work = _stage_assignment("w2", "work", 100.0, "done");
+        work.branch = Some("issue-200-fix".to_string());
+        app.data.assignments.push(work);
+        app.last_test_builds.insert(
+            "w2".to_string(),
+            TestBuildResult {
+                branch: "issue-200-fix".to_string(),
+                issue_number: 200,
+                exit_code: 0,
+                first_error: String::new(),
+                log_path: std::path::PathBuf::from("/tmp/test-build-w2.log"),
+                duration_secs: 5,
+                finished_at: Instant::now(),
+            },
+        );
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w2".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(244),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        app.fetched_prs_cache.borrow_mut().insert(
+            ("acme/api".to_string(), 244),
+            FetchedPr {
+                title: "WIP fix".to_string(),
+                body: String::new(),
+                files: vec!["src/lib.rs".to_string()],
+                reviews: vec![FetchedReview {
+                    state: "CHANGES_REQUESTED".to_string(),
+                    body: "src/lib.rs:42 — missing null check; add a guard before deref.".to_string(),
+                }],
+            },
+        );
+
+        let summary = app.pipeline_issue_summary();
+        let joined: String = summary
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<&str>>()
+            .join("\n");
+
+        assert!(joined.contains("✗ Changes Requested"));
+        assert!(joined.contains("missing null check"));
+    }
+
+    #[test]
+    fn test_guidance_shows_loading_when_pr_cache_empty() {
+        // Cache miss → the rendering should show a "loading…" hint
+        // rather than blowing up.  The actual fetch is kicked off by
+        // `pr_info_for_issue`; tests don't shell out to gh.
+        let mut app = make_pipeline_app();
+        let mut work = _stage_assignment("w2", "work", 100.0, "done");
+        work.branch = Some("issue-42-fix".to_string());
+        app.data.assignments.push(work);
+        // Open the guidance block via a persisted build record (no
+        // test gate in this fixture; build record opens the block).
+        app.last_test_builds.insert(
+            "w2".to_string(),
+            TestBuildResult {
+                branch: "issue-42-fix".to_string(),
+                issue_number: 42,
+                exit_code: 0,
+                first_error: String::new(),
+                log_path: std::path::PathBuf::from("/tmp/test-build-w2.log"),
+                duration_secs: 1,
+                finished_at: Instant::now(),
+            },
+        );
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w2".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(124),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        // Pre-populate `pending_pr_fetches` so `pr_info_for_issue`
+        // doesn't actually shell out to gh during the test.  An empty
+        // tx-half is fine; the cache stays empty and we just exercise
+        // the "loading" render path.
+        let (_tx, rx) = std::sync::mpsc::channel::<Result<FetchedPr, String>>();
+        app.pending_pr_fetches
+            .borrow_mut()
+            .insert(("acme/api".to_string(), 124), rx);
+
+        let summary = app.pipeline_issue_summary();
+        let joined: String = summary
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<&str>>()
+            .join("\n");
+        assert!(joined.contains("loading"), "loading hint missing: {joined}");
+    }
+
+    #[test]
+    fn test_guidance_hidden_when_no_persisted_build_and_test_not_actionable() {
+        // An issue with no Work and no build record gets no test row.
+        let app = make_pipeline_app();
+        let summary = app.pipeline_issue_summary();
+        for it in &summary.items {
+            let text: String = it.text.spans.iter().map(|s| s.text.clone()).collect();
+            assert!(
+                !text.contains("(not run yet — press B)"),
+                "stub build row leaked into a non-actionable issue: {:?}",
+                text,
+            );
+        }
+    }
+
+    // ── #270: selected-item action bar (no-mouse / SSH-friendly) ────────
+
+    #[test]
+    fn sidebar_action_bar_none_when_no_row_selected() {
+        // Without a focused row there's no row-specific verb to surface.
+        let app = make_app_default();
+        assert!(app.target_for_selected_sidebar_row().is_none());
+        assert!(app.sidebar_action_bar().is_none());
+    }
+
+    #[test]
+    fn sidebar_action_bar_offers_refine_on_backlog_row() {
+        let mut app = make_app_default();
+        // Seed a Backlog issue and focus it on the Board sidebar.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 88,
+            title: "backlog item".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+        });
+        app.rebuild_board_sidebar();
+        app.select_issue("repo-a", 88);
+
+        let bar = app.sidebar_action_bar().expect("Backlog selection → action bar");
+        let labels: Vec<&str> = bar.left_segments.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("Refine")),
+            "expected Refine button on a Backlog row; got {:?}",
+            labels,
+        );
+        // The action bar must NOT carry Copy or Refresh — those aren't
+        // row-state-specific (they live in the right-click menu only).
+        assert!(!labels.iter().any(|l| l.contains("Copy")));
+        assert!(!labels.iter().any(|l| l.contains("Refresh")));
+    }
+
+    #[test]
+    fn sidebar_action_bar_offers_mark_refined_on_refining_row() {
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 89,
+            title: "refining item".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:refining".to_string()],
+        });
+        app.rebuild_board_sidebar();
+        app.select_issue("repo-a", 89);
+
+        let bar = app.sidebar_action_bar().expect("Refining selection → action bar");
+        let labels: Vec<&str> = bar.left_segments.iter().map(|s| s.text.as_str()).collect();
+        assert!(labels.iter().any(|l| l.contains("Mark Refined")));
+        assert!(labels.iter().any(|l| l.contains("Drop to Backlog")));
+    }
+
+    #[test]
+    fn sidebar_action_bar_segments_carry_sidebar_action_prefix_for_dispatch() {
+        // The hit-tester strips `sidebar-action:` to recover the
+        // action_id; segments must carry the prefix so right-click
+        // and bar dispatch can be told apart from the same code path.
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 90,
+            title: "t".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+        });
+        app.rebuild_board_sidebar();
+        app.select_issue("repo-a", 90);
+
+        let bar = app.sidebar_action_bar().expect("backlog bar");
+        let ids: Vec<&str> = bar
+            .left_segments
+            .iter()
+            .filter_map(|s| s.action_id.as_ref().map(|i| i.as_str()))
+            .collect();
+        assert!(
+            ids.iter().all(|id| id.starts_with("sidebar-action:")),
+            "every clickable segment must carry the sidebar-action prefix; got {:?}",
+            ids,
+        );
+    }
+
+    // ── #249 Principle 1: panel toolbar (clickable verb buttons) ────────
+
+    #[test]
+    fn panel_toolbar_board_contains_core_verbs() {
+        // #192 / #263: Board toolbar now Notify · Retry · Purge.
+        // Plan / Approve / Merge dropped (Plan & Approve retired with
+        // Proposals; Merge is Pipeline-only).
+        let app = make_app_default();
+        let bar = app.panel_toolbar().expect("Board has a toolbar");
+        let labels: Vec<&str> = bar
+            .left_segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        for expected in &["[N]otify", "[R]etry", "[P]urge"] {
+            assert!(
+                labels.iter().any(|l| l.contains(expected)),
+                "Board toolbar missing {:?}; got {:?}",
+                expected,
+                labels,
+            );
+        }
+        // Plan / Approve / Merge must NOT appear on the Board toolbar.
+        for unexpected in &["[P]lan", "[A]pprove", "[M]erge"] {
+            assert!(
+                !labels.iter().any(|l| l.contains(unexpected)),
+                "Board toolbar should not include {:?}; got {:?}",
+                unexpected,
+                labels,
+            );
+        }
+    }
+
+    #[test]
+    fn panel_toolbar_pipeline_contains_pipeline_verbs() {
+        // #192 / #263: Pipeline toolbar now Notify · Ready · Merge · Retry.
+        // Plan dropped — Plan-stage rendering is per-issue (#258), not
+        // a panel-wide verb.
+        let app = make_pipeline_app();
+        let mut app = app;
+        app.active_view = SidebarView::Pipeline;
+        let bar = app.panel_toolbar().expect("Pipeline has a toolbar");
+        let labels: Vec<&str> = bar
+            .left_segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        for expected in &["[N]otify", "[r]eady", "[M]erge", "[R]etry"] {
+            assert!(
+                labels.iter().any(|l| l.contains(expected)),
+                "Pipeline toolbar missing {:?}; got {:?}",
+                expected,
+                labels,
+            );
+        }
+        assert!(
+            !labels.iter().any(|l| l.contains("[P]lan")),
+            "Pipeline toolbar should not include [P]lan; got {:?}",
+            labels,
+        );
+    }
+
+    #[test]
+    fn panel_toolbar_settings_and_machines_have_no_toolbar() {
+        // Settings and Machines have no panel-level verbs — toolbar
+        // should be absent so the form / detail list expands to fill the
+        // full main panel.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Settings;
+        assert!(app.panel_toolbar().is_none());
+        app.active_view = SidebarView::Machines;
+        assert!(app.panel_toolbar().is_none());
+    }
+
+    #[test]
+    fn panel_toolbar_disabled_button_drops_action_id() {
+        // The Retry button on the Board panel is disabled when there's
+        // no failed assignment to retry; disabled buttons must not carry
+        // an action_id so a click on them falls through.
+        let app = make_app_default();
+        let bar = app.panel_toolbar().expect("Board toolbar");
+        let retry = bar
+            .left_segments
+            .iter()
+            .find(|s| s.text.contains("[R]etry"))
+            .expect("Retry segment present");
+        assert!(
+            retry.action_id.is_none(),
+            "Retry should be disabled (no failed assignments)",
+        );
+    }
+
+    #[test]
+    fn panel_toolbar_suppressed_while_pending_confirm() {
+        // During an inline confirm prompt (purge/force-merge/test-fail),
+        // the toolbar is hidden — those modes consume every key and a
+        // visible toolbar above them would be misleading.
+        let mut app = make_app_default();
+        assert!(app.panel_toolbar().is_some());
+        app.pending_purge = Some((1, 0));
+        assert!(app.panel_toolbar().is_none());
+        app.pending_purge = None;
+        app.pending_force_merge = Some("api".to_string());
+        assert!(app.panel_toolbar().is_none());
+    }
+
+    #[test]
+    fn dispatch_toolbar_action_approve_no_longer_recognised() {
+        // #192 / #263: `toolbar:approve` is retired alongside the
+        // PROPOSALS section.  Stale segments (from a long-running
+        // session) fall through to the catch-all branch — returns
+        // false, no side effects, no spurious `coord approve` spawn.
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        let result = app.dispatch_toolbar_action("toolbar:approve");
+        assert!(!result);
+        // No toast — the catch-all is silent so the user isn't spammed
+        // when an unrelated stale segment is clicked.
+        assert_eq!(app.toasts.len(), before);
+    }
+
+    #[test]
+    fn dispatch_toolbar_action_ignores_unknown_id() {
+        // Defence-in-depth: an unknown action_id (stale segment from a
+        // previous frame) must not panic or fire side effects.
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        let result = app.dispatch_toolbar_action("toolbar:bogus");
+        assert!(!result);
+        assert_eq!(app.toasts.len(), before);
+    }
+
+    // ── #259: right-click context menu primitive ────────────────────────
+
+    /// Test helper: build a `BoardRow` target with sensible defaults so
+    /// each call site doesn't have to spell out every field.
+    fn board_target(
+        issue_number: Option<u64>,
+        lifecycle: BoardRowLifecycle,
+    ) -> ContextMenuTarget {
+        ContextMenuTarget::BoardRow {
+            issue_number,
+            repo_name: Some("repo-a".to_string()),
+            lifecycle,
+        }
+    }
+
+    fn pipeline_target(issue_number: Option<u64>) -> ContextMenuTarget {
+        ContextMenuTarget::PipelineRow {
+            issue_number,
+            lifecycle: PipelineRowLifecycle::Other,
+        }
+    }
+
+    #[test]
+    fn open_context_menu_board_row_seeds_state() {
+        // Opening on a Board row produces a non-empty item list and
+        // picks the first selectable item as the keyboard focus.
+        let mut app = make_app_default();
+        let pos = Point::new(10.0, 5.0);
+        let opened = app.open_context_menu(
+            pos,
+            board_target(Some(42), BoardRowLifecycle::InFlight),
+        );
+        assert!(opened, "context menu should open for a Board row");
+        let state = app.pending_context_menu.expect("state set");
+        assert!(!state.items.is_empty());
+        // First action item is the keyboard focus.  In-flight rows
+        // don't get a Refine, so Copy is first.
+        assert_eq!(
+            state.items[state.selected_idx].action_id.as_deref(),
+            Some("copy-issue-number"),
+        );
+        assert!(state.items.iter().any(|it| it.label.contains("#42")));
+    }
+
+    #[test]
+    fn open_context_menu_includes_refresh_for_pipeline_row() {
+        let mut app = make_app_default();
+        let opened = app.open_context_menu(Point::new(1.0, 1.0), pipeline_target(None));
+        assert!(opened);
+        let state = app.pending_context_menu.expect("state set");
+        assert!(state.items.iter().any(|it| it.label == "Refresh"));
+    }
+
+    #[test]
+    fn context_menu_move_selection_skips_separators() {
+        let mut app = make_app_default();
+        app.open_context_menu(
+            Point::new(0.0, 0.0),
+            board_target(Some(1), BoardRowLifecycle::InFlight),
+        );
+        // Layout (Copy / separator / Refresh) — move forward should land
+        // on Refresh, not the separator.
+        let state_before = app.pending_context_menu.clone().unwrap();
+        app.context_menu_move_selection(1);
+        let state_after = app.pending_context_menu.clone().unwrap();
+        assert_ne!(state_before.selected_idx, state_after.selected_idx);
+        assert_eq!(
+            state_after.items[state_after.selected_idx].action_id.as_deref(),
+            Some("refresh"),
+        );
+    }
+
+    #[test]
+    fn context_menu_activate_fires_action_and_dismisses() {
+        let mut app = make_app_default();
+        app.open_context_menu(
+            Point::new(0.0, 0.0),
+            board_target(Some(7), BoardRowLifecycle::InFlight),
+        );
+        let before = app.toasts.len();
+        let fired = app.context_menu_activate_selected();
+        assert!(fired);
+        // Menu dismissed.
+        assert!(app.pending_context_menu.is_none());
+        // Copy is a stub that pushes a toast.
+        assert_eq!(app.toasts.len(), before + 1);
+    }
+
+    #[test]
+    fn context_menu_dismiss_clears_state() {
+        let mut app = make_app_default();
+        app.open_context_menu(
+            Point::new(0.0, 0.0),
+            board_target(None, BoardRowLifecycle::Unknown),
+        );
+        assert!(app.pending_context_menu.is_some());
+        app.dismiss_context_menu();
+        assert!(app.pending_context_menu.is_none());
+    }
+
+    #[test]
+    fn dispatch_context_menu_action_refresh_does_not_toast() {
+        // Refresh is the only smoke-test item that runs real code (kicks
+        // a background data load).  It should NOT push a toast.
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        let target = board_target(None, BoardRowLifecycle::Unknown);
+        let result = app.dispatch_context_menu_action("refresh", &target);
+        assert!(result);
+        assert_eq!(app.toasts.len(), before);
+    }
+
+    #[test]
+    fn dispatch_context_menu_action_unknown_id_warns_via_toast() {
+        // Defence-in-depth: a stale action id (e.g. from a previous frame)
+        // must not panic — it surfaces a Warning toast instead.
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        let target = board_target(None, BoardRowLifecycle::Unknown);
+        let result = app.dispatch_context_menu_action("bogus", &target);
+        assert!(!result);
+        assert_eq!(app.toasts.len(), before + 1);
+    }
+
+    // ── #260: Refine right-click action ─────────────────────────────────
+
+    #[test]
+    fn backlog_row_context_menu_offers_refine() {
+        // The Refine action is only meaningful for Backlog rows — it'd
+        // be misleading on In-flight / Completed.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(42),
+            &BoardRowLifecycle::Backlog,
+        );
+        assert!(
+            items.iter().any(|it| it.action_id.as_deref() == Some("refine")),
+            "Backlog menu must include Refine; got {:?}",
+            items.iter().map(|it| &it.label).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn in_flight_row_context_menu_omits_refine() {
+        // Adding `status:refining` to an in-flight row would be
+        // confusing — refining is upstream of dispatch.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(42),
+            &BoardRowLifecycle::InFlight,
+        );
+        assert!(
+            !items.iter().any(|it| it.action_id.as_deref() == Some("refine")),
+            "Refine must not appear on In-flight rows",
+        );
+    }
+
+    #[test]
+    fn board_row_lifecycle_classifies_open_no_labels_as_backlog() {
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 10,
+            title: String::new(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+        });
+        assert_eq!(
+            app.board_row_lifecycle("repo-a", 10),
+            BoardRowLifecycle::Backlog,
+        );
+    }
+
+    #[test]
+    fn board_row_lifecycle_status_refining_label_yields_refining() {
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 11,
+            title: String::new(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:refining".to_string()],
+        });
+        assert_eq!(
+            app.board_row_lifecycle("repo-a", 11),
+            BoardRowLifecycle::Refining,
+        );
+    }
+
+    #[test]
+    fn board_row_lifecycle_status_ready_label_yields_refined() {
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 12,
+            title: String::new(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:ready".to_string()],
+        });
+        assert_eq!(
+            app.board_row_lifecycle("repo-a", 12),
+            BoardRowLifecycle::Refined,
+        );
+    }
+
+    #[test]
+    fn dispatch_refine_without_target_data_toasts_and_no_ops() {
+        // Refine requires both an issue number and a repo name; without
+        // either, the dispatch should surface guidance rather than
+        // crashing on the missing data.
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        let target = ContextMenuTarget::BoardRow {
+            issue_number: None,
+            repo_name: None,
+            lifecycle: BoardRowLifecycle::Backlog,
+        };
+        let fired = app.dispatch_context_menu_action("refine", &target);
+        assert!(!fired);
+        assert_eq!(app.toasts.len(), before + 1);
+    }
+
+    // ── #261: Send to Pipeline right-click action ───────────────────────
+
+    #[test]
+    fn refined_row_context_menu_offers_send_to_pipeline() {
+        // Send to Pipeline is the canonical Refined-row action.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(99),
+            &BoardRowLifecycle::Refined,
+        );
+        assert!(
+            items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("send-to-pipeline")),
+            "Refined menu must include Send to Pipeline; got {:?}",
+            items.iter().map(|it| &it.label).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn backlog_row_context_menu_omits_send_to_pipeline() {
+        // Pre-Refined rows still need scoping work — sending them to
+        // the Pipeline would dispatch undefined work.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(99),
+            &BoardRowLifecycle::Backlog,
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("send-to-pipeline")),
+            "Send to Pipeline must not appear on Backlog rows",
+        );
+    }
+
+    #[test]
+    fn in_flight_row_context_menu_omits_send_to_pipeline() {
+        // In-flight rows already carry the `coord` label — the action
+        // would be a no-op (and confusing).
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(99),
+            &BoardRowLifecycle::InFlight,
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("send-to-pipeline")),
+            "Send to Pipeline must not appear on In-flight rows",
+        );
+    }
+
+    #[test]
+    fn dispatch_send_to_pipeline_without_target_data_toasts_and_no_ops() {
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        let target = ContextMenuTarget::BoardRow {
+            issue_number: None,
+            repo_name: None,
+            lifecycle: BoardRowLifecycle::Refined,
+        };
+        let fired = app.dispatch_context_menu_action("send-to-pipeline", &target);
+        assert!(!fired);
+        assert_eq!(app.toasts.len(), before + 1);
+    }
+
+    // ── #266: Refining row right-click actions ──────────────────────────
+
+    #[test]
+    fn refining_row_context_menu_offers_mark_refined_and_drop_to_backlog() {
+        // Refining was a UX dead-end before #266 — users had to shell
+        // out to `coord ready`.  Both directions are now in the menu.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(42),
+            &BoardRowLifecycle::Refining,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            action_ids.contains(&"mark-refined"),
+            "Refining menu must offer Mark Refined; got {:?}",
+            action_ids,
+        );
+        assert!(
+            action_ids.contains(&"drop-to-backlog"),
+            "Refining menu must offer Drop to Backlog; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn refined_row_context_menu_offers_drop_to_refining() {
+        // Symmetric escape hatch — let the user re-open scoping on a
+        // Refined row without dropping all the way to Backlog.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(42),
+            &BoardRowLifecycle::Refined,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            action_ids.contains(&"drop-to-refining"),
+            "Refined menu must offer Drop to Refining; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn backlog_row_omits_refining_actions() {
+        // Mark Refined / Drop to Backlog are state-transition actions
+        // only meaningful for Refining rows.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(42),
+            &BoardRowLifecycle::Backlog,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(!action_ids.contains(&"mark-refined"));
+        assert!(!action_ids.contains(&"drop-to-backlog"));
+    }
+
+    #[test]
+    fn dispatch_mark_refined_without_target_toasts_and_no_ops() {
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        let target = ContextMenuTarget::BoardRow {
+            issue_number: None,
+            repo_name: None,
+            lifecycle: BoardRowLifecycle::Refining,
+        };
+        let fired = app.dispatch_context_menu_action("mark-refined", &target);
+        assert!(!fired);
+        assert_eq!(app.toasts.len(), before + 1);
+    }
+
+    // ── #262: Start right-click on Pipeline:New rows ────────────────────
+
+    #[test]
+    fn pipeline_new_row_context_menu_offers_both_start_variants() {
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            action_ids.contains(&"start-with-plan"),
+            "Pipeline:New menu must offer Start with Plan; got {:?}",
+            action_ids,
+        );
+        assert!(
+            action_ids.contains(&"start-skip-plan"),
+            "Pipeline:New menu must offer Skip Plan; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn pipeline_in_progress_row_omits_start() {
+        // Once work is dispatched, Start is meaningless — Retry / View
+        // Log become the relevant actions (filed for future work).
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::InProgress,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(!action_ids.contains(&"start-with-plan"));
+        assert!(!action_ids.contains(&"start-skip-plan"));
+    }
+
+    #[test]
+    fn pipeline_done_row_omits_start() {
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::Done,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(!action_ids.contains(&"start-with-plan"));
+        assert!(!action_ids.contains(&"start-skip-plan"));
+    }
+
+    #[test]
+    fn pipeline_row_lifecycle_new_for_coord_status_ready_no_assignments() {
+        // The motivating Pipeline:New definition: `coord` +
+        // `status:ready`, no assignments.
+        let mut app = make_pipeline_app();
+        // Issue #42 in the fixture has coord_repo=Some("api"); add the
+        // ready label to put it in the Pipeline:New bucket.
+        app.pipeline_issues[0].all_labels.push("status:ready".to_string());
+        let issue = app.pipeline_issues[0].clone();
+        assert_eq!(
+            app.pipeline_row_lifecycle(&issue),
+            PipelineRowLifecycle::New,
+        );
+    }
+
+    #[test]
+    fn pipeline_row_lifecycle_in_progress_when_has_assignment() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "running", None));
+        let issue = app.pipeline_issues[0].clone();
+        assert_eq!(
+            app.pipeline_row_lifecycle(&issue),
+            PipelineRowLifecycle::InProgress,
+        );
+    }
+
+    #[test]
+    fn pipeline_row_lifecycle_other_for_status_refining() {
+        // A coord-labelled issue marked back for refinement is Other —
+        // Start is not meaningful, the user should Mark Refined first.
+        let mut app = make_pipeline_app();
+        // #225 fixture seeds `status:ready` — replace with refining so
+        // the classifier sees ONLY status:refining.
+        app.pipeline_issues[0]
+            .all_labels
+            .retain(|l| !l.starts_with("status:"));
+        app.pipeline_issues[0].all_labels.push("status:refining".to_string());
+        let issue = app.pipeline_issues[0].clone();
+        assert_eq!(
+            app.pipeline_row_lifecycle(&issue),
+            PipelineRowLifecycle::Other,
+        );
+    }
+
+    #[test]
+    fn dispatch_drop_to_backlog_without_target_toasts_and_no_ops() {
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        let target = ContextMenuTarget::BoardRow {
+            issue_number: None,
+            repo_name: None,
+            lifecycle: BoardRowLifecycle::Refining,
+        };
+        let fired = app.dispatch_context_menu_action("drop-to-backlog", &target);
+        assert!(!fired);
+        assert_eq!(app.toasts.len(), before + 1);
+    }
+
+    // ── #249 Principle 2: toast-on-no-op preconditions ──────────────────
+
+    #[test]
+    fn proposals_section_hidden_after_retirement() {
+        // #192: PROPOSALS section is retired.  Even when the brain
+        // has produced proposals (legacy `coord plan` users), the
+        // sidebar should not render the section any more.  Right-
+        // click → Send to Pipeline is the canonical path now.
+        let mut app = make_app_default();
+        // Seed a proposal as if `coord plan` ran.
+        app.data.proposals.push(Proposal {
+            id: 1,
+            machine: "m".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "t".to_string(),
+            rationale: "r".to_string(),
+            proposal_type: "work".to_string(),
+        });
+        app.rebuild_board_sidebar();
+        assert!(
+            !app.has_proposals_section,
+            "PROPOSALS section must be hidden after #192",
+        );
+        assert!(
+            app.board_selected_proposal().is_none(),
+            "no UI → no selectable proposal",
+        );
+    }
+
+    #[test]
+    fn no_op_toast_when_retry_pressed_without_failed_assignment() {
+        // `R` in Board view requires a failed assignment to retry; on
+        // an empty board the precondition is unmet and the toast path
+        // fires.  Anchor the predicate that the handler keys off.
+        let app = make_app_default();
+        assert!(
+            app.board_selected_failed_assignment().is_none(),
+            "empty board ⇒ no failed assignment to retry",
+        );
+    }
+
+    #[test]
+    fn push_toast_appends_to_stack() {
+        // Confirms the toast plumbing the no-op branches rely on.
+        let mut app = make_app_default();
+        let before = app.toasts.len();
+        app.push_toast("title", "body", ToastSeverity::Info);
+        assert_eq!(app.toasts.len(), before + 1);
+    }
+
+    #[test]
+    fn settings_sidebar_placeholder_is_empty() {
+        // The Settings sidebar shows just a header strip — no clickable
+        // category rows — so misdirected clicks can't appear to do
+        // something.
+        let app = make_app_default();
+        let list = app.settings_sidebar_placeholder();
+        assert!(list.items.is_empty());
     }
 }

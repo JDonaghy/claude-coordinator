@@ -754,3 +754,56 @@ def test_upsert_open_issues_updates_title_on_resync(coord_db) -> None:
         "SELECT title FROM issues WHERE repo_name='repo' AND number=5"
     ).fetchone()
     assert row["title"] == "New title"
+
+
+# ── update_issue_labels (#266 follow-up) ────────────────────────────────────
+
+def test_update_issue_labels_writes_to_existing_row(coord_db) -> None:
+    """The TUI's right-click label actions write straight to the local
+    issues table after gh edit succeeds — without this, the TUI's 5s
+    auto-refresh shows stale labels until the throttled `coord sync`
+    runs (every 5 min)."""
+    import json
+    from coord.state import upsert_open_issues, update_issue_labels
+    from coord.db import get_connection
+
+    upsert_open_issues(
+        "repo",
+        [{"number": 7, "title": "T", "body": "", "labels": [{"name": "coord"}]}],
+    )
+
+    updated = update_issue_labels("repo", 7, ["coord", "status:refining"])
+    assert updated is True
+
+    row = get_connection().execute(
+        "SELECT labels FROM issues WHERE repo_name='repo' AND number=7"
+    ).fetchone()
+    labels = json.loads(row["labels"])
+    assert labels == ["coord", "status:refining"]
+
+
+def test_update_issue_labels_no_row_returns_false(coord_db) -> None:
+    """When the issue isn't in the cache yet (e.g. brain hasn't synced
+    this repo), update returns False — the row will be inserted by the
+    next `coord sync` so this is not an error."""
+    from coord.state import update_issue_labels
+
+    updated = update_issue_labels("repo", 999, ["coord"])
+    assert updated is False
+
+
+def test_update_issue_labels_dedups_and_sorts(coord_db) -> None:
+    """Labels are normalised on write (sorted, deduplicated) so the
+    classifier sees a canonical set — protects against accidental
+    duplicates from upstream callers."""
+    import json
+    from coord.state import upsert_open_issues, update_issue_labels
+    from coord.db import get_connection
+
+    upsert_open_issues("repo", [{"number": 8, "title": "T", "body": "", "labels": []}])
+    update_issue_labels("repo", 8, ["zeta", "alpha", "alpha", "beta"])
+
+    row = get_connection().execute(
+        "SELECT labels FROM issues WHERE repo_name='repo' AND number=8"
+    ).fetchone()
+    assert json.loads(row["labels"]) == ["alpha", "beta", "zeta"]

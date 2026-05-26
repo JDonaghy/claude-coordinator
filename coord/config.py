@@ -333,6 +333,12 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if not isinstance(coordinator_only_files, list) or not all(isinstance(f, str) for f in coordinator_only_files):
             raise ConfigError(f"repos[{i}].coordinator_only_files must be a list of strings")
 
+        # #268: reference_repos — sibling repos a worker may reference
+        # for context but doesn't actually build against.
+        reference_repos = entry.get("reference_repos", []) or []
+        if not isinstance(reference_repos, list) or not all(isinstance(r, str) for r in reference_repos):
+            raise ConfigError(f"repos[{i}].reference_repos must be a list of repo names")
+
         repos.append(
             Repo(
                 name=name,
@@ -344,6 +350,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 worker_permissions=worker_permissions,
                 housekeeping=housekeeping,
                 coordinator_only_files=coordinator_only_files,
+                reference_repos=reference_repos,
             )
         )
     return repos
@@ -719,6 +726,21 @@ def _validate_dependencies(repos: list[Repo]) -> None:
             )
         if r.name in r.depends_on:
             raise ConfigError(f"repo {r.name!r} cannot depend on itself")
+
+        # #268: reference_repos go through the same name-resolution as
+        # depends_on but DO NOT feed into the cycle detector — the
+        # intent is precisely to allow back-references (vimcode →
+        # quadraui in depends_on; quadraui → vimcode in reference_repos)
+        # that would be cycles if treated as build deps.
+        unknown_ref = [r2 for r2 in r.reference_repos if r2 not in repo_names]
+        if unknown_ref:
+            raise ConfigError(
+                f"repo {r.name!r} reference_repos unknown repos: {unknown_ref}"
+            )
+        if r.name in r.reference_repos:
+            raise ConfigError(
+                f"repo {r.name!r} cannot reference itself"
+            )
 
     cycles = detect_cycles(repos)
     if cycles:

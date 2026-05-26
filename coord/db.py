@@ -213,6 +213,9 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # #200: human-driven Test gate between Work and Review.
         "ALTER TABLE assignments ADD COLUMN test_state TEXT",
         "ALTER TABLE assignments ADD COLUMN test_reason TEXT",
+        # #253: persisted adversarial-review verdict so the merge gate can
+        # check approval without re-parsing logs after restart.
+        "ALTER TABLE assignments ADD COLUMN review_verdict TEXT",
     ]
     for sql in migrations:
         try:

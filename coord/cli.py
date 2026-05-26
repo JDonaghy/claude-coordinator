@@ -1604,6 +1604,23 @@ def approve(
     is_flag=True,
     help="Bypass claim detection only (use when retrying after infra failures).",
 )
+@click.option(
+    "--no-pull",
+    is_flag=True,
+    help=(
+        "Skip the auto-pull of stale dependency repos on the agent. "
+        "The briefing still carries a 'pull these before building' "
+        "addendum so the worker is aware (#267)."
+    ),
+)
+@click.option(
+    "--skip-freshness",
+    is_flag=True,
+    help=(
+        "Skip the dependency freshness check entirely — faster, no "
+        "network for GH HEADs.  Matches `coord approve --skip-freshness` (#267)."
+    ),
+)
 def assign(
     machine: str,
     repo: str,
@@ -1615,6 +1632,8 @@ def assign(
     plan_only: bool,
     no_plan: bool,
     force: bool,
+    no_pull: bool,
+    skip_freshness: bool,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -1725,9 +1744,62 @@ def assign(
             )
             sys.exit(1)
 
+    # #267: dependency freshness check — same machinery `coord approve`
+    # uses.  Default for `coord assign` is `--auto-pull` (the manual /
+    # right-click dispatch path is a deliberate user action; we want it
+    # to be safe by default).  `--no-pull` falls back to the briefing
+    # addendum; `--skip-freshness` bypasses entirely.
+    # #268: `relevant_repos` covers both transitive `depends_on` (build
+    # deps) and direct `reference_repos` (context).
+    pull_repos: list[str] = []
+    if not skip_freshness:
+        from coord import freshness as _fresh  # noqa: PLC0415
+        from coord.network import fetch_repos  # noqa: PLC0415
+
+        agent_repos = fetch_repos(machine_obj) or {}
+
+        repos_needed = _fresh.relevant_repos(proposal, cfg)
+        github_heads: dict[str, str | None] = {}
+        for dep_name, _kind in repos_needed:
+            dep_cfg = cfg.repo(dep_name)
+            if dep_cfg is None:
+                github_heads[dep_name] = None
+                continue
+            try:
+                github_heads[dep_name] = github_ops.get_default_branch_head(
+                    dep_cfg.github, dep_cfg.default_branch
+                )
+            except RuntimeError as e:
+                click.echo(
+                    f"  warning: could not get HEAD of {dep_cfg.github}: {e}",
+                    err=True,
+                )
+                github_heads[dep_name] = None
+
+        freshness = _fresh.dependency_freshness(
+            proposal, cfg, agent_repos, github_heads
+        )
+        needs = _fresh.stale_or_dirty(freshness)
+        if needs:
+            for f in needs:
+                click.echo(
+                    f"  dependency {f.repo_name}: {f.state}"
+                    + (f" ({f.error})" if f.error else ""),
+                )
+            if not no_pull:
+                pull_repos = [f.repo_name for f in needs if f.state == _fresh.STALE]
+                if pull_repos:
+                    click.echo(f"  will pull on agent before worker: {pull_repos}")
+            else:
+                addendum = _fresh.format_briefing_addendum(freshness)
+                if addendum:
+                    proposal.briefing = (proposal.briefing or "") + addendum
+
     # Dispatch to agent server
     try:
-        response = dispatch(proposal, cfg, fresh_branch=force)
+        response = dispatch(
+            proposal, cfg, pull_repos=pull_repos, fresh_branch=force,
+        )
     except httpx.HTTPError as e:
         click.echo(f"  dispatch failed: {e}", err=True)
         sys.exit(1)
@@ -2278,22 +2350,34 @@ def sync(config_path: Path, quiet: bool) -> None:
         click.echo(f"synced {total} open issue(s) across {len(cfg.repos)} repo(s)")
 
 
-@main.command(
-    help=(
-        "Mark a refined issue as ready for dispatch.\n\n"
-        "Sets the GitHub `status:ready` label and removes `status:refining` / "
-        "`status:backlog` if present. After this the issue appears in the "
-        "Pipeline panel as Pending with a [Go] button.\n\n"
-        "REPO is the local repo name from coordinator.yml; ISSUE is the GH "
-        "issue number."
-    )
-)
-@click.argument("repo")
-@click.argument("issue", type=int)
-@_CONFIG_OPTION
-def ready(repo: str, issue: int, config_path: Path) -> None:
+def _apply_label_change(
+    repo: str,
+    issue: int,
+    config_path: Path,
+    *,
+    add: set[str],
+    remove_if_present: set[str],
+    success_message: str,
+    no_op_message: str | None = None,
+) -> None:
+    """Shared backbone for the four label-change commands (#260/#261/#266).
+
+    Resolves *repo* via ``coordinator.yml``, fetches the issue's current
+    labels via ``gh issue view``, computes the post-edit label set, runs
+    ``gh issue edit`` with only the labels that are actually present
+    (``--remove-label`` errors on unknown repo labels), then writes the
+    new label set to the local ``issues`` cache so the TUI's next data
+    refresh tick reflects the change without waiting for the 5-minute
+    ``coord sync`` throttle.
+
+    ``no_op_message`` (optional) is echoed when there are no add/remove
+    ops to perform — used by ``coord backlog`` to say "already in
+    Backlog" instead of running a no-op ``gh issue edit``.
+    """
     import subprocess as _sp  # noqa: PLC0415
     import json as _json  # noqa: PLC0415
+
+    from coord.state import update_issue_labels  # noqa: PLC0415
 
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
@@ -2302,9 +2386,6 @@ def ready(repo: str, issue: int, config_path: Path) -> None:
         sys.exit(1)
     slug = repo_entry.github
 
-    # Fetch current labels first. gh issue edit --remove-label errors when
-    # the label doesn't exist on the *repo* (not just absent from the issue),
-    # so we must only request removal of labels that are actually present.
     try:
         view = _sp.run(
             ["gh", "issue", "view", str(issue), "--repo", slug, "--json", "labels"],
@@ -2322,12 +2403,20 @@ def ready(repo: str, issue: int, config_path: Path) -> None:
         click.echo(f"could not parse gh view output: {e}", err=True)
         sys.exit(1)
 
-    # Build edit args: always add status:ready; remove only present status:* peers.
-    args = ["gh", "issue", "edit", str(issue), "--repo", slug,
-            "--add-label", "status:ready"]
-    for stale in ("status:refining", "status:backlog"):
-        if stale in current:
-            args.extend(["--remove-label", stale])
+    to_add = add - current
+    to_remove = remove_if_present & current
+    if not to_add and not to_remove:
+        if no_op_message is not None:
+            click.echo(no_op_message)
+        else:
+            click.echo(success_message)
+        return
+
+    args = ["gh", "issue", "edit", str(issue), "--repo", slug]
+    for lbl in sorted(to_add):
+        args.extend(["--add-label", lbl])
+    for lbl in sorted(to_remove):
+        args.extend(["--remove-label", lbl])
 
     try:
         result = _sp.run(args, capture_output=True, text=True, timeout=15)
@@ -2337,7 +2426,121 @@ def ready(repo: str, issue: int, config_path: Path) -> None:
     if result.returncode != 0:
         click.echo(f"gh failed: {result.stderr.strip()}", err=True)
         sys.exit(1)
-    click.echo(f"#{issue} ({slug}) marked ready for dispatch")
+
+    new_labels = sorted((current - to_remove) | to_add)
+    update_issue_labels(repo, issue, new_labels)
+
+    click.echo(success_message)
+
+
+@main.command(
+    help=(
+        "Mark a refined issue as ready for dispatch.\n\n"
+        "Sets the GitHub `status:ready` label and removes `status:refining` / "
+        "`status:backlog` if present. After this the issue appears in the "
+        "Pipeline panel as Pending with a [Go] button.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the GH "
+        "issue number."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def ready(repo: str, issue: int, config_path: Path) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    _apply_label_change(
+        repo, issue, config_path,
+        add={"status:ready"},
+        remove_if_present={"status:refining", "status:backlog"},
+        success_message=f"#{issue} ({slug}) marked ready for dispatch",
+    )
+
+
+@main.command(
+    help=(
+        "Mark an issue as in-refinement on GitHub.\n\n"
+        "Sets the `status:refining` label and removes `status:ready` if "
+        "present so the issue moves out of Refined and back into the "
+        "scoping flow.  Symmetric with `coord ready`.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the "
+        "GH issue number."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def refine(repo: str, issue: int, config_path: Path) -> None:
+    """#260: TUI right-click 'Refine' fires this command to move a
+    Backlog row into the Refining lifecycle section."""
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    _apply_label_change(
+        repo, issue, config_path,
+        add={"status:refining"},
+        remove_if_present={"status:ready"},
+        success_message=f"#{issue} ({slug}) marked status:refining",
+    )
+
+
+@main.command(
+    help=(
+        "Send a refined issue to the Pipeline by tagging it with the "
+        "`coord` label on GitHub.\n\n"
+        "Symmetric with `coord refine` / `coord ready` — once the `coord` "
+        "label is present, the issue appears in the Pipeline panel's New "
+        "section and right-click → Start (or `coord assign`) can dispatch "
+        "it.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the "
+        "GH issue number."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def track(repo: str, issue: int, config_path: Path) -> None:
+    """#261: TUI right-click 'Send to Pipeline' fires this command to
+    add the `coord` label so the issue enters the Pipeline."""
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    _apply_label_change(
+        repo, issue, config_path,
+        add={"coord"},
+        remove_if_present=set(),
+        success_message=f"#{issue} ({slug}) sent to Pipeline (coord label added)",
+        no_op_message=f"#{issue} ({slug}) already on the Pipeline (coord label present)",
+    )
+
+
+@main.command(
+    help=(
+        "Drop an issue back to Backlog by removing its `status:*` label.\n\n"
+        "Symmetric with `coord refine` / `coord ready` — strips both "
+        "`status:refining` and `status:ready` if present, returning the "
+        "issue to the unscoped Backlog state.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the "
+        "GH issue number."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def backlog(repo: str, issue: int, config_path: Path) -> None:
+    """#266: TUI right-click 'Drop to Backlog' fires this command to
+    walk a Refining/Refined row back to the unscoped Backlog state."""
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    _apply_label_change(
+        repo, issue, config_path,
+        add=set(),
+        remove_if_present={"status:refining", "status:ready"},
+        success_message=f"#{issue} ({slug}) dropped to Backlog",
+        no_op_message=f"#{issue} ({slug}) already in Backlog (no status:* label)",
+    )
 
 
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")
@@ -2484,6 +2687,11 @@ def _load_issue_states() -> tuple[dict[str, set[int]], set[str]]:
     is_flag=True,
     help="Skip the CI check gate — merge even if checks failed or are still running.",
 )
+@click.option(
+    "--skip-review",
+    is_flag=True,
+    help="Skip the review-approval gate — merge even when no approved review is on the board (#253).",
+)
 def merge(
     config_path: Path,
     dry_run: bool,
@@ -2491,6 +2699,7 @@ def merge(
     repo_filter: str | None,
     method: str,
     force_merge: bool,
+    skip_review: bool,
 ) -> None:
     from coord import github_ops as gh_ops
     from coord import merge_queue as mq
@@ -2592,10 +2801,13 @@ def merge(
         return
 
     ci_store = build_ci_store(cfg.ci_store.type)
+    if skip_review:
+        click.echo("  --skip-review: review-approval gate bypassed (#253)")
     events = mq.process(
         items, gh_ops,
         method=method, dry_run=dry_run, presorted=presorted,
         ci_store=ci_store, force_merge=force_merge,
+        config=cfg, board=board, skip_review=skip_review,
     )
 
     for ev in events:
@@ -2736,6 +2948,81 @@ def resume(config_path: Path) -> None:
             click.echo(f"  {a.machine_name} → {a.repo_name} #{a.issue_number}: {a.issue_title}")
 
 
+def _restore_default_branch_after_test(cfg, assignment) -> None:
+    """#271 part 1: switch the local checkout back to the repo's
+    `default_branch` after a pass/skip verdict.
+
+    Resolves the repo path the same way `coord test`'s checkout step
+    does (local machine's `repo_paths` first, then any machine that
+    knows the repo).  Best-effort: a failed `git checkout` is surfaced
+    as a warning but doesn't fail the verdict recording.
+    """
+    import socket  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    if not assignment.branch:
+        # No branch was ever checked out — nothing to restore.
+        return
+
+    repo = cfg.repo(assignment.repo_name)
+    if repo is None or not repo.default_branch:
+        return
+
+    hostname = socket.gethostname().split(".")[0]
+    local_machine = next(
+        (m for m in cfg.machines if m.name == hostname or m.host.split(".")[0] == hostname),
+        None,
+    )
+    repo_path = None
+    if local_machine:
+        repo_path = local_machine.repo_path(assignment.repo_name)
+    if repo_path is None:
+        for m in cfg.machines:
+            repo_path = m.repo_path(assignment.repo_name)
+            if repo_path:
+                break
+    if repo_path is None:
+        return
+
+    repo_dir = _Path(repo_path).expanduser()
+    if not repo_dir.exists():
+        return
+
+    # Quick early-out: if the user is already on the default branch
+    # (e.g. they switched manually after running `coord test`), there's
+    # nothing to do and no need to announce a no-op.
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo_dir), capture_output=True, text=True, timeout=5,
+        )
+        if head.returncode == 0 and head.stdout.strip() == repo.default_branch:
+            return
+    except (subprocess.TimeoutExpired, OSError):
+        # If we can't even check the current branch, don't try to switch.
+        return
+
+    try:
+        result = subprocess.run(
+            ["git", "checkout", repo.default_branch],
+            cwd=str(repo_dir), capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        click.echo(f"  warning: could not restore default branch: {e}", err=True)
+        return
+    if result.returncode != 0:
+        # Most common cause: dirty working tree from manual edits during
+        # testing.  Surface it so the user can stash + retry manually.
+        click.echo(
+            f"  warning: could not switch back to {repo.default_branch!r}: "
+            f"{result.stderr.strip()}",
+            err=True,
+        )
+        return
+    click.echo(f"  restored: {repo.default_branch} in {repo_dir}")
+
+
 @main.command(help="Pull a worker's branch locally for testing, or record a Test gate verdict.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION
@@ -2798,6 +3085,14 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             click.echo(f"  reason: {reason}")
         elif verdict == "pass":
             click.echo(f"  Run: coord pr {assignment_id} to create the PR")
+
+        # #271 part 1: restore the local checkout to `default_branch`
+        # after a pass/skip verdict — local testing is done, the user
+        # is back to their normal workflow.  `--fail` leaves the
+        # branch checked out (user may want to dig further on the
+        # failure).
+        if verdict in ("pass", "skip"):
+            _restore_default_branch_after_test(cfg, assignment)
         return
 
     # ── Checkout and build ──────────────────────────────────────────────

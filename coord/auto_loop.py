@@ -105,6 +105,10 @@ def process_review_completion(
             detail=f"No structured review output in {log_path!r}",
         )]
 
+    # #253: persist the parsed verdict on the review assignment so the merge
+    # gate can refuse to merge work whose review hasn't approved.
+    review.review_verdict = findings.verdict
+
     if findings.verdict == "approve":
         # Mark the work assignment's review as done for board consistency.
         if review.review_of_assignment_id:
@@ -419,7 +423,9 @@ def run_for_review_transition(
     log_path: str | None = entry.get("log_path")
     actions = process_review_completion(review, board, config, log_path=log_path)
 
-    if any(a.kind == "fix_dispatched" for a in actions):
+    # Save when a fix was dispatched (new assignment) OR an approve was parsed
+    # (so review_verdict is persisted for the merge gate, #253).
+    if any(a.kind in ("fix_dispatched", "approved") for a in actions):
         save_board(board)
 
     return actions

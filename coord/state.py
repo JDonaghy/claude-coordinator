@@ -76,6 +76,7 @@ def _row_to_assignment(row: object) -> Assignment:
         review_posted_at=d.get("review_posted_at"),
         test_state=d.get("test_state"),
         test_reason=d.get("test_reason"),
+        review_verdict=d.get("review_verdict"),
     )
 
 
@@ -109,6 +110,7 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.review_posted_at,
         a.test_state,
         a.test_reason,
+        a.review_verdict,
     )
 
 
@@ -119,14 +121,14 @@ _UPSERT_SQL = """
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
-        review_posted_at, test_state, test_reason
+        review_posted_at, test_state, test_reason, review_verdict
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?
+        ?, ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         status             = excluded.status,
@@ -148,7 +150,8 @@ _UPSERT_SQL = """
         review_iteration   = excluded.review_iteration,
         review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at),
         test_state         = excluded.test_state,
-        test_reason        = excluded.test_reason
+        test_reason        = excluded.test_reason,
+        review_verdict     = COALESCE(excluded.review_verdict, review_verdict)
 """
 
 
@@ -716,6 +719,32 @@ def _infer_review_state(board: Board, conn: sqlite3.Connection) -> None:
             a.review_state = "done"
         else:
             a.review_state = "dispatched"
+
+
+def update_issue_labels(repo_name: str, issue_number: int, labels: list[str]) -> bool:
+    """Update the local ``issues`` row's labels column after a successful
+    GitHub label change.
+
+    Called by ``coord refine`` / ``coord ready`` / ``coord track`` /
+    ``coord backlog`` so the TUI's next data refresh picks up the new
+    label set without waiting for the full ``coord sync`` (which is
+    throttled to once per 5 minutes).
+
+    Returns ``True`` when a row was updated, ``False`` when no row
+    matched (the issue isn't in the local cache yet — it'll be
+    inserted on the next sync; not an error here).
+
+    Does not touch ``state`` or ``synced_at`` — only ``labels``.
+    Updating ``synced_at`` would defeat the brain's age-based pruning
+    of closed rows in ``upsert_open_issues``.
+    """
+    conn = get_connection()
+    cursor = conn.execute(
+        "UPDATE issues SET labels = ? WHERE repo_name = ? AND number = ?",
+        (json.dumps(sorted(set(labels))), repo_name, issue_number),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:

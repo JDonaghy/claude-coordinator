@@ -72,6 +72,50 @@ def classify_conflict(error: str | None) -> str:
     return "unknown"
 
 
+# ── Review gate (#253) ──────────────────────────────────────────────────────
+
+def requires_review(entry: "QueuedMerge", config) -> bool:
+    """True when *entry* must have an approved review before merging.
+
+    Honours both ``config.reviews.enabled`` (the master switch for the
+    adversarial review feature) and ``config.pipeline.default_gates`` (which
+    pipeline stages are enforced for work assignments).  A label-specific
+    pipeline override on the issue is not consulted here — the merge gate
+    operates on the *default* policy because the merge_queue entry doesn't
+    carry the issue's gate list.  Callers wanting per-issue overrides should
+    set ``--skip-review`` for the eligible entry instead.
+    """
+    if not getattr(config, "reviews", None) or not config.reviews.enabled:
+        return False
+    pipeline = getattr(config, "pipeline", None)
+    if pipeline is None:
+        return True
+    return "review" in (pipeline.default_gates or [])
+
+
+def has_approved_review(entry: "QueuedMerge", board) -> bool:
+    """True when a completed review with ``review_verdict='approve'`` exists
+    on *board* for the work assignment behind *entry*.
+
+    Scans both active and completed assignments — a review whose findings
+    were just posted may still be on ``board.active`` for a tick before
+    reconcile moves it to ``completed``.  We accept either, since the
+    verdict is what matters.
+    """
+    target_id = entry.assignment_id
+    if not target_id:
+        return False
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    for a in pool:
+        if getattr(a, "type", None) != "review":
+            continue
+        if getattr(a, "review_of_assignment_id", None) != target_id:
+            continue
+        if getattr(a, "review_verdict", None) == "approve":
+            return True
+    return False
+
+
 @dataclass
 class QueuedMerge:
     assignment_id: str
@@ -210,7 +254,13 @@ class MergeEvent:
 
 
 def _briefing_body(entry: QueuedMerge) -> str:
+    # `Closes #N` makes GitHub auto-close the linked issue when the PR
+    # merges — without it the issue stays stranded open and the TUI's
+    # lifecycle ledger shows the row as In-flight forever (the brain
+    # keeps re-synching it as state=open).  Quadraui #239/#240/#242 hit
+    # this in 2026-05; closing the issues was a manual cleanup.
     return (
+        f"Closes #{entry.issue_number}\n\n"
         f"Automated merge from the coordinator for assignment "
         f"{entry.assignment_id} on issue #{entry.issue_number}.\n\n"
         f"Worker branch: `{entry.branch}` → `{entry.target_branch}`."
@@ -226,6 +276,9 @@ def process(
     presorted: bool = False,
     ci_store: CiStore | None = None,
     force_merge: bool = False,
+    config=None,
+    board=None,
+    skip_review: bool = False,
 ) -> list[MergeEvent]:
     """Open PRs, size them, then merge each pending item.
 
@@ -239,6 +292,13 @@ def process(
     event and halts the group; a still-running check produces ``checks_pending``
     and halts the group.  ``force_merge=True`` skips this gate (the user has
     already seen the failures and chosen to merge anyway).
+
+    #253: When both *config* and *board* are supplied and the entry requires
+    a review (``reviews.enabled`` and ``"review"`` in ``pipeline.default_gates``)
+    but no approved review exists on the board, a ``review_required`` event
+    is emitted and the group is halted.  ``skip_review=True`` bypasses this
+    gate.  When *config* or *board* is None the gate is silently skipped
+    (legacy callers and tests that don't construct a board still work).
 
     Mutates `items` in place; the caller saves the queue after.
     """
@@ -291,6 +351,21 @@ def process(
         for entry in ordered:
             if entry.pr_number is None:
                 continue
+            # Review gate (#253): refuse to merge when a review is required by
+            # the pipeline policy but no approved review is on the board.
+            # --skip-review bypasses for trivial/docs-only merges where the
+            # user has consciously decided review isn't needed.
+            if (
+                not skip_review
+                and config is not None
+                and board is not None
+                and requires_review(entry, config)
+                and not has_approved_review(entry, board)
+            ):
+                msg = "review required but not approved"
+                entry.error = msg
+                events.append(MergeEvent(entry, "review_required", msg))
+                break  # halt this (repo, target) group
             # CI gate (#240): refuse to merge when checks are failed or
             # still running.  --force-merge overrides for the case where the
             # user has seen the failures and wants to merge anyway.

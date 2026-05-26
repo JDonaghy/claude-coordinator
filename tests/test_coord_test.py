@@ -134,6 +134,115 @@ class TestSmokeVerdict:
         assert "not found" in result.output
 
 
+# ── #271 part 1: default-branch restoration after pass/skip ────────────────
+
+
+class TestRestoreDefaultBranch:
+    """`coord test --passed` / `--skipped` should switch the local repo
+    back to its `default_branch` after recording the verdict.  Local
+    testing is done — restore the user's workflow."""
+
+    @patch("subprocess.run")
+    def test_passed_restores_default_branch(
+        self, mock_run: MagicMock,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
+    ) -> None:
+        # First call: rev-parse for current branch (returns the worker
+        # branch). Second call: git checkout main.
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="issue-42-fix-auth\n", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--passed", "--config", str(config_file),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "PASSED" in result.output
+
+        git_calls = [c for c in mock_run.call_args_list if
+                     isinstance(c.args[0], list) and c.args[0][0] == "git"]
+        # Expect rev-parse + checkout main (config_file's default_branch is "main").
+        assert any(c.args[0] == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
+                   for c in git_calls)
+        assert any(c.args[0] == ["git", "checkout", "main"] for c in git_calls)
+
+    @patch("subprocess.run")
+    def test_skipped_restores_default_branch(
+        self, mock_run: MagicMock,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
+    ) -> None:
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="issue-42-fix-auth\n", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--skipped", "--config", str(config_file),
+        ])
+        assert result.exit_code == 0, result.output
+        git_calls = [c for c in mock_run.call_args_list if
+                     isinstance(c.args[0], list) and c.args[0][0] == "git"]
+        assert any(c.args[0] == ["git", "checkout", "main"] for c in git_calls)
+
+    @patch("subprocess.run")
+    def test_failed_leaves_branch_checked_out(
+        self, mock_run: MagicMock,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
+    ) -> None:
+        """--fail must NOT restore — user may want to dig further on the failure."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--fail", "--reason", "broken",
+            "--config", str(config_file),
+        ])
+        assert result.exit_code == 0
+        git_calls = [c for c in mock_run.call_args_list if
+                     isinstance(c.args[0], list) and c.args[0][0] == "git"]
+        # No git checkout main — only the verdict was recorded.
+        assert not any(c.args[0] == ["git", "checkout", "main"] for c in git_calls)
+
+    @patch("subprocess.run")
+    def test_already_on_default_branch_is_silent_no_op(
+        self, mock_run: MagicMock,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
+    ) -> None:
+        """When `rev-parse HEAD` says we're already on `main`, the
+        helper doesn't attempt a no-op `git checkout main` and doesn't
+        echo a misleading 'restored' line."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="main\n", stderr="")
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--passed", "--config", str(config_file),
+        ])
+        assert result.exit_code == 0
+        assert "restored: main" not in result.output
+
+        git_calls = [c for c in mock_run.call_args_list if
+                     isinstance(c.args[0], list) and c.args[0][0] == "git"]
+        # rev-parse only — no checkout.
+        assert any(c.args[0] == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
+                   for c in git_calls)
+        assert not any(c.args[0] == ["git", "checkout", "main"] for c in git_calls)
+
+    @patch("subprocess.run")
+    def test_dirty_tree_failure_warns_but_passes_verdict(
+        self, mock_run: MagicMock,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
+    ) -> None:
+        """If the user has manual edits on the worker branch (dirty
+        tree), git checkout fails.  The verdict still records cleanly
+        and the user gets a warning to stash + retry."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="issue-42-fix-auth\n", stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="error: would overwrite local changes"),
+        ]
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--passed", "--config", str(config_file),
+        ])
+        # Verdict still records (exit 0) even when restore fails.
+        assert result.exit_code == 0
+        assert "PASSED" in result.output
+        assert "warning" in result.output.lower()
+
+
 # ── Branch checkout ─────────────────────────────────────────────────────────
 
 

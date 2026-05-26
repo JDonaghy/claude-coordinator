@@ -131,5 +131,137 @@ def test_briefing_addendum_mentions_stale_repos() -> None:
     ]
     body = format_briefing_addendum(fs)
     assert "Stale dependencies" in body
-    assert "`a` (local x123456" in body
-    assert "`b` is **dirty**" in body
+    # #268: build deps carry a `*(build dep)*` tag; reference repos carry
+    # a `*(reference)*` tag.
+    assert "`a` *(build dep)*" in body
+    assert "local x123456" in body
+    assert "`b` *(build dep)*" in body
+    assert "**dirty**" in body
+
+
+# ── #268: reference_repos ────────────────────────────────────────────────────
+
+
+def test_relevant_repos_includes_transitive_build_deps_and_direct_references() -> None:
+    from coord.freshness import BUILD, REFERENCE, relevant_repos
+
+    cfg = _config(
+        [
+            Repo(
+                name="quadraui",
+                github="acme/quadraui",
+                depends_on=["shared"],
+                reference_repos=["vimcode"],
+            ),
+            Repo(name="vimcode", github="acme/vimcode"),
+            Repo(name="shared", github="acme/shared"),
+        ]
+    )
+    pairs = relevant_repos(_proposal("quadraui"), cfg)
+    assert (("shared", BUILD)) in pairs
+    assert (("vimcode", REFERENCE)) in pairs
+
+
+def test_relevant_repos_dedupes_when_repo_is_both_dep_and_reference() -> None:
+    """If the same name appears in both `depends_on` and `reference_repos`,
+    the stricter `BUILD` tag wins so the briefing doesn't double-tag it."""
+    from coord.freshness import BUILD, relevant_repos
+
+    cfg = _config(
+        [
+            Repo(
+                name="a",
+                github="acme/a",
+                depends_on=["lib"],
+                reference_repos=["lib"],  # duplicate
+            ),
+            Repo(name="lib", github="acme/lib"),
+        ]
+    )
+    pairs = relevant_repos(_proposal("a"), cfg)
+    assert pairs.count(("lib", BUILD)) == 1
+    # No REFERENCE entry for `lib` — dedup'd.
+    kinds_for_lib = [k for n, k in pairs if n == "lib"]
+    assert kinds_for_lib == [BUILD]
+
+
+def test_dependency_freshness_includes_reference_repos() -> None:
+    cfg = _config(
+        [
+            Repo(name="quadraui", github="acme/quadraui", reference_repos=["vimcode"]),
+            Repo(name="vimcode", github="acme/vimcode"),
+        ]
+    )
+    repo_heads = {"vimcode": {"sha": "OLD", "branch": "main", "dirty": False}}
+    github: dict[str, str | None] = {"vimcode": "NEW"}
+
+    fs = dependency_freshness(_proposal("quadraui"), cfg, repo_heads, github)
+    by_repo = {f.repo_name: f for f in fs}
+    assert "vimcode" in by_repo
+    assert by_repo["vimcode"].state == STALE
+    # Tagged as a reference (not a build dep) so the briefing knows.
+    from coord.freshness import REFERENCE
+    assert by_repo["vimcode"].kind == REFERENCE
+
+
+def test_briefing_addendum_labels_reference_repos() -> None:
+    from coord.freshness import REFERENCE
+
+    fs = [
+        compare(
+            "vimcode",
+            {"sha": "OLD12345678", "branch": "main", "dirty": False},
+            "NEW98765432",
+            kind=REFERENCE,
+        ),
+    ]
+    body = format_briefing_addendum(fs)
+    assert "`vimcode` *(reference)*" in body
+    # And the explanatory blurb mentions references.
+    assert "siblings" in body.lower() or "context" in body.lower()
+
+
+def test_reference_repos_does_not_trip_cycle_detector() -> None:
+    """The motivating case: vimcode depends on quadraui (build dep), and
+    quadraui lists vimcode as a reference (sibling-extracted-from).
+    The cycle detector must NOT fire on this — that's precisely why
+    reference_repos is a separate field from depends_on."""
+    from coord.config import _validate_dependencies
+
+    repos = [
+        Repo(name="vimcode", github="acme/vimcode", depends_on=["quadraui"]),
+        Repo(
+            name="quadraui",
+            github="acme/quadraui",
+            depends_on=[],
+            reference_repos=["vimcode"],
+        ),
+    ]
+    # Should not raise.
+    _validate_dependencies(repos)
+
+
+def test_reference_repos_unknown_entry_raises() -> None:
+    from coord.config import ConfigError, _validate_dependencies
+
+    repos = [
+        Repo(
+            name="quadraui",
+            github="acme/quadraui",
+            reference_repos=["nonexistent"],
+        ),
+    ]
+    import pytest
+    with pytest.raises(ConfigError, match="reference_repos unknown"):
+        _validate_dependencies(repos)
+
+
+def test_reference_repos_self_reference_raises() -> None:
+    from coord.config import ConfigError, _validate_dependencies
+
+    repos = [
+        Repo(name="a", github="acme/a", reference_repos=["a"]),
+    ]
+    import pytest
+    with pytest.raises(ConfigError, match="cannot reference itself"):
+        _validate_dependencies(repos)

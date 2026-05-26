@@ -213,6 +213,159 @@ class TestProcess:
         assert all(c[1] != 1 for c in gh.merge_calls)
 
 
+class TestReviewGate:
+    """#253: process() must refuse to merge when reviews are required and
+    no approved review is on the board.
+
+    Reproduces the symptom from quadraui#233: a PR was opened and merged in
+    the same `coord merge` invocation, in 2 seconds, with no review.  These
+    tests cover the regression for both the legacy code path (no config/board
+    passed → gate skipped) and the new code path (config+board passed → gate
+    fires).
+    """
+
+    @staticmethod
+    def _config(*, enabled: bool = True, gates: list[str] | None = None):
+        """Build a minimal config-like object with the fields the gate reads."""
+        from dataclasses import dataclass
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = field(default_factory=_Reviews)
+            pipeline: _Pipeline = field(default_factory=_Pipeline)
+        cfg = _Cfg()
+        cfg.reviews.enabled = enabled
+        cfg.pipeline.default_gates = gates if gates is not None else ["review", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1") -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=aid,
+            type="work",
+            status="done",
+            branch=f"worker/{aid}",
+        )
+
+    @staticmethod
+    def _review(of_aid: str, *, verdict: str | None = "approve", status: str = "done") -> Assignment:
+        return Assignment(
+            machine_name="m2",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=f"rev-{of_aid}",
+            type="review",
+            status=status,
+            review_of_assignment_id=of_aid,
+            review_verdict=verdict,
+        )
+
+    def test_requires_review_helper_honours_config(self) -> None:
+        cfg = self._config(enabled=True, gates=["review", "merge"])
+        assert mq.requires_review(_q("a"), cfg) is True
+        cfg_off = self._config(enabled=False)
+        assert mq.requires_review(_q("a"), cfg_off) is False
+        cfg_no_gate = self._config(enabled=True, gates=["merge"])
+        assert mq.requires_review(_q("a"), cfg_no_gate) is False
+
+    def test_has_approved_review_finds_matching_review(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(_q("w1"), board) is True
+
+    def test_has_approved_review_rejects_request_changes(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", verdict="request-changes")
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(_q("w1"), board) is False
+
+    def test_has_approved_review_ignores_unrelated_reviews(self) -> None:
+        work = self._work("w1")
+        # Approved review but for a different work assignment
+        review = self._review("w99", verdict="approve")
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(_q("w1"), board) is False
+
+    def test_process_emits_review_required_event_and_halts_merge(self) -> None:
+        """The smoking-gun #233 regression: no review on board → no merge_pr call."""
+        cfg = self._config()
+        board = self._board(completed=[self._work("w1")])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        # PR is opened (so the user can inspect) but merge_pr is never called.
+        kinds = [e.kind for e in events]
+        assert "opened" in kinds
+        assert "review_required" in kinds
+        assert "merged" not in kinds
+        assert gh.merge_calls == []
+        # Item remains PENDING with an error so the TUI can surface it.
+        assert items[0].state == PENDING
+        assert items[0].error == "review required but not approved"
+
+    def test_process_proceeds_when_review_is_approved(self) -> None:
+        cfg = self._config()
+        board = self._board(completed=[
+            self._work("w1"),
+            self._review("w1", verdict="approve"),
+        ])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        assert any(e.kind == "merged" for e in events)
+        assert gh.merge_calls and gh.merge_calls[0][1] == 100  # the opened PR
+        assert items[0].state == MERGED
+
+    def test_skip_review_bypasses_gate(self) -> None:
+        """--skip-review must let a no-review merge proceed."""
+        cfg = self._config()
+        board = self._board(completed=[self._work("w1")])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, skip_review=True)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" not in kinds
+        assert "merged" in kinds
+        assert items[0].state == MERGED
+
+    def test_reviews_disabled_bypasses_gate(self) -> None:
+        cfg = self._config(enabled=False)
+        board = self._board(completed=[self._work("w1")])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" not in kinds
+        assert "merged" in kinds
+
+    def test_legacy_callers_without_config_unaffected(self) -> None:
+        """Callers that don't pass config/board still work (no surprise breakage)."""
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh)
+        assert any(e.kind == "merged" for e in events)
+
+
 class TestPendingSummary:
     def test_groups_by_repo_excludes_terminal(self) -> None:
         items = [

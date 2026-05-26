@@ -24,6 +24,8 @@ machines:
     repos: [api]
     repo_paths:
       api: /tmp/api
+reviews:
+  enabled: false
 """
 
 
@@ -180,6 +182,116 @@ class TestMergeCommand:
         assert persisted[0].state == mq.HUMAN_REQUIRED, (
             f"expected HUMAN_REQUIRED, got {persisted[0].state!r}"
         )
+
+    def test_review_gate_refuses_merge_without_approval(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#253 regression: reproduces the quadraui#233 scenario.
+
+        With reviews enabled and a done-work assignment that has no review on
+        the board, `coord merge` must refuse: PR may open (so the user can
+        inspect) but ``gh pr merge`` must NOT be called.
+        """
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        # Config with reviews enabled and "review" in the default gate set.
+        config_file.write_text(CONFIG_YAML.replace(
+            "reviews:\n  enabled: false\n", ""
+        ))
+
+        work = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=233,
+            issue_title="#233",
+            assignment_id="w233",
+            type="work",
+            status="done",
+            branch="issue-233-fix",
+        )
+        save_board(Board(active=[], completed=[work]))
+        _seed_queue([_entry("w233")])
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10):
+            create.return_value = {"number": 999, "url": "u/999", "existed": False}
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "review_required" in result.output
+        # The smoking gun: merge_pr must not have been called.
+        merge_fn.assert_not_called()
+
+    def test_skip_review_flag_bypasses_gate(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#253: --skip-review must allow merging without an approved review."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        config_file.write_text(CONFIG_YAML.replace(
+            "reviews:\n  enabled: false\n", ""
+        ))
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=234,
+            issue_title="#234", assignment_id="w234", type="work",
+            status="done", branch="issue-234-fix",
+        )
+        save_board(Board(active=[], completed=[work]))
+        _seed_queue([_entry("w234")])
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10):
+            create.return_value = {"number": 998, "url": "u/998", "existed": False}
+            merge_fn.return_value = (True, "ok")
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--skip-review"],
+            )
+
+        assert result.exit_code == 0, result.output
+        # Surface the override to the user.
+        assert "skip-review" in result.output or "skip_review" in result.output
+        merge_fn.assert_called_once()
+
+    def test_review_gate_merges_when_approved(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#253: an approved review on the board lets the merge proceed."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        config_file.write_text(CONFIG_YAML.replace(
+            "reviews:\n  enabled: false\n", ""
+        ))
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=235,
+            issue_title="#235", assignment_id="w235", type="work",
+            status="done", branch="issue-235-fix",
+        )
+        review = Assignment(
+            machine_name="other", repo_name="api", issue_number=235,
+            issue_title="[review] #235", assignment_id="rev-w235",
+            type="review", status="done",
+            review_of_assignment_id="w235",
+            review_verdict="approve",
+        )
+        save_board(Board(active=[], completed=[work, review]))
+        _seed_queue([_entry("w235")])
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10):
+            create.return_value = {"number": 997, "url": "u/997", "existed": False}
+            merge_fn.return_value = (True, "ok")
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        merge_fn.assert_called_once()
 
     def test_order_override(self, config_file: Path, coord_dir: Path) -> None:
         _seed_queue([_entry("a"), _entry("b"), _entry("c")])

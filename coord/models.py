@@ -30,6 +30,17 @@ class Repo:
     worker_permissions: WorkerPermissionsConfig | None = None
     housekeeping: list[str] = field(default_factory=list)
     coordinator_only_files: list[str] = field(default_factory=list)
+    # #268: repos a worker may reference for context but doesn't actually
+    # build against.  Common cases: sister projects extracted from a
+    # common ancestor (quadraui ← vimcode), reference implementations,
+    # "lift X out of Y into Z" issues.
+    #
+    # Honoured by the freshness check (pulled alongside `depends_on`)
+    # but ignored by the cycle detector — so a repo can list a sibling
+    # that already points back via `depends_on` without tripping the
+    # validator.  Reference entries do NOT walk transitively — they're
+    # a flat list.
+    reference_repos: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -108,6 +119,12 @@ class Assignment:
     # this being passed/skipped (or no Test stage configured).
     test_state: str | None = None
     test_reason: str | None = None
+    # #253: parsed adversarial-review verdict for type="review" assignments.
+    # None | "approve" | "request-changes". Set when notify or auto_loop
+    # extracts the structured REVIEW_VERDICT from the reviewer's log; consumed
+    # by the merge-queue gate (`has_approved_review`) to refuse merging work
+    # whose review has not approved.
+    review_verdict: str | None = None
 
 
 @dataclass
