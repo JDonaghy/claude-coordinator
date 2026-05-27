@@ -28,9 +28,9 @@ You (coordinator)
 ## Quick Demo
 
 ```bash
-pip install -e .
-coord init                    # interactive setup: detects repos, writes coordinator.yml
-coord agent &                 # start the agent server (port 7433)
+pip install claude-coordinator     # from PyPI
+coord init                         # interactive setup: detects repos, writes coordinator.yml
+coord agent &                      # start the agent server (port 7433) — see "Quick Start" for the systemd setup
 
 coord assign laptop myrepo 42 --model sonnet --briefing "Fix the auth bug"
 # → laptop → myrepo #42: Fix the auth middleware timeout
@@ -55,10 +55,12 @@ coord pr a1b2c3               # dispatch a worker to create the PR
 ### 1. Install
 
 ```bash
-git clone https://github.com/JDonaghy/claude-coordinator.git ~/src/claude-coordinator
-cd ~/src/claude-coordinator
-pip install -e .
+pip install claude-coordinator
 ```
+
+That's it. The `coord` CLI is now on your PATH. The same package provides the agent server (`coord agent` subcommand), so you don't need separate installs for the coordinator side and the worker side.
+
+> **Developing the coordinator itself?** Clone the repo and `pip install -e .` instead. Reserve editable installs for development machines; agent machines should always be PyPI installs (see [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md)).
 
 ### 2. Configure
 
@@ -71,17 +73,29 @@ Or copy `coordinator.example.yml` and edit it by hand. `coordinator.yml` is giti
 
 ### 3. Start the agent server
 
+For a quick local trial:
+
 ```bash
 coord agent &     # runs on port 7433; auto-detects machine from hostname
 ```
 
+For anything beyond a quick trial, use the installer script (sets up a systemd user service with auto-restart, survives reboots, separates worker logs from your shell):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash
+```
+
+The script also works on remote worker machines — see [Worker Node Setup](#worker-node-setup).
+
 ### 4. Coordinate
 
-**Option A — Use the /coordinator slash command in Claude Code:**
+You have three ways to drive the coordinator:
 
-Open Claude Code in the repo, type `/coordinator`. It handles first-time setup, issue triage, dispatch, monitoring, smoke tests, and PR creation. The slash command is at `.claude/commands/coordinator.md`.
+**Option A — `coord-tui` (recommended for interactive use):**
 
-**Option B — Use the CLI directly:**
+A terminal UI with live status, a pipeline view, keyboard-driven merge/bounce/watch, and SSE log tailing. Distributed as a separate Rust binary; see the `tui/` directory for build instructions. Once installed, run `coord-tui` from your project root. Pipeline keybinds are in the [Pipeline Lifecycle](#pipeline-lifecycle-status-labels) section.
+
+**Option B — The `coord` CLI directly:**
 
 ```bash
 coord status                              # verify agent is reachable
@@ -89,9 +103,16 @@ coord assign laptop myrepo 42 --model sonnet --briefing "Fix the auth bug"
 coord watch <id>                          # live filtered output
 coord test <id>                           # pull branch, run build + tests
 coord test --passed <id>                  # record result
-coord pr <id>                             # dispatch PR-creation worker
+coord pr <id>                             # dispatch PR-creation worker + adversarial review
+coord notify                              # post completion comments, trigger the auto-loop (run periodically)
 coord merge                               # open PRs and merge in sequence
 ```
+
+**Option C — The `/coordinator` slash command in Claude Code:**
+
+Open Claude Code in the repo, type `/coordinator`. It handles first-time setup, issue triage, dispatch, monitoring, smoke tests, and PR creation. The slash command is at `.claude/commands/coordinator.md`.
+
+The CLI and the TUI are peer clients of the same state (SQLite + `coordinator.yml` + GitHub) — use whichever you prefer for any given operation; they don't conflict. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full picture.
 
 ## Worker Node Setup
 
@@ -169,7 +190,8 @@ See [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md) for diagnostics and r
 | `coord test --fail <id> --reason "..."` | Record smoke test as failed |
 | `coord pr <id> [--no-review]` | Dispatch a worker to create a PR (auto-dispatches adversarial review unless --no-review) |
 | `coord fix <id> [--guidance "..."]` | Dispatch a fix-up worker for a failed smoke test (auto-escalates model) |
-| `coord notify` | Poll agents, post completion/failure comments to GitHub |
+| `coord bounce <review-id>` | Bounce the pipeline back to Work after a `request-changes` review (uses cached findings from the DB) |
+| `coord notify` | Poll agents, post completion/failure comments to GitHub, drive the auto-loop |
 | `coord merge [--dry-run] [--repo NAME] [--method rebase\|squash\|merge] [--order IDs]` | Process merge queue |
 | `coord split <IDs>` | Create sub-issues from split proposals |
 
@@ -334,15 +356,23 @@ The `coord-tui` Pipeline panel organises GitHub issues into five lifecycle secti
 - **Pending → In-progress**: Press `[Go]` in the TUI (or `coord assign`) — automatic once an assignment row exists
 - **In-progress → Done**: Merge the PR; include `Closes #N` in the PR body so GitHub auto-closes the issue
 
-### TUI keyboard shortcuts (Pipeline panel)
+### TUI keyboard shortcuts
 
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Navigate issues |
-| `Enter` | Fire the active pipeline action (`[Go]` / `[Retry]`) |
-| `R` | Immediate refresh from GitHub (force poll) |
-| `D` | Dismiss a Done-section issue from the panel (session-only) |
-| `h` / `l` | Cycle detail tabs (Pipeline → Issue → Stages) |
+| Key | Where | Action |
+|-----|-------|--------|
+| `j` / `k` | Pipeline | Navigate issues |
+| `Enter` | Pipeline | Fire the active pipeline action (`[Go]` / `[Retry]`) |
+| `m` / `M` | Pipeline | Merge the selected issue's PR (surfaces blocked-on-review / blocked-on-CI as toasts) |
+| `f` | Pipeline | Bounce after a `request-changes` review (re-runs the work against the cached findings) |
+| `B` | Pipeline (Done) | Pull branch + run build & tests locally |
+| `W` | Pipeline | Open the Watch overlay (SSE log tail of the active worker) |
+| `[` / `]` | Stages tab | Focus previous / next stage (mouse click also works) |
+| `R` | All | Immediate refresh from GitHub (force poll) |
+| `D` | Pipeline | Dismiss a Done-section issue from the panel (session-only) |
+| `h` / `l` | Detail | Cycle detail tabs (Pipeline → Issue → Stages) |
+| `u` | Machines | Trigger `/update` on the selected agent |
+| `c` | Machines | Clean stale worktrees on the selected agent |
+| `r` | Machines | Restart the selected agent (graceful, waits for active workers) |
 
 The background GitHub poll runs every **60 seconds**; press `R` to refresh on demand.
 
@@ -358,7 +388,7 @@ The background GitHub poll runs every **60 seconds**; press `R` to refresh on de
 - **Multi-repo** — tracks dependency chains between repos; upstream work blocks downstream dispatch
 - **File conflict avoidance** — coordinator ensures no two workers touch the same files simultaneously
 - **Claim detection** — checks board and remote `issue-{N}-*` branches before dispatching; refuses duplicates
-- **Adversarial reviews** — enabled by default: `coord pr` auto-dispatches an independent `claude -p` session that reviews the diff with zero shared context. Works on a single machine — independence comes from a fresh session, not separate hardware
+- **Adversarial reviews + auto-loop** — `coord pr` auto-dispatches an independent `claude -p` session that reviews the diff with zero shared context. If the verdict is `request-changes`, the auto-loop dispatches a fix worker pinned to the original branch; when the fix worker finishes, a fresh review fires automatically. The loop runs up to 3 iterations before asking for human judgment. The whole sequence is driven by `coord notify` — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the end-to-end walk-through. Reviewer independence comes from a fresh session, not separate hardware (it works on a single machine).
 - **Smoke testing** — capability-aware routing (GTK changes → machine with GTK)
 - **Merge queue** — sequences completed PRs with conflict detection and dependency-aware ordering
 - **Progress streaming** — workers emit `STATUS:`/`STUCK:` lines; `coord status` shows real-time progress
@@ -387,10 +417,13 @@ Even with a single machine, the pattern gives you scoping discipline, handoff re
 
 Started on one machine? Add more by:
 
-1. Install `coord` on the new machine (`pip install -e .` from the cloned repo)
-2. Start the agent: `coord agent` (port 7433)
-3. Add it to `coordinator.yml` under `machines:` with its Tailscale hostname
-4. `coord status` shows all machines and their connectivity
+1. On the new machine, run the installer (sets up the venv + systemd service in one shot):
+   ```bash
+   curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash -s -- --machine <name>
+   ```
+   No git clone needed on the worker machine — `install-agent.sh` pulls from PyPI.
+2. Add it to `coordinator.yml` under `machines:` with its Tailscale hostname.
+3. `coord status` from the coordinator machine shows all machines and their connectivity.
 
 For Tailscale setup, see [tailscale.com/kb](https://tailscale.com/kb/). The agent server only needs port 7433 reachable on the tailnet.
 
@@ -430,6 +463,7 @@ When `coord approve` warns about stale dependencies, an upstream repo on the tar
 - Python 3.12+
 - Claude Code CLI with Max or Pro subscription
 - `gh` CLI (authenticated, for coordinator-side GitHub operations)
+- Tailscale — optional, only needed for multi-machine setups
 
 ## Releasing a New Version
 
@@ -443,4 +477,3 @@ When `coord approve` warns about stale dependencies, an upstream repo on the tar
 4. GitHub Actions (`publish.yml`) builds and publishes to PyPI automatically using the `PYPI_API_TOKEN` repository secret. Check the Actions tab for progress.
 
 After the PyPI publish completes, upgrade remote agents — see [Upgrading Agents](#upgrading-agents).
-- Tailscale — optional, only needed for multi-machine setups

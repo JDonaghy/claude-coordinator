@@ -94,7 +94,7 @@ coord agent [--machine NAME]     # Start agent server on this machine (port 7433
 coord web                        # Start web dashboard (port 7434)
 coord config                     # Pretty-print parsed coordinator.yml
 coord version                    # Print version
-coord init                       # Interactive setup (stub — not yet implemented)
+coord init                       # Interactive setup: detects repos + capabilities, writes coordinator.yml
 ```
 
 ## Development
@@ -164,6 +164,7 @@ The coordinator session (typically Opus) costs ~10x more per token than Sonnet w
 
 ## Operational guides
 
+- **Architecture overview**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the CLI, TUI, agent servers, and workers fit together; the agent HTTP API surface; where each `coord` subcommand actually runs; the auto-loop walked end-to-end.
 - **Agents are installed from PyPI**, not from a local git clone. The `~/src/claude-coordinator` directory only exists on the coordinator-development machine; remote agent machines should have only `~/.coord-venv` with `pip install claude-coordinator`. Editable installs on remote agents are the source of most upgrade failures.
 - When an upgrade fails (`coord agent update --machine X` reports `did not come back`, or the version doesn't advance), see [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md). The most common fix is converting an editable install to PyPI — that doc has the exact commands.
 - New machines: `docs/AGENT_OPERATIONS.md` also covers first-time install and verification.
