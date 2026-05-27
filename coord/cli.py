@@ -2222,6 +2222,90 @@ def stop(assignment_id: str, config_path: Path) -> None:
     click.echo(f"Board updated: {assignment.repo_name} #{assignment.issue_number} marked failed")
 
 
+def _maybe_reconcile_branch(
+    assignment, repo_dir, *, original_error: str, config,
+):
+    """When `git checkout <db_branch>` fails, try to learn the PR's actual
+    head ref from GitHub and reconcile the DB.
+
+    Returns the new branch name when reconciliation succeeded (DB
+    updated + checkout retried + succeeded), or `None` when no PR is
+    associated, the gh call failed, the head ref matches what we
+    already had, or the retry checkout also failed.  The caller falls
+    back to the original error in those cases.
+    """
+    from coord.db import get_connection
+
+    # Need a PR number to look up the head ref.  Pull it from the
+    # merge_queue entry for this assignment.
+    aid = assignment.assignment_id
+    if not aid:
+        return None
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT pr_number, repo_github FROM merge_queue "
+        "WHERE assignment_id=?",
+        (aid,),
+    ).fetchone()
+    if row is None:
+        return None
+    pr_number = row["pr_number"]
+    repo_github = row["repo_github"]
+    if pr_number is None or not repo_github:
+        return None
+
+    # Fetch the PR's actual head ref from GitHub.  Returns the real
+    # branch name even when the DB has a stale slug.
+    try:
+        gh = subprocess.run(
+            [
+                "gh", "pr", "view", str(pr_number),
+                "--repo", repo_github,
+                "--json", "headRefName",
+                "--jq", ".headRefName",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    real_branch = gh.stdout.strip()
+    if not real_branch:
+        return None
+    if real_branch == assignment.branch:
+        # The PR DOES point at the DB-recorded branch; checkout failed
+        # for some other reason (local-only clone, network, etc.).
+        # Don't pretend we fixed it.
+        return None
+
+    # Try the checkout with the real branch — must succeed before we
+    # write it back to the DB.
+    try:
+        subprocess.run(
+            ["git", "checkout", real_branch], cwd=str(repo_dir),
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+
+    # Persist the reconciled branch on both tables so future runs of
+    # coord test / coord merge / TUI etc. all see the right value.
+    conn.execute(
+        "UPDATE assignments SET branch=? WHERE assignment_id=?",
+        (real_branch, aid),
+    )
+    conn.execute(
+        "UPDATE merge_queue SET branch=? WHERE assignment_id=?",
+        (real_branch, aid),
+    )
+    conn.commit()
+
+    # Mute the unused 'original_error' / 'config' params — they're
+    # there for future use (e.g. logging context, post-back to GitHub).
+    _ = original_error
+    _ = config
+    return real_branch
+
+
 @main.command("test", help="Queue a smoke test for a completed assignment.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION
@@ -3219,13 +3303,36 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             ["git", "fetch", "origin"], cwd=str(repo_dir),
             check=True, capture_output=True, text=True,
         )
+    except subprocess.CalledProcessError as e:
+        click.echo(f"error: git command failed: {e.stderr.strip()}", err=True)
+        sys.exit(1)
+    try:
         subprocess.run(
             ["git", "checkout", assignment.branch], cwd=str(repo_dir),
             check=True, capture_output=True, text=True,
         )
     except subprocess.CalledProcessError as e:
-        click.echo(f"error: git command failed: {e.stderr.strip()}", err=True)
-        sys.exit(1)
+        # Branch reconciliation: the DB-recorded branch can drift from
+        # reality (auto-loop creating orphan branches before #target_branch
+        # landed; slugifier changing max_len across releases; manual
+        # `git branch -m` on origin).  When checkout fails with a
+        # pathspec error AND the issue has a PR, fetch the PR's actual
+        # headRefName from GitHub, update the DB, and retry.
+        reconciled = _maybe_reconcile_branch(
+            assignment, repo_dir, original_error=e.stderr.strip(), config=cfg,
+        )
+        if reconciled is None:
+            click.echo(
+                f"error: git command failed: {e.stderr.strip()}",
+                err=True,
+            )
+            sys.exit(1)
+        # Re-load the assignment so subsequent code sees the new branch.
+        assignment.branch = reconciled
+        click.echo(
+            f"  branch drift reconciled: {assignment.branch!r} → using "
+            f"the PR's actual head ref",
+        )
 
     click.echo(f"Branch {assignment.branch!r} checked out.")
 

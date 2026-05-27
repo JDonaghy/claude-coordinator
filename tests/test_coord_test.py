@@ -314,3 +314,149 @@ class TestHelpText:
         assert "--passed" in result.output
         assert "--fail" in result.output
         assert "--reason" in result.output
+
+
+# ── Branch reconciliation (#bounce-followup) ────────────────────────────────
+
+
+class TestBranchReconciliation:
+    """When `git checkout <db_branch>` fails with pathspec error AND
+    the assignment has a PR in merge_queue, `coord test` falls back to
+    `gh pr view --json headRefName` to learn the real branch, updates
+    the DB, and retries.  Defends against:
+      - auto-loop creating orphan branches (pre-#target_branch fix)
+      - slugifier max_len changing across releases
+      - manual `git branch -m` on origin
+    """
+
+    @patch("subprocess.run")
+    def test_reconciles_when_pr_has_different_head_ref(
+        self,
+        mock_run: MagicMock,
+        config_file: Path,
+        board_with_done: Board,
+        repo_dir: Path,
+        coord_db,
+    ) -> None:
+        from coord.db import get_connection
+        from coord.state import get_connection as _gc  # ensure import path
+        _ = _gc
+
+        # Seed a merge_queue row pointing the assignment at PR #999.
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO merge_queue "
+            "(assignment_id, repo_name, repo_github, branch, target_branch, "
+            "issue_number, issue_title, state, pr_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "abc123", "api", "acme/api",
+                "issue-42-fix-auth",  # stale name (DB)
+                "main", 42, "Fix auth", "pending", 999,
+            ),
+        )
+        conn.commit()
+
+        # subprocess.run call sequence:
+        # 1. git fetch origin                                → ok
+        # 2. git checkout issue-42-fix-auth                  → FAIL (pathspec)
+        # 3. gh pr view 999 ... --json headRefName --jq ...  → returns the real name
+        # 4. git checkout <real-name>                        → ok
+        # 5. echo build-ok                                   → ok (config_file's build_command)
+        # 6. echo test-ok                                    → ok (config_file's test_command)
+        real_branch = "issue-42-fix-auth-fix-1-additional-error-handling"
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # git fetch
+            subprocess.CalledProcessError(
+                1, "git checkout",
+                stderr="error: pathspec 'issue-42-fix-auth' did not match any file(s) known to git",
+            ),
+            MagicMock(returncode=0, stdout=f"{real_branch}\n", stderr=""),  # gh pr view
+            MagicMock(returncode=0, stdout="", stderr=""),  # git checkout (retry)
+            MagicMock(returncode=0, stdout="", stderr=""),  # echo build-ok
+            MagicMock(returncode=0, stdout="", stderr=""),  # echo test-ok
+        ]
+
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--config", str(config_file),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "drift reconciled" in result.output
+        # DB was updated.
+        row = conn.execute(
+            "SELECT branch FROM merge_queue WHERE assignment_id='abc123'",
+        ).fetchone()
+        assert row["branch"] == real_branch
+        row2 = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id='abc123'",
+        ).fetchone()
+        assert row2["branch"] == real_branch
+
+    @patch("subprocess.run")
+    def test_falls_through_to_error_when_no_pr_in_merge_queue(
+        self,
+        mock_run: MagicMock,
+        config_file: Path,
+        board_with_done: Board,
+        repo_dir: Path,
+        coord_db,
+    ) -> None:
+        """No PR registered → can't ask GitHub.  Reconciliation
+        returns None and the original git error is surfaced."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # git fetch
+            subprocess.CalledProcessError(
+                1, "git checkout",
+                stderr="error: pathspec 'issue-42-fix-auth' did not match",
+            ),
+        ]
+
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--config", str(config_file),
+        ])
+        assert result.exit_code != 0
+        assert "pathspec" in result.output
+
+    @patch("subprocess.run")
+    def test_does_not_reconcile_when_head_ref_matches_db(
+        self,
+        mock_run: MagicMock,
+        config_file: Path,
+        board_with_done: Board,
+        repo_dir: Path,
+        coord_db,
+    ) -> None:
+        """The PR's headRefName equals the DB-recorded branch — the
+        checkout failure is unrelated (e.g. local clone missing the
+        ref).  Don't pretend we fixed it; surface the original error."""
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO merge_queue "
+            "(assignment_id, repo_name, repo_github, branch, target_branch, "
+            "issue_number, issue_title, state, pr_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "abc123", "api", "acme/api",
+                "issue-42-fix-auth", "main", 42, "Fix auth",
+                "pending", 999,
+            ),
+        )
+        conn.commit()
+
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # git fetch
+            subprocess.CalledProcessError(
+                1, "git checkout",
+                stderr="error: pathspec 'issue-42-fix-auth' did not match",
+            ),
+            # gh returns the SAME branch — no drift, nothing to fix.
+            MagicMock(returncode=0, stdout="issue-42-fix-auth\n", stderr=""),
+        ]
+
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--config", str(config_file),
+        ])
+        assert result.exit_code != 0
+        assert "pathspec" in result.output
+        assert "drift reconciled" not in result.output
