@@ -2321,6 +2321,85 @@ def retry(assignment_id: str, config_path: Path) -> None:
     )
 
 
+@main.command(
+    help=(
+        "Bounce the pipeline back to Work after a review requested changes. "
+        "Dispatches a fix worker that reads the reviewer's findings as its "
+        "briefing and pushes corrections to the same branch."
+    ),
+)
+@click.argument("review_assignment_id")
+@_CONFIG_OPTION
+def bounce(review_assignment_id: str, config_path: Path) -> None:
+    """Manual trigger for the auto-loop's fix-dispatch path.
+
+    `coord notify` already runs this automatically the first time a
+    review completion is observed, but the auto-loop bails when the
+    review log isn't reachable at that moment (remote agent offline /
+    log pruned).  This command re-runs the same dispatch on demand —
+    useful as a recovery path for the user and as the TUI's "Fix"
+    button.
+    """
+    from coord.auto_loop import process_review_completion
+    from coord.state import COORD_DIR, build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+    board = load_board() or build_board()
+
+    review = board.find_by_id(review_assignment_id)
+    if review is None:
+        click.echo(
+            f"error: assignment {review_assignment_id!r} not found in board",
+            err=True,
+        )
+        sys.exit(1)
+    if review.type != "review":
+        click.echo(
+            f"error: {review_assignment_id} is type={review.type!r}, not 'review'. "
+            f"Pass the review assignment id, not the work assignment id.",
+            err=True,
+        )
+        sys.exit(1)
+    if review.review_verdict not in ("request-changes", None):
+        click.echo(
+            f"info: review verdict is {review.review_verdict!r} — only "
+            f"'request-changes' triggers a fix dispatch. Nothing to do.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Try local log first; fall back to agent HTTP /logs when the
+    # review ran on a remote machine and the file isn't on this
+    # coordinator's filesystem.
+    machine = next(
+        (m for m in cfg.machines if m.name == review.machine_name), None,
+    )
+    machine_host = machine.host if machine and machine.host else None
+    local_log = COORD_DIR / "logs" / f"{review_assignment_id}.log"
+    log_path = str(local_log) if local_log.exists() else None
+
+    actions = process_review_completion(
+        review,
+        board,
+        cfg,
+        log_path=log_path,
+        machine_host=machine_host,
+    )
+
+    dispatched = any(a.kind == "fix_dispatched" for a in actions)
+    if dispatched:
+        save_board(board)
+
+    for a in actions:
+        click.echo(f"{a.kind}: {a.detail}")
+
+    if not dispatched:
+        # Distinguish "approve" (clean exit) from genuine failure modes.
+        if any(a.kind == "approved" for a in actions):
+            sys.exit(0)
+        sys.exit(1)
+
+
 @main.command(help="Sync open issues from GitHub into the local SQLite cache.")
 @_CONFIG_OPTION
 @click.option("--quiet", "-q", is_flag=True, help="Suppress per-repo output.")

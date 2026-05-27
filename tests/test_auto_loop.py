@@ -59,6 +59,26 @@ def config_loop_disabled(repo: Repo, machine: Machine) -> Config:
     )
 
 
+@pytest.fixture
+def config_path(tmp_path, coord_db):
+    """Write a minimal coordinator.yml so `coord bounce` can `_load_config` it.
+
+    `coord_db` is requested to set up the per-test SQLite home — the
+    bounce CLI loads/saves the board through that DB.
+    """
+    _ = coord_db  # required for save_board / load_board path
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n    default_branch: main\n"
+        "machines:\n"
+        "  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "    repo_paths:\n      api: /work/api\n"
+        "pipeline:\n  auto_loop: true\n  max_review_iterations: 3\n"
+    )
+    return p
+
+
 def _work_assignment(
     assignment_id: str = "work-abc",
     branch: str = "issue-1-fix",
@@ -680,3 +700,198 @@ class TestRunForReviewTransition:
         # Review not found on board → no actions (empty list or no_findings)
         # Should not raise; either returns [] or a no_findings/no_work_found action
         assert isinstance(actions, list)
+
+
+# ── coord bounce CLI + HTTP fallback ────────────────────────────────────────
+
+
+class TestProcessReviewCompletionAgentFallback:
+    """When the local log isn't reachable, process_review_completion
+    falls back to fetching the structured findings via the agent's
+    `/logs/<id>` HTTP endpoint.  Closes the gap that left quadraui#166
+    without an auto-fix dispatch."""
+
+    def test_falls_back_to_agent_when_local_log_missing(
+        self, config: Config, monkeypatch
+    ) -> None:
+        review = _review_assignment()
+        work = _work_assignment()
+        board = _board_with(work, review)
+
+        # Local log doesn't exist; agent HTTP returns findings.
+        from coord.review import ReviewFindings
+        called = {}
+
+        def fake_agent(host, aid, *args, **kwargs):
+            called["host"] = host
+            called["aid"] = aid
+            return ReviewFindings(
+                verdict="request-changes",
+                body="Issue in src/main.py — handle None case.",
+            )
+
+        monkeypatch.setattr(
+            "coord.auto_loop.parse_review_from_agent", fake_agent,
+        )
+
+        def fake_dispatch(*args, **kwargs):
+            # Stub the dispatch so the test doesn't need an agent server.
+            from coord.models import Assignment as A
+            return A(
+                machine_name="laptop", repo_name="api",
+                issue_number=42, issue_title="t", briefing="",
+                assignment_id="fix-1", status="running",
+                type="work", review_iteration=1,
+                review_of_assignment_id=work.assignment_id,
+            )
+
+        monkeypatch.setattr("coord.auto_loop._dispatch_fix", fake_dispatch)
+
+        actions = process_review_completion(
+            review,
+            board,
+            config,
+            log_path=None,  # no local log
+            machine_host="elitebook.tailnet",
+        )
+
+        assert called.get("host") == "elitebook.tailnet"
+        assert called.get("aid") == review.assignment_id
+        # Should have dispatched a fix worker via the HTTP-fetched findings.
+        assert any(a.kind == "fix_dispatched" for a in actions), actions
+
+    def test_no_fallback_when_no_host_supplied(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Without a machine_host the function can't fall back — must
+        still degrade to no_findings rather than crash."""
+        review = _review_assignment()
+        work = _work_assignment()
+        board = _board_with(work, review)
+
+        # The agent fallback must NOT be invoked when host is None.
+        def boom(*args, **kwargs):
+            raise AssertionError("parse_review_from_agent should not be called")
+
+        monkeypatch.setattr("coord.auto_loop.parse_review_from_agent", boom)
+
+        actions = process_review_completion(
+            review, board, config, log_path=None, machine_host=None,
+        )
+        assert actions[0].kind == "no_findings"
+
+
+class TestCoordBounceCommand:
+    """The `coord bounce <review-id>` CLI command — manual trigger
+    for the auto-loop's fix-dispatch path, used by the TUI's F key /
+    'Address review findings' action."""
+
+    def test_bounce_dispatches_when_verdict_is_request_changes(
+        self, config_path, monkeypatch
+    ) -> None:
+        """Happy path: review with request-changes → fix worker
+        dispatched, exit 0, board saved."""
+        from click.testing import CliRunner
+        from coord.cli import main as cli_main
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        # Seed the board with paired work + review (request-changes).
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="t", briefing="b",
+            assignment_id="work-1", status="done",
+            type="work", branch="issue-42-t",
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="t", briefing="",
+            assignment_id="review-1", status="done",
+            type="review", review_of_assignment_id="work-1",
+            review_verdict="request-changes",
+        )
+        save_board(Board(completed=[work, review]))
+
+        # Stub the dispatch so the test doesn't need a live agent.
+        def fake_dispatch(*args, **kwargs):
+            return Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=42, issue_title="t", briefing="",
+                assignment_id="fix-1", status="running",
+                type="work", review_iteration=1,
+                review_of_assignment_id="work-1",
+            )
+
+        monkeypatch.setattr("coord.auto_loop._dispatch_fix", fake_dispatch)
+
+        # Stub findings — bypass the log/HTTP path entirely.
+        from coord.review import ReviewFindings
+        monkeypatch.setattr(
+            "coord.auto_loop.parse_review_from_agent",
+            lambda *a, **kw: ReviewFindings(verdict="request-changes", body="fix x"),
+        )
+
+        result = CliRunner().invoke(cli_main, [
+            "bounce", "review-1", "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "fix_dispatched" in result.output
+
+    def test_bounce_refuses_when_verdict_is_approve(
+        self, config_path
+    ) -> None:
+        from click.testing import CliRunner
+        from coord.cli import main as cli_main
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        review = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="t", briefing="",
+            assignment_id="review-2", status="done",
+            type="review", review_of_assignment_id="work-1",
+            review_verdict="approve",
+        )
+        save_board(Board(completed=[review]))
+
+        result = CliRunner().invoke(cli_main, [
+            "bounce", "review-2", "--config", str(config_path),
+        ])
+        # Refuses with a clear message; doesn't dispatch anything.
+        assert result.exit_code != 0
+        assert "request-changes" in result.output
+
+    def test_bounce_refuses_when_assignment_not_review(
+        self, config_path
+    ) -> None:
+        from click.testing import CliRunner
+        from coord.cli import main as cli_main
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="t", briefing="b",
+            assignment_id="work-3", status="done", type="work",
+        )
+        save_board(Board(completed=[work]))
+
+        result = CliRunner().invoke(cli_main, [
+            "bounce", "work-3", "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "not 'review'" in result.output or "work" in result.output.lower()
+
+    def test_bounce_unknown_assignment_id(self, config_path) -> None:
+        from click.testing import CliRunner
+        from coord.cli import main as cli_main
+        from coord.models import Board
+        from coord.state import save_board
+
+        save_board(Board())
+
+        result = CliRunner().invoke(cli_main, [
+            "bounce", "nope", "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "not found" in result.output

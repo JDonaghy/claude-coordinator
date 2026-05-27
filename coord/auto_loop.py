@@ -43,7 +43,7 @@ import httpx
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord.models import Assignment, Board
-from coord.review import parse_review_from_log
+from coord.review import ReviewFindings, parse_review_from_agent, parse_review_from_log
 from coord.state import load_board, record_dispatched_assignment, save_board
 
 log = logging.getLogger(__name__)
@@ -70,17 +70,48 @@ class LoopAction:
 
 # ── Core logic ────────────────────────────────────────────────────────────────
 
+def _load_review_findings(
+    review: Assignment,
+    log_path: str | None,
+    machine_host: str | None,
+) -> ReviewFindings | None:
+    """Resolve a reviewer's structured findings.
+
+    Preferred source is the local stream-json / plain-text log; falls
+    back to fetching via the agent's ``/logs/<id>`` HTTP endpoint when
+    the local file isn't reachable.  Mirrors `notify._try_parse_and_post_review`'s
+    discipline — fixing the case where a remote agent's log wasn't on
+    the coordinator's filesystem at notify time (the bug that left
+    quadraui#166 without an auto-fix dispatch).
+    """
+    findings = parse_review_from_log(log_path) if log_path else None
+    if findings is not None:
+        return findings
+    if machine_host:
+        try:
+            findings = parse_review_from_agent(machine_host, review.assignment_id or "")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "auto_loop: failed to fetch review log from agent %s for %s: %s",
+                machine_host, review.assignment_id, exc,
+            )
+            findings = None
+    return findings
+
+
 def process_review_completion(
     review: Assignment,
     board: Board,
     config: Config,
     *,
     log_path: str | None = None,
+    machine_host: str | None = None,
     http_client: httpx.Client | None = None,
 ) -> list[LoopAction]:
     """Process a completed review assignment through the auto-loop.
 
-    Parses the reviewer's verdict from *log_path*, then either:
+    Parses the reviewer's verdict (local log or agent HTTP fallback when
+    *machine_host* is supplied), then either:
 
     - Returns an ``approved`` action (no side effects) if verdict is
       ``approve``.
@@ -94,15 +125,18 @@ def process_review_completion(
     if not config.pipeline.auto_loop:
         return [LoopAction(kind="disabled", assignment_id=review.assignment_id)]
 
-    findings = parse_review_from_log(log_path) if log_path else None
+    findings = _load_review_findings(review, log_path, machine_host)
     if findings is None:
         log.debug(
-            "auto_loop: no structured REVIEW_VERDICT in %s — skipping", log_path
+            "auto_loop: no structured REVIEW_VERDICT for %s (log=%r, host=%r) — skipping",
+            review.assignment_id, log_path, machine_host,
         )
         return [LoopAction(
             kind="no_findings",
             assignment_id=review.assignment_id,
-            detail=f"No structured review output in {log_path!r}",
+            detail=(
+                f"No structured review output (log={log_path!r}, host={machine_host!r})"
+            ),
         )]
 
     # #253: persist the parsed verdict on the review assignment so the merge
@@ -425,7 +459,22 @@ def run_for_review_transition(
         return []
 
     log_path: str | None = entry.get("log_path")
-    actions = process_review_completion(review, board, config, log_path=log_path)
+    # #fix-cli: include the agent's host so the auto-loop can fall back
+    # to HTTP /logs/<id> when the local log isn't on this filesystem
+    # (the gap that left quadraui#166 without a fix dispatch).
+    machine_host: str | None = None
+    machine_name = record.get("machine_name")
+    if machine_name:
+        machine = next((m for m in config.machines if m.name == machine_name), None)
+        if machine is not None and machine.host:
+            machine_host = machine.host
+    actions = process_review_completion(
+        review,
+        board,
+        config,
+        log_path=log_path,
+        machine_host=machine_host,
+    )
 
     # Save when a fix was dispatched (new assignment) OR an approve was parsed
     # (so review_verdict is persisted for the merge gate, #253).

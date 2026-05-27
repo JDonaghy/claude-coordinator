@@ -6088,6 +6088,70 @@ impl CoordApp {
         }
     }
 
+    /// Find the most-recent review assignment id for the selected Pipeline
+    /// row whose verdict is `request-changes`.  Used by the Fix action
+    /// (action bar + right-click menu + F keybind) to identify which
+    /// review's findings the dispatched fix worker should address.
+    fn selected_pipeline_review_id_for_bounce(&self) -> Option<String> {
+        if self.active_view != SidebarView::Pipeline {
+            return None;
+        }
+        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let entry = self
+            .data
+            .merge_queue
+            .iter()
+            .find(|m| m.issue_number == Some(issue.number))?;
+        let work_id = entry.assignment_id.clone();
+        // Most-recent review (highest dispatched_at) paired with this
+        // work and carrying a request-changes verdict.
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.assignment_type.as_deref() == Some("review"))
+            .filter(|a| a.review_of_assignment_id.as_deref() == Some(&work_id))
+            .filter(|a| a.review_verdict.as_deref() == Some("request-changes"))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|a| a.id.clone())
+    }
+
+    /// Dispatch `coord bounce <review-id>` for the selected Pipeline row.
+    /// Returns `true` when a command was actually spawned; toasts and
+    /// returns `false` when the row isn't actionable (no
+    /// request-changes verdict, no review pairing, etc.).
+    fn dispatch_bounce_for_selected_pipeline_row(&mut self) -> bool {
+        let Some(review_id) = self.selected_pipeline_review_id_for_bounce() else {
+            self.push_toast(
+                "Bounce",
+                "No request-changes review found for this row — nothing to address.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let spawned = self.command_runner.spawn(&["bounce", &review_id]);
+        if spawned {
+            self.push_toast(
+                "Bounce",
+                &format!(
+                    "Dispatching fix worker for review {}\u{2026}",
+                    &review_id[..review_id.len().min(8)],
+                ),
+                ToastSeverity::Info,
+            );
+        } else {
+            self.push_toast(
+                "Bounce",
+                "Another command is running — try again in a moment.",
+                ToastSeverity::Warning,
+            );
+        }
+        spawned
+    }
+
     /// Look up the CI summary for the currently-selected pipeline issue's
     /// merge queue entry.  Returns `None` when no PR is queued for the
     /// selected issue, or when no summary has been fetched yet.
@@ -7959,6 +8023,37 @@ impl CoordApp {
     /// Start variants from #262 — Start with Plan (dispatches a Plan
     /// worker first, gated by `coord approve-plan`) and Skip Plan
     /// (dispatches Work directly).  Other states omit them.
+    /// True when the row identified by `issue_number` has at least one
+    /// review-typed assignment with `verdict='request-changes'`.  Drives
+    /// the "Address review findings" menu / action-bar item — only
+    /// shown when there's actually a review for the user to address.
+    fn selected_row_has_request_changes_for(&self, issue_number: Option<u64>) -> bool {
+        let Some(num) = issue_number else { return false; };
+        // Match by issue number across both review and work assignments;
+        // the link is via review_of_assignment_id.  Filter the review
+        // pool by issue_number directly — cheaper than walking the
+        // merge_queue too.
+        let work_ids: Vec<&str> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == num)
+            .filter(|a| a.assignment_type.as_deref() == Some("work"))
+            .filter_map(|a| Some(a.id.as_str()))
+            .collect();
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.assignment_type.as_deref() == Some("review"))
+            .filter(|a| a.review_verdict.as_deref() == Some("request-changes"))
+            .any(|a| {
+                a.review_of_assignment_id
+                    .as_deref()
+                    .map(|id| work_ids.iter().any(|w| *w == id))
+                    .unwrap_or(false)
+            })
+    }
+
     fn context_menu_items_for_pipeline_row(
         &self,
         issue_number: Option<u64>,
@@ -7986,6 +8081,18 @@ impl CoordApp {
                         .with_shortcut("Enter"),
                 );
                 items.push(ContextMenuItem::action("stop", "Stop"));
+                // #bounce: when the latest review wants changes, offer to
+                // dispatch a fix worker (auto-loop's path) right from
+                // the row menu.  Shows up while the row is still
+                // "in-progress" because the work assignment may have
+                // completed but the issue's open state classifies it
+                // as InProgress (assignments + issue open).
+                if self.selected_row_has_request_changes_for(issue_number) {
+                    items.push(
+                        ContextMenuItem::action("bounce", "Address review findings")
+                            .with_shortcut("f"),
+                    );
+                }
                 items.push(ContextMenuItem::separator());
             }
             PipelineRowLifecycle::Done => {
@@ -8294,6 +8401,16 @@ impl CoordApp {
                         ToastSeverity::Warning,
                     );
                 }
+                true
+            }
+            // #bounce: address review findings — dispatches a fix
+            // worker for the most recent review-typed assignment whose
+            // verdict is `request-changes`.  Same code path as the auto-
+            // loop's automatic bounce; this is the manual trigger for
+            // when the auto-loop didn't fire (remote log unreachable,
+            // notify happened too late, etc.) or for retrying.
+            "bounce" => {
+                self.dispatch_bounce_for_selected_pipeline_row();
                 true
             }
             // Pipeline:InProgress — Stop cancels the running worker.
@@ -8907,6 +9024,7 @@ fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "watch" => Some("◉"),
         "stop" => Some("■"),
         "open-pr" => Some("↗"),
+        "bounce" => Some("↺"),
         // Panel-level verbs (`toolbar:<verb>` keys after the prefix).
         "notify" => Some("ⓘ"),
         "retry" => Some("↻"),
@@ -10380,6 +10498,20 @@ impl ShellApp for CoordApp {
                             self.pending_test_fail = Some((0, String::new()));
                             needs_redraw = true;
                         }
+                    }
+
+                    // #bounce: lowercase f = bounce the pipeline back
+                    // to a fix worker when the selected Pipeline row has
+                    // a request-changes review.  Uppercase F is the
+                    // Test-fail key (handled above) and only fires when
+                    // the test gate is actionable, so the two don't
+                    // overlap in practice.
+                    Key::Char('f')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.selected_pipeline_review_id_for_bounce().is_some() =>
+                    {
+                        self.dispatch_bounce_for_selected_pipeline_row();
+                        needs_redraw = true;
                     }
 
                     // ── #235 Phase 1: B = build (fetch + checkout +
@@ -15873,6 +16005,114 @@ mod tests {
             "Pipeline:Done menu must offer Open PR; got {:?}",
             action_ids,
         );
+    }
+
+    #[test]
+    fn pipeline_row_offers_bounce_when_review_requested_changes() {
+        // When a review came back as request-changes, the action bar
+        // surfaces "Address review findings" so the user can dispatch
+        // a fix worker without leaving the TUI.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        // Work + paired review with request-changes.
+        let mut work = _work_assignment("w1", 100.0, "done", None);
+        work.issue_number = 42;
+        app.data.assignments.push(work);
+        let mut review = _stage_assignment("rev-w1", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_of_assignment_id = Some("w1".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(review);
+
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::InProgress,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            action_ids.contains(&"bounce"),
+            "InProgress row with request-changes review must offer 'bounce'; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn pipeline_row_no_bounce_when_review_approved() {
+        // Approved reviews shouldn't offer the bounce action — there's
+        // nothing to fix.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let mut work = _work_assignment("w1", 100.0, "done", None);
+        work.issue_number = 42;
+        app.data.assignments.push(work);
+        let mut review = _stage_assignment("rev-w1", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_of_assignment_id = Some("w1".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::InProgress,
+        );
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            !action_ids.contains(&"bounce"),
+            "approved review should not offer bounce; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn dispatch_bounce_toasts_and_spawns_when_request_changes() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        // Seed merge_queue + work + request-changes review for issue 42.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(review);
+
+        let toasts_before = app.toasts.len();
+        let acted = app.dispatch_bounce_for_selected_pipeline_row();
+        assert!(acted, "bounce must dispatch when a request-changes review exists");
+        assert!(app.toasts.len() > toasts_before);
+        let body = app.toasts.last().expect("toast").0.body.to_string();
+        assert!(
+            body.to_lowercase().contains("rev-w42") || body.to_lowercase().contains("fix"),
+            "toast should mention dispatch; got {body:?}",
+        );
+    }
+
+    #[test]
+    fn dispatch_bounce_toasts_without_spawn_when_no_request_changes() {
+        // No review pairing → bounce is a no-op with an explanatory toast.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        let toasts_before = app.toasts.len();
+        let acted = app.dispatch_bounce_for_selected_pipeline_row();
+        assert!(!acted, "no spawn when nothing to bounce");
+        assert!(app.toasts.len() > toasts_before);
     }
 
     #[test]
