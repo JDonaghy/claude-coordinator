@@ -482,6 +482,30 @@ enum BoardRowLifecycle {
     Unknown,
 }
 
+/// Whether a Merge action against the currently-selected Pipeline row
+/// will actually do something useful.  Drives both the dispatch path
+/// (so silent no-ops become actionable toasts) and the toolbar button's
+/// enabled state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PipelineMergeState {
+    /// View isn't the Pipeline panel, or no row is selected.
+    NotApplicable,
+    /// Selected issue has no merge_queue entry — the worker hasn't
+    /// pushed a branch / opened a PR yet.
+    NoQueue { issue: u64 },
+    /// Selected issue's merge_queue entry is already merged.
+    Merged { issue: u64 },
+    /// Adversarial-review verdict isn't `approve` (`request-changes`,
+    /// `pending`, or never run).  Server-side `coord merge` will
+    /// refuse; surfacing it here gives the user actionable feedback.
+    BlockedOnReview { issue: u64, verdict: String },
+    /// CI checks are failed for the PR.  Falls through to the existing
+    /// `pending_force_merge` confirm prompt so the user can opt in.
+    BlockedOnCi { issue: u64, repo: String },
+    /// Safe to dispatch `coord merge --repo <repo>`.
+    Ready { issue: u64, repo: String },
+}
+
 /// #259: one item in an open context menu.  Lightweight engine-side
 /// shape converted to `quadraui::ContextMenuItem` at render time.
 #[derive(Clone, Debug)]
@@ -5920,6 +5944,150 @@ impl CoordApp {
         !approved
     }
 
+    /// Classification of whether a Merge action on the currently-selected
+    /// Pipeline row will actually do anything useful.  Drives both the
+    /// dispatch path (so silent no-ops are replaced with actionable
+    /// toasts) and the Merge button's `enabled` state on the panel
+    /// toolbar.
+    fn pipeline_merge_state(&self) -> PipelineMergeState {
+        if self.active_view != SidebarView::Pipeline {
+            return PipelineMergeState::NotApplicable;
+        }
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
+        else {
+            return PipelineMergeState::NotApplicable;
+        };
+        let Some(entry) = self
+            .data
+            .merge_queue
+            .iter()
+            .find(|m| m.issue_number == Some(issue.number))
+        else {
+            return PipelineMergeState::NoQueue {
+                issue: issue.number,
+            };
+        };
+        if entry.state == "merged" {
+            return PipelineMergeState::Merged {
+                issue: issue.number,
+            };
+        }
+        // Review gate — only meaningful when the pipeline has a Review
+        // stage; otherwise downstream `coord merge` won't enforce it.
+        let stages = self.pipeline_stage_names();
+        if stages.iter().any(|s| s == "review") {
+            let work_id = &entry.assignment_id;
+            // Find the review assignment paired with this work.
+            let verdict: Option<&str> = self
+                .data
+                .assignments
+                .iter()
+                .filter(|a| a.assignment_type.as_deref() == Some("review"))
+                .filter(|a| a.review_of_assignment_id.as_deref() == Some(work_id))
+                .find_map(|a| a.review_verdict.as_deref());
+            match verdict {
+                Some("approve") => { /* good — fall through to CI check */ }
+                Some(other) => {
+                    return PipelineMergeState::BlockedOnReview {
+                        issue: issue.number,
+                        verdict: other.to_string(),
+                    };
+                }
+                None => {
+                    return PipelineMergeState::BlockedOnReview {
+                        issue: issue.number,
+                        verdict: "pending".to_string(),
+                    };
+                }
+            }
+        }
+        // CI gate — only meaningful when a summary has been fetched
+        // and we've actually seen failures.  Pending checks fall
+        // through to Ready (coord merge will block server-side).
+        if let Some(summary) = self.ci_summary_for_selected_issue() {
+            if summary.has_failures() {
+                return PipelineMergeState::BlockedOnCi {
+                    issue: issue.number,
+                    repo: issue.coord_repo.clone().unwrap_or_default(),
+                };
+            }
+        }
+        PipelineMergeState::Ready {
+            issue: issue.number,
+            repo: issue.coord_repo.clone().unwrap_or_default(),
+        }
+    }
+
+    /// #272-followup: route a Merge action (m keybind OR toolbar:merge
+    /// button) through the state classifier so silent no-ops are
+    /// replaced with actionable toasts.  Returns `true` when something
+    /// happened (dispatched, opened a prompt, or surfaced a toast) so
+    /// the caller can request a redraw.
+    fn dispatch_pipeline_merge_for_selected_issue(&mut self) -> bool {
+        match self.pipeline_merge_state() {
+            PipelineMergeState::NotApplicable => {
+                // Outside the Pipeline view, fall back to the unscoped
+                // "merge whatever's ready" behaviour (matches the
+                // pre-classifier `m` keybind on the Board / Machines
+                // views).
+                self.command_runner.spawn(&["merge"]);
+                true
+            }
+            PipelineMergeState::NoQueue { issue } => {
+                self.push_toast(
+                    "Merge",
+                    &format!(
+                        "#{issue}: no PR queued yet — work hasn't pushed a branch."
+                    ),
+                    ToastSeverity::Warning,
+                );
+                true
+            }
+            PipelineMergeState::Merged { issue } => {
+                self.push_toast(
+                    "Merge",
+                    &format!("#{issue} is already merged."),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            PipelineMergeState::BlockedOnReview { issue, verdict } => {
+                let summary = match verdict.as_str() {
+                    "request-changes" => "review requested changes",
+                    "pending" => "no review verdict yet",
+                    other => other,
+                };
+                self.push_toast(
+                    "Merge blocked",
+                    &format!(
+                        "#{issue}: {summary}. Press M to skip review, or R to re-dispatch the reviewer."
+                    ),
+                    ToastSeverity::Warning,
+                );
+                true
+            }
+            PipelineMergeState::BlockedOnCi { issue, repo } => {
+                // Same confirm prompt the standalone CI-failed `m`
+                // keybind opens; the user has to type y to bypass.
+                let _ = issue;
+                self.pending_force_merge = Some(repo);
+                true
+            }
+            PipelineMergeState::Ready { issue: _, repo } => {
+                if repo.is_empty() {
+                    // No coord_repo mapping — fall back to unscoped
+                    // merge so power users with cross-repo work can
+                    // still drive it from the TUI.
+                    self.command_runner.spawn(&["merge"]);
+                } else {
+                    self.command_runner
+                        .spawn(&["merge", "--repo", &repo]);
+                }
+                true
+            }
+        }
+    }
+
     /// Look up the CI summary for the currently-selected pipeline issue's
     /// merge queue entry.  Returns `None` when no PR is queued for the
     /// selected issue, or when no summary has been fetched yet.
@@ -6726,6 +6894,30 @@ impl CoordApp {
                     &format_cost_usd(cost),
                     Some(Color::rgb(180, 180, 180)),
                 ));
+            }
+            // #272-followup: surface the local DB's review_verdict on
+            // review-typed assignments so the user can see WHY a
+            // merge is blocked without leaving the TUI.  Earlier
+            // session feedback: "I cant access the review text and
+            // tell if it passed or failed".
+            if a.assignment_type.as_deref() == Some("review") {
+                if let Some(verdict) = a.review_verdict.as_deref() {
+                    let (label, color) = match verdict {
+                        "approve" => ("✓ approved", Color::rgb(120, 200, 120)),
+                        "request-changes" => (
+                            "✗ changes requested",
+                            Color::rgb(220, 100, 100),
+                        ),
+                        other => (other, Color::rgb(220, 180, 100)),
+                    };
+                    items.push(kv_item("Verdict", label, Some(color)));
+                } else {
+                    items.push(kv_item(
+                        "Verdict",
+                        "(pending — not parsed yet)",
+                        Some(Color::rgb(160, 160, 180)),
+                    ));
+                }
             }
             items.push(kv_item("", "", None));
         }
@@ -8477,7 +8669,21 @@ impl CoordApp {
                 vec![
                     toolbar_button("notify", "[N]otify", true),
                     toolbar_button("ready", "[r]eady", ready_enabled),
-                    toolbar_button("merge", "[M]erge", true),
+                    // #272-followup: enable Merge only when the
+                    // classifier says the selected issue is actually
+                    // mergeable.  Disabled buttons render dimmed but
+                    // keep their id (so hover tooltips can fire) and
+                    // refuse clicks — better UX than silently
+                    // dispatching a futile `coord merge`.
+                    toolbar_button(
+                        "merge",
+                        "[M]erge",
+                        matches!(
+                            self.pipeline_merge_state(),
+                            PipelineMergeState::Ready { .. }
+                                | PipelineMergeState::BlockedOnCi { .. }
+                        ),
+                    ),
                     toolbar_button("retry", "[R]etry", retry_enabled),
                 ]
             }
@@ -8552,26 +8758,10 @@ impl CoordApp {
                 true
             }
             "toolbar:merge" => {
-                // #245: in the Pipeline view, route through the same
-                // failed-CI confirm prompt the `m` keybind uses.  Outside
-                // the Pipeline, plain `coord merge` (CI gate stays in
-                // place server-side).
-                if self.active_view == SidebarView::Pipeline
-                    && self
-                        .ci_summary_for_selected_issue()
-                        .map(|s| s.has_failures())
-                        .unwrap_or(false)
-                {
-                    let repo = self
-                        .pipeline_sel
-                        .and_then(|i| self.pipeline_issues.get(i))
-                        .and_then(|issue| issue.coord_repo.clone())
-                        .unwrap_or_default();
-                    self.pending_force_merge = Some(repo);
-                } else {
-                    self.command_runner.spawn(&["merge"]);
-                }
-                true
+                // #272-followup: shared classifier with the `m` keybind.
+                // Outside the Pipeline view this falls through to plain
+                // `coord merge` (server-side gates still apply).
+                self.dispatch_pipeline_merge_for_selected_issue()
             }
             "toolbar:retry" => {
                 if self.active_view == SidebarView::Pipeline {
@@ -10081,30 +10271,12 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
                     Key::Char('m') => {
-                        // #245: when the selected pipeline issue's PR has
-                        // failed CI checks, the status-bar hint reads
-                        // "Checks failed: …  m=merge anyway".  Honour that
-                        // promise by routing `m` to a force-merge — but
-                        // only after a one-key confirm so a fat-finger
-                        // can't merge a red PR.
-                        if self.active_view == SidebarView::Pipeline
-                            && self
-                                .ci_summary_for_selected_issue()
-                                .map(|s| s.has_failures())
-                                .unwrap_or(false)
-                        {
-                            // Scope to the selected issue's coord repo so a
-                            // force-merge against one red PR doesn't blanket
-                            // every queued entry.  Empty string ⇒ no scope.
-                            let repo = self
-                                .pipeline_sel
-                                .and_then(|i| self.pipeline_issues.get(i))
-                                .and_then(|issue| issue.coord_repo.clone())
-                                .unwrap_or_default();
-                            self.pending_force_merge = Some(repo);
-                            needs_redraw = true;
-                        } else {
-                            self.command_runner.spawn(&["merge"]);
+                        // #272-followup: route everything through the
+                        // classifier so silent no-ops become actionable
+                        // toasts (review blocked → toast; CI failed →
+                        // open the force-merge prompt; ready → spawn
+                        // `coord merge --repo <slug>`).
+                        if self.dispatch_pipeline_merge_for_selected_issue() {
                             needs_redraw = true;
                         }
                     }
@@ -12682,6 +12854,205 @@ mod tests {
             repo_github: "acme/api".to_string(),
         });
         assert!(!app.merge_blocked_on_review_for_selected_issue());
+    }
+
+    // ── #272-followup: PipelineMergeState classifier + dispatcher ────────
+
+    #[test]
+    fn pipeline_merge_state_no_queue_when_no_entry() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        assert_eq!(
+            app.pipeline_merge_state(),
+            PipelineMergeState::NoQueue { issue: 42 },
+        );
+    }
+
+    #[test]
+    fn pipeline_merge_state_blocked_on_review_when_request_changes() {
+        // Real scenario: quadraui#166 had review_verdict='request-changes'
+        // but coord merge silently no-op'd because the user's m keybind
+        // dispatched plain `coord merge`.  The classifier should surface
+        // this so the dispatcher can toast instead.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(review);
+        match app.pipeline_merge_state() {
+            PipelineMergeState::BlockedOnReview { issue, verdict } => {
+                assert_eq!(issue, 42);
+                assert_eq!(verdict, "request-changes");
+            }
+            other => panic!("expected BlockedOnReview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_merge_state_ready_when_approved_and_no_ci_failures() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+        match app.pipeline_merge_state() {
+            PipelineMergeState::Ready { issue, repo } => {
+                assert_eq!(issue, 42);
+                assert_eq!(repo, "api");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_merge_state_merged_when_entry_merged() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        assert_eq!(
+            app.pipeline_merge_state(),
+            PipelineMergeState::Merged { issue: 42 },
+        );
+    }
+
+    #[test]
+    fn dispatch_pipeline_merge_blocked_on_review_toasts_no_spawn() {
+        // The actual bug the user reported: pressing m on a row with
+        // request-changes verdict should NOT silently spawn `coord
+        // merge` (which would no-op).  It should toast.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(review);
+
+        let toasts_before = app.toasts.len();
+        let acted = app.dispatch_pipeline_merge_for_selected_issue();
+        assert!(acted, "dispatcher should report having handled the action");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "must surface a toast — silent no-op was the bug we're fixing",
+        );
+        // The toast message should mention "review" so the user knows
+        // what's wrong without reading the source.
+        let last = app.toasts.last().expect("toast pushed");
+        let body = last.0.body.to_string();
+        assert!(
+            body.to_lowercase().contains("review"),
+            "toast body should mention 'review', got: {body:?}",
+        );
+        // Most importantly: no command was spawned.  The runner stays
+        // in its initial idle state.
+        assert!(
+            !app.command_runner.is_running(),
+            "must not spawn coord merge when blocked on review",
+        );
+    }
+
+    #[test]
+    fn dispatch_pipeline_merge_no_queue_toasts_no_spawn() {
+        // When the user clicks Merge on an issue that hasn't been
+        // enqueued yet, surface a clear toast rather than running
+        // `coord merge` against an empty queue.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        let toasts_before = app.toasts.len();
+        let acted = app.dispatch_pipeline_merge_for_selected_issue();
+        assert!(acted);
+        assert!(app.toasts.len() > toasts_before);
+        let body = app.toasts.last().expect("toast").0.body.to_string();
+        assert!(
+            body.to_lowercase().contains("no pr") || body.to_lowercase().contains("queue"),
+            "toast should explain the no-queue state, got: {body:?}",
+        );
+        assert!(!app.command_runner.is_running());
+    }
+
+    #[test]
+    fn merge_button_disabled_when_blocked_on_review() {
+        // The toolbar Merge button should render disabled when the
+        // selected issue can't actually be merged — the primitive's
+        // hit_test then refuses clicks and the user sees the dimmed
+        // affordance.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(review);
+
+        let bar = app.panel_toolbar().expect("Pipeline toolbar present");
+        let merge_btn = bar
+            .buttons
+            .iter()
+            .find_map(|b| match b {
+                ToolbarButton::Action { id, enabled, label, .. }
+                    if id.as_str() == "toolbar:merge" =>
+                {
+                    Some((label.clone(), *enabled))
+                }
+                _ => None,
+            })
+            .expect("Merge button present on Pipeline toolbar");
+        assert!(
+            merge_btn.0.contains("[M]erge"),
+            "found wrong button by id: label={:?}",
+            merge_btn.0,
+        );
+        assert!(
+            !merge_btn.1,
+            "Merge button must render disabled when review blocks the merge",
+        );
     }
 
     // ── #235: Phase 1 Test-stage build ────────────────────────────────────
