@@ -2864,21 +2864,24 @@ def post_pending_reviews(config_path: Path, repo_name: str | None) -> None:
             )
 
 
-def _load_issue_states() -> tuple[dict[str, set[int]], set[str]]:
-    """Return ``(open_by_repo, repos_with_data)``.
+def _load_issue_states() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+    """Return ``(open_by_repo, known_by_repo)``.
 
     - ``open_by_repo[repo]`` = set of issue numbers with state='open'.
-    - ``repos_with_data`` = set of repos for which the issues table has
-      at least one row (any state).
+    - ``known_by_repo[repo]`` = set of issue numbers with ANY state row in
+      the cache.
 
-    Used by the `coord merge` auto-enqueue path (#242).  Filter logic:
+    Used by the `coord merge` auto-enqueue path (#242).  Filter logic
+    (in the caller) is permissive on cache misses:
 
-    - issue is in ``open_by_repo`` → allow (open issue, fine to enqueue)
-    - issue is NOT in ``open_by_repo`` AND repo is in ``repos_with_data``
-      → deny (we know about this repo's issues and this one is closed)
-    - issue is NOT in ``open_by_repo`` AND repo is NOT in ``repos_with_data``
-      → allow (the issues table has no data for this repo at all; default
-      to legacy behavior of letting the user re-attempt)
+    - issue in ``known_by_repo[repo]`` AND not in ``open_by_repo[repo]``
+      → deny (we have explicit "closed" evidence)
+    - otherwise → allow
+
+    The earlier implementation denied any issue whose repo had ANY rows in
+    the issues table but no row for the specific number — which silently
+    skipped issues created after the cache's most-recent sync (we hit this
+    when #278/#280 landed but the local cache stopped at #271).
     """
     try:
         from coord.db import get_connection
@@ -2888,16 +2891,17 @@ def _load_issue_states() -> tuple[dict[str, set[int]], set[str]]:
             "SELECT repo_name, number, state FROM issues"
         ).fetchall()
     except Exception:  # noqa: BLE001 — caller treats empty as "unknown"
-        return {}, set()
+        return {}, {}
 
     open_by_repo: dict[str, set[int]] = {}
-    repos_with_data: set[str] = set()
+    known_by_repo: dict[str, set[int]] = {}
     for row in rows:
         repo_name = row[0]
-        repos_with_data.add(repo_name)
+        number = int(row[1])
+        known_by_repo.setdefault(repo_name, set()).add(number)
         if row[2] == "open":
-            open_by_repo.setdefault(repo_name, set()).add(int(row[1]))
-    return open_by_repo, repos_with_data
+            open_by_repo.setdefault(repo_name, set()).add(number)
+    return open_by_repo, known_by_repo
 
 
 @main.command(help="Process the merge queue: open PRs and merge in sequence.")
@@ -2956,7 +2960,7 @@ def merge(
     # miss), default to OPEN — that matches the prior coord status enqueue
     # path which had no such check.
     board = load_board()
-    open_by_repo, repos_with_issue_data = _load_issue_states()
+    open_by_repo, known_by_repo = _load_issue_states()
     # Set of (repo_name, issue_number) for which a `merged` entry already
     # exists.  Avoids spawning a fresh PR for an issue that was already
     # merged via a prior work attempt (multiple work assignments per issue
@@ -2979,13 +2983,16 @@ def merge(
             if repo_cfg is None:
                 continue
             # Issue-state filter: skip closed issues (probably merged elsewhere).
-            # Distinguish "we have no data for this repo" (allow, legacy) from
-            # "we have data for this repo but this issue isn't in the open
-            # set" (closed → deny).
-            if a.repo_name in repos_with_issue_data:
-                open_issues = open_by_repo.get(a.repo_name, set())
-                if a.issue_number not in open_issues:
-                    continue
+            # We deny only when the cache has explicit evidence the issue is
+            # closed — i.e. there's a row for this (repo, number) and its
+            # state isn't 'open'.  If the cache simply has no row for this
+            # issue (e.g. it was created after the last sync), treat as
+            # unknown and allow — denying on cache miss silently skipped
+            # post-sync issues (#278/#280 hit this).
+            known_issues = known_by_repo.get(a.repo_name, set())
+            open_issues = open_by_repo.get(a.repo_name, set())
+            if a.issue_number in known_issues and a.issue_number not in open_issues:
+                continue
             # Skip issues whose latest work was already merged (via any
             # prior assignment_id).
             if (a.repo_name, a.issue_number) in already_merged:

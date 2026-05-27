@@ -401,6 +401,36 @@ class TestMergeAutoEnqueue:
         create.assert_not_called()
         merge_fn.assert_not_called()
 
+    def test_auto_enqueues_when_issue_postdates_cache(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """When the issues cache has rows for the repo but no row for THIS
+        issue (e.g. the issue was created after the most recent sync), the
+        auto-enqueue must treat it as unknown and allow — not falsely
+        infer "closed" from cache miss.
+
+        Repro: cache topped out at #271; #278/#280 silently skipped because
+        the filter saw the repo had data but no row for 278/280.
+        """
+        # Cache has rows for other issues in the repo, but NOT for #280.
+        self._seed_issue_state(coord_db, number=271, state="closed")
+        self._seed_board_with_done_work(
+            coord_db, issue_number=280, assignment_id="w280",
+            branch="issue-280-foo",
+        )
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10):
+            create.return_value = {"number": 999, "url": "u/999", "existed": False}
+            merge_fn.return_value = (True, "ok")
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" in result.output
+        assert "#280" in result.output
+        create.assert_called_once()
+
     def test_skips_issues_already_merged_via_other_assignment(
         self, config_file: Path, coord_dir: Path, coord_db
     ) -> None:
