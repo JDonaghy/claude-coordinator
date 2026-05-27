@@ -199,3 +199,73 @@ def test_worktree_setup_failure_marks_assignment_failed(tmp_path: Path) -> None:
     assert a.status == FAILED
     assert "worktree setup failed" in a.error
     server.shutdown()
+
+
+# ── #target_branch: explicit branch override ────────────────────────────────
+
+
+def test_target_branch_overrides_slugified_title(
+    tmp_path: Path, repo_clone: Path
+) -> None:
+    """When `AssignmentSpec.target_branch` is set, the agent checks
+    that branch out instead of deriving a new one from the slugified
+    issue title.  This is the auto-loop's fix-dispatch path — fix
+    workers must push to the original work's branch so the existing
+    PR gets the fix commits."""
+    # First worker creates the original branch (status:ready style).
+    server = AgentServer(
+        machine_name="t", repos=["api"],
+        repo_paths={"api": str(repo_clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/true"],
+    )
+    spec1 = AssignmentSpec(
+        repo_name="api", repo_path=str(repo_clone),
+        issue_number=42, issue_title="add feature X", briefing="b",
+    )
+    a1 = server.assign(spec1)
+    final1 = server.wait_for(a1.id, timeout=10)
+    assert final1.status == DONE
+    original_branch = final1.branch  # `issue-42-add-feature-x`
+    assert original_branch == "issue-42-add-feature-x"
+
+    # Second worker (fix iteration) — different issue title that would
+    # normally produce a NEW branch, but target_branch pins it to the
+    # original.
+    spec2 = AssignmentSpec(
+        repo_name="api", repo_path=str(repo_clone),
+        issue_number=42, issue_title="[fix-1] add feature X",
+        briefing="b",
+        target_branch=original_branch,
+    )
+    a2 = server.assign(spec2)
+    final2 = server.wait_for(a2.id, timeout=10)
+    assert final2.status == DONE
+    # Captured branch must be the original — not a `[fix-1]` derivation.
+    assert final2.branch == original_branch, (
+        f"target_branch override failed: expected {original_branch!r}, "
+        f"got {final2.branch!r} (the fix would push to an orphan branch)"
+    )
+    server.shutdown()
+
+
+def test_no_target_branch_uses_slugified_title(
+    tmp_path: Path, repo_clone: Path
+) -> None:
+    """Without target_branch, the agent derives the branch from
+    `issue-{N}-{slug(title)}` as before — backwards compatible."""
+    server = AgentServer(
+        machine_name="t", repos=["api"],
+        repo_paths={"api": str(repo_clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/true"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api", repo_path=str(repo_clone),
+        issue_number=99, issue_title="my cool change", briefing="b",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == DONE
+    assert final.branch == "issue-99-my-cool-change"
+    server.shutdown()

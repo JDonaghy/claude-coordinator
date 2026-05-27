@@ -266,6 +266,18 @@ class TestProcessReviewCompletion:
         assert fix.branch == "issue-1-fix"
         assert fix.review_of_assignment_id == "work-abc"
 
+        # #target_branch: the dispatch payload MUST tell the agent to
+        # check out the original work's branch.  Without this the agent
+        # would derive a new branch from the `[fix-1] …` slugified
+        # title and the fix commits would land on an orphan branch
+        # instead of the existing PR's branch.
+        call_args = mock_http.post.call_args
+        sent_payload = call_args.kwargs["json"]
+        assert sent_payload["target_branch"] == "issue-1-fix", (
+            f"fix dispatch must pin target_branch to the original work's "
+            f"branch; got {sent_payload.get('target_branch')!r}"
+        )
+
     def test_request_changes_work_not_on_board_returns_no_work_found(
         self, config: Config, tmp_path
     ) -> None:

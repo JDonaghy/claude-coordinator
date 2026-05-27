@@ -186,6 +186,13 @@ class AssignmentSpec:
     # When True, ignore existing issue-N-* branches and create a fresh branch
     # from the default branch. Used by --force dispatch to avoid stale branches.
     fresh_branch: bool = False
+    # #target_branch: override the slugified-title-derived branch name with
+    # an explicit existing branch.  Used by the auto-loop's fix dispatch so
+    # the fix worker pushes commits to the ORIGINAL work's branch (and the
+    # same PR gets the fix) instead of creating a new orphan branch from
+    # the `[fix-N]` issue-title prefix.  When set, the agent checks out
+    # this branch directly instead of deriving from issue_number + title.
+    target_branch: str | None = None
 
 
 class _GitError(RuntimeError):
@@ -783,8 +790,19 @@ class AgentServer:
                 # Local `<default>` may not exist (fresh clone) — silent.
                 pass
 
-        # Branch name for this assignment
-        branch_name = f"issue-{assignment.spec.issue_number}-{_slugify(assignment.spec.issue_title)}"
+        # Branch name for this assignment.  When `target_branch` is set
+        # (auto-loop fix dispatch path), use it verbatim — the caller
+        # knows the exact branch they want the worker to check out, and
+        # we must NOT derive a new name from the (possibly `[fix-N]`-
+        # prefixed) issue title or the fix would land on an orphan
+        # branch instead of the original PR's branch.
+        if assignment.spec.target_branch:
+            branch_name = assignment.spec.target_branch
+        else:
+            branch_name = (
+                f"issue-{assignment.spec.issue_number}-"
+                f"{_slugify(assignment.spec.issue_title)}"
+            )
 
         # Check if branch already exists (locally or on remote — retry scenario)
         branch_exists = False

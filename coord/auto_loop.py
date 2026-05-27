@@ -360,6 +360,12 @@ def _dispatch_fix(
         # branch so the agent branches from origin/<default> rather than
         # any local-only ref.
         "branch": repo.default_branch or "main",
+        # #target_branch: tell the agent to check out the ORIGINAL work's
+        # branch rather than deriving a new one from the `[fix-N] …`
+        # issue title.  Without this the fix worker pushed to a
+        # new orphan branch and the existing PR never received the fix
+        # commits (quadraui#166 hit this hard).
+        "target_branch": work.branch,
     }
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
