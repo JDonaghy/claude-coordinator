@@ -278,6 +278,10 @@ struct Assignment {
     /// * `Some([])` — explicit "(none — change is internal)" form.
     /// * `Some(vec)` — bullets to render under the Test stage.
     smoke_tests: Option<Vec<String>>,
+    /// #bounce: cached review findings (verdict + body), JSON-encoded
+    /// in the DB column.  `None` for non-review assignments and for
+    /// reviews completed before the cache landed.
+    review_findings: Option<String>,
 }
 
 impl Assignment {
@@ -1403,7 +1407,7 @@ fn load_data() -> BoardData {
             "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
              status, branch, model, type, dispatched_at, finished_at, exit_code, \
              test_state, review_verdict, review_of_assignment_id, cost_usd, \
-             smoke_tests \
+             smoke_tests, review_findings \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1430,6 +1434,7 @@ fn load_data() -> BoardData {
                 smoke_tests: row
                     .get::<_, Option<String>>(16)?
                     .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok()),
+                review_findings: row.get::<_, Option<String>>(17)?,
             })
         }) {
             Ok(r) => r,
@@ -2460,6 +2465,20 @@ pub struct CoordApp {
     /// `sidebar_action_bar_hover`.
     panel_toolbar_hover: ToolbarHoverTracker,
 
+    /// Index of the currently-selected stage in the Pipeline > Stages
+    /// tab.  `None` defaults to "no stage selected" — first arrow / click
+    /// snaps to a sensible default (usually the latest non-pending
+    /// stage).  Driven by Left/Right arrows when the Stages tab is
+    /// active, and by mouse clicks on stage boxes.  When focused,
+    /// quadraui's PipelineView rasteriser draws the box with an accent
+    /// border, and coord-tui renders the matching stage's content
+    /// (logs / findings) in the scrollable panel below the strip.
+    pipeline_focused_stage: Option<usize>,
+    /// Scroll offset (line index) for the stage-content scrollable
+    /// panel below the pipeline strip.  Reset when the focused stage
+    /// changes.
+    pipeline_stage_content_scroll: usize,
+
     // ── Settings panel ───────────────────────────────────────────────────
     /// Persisted user settings loaded from `~/.coord/settings.toml`.
     settings: TuiSettings,
@@ -2589,6 +2608,8 @@ impl CoordApp {
             watch_sse: None,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
+            pipeline_focused_stage: None,
+            pipeline_stage_content_scroll: 0,
             settings: TuiSettings::load(),
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
             settings_field_sel: 0,
@@ -4983,6 +5004,41 @@ impl CoordApp {
     /// DB — these were resolved outside the coord pipeline, so showing an
     /// all-Skipped stage widget would be misleading. The caller will render
     /// the "closed without coord pipeline" placeholder instead.
+    /// Move the Pipeline > Stages focus to the next stage (right).
+    /// Wraps to the first stage from the last.  Resets the content
+    /// scroll so the user starts at the top of the new content.
+    fn focus_next_pipeline_stage(&mut self) {
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
+        else { return; };
+        let stages = self.pipeline_stage_names_for_issue(issue);
+        if stages.is_empty() {
+            return;
+        }
+        let next = match self.pipeline_focused_stage {
+            None => 0,
+            Some(i) => (i + 1) % stages.len(),
+        };
+        self.pipeline_focused_stage = Some(next);
+        self.pipeline_stage_content_scroll = 0;
+    }
+
+    /// Move the Pipeline > Stages focus to the previous stage (left).
+    /// Wraps to the last stage from the first.
+    fn focus_prev_pipeline_stage(&mut self) {
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
+        else { return; };
+        let stages = self.pipeline_stage_names_for_issue(issue);
+        if stages.is_empty() {
+            return;
+        }
+        let prev = match self.pipeline_focused_stage {
+            None => stages.len() - 1,
+            Some(i) => (i + stages.len() - 1) % stages.len(),
+        };
+        self.pipeline_focused_stage = Some(prev);
+        self.pipeline_stage_content_scroll = 0;
+    }
+
     fn build_pipeline_widget(&self) -> Option<QuiPipelineView> {
         let idx = self.pipeline_sel?;
         let issue = self.pipeline_issues.get(idx)?;
@@ -5069,10 +5125,16 @@ impl CoordApp {
             })
             .collect();
 
+        // Clamp the persisted focus to the current stage count so a
+        // smaller pipeline (e.g. issue without a Plan stage) doesn't
+        // get a focus pointing past its last stage.
+        let focused_stage = self
+            .pipeline_focused_stage
+            .filter(|&i| i < stages.len());
         Some(QuiPipelineView {
             id: WidgetId::new("pipeline:detail"),
             stages,
-            focused_stage: None,
+            focused_stage,
         })
     }
 
@@ -6807,6 +6869,267 @@ impl CoordApp {
     /// pipeline; under each section, the latest matching assignment's
     /// id, machine, status, dispatched/finished times and exit code
     /// (or the merge_queue row's state and PR for the merge stage).
+    /// #stage-content: return the content rows for the focused stage's
+    /// detail panel.  Each stage type sources its content differently:
+    ///
+    /// - **Plan**   — the worker's plan log tail (planning agent output)
+    /// - **Work**   — the worker's log tail (summary of work done)
+    /// - **Test**   — the cached `TestBuildResult.log_path` first 200 lines
+    /// - **Review** — the cached `review_findings` body from the DB
+    ///                (populated by notify when the review completed)
+    /// - **Merge**  — the merge_queue entry's state + error if any
+    ///
+    /// Returns an empty `Vec` when no content can be sourced — the
+    /// caller renders a "no content available" placeholder.
+    fn stage_content_for(&self, issue: &PipelineIssue, stage_name: &str) -> Vec<ListItem> {
+        match stage_name {
+            "review" => self.stage_content_review(issue),
+            "test" => self.stage_content_test(issue),
+            "merge" => self.stage_content_merge(issue),
+            // Plan + Work both read the latest assignment's log tail.
+            "plan" | "work" => self.stage_content_assignment_log(issue, stage_name),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Pull the cached review findings (verdict + body) for the
+    /// selected pipeline issue.  Reads the JSON column populated by
+    /// `coord/notify.py::_persist_review_findings`.
+    fn stage_content_review(&self, issue: &PipelineIssue) -> Vec<ListItem> {
+        // Find the latest review assignment for this issue.
+        let local_repo = issue.coord_repo.as_deref();
+        let review = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| a.assignment_type.as_deref() == Some("review"))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(review) = review else { return Vec::new() };
+        // Findings JSON was loaded with the board (no per-render DB
+        // query).  When None, notify hasn't parsed this review yet —
+        // running `coord notify` or `coord bounce` refreshes it.
+        let Some(raw) = review.review_findings.as_deref() else {
+            return vec![kv_item(
+                "",
+                "   (review not yet parsed — run `coord notify` or `coord bounce` to refresh)",
+                Some(Color::rgb(160, 160, 180)),
+            )];
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(_) => {
+                return vec![kv_item(
+                    "",
+                    "   (review_findings JSON malformed — re-parse via `coord notify`)",
+                    Some(Color::rgb(220, 180, 100)),
+                )];
+            }
+        };
+        let verdict = parsed
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let body = parsed
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut rows: Vec<ListItem> = Vec::new();
+        let (vtext, vcolor) = match verdict.as_str() {
+            "approve" => ("✓ approved", Color::rgb(120, 200, 120)),
+            "request-changes" => ("✗ changes requested", Color::rgb(220, 100, 100)),
+            other => (other, Color::rgb(220, 180, 100)),
+        };
+        rows.push(kv_item("Verdict", vtext, Some(vcolor)));
+        rows.push(kv_item("", "", None));
+        // Render the body line-by-line as plain text (markdown
+        // styling lands once quadraui#262 ships and we adopt it).
+        // Filter out the coord:review header — that's machine-readable
+        // metadata, not user-facing prose.
+        for line in body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("<!-- coord:review"))
+        {
+            if line.is_empty() {
+                rows.push(kv_item("", "", None));
+            } else {
+                let trimmed: String = line.chars().take(180).collect();
+                rows.push(kv_item("", &format!("   {trimmed}"), None));
+            }
+        }
+        rows
+    }
+
+    /// Test stage content — the cached build log from the most recent
+    /// `coord test` run for the issue's work assignment.
+    fn stage_content_test(&self, issue: &PipelineIssue) -> Vec<ListItem> {
+        // Find the latest work assignment.
+        let local_repo = issue.coord_repo.as_deref();
+        let work_id = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|a| a.id.clone());
+        let Some(work_id) = work_id else { return Vec::new() };
+        let Some(build) = self.last_test_builds.get(&work_id) else {
+            return vec![kv_item(
+                "",
+                "   (no build recorded — press B to run `coord test`)",
+                Some(Color::rgb(160, 160, 180)),
+            )];
+        };
+        let mut rows: Vec<ListItem> = Vec::new();
+        let (status_label, status_color) = if build.exit_code == 0 {
+            ("✓ succeeded", Color::rgb(120, 200, 120))
+        } else {
+            ("✗ failed", Color::rgb(220, 100, 100))
+        };
+        rows.push(kv_item("Build", status_label, Some(status_color)));
+        rows.push(kv_item(
+            "Exit code",
+            &build.exit_code.to_string(),
+            Some(Color::rgb(180, 180, 180)),
+        ));
+        rows.push(kv_item(
+            "Log",
+            &build.log_path.display().to_string(),
+            Some(Color::rgb(160, 160, 180)),
+        ));
+        rows.push(kv_item("", "", None));
+        // Read the first 200 lines of the log for inline display.
+        let content = std::fs::read_to_string(&build.log_path).unwrap_or_default();
+        if content.is_empty() {
+            rows.push(kv_item(
+                "",
+                "   (log file empty or unreadable)",
+                Some(Color::rgb(160, 160, 180)),
+            ));
+        } else {
+            for line in content.lines().take(200) {
+                let trimmed: String = line.chars().take(180).collect();
+                rows.push(kv_item("", &format!("   {trimmed}"), None));
+            }
+        }
+        rows
+    }
+
+    /// Merge stage content — pulled from the merge_queue entry.
+    fn stage_content_merge(&self, issue: &PipelineIssue) -> Vec<ListItem> {
+        let entry = self
+            .data
+            .merge_queue
+            .iter()
+            .find(|m| m.issue_number == Some(issue.number));
+        let Some(entry) = entry else { return Vec::new() };
+        let mut rows: Vec<ListItem> = Vec::new();
+        rows.push(kv_item(
+            "State",
+            &entry.state,
+            Some(Color::rgb(200, 200, 220)),
+        ));
+        if let Some(pr) = entry.pr_number {
+            rows.push(kv_item(
+                "PR",
+                &format!("#{pr}"),
+                Some(Color::rgb(160, 200, 220)),
+            ));
+        }
+        rows
+    }
+
+    /// Plan / Work stage content — read the tail of the matching
+    /// assignment's log file.  Returns an empty placeholder when no
+    /// assignment exists or the log is unreadable.
+    fn stage_content_assignment_log(
+        &self,
+        issue: &PipelineIssue,
+        stage: &str,
+    ) -> Vec<ListItem> {
+        let local_repo = issue.coord_repo.as_deref();
+        let assignment = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| {
+                let t = a.assignment_type.as_deref().unwrap_or("work");
+                if stage == "work" {
+                    t == "work"
+                } else {
+                    t == stage
+                }
+            })
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(a) = assignment else { return Vec::new() };
+        let log_path = std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_default(),
+        )
+        .join(".coord")
+        .join("logs")
+        .join(format!("{}.log", a.id));
+        let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if content.is_empty() {
+            return vec![kv_item(
+                "",
+                &format!(
+                    "   (log not on this machine — assignment ran on {}; \
+                     run `coord log {} -f` to follow)",
+                    a.machine, a.id,
+                ),
+                Some(Color::rgb(160, 160, 180)),
+            )];
+        }
+        // Tail of the log — last 200 lines.
+        let lines: Vec<&str> = content.lines().collect();
+        let tail_start = lines.len().saturating_sub(200);
+        let mut rows: Vec<ListItem> = Vec::new();
+        if tail_start > 0 {
+            rows.push(kv_item(
+                "",
+                &format!(
+                    "   (showing last 200 of {} lines from {}.log)",
+                    lines.len(), a.id,
+                ),
+                Some(Color::rgb(140, 140, 160)),
+            ));
+            rows.push(kv_item("", "", None));
+        }
+        for line in &lines[tail_start..] {
+            let trimmed: String = line.chars().take(180).collect();
+            rows.push(kv_item("", &format!("   {trimmed}"), None));
+        }
+        rows
+    }
+
     fn pipeline_stages_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
         let issue = self
@@ -6844,8 +7167,9 @@ impl CoordApp {
             };
         }
 
-        for name in self.pipeline_stage_names_for_issue(&issue) {
-            let status = self.stage_status_for(&issue, &name);
+        let stage_names = self.pipeline_stage_names_for_issue(&issue);
+        for name in &stage_names {
+            let status = self.stage_status_for(&issue, name);
             let (icon, color) = match status {
                 StageStatus::Done => ("✓", Color::rgb(120, 200, 120)),
                 StageStatus::Active => ("~", Color::rgb(220, 180, 100)),
@@ -6854,7 +7178,7 @@ impl CoordApp {
                 StageStatus::Pending => ("·", Color::rgb(140, 140, 140)),
                 StageStatus::Stale => ("↻", Color::rgb(140, 140, 140)),
             };
-            let header = format!(" {} {}", icon, capitalize(&name));
+            let header = format!(" {} {}", icon, capitalize(name));
             items.push(ListItem {
                 text: StyledText {
                     spans: vec![StyledSpan::with_fg(header, color)],
@@ -6867,9 +7191,51 @@ impl CoordApp {
             if name == "merge" {
                 self.append_merge_stage_rows(&mut items, &issue);
             } else {
-                self.append_assignment_stage_rows(&mut items, &issue, &name);
+                self.append_assignment_stage_rows(&mut items, &issue, name);
             }
             items.push(kv_item("", "", None));
+        }
+
+        // #stage-content: per-stage content panel.  When a stage is
+        // focused (mouse click on a stage box OR [/] keys on the
+        // Stages tab), render its associated output at the bottom of
+        // the list.  Plan → planner agent output; Work → worker log
+        // tail; Test → build output; Review → cached review findings.
+        if let Some(focused_idx) = self
+            .pipeline_focused_stage
+            .filter(|&i| i < stage_names.len())
+        {
+            let name = &stage_names[focused_idx];
+            items.push(kv_item("", "", None));
+            items.push(kv_item(
+                "",
+                &format!(" ── Stage content: {} ──", capitalize(name)),
+                Some(Color::rgb(220, 220, 230)),
+            ));
+            items.push(kv_item(
+                "",
+                "   ([/] previous · ]/] next · click a stage box to switch)",
+                Some(Color::rgb(140, 140, 160)),
+            ));
+            items.push(kv_item("", "", None));
+            let content_rows = self.stage_content_for(&issue, name);
+            if content_rows.is_empty() {
+                items.push(kv_item(
+                    "",
+                    "   (no content available for this stage yet)",
+                    Some(Color::rgb(140, 140, 160)),
+                ));
+            } else {
+                items.extend(content_rows);
+            }
+        } else {
+            // No stage focused — hint at the affordance once the user
+            // has rendered at least one stage.
+            items.push(kv_item(
+                "",
+                " Tip: click a stage box (or press [ / ]) to view its output here.",
+                Some(Color::rgb(140, 140, 160)),
+            ));
         }
         ListView {
             id: WidgetId::new("pipeline-stages"),
@@ -7499,7 +7865,15 @@ impl CoordApp {
                             self.dispatch_pipeline_stage(stage_idx);
                             return true;
                         }
-                        PipelineHit::Body(_) | PipelineHit::Empty => return false,
+                        PipelineHit::Body(stage_idx) => {
+                            // Click on a stage box (outside the action
+                            // button) — set focus so the content panel
+                            // below switches to this stage's output.
+                            self.pipeline_focused_stage = Some(stage_idx);
+                            self.pipeline_stage_content_scroll = 0;
+                            return true;
+                        }
+                        PipelineHit::Empty => return false,
                     }
                 }
             }
@@ -10138,6 +10512,25 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── [ / ] — cycle focused stage on the Stages tab ────
+                    // Sets `pipeline_focused_stage`, which the rasteriser
+                    // draws with an accent border, and selects which
+                    // stage's content the scrollable panel shows.
+                    Key::Char('[')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Stages =>
+                    {
+                        self.focus_prev_pipeline_stage();
+                        needs_redraw = true;
+                    }
+                    Key::Char(']')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Stages =>
+                    {
+                        self.focus_next_pipeline_stage();
+                        needs_redraw = true;
+                    }
+
                     // ── h/l — cycle Pipeline detail tabs ─────────────────
                     // Order: Pipeline → Issue → Stages → Pipeline …
                     Key::Char('h') | Key::Named(NamedKey::Left)
@@ -10932,6 +11325,8 @@ mod tests {
             watch_sse: None,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
+            pipeline_focused_stage: None,
+            pipeline_stage_content_scroll: 0,
             settings: TuiSettings::default(),
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
             settings_field_sel: 0,
@@ -11091,6 +11486,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         }
     }
 
@@ -11149,6 +11545,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         }
     }
 
@@ -12212,6 +12609,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -12248,6 +12646,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -12519,6 +12918,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         }
     }
 
@@ -13408,6 +13808,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -13447,6 +13848,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -13486,6 +13888,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -13522,6 +13925,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -13598,6 +14002,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -13637,6 +14042,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -13663,6 +14069,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -13694,6 +14101,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -13714,6 +14122,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -13742,6 +14151,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -13795,6 +14205,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -13830,6 +14241,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -13849,6 +14261,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -13913,6 +14326,7 @@ mod tests {
                 review_of_assignment_id: None,
                 cost_usd: None,
                 smoke_tests: None,
+                review_findings: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -13952,6 +14366,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -13986,6 +14401,7 @@ mod tests {
                 review_of_assignment_id: None,
                 cost_usd: None,
                 smoke_tests: None,
+                review_findings: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -14025,6 +14441,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -14099,6 +14516,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -14133,6 +14551,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -14161,6 +14580,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -14189,6 +14609,7 @@ mod tests {
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
+            review_findings: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -16140,6 +16561,104 @@ mod tests {
             labels.iter().any(|l| l == "Stop"),
             "expected Stop in action bar; got {:?}",
             labels,
+        );
+    }
+
+    // ── #stage-content: per-stage focus + content panel ──────────────────
+
+    #[test]
+    fn focus_next_stage_advances_and_wraps() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        assert_eq!(app.pipeline_focused_stage, None);
+        app.focus_next_pipeline_stage();
+        assert_eq!(app.pipeline_focused_stage, Some(0));
+        app.focus_next_pipeline_stage();
+        assert_eq!(app.pipeline_focused_stage, Some(1));
+        // Advance to the last + wrap to 0.
+        let stage_count = app
+            .pipeline_stage_names_for_issue(&app.pipeline_issues[0])
+            .len();
+        for _ in 2..stage_count {
+            app.focus_next_pipeline_stage();
+        }
+        // Now focused on the last stage.  One more wraps back to 0.
+        app.focus_next_pipeline_stage();
+        assert_eq!(app.pipeline_focused_stage, Some(0));
+    }
+
+    #[test]
+    fn focus_prev_stage_wraps_from_none_to_last() {
+        // Pressing [ before anything is focused should snap to the
+        // last stage (so users immediately see the most recent
+        // pipeline output rather than the empty Plan stage).
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let stage_count = app
+            .pipeline_stage_names_for_issue(&app.pipeline_issues[0])
+            .len();
+        app.focus_prev_pipeline_stage();
+        assert_eq!(app.pipeline_focused_stage, Some(stage_count - 1));
+    }
+
+    #[test]
+    fn stage_content_review_renders_cached_findings() {
+        // The DB cache lives on the review-typed assignment as a JSON
+        // string.  stage_content_review should parse it and render
+        // verdict + body.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let mut review = _stage_assignment("rev1", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_of_assignment_id = Some("w1".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        review.review_findings = Some(
+            "{\"verdict\":\"request-changes\",\"body\":\"## Issues\\n- Missing test for edge case\"}"
+                .to_string(),
+        );
+        app.data.assignments.push(review);
+
+        let issue = app.pipeline_issues[0].clone();
+        let rows = app.stage_content_review(&issue);
+        // Should contain the verdict label + the body content.
+        let text: String = rows
+            .iter()
+            .flat_map(|r| r.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("changes requested") || text.contains("request-changes"),
+            "expected verdict in rendered content; got: {text:?}",
+        );
+        assert!(
+            text.contains("Missing test for edge case"),
+            "expected body in rendered content; got: {text:?}",
+        );
+    }
+
+    #[test]
+    fn stage_content_review_falls_back_when_no_cache() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let mut review = _stage_assignment("rev2", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_verdict = Some("approve".to_string());
+        review.review_findings = None;  // no cache
+        app.data.assignments.push(review);
+
+        let rows = app.stage_content_review(&app.pipeline_issues[0].clone());
+        let text: String = rows
+            .iter()
+            .flat_map(|r| r.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("not yet parsed") || text.contains("coord notify"),
+            "expected hint about parsing; got: {text:?}",
         );
     }
 
