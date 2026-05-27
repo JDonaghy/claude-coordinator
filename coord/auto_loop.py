@@ -43,7 +43,12 @@ import httpx
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord.models import Assignment, Board
-from coord.review import ReviewFindings, parse_review_from_agent, parse_review_from_log
+from coord.review import (
+    ReviewFindings,
+    dispatch_review,
+    parse_review_from_agent,
+    parse_review_from_log,
+)
 from coord.state import load_board, record_dispatched_assignment, save_board
 
 log = logging.getLogger(__name__)
@@ -57,12 +62,15 @@ class LoopAction:
 
     kind: str
     """One of:
-    - ``"fix_dispatched"``   — a fix worker was dispatched
-    - ``"approved"``         — review approved; no further action needed
-    - ``"max_iterations"``   — loop stopped; user intervention required
-    - ``"no_findings"``      — log had no structured REVIEW_VERDICT block
-    - ``"no_work_found"``    — could not locate the work assignment on the board
-    - ``"disabled"``         — auto_loop is disabled in config
+    - ``"fix_dispatched"``     — a fix worker was dispatched
+    - ``"approved"``           — review approved; no further action needed
+    - ``"max_iterations"``     — loop stopped; user intervention required
+    - ``"no_findings"``        — log had no structured REVIEW_VERDICT block
+    - ``"no_work_found"``      — could not locate the work assignment on the board
+    - ``"disabled"``           — auto_loop is disabled in config
+    - ``"review_dispatched"``  — a re-review was dispatched after a fix worker completed
+    - ``"iteration_cap_hit"``  — fix.review_iteration >= max_review_iterations;
+                                 not dispatching another review
     """
     assignment_id: str | None
     detail: str = ""
@@ -442,6 +450,100 @@ def _post_max_iterations_notice(work: Assignment, config: Config) -> None:
 
 
 # ── notify.py integration ─────────────────────────────────────────────────────
+
+def run_for_fix_transition(
+    assignment_id: str,
+    config: Config,
+) -> list[LoopAction]:
+    """Entry point called from ``notify.run()`` for each completed fix worker.
+
+    When a bounce-fix worker (``type="work"``, ``review_of_assignment_id``
+    IS NOT NULL, title starting with ``"[fix-"``) completes, dispatch a fresh
+    review against it so the review → fix → re-review cycle closes
+    automatically without manual ``coord pr`` invocations.
+
+    Caps re-review iterations at ``config.pipeline.max_review_iterations``
+    using the fix worker's ``review_iteration`` field.  When
+    ``fix.review_iteration >= max_review_iterations`` the loop has already
+    used all its fix rounds, so no further review is dispatched and an
+    ``iteration_cap_hit`` action is returned instead.
+
+    Parameters
+    ----------
+    assignment_id:
+        The completed fix worker's assignment ID.
+    config:
+        Parsed coordinator config.
+
+    Returns
+    -------
+    list[LoopAction]
+        ``[LoopAction(kind="review_dispatched", ...)]`` on success,
+        ``[LoopAction(kind="iteration_cap_hit", ...)]`` when the cap is hit,
+        ``[LoopAction(kind="disabled", ...)]`` when auto_loop is off, or
+        ``[]`` when the assignment is not found on the board or
+        ``dispatch_review`` cannot find a capable machine.
+    """
+    if not config.pipeline.auto_loop:
+        return [LoopAction(kind="disabled", assignment_id=assignment_id)]
+
+    board = load_board()
+    if board is None:
+        log.debug("auto_loop: no board — skipping fix completion %s", assignment_id)
+        return []
+
+    fix = board.find_by_id(assignment_id)
+    if fix is None:
+        log.debug(
+            "auto_loop: fix assignment %s not found on board — skipping",
+            assignment_id,
+        )
+        return []
+
+    max_iter = config.pipeline.max_review_iterations
+    if fix.review_iteration >= max_iter:
+        log.warning(
+            "auto_loop: fix %s has review_iteration=%d >= max_review_iterations=%d "
+            "— not dispatching another review",
+            assignment_id, fix.review_iteration, max_iter,
+        )
+        return [LoopAction(
+            kind="iteration_cap_hit",
+            assignment_id=assignment_id,
+            detail=(
+                f"fix iteration {fix.review_iteration} >= "
+                f"max_review_iterations {max_iter}; "
+                "not dispatching another review"
+            ),
+        )]
+
+    review = dispatch_review(fix, board, config)
+
+    if review is None:
+        log.warning(
+            "auto_loop: dispatch_review returned None for fix %s "
+            "(no capable machine or dedup check rejected the dispatch)",
+            assignment_id,
+        )
+        return []
+
+    fix.review_state = "dispatched"
+    save_board(board)
+
+    log.info(
+        "auto_loop: dispatched re-review %s for fix worker %s (iteration %d/%d)",
+        review.assignment_id, assignment_id, fix.review_iteration, max_iter,
+    )
+    return [LoopAction(
+        kind="review_dispatched",
+        assignment_id=assignment_id,
+        detail=(
+            f"re-review {review.assignment_id} dispatched to "
+            f"{review.machine_name} (fix iteration {fix.review_iteration}/"
+            f"{max_iter})"
+        ),
+    )]
+
 
 def run_for_review_transition(
     assignment_id: str,

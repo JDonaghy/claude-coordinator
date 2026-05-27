@@ -14,6 +14,7 @@ from coord.auto_loop import (
     _build_fix_briefing,
     _post_max_iterations_notice,
     process_review_completion,
+    run_for_fix_transition,
     run_for_review_transition,
 )
 from coord.config import Config, PipelineConfig, ReviewsConfig
@@ -1028,3 +1029,150 @@ class TestReviewFindingsDbCache:
         )
         assert findings is not None
         assert findings.body == "from http"
+
+
+# ── Unit tests: run_for_fix_transition ──────────────────────────────────────
+
+
+def _fix_assignment(
+    assignment_id: str = "fix-1",
+    review_iteration: int = 1,
+    review_of: str = "work-abc",
+) -> Assignment:
+    """Build a bounce-fix work assignment (the type dispatched by process_review_completion)."""
+    a = _work_assignment(assignment_id=assignment_id, review_iteration=review_iteration)
+    a.review_of_assignment_id = review_of
+    a.issue_title = f"[fix-{review_iteration}] Fix the thing"
+    return a
+
+
+def _stub_review_assignment(assignment_id: str = "re-review-1") -> Assignment:
+    """Build a minimal review assignment to stand in for dispatch_review's return value."""
+    return Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1,
+        issue_title="[review] Fix the thing",
+        assignment_id=assignment_id,
+        status="running",
+        type="review",
+        review_of_assignment_id="fix-1",
+    )
+
+
+class TestRunForFixTransition:
+    """run_for_fix_transition: auto-dispatch a fresh review when a fix worker completes."""
+
+    def test_run_for_fix_transition_dispatches_review(
+        self, config: Config, coord_db
+    ) -> None:
+        """Happy path: fix worker completes → fresh review dispatched, board saved."""
+        from coord.state import load_board, save_board
+
+        fix = _fix_assignment()
+        board = Board(completed=[fix])
+        save_board(board)
+
+        stub_review = _stub_review_assignment()
+
+        with patch("coord.auto_loop.dispatch_review", return_value=stub_review):
+            actions = run_for_fix_transition("fix-1", config)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "review_dispatched"
+        assert actions[0].assignment_id == "fix-1"
+
+        # Board was saved with the fix's review_state updated.
+        loaded = load_board()
+        assert loaded is not None
+        found = loaded.find_by_id("fix-1")
+        assert found is not None
+        assert found.review_state == "dispatched"
+
+    def test_run_for_fix_transition_iteration_cap_hit(
+        self, config: Config, coord_db
+    ) -> None:
+        """fix.review_iteration == max_review_iterations → no review dispatched."""
+        from coord.state import save_board
+
+        # review_iteration == max_review_iterations (3) → cap hit.
+        fix = _fix_assignment(assignment_id="fix-3", review_iteration=3)
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with patch("coord.auto_loop.dispatch_review") as mock_dispatch:
+            actions = run_for_fix_transition("fix-3", config)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "iteration_cap_hit"
+        # dispatch_review must NOT be called when the cap is hit.
+        mock_dispatch.assert_not_called()
+
+    def test_run_for_fix_transition_no_machine_available(
+        self, config: Config, coord_db
+    ) -> None:
+        """dispatch_review returns None (no capable machine) → graceful no-op."""
+        from coord.state import save_board
+
+        fix = _fix_assignment()
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with patch("coord.auto_loop.dispatch_review", return_value=None):
+            actions = run_for_fix_transition("fix-1", config)
+
+        # No dispatch possible → empty list (caller can retry later).
+        assert actions == []
+
+    def test_run_for_fix_transition_disabled(
+        self, config_loop_disabled: Config, coord_db
+    ) -> None:
+        """auto_loop=false → disabled action, no dispatch attempt."""
+        from coord.state import save_board
+
+        fix = _fix_assignment()
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with patch("coord.auto_loop.dispatch_review") as mock_dispatch:
+            actions = run_for_fix_transition("fix-1", config_loop_disabled)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "disabled"
+        mock_dispatch.assert_not_called()
+
+    def test_run_for_fix_transition_no_board(self, config: Config) -> None:
+        """No saved board → returns empty list without raising."""
+        with patch("coord.auto_loop.load_board", return_value=None):
+            actions = run_for_fix_transition("fix-1", config)
+        assert actions == []
+
+    def test_run_for_fix_transition_assignment_not_on_board(
+        self, config: Config, coord_db
+    ) -> None:
+        """Fix assignment not found on board → returns empty list without raising."""
+        from coord.state import save_board
+
+        save_board(Board())  # empty board
+
+        actions = run_for_fix_transition("nonexistent-id", config)
+        assert actions == []
+
+    def test_run_for_fix_transition_below_cap_dispatches(
+        self, config: Config, coord_db
+    ) -> None:
+        """review_iteration < max_review_iterations → dispatch proceeds."""
+        from coord.state import save_board
+
+        # iteration=2, max=3 → still allowed.
+        fix = _fix_assignment(assignment_id="fix-2", review_iteration=2)
+        board = Board(completed=[fix])
+        save_board(board)
+
+        stub_review = _stub_review_assignment(assignment_id="re-review-2")
+
+        with patch("coord.auto_loop.dispatch_review", return_value=stub_review):
+            actions = run_for_fix_transition("fix-2", config)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "review_dispatched"
