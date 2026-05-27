@@ -6137,7 +6137,7 @@ impl CoordApp {
             self.push_toast(
                 "Bounce",
                 &format!(
-                    "Dispatching fix worker for review {}\u{2026}",
+                    "Dispatching fix worker for review {}\u{2026} Work will go Active in 1-3s once the subprocess completes.",
                     &review_id[..review_id.len().min(8)],
                 ),
                 ToastSeverity::Info,
