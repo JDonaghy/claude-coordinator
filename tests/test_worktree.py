@@ -432,9 +432,13 @@ class TestWorktreeStartupPrune:
         or a deleted worktree used as a source directory can trigger this on
         agent startup (e.g. after exec_restart following /update).  Regression
         test for issue #280.
+
+        Calls ``_prune_worktrees`` directly — relying on ``_load_state`` to
+        invoke it is unreliable because ``_load_state`` returns early when
+        ``state_path`` doesn't exist (which it doesn't, in this test).
         """
         nonexistent = str(tmp_path / "repo_that_was_deleted")
-        # Path deliberately does NOT exist — agent init must survive.
+        # Path deliberately does NOT exist — prune must survive it.
         server = AgentServer(
             machine_name="t",
             repos=["api"],
@@ -442,11 +446,19 @@ class TestWorktreeStartupPrune:
             worker_command=lambda spec: ["/bin/true"],
             repo_paths={"api": nonexistent},
         )
-        assert server is not None
+        # Direct call — this is what's actually being regression-tested.
+        # Without the (_GitError, FileNotFoundError, OSError) catch in
+        # _prune_worktrees, this raises FileNotFoundError.
+        server._prune_worktrees()
         server.shutdown()
 
     def test_prune_continues_after_one_missing_path(self, tmp_path: Path, repo: Path) -> None:
-        """When one repo_path is missing, _prune_worktrees should still prune the rest."""
+        """When one repo_path is missing, _prune_worktrees should still prune the rest.
+
+        Direct call (see test_prune_tolerates_missing_repo_path) — going
+        through ``__init__`` doesn't reach ``_prune_worktrees`` when the state
+        file doesn't yet exist.
+        """
         nonexistent = str(tmp_path / "gone")
         # Two repos: one valid, one missing.  Both should be attempted; neither
         # should abort the loop.
@@ -457,7 +469,8 @@ class TestWorktreeStartupPrune:
             worker_command=lambda spec: ["/bin/true"],
             repo_paths={"api": str(repo), "sdk": nonexistent},
         )
-        assert server is not None
+        # Direct call — must not raise even though "sdk" path is missing.
+        server._prune_worktrees()
         server.shutdown()
 
 
