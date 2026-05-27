@@ -8167,10 +8167,17 @@ fn build_quadraui_context_menu(state: &ContextMenuState) -> ContextMenu {
 
 impl CoordApp {
     /// Height of the per-row action bar rendered above the sidebar tree.
-    /// Matches the per-panel toolbar height so the panel chrome lines up
-    /// visually across the activity bar / sidebar / main split.
+    ///
+    /// **Exactly one cell tall in TUI mode.**  Earlier this was `lh * 1.4`
+    /// to look like a button row, but the quadraui TUI rasteriser only
+    /// paints into a single row regardless of the rect height — so 1.4
+    /// reserved 1.4 cells of layout space while only 1 cell was actually
+    /// painted.  The 0.4-cell ghost band shifted tree clicks down by one
+    /// row.  Until the rasteriser paints multi-row toolbars (tracked
+    /// upstream — see the "Sidebar" composite primitive design), keep
+    /// the height aligned with what's actually painted.
     fn sidebar_action_bar_height(&self, lh: f32) -> f32 {
-        lh * 1.4
+        lh
     }
 
     /// #270: build the contextual action bar for the currently-selected
@@ -8280,9 +8287,11 @@ impl CoordApp {
         sidebar_b: Rect,
         lh: f32,
     ) -> (Rect, bool) {
-        let Some(bar) = self.sidebar_action_bar() else {
-            return (sidebar_b, false);
-        };
+        // The slot is always reserved (see render path) so tree clicks
+        // stay row-aligned regardless of whether a bar is present.
+        // Match that here: every click in the top cell is swallowed,
+        // even when no bar is visible — otherwise click and paint
+        // disagree about where the tree starts.
         let bar_h = self.sidebar_action_bar_height(lh);
         let bar_rect = Rect::new(sidebar_b.x, sidebar_b.y, sidebar_b.width, bar_h);
         let content_rect = Rect::new(
@@ -8294,6 +8303,12 @@ impl CoordApp {
         if pos.y < bar_rect.y || pos.y >= bar_rect.y + bar_rect.height {
             return (content_rect, false);
         }
+        let Some(bar) = self.sidebar_action_bar() else {
+            // No bar drawn but slot still reserved — swallow the click
+            // so it doesn't fall through to a tree row that visually
+            // sits BELOW the empty band.
+            return (content_rect, true);
+        };
         let layout = bar.layout(
             bar_rect.x,
             bar_rect.y,
@@ -8323,10 +8338,12 @@ impl CoordApp {
 impl CoordApp {
     /// Height of the toolbar row at the top of the main panel.
     ///
-    /// Matches `tab_h` (lh * 1.4) used by the Board / Pipeline detail tab
-    /// bars so the panel chrome lines up visually.
+    /// One cell exactly — see `sidebar_action_bar_height` for why we
+    /// can't use `lh * 1.4` until the quadraui rasteriser paints
+    /// multi-row toolbars.  When that lands upstream, both heights can
+    /// grow to match the tab-bar visual.
     fn toolbar_height(&self, lh: f32) -> f32 {
-        lh * 1.4
+        lh
     }
 
     /// Build the toolbar (a row of clickable verb buttons) for the current
@@ -9111,28 +9128,42 @@ impl ShellApp for CoordApp {
 
         // ── Sidebar: list content (sidebar system / machines) ────────
         if let Some(full_sidebar_rect) = layout.sidebar_content_bounds {
-            // #270: contextual action bar above the tree.  Carves a
-            // row off the top of the sidebar; the tree renders into
-            // the remainder.  None when no row is selected or the
-            // selected row has no row-state-specific verbs.
-            let sidebar_rect = if let Some(action_bar) = self.sidebar_action_bar() {
-                let ab_h = self.sidebar_action_bar_height(lh);
-                let ab_rect = Rect::new(
-                    full_sidebar_rect.x,
-                    full_sidebar_rect.y,
-                    full_sidebar_rect.width,
-                    ab_h,
-                );
+            // #270: contextual action bar above the tree.  Always
+            // reserves a row at the top of the sidebar — even when
+            // there are no buttons for the current row — so the tree
+            // below doesn't jump around as selections cycle through
+            // lifecycle states.  Activity-bar views without
+            // row-actions (Machines / Settings) also leave the slot
+            // present so visual chrome is consistent.
+            let ab_h = self.sidebar_action_bar_height(lh);
+            let ab_rect = Rect::new(
+                full_sidebar_rect.x,
+                full_sidebar_rect.y,
+                full_sidebar_rect.width,
+                ab_h,
+            );
+            if let Some(action_bar) = self.sidebar_action_bar() {
                 backend.draw_toolbar(ab_rect, &action_bar, None, None);
-                Rect::new(
-                    full_sidebar_rect.x,
-                    full_sidebar_rect.y + ab_h,
-                    full_sidebar_rect.width,
-                    (full_sidebar_rect.height - ab_h).max(0.0),
-                )
             } else {
-                full_sidebar_rect
-            };
+                // Empty slot — paint background so the row reads as
+                // intentional chrome rather than a rendering bug.
+                backend.draw_toolbar(
+                    ab_rect,
+                    &Toolbar {
+                        id: WidgetId::new("sidebar-action-bar-empty"),
+                        buttons: Vec::new(),
+                        bg: None,
+                    },
+                    None,
+                    None,
+                );
+            }
+            let sidebar_rect = Rect::new(
+                full_sidebar_rect.x,
+                full_sidebar_rect.y + ab_h,
+                full_sidebar_rect.width,
+                (full_sidebar_rect.height - ab_h).max(0.0),
+            );
             match self.active_view {
                 SidebarView::Board => {
                     self.board_sidebar.render(backend, sidebar_rect);
