@@ -97,6 +97,40 @@ class TestDispatch:
         payload = mock_post.call_args.kwargs["json"]
         assert payload["branch"] == "main"
 
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_target_branch_when_set(
+        self, mock_post: MagicMock, config: Config,
+    ) -> None:
+        """When proposal.target_branch is set, dispatch payload includes it
+        so the agent checks out the explicit branch instead of slugifying the
+        (possibly `[fix-N] …` / `[conflict-fix] …`-prefixed) issue title."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=206, issue_title="[fix-1] tui machines panel restart update",
+            rationale="follow-up",
+            target_branch="issue-206-tui-machines-panel-restart-update",
+        )
+        dispatch(p, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["target_branch"] == "issue-206-tui-machines-panel-restart-update"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_omits_target_branch_when_unset(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Older agents (pre-#target_branch) reject unknown kwargs in
+        AssignmentSpec(**body), so the field must be omitted when not set."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "target_branch" not in payload
+
     def test_unknown_machine_raises(self, config: Config) -> None:
         bad = Proposal(
             id=1, machine_name="ghost", repo_name="api",

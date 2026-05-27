@@ -156,6 +156,13 @@ class Proposal:
     # Pipeline gate requirements — mirrors Assignment.required_gates.
     # Set by the coordinator before dispatch so the ledger records intent.
     required_gates: list[str] = field(default_factory=list)
+    # Optional explicit branch the agent must check out, bypassing the
+    # slugified-title-derived branch name.  Used by follow-up dispatches
+    # (pr, fix-up, continuation) so prefixed issue titles like
+    # `[fix-1] …` or `[conflict-fix] …` don't push to a new orphan
+    # branch — the worker must land commits on the parent assignment's
+    # branch instead.
+    target_branch: str | None = None
 
 
 @dataclass

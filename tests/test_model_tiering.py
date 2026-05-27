@@ -477,6 +477,81 @@ class TestFollowupEscalation:
 
         assert captured["model"] == "sonnet"
 
+    def test_followup_carries_parent_branch_as_target_branch(self) -> None:
+        """Regression: _dispatch_followup must pin the new worker to the
+        parent's existing branch so a `[fix-N] …` / `[conflict-fix] …`-prefixed
+        issue title doesn't make the agent slugify it into an orphan branch.
+
+        Reproduces the #206 incident where `coord pr` on a fix-up assignment
+        derived branch `issue-206-fix-1-tui-machines-panel-restart-update`
+        instead of pushing to the original `issue-206-…` branch.
+        """
+        from coord.cli import _dispatch_followup
+
+        cfg = _make_cfg(default_model="sonnet")
+        original = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=206,
+            issue_title="[fix-1] tui machines panel restart update",
+            assignment_id="parent12345",
+            status="done",
+            branch="issue-206-tui-machines-panel-restart-update",
+            briefing="b",
+        )
+
+        captured: dict = {}
+
+        def fake_dispatch(proposal, _cfg, **_kwargs):
+            captured["target_branch"] = proposal.target_branch
+            return {"id": "newid12345"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), patch(
+            "coord.dispatch.post_briefing"
+        ), patch("coord.state.record_dispatched"), patch(
+            "coord.state.save_board"
+        ), patch("coord.state.build_board"), patch(
+            "coord.state.load_dispatched", return_value=[]
+        ):
+            _dispatch_followup(cfg, original, "create the PR")
+
+        assert captured["target_branch"] == "issue-206-tui-machines-panel-restart-update"
+
+    def test_followup_target_branch_none_when_parent_has_no_branch(self) -> None:
+        """Plan-type parents have branch=None; followups must not invent one.
+        The agent then derives the branch from the (unprefixed) issue title."""
+        from coord.cli import _dispatch_followup
+
+        cfg = _make_cfg(default_model="sonnet")
+        original = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Plan: refactor cache",
+            assignment_id="planparent1",
+            status="done",
+            branch=None,
+            briefing="b",
+            type="plan",
+        )
+
+        captured: dict = {}
+
+        def fake_dispatch(proposal, _cfg, **_kwargs):
+            captured["target_branch"] = proposal.target_branch
+            return {"id": "workchild12"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), patch(
+            "coord.dispatch.post_briefing"
+        ), patch("coord.state.record_dispatched"), patch(
+            "coord.state.save_board"
+        ), patch("coord.state.build_board"), patch(
+            "coord.state.load_dispatched", return_value=[]
+        ):
+            _dispatch_followup(cfg, original, "do the work", type="work")
+
+        assert captured["target_branch"] is None
+
     def test_escalation_in_fix_sonnet_to_opus(self) -> None:
         """coord fix on an assignment that ran sonnet escalates to opus."""
         cfg = _make_cfg(default_model="sonnet")

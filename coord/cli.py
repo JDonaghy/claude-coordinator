@@ -4072,6 +4072,13 @@ def _dispatch_followup(
         model=model if model else cfg.models.default,
         type=type,
         files_likely=files_likely if files_likely is not None else [],
+        # Pin the follow-up to the parent's branch when one exists.  Without
+        # this, prefixed issue titles like `[fix-1] …` or `[conflict-fix] …`
+        # carried into _dispatch_followup (e.g. `coord pr` on a fix-up
+        # assignment) cause the agent to slugify the prefixed title and
+        # push to an orphan branch instead of the original PR's branch.
+        # Mirrors what _dispatch_fix / dispatch_conflict_fix already do.
+        target_branch=original.branch or None,
     )
 
     response = dispatch(proposal, cfg)

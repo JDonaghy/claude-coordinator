@@ -84,6 +84,10 @@ def dispatch(
     # and will reject the payload with a 400.
     if fresh_branch:
         payload["fresh_branch"] = True
+    # Only send target_branch when set — agents predating #target_branch
+    # (and the AssignmentSpec(**body) kwargs check) reject unknown fields.
+    if proposal.target_branch:
+        payload["target_branch"] = proposal.target_branch
 
     resp = httpx.post(url, json=payload, timeout=15)
     resp.raise_for_status()
