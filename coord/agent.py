@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -31,13 +32,12 @@ def _dir_size(path: Path) -> int:
     Silently skips entries that can't be stat'd (deleted mid-walk, permission
     errors, etc.).  Returns 0 when *path* does not exist.
     """
-    import stat as _stat_mod
     total = 0
     try:
         for p in path.rglob("*"):
             try:
                 st = p.stat()
-                if _stat_mod.S_ISREG(st.st_mode):
+                if stat.S_ISREG(st.st_mode):
                     total += st.st_size
             except OSError:
                 pass
@@ -449,6 +449,14 @@ class AgentServer:
         self._processes: dict[str, subprocess.Popen] = {}
         self._threads: dict[str, threading.Thread] = {}
 
+        # Cache for /health worktree_bytes — recomputing it walks every
+        # file under ~/.coord/worktrees on every /health call, which is
+        # tens or hundreds of thousands of stat syscalls when worktrees
+        # contain node_modules / target / etc.  Cache for a few seconds
+        # so polling clients don't pin the agent in an rglob.
+        self._worktree_bytes_cache: tuple[float, int] | None = None  # (computed_at, bytes)
+        self._worktree_bytes_ttl: float = 30.0  # seconds
+
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
@@ -463,8 +471,7 @@ class AgentServer:
                 for a in self._assignments.values()
                 if a.status in (DONE, FAILED, CANCELLED)
             )
-        worktree_base = self.state_dir / "worktrees"
-        worktree_bytes = _dir_size(worktree_base)
+        worktree_bytes = self._cached_worktree_bytes()
         return {
             "machine": self.machine_name,
             "capabilities": self.capabilities,
@@ -480,6 +487,26 @@ class AgentServer:
             "worktree_bytes": worktree_bytes,
         }
 
+    def _cached_worktree_bytes(self) -> int:
+        """Return total worktree disk usage with a short TTL cache.
+
+        Recomputing on every /health call is too expensive — a real worktree
+        with ``node_modules`` / ``target`` / build outputs can need hundreds
+        of thousands of stat syscalls per call, and the TUI polls /health
+        with a 2 s timeout (see ``tui/src/app.rs`` health refresh).  A short
+        TTL keeps the number trustworthy without pinning the agent in an
+        rglob.
+        """
+        worktree_base = self.state_dir / "worktrees"
+        now = time.time()
+        cached = self._worktree_bytes_cache
+        if cached is not None and (now - cached[0]) < self._worktree_bytes_ttl:
+            return cached[1]
+        size = _dir_size(worktree_base)
+        # Single-writer assignment is atomic in CPython; no lock needed.
+        self._worktree_bytes_cache = (now, size)
+        return size
+
     def clean_worktrees(self, *, recent_secs: float = 300.0) -> dict:
         """Remove git worktrees for assignments in terminal states.
 
@@ -488,6 +515,13 @@ class AgentServer:
         - Assignments whose ``finished_at`` timestamp is within
           *recent_secs* seconds of now (default 5 min) — protects against
           racing with a worker that just finished/was cancelled.
+        - Directories whose ``mtime`` is within *recent_secs* of now —
+          this catches the window between ``_setup_worktree`` creating
+          the directory and ``assign()`` registering the assignment in
+          ``self._assignments``.  Without it, a ``clean_worktrees`` call
+          that snapshots ``_assignments`` mid-spawn would treat the
+          freshly-created tree as orphaned and ``git worktree remove`` it
+          out from under the worker.
 
         Returns ``{"cleaned": N, "kept": M, "bytes_freed": B}``.
         """
@@ -520,6 +554,22 @@ class AgentServer:
             if a is not None and a.finished_at is not None:
                 age = now - a.finished_at
                 if age < recent_secs:
+                    kept += 1
+                    continue
+
+            # Skip directories that were created very recently even when
+            # we don't (yet) have an assignment record.  This closes the
+            # race window between `_setup_worktree` (which makes the dir)
+            # and the `with self._lock: self._assignments[id] = …` insert
+            # in `assign()` — if `clean_worktrees` snapshots _assignments
+            # in that window, the worktree looks orphaned but the worker
+            # is still inside `git worktree add`.
+            if a is None:
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    mtime = None
+                if mtime is not None and (now - mtime) < recent_secs:
                     kept += 1
                     continue
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -279,16 +280,104 @@ def test_clean_worktrees_empty_base(tmp_path: Path) -> None:
 
 
 def test_clean_worktrees_removes_orphan(tmp_path: Path) -> None:
-    """Orphaned worktrees (no matching assignment) are removed."""
+    """Orphaned worktrees (no matching assignment) are removed.
+
+    Uses ``recent_secs=0`` to bypass the race-window mtime guard that
+    normally protects just-created directories from being deleted out
+    from under a still-spawning worker.
+    """
     server = _server(tmp_path)
     orphan = server.state_dir / "worktrees" / "no-such-assignment"
     orphan.mkdir(parents=True)
     (orphan / "file.txt").write_text("data")
 
-    result = server.clean_worktrees()
+    result = server.clean_worktrees(recent_secs=0)
     assert result["cleaned"] == 1
     assert result["bytes_freed"] > 0
     assert not orphan.exists()
+
+
+def test_clean_worktrees_keeps_fresh_orphan(tmp_path: Path) -> None:
+    """Race protection: an orphan whose mtime is within recent_secs is kept.
+
+    Closes the window where ``_setup_worktree`` has created the
+    directory but ``assign()`` hasn't yet inserted the assignment into
+    ``self._assignments`` — without this guard a concurrent
+    ``clean_worktrees`` would ``git worktree remove`` the freshly-made
+    tree out from under the spawning worker.
+    """
+    server = _server(tmp_path)
+    # mtime is "now" — within the default 5-minute recent_secs window.
+    fresh = server.state_dir / "worktrees" / "racing-id"
+    fresh.mkdir(parents=True)
+    (fresh / "file.txt").write_text("partial")
+
+    result = server.clean_worktrees(recent_secs=300)
+    assert result["cleaned"] == 0
+    assert result["kept"] == 1
+    assert fresh.exists()
+
+
+def test_clean_worktrees_removes_aged_orphan(tmp_path: Path) -> None:
+    """An orphan with old mtime is removed under the default recent_secs."""
+    server = _server(tmp_path)
+    aged = server.state_dir / "worktrees" / "old-orphan"
+    aged.mkdir(parents=True)
+    (aged / "leftover.txt").write_text("stale")
+    # Back-date the directory mtime to simulate an orphan from a
+    # previous agent session.
+    old = time.time() - 3600  # 1 hour ago
+    os.utime(aged, (old, old))
+
+    result = server.clean_worktrees(recent_secs=300)
+    assert result["cleaned"] == 1
+    assert not aged.exists()
+
+
+def test_clean_worktrees_keeps_recently_finished(tmp_path: Path) -> None:
+    """Recently-finished assignments are kept (worker may still be tearing down)."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+    a = server.assign(_spec(repo))
+    final = server.wait_for(a.id)
+
+    # Re-create the worktree dir so we have something to potentially clean.
+    stale_wt = server.state_dir / "worktrees" / final.id
+    stale_wt.mkdir(parents=True, exist_ok=True)
+    (stale_wt / "leftover.txt").write_text("stale data")
+    # The assignment record's finished_at is "now-ish"; default
+    # recent_secs=300 should keep the worktree.
+    result = server.clean_worktrees(recent_secs=300)
+    assert result["kept"] >= 1
+    assert result["cleaned"] == 0
+    assert stale_wt.exists()
+    server.shutdown()
+
+
+def test_health_worktree_bytes_is_cached(tmp_path: Path) -> None:
+    """health()'s worktree_bytes is cached so /health doesn't rglob every call.
+
+    Files added after the first call should not be visible until the
+    cache TTL expires (or is invalidated).
+    """
+    server = _server(tmp_path)
+    wt_dir = server.state_dir / "worktrees" / "cache-test"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "a.bin").write_bytes(b"X" * 1024)
+
+    first = server.health()["worktree_bytes"]
+    assert first >= 1024
+
+    # Add a much bigger file after the cache has been populated.
+    (wt_dir / "b.bin").write_bytes(b"Y" * 8192)
+    second = server.health()["worktree_bytes"]
+    # Cache TTL is ~30 s by default — the new file should not be visible yet.
+    assert second == first
+
+    # Force-expire the cache and the new size becomes visible.
+    server._worktree_bytes_cache = None
+    third = server.health()["worktree_bytes"]
+    assert third >= first + 8192
 
 
 def test_clean_worktrees_keeps_running(tmp_path: Path) -> None:
