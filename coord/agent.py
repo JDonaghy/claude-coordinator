@@ -867,7 +867,7 @@ class AgentServer:
         if worktree_path.exists():
             try:
                 _git(repo_path, "worktree", "remove", str(worktree_path), "--force")
-            except _GitError:
+            except (_GitError, FileNotFoundError, OSError):
                 shutil.rmtree(worktree_path, ignore_errors=True)
 
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1229,7 +1229,14 @@ class AgentServer:
         self._prune_worktrees()
 
     def _prune_worktrees(self) -> None:
-        """Ask git to prune stale worktree bookkeeping for each known repo."""
+        """Ask git to prune stale worktree bookkeeping for each known repo.
+
+        Tolerates missing or inaccessible repo directories — ``subprocess.run``
+        raises ``FileNotFoundError`` (not ``_GitError``) when its *cwd* doesn't
+        exist, so we catch ``(FileNotFoundError, OSError)`` as well.  This
+        prevents a stale worktree entry from crashing the agent on startup
+        (e.g. after ``exec_restart`` when one of the repo paths has gone away).
+        """
         seen_paths: set[str] = set()
         for path_str in self.repo_paths.values():
             if path_str in seen_paths:
@@ -1237,7 +1244,7 @@ class AgentServer:
             seen_paths.add(path_str)
             try:
                 _git(Path(path_str).expanduser(), "worktree", "prune")
-            except _GitError:
+            except (_GitError, FileNotFoundError, OSError):
                 pass
 
     def shutdown(self, *, kill_running: bool = False) -> None:

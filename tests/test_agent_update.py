@@ -211,6 +211,84 @@ class TestUpdateEndpoint:
         assert any("install" in c and "--upgrade" in c for c in pip_cmds)
         server.shutdown()
 
+    def test_update_last_update_shows_upgraded_even_if_exec_restart_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """last_update.json must persist result='upgraded' BEFORE exec_restart runs.
+
+        If the new process crashes on startup (e.g. _prune_worktrees raises
+        FileNotFoundError), last_update.json was already written as 'upgraded'
+        so the coordinator can distinguish a clean upgrade + dead-restart from
+        a failed pip step.  Regression test for issue #280.
+        """
+        import json as _json
+
+        def boom(_argv: list[str]) -> None:
+            raise RuntimeError("simulated exec_restart failure")
+
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(True, "/fake/src")),
+            patch("coord.agent_app.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stdout="Already up to date.", stderr="")
+            client, server = _make_client(tmp_path, exec_restart=boom)
+            client.post("/update")
+            # Give the background thread time to complete.
+            deadline = time.time() + 5
+            while not (server.state_dir / "last_update.json").exists() and time.time() < deadline:
+                time.sleep(0.05)
+
+        last = _json.loads((server.state_dir / "last_update.json").read_text())
+        # The upgrade step succeeded; result must be "upgraded" even though
+        # exec_restart itself raised an exception.
+        assert last["result"] == "upgraded", (
+            f"expected result='upgraded', got {last['result']!r}; "
+            "last_update.json must be written BEFORE exec_restart is called"
+        )
+        server.shutdown()
+
+    def test_update_git_pull_fnf_writes_failed_result(self, tmp_path: Path) -> None:
+        """If the git pull cwd doesn't exist, result must be 'failed' (not 'upgraded').
+
+        This covers the scenario where the editable install's source directory
+        has been deleted (e.g. it was a worktree that got pruned).  The pip/git
+        step raises FileNotFoundError BEFORE the upgrade succeeds, so
+        last_update.json should record result='failed'.  Regression test for
+        issue #280.
+        """
+        import json as _json
+
+        restarted: list = []
+
+        # Build the server (and the underlying git repo) BEFORE patching
+        # subprocess.run — _make_server calls git init/commit which must
+        # use the real subprocess.run.
+        client, server = _make_client(tmp_path, exec_restart=restarted.append)
+
+        def fake_run(cmd, **kwargs):
+            # Simulate subprocess.run raising FileNotFoundError because the
+            # cwd (the deleted worktree) no longer exists.
+            raise FileNotFoundError(
+                2, "No such file or directory", "/home/user/.coord/worktrees/deadbeef"
+            )
+
+        with (
+            patch("coord.agent_app._detect_install_mode",
+                  return_value=(True, "/home/user/.coord/worktrees/deadbeef")),
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+        ):
+            client.post("/update")
+            # Wait for the background thread to write last_update.json.
+            deadline = time.time() + 5
+            while not (server.state_dir / "last_update.json").exists() and time.time() < deadline:
+                time.sleep(0.05)
+
+        assert not restarted, "exec_restart must not fire when git pull raises"
+        last = _json.loads((server.state_dir / "last_update.json").read_text())
+        assert last["result"] == "failed"
+        assert "FileNotFoundError" in (last.get("error") or "")
+        server.shutdown()
+
 
 # ── /restart ──────────────────────────────────────────────────────────────
 

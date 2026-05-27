@@ -424,6 +424,42 @@ class TestWorktreeStartupPrune:
         assert server is not None
         server.shutdown()
 
+    def test_prune_tolerates_missing_repo_path(self, tmp_path: Path) -> None:
+        """_prune_worktrees must not crash when a configured repo_path doesn't exist.
+
+        subprocess.run raises FileNotFoundError (not _GitError) when its cwd
+        argument points to a non-existent directory.  A stale editable install
+        or a deleted worktree used as a source directory can trigger this on
+        agent startup (e.g. after exec_restart following /update).  Regression
+        test for issue #280.
+        """
+        nonexistent = str(tmp_path / "repo_that_was_deleted")
+        # Path deliberately does NOT exist — agent init must survive.
+        server = AgentServer(
+            machine_name="t",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/true"],
+            repo_paths={"api": nonexistent},
+        )
+        assert server is not None
+        server.shutdown()
+
+    def test_prune_continues_after_one_missing_path(self, tmp_path: Path, repo: Path) -> None:
+        """When one repo_path is missing, _prune_worktrees should still prune the rest."""
+        nonexistent = str(tmp_path / "gone")
+        # Two repos: one valid, one missing.  Both should be attempted; neither
+        # should abort the loop.
+        server = AgentServer(
+            machine_name="t",
+            repos=["api", "sdk"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/true"],
+            repo_paths={"api": str(repo), "sdk": nonexistent},
+        )
+        assert server is not None
+        server.shutdown()
+
 
 class TestParallelWorktrees:
     def test_two_assignments_same_repo_different_issues(
