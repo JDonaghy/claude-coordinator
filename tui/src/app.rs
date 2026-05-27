@@ -56,9 +56,9 @@ use quadraui::{
     Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
-    ShellConfig, ShellContext, StageStatus, StatusBar, StatusBarSegment, StyledSpan, StyledText,
-    TabBar, TabItem, Toolbar, ToolbarButton, ToolbarHit, ToolbarItemMeasure, TreeRow, UiEvent,
-    WidgetId,
+    ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
+    StatusBarSegment, StyledSpan, StyledText, TabBar, TabItem, Toolbar, ToolbarButton,
+    ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
@@ -2426,6 +2426,16 @@ pub struct CoordApp {
     /// (it detects the disconnect on the next `tx.send()` call).
     watch_sse: Option<WatchSseState>,
 
+    /// Hover state for the sidebar action bar (above the Board / Pipeline
+    /// tree).  Driven by `UiEvent::MouseMoved`; read at render time and
+    /// passed to `backend.draw_sidebar_panel` so the rasteriser can tint
+    /// the hovered button.  Cleared when the cursor leaves the bar.
+    sidebar_action_bar_hover: ToolbarHoverTracker,
+    /// Hover state for the view-level panel toolbar (above the main
+    /// detail area).  Same shape and lifecycle as
+    /// `sidebar_action_bar_hover`.
+    panel_toolbar_hover: ToolbarHoverTracker,
+
     // ── Settings panel ───────────────────────────────────────────────────
     /// Persisted user settings loaded from `~/.coord/settings.toml`.
     settings: TuiSettings,
@@ -2553,6 +2563,8 @@ impl CoordApp {
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
+            sidebar_action_bar_hover: ToolbarHoverTracker::new(),
+            panel_toolbar_hover: ToolbarHoverTracker::new(),
             settings: TuiSettings::load(),
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
             settings_field_sel: 0,
@@ -6930,6 +6942,59 @@ impl CoordApp {
                 }
             }
 
+            // #272: drive ToolbarHoverTracker from MouseMoved so the
+            // hovered toolbar button gets a background tint without the
+            // host having to track button bounds across frames.  A
+            // change in the hovered id triggers a redraw.
+            UiEvent::MouseMoved { position, .. } => {
+                let pos = *position;
+                let lh = backend.line_height();
+                let mut redraw = false;
+                if ctx.in_sidebar(pos.x, pos.y) {
+                    if let Some(sidebar_b) = ctx.sidebar_bounds() {
+                        let panel = self.build_sidebar_action_panel(lh);
+                        let layout = panel.layout(
+                            sidebar_b,
+                            quadraui::SidebarPanelMeasure::new(lh, 8.0),
+                            toolbar_tui_measure,
+                        );
+                        if let Some(t) = layout.toolbar_layout.as_ref() {
+                            redraw |= self
+                                .sidebar_action_bar_hover
+                                .update(t, pos.x, pos.y);
+                        } else {
+                            redraw |= self.sidebar_action_bar_hover.clear();
+                        }
+                        redraw |= self.panel_toolbar_hover.clear();
+                    }
+                } else if ctx.in_main(pos.x, pos.y) {
+                    if let Some(toolbar) = self.panel_toolbar() {
+                        let panel = SidebarPanel {
+                            id: WidgetId::new("panel-toolbar"),
+                            toolbar: Some(toolbar),
+                            toolbar_height: Some(self.toolbar_height(lh)),
+                        };
+                        let layout = panel.layout(
+                            ctx.main_bounds(),
+                            quadraui::SidebarPanelMeasure::new(lh, 8.0),
+                            toolbar_tui_measure,
+                        );
+                        if let Some(t) = layout.toolbar_layout.as_ref() {
+                            redraw |= self.panel_toolbar_hover.update(t, pos.x, pos.y);
+                        } else {
+                            redraw |= self.panel_toolbar_hover.clear();
+                        }
+                    } else {
+                        redraw |= self.panel_toolbar_hover.clear();
+                    }
+                    redraw |= self.sidebar_action_bar_hover.clear();
+                } else {
+                    redraw |= self.sidebar_action_bar_hover.clear();
+                    redraw |= self.panel_toolbar_hover.clear();
+                }
+                redraw
+            }
+
             _ => false,
         }
     }
@@ -6948,7 +7013,9 @@ impl CoordApp {
         // we've already dispatched the action.  Pass the shrunken rect
         // to the tree's hit-tester so its math doesn't see the bar row.
         let lh = backend.line_height();
-        let (sidebar_b, consumed) = self.hit_test_sidebar_action_bar(pos, sidebar_b, lh);
+        let (sidebar_b, consumed) =
+            self.hit_test_sidebar_action_bar(pos, sidebar_b, lh);
+        let _ = backend; // backend reserved for hover updates wired below
         if consumed {
             return true;
         }
@@ -8166,18 +8233,36 @@ fn build_quadraui_context_menu(state: &ContextMenuState) -> ContextMenu {
 // ─── Selected-item action bar (#270) ─────────────────────────────────────────
 
 impl CoordApp {
+    /// #272: build the `SidebarPanel` for the Board / Pipeline sidebar.
+    ///
+    /// Always emits a header toolbar — even when no row-specific verbs
+    /// apply — so the layout reserves the slot and the tree below
+    /// doesn't shift between selections.  Returns the panel as a
+    /// value rather than a `&SidebarPanel` because the toolbar buttons
+    /// are derived from current state (selected row's lifecycle).
+    fn build_sidebar_action_panel(&self, lh: f32) -> SidebarPanel {
+        let toolbar = self.sidebar_action_bar().unwrap_or_else(|| Toolbar {
+            id: WidgetId::new("sidebar-action-bar-empty"),
+            buttons: Vec::new(),
+            bg: None,
+        });
+        SidebarPanel {
+            id: WidgetId::new("sidebar-panel"),
+            toolbar: Some(toolbar),
+            toolbar_height: Some(self.sidebar_action_bar_height(lh)),
+        }
+    }
+
     /// Height of the per-row action bar rendered above the sidebar tree.
     ///
-    /// **Exactly one cell tall in TUI mode.**  Earlier this was `lh * 1.4`
-    /// to look like a button row, but the quadraui TUI rasteriser only
-    /// paints into a single row regardless of the rect height — so 1.4
-    /// reserved 1.4 cells of layout space while only 1 cell was actually
-    /// painted.  The 0.4-cell ghost band shifted tree clicks down by one
-    /// row.  Until the rasteriser paints multi-row toolbars (tracked
-    /// upstream — see the "Sidebar" composite primitive design), keep
-    /// the height aligned with what's actually painted.
+    /// Two cells tall in TUI / two line-heights in GTK.  The quadraui
+    /// rasteriser now paints multi-row toolbars (vertically centring
+    /// the text) and `SidebarPanel` reserves the slot at the
+    /// configured height even when the bar has no buttons — so this
+    /// extra height is safe (no off-by-one click bug) and gives a
+    /// proper button-row visual.
     fn sidebar_action_bar_height(&self, lh: f32) -> f32 {
-        lh
+        lh * 2.0
     }
 
     /// #270: build the contextual action bar for the currently-selected
@@ -8226,7 +8311,7 @@ impl CoordApp {
                 Some(ToolbarButton::Action {
                     id: WidgetId::new(format!("sidebar-action:{}", id_raw)),
                     label: it.label.clone(),
-                    icon: None,
+                    icon: icon_for_action(id_raw).map(String::from),
                     key_hint: it.shortcut.clone(),
                     // The right-click menu only surfaces actions when
                     // they apply to the current row state, so every
@@ -8287,37 +8372,19 @@ impl CoordApp {
         sidebar_b: Rect,
         lh: f32,
     ) -> (Rect, bool) {
-        // The slot is always reserved (see render path) so tree clicks
-        // stay row-aligned regardless of whether a bar is present.
-        // Match that here: every click in the top cell is swallowed,
-        // even when no bar is visible — otherwise click and paint
-        // disagree about where the tree starts.
-        let bar_h = self.sidebar_action_bar_height(lh);
-        let bar_rect = Rect::new(sidebar_b.x, sidebar_b.y, sidebar_b.width, bar_h);
-        let content_rect = Rect::new(
-            sidebar_b.x,
-            sidebar_b.y + bar_h,
-            sidebar_b.width,
-            (sidebar_b.height - bar_h).max(0.0),
-        );
-        if pos.y < bar_rect.y || pos.y >= bar_rect.y + bar_rect.height {
-            return (content_rect, false);
-        }
-        let Some(bar) = self.sidebar_action_bar() else {
-            // No bar drawn but slot still reserved — swallow the click
-            // so it doesn't fall through to a tree row that visually
-            // sits BELOW the empty band.
-            return (content_rect, true);
-        };
-        let layout = bar.layout(
-            bar_rect.x,
-            bar_rect.y,
-            bar_rect.width,
-            bar_rect.height,
+        // #272: layout/hit-test goes through the SidebarPanel primitive
+        // so click and paint can't drift apart.  `Content { .. }`
+        // means the click landed below the toolbar slot (tree
+        // territory) and the caller should forward to the tree.
+        let panel = self.build_sidebar_action_panel(lh);
+        let layout = panel.layout(
+            sidebar_b,
+            quadraui::SidebarPanelMeasure::new(lh, 8.0),
             toolbar_tui_measure,
         );
+        let content_rect = layout.content_bounds;
         match layout.hit_test(pos.x, pos.y) {
-            ToolbarHit::Button(id) => {
+            SidebarPanelHit::ToolbarButton(id) => {
                 if let Some(action) = id.as_str().strip_prefix("sidebar-action:") {
                     let action = action.to_string();
                     if let Some(target) = self.target_for_selected_sidebar_row() {
@@ -8326,9 +8393,12 @@ impl CoordApp {
                 }
                 (content_rect, true)
             }
-            // Click landed in the bar but on a gap / disabled action —
-            // swallow it so it doesn't fall through to the tree.
-            ToolbarHit::Empty => (content_rect, true),
+            // Click inside the toolbar slot but not on a clickable
+            // button (gap, separator, or disabled) — swallow so it
+            // doesn't fall through to the tree.
+            SidebarPanelHit::ToolbarEmpty => (content_rect, true),
+            // Below the toolbar slot — let the tree handle it.
+            SidebarPanelHit::Content { .. } | SidebarPanelHit::Empty => (content_rect, false),
         }
     }
 }
@@ -8338,12 +8408,12 @@ impl CoordApp {
 impl CoordApp {
     /// Height of the toolbar row at the top of the main panel.
     ///
-    /// One cell exactly — see `sidebar_action_bar_height` for why we
-    /// can't use `lh * 1.4` until the quadraui rasteriser paints
-    /// multi-row toolbars.  When that lands upstream, both heights can
-    /// grow to match the tab-bar visual.
+    /// Two cells tall — matches `sidebar_action_bar_height` for visual
+    /// consistency across the activity bar / sidebar / main panel
+    /// chrome.  Safe to grow now that the quadraui rasteriser paints
+    /// multi-row toolbars.
     fn toolbar_height(&self, lh: f32) -> f32 {
-        lh
+        lh * 2.0
     }
 
     /// Build the toolbar (a row of clickable verb buttons) for the current
@@ -8438,40 +8508,31 @@ impl CoordApp {
         let Some(toolbar) = self.panel_toolbar() else {
             return (main_b, false);
         };
-        let tb_h = self.toolbar_height(lh);
-        let tb_rect = Rect::new(main_b.x, main_b.y, main_b.width, tb_h);
-        // Pre-compute the shrunken rect — we hand it back regardless of
-        // whether the click landed on a segment, since the rest of the
-        // panel rendering uses it.
-        let content_rect = Rect::new(
-            main_b.x,
-            main_b.y + tb_h,
-            main_b.width,
-            (main_b.height - tb_h).max(0.0),
-        );
-        if pos.y < tb_rect.y || pos.y >= tb_rect.y + tb_rect.height {
-            return (content_rect, false);
-        }
-        // Resolve the click through the primitive's own layout/hit_test
-        // so the math stays in one place — matches the TUI rasteriser's
-        // measurement (`[ label (key) ]` cells).
-        let layout = toolbar.layout(
-            tb_rect.x,
-            tb_rect.y,
-            tb_rect.width,
-            tb_rect.height,
+        // #272: route through SidebarPanelLayout::hit_test so click +
+        // paint share one definition of "where the toolbar slot is".
+        let panel = SidebarPanel {
+            id: WidgetId::new("panel-toolbar"),
+            toolbar: Some(toolbar),
+            toolbar_height: Some(self.toolbar_height(lh)),
+        };
+        let layout = panel.layout(
+            main_b,
+            quadraui::SidebarPanelMeasure::new(lh, 8.0),
             toolbar_tui_measure,
         );
+        let content_rect = layout.content_bounds;
         match layout.hit_test(pos.x, pos.y) {
-            ToolbarHit::Button(id) => {
+            SidebarPanelHit::ToolbarButton(id) => {
                 let action_id = id.as_str().to_string();
                 self.dispatch_toolbar_action(&action_id);
                 (content_rect, true)
             }
-            // Empty hit (gap, separator, label, or disabled action) —
-            // swallow the click so it doesn't fall through to the panel
-            // body or surprise the user.
-            ToolbarHit::Empty => (content_rect, true),
+            SidebarPanelHit::ToolbarEmpty => (content_rect, true),
+            // Click landed below the toolbar — caller routes to the
+            // tab bar / content beneath.
+            SidebarPanelHit::Content { .. } | SidebarPanelHit::Empty => {
+                (content_rect, false)
+            }
         }
     }
 
@@ -8631,11 +8692,38 @@ fn toolbar_button(verb: &str, label: &str, enabled: bool) -> ToolbarButton {
         // Strip the surrounding spaces — the primitive adds its own
         // padding via `[ ... ]` framing in the TUI rasteriser.
         label: label.trim().to_string(),
-        icon: None,
+        icon: icon_for_action(verb).map(String::from),
         key_hint: None,
         enabled,
         is_active: false,
         tooltip: String::new(),
+    }
+}
+
+/// Map an `action_id` (sidebar row action or panel-toolbar verb) to a
+/// short unicode glyph used as the button icon.  Plain printable
+/// unicode rather than Private-Use-Area nerdfont so the icons render
+/// on every terminal; the user can swap to nerdfont later if desired.
+fn icon_for_action(action_id: &str) -> Option<&'static str> {
+    match action_id {
+        // Row actions (sidebar action bar).
+        "refine" => Some("✎"),
+        "mark-refined" => Some("✓"),
+        "send-to-pipeline" => Some("→"),
+        "drop-to-backlog" => Some("↩"),
+        "drop-to-refining" => Some("↶"),
+        "start-with-plan" => Some("☰"),
+        "start-skip-plan" => Some("▶"),
+        "watch" => Some("◉"),
+        "stop" => Some("■"),
+        "open-pr" => Some("↗"),
+        // Panel-level verbs (`toolbar:<verb>` keys after the prefix).
+        "notify" => Some("ⓘ"),
+        "retry" => Some("↻"),
+        "purge" => Some("✕"),
+        "ready" => Some("✓"),
+        "merge" => Some("⤵"),
+        _ => None,
     }
 }
 
@@ -9128,42 +9216,22 @@ impl ShellApp for CoordApp {
 
         // ── Sidebar: list content (sidebar system / machines) ────────
         if let Some(full_sidebar_rect) = layout.sidebar_content_bounds {
-            // #270: contextual action bar above the tree.  Always
-            // reserves a row at the top of the sidebar — even when
-            // there are no buttons for the current row — so the tree
-            // below doesn't jump around as selections cycle through
-            // lifecycle states.  Activity-bar views without
-            // row-actions (Machines / Settings) also leave the slot
-            // present so visual chrome is consistent.
-            let ab_h = self.sidebar_action_bar_height(lh);
-            let ab_rect = Rect::new(
-                full_sidebar_rect.x,
-                full_sidebar_rect.y,
-                full_sidebar_rect.width,
-                ab_h,
+            // #270 / #272: SidebarPanel composes the contextual action
+            // bar + the tree beneath into one primitive.  The slot is
+            // always reserved at `sidebar_action_bar_height` even when
+            // the bar has no buttons, so the tree doesn't shift as
+            // selections cycle through lifecycle states; and click
+            // dispatch routes through `SidebarPanelLayout::hit_test`
+            // so the off-by-one math we had to maintain by hand is
+            // gone.
+            let panel = self.build_sidebar_action_panel(lh);
+            let panel_layout = backend.draw_sidebar_panel(
+                full_sidebar_rect,
+                &panel,
+                self.sidebar_action_bar_hover.hovered_id(),
+                None,
             );
-            if let Some(action_bar) = self.sidebar_action_bar() {
-                backend.draw_toolbar(ab_rect, &action_bar, None, None);
-            } else {
-                // Empty slot — paint background so the row reads as
-                // intentional chrome rather than a rendering bug.
-                backend.draw_toolbar(
-                    ab_rect,
-                    &Toolbar {
-                        id: WidgetId::new("sidebar-action-bar-empty"),
-                        buttons: Vec::new(),
-                        bg: None,
-                    },
-                    None,
-                    None,
-                );
-            }
-            let sidebar_rect = Rect::new(
-                full_sidebar_rect.x,
-                full_sidebar_rect.y + ab_h,
-                full_sidebar_rect.width,
-                (full_sidebar_rect.height - ab_h).max(0.0),
-            );
+            let sidebar_rect = panel_layout.content_bounds;
             match self.active_view {
                 SidebarView::Board => {
                     self.board_sidebar.render(backend, sidebar_rect);
@@ -9192,15 +9260,21 @@ impl ShellApp for CoordApp {
         // row off the top; everything else renders into the shrunken
         // rect below it.
         let m = if let Some(toolbar) = self.panel_toolbar() {
-            let tb_h = self.toolbar_height(lh);
-            let tb_rect = Rect::new(full_m.x, full_m.y, full_m.width, tb_h);
-            backend.draw_toolbar(tb_rect, &toolbar, None, None);
-            Rect::new(
-                full_m.x,
-                full_m.y + tb_h,
-                full_m.width,
-                (full_m.height - tb_h).max(0.0),
-            )
+            // #272: same SidebarPanel composition for the main-panel
+            // toolbar so the tab bar below doesn't have to coordinate
+            // its own slot carving.
+            let panel = SidebarPanel {
+                id: WidgetId::new("panel-toolbar"),
+                toolbar: Some(toolbar),
+                toolbar_height: Some(self.toolbar_height(lh)),
+            };
+            let panel_layout = backend.draw_sidebar_panel(
+                full_m,
+                &panel,
+                self.panel_toolbar_hover.hovered_id(),
+                None,
+            );
+            panel_layout.content_bounds
         } else {
             full_m
         };
@@ -10552,6 +10626,8 @@ mod tests {
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
             watch_sse: None,
+            sidebar_action_bar_hover: ToolbarHoverTracker::new(),
+            panel_toolbar_hover: ToolbarHoverTracker::new(),
             settings: TuiSettings::default(),
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
             settings_field_sel: 0,
@@ -11129,7 +11205,9 @@ mod tests {
         // Use a large content rect so the layout produces well-separated stages.
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let lh: f32 = 1.0;
-        let tb_h = lh * 1.4;  // #249 toolbar at top
+        // #272: panel toolbar is now 2 cells tall (was 1.4) since the
+        // quadraui rasteriser paints multi-row toolbars.
+        let tb_h = lh * 2.0;
         let tab_h = lh * 1.4; // pipeline detail tab bar below toolbar
         let after_toolbar = Rect::new(
             main_b.x,
