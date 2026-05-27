@@ -96,7 +96,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             test_state TEXT,
             test_reason TEXT,
             cost_usd REAL,
-            smoke_tests TEXT
+            smoke_tests TEXT,
+            review_findings TEXT
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -223,6 +224,12 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # #252: worker-emitted smoke-test list (JSON array of strings;
         # NULL = not emitted, '[]' = explicit "(none — internal)").
         "ALTER TABLE assignments ADD COLUMN smoke_tests TEXT",
+        # #bounce: cached review-findings body (markdown text) so coord
+        # bounce + the upcoming per-stage display don't have to re-fetch
+        # the review log from the agent.  Populated by notify.py when
+        # the review is first parsed.  NULL = not yet parsed; populated
+        # = full findings.body text.
+        "ALTER TABLE assignments ADD COLUMN review_findings TEXT",
     ]
     for sql in migrations:
         try:

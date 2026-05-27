@@ -564,6 +564,67 @@ def mark_notified(
 
 # ── Review-findings tracking ──────────────────────────────────────────────────
 
+def update_assignment_review_findings(
+    assignment_id: str,
+    *,
+    verdict: str,
+    body: str,
+) -> None:
+    """#bounce: persist a parsed `ReviewFindings` on the assignment row.
+
+    Stored as JSON ({"verdict": ..., "body": ...}) so the future read
+    path can recover both fields with one column.  Callers that only
+    know the verdict (and not the body) should use
+    `update_assignment_review_verdict` instead; this helper is for the
+    place where notify already parsed the full findings.
+
+    Idempotent: silently no-ops when the row doesn't exist (matches the
+    other `update_assignment_*` helpers).
+    """
+    if not assignment_id:
+        return
+    payload = json.dumps({"verdict": verdict, "body": body})
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET review_findings=?, review_verdict=? "
+        "WHERE assignment_id=?",
+        (payload, verdict, assignment_id),
+    )
+    conn.commit()
+
+
+def load_assignment_review_findings(
+    assignment_id: str,
+) -> tuple[str, str] | None:
+    """#bounce: read back a cached `(verdict, body)` for an assignment.
+
+    Returns `None` when the row doesn't exist or the column is NULL
+    (notify hasn't parsed this review yet) — callers fall back to
+    parsing the log via local file or agent HTTP.
+    """
+    if not assignment_id:
+        return None
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT review_findings FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row["review_findings"] if hasattr(row, "keys") else row[0]
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    verdict = payload.get("verdict") if isinstance(payload, dict) else None
+    body = payload.get("body") if isinstance(payload, dict) else None
+    if not isinstance(verdict, str) or not isinstance(body, str):
+        return None
+    return (verdict, body)
+
+
 def update_assignment_smoke_tests(
     assignment_id: str, smoke_tests: list[str],
 ) -> None:

@@ -343,6 +343,28 @@ def _persist_review_verdict(assignment_id: str, verdict: str) -> None:
         )
 
 
+def _persist_review_findings(assignment_id: str, verdict: str, body: str) -> None:
+    """#bounce: persist both verdict + findings body in one shot.
+
+    Mirrors `_persist_review_verdict` (which we keep for callers that
+    only have the verdict) but also caches the body so `coord bounce`
+    can skip the slow HTTP log fetch.  Best-effort; a DB error is
+    logged and swallowed.
+    """
+    if verdict not in ("approve", "request-changes"):
+        return
+    try:
+        from coord.state import update_assignment_review_findings  # noqa: PLC0415
+
+        update_assignment_review_findings(
+            assignment_id, verdict=verdict, body=body,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Failed to persist review_findings for %s: %s", assignment_id, exc
+        )
+
+
 def _try_parse_and_post_review(
     transition: Transition,
     record: dict,
@@ -385,7 +407,12 @@ def _try_parse_and_post_review(
     # #253: persist the parsed verdict on the review assignment so the merge
     # gate can refuse to merge work whose review hasn't approved.  Independent
     # of auto_loop (which may be disabled in config).
-    _persist_review_verdict(transition.assignment_id, findings.verdict)
+    # #bounce: also persist the findings.body so `coord bounce` (and the
+    # future per-stage display) can read it from the DB without re-fetching
+    # the worker's full log.
+    _persist_review_findings(
+        transition.assignment_id, findings.verdict, findings.body
+    )
 
     review_target = record.get("review_target")
     repo_github = record["repo_github"]
@@ -680,6 +707,10 @@ def post_orphaned_review_findings(
             if findings is None:
                 log.debug("post_orphaned: no findings (local + agent both missed) for %s", aid)
                 continue
+
+            # #bounce: cache the parsed findings so coord bounce + the
+            # per-stage display can skip the HTTP fetch on later runs.
+            _persist_review_findings(aid, findings.verdict, findings.body)
 
             review_target = row.get("review_target")
             repo_github = row.get("repo_github") or ""

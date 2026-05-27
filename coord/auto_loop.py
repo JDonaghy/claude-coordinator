@@ -77,16 +77,39 @@ def _load_review_findings(
 ) -> ReviewFindings | None:
     """Resolve a reviewer's structured findings.
 
-    Preferred source is the local stream-json / plain-text log; falls
-    back to fetching via the agent's ``/logs/<id>`` HTTP endpoint when
-    the local file isn't reachable.  Mirrors `notify._try_parse_and_post_review`'s
-    discipline — fixing the case where a remote agent's log wasn't on
-    the coordinator's filesystem at notify time (the bug that left
-    quadraui#166 without an auto-fix dispatch).
+    Resolution order, cheapest first:
+    1. **DB cache** — `notify` populates `review_findings` on the row
+       when it first parses a review (#bounce).  Hit means zero I/O,
+       so a manual `coord bounce` after notify has run is near-instant.
+    2. **Local log file** — works when the review ran on this machine.
+    3. **Agent HTTP `/logs/<id>`** — fetches the worker's full log
+       from the remote agent.  Slowest (multi-MB downloads + 15s
+       timeout) but the only option when the review ran on another
+       machine and notify hasn't cached findings yet.
+
+    Returns `None` only when ALL three sources fail.
     """
+    # 1. DB cache — fastest.
+    if review.assignment_id:
+        try:
+            from coord.state import load_assignment_review_findings  # noqa: PLC0415
+            cached = load_assignment_review_findings(review.assignment_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "auto_loop: DB cache lookup failed for %s: %s",
+                review.assignment_id, exc,
+            )
+            cached = None
+        if cached is not None:
+            verdict, body = cached
+            return ReviewFindings(verdict=verdict, body=body)
+
+    # 2. Local log file.
     findings = parse_review_from_log(log_path) if log_path else None
     if findings is not None:
         return findings
+
+    # 3. Agent HTTP fallback.
     if machine_host:
         try:
             findings = parse_review_from_agent(machine_host, review.assignment_id or "")

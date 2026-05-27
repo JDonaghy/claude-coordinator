@@ -895,3 +895,124 @@ class TestCoordBounceCommand:
         ])
         assert result.exit_code != 0
         assert "not found" in result.output
+
+
+class TestReviewFindingsDbCache:
+    """The DB cache layer for review findings.  notify populates it on
+    first parse; coord bounce reads it back near-instantly so we don't
+    have to refetch the multi-MB worker log over Tailscale every time."""
+
+    def test_save_and_load_roundtrip(self, coord_db) -> None:
+        from coord.state import (
+            update_assignment_review_findings,
+            load_assignment_review_findings,
+        )
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="t", briefing="",
+            assignment_id="r1", status="done", type="review",
+        )
+        save_board(Board(completed=[review]))
+
+        update_assignment_review_findings(
+            "r1", verdict="request-changes",
+            body="### Required changes\n- Handle None case",
+        )
+        result = load_assignment_review_findings("r1")
+        assert result is not None
+        verdict, body = result
+        assert verdict == "request-changes"
+        assert "Handle None case" in body
+
+    def test_load_returns_none_when_unset(self, coord_db) -> None:
+        from coord.state import (
+            save_board, load_assignment_review_findings,
+        )
+        from coord.models import Assignment, Board
+
+        review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="t", briefing="",
+            assignment_id="r2", status="done", type="review",
+        )
+        save_board(Board(completed=[review]))
+        # Never wrote findings — should be None.
+        assert load_assignment_review_findings("r2") is None
+
+    def test_load_returns_none_for_unknown_id(self, coord_db) -> None:
+        from coord.state import load_assignment_review_findings
+        assert load_assignment_review_findings("ghost") is None
+
+    def test_load_findings_via_cache_skips_log_and_http(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        """When DB has the cached findings, neither the local log nor
+        the agent HTTP fallback are touched."""
+        from coord.auto_loop import _load_review_findings
+        from coord.state import (
+            update_assignment_review_findings, save_board,
+        )
+        from coord.models import Assignment, Board
+
+        review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="t", briefing="",
+            assignment_id="r3", status="done", type="review",
+        )
+        save_board(Board(completed=[review]))
+        update_assignment_review_findings(
+            "r3", verdict="approve", body="Looks good."
+        )
+
+        # If the function reached the HTTP fallback it would call this:
+        def boom_http(*args, **kwargs):
+            raise AssertionError(
+                "DB cache should have served the request — HTTP fetch must not run"
+            )
+
+        def boom_log(*args, **kwargs):
+            raise AssertionError(
+                "DB cache should have served the request — log parse must not run"
+            )
+
+        monkeypatch.setattr("coord.auto_loop.parse_review_from_agent", boom_http)
+        monkeypatch.setattr("coord.auto_loop.parse_review_from_log", boom_log)
+
+        findings = _load_review_findings(review, log_path="/no/such", machine_host="x")
+        assert findings is not None
+        assert findings.verdict == "approve"
+        assert findings.body == "Looks good."
+
+    def test_falls_back_to_http_when_cache_empty(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        """When the DB row exists but review_findings is NULL (e.g. a
+        review that completed before this cache landed), the loader
+        falls back to local log → HTTP as before."""
+        from coord.auto_loop import _load_review_findings
+        from coord.state import save_board
+        from coord.models import Assignment, Board
+        from coord.review import ReviewFindings
+
+        review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="t", briefing="",
+            assignment_id="r4", status="done", type="review",
+        )
+        save_board(Board(completed=[review]))
+        # No update_assignment_review_findings call — cache stays NULL.
+
+        monkeypatch.setattr(
+            "coord.auto_loop.parse_review_from_agent",
+            lambda h, aid, *a, **kw: ReviewFindings(
+                verdict="request-changes", body="from http"
+            ),
+        )
+        findings = _load_review_findings(
+            review, log_path=None, machine_host="elitebook.tail"
+        )
+        assert findings is not None
+        assert findings.body == "from http"
