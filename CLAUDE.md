@@ -162,6 +162,12 @@ The coordinator session (typically Opus) costs ~10x more per token than Sonnet w
 - Agent server port: 7433, dashboard port: 7434
 - GitHub issue comments carry `<!-- coord:event=... assignment=... -->` markers for machine parsing
 
+## Operational guides
+
+- **Agents are installed from PyPI**, not from a local git clone. The `~/src/claude-coordinator` directory only exists on the coordinator-development machine; remote agent machines should have only `~/.coord-venv` with `pip install claude-coordinator`. Editable installs on remote agents are the source of most upgrade failures.
+- When an upgrade fails (`coord agent update --machine X` reports `did not come back`, or the version doesn't advance), see [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md). The most common fix is converting an editable install to PyPI — that doc has the exact commands.
+- New machines: `docs/AGENT_OPERATIONS.md` also covers first-time install and verification.
+
 ## Status
 
 Issues #1-19 are closed. The core loop, multi-machine dispatch, Tailscale networking, adversarial reviews, merge queue, smoke testing, progress streaming, claim detection, and failure reassignment are all implemented. Remaining work is tracked in the [GitHub issue tracker](https://github.com/JDonaghy/claude-coordinator/issues).

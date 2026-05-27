@@ -136,15 +136,15 @@ Old agents (installed before 0.3.0) don't have the `/update` endpoint. SSH in to
 
 # Alternatively, re-run the installer (it's idempotent):
 curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash
-
-# If installed editable (git clone):
-cd ~/src/claude-coordinator && git pull --ff-only
-# then restart the agent process
 ```
 
 After upgrading, verify with `curl -s http://<host>:7433/status | python3 -c "import sys,json; print(json.load(sys.stdin).get('version'))"`.
 
 **Why this matters:** agents older than 0.3.0 reject `coord assign --force` with a 400 error (`unexpected keyword argument 'fresh_branch'`).
+
+### When `/update` fails or the version doesn't advance
+
+See [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md) for diagnostics and recovery. The most common cause is an old editable (`pip install -e .`) install on the agent machine — convert it to a PyPI install with the recipe in that doc.
 
 ## Command Reference
 
