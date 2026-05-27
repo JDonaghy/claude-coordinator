@@ -244,6 +244,10 @@ def dispatch_conflict_fix(
         "system_prompt": CONFLICT_FIX_SYSTEM_PROMPT,
         "review_target": entry.branch,
         "branch": entry.branch,
+        # #277: pin the agent to the original branch — otherwise it derives a
+        # slug from the "[conflict-fix] …" issue_title and pushes the rebase
+        # to an orphan branch, leaving the real PR stale.
+        "target_branch": entry.branch,
     }
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"

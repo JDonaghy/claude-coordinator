@@ -304,6 +304,20 @@ class TestDispatch:
         # Dedup: no repeats even if repo config happened to include one.
         assert len(deny) == len(set(deny))
 
+    def test_payload_pins_target_branch_to_original(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#277: the dispatch payload must set ``target_branch`` to the
+        original branch so the agent checks out that branch instead of
+        deriving an orphan slug from ``[conflict-fix] <title>``."""
+        client = _FakeHTTPClient({"id": "fix-id-tb"})
+        dispatch_conflict_fix(
+            _entry(), Board(), two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+        _, payload = client.calls[0]
+        assert payload.get("target_branch") == _entry().branch
+
     def test_retry_cap_blocks_second_dispatch_when_prior_completed(
         self, two_machine_config: Config, coord_db,
     ) -> None:
