@@ -87,6 +87,9 @@ class TestClassifyConflict:
         "branch is not up to date with the base branch",
         "non-fast-forward update rejected",
         "PR is behind the base branch",
+        # #276: the actual phrasing gh pr merge returns when base has moved.
+        "Pull request #273 is not mergeable: the merge commit cannot be cleanly created.",
+        "X PR is not mergeable",
     ])
     def test_rebaseable(self, msg: str) -> None:
         assert classify_conflict(msg) == "rebaseable"

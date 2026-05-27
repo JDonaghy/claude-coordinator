@@ -41,6 +41,10 @@ _REBASEABLE_SIGNALS = (
     "not up to date",
     "non-fast-forward",
     "behind the base branch",
+    # `gh pr merge` returns this when the PR is behind base and a rebase
+    # would be needed.  Common on PRs that sat open while main moved.
+    "merge commit cannot be cleanly created",
+    "not mergeable",
 )
 
 _HUMAN_SIGNALS = (
