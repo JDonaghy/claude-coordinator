@@ -842,6 +842,9 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
     # Collect (transition, record, entry) tuples for review completions so we
     # can feed them to the auto-loop after all notifications are posted.
     review_completions: list[tuple[Transition, dict, dict]] = []
+    # Collect (transition, record) tuples for completed fix workers so we can
+    # dispatch a fresh review against each one after notifications are posted.
+    fix_completions: list[tuple[Transition, dict]] = []
 
     posted: list[Transition] = []
     for transition, record, entry in detect_transitions(config):
@@ -857,6 +860,15 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
             and transition.event == EVENT_COMPLETION
         ):
             review_completions.append((transition, record, entry))
+        # Track completed fix workers (type="work", review_of_assignment_id set,
+        # title starts with "[fix-") for auto-loop re-review dispatch.
+        elif (
+            record.get("type") == "work"
+            and transition.event == EVENT_COMPLETION
+            and record.get("review_of_assignment_id")
+            and (record.get("issue_title") or "").startswith("[fix-")
+        ):
+            fix_completions.append((transition, record))
 
     # Also detect and post stuck signals
     stuck_posted: list[StuckDetection] = []
@@ -904,5 +916,30 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
                     )
         except Exception:  # noqa: BLE001
             log.exception("auto_loop: unexpected error in review completion loop")
+
+    # Auto-loop: for each completed fix worker, dispatch a fresh review so
+    # the review → fix → re-review cycle closes without manual coord pr invocations.
+    # Runs after review_completions so a simultaneous review + fix completion
+    # in the same notify run is handled review-first.
+    if fix_completions:
+        try:
+            from coord.auto_loop import run_for_fix_transition  # noqa: PLC0415
+            for transition, _record in fix_completions:
+                try:
+                    actions = run_for_fix_transition(
+                        transition.assignment_id, config
+                    )
+                    for action in actions:
+                        log.info(
+                            "auto_loop fix_transition %s: %s (assignment=%s)",
+                            action.kind, action.detail, action.assignment_id,
+                        )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "auto_loop: error processing fix completion %s",
+                        transition.assignment_id,
+                    )
+        except Exception:  # noqa: BLE001
+            log.exception("auto_loop: unexpected error in fix completion loop")
 
     return posted, stuck_posted
