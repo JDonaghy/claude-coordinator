@@ -128,6 +128,38 @@ class TestEnqueue:
         assert enqueue(a, repo_github="acme/api", target_branch="main") is None
         assert load_queue() == []
 
+    def test_dedup_by_branch_not_assignment_id(self, coord_db) -> None:
+        """#274: a second work assignment on the same branch — fix-1 in the
+        auto-loop, or the PR-creator dispatched by ``coord pr`` — must not
+        produce a duplicate queue row."""
+        first = Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="orig", branch="issue-1-foo", status="done",
+        )
+        fix = Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="[fix-1] t",
+            assignment_id="fix1", branch="issue-1-foo", status="done",
+        )
+        assert enqueue(first, repo_github="acme/api", target_branch="main") is not None
+        assert enqueue(fix, repo_github="acme/api", target_branch="main") is None
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "orig"
+
+    def test_different_branch_same_repo_still_enqueues(self, coord_db) -> None:
+        """Sanity: dedup is scoped to (repo_github, branch), not repo alone."""
+        a1 = Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a1", branch="issue-1-foo", status="done",
+        )
+        a2 = Assignment(
+            machine_name="m", repo_name="api", issue_number=2, issue_title="t",
+            assignment_id="a2", branch="issue-2-bar", status="done",
+        )
+        assert enqueue(a1, repo_github="acme/api", target_branch="main") is not None
+        assert enqueue(a2, repo_github="acme/api", target_branch="main") is not None
+        assert len(load_queue()) == 2
+
 
 # ── Processing with a stub gh ops ────────────────────────────────────────────
 

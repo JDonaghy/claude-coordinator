@@ -204,11 +204,21 @@ def enqueue(
     """Add a completed assignment to the queue if it isn't already there.
 
     Returns the new entry, or None if it was already queued or has no branch.
+
+    Dedup is by ``(repo_github, branch)`` — the queue's natural key is the
+    branch we'd merge, not the assignment_id.  Multiple work assignments
+    routinely target the same branch (original + fix-1 in the auto-loop,
+    original + PR-creator from ``coord pr``); they should not produce
+    duplicate rows. (#274)
     """
     if not assignment.branch:
         return None
     items = load_queue()
-    if any(x.assignment_id == assignment.assignment_id for x in items):
+    if any(
+        x.assignment_id == assignment.assignment_id
+        or (x.repo_github == repo_github and x.branch == assignment.branch)
+        for x in items
+    ):
         return None
     entry = QueuedMerge(
         assignment_id=assignment.assignment_id or "",
