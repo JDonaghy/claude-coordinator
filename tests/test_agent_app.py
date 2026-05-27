@@ -344,13 +344,17 @@ def test_worktree_clean_empty(tmp_path: Path) -> None:
 
 
 def test_worktree_clean_removes_orphan(tmp_path: Path) -> None:
-    """POST /worktree-clean removes orphaned worktrees (no matching assignment)."""
+    """POST /worktree-clean removes orphaned worktrees (no matching assignment).
+
+    Uses ``recent_secs=0`` to bypass the race-window mtime guard that
+    would otherwise keep this just-created directory.
+    """
     client, server = _client(tmp_path)
     orphan = server.state_dir / "worktrees" / "no-such-id"
     orphan.mkdir(parents=True)
     (orphan / "data.txt").write_text("hello")
 
-    r = client.post("/worktree-clean")
+    r = client.post("/worktree-clean", json={"recent_secs": 0})
     assert r.status_code == 200
     body = r.json()
     assert body["cleaned"] == 1
@@ -358,9 +362,23 @@ def test_worktree_clean_removes_orphan(tmp_path: Path) -> None:
 
 
 def test_worktree_clean_respects_recent_secs(tmp_path: Path) -> None:
-    """POST /worktree-clean with recent_secs body parameter is accepted."""
-    client, _ = _client(tmp_path)
+    """recent_secs body param actually protects fresh orphans (race fix)."""
+    client, server = _client(tmp_path)
+    fresh = server.state_dir / "worktrees" / "racing-id"
+    fresh.mkdir(parents=True)
+    (fresh / "data.txt").write_text("partial")
+
+    # Large recent_secs → fresh orphan must NOT be deleted.
     r = client.post("/worktree-clean", json={"recent_secs": 600})
     assert r.status_code == 200
     body = r.json()
-    assert "cleaned" in body
+    assert body["cleaned"] == 0
+    assert body["kept"] == 1
+    assert fresh.exists()
+
+    # recent_secs=0 → same orphan IS deleted on the next call.
+    r = client.post("/worktree-clean", json={"recent_secs": 0})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cleaned"] == 1
+    assert not fresh.exists()

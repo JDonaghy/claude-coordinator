@@ -11040,7 +11040,13 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    Key::Char('r') => {
+                    // NOTE: This is the *default* `r` binding. View-specific
+                    // overrides (Machines, Pipeline) sit further down with
+                    // their own `if self.active_view == …` guards and would
+                    // be dead code without this exclusion — Rust evaluates
+                    // match arms top-to-bottom, so an unguarded `r` here
+                    // would silently shadow them.
+                    Key::Char('r') if self.active_view != SidebarView::Machines => {
                         self.refresh();
                         self.kick_issue_sync();
                         needs_redraw = true;
@@ -11864,6 +11870,8 @@ mod tests {
                 reachable: true,
                 active_count: 0,
                 repos: vec!["empty-repo".to_string()],
+                version: None,
+                worktree_bytes: 0,
             }],
             ..BoardData::default()
         });
@@ -12365,6 +12373,8 @@ mod tests {
                 reachable: true,
                 active_count: 0,
                 repos: vec!["empty-repo".to_string()],
+                version: None,
+                worktree_bytes: 0,
             }],
             ..BoardData::default()
         });
@@ -12695,6 +12705,8 @@ mod tests {
                 reachable: true,
                 active_count: 0,
                 repos: vec!["api".to_string()],
+                version: None,
+                worktree_bytes: 0,
             }],
             ..BoardData::default()
         };
@@ -15013,6 +15025,8 @@ mod tests {
                         reachable: true,
                         active_count: 3,
                         repos: vec!["api".to_string()],
+                        version: None,
+                        worktree_bytes: 0,
                     },
                     Machine {
                         name: "idle".to_string(),
@@ -15020,6 +15034,8 @@ mod tests {
                         reachable: true,
                         active_count: 0,
                         repos: vec!["api".to_string()],
+                        version: None,
+                        worktree_bytes: 0,
                     },
                     Machine {
                         name: "wrong-repo".to_string(),
@@ -15027,6 +15043,8 @@ mod tests {
                         reachable: true,
                         active_count: 0,
                         repos: vec!["other".to_string()],
+                        version: None,
+                        worktree_bytes: 0,
                     },
                 ],
                 ..BoardData::default()
@@ -15047,6 +15065,8 @@ mod tests {
                     reachable: false,
                     active_count: 0,
                     repos: vec!["api".to_string()],
+                    version: None,
+                    worktree_bytes: 0,
                 }],
                 ..BoardData::default()
             },
