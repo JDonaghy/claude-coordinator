@@ -4759,6 +4759,13 @@ impl CoordApp {
         if issue.is_closed {
             return "done";
         }
+        // An open issue whose merge_queue entry is "merged" is logically
+        // completed — the PR closed the issue via `fixes #N` even before the
+        // brain has synced the GitHub close.  Mirror the Board classifier
+        // (IssueGroup::lifecycle_section) which already treats merged as done.
+        if self.merge_stage_status_for(issue) == StageStatus::Done {
+            return "done";
+        }
         let has_assignments = self.data.assignments.iter().any(|a| {
             a.issue_number == issue.number
                 && issue
@@ -13232,6 +13239,29 @@ mod tests {
     fn rebuild_pipeline_sidebar_lifecycle_done_when_closed() {
         let mut app = make_pipeline_app();
         app.pipeline_issues[0].is_closed = true;
+        let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
+        assert_eq!(section, "done");
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_lifecycle_done_when_merge_queue_merged() {
+        // #283: An OPEN issue (is_closed=false) whose merge_queue entry has
+        // state="merged" must classify as "done" — the PR already closed it
+        // via `fixes #N` even before the brain synced the GitHub close.
+        let mut app = make_pipeline_app();
+        // Issue #42 is open (is_closed=false by default in make_pipeline_app).
+        assert!(!app.pipeline_issues[0].is_closed);
+        // Add a done work assignment for issue #42.
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        // Add a merge_queue entry with state="merged" for issue #42.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(1),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "done");
     }
