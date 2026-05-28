@@ -574,7 +574,10 @@ def _find_or_open_pr(
             base=default_branch,
             head=branch,
             title=f"#{issue_number}: {issue_title}",
-            body=f"Automated PR opened by coordinator for review of issue #{issue_number}.",
+            body=(
+                f"Closes #{issue_number}\n\n"
+                f"Automated PR opened by coordinator for review of issue #{issue_number}."
+            ),
         )
     except RuntimeError:
         return None
