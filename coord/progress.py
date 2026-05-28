@@ -200,6 +200,57 @@ def parse_smoke_tests_from_log(
     return _extract_smoke_tests_from_text(text)
 
 
+def parse_smoke_tests_from_agent(
+    host: str,
+    assignment_id: str,
+    port: int = 7433,
+    timeout: float = 15.0,
+) -> list[str] | None:
+    """#252: fetch a worker's log via the agent's ``/logs/<id>`` endpoint
+    and extract the SMOKE_TESTS block.
+
+    Use this instead of :func:`parse_smoke_tests_from_log` when the worker
+    ran on a remote agent and the log isn't on the coordinator's local
+    filesystem.  Mirrors :func:`coord.review.parse_review_from_agent` and
+    :func:`coord.plan_parser.parse_plan_from_agent`.  Returns the same
+    three-state result as :func:`_extract_smoke_tests_from_text`.
+    """
+    import httpx  # noqa: PLC0415
+
+    url = f"http://{host}:{port}/logs/{assignment_id}"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        text = resp.text
+    except (httpx.HTTPError, httpx.TimeoutException):
+        return None
+    if not text:
+        return None
+
+    # Detect stream-json the same way is_stream_json() does for files.
+    stream_json = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        stream_json = stripped.startswith("{")
+        break
+
+    if stream_json:
+        from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+        texts: list[str] = []
+        for line in text.splitlines():
+            event = parse_event(line.rstrip("\n"))
+            if event is None or event.type != "assistant":
+                continue
+            t = _assistant_text(event)
+            if t:
+                texts.append(t)
+        return _extract_smoke_tests_from_text("\n".join(texts))
+
+    return _extract_smoke_tests_from_text(text)
+
+
 def _detect_warnings(progress: WorkerProgress, all_updates: list[str]) -> None:
     if progress.stuck:
         progress.warnings.append("worker is STUCK and waiting for guidance")

@@ -194,3 +194,58 @@ def parse_plan_from_log(log_path: str | Path) -> WorkerPlan | None:
 
     plan = parse_plan_text(text)
     return None if plan.is_empty() else plan
+
+
+def parse_plan_from_agent(
+    host: str,
+    assignment_id: str,
+    port: int = 7433,
+    timeout: float = 15.0,
+) -> WorkerPlan | None:
+    """Fetch a plan worker's log via the agent's ``/logs/<id>`` endpoint
+    and parse it.
+
+    Use this instead of :func:`parse_plan_from_log` when the plan worker
+    ran on a remote agent and the log file isn't on the coordinator's
+    local filesystem.  Mirrors :func:`coord.review.parse_review_from_agent`.
+    Returns ``None`` on network failure, empty log, or no recognised plan
+    sections.
+    """
+    import httpx  # noqa: PLC0415
+
+    url = f"http://{host}:{port}/logs/{assignment_id}"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        text = resp.text
+    except (httpx.HTTPError, httpx.TimeoutException):
+        return None
+    if not text:
+        return None
+
+    # The agent returns stream-json verbatim when the worker was launched
+    # with --output-format stream-json (the standard).  Detect the same way
+    # is_stream_json() does for files: first non-comment, non-blank line
+    # starts with `{`.
+    stream_json = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        stream_json = stripped.startswith("{")
+        break
+
+    if stream_json:
+        # Reuse the stream-json text extractor by writing to a temp file —
+        # the existing extractor opens by path.  Cheap enough at log sizes
+        # we see in practice (≤ a few MB).
+        import tempfile  # noqa: PLC0415
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=True) as tf:
+            tf.write(text)
+            tf.flush()
+            extracted = _extract_text_from_stream_json(Path(tf.name))
+    else:
+        extracted = text
+
+    plan = parse_plan_text(extracted)
+    return None if plan.is_empty() else plan

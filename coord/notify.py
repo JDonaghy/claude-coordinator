@@ -246,24 +246,43 @@ def post_stuck(detection: StuckDetection, record: dict) -> None:
 def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
     """#252: parse the worker's SMOKE_TESTS block and persist it on the row.
 
-    Only works from a local log — the agent's status entry doesn't
-    carry the block.  Silent on failure.
+    Tries the local log first, then falls back to the agent's /logs/<id>
+    endpoint for remote-agent assignments (mirrors the plan and review
+    capture paths).  Silent on failure.
     """
+    from coord.progress import (  # noqa: PLC0415
+        parse_smoke_tests_from_agent,
+        parse_smoke_tests_from_log,
+    )
+    from coord.state import update_assignment_smoke_tests  # noqa: PLC0415
+
+    parsed: list[str] | None = None
     log_path = entry.get("log_path")
-    if not log_path:
-        return
-    try:
-        from coord.progress import parse_smoke_tests_from_log  # noqa: PLC0415
-        from coord.state import update_assignment_smoke_tests  # noqa: PLC0415
-        parsed = parse_smoke_tests_from_log(Path(log_path))
-    except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "_capture_smoke_tests: failed to parse log for %s: %s",
-            transition.assignment_id, exc,
-        )
-        return
+    if log_path:
+        try:
+            parsed = parse_smoke_tests_from_log(Path(log_path))
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_capture_smoke_tests: failed to parse local log for %s: %s",
+                transition.assignment_id, exc,
+            )
+
     if parsed is None:
-        # No SMOKE_TESTS block in the log — leave smoke_tests NULL so the
+        # Local log unavailable (remote-agent assignment) — fetch via the
+        # agent's /logs/<id> endpoint.  Same fallback the plan and review
+        # paths use.
+        host = _agent_host(transition.machine_name)
+        if host:
+            try:
+                parsed = parse_smoke_tests_from_agent(host, transition.assignment_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_capture_smoke_tests: failed to fetch from agent %s for %s: %s",
+                    host, transition.assignment_id, exc,
+                )
+
+    if parsed is None:
+        # No SMOKE_TESTS block anywhere — leave smoke_tests NULL so the
         # TUI shows the graceful-degradation placeholder.
         return
     try:
@@ -519,17 +538,31 @@ def _try_parse_and_post_plan(
     Returns True if a plan comment was successfully posted, False otherwise.
     Silently swallows all errors so callers can fall back gracefully.
     """
-    from coord.plan_parser import parse_plan_from_log  # noqa: PLC0415
+    from coord.plan_parser import parse_plan_from_log, parse_plan_from_agent  # noqa: PLC0415
 
     log_path = entry.get("log_path")
-    if not log_path:
-        return False
+    worker_plan = None
+    if log_path:
+        try:
+            worker_plan = parse_plan_from_log(log_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to parse plan log for %s: %s", transition.assignment_id, exc)
 
-    try:
-        worker_plan = parse_plan_from_log(log_path)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Failed to parse plan log for %s: %s", transition.assignment_id, exc)
-        return False
+    # Local log unavailable (worker ran on a remote agent — entry.log_path
+    # is the agent's filesystem path, not the coordinator's).  Mirror the
+    # review path: fall back to the agent's /logs/<id> endpoint.  Without
+    # this, every remote-agent plan got posted as a generic "completion"
+    # comment and the structured plan was lost (we hit this on quadraui#264).
+    if worker_plan is None or worker_plan.is_empty():
+        host = _agent_host(transition.machine_name)
+        if host:
+            try:
+                worker_plan = parse_plan_from_agent(host, transition.assignment_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Failed to fetch plan log from agent %s for %s: %s",
+                    host, transition.assignment_id, exc,
+                )
 
     if worker_plan is None or worker_plan.is_empty():
         return False
