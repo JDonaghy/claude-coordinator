@@ -2834,6 +2834,13 @@ pub struct CoordApp {
     /// This is intentionally in-memory: for MVP, hiding accumulation is
     /// sufficient — no persistence needed.
     pipeline_dismissed: std::collections::HashSet<(String, u64)>,
+    /// #290: issues for which a `coord merge` was just dispatched via the
+    /// Pipeline view's Go button but the local DB hasn't yet confirmed the
+    /// new merge_queue entry.  `merge_stage_status_for` returns Active for
+    /// these issues so the Merge box turns blue and the Go button drops
+    /// immediately — without waiting for the next DB refresh.  Cleared in
+    /// `apply_pending_data` once the real merge_queue row lands.
+    pipeline_inflight_merges: std::collections::HashSet<(String, u64)>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -2929,6 +2936,7 @@ impl CoordApp {
             pipeline_ci_checks: std::collections::HashMap::new(),
             pipeline_ci_loader: std::collections::HashMap::new(),
             pipeline_dismissed: std::collections::HashSet::new(),
+            pipeline_inflight_merges: std::collections::HashSet::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -3467,6 +3475,15 @@ impl CoordApp {
                 self.pending_data = None;
                 self.refreshed_at = Instant::now();
                 self.fetch_error = None;
+                // #290: clear optimistic merge-in-flight flags for issues where
+                // the DB has now confirmed a real merge_queue entry (any state).
+                // Once the row exists, merge_stage_status_for reads the real state.
+                self.pipeline_inflight_merges.retain(|(_, issue_number)| {
+                    !self.data
+                        .merge_queue
+                        .iter()
+                        .any(|m| m.issue_number == Some(*issue_number))
+                });
                 let m = self.data.machines.len();
                 if m > 0 {
                     self.machine_sel = self.machine_sel.min(m - 1);
@@ -4909,25 +4926,42 @@ impl CoordApp {
     /// Issues that the user has dismissed via 'D' are excluded.
     fn pipeline_groups_for_repo(&self, repo_key: &str) -> Vec<(&'static str, Vec<usize>)> {
         const VISIBLE_LIFECYCLE: [&str; 3] = ["pending", "in-progress", "done"];
+
+        // #290: deduplicate by (repo_slug, issue_number) — keep the *last*
+        // occurrence so that a newer closed entry (from the gh --state=closed
+        // query) beats a stale open entry (from --state=open) when the two
+        // queries race around an issue that just closed.  Without this, the
+        // same issue can appear in both "in-progress" (open copy) and "done"
+        // (closed copy) simultaneously during the transition window.
+        let mut dedup: std::collections::HashMap<(String, u64), usize> =
+            std::collections::HashMap::new();
+        for (i, issue) in self.pipeline_issues.iter().enumerate() {
+            if Self::pipeline_repo_key(issue) == repo_key
+                && !self
+                    .pipeline_dismissed
+                    .contains(&(issue.repo_slug.clone(), issue.number))
+            {
+                // Last write wins — later index = more recent entry from fetch.
+                dedup.insert((issue.repo_slug.clone(), issue.number), i);
+            }
+        }
+
         let mut result: Vec<(&'static str, Vec<usize>)> = Vec::new();
         for &lc in &VISIBLE_LIFECYCLE {
-            let idxs: Vec<usize> = self
-                .pipeline_issues
-                .iter()
-                .enumerate()
-                .filter(|(_, issue)| {
-                    Self::pipeline_repo_key(issue) == repo_key
-                        && self.pipeline_lifecycle_section(issue) == lc
-                        && !self
-                            .pipeline_dismissed
-                            .contains(&(issue.repo_slug.clone(), issue.number))
+            let mut idxs: Vec<usize> = dedup
+                .values()
+                .copied()
+                .filter(|&i| {
+                    let issue = &self.pipeline_issues[i];
+                    self.pipeline_lifecycle_section(issue) == lc
                         // FILTER box: drop non-matching issues so empty
                         // lifecycle groups (and, in the rebuild, empty repo
                         // sections) fall away — matching Board behavior.
                         && self.pipeline_search.matches(issue.number, &issue.title)
                 })
-                .map(|(i, _)| i)
                 .collect();
+            // Sort to restore stable ordering by original position in pipeline_issues.
+            idxs.sort_unstable();
             if !idxs.is_empty() {
                 result.push((lc, idxs));
             }
@@ -5325,6 +5359,21 @@ impl CoordApp {
         // the auto-rebase is part of the merge phase, not a separate stage.
         if self.has_active_conflict_fix(issue) {
             return StageStatus::Active;
+        }
+        // #290: if a merge was just dispatched from the Go button, optimistically
+        // return Active immediately so the Merge box turns blue and the Go button
+        // disappears — without waiting for the next DB refresh to land the real
+        // merge_queue entry.  The flag is cleared in apply_pending_data once the
+        // entry exists in the DB, at which point the real state takes over.
+        if self.pipeline_inflight_merges.contains(&(issue.repo_slug.clone(), issue.number)) {
+            let has_real_entry = self
+                .data
+                .merge_queue
+                .iter()
+                .any(|m| m.issue_number == Some(issue.number));
+            if !has_real_entry {
+                return StageStatus::Active;
+            }
         }
         let entry = self
             .data
@@ -6317,6 +6366,11 @@ impl CoordApp {
             &coord_repo,
         ]);
         if spawned {
+            // #290: mark the issue as in-flight so merge_stage_status_for returns
+            // Active immediately — the Merge box turns blue and the Go button drops
+            // at once, without waiting for the DB to reflect the new merge_queue entry.
+            self.pipeline_inflight_merges
+                .insert((issue.repo_slug.clone(), issue.number));
             self.pipeline_status = Some((
                 format!("merge dispatched for {} (#{})", coord_repo, issue.number),
                 Instant::now(),
@@ -12203,6 +12257,7 @@ mod tests {
             pipeline_ci_checks: std::collections::HashMap::new(),
             pipeline_ci_loader: std::collections::HashMap::new(),
             pipeline_dismissed: std::collections::HashSet::new(),
+            pipeline_inflight_merges: std::collections::HashSet::new(),
         }
     }
 
@@ -13545,6 +13600,132 @@ mod tests {
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "done");
+    }
+
+    // ── #290: optimistic merge Active state ──────────────────────────────
+
+    #[test]
+    fn merge_stage_active_immediately_after_inflight_recorded() {
+        // #290: inserting an issue into pipeline_inflight_merges (what
+        // dispatch_pipeline_merge does on a successful spawn) must cause
+        // merge_stage_status_for to return Active at once — before the DB
+        // delivers the real merge_queue entry.
+        let mut app = make_pipeline_app();
+        let issue = app.pipeline_issues[0].clone();
+
+        // Sanity: no merge_queue entry → Pending initially.
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Pending,
+            "pre-condition: no merge_queue entry means Pending",
+        );
+
+        // Simulate what dispatch_pipeline_merge does on a successful spawn.
+        app.pipeline_inflight_merges
+            .insert((issue.repo_slug.clone(), issue.number));
+
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Active,
+            "must be Active immediately after dispatch, before DB confirms",
+        );
+    }
+
+    #[test]
+    fn merge_stage_active_real_state_takes_over_when_db_entry_arrives() {
+        // #290: once a real merge_queue entry lands (any state), the
+        // optimistic inflight flag is superseded by the real state.
+        let mut app = make_pipeline_app();
+        let issue = app.pipeline_issues[0].clone();
+
+        // Insert inflight flag.
+        app.pipeline_inflight_merges
+            .insert((issue.repo_slug.clone(), issue.number));
+        assert_eq!(app.merge_stage_status_for(&issue), StageStatus::Active);
+
+        // Real DB entry arrives with state "open" (coord merge enqueued it).
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "open".to_string(),
+            pr_number: Some(101),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+
+        // Real state takes over — inflight flag is now ignored because the
+        // merge_queue entry exists.  "open" → Active is still correct.
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Active,
+            "real 'open' state must also produce Active",
+        );
+    }
+
+    // ── #290: sidebar dedup during open→closed transition ────────────────
+
+    #[test]
+    fn pipeline_groups_no_duplicate_row_during_open_to_closed_transition() {
+        // #290: pipeline_issues can momentarily contain two entries for the
+        // same issue — one from the gh --state=open query (seen as
+        // "in-progress") and one from --state=closed (seen as "done").
+        // pipeline_groups_for_repo must deduplicate so the issue appears
+        // exactly once, with the more-recent (closed) entry winning.
+        let mut app = make_pipeline_app();
+
+        // Issue #42 (index 0) is already in pipeline_issues as open+ready.
+        // Give it a running assignment so its lifecycle is "in-progress".
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 42, "api", Some("work")));
+
+        // Simulate the race: the --state=closed query also returned #42 as
+        // closed.  Appending puts it at a higher index (later = wins dedup).
+        app.pipeline_issues.push(PipelineIssue {
+            number: 42,
+            title: "Add cool thing".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: true,
+        });
+
+        let groups = app.pipeline_groups_for_repo("api");
+
+        // Count how many times #42 appears across all lifecycle sections.
+        let count_42: usize = groups
+            .iter()
+            .flat_map(|(_, idxs)| idxs.iter())
+            .filter(|&&i| app.pipeline_issues[i].number == 42)
+            .count();
+        assert_eq!(
+            count_42, 1,
+            "issue #42 must appear exactly once; appeared {count_42} time(s)",
+        );
+
+        // The surviving entry must be the closed (done) one.
+        let in_done = groups
+            .iter()
+            .find(|(k, _)| *k == "done")
+            .map(|(_, idxs)| idxs.iter().any(|&i| app.pipeline_issues[i].number == 42))
+            .unwrap_or(false);
+        assert!(
+            in_done,
+            "closed entry must win: issue #42 must be in the 'done' section",
+        );
+
+        // The in-progress section must NOT contain #42.
+        let in_progress = groups
+            .iter()
+            .find(|(k, _)| *k == "in-progress")
+            .map(|(_, idxs)| idxs.iter().any(|&i| app.pipeline_issues[i].number == 42))
+            .unwrap_or(false);
+        assert!(
+            !in_progress,
+            "open (stale) entry must be suppressed: #42 must not appear in 'in-progress'",
+        );
     }
 
     // ── Pipeline selection preservation across pipeline_issues swaps ──────
