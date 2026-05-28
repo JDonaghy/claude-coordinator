@@ -79,6 +79,53 @@ To target one machine:
 coord agent update --machine precision
 ```
 
+## Upgrade via the raw `/update` endpoint (reliable fallback)
+
+`coord agent update` is a thin wrapper over the agent's `POST /update`
+HTTP endpoint plus a 120 s "wait for it to come back" loop. That loop is
+the source of the `✗ did not come back` **false negative**: the upgrade
+triggers an `os.execv` restart, and on a slow machine (or slow pip) the
+agent can take longer than 120 s to rebind the port — the CLI gives up
+and reports failure even though the agent recovers seconds later and is
+actually on the new version.
+
+When that happens, drive the endpoint directly and poll `/health`
+yourself — no artificial timeout:
+
+```bash
+# 1. Fire the upgrade. Returns 202 immediately; the pip install + restart
+#    run in a background thread on the agent.
+curl -s -X POST http://<host>:7433/update
+# → {"status":"updating","mode":"pip install --upgrade"}
+
+# 2. Poll /health until the version advances (the agent drops its socket
+#    briefly during the execv restart — `curl` failing for a few seconds
+#    is expected).
+until [ "$(curl -s http://<host>:7433/health | python3 -c 'import sys,json;print(json.load(sys.stdin).get("version"))' 2>/dev/null)" = "<new-version>" ]; do
+  sleep 3
+done
+echo "agent is on <new-version>"
+```
+
+Behaviour worth knowing:
+
+- The endpoint **runs `pip install --upgrade --no-cache-dir
+  claude-coordinator`** (or `git pull --ff-only` for an editable
+  install) in a daemon-less background thread, then `os.execv`-restarts
+  **only if the version actually changed**.
+- If the installed version is already current it records
+  `result: no_change` and does **not** restart — so hitting `/update` on
+  an already-up-to-date agent is harmless (it just runs pip and returns).
+- The full pip/git output is written to `~/.coord/last_update.log` on
+  the agent; a short excerpt plus `mode` / `result` / `version_before` /
+  `version_after` / `error` are surfaced under `last_update` in
+  `/health`.
+
+**Do not update an agent that is running a worker you care about** — the
+`os.execv` restart kills in-flight `claude -p` subprocesses. Check
+`curl -s http://<host>:7433/status` for a non-empty `active` list first,
+or wait for the work to finish.
+
 ## Diagnose a failed upgrade
 
 If `coord agent update` reports `✗ did not come back` or the version doesn't advance, query the machine's `/health` and read `last_update`:
