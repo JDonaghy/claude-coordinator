@@ -2,6 +2,49 @@
 
 How to install, upgrade, diagnose, and recover the per-machine agent server.
 
+## Publishing a release (PyPI)
+
+**Releases are published by GitHub Actions, not by local `twine upload`.**
+The PyPI token lives in the `PYPI_API_TOKEN` repo secret; it is not
+available on any developer machine. Do not run `twine upload` locally —
+it will hang on an interactive token prompt.
+
+The release is triggered by **pushing a `v*` tag**
+(`.github/workflows/publish.yml`). The workflow builds the sdist + wheel,
+publishes to PyPI via `pypa/gh-action-pypi-publish`, and cuts a GitHub
+release with auto-generated notes.
+
+To cut a release:
+
+```bash
+# 1. Bump the version in BOTH places (they must match):
+#    - pyproject.toml  → version = "X.Y.Z"
+#    - coord/__init__.py → __version__ = "X.Y.Z"
+# 2. Commit the bump, then push main:
+git push origin main
+# 3. Tag the bump commit and push the tag — THIS is what publishes:
+git tag vX.Y.Z <bump-commit-sha>
+git push origin vX.Y.Z
+```
+
+Watch the run:
+
+```bash
+gh run list --repo JDonaghy/claude-coordinator --workflow publish.yml --limit 1
+gh run watch <run-id> --repo JDonaghy/claude-coordinator
+```
+
+PyPI propagation can lag a minute or two after the workflow goes green.
+`pip install --upgrade` (and `coord agent update`) may report
+`no_change` until the new version is visible — wait and retry rather
+than assuming the publish failed.
+
+**Anything that changes `coord/agent.py` (e.g. the worker system
+prompts) only takes effect on agents after a release + rollout.**
+Coordinator-only code (CLI, `notify.py`, parsers, TUI) is live from the
+editable install the moment it's on disk — but agents run from PyPI, so
+agent-side changes need this release flow plus the rollout below.
+
 ## Install a new agent (first time)
 
 On the target machine:
