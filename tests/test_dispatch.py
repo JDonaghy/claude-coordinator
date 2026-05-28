@@ -172,3 +172,35 @@ class TestPostBriefing:
         )
         with pytest.raises(ValueError, match="Unknown repo"):
             post_briefing(bad, config)
+
+    @patch("coord.dispatch.github_ops.add_issue_labels")
+    @patch("coord.dispatch.github_ops.post_issue_comment")
+    def test_auto_labels_issue_with_tracked_labels(
+        self,
+        mock_comment: MagicMock,
+        mock_add_labels: MagicMock,
+        config: Config,
+        proposal: Proposal,
+    ) -> None:
+        """post_briefing must tag the issue with cfg.pipeline.tracked_labels()
+        so the TUI Pipeline panel picks it up.  Without this, manually
+        filed issues stay invisible until the user remembers to label them
+        (we hit this on quadraui#263)."""
+        post_briefing(proposal, config)
+        mock_add_labels.assert_called_once_with("acme/api", 10, ["coord"])
+
+    @patch("coord.dispatch.github_ops.add_issue_labels")
+    @patch("coord.dispatch.github_ops.post_issue_comment")
+    def test_labeling_failure_does_not_break_briefing(
+        self,
+        mock_comment: MagicMock,
+        mock_add_labels: MagicMock,
+        config: Config,
+        proposal: Proposal,
+    ) -> None:
+        """Labeling is best-effort — a `gh` failure must not propagate
+        and break the briefing flow."""
+        mock_add_labels.side_effect = RuntimeError("gh not installed")
+        post_briefing(proposal, config)  # must not raise
+        mock_comment.assert_called_once()
+        mock_add_labels.assert_called_once()

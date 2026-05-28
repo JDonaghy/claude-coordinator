@@ -38,6 +38,19 @@ def post_issue_comment(repo: str, issue_number: int, body: str):
     _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
 
 
+def add_issue_labels(repo: str, issue_number: int, labels: list[str]) -> None:
+    """Add labels to an issue. Idempotent — `gh issue edit --add-label`
+    silently no-ops when the label is already present.  Raises RuntimeError
+    on `gh` failure; callers should wrap in try/except when labeling is
+    best-effort (e.g. post-dispatch auto-tagging)."""
+    if not labels:
+        return
+    args = ["issue", "edit", str(issue_number), "--repo", repo]
+    for lbl in labels:
+        args.extend(["--add-label", lbl])
+    _gh(*args)
+
+
 def get_repo_file(repo: str, path: str, branch: str = "develop") -> str:
     import base64
     raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")

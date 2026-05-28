@@ -187,6 +187,18 @@ def post_briefing(
     )
     github_ops.post_issue_comment(repo.github, proposal.issue_number, body)
 
+    # Auto-tag the issue with pipeline_tracked_labels so the TUI's Pipeline
+    # panel picks it up on the next `gh search issues` poll.  Without this,
+    # manually filed issues stay invisible until the user remembers to
+    # label them (we hit this filing quadraui#263).  Best-effort — never
+    # fail the briefing post on a labeling error.
+    tracked = config.pipeline.tracked_labels()
+    if tracked:
+        try:
+            github_ops.add_issue_labels(repo.github, proposal.issue_number, tracked)
+        except (RuntimeError, OSError):
+            pass
+
 
 def post_completion(
     *,
