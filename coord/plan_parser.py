@@ -13,6 +13,11 @@ Recognised headings (as defined in ``WORKER_PLAN_PROMPT`` in ``coord.agent``):
     APPROACH:    concise implementation approach (multi-sentence)
     RISKS:       potential blockers, conflicts, or tricky areas
     ESTIMATE:    rough complexity: trivial | small | medium | large
+
+Plus a fenced ``SMOKE_TESTS:`` / ``END_SMOKE_TESTS`` block — bullets the
+human should run after the work lands.  Parsed the same way the work
+worker's end-of-job block is (``coord.progress.parse_smoke_tests``) so
+the two sources are interchangeable.
 """
 
 from __future__ import annotations
@@ -45,6 +50,12 @@ class WorkerPlan:
     approach: str = ""
     risks: str = ""
     estimate: str = ""
+    # SMOKE_TESTS block emitted by the plan worker.  Tri-state, same shape as
+    # Assignment.smoke_tests / parse_smoke_tests_from_log:
+    #   None — no block emitted (or block was empty/malformed)
+    #   []   — explicit "(none — change is internal)"
+    #   list — one bullet per item
+    smoke_tests: list[str] | None = None
     raw_text: str = ""
 
     def is_empty(self) -> bool:
@@ -57,6 +68,7 @@ class WorkerPlan:
                 self.approach,
                 self.risks,
                 self.estimate,
+                self.smoke_tests is not None,
             ]
         )
 
@@ -68,6 +80,7 @@ class WorkerPlan:
             "approach": self.approach,
             "risks": self.risks,
             "estimate": self.estimate,
+            "smoke_tests": self.smoke_tests,
             "raw_text": self.raw_text,
         }
 
@@ -80,6 +93,7 @@ class WorkerPlan:
             approach=data.get("approach", ""),
             risks=data.get("risks", ""),
             estimate=data.get("estimate", ""),
+            smoke_tests=data.get("smoke_tests"),
             raw_text=data.get("raw_text", ""),
         )
 
@@ -142,6 +156,8 @@ def parse_plan_text(text: str) -> WorkerPlan:
     Returns a :class:`WorkerPlan` whose ``raw_text`` is always set to *text*,
     and whose section fields are populated from any recognised headings found.
     """
+    from coord.progress import _extract_smoke_tests_from_text  # noqa: PLC0415
+
     sections = _parse_sections(text)
     return WorkerPlan(
         plan=sections.get("PLAN", ""),
@@ -150,6 +166,7 @@ def parse_plan_text(text: str) -> WorkerPlan:
         approach=sections.get("APPROACH", ""),
         risks=sections.get("RISKS", ""),
         estimate=sections.get("ESTIMATE", ""),
+        smoke_tests=_extract_smoke_tests_from_text(text),
         raw_text=text,
     )
 

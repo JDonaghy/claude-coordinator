@@ -61,6 +61,27 @@ class TestWorkerPlan:
         assert wp.files_read == []
         assert wp.is_empty()
 
+    def test_smoke_tests_roundtrip(self) -> None:
+        wp = WorkerPlan(
+            plan="x",
+            smoke_tests=["scenario A — trigger B — expect C"],
+        )
+        restored = WorkerPlan.from_dict(wp.to_dict())
+        assert restored.smoke_tests == ["scenario A — trigger B — expect C"]
+
+    def test_smoke_tests_empty_list_distinct_from_none(self) -> None:
+        """[] means "no smoke tests needed (change is internal)"; None means
+        "no block emitted".  The two must survive a roundtrip."""
+        wp_none = WorkerPlan.from_dict({"smoke_tests": None})
+        wp_empty = WorkerPlan.from_dict({"smoke_tests": []})
+        assert wp_none.smoke_tests is None
+        assert wp_empty.smoke_tests == []
+
+    def test_not_empty_when_only_smoke_tests_set(self) -> None:
+        """A plan with just SMOKE_TESTS: (none — change is internal) is
+        not empty — the worker did emit a block."""
+        assert not WorkerPlan(smoke_tests=[]).is_empty()
+
 
 # ---------------------------------------------------------------------------
 # _parse_file_list
@@ -219,6 +240,42 @@ class TestParsePlanText:
         plan = parse_plan_text(text)
         assert plan.plan == ""
         assert not plan.is_empty()
+
+    def test_smoke_tests_block_extracted(self) -> None:
+        text = (
+            "FILES_MODIFY: coord/agent.py\n"
+            "APPROACH: tighten the loop\n"
+            "ESTIMATE: small\n"
+            "\n"
+            "SMOKE_TESTS:\n"
+            "- press B in TUI — opens build dialog — exit code 0\n"
+            "- restart agent — should reconnect within 5s — no error toast\n"
+            "END_SMOKE_TESTS\n"
+        )
+        plan = parse_plan_text(text)
+        assert plan.smoke_tests == [
+            "press B in TUI — opens build dialog — exit code 0",
+            "restart agent — should reconnect within 5s — no error toast",
+        ]
+
+    def test_smoke_tests_none_form_is_empty_list(self) -> None:
+        """SMOKE_TESTS: (none — change is internal) folds to []."""
+        text = (
+            "APPROACH: docstring tweaks\n"
+            "SMOKE_TESTS: (none — change is internal)\n"
+            "END_SMOKE_TESTS\n"
+        )
+        plan = parse_plan_text(text)
+        assert plan.smoke_tests == []
+
+    def test_no_smoke_block_leaves_field_none(self) -> None:
+        """Plan with the other sections but no SMOKE_TESTS leaves the
+        field as None so downstream can detect "didn't emit" vs "emitted
+        empty"."""
+        text = "FILES_MODIFY: a.py\nAPPROACH: x\nESTIMATE: trivial\n"
+        plan = parse_plan_text(text)
+        assert plan.smoke_tests is None
+        assert not plan.is_empty()  # other sections are populated
 
 
 # ---------------------------------------------------------------------------

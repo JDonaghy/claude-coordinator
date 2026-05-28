@@ -4147,6 +4147,18 @@ def _plan_dict_to_text(plan_dict: dict) -> str:
         parts.append(f"Risks:\n{plan.risks}")
     if plan.estimate:
         parts.append(f"Estimate:\n{plan.estimate}")
+    # Smoke tests authored at planning time — the work worker re-emits
+    # these (refining if needed) in its own SMOKE_TESTS block before
+    # exit.  Surfacing them in the briefing lets the worker copy them
+    # verbatim when the change matches the plan.
+    if plan.smoke_tests:
+        bullets = "\n".join(f"  - {b}" for b in plan.smoke_tests)
+        parts.append(f"Smoke tests (from plan — re-emit in your SMOKE_TESTS block):\n{bullets}")
+    elif plan.smoke_tests == []:
+        parts.append(
+            "Smoke tests (from plan): (none — change is internal). "
+            "Emit `SMOKE_TESTS: (none — change is internal)` in your block."
+        )
     # Fall back to raw_text when no structured sections were found.
     if not parts:
         return plan.raw_text or "(no plan text)"
@@ -4394,6 +4406,15 @@ def approve_plan(assignment_id: str, config_path: Path) -> None:
     except ValueError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
+
+    # Persist plan-stage SMOKE_TESTS onto the new work assignment so the
+    # TUI surfaces them immediately — and so they survive even if the
+    # work worker exits without re-emitting its own block.  The work
+    # worker's later SMOKE_TESTS (captured by notify._capture_smoke_tests)
+    # overrides this when present.
+    if plan_obj.smoke_tests is not None:
+        from coord.state import update_assignment_smoke_tests  # noqa: PLC0415
+        update_assignment_smoke_tests(new_id, plan_obj.smoke_tests)
 
     click.echo(f"  Work assignment dispatched (assignment {new_id})")
     click.echo(f"  repo: {assignment.repo_name}  issue: #{assignment.issue_number}")

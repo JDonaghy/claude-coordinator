@@ -233,6 +233,79 @@ class TestApprovePlan:
         assert "coord/cache.py" in proposal.files_likely
         assert "coord/api.py" in proposal.files_likely
 
+    def test_plan_smoke_tests_persisted_to_work_assignment(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """When the plan's SMOKE_TESTS block was captured, approve-plan must
+        persist it on the new work assignment so the TUI surfaces it
+        immediately (and so it survives if the work worker exits without
+        re-emitting the block — the unreliable case the user keeps hitting)."""
+        plan_with_smoke = dict(_SAMPLE_PLAN_DICT)
+        plan_with_smoke["smoke_tests"] = [
+            "press B in TUI — opens build dialog — exit code 0",
+            "restart agent — reconnects within 5s — no error toast",
+        ]
+        a = _make_plan_assignment(
+            assignment_id="plan-smoke", plan=plan_with_smoke
+        )
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "work-smoke"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.state.update_assignment_smoke_tests") as upd:
+            result = CliRunner().invoke(
+                main, ["approve-plan", "plan-smoke", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        upd.assert_called_once_with(
+            "work-smoke",
+            [
+                "press B in TUI — opens build dialog — exit code 0",
+                "restart agent — reconnects within 5s — no error toast",
+            ],
+        )
+
+    def test_plan_smoke_tests_none_form_persisted_as_empty_list(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """SMOKE_TESTS: (none — change is internal) folds to []; that empty
+        list must still be persisted (distinct from None="no block emitted")."""
+        plan_internal = dict(_SAMPLE_PLAN_DICT)
+        plan_internal["smoke_tests"] = []
+        a = _make_plan_assignment(assignment_id="plan-int", plan=plan_internal)
+        state_mod.save_board(Board(active=[], completed=[a]))
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "work-int"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.state.update_assignment_smoke_tests") as upd:
+            result = CliRunner().invoke(
+                main, ["approve-plan", "plan-int", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        upd.assert_called_once_with("work-int", [])
+
+    def test_plan_without_smoke_tests_does_not_call_update(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """When the plan didn't emit a SMOKE_TESTS block (legacy plans or plan
+        worker forgot), don't touch the work assignment's smoke_tests field."""
+        # _SAMPLE_PLAN_DICT has no "smoke_tests" key → WorkerPlan.smoke_tests=None
+        a = _make_plan_assignment(assignment_id="plan-old", plan=_SAMPLE_PLAN_DICT)
+        state_mod.save_board(Board(active=[], completed=[a]))
+
+        with patch("coord.dispatch.dispatch", return_value={"id": "work-old"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.state.update_assignment_smoke_tests") as upd:
+            result = CliRunner().invoke(
+                main, ["approve-plan", "plan-old", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        upd.assert_not_called()
+
     def test_same_machine_used(self, config_file: Path, coord_dir: Path) -> None:
         """The work assignment must target the same machine as the plan."""
         a = _make_plan_assignment(

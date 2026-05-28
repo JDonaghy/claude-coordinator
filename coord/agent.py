@@ -339,6 +339,28 @@ APPROACH: <concise description of the implementation approach (3-5 sentences)>
 RISKS: <potential blockers, conflicts, or tricky areas>
 ESTIMATE: <rough complexity: trivial | small | medium | large>
 
+Then emit a SMOKE_TESTS block — what the human should manually verify after \
+the work lands. You know the intent at planning time; you don't yet know \
+which diff lines will exist, but you do know which user-visible behaviours \
+this change is meant to affect. Author smoke tests against intent, not \
+mechanism.
+
+  SMOKE_TESTS:
+  - [scenario] — [how to trigger] — [what to look for]
+  - [scenario] — [how to trigger] — [what to look for]
+  END_SMOKE_TESTS
+
+Keep it to 2-5 items, one bullet per line. Each bullet has three \
+em-dash-separated parts: the scenario, the trigger, and the success signal. \
+Include any commands the human should re-run on their hardware (e.g. \
+`cargo test --features gtk` when only that build exercises the change).
+
+If the change is purely internal — no user-visible behaviour, automated \
+tests already cover the affected paths — emit exactly:
+
+  SMOKE_TESTS: (none — change is internal)
+  END_SMOKE_TESTS
+
 Rules:
 - Do NOT run gh commands.
 - Do NOT write, edit, or create any files.
