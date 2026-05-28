@@ -4048,6 +4048,7 @@ def _dispatch_followup(
     model: str | None = None,
     type: str = "work",
     files_likely: list[str] | None = None,
+    inherit_branch: bool = True,
 ) -> str:
     """Dispatch a follow-up assignment for an existing assignment. Returns assignment ID.
 
@@ -4059,6 +4060,14 @@ def _dispatch_followup(
 
     *files_likely* is the list of files the worker is expected to touch.
     When None, an empty list is used (no file constraints).
+
+    *inherit_branch* controls whether the follow-up checks out the parent's
+    branch (``target_branch=original.branch``).  True for follow-ups that
+    *continue* existing work on the same branch (``coord pr``, smoke-test
+    fix-up, continuation).  Must be False when the parent is a read-only
+    PLAN assignment: a plan never pushes, its recorded branch is a
+    throwaway worktree name (sometimes a stale/wrong capture), and the
+    work it spawns must start a FRESH branch derived from the issue.
     """
     from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
     from coord.state import build_board, record_dispatched, save_board, load_dispatched
@@ -4079,13 +4088,16 @@ def _dispatch_followup(
         model=model if model else cfg.models.default,
         type=type,
         files_likely=files_likely if files_likely is not None else [],
-        # Pin the follow-up to the parent's branch when one exists.  Without
-        # this, prefixed issue titles like `[fix-1] …` or `[conflict-fix] …`
-        # carried into _dispatch_followup (e.g. `coord pr` on a fix-up
-        # assignment) cause the agent to slugify the prefixed title and
-        # push to an orphan branch instead of the original PR's branch.
-        # Mirrors what _dispatch_fix / dispatch_conflict_fix already do.
-        target_branch=original.branch or None,
+        # Pin the follow-up to the parent's branch when one exists AND the
+        # caller wants continuation.  Without this, prefixed issue titles
+        # like `[fix-1] …` / `[conflict-fix] …` carried into
+        # _dispatch_followup (e.g. `coord pr` on a fix-up assignment)
+        # cause the agent to slugify the prefixed title and push to an
+        # orphan branch instead of the original PR's branch.  But for a
+        # plan→work hand-off the parent is read-only and its branch is a
+        # throwaway (sometimes wrong) capture, so the work must branch
+        # fresh — callers pass inherit_branch=False there.
+        target_branch=(original.branch or None) if inherit_branch else None,
     )
 
     response = dispatch(proposal, cfg)
@@ -4399,6 +4411,10 @@ def approve_plan(assignment_id: str, config_path: Path) -> None:
             enhanced_briefing,
             type="work",
             files_likely=files_likely,
+            # The plan is read-only; its recorded branch is a throwaway
+            # worktree name (and can be a stale/wrong capture).  Work must
+            # branch fresh from the issue, not inherit the plan's branch.
+            inherit_branch=False,
         )
     except httpx.HTTPError as e:
         click.echo(f"error: dispatch failed: {e}", err=True)
@@ -4500,6 +4516,9 @@ def reject_plan(assignment_id: str, config_path: Path, guidance: str) -> None:
             enhanced_briefing,
             type="plan",
             files_likely=list(assignment.files_allowed),
+            # Revised plan is read-only too — don't inherit the prior
+            # plan's throwaway branch.
+            inherit_branch=False,
         )
     except httpx.HTTPError as e:
         click.echo(f"error: dispatch failed: {e}", err=True)

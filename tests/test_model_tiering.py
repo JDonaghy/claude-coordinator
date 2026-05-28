@@ -552,6 +552,52 @@ class TestFollowupEscalation:
 
         assert captured["target_branch"] is None
 
+    def test_followup_inherit_branch_false_suppresses_parent_branch(self) -> None:
+        """Regression: approve-plan dispatches work off a read-only PLAN
+        whose recorded branch is a throwaway worktree name — sometimes a
+        stale/wrong capture (we saw a #264 plan carry an `issue-216-…`
+        branch).  With inherit_branch=False the work must start a FRESH
+        branch (target_branch=None), not check out the plan's branch.
+
+        Without the fix, `coord approve-plan` produced a worker that tried
+        `git worktree add … issue-216-pipeline-stage-colors` and failed
+        with a worktree collision 7s after dispatch.
+        """
+        from coord.cli import _dispatch_followup
+
+        cfg = _make_cfg(default_model="sonnet")
+        plan_parent = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=264,
+            issue_title="Chat overlay primitive",
+            assignment_id="planparent2",
+            status="done",
+            # Wrong/stale branch captured on the read-only plan.
+            branch="issue-216-pipeline-stage-colors",
+            briefing="b",
+            type="plan",
+        )
+
+        captured: dict = {}
+
+        def fake_dispatch(proposal, _cfg, **_kwargs):
+            captured["target_branch"] = proposal.target_branch
+            return {"id": "workchild99"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), patch(
+            "coord.dispatch.post_briefing"
+        ), patch("coord.state.record_dispatched"), patch(
+            "coord.state.save_board"
+        ), patch("coord.state.build_board"), patch(
+            "coord.state.load_dispatched", return_value=[]
+        ):
+            _dispatch_followup(
+                cfg, plan_parent, "do the work", type="work", inherit_branch=False,
+            )
+
+        assert captured["target_branch"] is None
+
     def test_escalation_in_fix_sonnet_to_opus(self) -> None:
         """coord fix on an assignment that ran sonnet escalates to opus."""
         cfg = _make_cfg(default_model="sonnet")
