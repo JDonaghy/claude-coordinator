@@ -180,6 +180,26 @@ def process_review_completion(
             work = board.find_by_id(review.review_of_assignment_id)
             if work is not None:
                 work.review_state = "done"
+                # #292 (Defect 2): proactively enqueue/refresh the merge queue
+                # entry so the TUI shows the Merge stage as ready without
+                # requiring a manual `coord merge` run first.  If the entry was
+                # keyed to an earlier work assignment (the original pre-bounce
+                # assignment), refresh_entry_assignment updates its
+                # assignment_id so has_approved_review can find this approval.
+                try:
+                    from coord import merge_queue as mq  # noqa: PLC0415
+                    repo_cfg = config.repo(work.repo_name)
+                    if repo_cfg is not None and work.branch:
+                        mq.refresh_entry_assignment(
+                            work,
+                            repo_github=repo_cfg.github,
+                            target_branch=repo_cfg.default_branch,
+                        )
+                except Exception as exc:  # noqa: BLE001 — best-effort; merge gate still works
+                    log.warning(
+                        "auto_loop: refresh_entry_assignment failed for %s: %s",
+                        work.assignment_id, exc,
+                    )
         return [LoopAction(
             kind="approved",
             assignment_id=review.assignment_id,

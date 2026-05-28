@@ -6319,17 +6319,66 @@ impl CoordApp {
         if !stages.iter().any(|s| s == "review") {
             return false;
         }
-        // Find the latest work assignment for this issue (matching the
-        // merge entry's assignment_id).  Then look for an approve verdict
-        // on a review-typed assignment whose review_of_assignment_id
-        // matches.  Mirrors coord/merge_queue.py::has_approved_review.
-        let work_id = &entry.assignment_id;
-        let approved = self.data.assignments.iter().any(|a| {
-            a.assignment_type.as_deref() == Some("review")
-                && a.review_of_assignment_id.as_deref() == Some(work_id)
-                && a.review_verdict.as_deref() == Some("approve")
-        });
+        // #292 (Defect 1/2): mirror coord/merge_queue.py::has_approved_review.
+        // After a review bounce the entry may be keyed to the *original* work
+        // assignment while the approved re-review is linked to the *fix* work
+        // assignment.  Collect ALL work IDs for this issue and accept an
+        // approval against any of them.  Seed with entry.assignment_id so
+        // reviews are found even when the work row is pruned from the DB.
+        let approved = self.issue_has_any_approved_review(issue, Some(&entry.assignment_id));
         !approved
+    }
+
+    /// Returns true when any review assignment for *issue* carries
+    /// `review_verdict="approve"`.
+    ///
+    /// #292: used by `merge_blocked_on_review_for_selected_issue` and
+    /// `pipeline_merge_state` to accept an approval on a *fix* work
+    /// assignment even when the merge entry is still keyed to the original
+    /// work assignment.  Mirrors `coord/merge_queue.py::has_approved_review`.
+    ///
+    /// *seed_work_id*: the queue entry's `assignment_id`, included in the
+    /// set of candidate work IDs even when the corresponding assignment row
+    /// has been pruned from `data.assignments` (old rows GC'd from the local
+    /// DB).  Pass `None` when no queue entry is involved (the no-queue path
+    /// in `pipeline_merge_state`).
+    fn issue_has_any_approved_review(
+        &self,
+        issue: &PipelineIssue,
+        seed_work_id: Option<&str>,
+    ) -> bool {
+        // Collect all work assignment IDs for this issue from the local DB.
+        let mut work_ids: std::collections::HashSet<&str> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| {
+                a.issue_number == issue.number
+                    && a.assignment_type.as_deref() == Some("work")
+            })
+            .map(|a| a.id.as_str())
+            .collect();
+
+        // Also seed with the queue entry's assignment_id so reviews that
+        // point to it are found even when the corresponding work assignment
+        // row has been pruned from data.assignments.
+        if let Some(id) = seed_work_id {
+            work_ids.insert(id);
+        }
+
+        if work_ids.is_empty() {
+            return false;
+        }
+
+        self.data.assignments.iter().any(|a| {
+            a.assignment_type.as_deref() == Some("review")
+                && a.issue_number == issue.number
+                && a.review_of_assignment_id
+                    .as_deref()
+                    .map(|id| work_ids.contains(id))
+                    .unwrap_or(false)
+                && a.review_verdict.as_deref() == Some("approve")
+        })
     }
 
     /// Classification of whether a Merge action on the currently-selected
@@ -6351,6 +6400,20 @@ impl CoordApp {
             .iter()
             .find(|m| m.issue_number == Some(issue.number))
         else {
+            // #292 (Defect 2): no queue entry yet — this is normal when
+            // notify/auto_loop haven't had a chance to create the entry.
+            // If work is done and review is approved, let `coord merge`
+            // handle the auto-enqueue rather than showing a misleading
+            // "no PR queued — work hasn't pushed a branch" toast.
+            let stages = self.pipeline_stage_names();
+            if stages.iter().any(|s| s == "review")
+                && self.issue_has_any_approved_review(issue, None)
+            {
+                return PipelineMergeState::Ready {
+                    issue: issue.number,
+                    repo: issue.coord_repo.clone().unwrap_or_default(),
+                };
+            }
             return PipelineMergeState::NoQueue {
                 issue: issue.number,
             };
@@ -6362,31 +6425,32 @@ impl CoordApp {
         }
         // Review gate — only meaningful when the pipeline has a Review
         // stage; otherwise downstream `coord merge` won't enforce it.
+        // #292 (Defect 1/2): use issue_has_any_approved_review so a fix-work
+        // approval is found even when the entry is keyed to the original work.
+        // Seed with entry.assignment_id so reviews are found even if the work
+        // row itself has been pruned from data.assignments.
         let stages = self.pipeline_stage_names();
         if stages.iter().any(|s| s == "review") {
-            let work_id = &entry.assignment_id;
-            // Find the review assignment paired with this work.
-            let verdict: Option<&str> = self
-                .data
-                .assignments
-                .iter()
-                .filter(|a| a.assignment_type.as_deref() == Some("review"))
-                .filter(|a| a.review_of_assignment_id.as_deref() == Some(work_id))
-                .find_map(|a| a.review_verdict.as_deref());
-            match verdict {
-                Some("approve") => { /* good — fall through to CI check */ }
-                Some(other) => {
-                    return PipelineMergeState::BlockedOnReview {
-                        issue: issue.number,
-                        verdict: other.to_string(),
-                    };
-                }
-                None => {
-                    return PipelineMergeState::BlockedOnReview {
-                        issue: issue.number,
-                        verdict: "pending".to_string(),
-                    };
-                }
+            let approved = self.issue_has_any_approved_review(issue, Some(&entry.assignment_id));
+            if !approved {
+                // Surface the most informative verdict we can find.
+                // Prefer "request-changes" over a bare "pending" so the
+                // toast tells the user what happened.
+                let verdict = self
+                    .data
+                    .assignments
+                    .iter()
+                    .filter(|a| {
+                        a.assignment_type.as_deref() == Some("review")
+                            && a.issue_number == issue.number
+                    })
+                    .filter_map(|a| a.review_verdict.as_deref())
+                    .find(|&v| v == "request-changes")
+                    .unwrap_or("pending");
+                return PipelineMergeState::BlockedOnReview {
+                    issue: issue.number,
+                    verdict: verdict.to_string(),
+                };
             }
         }
         // CI gate — only meaningful when a summary has been fetched
@@ -14226,6 +14290,192 @@ mod tests {
         assert!(
             !merge_btn.1,
             "Merge button must render disabled when review blocks the merge",
+        );
+    }
+
+    // ── #292: review bounce → merge fixes ────────────────────────────────
+
+    #[test]
+    fn pipeline_merge_state_ready_after_bounce_approve_on_fix_work() {
+        // #292 Defect 1/2: entry keyed to orig-work, but re-review approved
+        // fix-work.  State should be Ready, not BlockedOnReview.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        // Queue entry keyed to the ORIGINAL work assignment.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "orig-work".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(268),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+
+        // Original work (done, request-changes review).
+        let mut orig_work = _stage_assignment("orig-work", "work", 100.0, "done");
+        orig_work.branch = Some("issue-42-feat".to_string());
+        app.data.assignments.push(orig_work);
+
+        let mut orig_review = _stage_assignment("rev-orig", "review", 150.0, "done");
+        orig_review.review_of_assignment_id = Some("orig-work".to_string());
+        orig_review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(orig_review);
+
+        // Fix work on the same branch, approved by re-review.
+        let mut fix_work = _stage_assignment("fix-work", "work", 200.0, "done");
+        fix_work.branch = Some("issue-42-feat".to_string());
+        app.data.assignments.push(fix_work);
+
+        let mut re_review = _stage_assignment("rev-fix", "review", 250.0, "done");
+        re_review.review_of_assignment_id = Some("fix-work".to_string());
+        re_review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(re_review);
+
+        match app.pipeline_merge_state() {
+            PipelineMergeState::Ready { issue, repo } => {
+                assert_eq!(issue, 42);
+                assert_eq!(repo, "api");
+            }
+            other => panic!("expected Ready after bounce approve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_merge_state_ready_no_queue_entry_but_approved() {
+        // #292 Defect 2: no queue entry exists yet (notify/auto_loop
+        // haven't run) but the fix work has been approved.  State should
+        // be Ready so coord merge auto-enqueues, not NoQueue with a
+        // misleading "work hasn't pushed a branch" toast.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        // No merge_queue entry at all.
+
+        let mut fix_work = _stage_assignment("fix-work", "work", 200.0, "done");
+        fix_work.branch = Some("issue-42-feat".to_string());
+        app.data.assignments.push(fix_work);
+
+        let mut re_review = _stage_assignment("rev-fix", "review", 250.0, "done");
+        re_review.review_of_assignment_id = Some("fix-work".to_string());
+        re_review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(re_review);
+
+        match app.pipeline_merge_state() {
+            PipelineMergeState::Ready { issue, repo } => {
+                assert_eq!(issue, 42);
+                assert_eq!(repo, "api");
+            }
+            other => panic!("expected Ready (no queue but approved), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_merge_state_no_queue_without_approval() {
+        // When there's no queue entry AND no approval, NoQueue is still correct.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        let mut work = _stage_assignment("w1", "work", 100.0, "done");
+        work.branch = Some("issue-42-feat".to_string());
+        app.data.assignments.push(work);
+        // No review assigned yet.
+
+        assert_eq!(
+            app.pipeline_merge_state(),
+            PipelineMergeState::NoQueue { issue: 42 },
+        );
+    }
+
+    #[test]
+    fn pipeline_merge_state_blocked_when_all_reviews_request_changes() {
+        // After a bounce, if the re-review also requested changes we must
+        // stay BlockedOnReview (no approval in the chain).
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "orig-work".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: None,
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+
+        let mut orig_work = _stage_assignment("orig-work", "work", 100.0, "done");
+        orig_work.branch = Some("issue-42-feat".to_string());
+        app.data.assignments.push(orig_work);
+
+        let mut orig_review = _stage_assignment("rev-orig", "review", 150.0, "done");
+        orig_review.review_of_assignment_id = Some("orig-work".to_string());
+        orig_review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(orig_review);
+
+        let mut fix_work = _stage_assignment("fix-work", "work", 200.0, "done");
+        fix_work.branch = Some("issue-42-feat".to_string());
+        app.data.assignments.push(fix_work);
+
+        let mut re_review = _stage_assignment("rev-fix", "review", 250.0, "done");
+        re_review.review_of_assignment_id = Some("fix-work".to_string());
+        re_review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(re_review);
+
+        match app.pipeline_merge_state() {
+            PipelineMergeState::BlockedOnReview { issue, verdict } => {
+                assert_eq!(issue, 42);
+                assert_eq!(verdict, "request-changes");
+            }
+            other => panic!("expected BlockedOnReview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_pipeline_merge_bounce_approved_fires_coord_merge() {
+        // #292: after a bounce approval, dispatch_pipeline_merge_for_selected_issue
+        // should spawn coord merge, not surface a BlockedOnReview toast.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "orig-work".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(268),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+
+        // Bounce scenario: original request-changes, fix approved.
+        let mut orig_work = _stage_assignment("orig-work", "work", 100.0, "done");
+        orig_work.branch = Some("issue-42-feat".to_string());
+        app.data.assignments.push(orig_work);
+        let mut orig_review = _stage_assignment("rev-orig", "review", 150.0, "done");
+        orig_review.review_of_assignment_id = Some("orig-work".to_string());
+        orig_review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(orig_review);
+        let mut fix_work = _stage_assignment("fix-work", "work", 200.0, "done");
+        fix_work.branch = Some("issue-42-feat".to_string());
+        app.data.assignments.push(fix_work);
+        let mut re_review = _stage_assignment("rev-fix", "review", 250.0, "done");
+        re_review.review_of_assignment_id = Some("fix-work".to_string());
+        re_review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(re_review);
+
+        let toasts_before = app.toasts.len();
+        let acted = app.dispatch_pipeline_merge_for_selected_issue();
+        assert!(acted, "dispatcher must act");
+        // No blocking toast — command was dispatched instead.
+        assert_eq!(
+            app.toasts.len(),
+            toasts_before,
+            "no blocking toast expected when review is approved after bounce",
+        );
+        assert!(
+            app.command_runner.is_running(),
+            "coord merge must be spawned after bounce approve",
         );
     }
 

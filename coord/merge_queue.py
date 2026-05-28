@@ -105,15 +105,35 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     were just posted may still be on ``board.active`` for a tick before
     reconcile moves it to ``completed``.  We accept either, since the
     verdict is what matters.
+
+    #292 (Defect 1): after a review bounce the queue entry may be keyed to
+    the *original* work assignment while the approved re-review is linked to
+    the *fix* work assignment.  To handle this we collect **all** work
+    assignment IDs that share the same branch (including the entry's own ID)
+    and accept any approved review that points to any of them.
     """
-    target_id = entry.assignment_id
-    if not target_id:
-        return False
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+
+    # Seed with the entry's own assignment_id, then expand to any work
+    # assignment on the same branch (e.g. fix workers from the auto-loop).
+    branch_work_ids: set[str] = set()
+    if entry.assignment_id:
+        branch_work_ids.add(entry.assignment_id)
+    for a in pool:
+        if getattr(a, "type", None) != "work":
+            continue
+        aid = getattr(a, "assignment_id", None)
+        branch = getattr(a, "branch", None)
+        if aid and branch and branch == entry.branch:
+            branch_work_ids.add(aid)
+
+    if not branch_work_ids:
+        return False
+
     for a in pool:
         if getattr(a, "type", None) != "review":
             continue
-        if getattr(a, "review_of_assignment_id", None) != target_id:
+        if getattr(a, "review_of_assignment_id", None) not in branch_work_ids:
             continue
         if getattr(a, "review_verdict", None) == "approve":
             return True
@@ -238,6 +258,62 @@ def enqueue(
     return entry
 
 
+def refresh_entry_assignment(
+    assignment: Assignment,
+    repo_github: str,
+    target_branch: str,
+) -> bool:
+    """Ensure a PENDING queue entry exists for *assignment*'s branch and
+    is keyed to *assignment*.
+
+    #292 (Defect 2): after a review bounce the entry was created during an
+    earlier ``coord merge`` run and is keyed to the *original* work
+    assignment.  When the fix work gets approved, the entry's
+    ``assignment_id`` must be updated so ``has_approved_review`` (and the
+    matching TUI check) can find the approval.
+
+    - If no entry exists for the branch, one is created (same as
+      ``enqueue``).
+    - If an entry already exists keyed to a different assignment on the
+      same branch and its state is ``PENDING``, its ``assignment_id`` is
+      updated and any stale ``"review required"`` error is cleared.
+    - If the entry is in a terminal state (MERGED, CONFLICT, etc.) it is
+      left untouched.
+
+    Returns ``True`` when a change was made (entry created or updated).
+    """
+    if not assignment.branch or not assignment.assignment_id:
+        return False
+    items = load_queue()
+    existing = next(
+        (x for x in items if x.repo_github == repo_github and x.branch == assignment.branch),
+        None,
+    )
+    if existing is None:
+        entry = QueuedMerge(
+            assignment_id=assignment.assignment_id,
+            repo_name=assignment.repo_name,
+            repo_github=repo_github,
+            branch=assignment.branch,
+            target_branch=target_branch,
+            issue_number=assignment.issue_number,
+            issue_title=assignment.issue_title,
+        )
+        items.append(entry)
+        save_queue(items)
+        return True
+    if existing.assignment_id == assignment.assignment_id:
+        return False  # already correct
+    if existing.state != PENDING:
+        return False  # don't touch terminal entries (MERGED, CONFLICT, etc.)
+    existing.assignment_id = assignment.assignment_id
+    # Clear a stale "review required" error now that a fresh approval arrived.
+    if existing.error == "review required but not approved":
+        existing.error = None
+    save_queue(items)
+    return True
+
+
 # ── Sequencing ───────────────────────────────────────────────────────────
 
 def sequence(items: Iterable[QueuedMerge]) -> list[QueuedMerge]:
@@ -296,23 +372,28 @@ def process(
 ) -> list[MergeEvent]:
     """Open PRs, size them, then merge each pending item.
 
-    Items are grouped by (repo_github, target_branch); a conflict in one
-    group halts only that group. Within a group, items are merged in input
-    order — call `sequence(group)` first if you want size-based ordering.
+    Items are grouped by (repo_github, target_branch); a **merge conflict**
+    in one group halts only that group (the target-branch state is now dirty
+    for later entries).  Within a group, items are merged in input order —
+    call `sequence(group)` first if you want size-based ordering.
     Set `presorted=True` to make that explicit at call sites.
 
     When ``ci_store`` is provided and available, each PR is checked against
     its CI status before merge.  A failed check produces a ``checks_failed``
-    event and halts the group; a still-running check produces ``checks_pending``
-    and halts the group.  ``force_merge=True`` skips this gate (the user has
-    already seen the failures and chosen to merge anyway).
+    event; a still-running check produces ``checks_pending``.  In both cases
+    the entry is **skipped** (``continue``) rather than halting the group, so
+    a ready sibling can still merge.  ``force_merge=True`` skips this gate.
 
     #253: When both *config* and *board* are supplied and the entry requires
     a review (``reviews.enabled`` and ``"review"`` in ``pipeline.default_gates``)
     but no approved review exists on the board, a ``review_required`` event
-    is emitted and the group is halted.  ``skip_review=True`` bypasses this
-    gate.  When *config* or *board* is None the gate is silently skipped
-    (legacy callers and tests that don't construct a board still work).
+    is emitted and the entry is **skipped** (not the whole group — #292
+    Defect 3).  ``skip_review=True`` bypasses this gate.  When *config* or
+    *board* is None the gate is silently skipped (legacy callers and tests
+    that don't construct a board still work).
+
+    Dry-run applies the review gate (#292 Defect 4) so output reflects what
+    a real run would do.  CI cannot be checked without a real PR number.
 
     Mutates `items` in place; the caller saves the queue after.
     """
@@ -331,6 +412,21 @@ def process(
                 events.append(MergeEvent(entry, "opened", f"(dry run) would open PR for {entry.branch}"))
             ordered = group if presorted else sequence(group)
             for entry in ordered:
+                # #292 (Defect 4): apply the review gate in dry-run so output
+                # reflects real behaviour.  CI cannot be checked in dry-run
+                # (no PR exists yet), so only the review gate is evaluated.
+                if (
+                    not skip_review
+                    and config is not None
+                    and board is not None
+                    and requires_review(entry, config)
+                    and not has_approved_review(entry, board)
+                ):
+                    events.append(MergeEvent(
+                        entry, "review_required",
+                        f"(dry run) would be blocked: review required but not approved for {entry.branch}",
+                    ))
+                    continue
                 events.append(MergeEvent(
                     entry, "merged",
                     f"(dry run) would merge {entry.branch} → {entry.target_branch}",
@@ -369,6 +465,9 @@ def process(
             # the pipeline policy but no approved review is on the board.
             # --skip-review bypasses for trivial/docs-only merges where the
             # user has consciously decided review isn't needed.
+            # #292 (Defect 3): skip this entry and try the next one in the
+            # group rather than halting the whole group.  An un-reviewed entry
+            # should not prevent a fully-approved sibling from merging.
             if (
                 not skip_review
                 and config is not None
@@ -379,10 +478,13 @@ def process(
                 msg = "review required but not approved"
                 entry.error = msg
                 events.append(MergeEvent(entry, "review_required", msg))
-                break  # halt this (repo, target) group
+                continue  # #292: skip this entry; try the next in the group
             # CI gate (#240): refuse to merge when checks are failed or
             # still running.  --force-merge overrides for the case where the
             # user has seen the failures and wants to merge anyway.
+            # #292 (Defect 3): skip-and-proceed for CI gates too, same logic
+            # as the review gate — a pending/failing CI entry should not
+            # block an approved sibling in the same (repo, target) group.
             if not force_merge and ci.is_available:
                 checks = ci.list_checks_for_pr(entry.repo_github, entry.pr_number)
                 failed = failed_checks(checks)
@@ -393,14 +495,14 @@ def process(
                     msg = f"checks failed: {summary}"
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_failed", msg))
-                    break  # halt this (repo, target) group
+                    continue  # #292: skip, don't halt the group
                 pending = in_flight_checks(checks)
                 if pending:
                     summary = ", ".join(c.name for c in pending)
                     msg = f"checks still running: {summary}"
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_pending", msg))
-                    break
+                    continue  # #292: skip, don't halt the group
             entry.last_attempt = time.time()
             entry.state = MERGING
             ok, msg = gh_ops.merge_pr(entry.repo_github, entry.pr_number, method=method)

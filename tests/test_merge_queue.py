@@ -397,6 +397,215 @@ class TestReviewGate:
         events = process(items, gh)
         assert any(e.kind == "merged" for e in events)
 
+    # ── #292 Defect 1: has_approved_review with bounce ────────────────────
+
+    def test_has_approved_review_bounce_fix_approves(self) -> None:
+        """#292: approval on fix-work is found even when entry is keyed to orig-work."""
+        orig_work = self._work("orig")
+        fix_work = Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="[fix-1] t",
+            assignment_id="fix1",
+            type="work",
+            status="done",
+            # Same branch as orig_work
+            branch="worker/orig",
+        )
+        # Review that approved the fix work (not the original)
+        re_review = self._review("fix1", verdict="approve")
+        # Original review requested changes
+        orig_review = self._review("orig", verdict="request-changes")
+        board = self._board(completed=[orig_work, orig_review, fix_work, re_review])
+        # Entry keyed to orig-work (as it would be after the first coord merge)
+        entry = _q("orig", branch="worker/orig")
+        assert mq.has_approved_review(entry, board) is True
+
+    def test_has_approved_review_bounce_no_approve_yet(self) -> None:
+        """#292: if no approval at all across the branch, still returns False."""
+        orig_work = self._work("orig")
+        fix_work = Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="[fix-1] t",
+            assignment_id="fix1",
+            type="work",
+            status="done",
+            branch="worker/orig",
+        )
+        orig_review = self._review("orig", verdict="request-changes")
+        fix_review = self._review("fix1", verdict="request-changes")
+        board = self._board(completed=[orig_work, orig_review, fix_work, fix_review])
+        entry = _q("orig", branch="worker/orig")
+        assert mq.has_approved_review(entry, board) is False
+
+    # ── #292 Defect 3: skip-and-proceed instead of group-halt ────────────
+
+    def test_process_review_gated_entry_does_not_block_approved_sibling(self) -> None:
+        """#292: an un-reviewed entry should not block an approved sibling."""
+        cfg = self._config()
+        approved_work = self._work("approved")
+        approved_review = self._review("approved", verdict="approve")
+        board = self._board(completed=[
+            self._work("ungated"),  # no review
+            approved_work,
+            approved_review,
+        ])
+        # Two entries in the same (repo, target) group
+        items = [
+            _q("ungated", size=10),
+            _q("approved", size=20),
+        ]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        # ungated entry is blocked
+        assert "review_required" in kinds
+        # approved entry still merges
+        assert "merged" in kinds
+        # Both PRC opened
+        assert len(gh.create_calls) == 2
+        states = {x.assignment_id: x.state for x in items}
+        assert states["ungated"] == PENDING
+        assert states["approved"] == MERGED
+
+    def test_process_review_gated_entry_does_not_block_first_entry_if_second_approved(self) -> None:
+        """#292: approved entry merges even when it is sequenced AFTER a blocked one."""
+        cfg = self._config()
+        board = self._board(completed=[
+            self._work("blocked"),  # no review
+            self._work("approved"),
+            self._review("approved", verdict="approve"),
+        ])
+        # Explicit ordering: blocked first, approved second
+        items = [_q("blocked", size=5), _q("approved", size=50)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, presorted=True)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" in kinds
+        assert "merged" in kinds
+        states = {x.assignment_id: x.state for x in items}
+        assert states["blocked"] == PENDING
+        assert states["approved"] == MERGED
+
+    # ── #292 Defect 4: dry-run applies the review gate ────────────────────
+
+    def test_dry_run_shows_review_required_for_unapproved(self) -> None:
+        """#292: dry-run must surface review_required, not 'would merge'."""
+        cfg = self._config()
+        board = self._board(completed=[self._work("w1")])  # no approval
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" in kinds
+        assert "merged" not in kinds
+        # dry-run never touches state
+        assert items[0].state == PENDING
+
+    def test_dry_run_shows_merged_for_approved(self) -> None:
+        """#292: dry-run with a real approval → would-merge event."""
+        cfg = self._config()
+        board = self._board(completed=[
+            self._work("w1"),
+            self._review("w1", verdict="approve"),
+        ])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        kinds = [e.kind for e in events]
+        assert "merged" in kinds
+        assert "review_required" not in kinds
+        assert items[0].state == PENDING  # dry-run: state untouched
+
+
+class TestRefreshEntryAssignment:
+    """#292: refresh_entry_assignment creates or updates queue entries."""
+
+    def _work(self, aid: str, branch: str = "worker/orig") -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=aid,
+            type="work",
+            status="done",
+            branch=branch,
+        )
+
+    def test_creates_entry_when_none_exists(self, coord_db) -> None:
+        work = self._work("fix1")
+        result = mq.refresh_entry_assignment(work, repo_github="acme/api", target_branch="main")
+        assert result is True
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "fix1"
+
+    def test_updates_assignment_id_for_existing_pending_entry(self, coord_db) -> None:
+        # Seed with orig-work keyed entry
+        orig = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="orig", branch="worker/orig", status="done",
+        )
+        mq.enqueue(orig, repo_github="acme/api", target_branch="main")
+        assert load_queue()[0].assignment_id == "orig"
+
+        fix = self._work("fix1", branch="worker/orig")
+        result = mq.refresh_entry_assignment(fix, repo_github="acme/api", target_branch="main")
+        assert result is True
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "fix1"
+
+    def test_clears_stale_review_error(self, coord_db) -> None:
+        orig = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="orig", branch="worker/orig", status="done",
+        )
+        mq.enqueue(orig, repo_github="acme/api", target_branch="main")
+        items = load_queue()
+        items[0].error = "review required but not approved"
+        mq.save_queue(items)
+
+        fix = self._work("fix1", branch="worker/orig")
+        mq.refresh_entry_assignment(fix, repo_github="acme/api", target_branch="main")
+        assert load_queue()[0].error is None
+
+    def test_no_change_when_assignment_id_already_correct(self, coord_db) -> None:
+        work = self._work("fix1")
+        mq.enqueue(work, repo_github="acme/api", target_branch="main")
+        result = mq.refresh_entry_assignment(work, repo_github="acme/api", target_branch="main")
+        assert result is False  # no change
+
+    def test_does_not_touch_merged_entry(self, coord_db) -> None:
+        orig = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="orig", branch="worker/orig", status="done",
+        )
+        mq.enqueue(orig, repo_github="acme/api", target_branch="main")
+        items = load_queue()
+        items[0].state = mq.MERGED
+        mq.save_queue(items)
+
+        fix = self._work("fix1", branch="worker/orig")
+        result = mq.refresh_entry_assignment(fix, repo_github="acme/api", target_branch="main")
+        assert result is False
+        assert load_queue()[0].assignment_id == "orig"  # untouched
+
+    def test_noop_when_no_branch(self, coord_db) -> None:
+        work = self._work("fix1", branch="")
+        work.branch = None  # type: ignore[assignment]
+        result = mq.refresh_entry_assignment(work, repo_github="acme/api", target_branch="main")
+        assert result is False
+        assert load_queue() == []
+
 
 class TestPendingSummary:
     def test_groups_by_repo_excludes_terminal(self) -> None:
