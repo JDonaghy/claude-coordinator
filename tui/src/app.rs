@@ -5168,8 +5168,12 @@ impl CoordApp {
         self.pipeline_repo_names = repos;
         self.pipeline_sidebar = sidebar;
 
-        // Restore previous selection if the issue still exists.  Repo
-        // `sec_idx` maps to sidebar section `sec_idx + search_offset`.
+        // Capture the previous issue number before the partial move below.
+        // Used later to decide whether the focused-stage index needs to be
+        // recomputed (we only reset on issue change, not on every refresh).
+        let prev_issue_num: Option<u64> = prev_sel.as_ref().map(|(_, num)| *num);
+
+        // Restore previous selection if the issue still exists.
         if let Some((repo, num)) = prev_sel {
             'outer: for (sec_idx, repo_key) in self.pipeline_repo_names.iter().enumerate() {
                 let groups = self.pipeline_groups_for_repo(repo_key);
@@ -5204,6 +5208,18 @@ impl CoordApp {
         // applied (scroll_to_active_section calls in handle_key_selection
         // assume an active section).
         self.pipeline_sidebar.set_panel_scroll(prev_panel_scroll);
+        // Auto-focus: when the selected issue changes (or on first render
+        // with no previous selection), default to the smart stage rather
+        // than leaving `pipeline_focused_stage = None`.  When the same
+        // issue is re-selected after a data refresh, keep the focus stable
+        // so a 15 s refresh doesn't clobber the user's explicit choice.
+        let new_issue_num = self.pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .map(|iss| iss.number);
+        if new_issue_num != prev_issue_num {
+            self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
+            self.pipeline_stage_content_scroll = 0;
+        }
     }
 
     /// Resolve the SidebarSystem's current selection to a `pipeline_issues`
@@ -5498,6 +5514,35 @@ impl CoordApp {
             }
         }
         "done".to_string()
+    }
+
+    /// Compute the default focused-stage index for the currently-selected
+    /// pipeline issue.  Called whenever the selection changes so the
+    /// Pipeline tab always opens on the most relevant content without
+    /// requiring the user to click or press `[`/`]` first.
+    ///
+    /// - **In-progress** issues → first stage that is not Done or Skipped
+    ///   (the "current" stage the user is waiting on).
+    /// - **Done** issues (all stages Done/Skipped) → last stage index
+    ///   (typically merge), so the user immediately sees the completion detail.
+    /// - Returns `None` when no issue is selected or the issue has no stages.
+    fn default_focused_stage_for_selected_issue(&self) -> Option<usize> {
+        let idx = self.pipeline_sel?;
+        let issue = self.pipeline_issues.get(idx)?;
+        let stages = self.pipeline_stage_names_for_issue(issue);
+        if stages.is_empty() {
+            return None;
+        }
+        // First stage that is not yet finished — that's the "current" stage.
+        for (i, name) in stages.iter().enumerate() {
+            let status = self.stage_status_for(issue, name);
+            if status != StageStatus::Done && status != StageStatus::Skipped {
+                return Some(i);
+            }
+        }
+        // All stages settled → point at the last one so the user sees the
+        // final outcome (merge details, review verdict, etc.) immediately.
+        Some(stages.len() - 1)
     }
 
     /// Build the quadraui `PipelineView` widget for the selected issue.
@@ -7092,6 +7137,11 @@ impl CoordApp {
     /// #271 part 2 test guidance (branch / repo path / suggested
     /// commands / persisted Phase 1 build result) when Test is
     /// actionable or has been built.
+    ///
+    /// Still used by tests; the render path now uses
+    /// `pipeline_tab_body_list` which inlines this content alongside the
+    /// focused-stage output.
+    #[allow(dead_code)]
     fn pipeline_issue_summary(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
         if let Some(idx) = self.pipeline_sel {
@@ -7130,6 +7180,104 @@ impl CoordApp {
             items,
             selected_idx: 0,
             scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
+    /// Body list for the **Pipeline** detail tab: issue meta summary
+    /// (repo, labels, gates, test guidance) followed immediately by the
+    /// focused stage's full content (plan log, worker log, test output,
+    /// review verdict + body, merge details).
+    ///
+    /// Replacing the plain `pipeline_issue_summary` with this combined
+    /// list means the user sees the most relevant stage output on the
+    /// default tab without switching to Stages.  The scroll offset is
+    /// driven by `pipeline_stage_content_scroll` so the wheel and j/k
+    /// keys can move through the content as on the Stages tab.
+    fn pipeline_tab_body_list(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .cloned();
+
+        // ── Meta summary (repo / labels / gates / status) ────────────
+        if let Some(ref issue) = issue {
+            items.push(kv_item("Repo", &issue.repo_slug, Some(Color::rgb(160, 160, 180))));
+            if let Some(local) = &issue.coord_repo {
+                items.push(kv_item("Local", local, Some(Color::rgb(140, 200, 140))));
+            } else {
+                items.push(kv_item(
+                    "Local",
+                    "(no coordinator.yml mapping)",
+                    Some(Color::rgb(220, 150, 80)),
+                ));
+            }
+            if !issue.matched_labels.is_empty() {
+                items.push(kv_item(
+                    "Labels",
+                    &issue.matched_labels.join(", "),
+                    Some(Color::rgb(160, 160, 180)),
+                ));
+            }
+            items.push(kv_item(
+                "Gates",
+                &self.pipeline_stage_names_for_issue(issue).join(" → "),
+                Some(Color::rgb(160, 160, 180)),
+            ));
+            if let Some((msg, when)) = &self.pipeline_status {
+                if when.elapsed() < Duration::from_secs(8) {
+                    items.push(kv_item("", "", None));
+                    items.push(kv_item(
+                        "",
+                        &format!("  {}", msg),
+                        Some(Color::rgb(180, 180, 100)),
+                    ));
+                }
+            }
+            self.append_test_guidance_rows(&mut items, issue);
+        }
+
+        // ── Focused-stage content ─────────────────────────────────────
+        if let Some(ref issue) = issue {
+            let stage_names = self.pipeline_stage_names_for_issue(issue);
+            if let Some(focused_idx) = self
+                .pipeline_focused_stage
+                .filter(|&i| i < stage_names.len())
+            {
+                let name = &stage_names[focused_idx];
+                items.push(kv_item("", "", None));
+                items.push(kv_item(
+                    "",
+                    &format!(" ── Stage content: {} ──", capitalize(name)),
+                    Some(Color::rgb(220, 220, 230)),
+                ));
+                items.push(kv_item(
+                    "",
+                    "   ([/] previous · [/] next · click a stage box above to switch)",
+                    Some(Color::rgb(140, 140, 160)),
+                ));
+                items.push(kv_item("", "", None));
+                let content_rows = self.stage_content_for(issue, name);
+                if content_rows.is_empty() {
+                    items.push(kv_item(
+                        "",
+                        "   (no content available for this stage yet)",
+                        Some(Color::rgb(140, 140, 160)),
+                    ));
+                } else {
+                    items.extend(content_rows);
+                }
+            }
+        }
+
+        ListView {
+            id: WidgetId::new("pipeline-tab-body"),
+            title: None,
+            items,
+            selected_idx: 0,
+            scroll_offset: self.pipeline_stage_content_scroll,
             has_focus: false,
             bordered: false,
         }
@@ -7907,10 +8055,10 @@ impl CoordApp {
         }
 
         // #stage-content: per-stage content panel.  When a stage is
-        // focused (mouse click on a stage box OR [/] keys on the
-        // Stages tab), render its associated output at the bottom of
-        // the list.  Plan → planner agent output; Work → worker log
-        // tail; Test → build output; Review → cached review findings.
+        // focused ([/] keys, or a click on the stage box on the Pipeline
+        // tab), render its associated output at the bottom of the list.
+        // Plan → planner agent output; Work → worker log tail;
+        // Test → build output; Review → cached review findings.
         if let Some(focused_idx) = self
             .pipeline_focused_stage
             .filter(|&i| i < stage_names.len())
@@ -7924,7 +8072,7 @@ impl CoordApp {
             ));
             items.push(kv_item(
                 "",
-                "   ([/] previous · ]/] next · click a stage box to switch)",
+                "   ([/] previous · [/] next stage)",
                 Some(Color::rgb(140, 140, 160)),
             ));
             items.push(kv_item("", "", None));
@@ -7939,11 +8087,11 @@ impl CoordApp {
                 items.extend(content_rows);
             }
         } else {
-            // No stage focused — hint at the affordance once the user
-            // has rendered at least one stage.
+            // No stage focused — auto-focus should handle this, but
+            // show a hint for issues with no stages or no content yet.
             items.push(kv_item(
                 "",
-                " Tip: click a stage box (or press [ / ]) to view its output here.",
+                " Tip: press [ / ] to view each stage's output here.",
                 Some(Color::rgb(140, 140, 160)),
             ));
         }
@@ -8434,8 +8582,14 @@ impl CoordApp {
                 false
             }
             SidebarView::Pipeline => {
+                let prev = self.pipeline_sel;
                 let result = self.pipeline_sidebar.handle(event, backend, sidebar_b);
                 self.pipeline_sel = self.selected_pipeline_index();
+                if self.pipeline_sel != prev {
+                    self.pipeline_focused_stage =
+                        self.default_focused_stage_for_selected_issue();
+                    self.pipeline_stage_content_scroll = 0;
+                }
                 match result {
                     SidebarEvent::FormEvent { section: 0, event: FormEvent::TextInputChanged { ref value, .. } } => {
                         self.pipeline_search.set_value(value);
@@ -8730,7 +8884,19 @@ impl CoordApp {
                                 (self.pipeline_stage_content_scroll + 1).min(max);
                         }
                     }
-                    PipelineDetailTab::Pipeline => {}
+                    PipelineDetailTab::Pipeline => {
+                        // The body list (meta + stage content) is now
+                        // scrollable on the Pipeline tab.
+                        let items = self.pipeline_tab_body_list().items.len();
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if delta.y > 0.0 {
+                            self.pipeline_stage_content_scroll =
+                                self.pipeline_stage_content_scroll.saturating_sub(1);
+                        } else if delta.y < 0.0 {
+                            self.pipeline_stage_content_scroll =
+                                (self.pipeline_stage_content_scroll + 1).min(max);
+                        }
+                    }
                 }
                 let _ = visible;
                 true
@@ -10796,7 +10962,7 @@ impl ShellApp for CoordApp {
                             } else {
                                 backend.draw_list(pv_rect, &self.pipeline_placeholder_list());
                             }
-                            backend.draw_list(meta_rect, &self.pipeline_issue_summary());
+                            backend.draw_list(meta_rect, &self.pipeline_tab_body_list());
                         }
                         PipelineDetailTab::Issue => {
                             backend.draw_list(content_rect, &self.pipeline_issue_body_list());
@@ -11314,6 +11480,9 @@ impl ShellApp for CoordApp {
                                 self.pipeline_sel = self.selected_pipeline_index();
                                 if self.pipeline_sel != prev {
                                     self.pipeline_detail_scroll = 0;
+                                    self.pipeline_focused_stage =
+                                        self.default_focused_stage_for_selected_issue();
+                                    self.pipeline_stage_content_scroll = 0;
                                 }
                             }
                             // Settings: handled by the earlier guarded arm.
@@ -11348,6 +11517,9 @@ impl ShellApp for CoordApp {
                                 self.pipeline_sel = self.selected_pipeline_index();
                                 if self.pipeline_sel != prev {
                                     self.pipeline_detail_scroll = 0;
+                                    self.pipeline_focused_stage =
+                                        self.default_focused_stage_for_selected_issue();
+                                    self.pipeline_stage_content_scroll = 0;
                                 }
                             }
                             // Settings: handled by the earlier guarded arm.
@@ -11356,20 +11528,24 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── [ / ] — cycle focused stage on the Stages tab ────
+                    // ── [ / ] — cycle focused stage (Pipeline + Stages tabs) ─
                     // Sets `pipeline_focused_stage`, which the rasteriser
-                    // draws with an accent border, and selects which
-                    // stage's content the scrollable panel shows.
+                    // draws with an accent border on the stage boxes and
+                    // selects which stage's content the scrollable panel shows.
+                    // Available on both the Pipeline tab (stage-content panel
+                    // below the boxes) and the Stages tab.
                     Key::Char('[')
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Stages =>
+                            && (self.pipeline_detail_tab == PipelineDetailTab::Stages
+                                || self.pipeline_detail_tab == PipelineDetailTab::Pipeline) =>
                     {
                         self.focus_prev_pipeline_stage();
                         needs_redraw = true;
                     }
                     Key::Char(']')
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Stages =>
+                            && (self.pipeline_detail_tab == PipelineDetailTab::Stages
+                                || self.pipeline_detail_tab == PipelineDetailTab::Pipeline) =>
                     {
                         self.focus_next_pipeline_stage();
                         needs_redraw = true;
@@ -11433,8 +11609,14 @@ impl ShellApp for CoordApp {
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
                             SidebarView::Pipeline => {
+                                let prev = self.pipeline_sel;
                                 self.pipeline_sidebar.handle(&event, backend, list_b);
                                 self.pipeline_sel = self.selected_pipeline_index();
+                                if self.pipeline_sel != prev {
+                                    self.pipeline_focused_stage =
+                                        self.default_focused_stage_for_selected_issue();
+                                    self.pipeline_stage_content_scroll = 0;
+                                }
                             }
                             SidebarView::Settings => {
                                 // #237: jump to the first interactive field
@@ -11466,8 +11648,14 @@ impl ShellApp for CoordApp {
                                 self.fix_machine_scroll(content_visible_rows(list_b, lh));
                             }
                             SidebarView::Pipeline => {
+                                let prev = self.pipeline_sel;
                                 self.pipeline_sidebar.handle(&event, backend, list_b);
                                 self.pipeline_sel = self.selected_pipeline_index();
+                                if self.pipeline_sel != prev {
+                                    self.pipeline_focused_stage =
+                                        self.default_focused_stage_for_selected_issue();
+                                    self.pipeline_stage_content_scroll = 0;
+                                }
                             }
                             SidebarView::Settings => {
                                 // #237: jump to the last interactive field
@@ -18147,22 +18335,24 @@ mod tests {
 
     #[test]
     fn focus_next_stage_advances_and_wraps() {
+        // Since auto-focus now defaults to the first pending stage (Some(0)
+        // for a brand-new issue with no assignments), the initial state is
+        // Some(0) rather than None.  The advance+wrap behaviour is unchanged.
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
-        assert_eq!(app.pipeline_focused_stage, None);
-        app.focus_next_pipeline_stage();
+        // Auto-focus puts us on stage 0 (work — the first pending stage).
         assert_eq!(app.pipeline_focused_stage, Some(0));
         app.focus_next_pipeline_stage();
         assert_eq!(app.pipeline_focused_stage, Some(1));
-        // Advance to the last + wrap to 0.
+        // Advance to the last stage.
         let stage_count = app
             .pipeline_stage_names_for_issue(&app.pipeline_issues[0])
             .len();
         for _ in 2..stage_count {
             app.focus_next_pipeline_stage();
         }
-        // Now focused on the last stage.  One more wraps back to 0.
+        // Now at the last stage.  One more wraps back to 0.
         app.focus_next_pipeline_stage();
         assert_eq!(app.pipeline_focused_stage, Some(0));
     }
@@ -18238,6 +18428,161 @@ mod tests {
         assert!(
             text.contains("not yet parsed") || text.contains("coord notify"),
             "expected hint about parsing; got: {text:?}",
+        );
+    }
+
+    // ── #289: auto-focus + Pipeline-tab stage content ──────────────────────
+
+    /// Auto-focus defaults to the first pending (non-Done, non-Skipped)
+    /// stage for an in-progress issue.  For the base fixture the issue has
+    /// no assignments, so work=Pending → auto-focus = Some(0).
+    #[test]
+    fn auto_focus_in_progress_issue_defaults_to_first_pending_stage() {
+        let app = make_pipeline_app();
+        // Issue #42: no assignments → work is Pending (first stage).
+        // rebuild_pipeline_sidebar was called in make_pipeline_app and
+        // pipeline_sel defaults to Some(0).
+        assert_eq!(
+            app.pipeline_focused_stage,
+            Some(0),
+            "expected auto-focus on stage 0 (work) for a new issue with no assignments",
+        );
+        // Confirm stage 0 really is "work".
+        let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
+        assert_eq!(stages.get(0).map(|s| s.as_str()), Some("work"));
+    }
+
+    /// `default_focused_stage_for_selected_issue` returns the last stage
+    /// when all stages are Done or Skipped (Done issue).
+    ///
+    /// Note: auto-focus only fires on *selection change*; testing the helper
+    /// directly avoids a spurious rebuild skipping the recomputation because
+    /// the same issue number is already selected.
+    #[test]
+    fn auto_focus_done_issue_defaults_to_last_stage() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        // Mark the issue closed and attach done assignments for every stage
+        // so all stages are Done/Skipped.
+        app.pipeline_issues[0].is_closed = true;
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        // Query the helper directly rather than via rebuild so we don't trip
+        // the "same issue — skip auto-focus" guard.
+        let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
+        let last_idx = stages.len() - 1;
+        let default_focus = app.default_focused_stage_for_selected_issue();
+        assert_eq!(
+            default_focus,
+            Some(last_idx),
+            "expected auto-focus on last stage ({last_idx} = {:?}) for Done issue; got {:?}",
+            stages.last(),
+            default_focus,
+        );
+    }
+
+    /// `default_focused_stage_for_selected_issue` returns the index of the
+    /// first non-Done stage.  When Work is done and Review is pending, that
+    /// is stage index 1.
+    #[test]
+    fn auto_focus_in_progress_lands_on_current_stage() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        // Work done, review pending → current stage = review (index 1).
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
+        // Confirm stage 1 is "review".
+        assert_eq!(stages.get(1).map(|s| s.as_str()), Some("review"));
+        let default_focus = app.default_focused_stage_for_selected_issue();
+        assert_eq!(
+            default_focus,
+            Some(1),
+            "expected auto-focus on review (1) when work is done; got {:?}",
+            default_focus,
+        );
+    }
+
+    /// The Pipeline tab body list must include the focused stage's content
+    /// rows.  When a review assignment has cached findings, those findings
+    /// (verdict + body) must appear in `pipeline_tab_body_list` when the
+    /// review stage is explicitly focused.
+    #[test]
+    fn pipeline_tab_body_includes_review_verdict_when_focused() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let mut review = _stage_assignment("rev1", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_of_assignment_id = Some("w1".to_string());
+        review.review_verdict = Some("approve".to_string());
+        review.review_findings = Some(
+            r#"{"verdict":"approve","body":"LGTM — no issues found."}"#.to_string(),
+        );
+        app.data.assignments.push(review);
+        // Explicitly focus the review stage (index 1: work, review, merge).
+        app.pipeline_focused_stage = Some(1);
+
+        let body = app.pipeline_tab_body_list();
+        let text: String = body
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("approved") || text.contains("approve"),
+            "expected review verdict in Pipeline tab body; got: {text:?}",
+        );
+        assert!(
+            text.contains("LGTM") || text.contains("no issues"),
+            "expected review body in Pipeline tab body; got: {text:?}",
+        );
+    }
+
+    /// For a Done issue (all stages settled), the Pipeline tab body list
+    /// shows the last stage's content.  With merge focused, it should
+    /// surface merge queue details.
+    #[test]
+    fn pipeline_tab_body_includes_stage_content_for_done_issue() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_issues[0].is_closed = true;
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(99),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        // Explicitly focus the last stage (merge = index 2).
+        let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
+        let last_idx = stages.len() - 1;
+        assert_eq!(stages[last_idx], "merge");
+        app.pipeline_sel = Some(0);
+        app.pipeline_focused_stage = Some(last_idx);
+
+        let body = app.pipeline_tab_body_list();
+        let text: String = body
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The stage-content header and merge state should appear.
+        assert!(
+            text.contains("Stage content") || text.contains("Merge") || text.contains("merge"),
+            "expected merge stage content in Pipeline tab body for Done issue; got: {text:?}",
         );
     }
 
