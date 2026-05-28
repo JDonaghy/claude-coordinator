@@ -9703,6 +9703,13 @@ impl CoordApp {
         // Poll background command runner
         if self.command_runner.poll() {
             self.refresh();
+            // A coord command just finished — most of them mutate labels
+            // (track, refine, ready, backlog, bounce) or assignment state.
+            // Invalidate the 60s pipeline-loader throttle so the next tick
+            // re-polls gh immediately and the user sees the result in
+            // seconds, not up to a minute.  An extra gh search per user
+            // action is cheap.
+            self.pipeline_last_load = None;
             needs_redraw = true;
         }
 
