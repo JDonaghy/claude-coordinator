@@ -31,7 +31,8 @@
 //! - `~/.coord/coord.db` — SQLite database (WAL mode) written by the coordinator
 //!
 //! **Auto-refresh:** every 5 s, checked at the start of each [`ShellApp::handle`]
-//! call (the [`ShellApp`] trait has no `tick()` callback).
+//! call and on every [`ShellApp::tick`] (quadraui drives `tick` ~60Hz so
+//! refreshes proceed while the user is idle).
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -11320,7 +11321,14 @@ impl ShellApp for CoordApp {
     /// command-runner draining, and watch-log polling proceed even when the
     /// user isn't typing.
     fn tick(&mut self, _backend: &mut dyn Backend) -> Reaction {
-        if self.run_periodic_work() {
+        // Drain any completed background data load first.  Without this,
+        // run_periodic_work() kicks off a new fetch and shows
+        // "↻ loading…" but never picks up the completed receiver, so the
+        // status bar stays yellow and assignment state (e.g. running→done)
+        // doesn't reflect until the user moves the mouse or presses a key.
+        let mut needs_redraw = self.apply_pending_data();
+        needs_redraw |= self.run_periodic_work();
+        if needs_redraw {
             Reaction::Redraw
         } else {
             Reaction::Continue
