@@ -7677,7 +7677,9 @@ impl CoordApp {
             title: None,
             items,
             selected_idx: 0,
-            scroll_offset: 0,
+            // Stage content (esp. a rendered plan) can overflow the panel.
+            // Honour the scroll offset driven by the scroll wheel / keys.
+            scroll_offset: self.pipeline_stage_content_scroll,
             has_focus: false,
             bordered: false,
         }
@@ -8422,19 +8424,33 @@ impl CoordApp {
                 true
             }
             SidebarView::Pipeline => {
-                // Issue tab body is the scrollable region on the Pipeline view.
-                // The Pipeline and Stages tabs render fixed-size widgets, so
-                // scrollwheel on those is consumed but otherwise inert.
-                if self.pipeline_detail_tab == PipelineDetailTab::Issue {
-                    let items = self.pipeline_issue_body_list().items.len();
-                    let max = items.saturating_sub(visible.saturating_sub(1));
-                    if delta.y > 0.0 {
-                        self.pipeline_detail_scroll =
-                            self.pipeline_detail_scroll.saturating_sub(1);
-                    } else if delta.y < 0.0 {
-                        self.pipeline_detail_scroll =
-                            (self.pipeline_detail_scroll + 1).min(max);
+                // Issue tab body and Stages tab content (rendered plan, log
+                // tails) can both overflow the panel.  The Pipeline tab is a
+                // fixed-size widget — scroll there is consumed but inert.
+                match self.pipeline_detail_tab {
+                    PipelineDetailTab::Issue => {
+                        let items = self.pipeline_issue_body_list().items.len();
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if delta.y > 0.0 {
+                            self.pipeline_detail_scroll =
+                                self.pipeline_detail_scroll.saturating_sub(1);
+                        } else if delta.y < 0.0 {
+                            self.pipeline_detail_scroll =
+                                (self.pipeline_detail_scroll + 1).min(max);
+                        }
                     }
+                    PipelineDetailTab::Stages => {
+                        let items = self.pipeline_stages_list().items.len();
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if delta.y > 0.0 {
+                            self.pipeline_stage_content_scroll =
+                                self.pipeline_stage_content_scroll.saturating_sub(1);
+                        } else if delta.y < 0.0 {
+                            self.pipeline_stage_content_scroll =
+                                (self.pipeline_stage_content_scroll + 1).min(max);
+                        }
+                    }
+                    PipelineDetailTab::Pipeline => {}
                 }
                 let _ = visible;
                 true
@@ -10922,6 +10938,26 @@ impl ShellApp for CoordApp {
                             && self.pipeline_detail_tab == PipelineDetailTab::Issue =>
                     {
                         self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+
+                    // ── j/k — scroll Stages tab content (plan / log) ──────
+                    // `[`/`]` switch the focused stage; j/k scroll the
+                    // rendered content (plans + log tails overflow easily).
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Stages =>
+                    {
+                        self.pipeline_stage_content_scroll =
+                            self.pipeline_stage_content_scroll.saturating_add(1);
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Stages =>
+                    {
+                        self.pipeline_stage_content_scroll =
+                            self.pipeline_stage_content_scroll.saturating_sub(1);
                         needs_redraw = true;
                     }
 
