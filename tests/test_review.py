@@ -475,6 +475,47 @@ def test_dispatch_review_records_to_dispatched_ledger(
     assert records[0]["machine_name"] == "server"
 
 
+# ── _find_or_open_pr — PR body carries closing keyword (#287) ───────────────
+
+
+def test_find_or_open_pr_body_includes_closes_keyword() -> None:
+    """_find_or_open_pr must prepend 'Closes #{issue_number}' so GitHub
+    auto-closes the linked issue when the PR is merged (#287).  Without
+    it the issue stays stranded open and the coordinator brain keeps
+    re-syncing it as state=open.
+    """
+    from coord.review import _find_or_open_pr
+    import coord.github_ops as github_ops_mod
+
+    captured: dict = {}
+
+    def _fake_find_pr(repo_github, branch):
+        return None  # no existing PR → trigger create_pr path
+
+    def _fake_create_pr(repo_github, *, base, head, title, body):
+        captured["body"] = body
+        return {"number": 55, "url": "https://github.com/acme/api/pull/55", "existed": False}
+
+    import unittest.mock as mock
+    with (
+        mock.patch.object(github_ops_mod, "find_pr_for_branch", _fake_find_pr),
+        mock.patch.object(github_ops_mod, "create_pr", _fake_create_pr),
+    ):
+        result = _find_or_open_pr(
+            "acme/api",
+            branch="issue-42-fix",
+            default_branch="main",
+            issue_number=42,
+            issue_title="Fix the login bug",
+        )
+
+    assert result is not None
+    assert result["number"] == 55
+    assert "Closes #42" in captured["body"]
+    # The closing keyword must come at the very start so GitHub parses it.
+    assert captured["body"].startswith("Closes #42\n\n")
+
+
 # ── Reviewer system prompt ──────────────────────────────────────────────────
 
 
