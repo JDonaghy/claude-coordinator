@@ -847,6 +847,27 @@ struct BoardData {
     /// becomes "approve the plan and dispatch work" rather than fresh
     /// dispatch.  Defaults to `false`.
     pipeline_require_plan: bool,
+    /// Cached structured plans keyed by plan-assignment-id.  Populated by
+    /// `coord notify` parsing the worker log into the `plans` table; the
+    /// TUI just loads the JSON blob and renders it in the Plan stage
+    /// content panel.
+    plans: std::collections::HashMap<String, PlanData>,
+}
+
+/// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.
+/// Only the fields we render are pulled out; everything else stays in
+/// the original JSON blob (we don't roundtrip it back to disk).
+#[derive(Clone, Debug, Default)]
+struct PlanData {
+    plan: String,
+    files_modify: Vec<String>,
+    approach: String,
+    risks: String,
+    estimate: String,
+    /// Tri-state: None = no SMOKE_TESTS block emitted (legacy / plan
+    /// worker forgot); `Some(empty)` = "(none — change is internal)";
+    /// `Some(non-empty)` = bullets.
+    smoke_tests: Option<Vec<String>>,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1719,6 +1740,30 @@ fn load_data() -> BoardData {
         pipeline_require_plan,
     ) = load_pipeline_meta(&conn);
 
+    // ── Query cached structured plans ──────────────────────────────────────
+    // Populated by `coord notify` parsing the plan worker's log into the
+    // `plans` table.  The TUI renders these directly in the Plan stage
+    // content panel — without this the panel falls back to dumping the
+    // raw stream-json log (unreadable).
+    let plans: std::collections::HashMap<String, PlanData> = {
+        let mut out = std::collections::HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT assignment_id, plan_data FROM plans") {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                let aid: String = row.get(0)?;
+                let raw: String = row.get(1)?;
+                Ok((aid, raw))
+            }) {
+                for r in rows.flatten() {
+                    let (aid, raw) = r;
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        out.insert(aid, parse_plan_data(&v));
+                    }
+                }
+            }
+        }
+        out
+    };
+
     BoardData {
         local_machine,
         assignments,
@@ -1730,6 +1775,43 @@ fn load_data() -> BoardData {
         pipeline_tracked_labels,
         pipeline_repos,
         pipeline_require_plan,
+        plans,
+    }
+}
+
+/// Decode a JSON plan_data blob into a `PlanData`.  Mirrors
+/// `coord.plan_parser.WorkerPlan.from_dict`; tolerant of missing fields.
+fn parse_plan_data(v: &serde_json::Value) -> PlanData {
+    fn s(v: &serde_json::Value, key: &str) -> String {
+        v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    }
+    fn vs(v: &serde_json::Value, key: &str) -> Vec<String> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    // smoke_tests is tri-state: missing/null → None, [] → Some(empty),
+    // non-empty list → Some(bullets).
+    let smoke_tests = match v.get("smoke_tests") {
+        Some(serde_json::Value::Array(arr)) => Some(
+            arr.iter()
+                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                .collect(),
+        ),
+        _ => None,
+    };
+    PlanData {
+        plan: s(v, "plan"),
+        files_modify: vs(v, "files_modify"),
+        approach: s(v, "approach"),
+        risks: s(v, "risks"),
+        estimate: s(v, "estimate"),
+        smoke_tests,
     }
 }
 
@@ -7123,10 +7205,126 @@ impl CoordApp {
             "review" => self.stage_content_review(issue),
             "test" => self.stage_content_test(issue),
             "merge" => self.stage_content_merge(issue),
-            // Plan + Work both read the latest assignment's log tail.
-            "plan" | "work" => self.stage_content_assignment_log(issue, stage_name),
+            // Plan: prefer the structured plan cached in the plans table
+            // (parsed by `coord notify`); fall back to log tail if no row.
+            // Without this the panel dumped raw stream-json events,
+            // unreadable to humans.
+            "plan" => self.stage_content_plan(issue),
+            // Work: read the latest assignment's log tail.
+            "work" => self.stage_content_assignment_log(issue, stage_name),
             _ => Vec::new(),
         }
+    }
+
+    /// Render the structured plan for the selected pipeline issue.
+    /// Pulls from `BoardData.plans` (populated by `coord notify` parsing
+    /// the plan worker's log).  When no plan row exists (notify hasn't
+    /// run yet, or the worker exited without a structured plan), falls
+    /// back to the log-tail view so the user sees something.
+    fn stage_content_plan(&self, issue: &PipelineIssue) -> Vec<ListItem> {
+        let local_repo = issue.coord_repo.as_deref();
+        let plan_assignment = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| a.assignment_type.as_deref() == Some("plan"))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(a) = plan_assignment else { return Vec::new() };
+        let Some(plan) = self.data.plans.get(&a.id) else {
+            // No structured plan cached — fall back to log tail with a hint.
+            let mut rows = vec![kv_item(
+                "",
+                "   (plan not yet parsed — run `coord notify` to refresh)",
+                Some(Color::rgb(160, 160, 180)),
+            )];
+            rows.push(kv_item("", "", None));
+            rows.extend(self.stage_content_assignment_log(issue, "plan"));
+            return rows;
+        };
+
+        let label_color = Color::rgb(180, 200, 240);
+        let body_color = Color::rgb(220, 220, 220);
+        let mut rows: Vec<ListItem> = Vec::new();
+
+        if !plan.plan.is_empty() {
+            rows.push(kv_item("", " Summary", Some(label_color)));
+            for line in plan.plan.lines() {
+                rows.push(kv_item("", &format!("   {}", line), Some(body_color)));
+            }
+            rows.push(kv_item("", "", None));
+        }
+
+        if !plan.files_modify.is_empty() {
+            rows.push(kv_item("", " Files to modify", Some(label_color)));
+            for f in &plan.files_modify {
+                rows.push(kv_item("", &format!("   - {}", f), Some(body_color)));
+            }
+            rows.push(kv_item("", "", None));
+        }
+
+        if !plan.approach.is_empty() {
+            rows.push(kv_item("", " Approach", Some(label_color)));
+            for line in plan.approach.lines() {
+                rows.push(kv_item("", &format!("   {}", line), Some(body_color)));
+            }
+            rows.push(kv_item("", "", None));
+        }
+
+        if !plan.risks.is_empty() {
+            rows.push(kv_item("", " Risks", Some(label_color)));
+            for line in plan.risks.lines() {
+                rows.push(kv_item("", &format!("   {}", line), Some(body_color)));
+            }
+            rows.push(kv_item("", "", None));
+        }
+
+        if !plan.estimate.is_empty() {
+            rows.push(kv_item("", " Estimate", Some(label_color)));
+            rows.push(kv_item("", &format!("   {}", plan.estimate), Some(body_color)));
+            rows.push(kv_item("", "", None));
+        }
+
+        match &plan.smoke_tests {
+            Some(bullets) if bullets.is_empty() => {
+                rows.push(kv_item("", " Smoke tests", Some(label_color)));
+                rows.push(kv_item(
+                    "",
+                    "   (none — change is internal)",
+                    Some(Color::rgb(160, 160, 180)),
+                ));
+                rows.push(kv_item("", "", None));
+            }
+            Some(bullets) => {
+                rows.push(kv_item("", " Smoke tests", Some(label_color)));
+                for b in bullets {
+                    rows.push(kv_item("", &format!("   - {}", b), Some(body_color)));
+                }
+                rows.push(kv_item("", "", None));
+            }
+            None => {
+                // Plan worker predates the SMOKE_TESTS-in-plan prompt
+                // (or just forgot).  Show a muted line so the user knows
+                // it's missing but doesn't have to dig.
+                rows.push(kv_item("", " Smoke tests", Some(label_color)));
+                rows.push(kv_item(
+                    "",
+                    "   (no SMOKE_TESTS block in plan — author manually)",
+                    Some(Color::rgb(160, 160, 180)),
+                ));
+                rows.push(kv_item("", "", None));
+            }
+        }
+
+        rows
     }
 
     /// Pull the cached review findings (verdict + body) for the
