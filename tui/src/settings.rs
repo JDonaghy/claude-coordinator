@@ -178,6 +178,27 @@ impl Theme {
     }
 }
 
+// ─── Keybindings ─────────────────────────────────────────────────────────────
+
+/// User-mappable action names recognised by the TUI.
+pub const ACTION_PIPELINE_REFRESH: &str = "pipeline_refresh";
+
+/// Returns the default key string for a named action.
+pub fn default_keybinding(action: &str) -> Option<&'static str> {
+    match action {
+        ACTION_PIPELINE_REFRESH => Some("Ctrl+R"),
+        _ => None,
+    }
+}
+
+/// Build the default keybindings map used when no `[keybindings]` section
+/// exists in `settings.toml`.
+pub fn default_keybindings() -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert(ACTION_PIPELINE_REFRESH.to_string(), "Ctrl+R".to_string());
+    m
+}
+
 // ─── TuiSettings ─────────────────────────────────────────────────────────────
 
 /// All user-facing settings that are persisted to `~/.coord/settings.toml`.
@@ -201,6 +222,13 @@ pub struct TuiSettings {
     /// dispatch time when the user explicitly overrides the default.
     #[serde(default)]
     pub machine_model: HashMap<String, ModelPref>,
+
+    /// User-mappable key bindings.  Keys are action names (e.g.
+    /// `"pipeline_refresh"`); values are key strings in either vim-style
+    /// (`<C-r>`) or plus-style (`Ctrl+R`).  Unrecognised action names are
+    /// silently ignored.  An action with an empty string disables the binding.
+    #[serde(default = "default_keybindings")]
+    pub keybindings: HashMap<String, String>,
 }
 
 impl Default for TuiSettings {
@@ -211,6 +239,7 @@ impl Default for TuiSettings {
             audio_on_completion: false,
             log_cache_ttl: LogCacheTtl::default(),
             machine_model: HashMap::new(),
+            keybindings: default_keybindings(),
         }
     }
 }
@@ -392,6 +421,7 @@ mod tests {
             audio_on_completion: true,
             log_cache_ttl: LogCacheTtl::FiveSec,
             machine_model,
+            keybindings: default_keybindings(),
         };
 
         original.save_to_path(&path).expect("save should succeed");
@@ -404,6 +434,35 @@ mod tests {
         assert_eq!(loaded.log_cache_ttl, LogCacheTtl::FiveSec);
         assert_eq!(loaded.machine_model.get("mybox"), Some(&ModelPref::Opus));
         assert_eq!(loaded.machine_model.get("laptop"), Some(&ModelPref::Haiku));
+        assert_eq!(
+            loaded.keybindings.get(ACTION_PIPELINE_REFRESH).map(|s| s.as_str()),
+            Some("Ctrl+R"),
+        );
+    }
+
+    #[test]
+    fn default_keybindings_includes_pipeline_refresh() {
+        let s = TuiSettings::default();
+        assert_eq!(
+            s.keybindings.get(ACTION_PIPELINE_REFRESH).map(|s| s.as_str()),
+            Some("Ctrl+R"),
+        );
+    }
+
+    #[test]
+    fn keybinding_empty_string_disables_action() {
+        let mut s = TuiSettings::default();
+        s.keybindings.insert(ACTION_PIPELINE_REFRESH.to_string(), String::new());
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("coord_settings_test_empty_bind_{}.toml", std::process::id()));
+        s.save_to_path(&path).expect("save");
+        let loaded = TuiSettings::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            loaded.keybindings.get(ACTION_PIPELINE_REFRESH).map(|s| s.as_str()),
+            Some(""),
+            "empty string binding should survive round-trip"
+        );
     }
 
     #[test]

@@ -52,7 +52,11 @@ use quadraui::primitives::context_menu::{
 use quadraui::primitives::form::{FieldKind, Form, FormEvent, FormField};
 use quadraui::primitives::toast::{ToastCorner, ToastItem, ToastSeverity, ToastStack};
 
-use crate::settings::{LogCacheTtl, ModelPref, RefreshCadence, Theme, TuiSettings};
+use crate::settings::{
+    LogCacheTtl, ModelPref, RefreshCadence, Theme, TuiSettings,
+    ACTION_PIPELINE_REFRESH,
+};
+use quadraui::accelerator::{parse_key_binding, ParsedBinding};
 use quadraui::{
     Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
@@ -2783,6 +2787,9 @@ pub struct CoordApp {
     // ── Settings panel ───────────────────────────────────────────────────
     /// Persisted user settings loaded from `~/.coord/settings.toml`.
     settings: TuiSettings,
+    /// Pre-parsed keybindings from `settings.keybindings`. Rebuilt whenever
+    /// settings are saved so lookups are O(n) equality checks, not string parses.
+    parsed_keybindings: Vec<(String, ParsedBinding)>,
     /// FormController backing the settings form (right pane).
     ///
     /// `RefCell` is used so the form can be rebuilt and rendered from the
@@ -2860,8 +2867,63 @@ impl Default for CoordApp {
     }
 }
 
+/// Parse all keybinding strings from a `TuiSettings` into `ParsedBinding`s.
+/// Unrecognised or unparseable entries are silently skipped.
+fn parse_keybindings(settings: &TuiSettings) -> Vec<(String, ParsedBinding)> {
+    settings
+        .keybindings
+        .iter()
+        .filter_map(|(action, key_str)| {
+            if key_str.is_empty() {
+                return None;
+            }
+            let parsed = parse_key_binding(key_str)?;
+            Some((action.clone(), parsed))
+        })
+        .collect()
+}
+
+/// Normalise a `Key` to the string format used by `ParsedBinding::key`:
+/// single chars are lowercased; named keys use their display name.
+fn key_to_binding_str(key: &Key) -> String {
+    use quadraui::NamedKey;
+    match key {
+        Key::Char(c) => c.to_ascii_lowercase().to_string(),
+        Key::Named(n) => match n {
+            NamedKey::Escape    => "Escape".to_string(),
+            NamedKey::Enter     => "Enter".to_string(),
+            NamedKey::Tab       => "Tab".to_string(),
+            NamedKey::Backspace => "Backspace".to_string(),
+            NamedKey::Delete    => "Delete".to_string(),
+            NamedKey::Home      => "Home".to_string(),
+            NamedKey::End       => "End".to_string(),
+            NamedKey::PageUp    => "PageUp".to_string(),
+            NamedKey::PageDown  => "PageDown".to_string(),
+            NamedKey::Up        => "Up".to_string(),
+            NamedKey::Down      => "Down".to_string(),
+            NamedKey::Left      => "Left".to_string(),
+            NamedKey::Right     => "Right".to_string(),
+            NamedKey::F(n)      => format!("F{n}"),
+            _                   => String::new(),
+        },
+    }
+}
+
 impl CoordApp {
     /// Create a new app.
+    /// Check whether the given key+modifiers match a named action in the user's
+    /// keybindings table.  Returns the action name when matched.
+    fn action_for_key<'a>(&'a self, key: &Key, modifiers: &quadraui::Modifiers) -> Option<&'a str> {
+        let key_str = key_to_binding_str(key);
+        if key_str.is_empty() {
+            return None;
+        }
+        self.parsed_keybindings
+            .iter()
+            .find(|(_, binding)| binding.key == key_str && binding.modifiers == *modifiers)
+            .map(|(action, _)| action.as_str())
+    }
+
     ///
     /// Board data is fetched on a background thread so the UI renders
     /// immediately.  The status bar shows "↻ loading…" until the first
@@ -2930,6 +2992,7 @@ impl CoordApp {
             pipeline_focused_stage: None,
             pipeline_stage_content_scroll: 0,
             settings: TuiSettings::load(),
+            parsed_keybindings: parse_keybindings(&TuiSettings::load()),
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
             settings_field_sel: 0,
             audio_prev_running: std::collections::HashSet::new(),
@@ -11210,6 +11273,21 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── User-mapped keybindings (checked before hardcoded bindings) ──────
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            if let Some(action) = self.action_for_key(key, modifiers) {
+                match action {
+                    ACTION_PIPELINE_REFRESH => {
+                        self.pipeline_last_load = None;
+                        self.maybe_kick_pipeline_loader();
+                        self.push_toast("Pipeline", "Refreshing issues from GitHub…", ToastSeverity::Info);
+                        return Reaction::Redraw;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // ── Keyboard and window events ────────────────────────────────────────
         match &event {
             UiEvent::KeyPressed { key, .. } => {
@@ -12483,6 +12561,7 @@ mod tests {
             pipeline_focused_stage: None,
             pipeline_stage_content_scroll: 0,
             settings: TuiSettings::default(),
+            parsed_keybindings: parse_keybindings(&TuiSettings::default()),
             settings_form: std::cell::RefCell::new(FormController::new("settings".to_string())),
             settings_field_sel: 0,
             audio_prev_running: std::collections::HashSet::new(),
