@@ -11794,7 +11794,7 @@ impl ShellApp for CoordApp {
                         if let Some(w) = &self.watch {
                             let mut chat = ChatController::new("inject");
                             chat.set_status(StyledText::plain(format!(
-                                "  Guidance → {} #{} on {}  (Ctrl+Enter = send · Esc = close)",
+                                "  Guidance → {} #{} on {}  (Ctrl+S or Alt+Enter = send · Esc = close)",
                                 w.assignment_type, w.issue_number, w.machine
                             )));
                             chat.set_transcript(self.inject_transcript.clone());
