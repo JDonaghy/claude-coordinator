@@ -643,6 +643,24 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             transition.event,
             branch=entry.get("branch"),
         )
+    elif transition.event == EVENT_COMPLETION and assignment_type == "conflict-fix":
+        post_completion(exit_code=transition.exit_code or 0, **common)
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+        # Re-enqueue the parent merge entry so the next `coord merge` retries.
+        # This mirrors the reconcile() path — whichever runs first wins.
+        parent_id = record.get("review_of_assignment_id")
+        if parent_id:
+            from coord.reconcile import on_conflict_fix_done  # noqa: PLC0415
+            on_conflict_fix_done(
+                parent_assignment_id=parent_id,
+                fix_assignment_id=transition.assignment_id,
+                machine_name=transition.machine_name,
+                succeeded=True,
+            )
     elif transition.event == EVENT_COMPLETION:
         post_completion(exit_code=transition.exit_code or 0, **common)
         mark_notified(

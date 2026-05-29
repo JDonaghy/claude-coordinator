@@ -500,3 +500,51 @@ class TestReconcileHook:
         with patch("coord.github_ops.post_issue_comment") as post:
             _on_conflict_fix_done(fix, succeeded=True)
         post.assert_not_called()
+
+    def test_notify_path_resets_entry_to_pending(self, coord_db) -> None:
+        """coord notify must re-enqueue the parent merge entry when a
+        conflict-fix worker completes — the bug that caused the Merge box
+        to stay grey forever with no Go button (#291-area regression).
+
+        post_transition is the notify code path; it must call
+        on_conflict_fix_done so the queue state flips conflict → pending
+        without needing a manual coord resume.
+        """
+        from coord import merge_queue as mq
+        from coord.notify import post_transition, Transition, EVENT_COMPLETION
+
+        self._populate_queue()
+
+        transition = Transition(
+            assignment_id="fix-id",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+        record = {
+            "repo_github": "acme/api",
+            "type": "conflict-fix",
+            "review_of_assignment_id": "abc123",
+        }
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1060.0,
+            "branch": "issue-1-fix",
+            "log_path": None,
+        }
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+        ):
+            post_transition(transition, record, entry)
+
+        queue = mq.load_queue()
+        assert len(queue) == 1
+        assert queue[0].state == PENDING, (
+            "conflict-fix completion via notify should reset queue entry to PENDING"
+        )
+        assert queue[0].error is None

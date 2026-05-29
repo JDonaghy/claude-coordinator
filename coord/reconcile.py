@@ -278,30 +278,61 @@ def reconcile(board: Board, config: Config) -> list[str]:
     return changed
 
 
-def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> None:
+def _post_human_required_comment_raw(
+    entry: QueuedMerge,
+    fix_assignment_id: str,
+    machine_name: str,
+) -> None:
+    """Notify the user on GitHub that a conflict-fix worker gave up."""
+    from coord import github_ops  # noqa: PLC0415
+
+    body = (
+        "## Conflict-fix worker could not auto-resolve\n\n"
+        f"Worker `{fix_assignment_id}` on "
+        f"`{machine_name}` attempted to rebase "
+        f"`{entry.branch}` onto `{entry.target_branch}` and exited "
+        "non-zero. The merge queue entry is now `HUMAN_REQUIRED`.\n\n"
+        f"**Last error:** `{entry.error or 'unknown'}`\n\n"
+        "Manual resolution required: rebase the branch locally and "
+        "`git push --force-with-lease`, then re-run `coord merge`. The "
+        "coordinator will not re-dispatch a conflict-fix for this entry "
+        "in the current session."
+    )
+    try:
+        github_ops.post_issue_comment(entry.repo_github, entry.issue_number, body)
+    except Exception as exc:  # noqa: BLE001 — best-effort notification
+        import logging  # noqa: PLC0415
+        logging.warning(
+            "could not post HUMAN_REQUIRED comment on %s#%d: %s",
+            entry.repo_github, entry.issue_number, exc,
+        )
+
+
+def on_conflict_fix_done(
+    *,
+    parent_assignment_id: str,
+    fix_assignment_id: str,
+    machine_name: str,
+    succeeded: bool,
+) -> None:
     """Update the parent merge entry after a conflict-fix worker finishes.
 
     On *succeeded*: the merge entry is reset to PENDING so the next
     ``coord merge`` retries.  On failure: marked HUMAN_REQUIRED so the TUI
     can surface "manual resolution required", and a comment is posted on
-    the underlying issue so the user is notified outside the TUI too
-    (#243-review-2 — the worker briefing no longer asks the worker to post
-    this comment, so the coordinator owns it).
+    the underlying issue so the user is notified outside the TUI too.
 
-    Looking up the parent entry by ``review_of_assignment_id`` (the original
-    work assignment's id) — that's the column conflict-fix reuses to link
-    back to its target.
+    Called from both ``reconcile()`` (via mark_done/failed) and
+    ``coord notify`` (via post_transition) — both paths must trigger this
+    so the re-enqueue fires regardless of which polling command runs first.
     """
-    parent_id = fix_assignment.review_of_assignment_id
-    if not parent_id:
-        return
     from coord import merge_queue as mq  # noqa: PLC0415
 
     items = mq.load_queue()
     changed = False
     failed_entry: mq.QueuedMerge | None = None
     for entry in items:
-        if entry.assignment_id != parent_id:
+        if entry.assignment_id != parent_assignment_id:
             continue
         if succeeded:
             entry.state = mq.PENDING
@@ -320,37 +351,21 @@ def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> Non
         mq.save_queue(items)
 
     if failed_entry is not None:
-        _post_human_required_comment(failed_entry, fix_assignment)
-
-
-def _post_human_required_comment(
-    entry: QueuedMerge, fix_assignment: Assignment,
-) -> None:
-    """Notify the user on GitHub that a conflict-fix worker gave up.
-
-    Best-effort: errors are swallowed (logged) since the TUI also surfaces
-    HUMAN_REQUIRED via the merge stage substate — the comment is a
-    convenience, not the only notification channel.
-    """
-    from coord import github_ops  # noqa: PLC0415
-
-    body = (
-        "## Conflict-fix worker could not auto-resolve\n\n"
-        f"Worker `{fix_assignment.assignment_id}` on "
-        f"`{fix_assignment.machine_name}` attempted to rebase "
-        f"`{entry.branch}` onto `{entry.target_branch}` and exited "
-        "non-zero. The merge queue entry is now `HUMAN_REQUIRED`.\n\n"
-        f"**Last error:** `{entry.error or 'unknown'}`\n\n"
-        "Manual resolution required: rebase the branch locally and "
-        "`git push --force-with-lease`, then re-run `coord merge`. The "
-        "coordinator will not re-dispatch a conflict-fix for this entry "
-        "in the current session."
-    )
-    try:
-        github_ops.post_issue_comment(entry.repo_github, entry.issue_number, body)
-    except Exception as exc:  # noqa: BLE001 — best-effort notification
-        import logging  # noqa: PLC0415
-        logging.warning(
-            "could not post HUMAN_REQUIRED comment on %s#%d: %s",
-            entry.repo_github, entry.issue_number, exc,
+        _post_human_required_comment_raw(
+            entry=failed_entry,
+            fix_assignment_id=fix_assignment_id,
+            machine_name=machine_name,
         )
+
+
+def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> None:
+    """Thin wrapper used by the reconcile() loop."""
+    parent_id = fix_assignment.review_of_assignment_id
+    if not parent_id:
+        return
+    on_conflict_fix_done(
+        parent_assignment_id=parent_id,
+        fix_assignment_id=fix_assignment.assignment_id or "",
+        machine_name=fix_assignment.machine_name or "",
+        succeeded=succeeded,
+    )
