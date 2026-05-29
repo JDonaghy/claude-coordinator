@@ -9784,12 +9784,22 @@ impl CoordApp {
             // #261: Send to Pipeline — add the `coord` label so the
             // issue moves Refined → Pipeline:New.  Wraps the new
             // `coord track <repo> <num>` Python command.
-            "send-to-pipeline" => self.dispatch_board_row_command(
-                target,
-                "track",
-                "Send to Pipeline",
-                "#{} → Pipeline (adding coord label…)",
-            ),
+            "send-to-pipeline" => {
+                let dispatched = self.dispatch_board_row_command(
+                    target,
+                    "track",
+                    "Send to Pipeline",
+                    "#{} → Pipeline (adding coord label…)",
+                );
+                if dispatched {
+                    // coord track adds the coord label on GitHub; kick the
+                    // pipeline loader so the issue appears in New without
+                    // waiting for the 60 s auto-refresh.
+                    self.pipeline_last_load = None;
+                    self.maybe_kick_pipeline_loader();
+                }
+                dispatched
+            }
             // #266: Refining → Refined — wraps existing `coord ready`.
             "mark-refined" => self.dispatch_board_row_command(
                 target,
