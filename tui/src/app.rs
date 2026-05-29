@@ -336,6 +336,9 @@ enum PipelineDetailTab {
     /// Per-stage detail: assignment id, machine, status, timing,
     /// exit code (or merge-queue state for the merge stage).
     Stages,
+    /// Live worker log — same content as the watch overlay but inline
+    /// so the pipeline stage boxes remain visible above.
+    Log,
 }
 
 /// The tabs shown in the Board view detail panel.
@@ -5765,16 +5768,24 @@ impl CoordApp {
                         }
                     }
                 }
-                // Show live turn count on the Active stage box when the SSE
-                // watch is streaming for this stage's running assignment.
+                // Show turn count on Active stage box — prefer live SSE
+                // count when watching, fall back to local log count.
                 if status == StageStatus::Active {
-                    if let Some(sse) = &self.watch_sse {
-                        let watched_id = self.watch.as_ref().map(|w| w.assignment_id.as_str());
-                        let stage_running = self.assignments_for_stage(issue, name)
-                            .iter()
-                            .any(|a| a.status == "running" && Some(a.id.as_str()) == watched_id);
-                        if stage_running && sse.current_turn > 0 {
-                            label = format!("{} T{}", label, sse.current_turn);
+                    let running = self.assignments_for_stage(issue, name)
+                        .into_iter()
+                        .find(|a| a.status == "running");
+                    if let Some(a) = running {
+                        let turns = if let Some(sse) = &self.watch_sse {
+                            let watching = self.watch.as_ref()
+                                .map(|w| w.assignment_id == a.id)
+                                .unwrap_or(false);
+                            if watching && sse.current_turn > 0 { sse.current_turn }
+                            else { self.turn_count_from_log(&a.id) }
+                        } else {
+                            self.turn_count_from_log(&a.id)
+                        };
+                        if turns > 0 {
+                            label = format!("{} T{}", label, turns);
                         }
                     }
                 }
@@ -7247,6 +7258,12 @@ impl CoordApp {
                     is_dirty: false,
                     is_preview: false,
                 },
+                TabItem {
+                    label: " Log ".to_string(),
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Log,
+                    is_dirty: false,
+                    is_preview: false,
+                },
             ],
             scroll_offset: 0,
             right_segments: vec![],
@@ -8123,6 +8140,60 @@ impl CoordApp {
         rows
     }
 
+    /// Log tab: show the running (or most-recent) assignment's worker log
+    /// for the selected pipeline issue.  Uses `get_activity_log` so it
+    /// works from the local file cache or remote HTTP fetch — no SSE watch
+    /// needed.
+    fn pipeline_log_list(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i));
+        if let Some(issue) = issue {
+            let local_repo = issue.coord_repo.as_deref();
+            let assignment = self
+                .data
+                .assignments
+                .iter()
+                .filter(|a| a.issue_number == issue.number)
+                .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+                .find(|a| a.status == "running")
+                .or_else(|| {
+                    self.data.assignments.iter()
+                        .filter(|a| a.issue_number == issue.number)
+                        .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+                        .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
+                            .unwrap_or(std::cmp::Ordering::Equal))
+                });
+            if let Some(a) = assignment {
+                items.extend(self.get_activity_log(&a.id, &a.machine));
+            } else {
+                items.push(kv_item("", "  (no assignment log available)", Some(Color::rgb(100, 100, 100))));
+            }
+        } else {
+            items.push(kv_item("", "  (select an issue to view its log)", Some(Color::rgb(100, 100, 100))));
+        }
+        ListView {
+            id: WidgetId::new("pipeline-log"),
+            title: None,
+            items,
+            selected_idx: 0,
+            scroll_offset: self.pipeline_detail_scroll,
+            has_focus: false,
+            bordered: false,
+        }
+    }
+
+    /// Count `[assistant]` turns in the local log for an assignment.
+    /// Returns 0 when the log is not cached locally.
+    fn turn_count_from_log(&self, assignment_id: &str) -> usize {
+        let path = coord_dir().join("logs").join(format!("{}.log", assignment_id));
+        let Ok(content) = std::fs::read_to_string(&path) else { return 0; };
+        content.lines()
+            .filter(|l| json_str(l, "type").as_deref() == Some("assistant"))
+            .count()
+    }
+
     fn pipeline_stages_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
         let issue = self
@@ -8913,7 +8984,8 @@ impl CoordApp {
                     let new_tab = match idx {
                         0 => PipelineDetailTab::Pipeline,
                         1 => PipelineDetailTab::Issue,
-                        _ => PipelineDetailTab::Stages,
+                        2 => PipelineDetailTab::Stages,
+                        _ => PipelineDetailTab::Log,
                     };
                     if new_tab != self.pipeline_detail_tab {
                         self.pipeline_detail_tab = new_tab;
@@ -9102,6 +9174,17 @@ impl CoordApp {
                         } else if delta.y < 0.0 {
                             self.pipeline_stage_content_scroll =
                                 (self.pipeline_stage_content_scroll + 1).min(max);
+                        }
+                    }
+                    PipelineDetailTab::Log => {
+                        let items = self.pipeline_log_list().items.len();
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if delta.y > 0.0 {
+                            self.pipeline_detail_scroll =
+                                self.pipeline_detail_scroll.saturating_sub(1);
+                        } else if delta.y < 0.0 {
+                            self.pipeline_detail_scroll =
+                                (self.pipeline_detail_scroll + 1).min(max);
                         }
                     }
                 }
@@ -11195,9 +11278,7 @@ impl ShellApp for CoordApp {
             SidebarView::Pipeline => {
                 // Watch overlay takes over the entire main panel when active —
                 // tabs, pipeline view, meta line all hidden while watching.
-                if self.watch.is_some() {
-                    backend.draw_list(m, &self.watch_log_list());
-                } else if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
+                if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
                     backend.draw_list(m, &self.pipeline_placeholder_list());
                 } else {
                     // Tab bar.
@@ -11228,6 +11309,9 @@ impl ShellApp for CoordApp {
                         }
                         PipelineDetailTab::Stages => {
                             backend.draw_list(content_rect, &self.pipeline_stages_list());
+                        }
+                        PipelineDetailTab::Log => {
+                            backend.draw_list(content_rect, &self.pipeline_log_list());
                         }
                     }
                 }
@@ -11826,14 +11910,15 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── h/l — cycle Pipeline detail tabs ─────────────────
-                    // Order: Pipeline → Issue → Stages → Pipeline …
+                    // Order: Pipeline → Issue → Stages → Log → Pipeline …
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
                         self.pipeline_detail_tab = match self.pipeline_detail_tab {
-                            PipelineDetailTab::Pipeline => PipelineDetailTab::Stages,
+                            PipelineDetailTab::Pipeline => PipelineDetailTab::Log,
                             PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
                             PipelineDetailTab::Stages => PipelineDetailTab::Issue,
+                            PipelineDetailTab::Log => PipelineDetailTab::Stages,
                         };
                         self.pipeline_detail_scroll = 0;
                         needs_redraw = true;
@@ -11844,7 +11929,8 @@ impl ShellApp for CoordApp {
                         self.pipeline_detail_tab = match self.pipeline_detail_tab {
                             PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
                             PipelineDetailTab::Issue => PipelineDetailTab::Stages,
-                            PipelineDetailTab::Stages => PipelineDetailTab::Pipeline,
+                            PipelineDetailTab::Stages => PipelineDetailTab::Log,
+                            PipelineDetailTab::Log => PipelineDetailTab::Pipeline,
                         };
                         self.pipeline_detail_scroll = 0;
                         needs_redraw = true;
@@ -11941,14 +12027,15 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── Enter — Stages tab: open watch overlay for the
-                    //              issue's running assignment. Other
-                    //              tabs: fire Go on the active stage.
+                    // ── Enter — Stages tab: switch to Log tab to view the
+                    //              worker log inline.  Log tab: Go fires
+                    //              the active stage.  Other tabs: Go fires.
                     Key::Named(NamedKey::Enter)
                         if self.active_view == SidebarView::Pipeline =>
                     {
                         if self.pipeline_detail_tab == PipelineDetailTab::Stages {
-                            self.open_watch_for_selected_issue();
+                            self.pipeline_detail_tab = PipelineDetailTab::Log;
+                            self.pipeline_detail_scroll = 0;
                         } else {
                             self.dispatch_pipeline_active_go();
                         }
