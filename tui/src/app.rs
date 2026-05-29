@@ -58,7 +58,8 @@ use crate::settings::{
 };
 use quadraui::accelerator::{parse_key_binding, ParsedBinding};
 use quadraui::{
-    Backend, Badge, Color, Decoration, Key, ListItem, ListView, MouseButton, NamedKey,
+    Backend, Badge, ChatController, ChatControllerEvent, ChatRole, ChatTurn, Color, Decoration,
+    Key, ListItem, ListView, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
@@ -1014,6 +1015,15 @@ fn fmt_dur(secs: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Format elapsed seconds as mm:ss (under 1 hour) or h:mm:ss (≥1 hour).
+fn fmt_elapsed_mmss(secs: u64) -> String {
+    if secs < 3600 {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    } else {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
     }
 }
 
@@ -2709,12 +2719,12 @@ pub struct CoordApp {
     /// Active watch overlay (live log + kill controls). `None` when no
     /// assignment is being watched.
     watch: Option<WatchState>,
-    /// Input text for the inline inject prompt inside the watch overlay.
-    /// Empty when not in input mode.
-    inject_input: String,
-    /// Whether the inject input is currently capturing keyboard input.
-    /// Toggled by 'b' (open) and Escape/Enter (close).
-    inject_focused: bool,
+    /// Chat overlay for mid-flight worker guidance. `None` when closed.
+    inject_chat: Option<ChatController>,
+    /// Transcript of past injections (User turns) for the current watch session.
+    inject_transcript: Vec<ChatTurn>,
+    /// Animation frame counter for the inject chat spinner.
+    inject_spinner_frame: usize,
     /// Which tab is active in the Pipeline detail pane.
     pipeline_detail_tab: PipelineDetailTab,
     /// Which tab is active in the Board detail pane.
@@ -3011,8 +3021,9 @@ impl CoordApp {
             toasts: Vec::new(),
             next_toast_id: 0,
             watch: None,
-            inject_input: String::new(),
-            inject_focused: false,
+            inject_chat: None,
+            inject_transcript: Vec::new(),
+            inject_spinner_frame: 0,
             pipeline_detail_tab: PipelineDetailTab::default(),
             board_detail_tab: BoardDetailTab::default(),
             pipeline_detail_scroll: 0,
@@ -3254,21 +3265,25 @@ impl CoordApp {
         // Dropping watch_sse drops the Receiver; the background thread detects
         // the disconnect on its next tx.send() and exits cleanly.
         self.watch_sse = None;
+        self.inject_chat = None;
+        self.inject_transcript.clear();
     }
 
     /// Called whenever the Log tab becomes active.  Opens (or keeps open)
     /// the SSE stream for the selected issue's assignment so the Log tab
     /// shows live content without the HTTP-cache-TTL "Loading log…" flicker.
     fn ensure_log_tab_sse(&mut self) {
-        // If SSE is already open for the right assignment, leave it alone.
+        // If SSE is already open (or done) for the right assignment, leave it alone.
         if let (Some(w), Some(sse)) = (&self.watch, &self.watch_sse) {
             let issue_id = self.pipeline_sel
                 .and_then(|i| self.pipeline_issues.get(i))
                 .map(|iss| iss.number);
             if issue_id == Some(w.issue_number) && sse.assignment_id == w.assignment_id {
+                // SSE matches — keep it whether live or done (done shows "stream ended" footer).
                 return;
             }
         }
+        // No SSE yet, or it's for a different assignment — open for the current issue.
         self.open_watch_for_selected_issue();
     }
 
@@ -3474,39 +3489,11 @@ impl CoordApp {
                     ""
                 };
                 format!(
-                    " WATCH — {} #{} → {} ({}) (b=ask{}  K=kill  R=refresh  q=close) ",
+                    " WATCH — {} #{} → {} ({}) (b=chat{}  K=kill  R=refresh  q=close) ",
                     w.repo, w.issue_number, w.machine, w.assignment_type, extra_keys
                 )
             }
         };
-        // If the inject prompt is open, append it as a visible row at the
-        // bottom — chrome stays minimal but the user can see what they're
-        // typing.
-        if self.inject_focused {
-            items.push(kv_item("", "", None));
-            items.push(ListItem {
-                text: StyledText {
-                    spans: vec![
-                        StyledSpan::with_fg(
-                            " ask> ".to_string(),
-                            Color::rgb(130, 170, 210),
-                        ),
-                        StyledSpan::with_fg(
-                            format!("{}_", self.inject_input),
-                            Color::rgb(255, 255, 255),
-                        ),
-                    ],
-                },
-                icon: None,
-                detail: None,
-                decoration: Decoration::Normal,
-            });
-            items.push(kv_item(
-                "",
-                " Enter=send  Esc=cancel ",
-                Some(Color::rgb(140, 140, 140)),
-            ));
-        }
         // Stick-to-bottom default: position the viewport so the LAST item
         // is the last visible row. The viewport-row count is cached during
         // the most recent mouse_main_scroll / tick (see
@@ -3537,25 +3524,33 @@ impl CoordApp {
         }
     }
 
-    /// Submit the current inject input to the watched worker via
-    /// `coord inject`.  Closes the input on success.
-    fn submit_inject(&mut self) -> bool {
+    /// Send `text` to the watched worker via `coord inject`.
+    /// Appends the text to the inject transcript and clears the chat input on success.
+    fn submit_inject(&mut self, text: String) -> bool {
         let Some(w) = self.watch.clone() else { return false; };
-        let text = self.inject_input.trim().to_string();
-        if text.is_empty() {
-            self.inject_focused = false;
-            return false;
-        }
+        let text = text.trim().to_string();
+        if text.is_empty() { return false; }
         let spawned = self
             .command_runner
             .spawn(&["inject", &w.assignment_id, &text]);
         if spawned {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs_f64());
+            self.inject_transcript.push(ChatTurn {
+                role: ChatRole::User,
+                text: StyledText::plain(text.clone()),
+                timestamp_unix: now,
+            });
+            if let Some(ref mut chat) = self.inject_chat {
+                chat.set_transcript(self.inject_transcript.clone());
+                chat.clear_input();
+            }
             self.pipeline_status = Some((
                 format!("asked worker #{}: {}", w.issue_number, text),
                 Instant::now(),
             ));
-            self.inject_input.clear();
-            self.inject_focused = false;
         } else {
             self.pipeline_status = Some((
                 "another command is running — try again in a moment".to_string(),
@@ -4129,6 +4124,10 @@ impl CoordApp {
                     self.board_sidebar.set_collapsed(i + new_offset, was_collapsed);
                 }
             }
+        }
+        // Re-apply filter focus after rebuild so the cursor survives auto-refresh.
+        if self.board_search.focused {
+            self.board_sidebar.focus_form(0, true);
         }
     }
 
@@ -5374,6 +5373,10 @@ impl CoordApp {
             self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
             self.pipeline_stage_content_scroll = 0;
         }
+        // Re-apply filter focus after rebuild so the cursor survives auto-refresh.
+        if self.pipeline_search.focused {
+            self.pipeline_sidebar.focus_form(0, true);
+        }
     }
 
     /// Resolve the SidebarSystem's current selection to a `pipeline_issues`
@@ -5797,8 +5800,9 @@ impl CoordApp {
                         }
                     }
                 }
-                // Show turn count on Active stage box — prefer live SSE
-                // count when watching, fall back to local log count.
+                // Show turn count + elapsed on Active stage box.
+                // Prefer live SSE turn count when watching, fall back to local log.
+                // Elapsed is computed from dispatched_at to now (wall-clock).
                 if status == StageStatus::Active {
                     let running = self.assignments_for_stage(issue, name)
                         .into_iter()
@@ -5815,6 +5819,15 @@ impl CoordApp {
                         };
                         if turns > 0 {
                             label = format!("{} T{}", label, turns);
+                        }
+                        // Elapsed since dispatch — second line in the box.
+                        if let Some(dispatched_f) = a.dispatched_at {
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs_f64())
+                                .unwrap_or(dispatched_f);
+                            let elapsed = (now_secs - dispatched_f).max(0.0) as u64;
+                            label = format!("{}\n{}", label, fmt_elapsed_mmss(elapsed));
                         }
                     }
                 }
@@ -7842,7 +7855,13 @@ impl CoordApp {
                     .partial_cmp(&b.dispatched_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-        let Some(a) = plan_assignment else { return Vec::new() };
+        let Some(a) = plan_assignment else {
+            return vec![kv_item(
+                "",
+                "   (plan assignment not found in board — press S to sync, or run `coord notify`)",
+                Some(Color::rgb(160, 160, 180)),
+            )];
+        };
         let Some(plan) = self.data.plans.get(&a.id) else {
             // No structured plan cached — fall back to log tail with a hint.
             let mut rows = vec![kv_item(
@@ -8193,6 +8212,33 @@ impl CoordApp {
                             .unwrap_or(std::cmp::Ordering::Equal))
                 });
             if let Some(a) = assignment {
+                // Session elapsed header — shows wall-clock time, which is
+                // meaningful even when per-turn +Ns isn't available (historical
+                // replay lines all arrive in a burst with the same Instant).
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let elapsed_header = match (a.dispatched_at, a.finished_at) {
+                    (Some(start), Some(end)) => {
+                        let secs = (end - start).max(0.0) as u64;
+                        format!("  {} · {} · elapsed {}",
+                            a.assignment_type.as_deref().unwrap_or("work"),
+                            a.machine,
+                            fmt_elapsed_mmss(secs))
+                    }
+                    (Some(start), None) => {
+                        let secs = (now_secs - start).max(0.0) as u64;
+                        format!("  {} · {} · running {}",
+                            a.assignment_type.as_deref().unwrap_or("work"),
+                            a.machine,
+                            fmt_elapsed_mmss(secs))
+                    }
+                    _ => format!("  {} · {}", a.assignment_type.as_deref().unwrap_or("work"), a.machine),
+                };
+                items.push(kv_item("", &elapsed_header, Some(Color::rgb(120, 120, 140))));
+                items.push(kv_item("", "", None));
+
                 // Use SSE if the watch is open for this exact assignment —
                 // avoids the HTTP-cache-TTL "Loading log…" flicker.
                 let sse_for_this = self.watch_sse.as_ref().filter(|sse| {
@@ -8217,12 +8263,20 @@ impl CoordApp {
         } else {
             items.push(kv_item("", "  (select an issue to view its log)", Some(Color::rgb(100, 100, 100))));
         }
+        // Sticky-to-bottom: usize::MAX is the sentinel for "follow tail".
+        // Compute the real offset here so draw_list gets a clamped value.
+        let visible_rows = self.last_main_visible_rows.get().max(1);
+        let scroll = if self.pipeline_detail_scroll == usize::MAX {
+            items.len().saturating_sub(visible_rows)
+        } else {
+            self.pipeline_detail_scroll
+        };
         ListView {
             id: WidgetId::new("pipeline-log"),
             title: None,
             items,
             selected_idx: 0,
-            scroll_offset: self.pipeline_detail_scroll,
+            scroll_offset: scroll,
             has_focus: false,
             bordered: false,
         }
@@ -8839,6 +8893,12 @@ impl CoordApp {
                         self.rebuild_board_sidebar();
                         true
                     }
+                    // Click on the filter TextInput focuses it (emits FocusChanged).
+                    SidebarEvent::FormEvent { section: 0, event: FormEvent::FocusChanged { .. } } => {
+                        self.board_search.focused = true;
+                        self.board_sidebar.focus_form(0, true);
+                        true
+                    }
                     // Chevron click on a status-group header row — same
                     // toggle logic as RowSelected/RowActivated with path.len()==1.
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
@@ -8896,6 +8956,12 @@ impl CoordApp {
                     SidebarEvent::FormEvent { section: 0, event: FormEvent::TextInputChanged { ref value, .. } } => {
                         self.pipeline_search.set_value(value);
                         self.rebuild_pipeline_sidebar(None);
+                        true
+                    }
+                    // Click on the filter TextInput focuses it (emits FocusChanged).
+                    SidebarEvent::FormEvent { section: 0, event: FormEvent::FocusChanged { .. } } => {
+                        self.pipeline_search.focused = true;
+                        self.pipeline_sidebar.focus_form(0, true);
                         true
                     }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
@@ -9033,7 +9099,7 @@ impl CoordApp {
                     };
                     if new_tab != self.pipeline_detail_tab {
                         self.pipeline_detail_tab = new_tab;
-                        self.pipeline_detail_scroll = 0;
+                        self.pipeline_detail_scroll = if new_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
                         if new_tab == PipelineDetailTab::Log {
                             self.ensure_log_tab_sse();
                         }
@@ -9225,13 +9291,20 @@ impl CoordApp {
                     }
                     PipelineDetailTab::Log => {
                         let items = self.pipeline_log_list().items.len();
-                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        let visible_rows = visible.max(1);
+                        let max = items.saturating_sub(visible_rows.saturating_sub(1));
+                        let current = if self.pipeline_detail_scroll == usize::MAX {
+                            max
+                        } else {
+                            self.pipeline_detail_scroll
+                        };
                         if delta.y > 0.0 {
-                            self.pipeline_detail_scroll =
-                                self.pipeline_detail_scroll.saturating_sub(1);
+                            // Scroll up breaks sticky.
+                            self.pipeline_detail_scroll = current.saturating_sub(1);
                         } else if delta.y < 0.0 {
-                            self.pipeline_detail_scroll =
-                                (self.pipeline_detail_scroll + 1).min(max);
+                            let new = (current + 1).min(max);
+                            // Re-stick when reaching the bottom.
+                            self.pipeline_detail_scroll = if new >= max { usize::MAX } else { new };
                         }
                     }
                 }
@@ -10779,6 +10852,13 @@ impl CoordApp {
             needs_redraw |= self.drain_sse_watch();
         }
 
+        // Advance inject chat spinner when the overlay is open.
+        if let Some(ref mut chat) = self.inject_chat {
+            self.inject_spinner_frame = self.inject_spinner_frame.wrapping_add(1);
+            chat.set_spinner_frame(self.inject_spinner_frame);
+            needs_redraw = true;
+        }
+
         // #235: Drain Phase 1 build completions and toast the outcome.
         // Cheap no-op when no jobs are in flight.
         needs_redraw |= self.poll_test_build_jobs();
@@ -11381,6 +11461,11 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── Inject chat overlay — renders over the main panel ───────────
+        if let Some(ref chat) = self.inject_chat {
+            chat.render(backend, m);
+        }
+
         // ── Toast overlay (bottom-right of main content) ────────────────
         if let Some(stack) = self.toast_stack() {
             backend.draw_toast_stack(layout.main_content_bounds, &stack);
@@ -11416,6 +11501,25 @@ impl ShellApp for CoordApp {
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
 
+        // ── Inject chat overlay — intercepts ALL events when open ───────────
+        // When the chat is open it takes over input; normal sidebar/pipeline
+        // handlers are bypassed. handle_mouse is also skipped so a click on
+        // the sidebar doesn't change selection while the user is typing.
+        if self.inject_chat.is_some() {
+            let main_rect = ctx.main_bounds();
+            let result = self.inject_chat.as_mut().unwrap().handle(&event, backend, main_rect);
+            match result {
+                ChatControllerEvent::Submit { text } => {
+                    self.submit_inject(text);
+                }
+                ChatControllerEvent::Cancelled => {
+                    self.inject_chat = None;
+                }
+                _ => {}
+            }
+            return Reaction::Redraw;
+        }
+
         // ── Mouse / scroll dispatch (before consuming the event) ─────────────
         needs_redraw |= self.handle_mouse(&event, backend, ctx);
 
@@ -11425,7 +11529,7 @@ impl ShellApp for CoordApp {
 
         // ── #200 Pending test-fail reason: intercept all keys until submit ────
         // Enter submits and records test_state=failed. Esc cancels. Backspace
-        // edits. Any printable char appends. Same pattern as inject_focused.
+        // edits. Any printable char appends.
         if self.pending_test_fail.is_some() {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 match key {
@@ -11682,43 +11786,32 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── Watch overlay: inject input mode takes priority ──
-                    // When the inject prompt is open, ALL char/Enter/Esc/
-                    // Backspace go to the input buffer until it closes.
-                    Key::Named(NamedKey::Enter) if self.inject_focused => {
-                        self.submit_inject();
+                    // ── Watch overlay: control keys ─────────────────────
+                    // 'b' opens the ChatController guidance overlay. When the
+                    // overlay is open, ALL events are intercepted earlier in
+                    // handle() — these arms only fire when it is closed.
+                    Key::Char('b') if self.watch.is_some() && self.inject_chat.is_none() => {
+                        if let Some(w) = &self.watch {
+                            let mut chat = ChatController::new("inject");
+                            chat.set_status(StyledText::plain(format!(
+                                "  Guidance → {} #{} on {}  (Ctrl+Enter = send · Esc = close)",
+                                w.assignment_type, w.issue_number, w.machine
+                            )));
+                            chat.set_transcript(self.inject_transcript.clone());
+                            self.inject_chat = Some(chat);
+                        }
                         needs_redraw = true;
                     }
-                    Key::Named(NamedKey::Escape) if self.inject_focused => {
-                        self.inject_input.clear();
-                        self.inject_focused = false;
-                        needs_redraw = true;
-                    }
-                    Key::Named(NamedKey::Backspace) if self.inject_focused => {
-                        self.inject_input.pop();
-                        needs_redraw = true;
-                    }
-                    Key::Char(ch) if self.inject_focused => {
-                        self.inject_input.push(*ch);
-                        needs_redraw = true;
-                    }
-
-                    // ── Watch overlay (no input active): control keys ────
-                    Key::Char('b') if self.watch.is_some() && !self.inject_focused => {
-                        self.inject_focused = true;
-                        self.inject_input.clear();
-                        needs_redraw = true;
-                    }
-                    Key::Char('K') if self.watch.is_some() && !self.inject_focused => {
+                    Key::Char('K') if self.watch.is_some() => {
                         self.kill_watched();
                         needs_redraw = true;
                     }
-                    Key::Char('A') if self.watch.is_some() && !self.inject_focused => {
+                    Key::Char('A') if self.watch.is_some() => {
                         self.approve_watched_plan();
                         needs_redraw = true;
                     }
                     // R = force a fresh SSE connection from byte 0.
-                    Key::Char('R') if self.watch.is_some() && !self.inject_focused => {
+                    Key::Char('R') if self.watch.is_some() => {
                         self.reset_sse_watch();
                         needs_redraw = true;
                     }
@@ -11729,7 +11822,7 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
                     Key::Char('j') | Key::Named(NamedKey::Down)
-                        if self.watch.is_some() && !self.inject_focused =>
+                        if self.watch.is_some() =>
                     {
                         if let Some(w) = self.watch.as_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
@@ -11738,7 +11831,7 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
-                        if self.watch.is_some() && !self.inject_focused =>
+                        if self.watch.is_some() =>
                     {
                         if let Some(w) = self.watch.as_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
@@ -11874,6 +11967,37 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── j/k — scroll Log tab: sticky-to-bottom ────────────
+                    // Up breaks sticky; Down re-sticks when reaching the bottom.
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                    {
+                        let items = self.pipeline_log_list().items.len();
+                        let visible = self.last_main_visible_rows.get().max(1);
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if self.pipeline_detail_scroll != usize::MAX {
+                            let new = self.pipeline_detail_scroll.saturating_add(1);
+                            self.pipeline_detail_scroll = if new >= max { usize::MAX } else { new };
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                    {
+                        let items = self.pipeline_log_list().items.len();
+                        let visible = self.last_main_visible_rows.get().max(1);
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        let current = if self.pipeline_detail_scroll == usize::MAX {
+                            max
+                        } else {
+                            self.pipeline_detail_scroll
+                        };
+                        self.pipeline_detail_scroll = current.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+
                     // ── Down / j ─────────────────────────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down) => {
                         match self.active_view {
@@ -11983,7 +12107,7 @@ impl ShellApp for CoordApp {
                             PipelineDetailTab::Stages => PipelineDetailTab::Issue,
                             PipelineDetailTab::Log => PipelineDetailTab::Stages,
                         };
-                        self.pipeline_detail_scroll = 0;
+                        self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
                         if self.pipeline_detail_tab == PipelineDetailTab::Log {
                             self.ensure_log_tab_sse();
                         }
@@ -11998,7 +12122,7 @@ impl ShellApp for CoordApp {
                             PipelineDetailTab::Stages => PipelineDetailTab::Log,
                             PipelineDetailTab::Log => PipelineDetailTab::Pipeline,
                         };
-                        self.pipeline_detail_scroll = 0;
+                        self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
                         if self.pipeline_detail_tab == PipelineDetailTab::Log {
                             self.ensure_log_tab_sse();
                         }
@@ -12104,7 +12228,7 @@ impl ShellApp for CoordApp {
                     {
                         if self.pipeline_detail_tab == PipelineDetailTab::Stages {
                             self.pipeline_detail_tab = PipelineDetailTab::Log;
-                            self.pipeline_detail_scroll = 0;
+                            self.pipeline_detail_scroll = usize::MAX;
                             self.ensure_log_tab_sse();
                         } else {
                             self.dispatch_pipeline_active_go();
@@ -12863,8 +12987,9 @@ mod tests {
             toasts: Vec::new(),
             next_toast_id: 0,
             watch: None,
-            inject_input: String::new(),
-            inject_focused: false,
+            inject_chat: None,
+            inject_transcript: Vec::new(),
+            inject_spinner_frame: 0,
             pipeline_detail_tab: PipelineDetailTab::default(),
             board_detail_tab: BoardDetailTab::default(),
             pipeline_detail_scroll: 0,
