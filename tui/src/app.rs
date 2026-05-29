@@ -3989,9 +3989,6 @@ impl CoordApp {
                 }
             }
         }
-        if self.board_search.focused {
-            self.board_sidebar.set_active_section(Some(0));
-        }
     }
 
     /// Repo section offset: 1 for the search form + 1 more if proposals exist.
@@ -5235,15 +5232,6 @@ impl CoordApp {
         if new_issue_num != prev_issue_num {
             self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
             self.pipeline_stage_content_scroll = 0;
-        }
-        // If the filter had focus before the rebuild, restore it.  A fresh
-        // SidebarSystem starts with no active section (FocusGroup::active =
-        // None), so the form renders with has_focus:false even though
-        // pipeline_search.focused is still true — the cursor and focus ring
-        // disappear and typing stops working.  Re-activating section 0 makes
-        // build_view emit has_focus:true for the form again.
-        if self.pipeline_search.focused {
-            self.pipeline_sidebar.set_active_section(Some(0));
         }
     }
 
