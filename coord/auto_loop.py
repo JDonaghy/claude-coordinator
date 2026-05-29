@@ -192,6 +192,34 @@ def process_review_completion(
     )
 
 
+def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
+    """Choose the model alias for a fix worker on a given bounce *iteration*.
+
+    Pure function so the iteration → model mapping is unit-testable.
+
+    Returns ``None`` when ``pipeline.escalate_fix_model`` is disabled — the
+    fix dispatch then sets no model and the agent falls back to ``claude -p``'s
+    default (today's behaviour).
+
+    When escalation is enabled:
+      - iteration 1 → ``config.models.default`` (first fix stays cheap/fast).
+      - iteration 2+ → climb one rung up ``config.models.escalation`` per
+        iteration, capped at the top of the ladder.
+
+    Example with escalation ``[haiku, sonnet, opus]`` and default ``sonnet``:
+    iter 1 → sonnet, iter 2 → opus, iter 3 → opus (capped).
+    """
+    if not config.pipeline.escalate_fix_model:
+        return None
+
+    model = config.models.default
+    # iteration 1 stays on the base model; each later iteration escalates one
+    # rung (next_model caps at the top of the ladder).
+    for _ in range(max(iteration, 1) - 1):
+        model = config.models.next_model(model)
+    return model
+
+
 def _dispatch_fix_for_review(
     review: Assignment,
     findings,
@@ -241,10 +269,14 @@ def _dispatch_fix_for_review(
             ),
         )]
 
-    # Build briefing and dispatch.
+    # Build briefing and dispatch.  The fix worker escalates the model per
+    # iteration (when pipeline.escalate_fix_model is enabled); compute it here
+    # where the iteration is known and thread it into the dispatch.
     briefing = _build_fix_briefing(work, findings, next_iteration, max_iter)
+    model = _fix_model_for_iteration(config, next_iteration)
     fix = _dispatch_fix(
-        work, briefing, board, config, next_iteration, http_client=http_client
+        work, briefing, board, config, next_iteration,
+        model=model, http_client=http_client,
     )
 
     if fix is None:
@@ -319,6 +351,7 @@ def _dispatch_fix(
     config: Config,
     iteration: int,
     *,
+    model: str | None = None,
     http_client: httpx.Client | None = None,
 ) -> Assignment | None:
     """POST a fix assignment to the agent server.
@@ -375,6 +408,10 @@ def _dispatch_fix(
         # commits (quadraui#166 hit this hard).
         "target_branch": work.branch,
     }
+    # Escalated model per bounce iteration (None when pipeline
+    # .escalate_fix_model is disabled — preserves today's no-model behaviour).
+    if model is not None:
+        payload["model"] = model
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     client = http_client or httpx
@@ -404,6 +441,9 @@ def _dispatch_fix(
         review_of_assignment_id=work.assignment_id,
         # Iteration counter so the loop knows when to stop.
         review_iteration=iteration,
+        # Escalated model for this bounce iteration (None preserves the
+        # legacy behaviour where the agent picks claude -p's default).
+        model=model,
     )
     board.active.append(fix_assignment)
 

@@ -173,12 +173,20 @@ class PipelineConfig:
     ``max_review_iterations`` is the maximum number of fix rounds before
     the auto-loop stops and posts a notice asking for manual intervention.
     Default is 3.
+
+    ``escalate_fix_model`` controls whether auto-dispatched fix workers
+    escalate the model on each bounce iteration.  When ``True`` (default),
+    the first fix stays on ``models.default`` and each subsequent fix
+    iteration climbs one rung up ``models.escalation`` (capped at the top).
+    When ``False``, fix dispatches set no model (today's behaviour: the
+    agent falls back to ``claude -p``'s default).
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
     labels: dict[str, list[str]] = field(default_factory=dict)
     auto_loop: bool = True
     max_review_iterations: int = 3
+    escalate_fix_model: bool = True
 
     def tracked_labels(self) -> list[str]:
         """Return the GitHub issue labels considered part of the pipeline.
@@ -666,6 +674,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         if not isinstance(value, int) or value < 1:
             raise ConfigError("pipeline.max_review_iterations must be a positive integer")
         cfg.max_review_iterations = value
+
+    if "escalate_fix_model" in raw:
+        value = raw["escalate_fix_model"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.escalate_fix_model must be a boolean")
+        cfg.escalate_fix_model = value
 
     return cfg
 

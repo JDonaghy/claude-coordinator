@@ -12,12 +12,13 @@ import pytest
 from coord.auto_loop import (
     LoopAction,
     _build_fix_briefing,
+    _fix_model_for_iteration,
     _post_max_iterations_notice,
     process_review_completion,
     run_for_fix_transition,
     run_for_review_transition,
 )
-from coord.config import Config, PipelineConfig, ReviewsConfig
+from coord.config import Config, ModelsConfig, PipelineConfig, ReviewsConfig
 from coord.models import Assignment, Board, Machine, Repo
 from coord.review import ReviewFindings
 
@@ -417,6 +418,122 @@ class TestBuildFixBriefing:
         assert "do not change the branch name" in briefing.lower()
 
 
+# ── Unit tests: _fix_model_for_iteration ─────────────────────────────────────
+
+
+def _config_with_models(
+    *,
+    default: str = "sonnet",
+    escalation: list[str] | None = None,
+    escalate_fix_model: bool = True,
+) -> Config:
+    """Build a Config with a tunable models ladder + escalate knob."""
+    return Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[],
+        models=ModelsConfig(
+            default=default,
+            escalation=escalation or ["haiku", "sonnet", "opus"],
+        ),
+        pipeline=PipelineConfig(escalate_fix_model=escalate_fix_model),
+    )
+
+
+class TestFixModelForIteration:
+    def test_iteration_1_returns_base_default(self) -> None:
+        cfg = _config_with_models(default="sonnet")
+        assert _fix_model_for_iteration(cfg, 1) == "sonnet"
+
+    def test_iteration_2_returns_next_rung(self) -> None:
+        # default sonnet, ladder [haiku, sonnet, opus] → iter 2 escalates to opus
+        cfg = _config_with_models(default="sonnet")
+        assert _fix_model_for_iteration(cfg, 2) == "opus"
+
+    def test_iteration_beyond_ladder_caps_at_top(self) -> None:
+        cfg = _config_with_models(default="sonnet")
+        # iter 3+ stays capped at the top of the ladder (opus)
+        assert _fix_model_for_iteration(cfg, 3) == "opus"
+        assert _fix_model_for_iteration(cfg, 10) == "opus"
+
+    def test_escalates_one_rung_per_iteration_from_bottom(self) -> None:
+        # default haiku, ladder [haiku, sonnet, opus]
+        cfg = _config_with_models(default="haiku")
+        assert _fix_model_for_iteration(cfg, 1) == "haiku"
+        assert _fix_model_for_iteration(cfg, 2) == "sonnet"
+        assert _fix_model_for_iteration(cfg, 3) == "opus"
+        assert _fix_model_for_iteration(cfg, 4) == "opus"  # capped
+
+    def test_returns_none_when_escalation_disabled(self) -> None:
+        cfg = _config_with_models(escalate_fix_model=False)
+        assert _fix_model_for_iteration(cfg, 1) is None
+        assert _fix_model_for_iteration(cfg, 2) is None
+        assert _fix_model_for_iteration(cfg, 5) is None
+
+
+class TestFixModelDispatch:
+    """The escalated model lands on both the POST payload and the Assignment."""
+
+    def _dispatch(self, config: Config, tmp_path) -> tuple[Any, Any]:
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\nREVIEW_BODY:\nFix.\nEND_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-001"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        sent_payload = mock_http.post.call_args.kwargs["json"]
+        fix = board.active[0]
+        return sent_payload, fix
+
+    def test_payload_and_assignment_carry_base_model_on_first_fix(
+        self, tmp_path
+    ) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tail",
+                    repos=["api"], repo_paths={"api": "/work/api"},
+                )
+            ],
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+            models=ModelsConfig(default="sonnet", escalation=["haiku", "sonnet", "opus"]),
+            pipeline=PipelineConfig(auto_loop=True, escalate_fix_model=True),
+        )
+        # work.review_iteration=0 → next_iteration=1 → base model "sonnet"
+        payload, fix = self._dispatch(cfg, tmp_path)
+        assert payload["model"] == "sonnet"
+        assert fix.model == "sonnet"
+
+    def test_no_model_set_when_escalation_disabled(self, tmp_path) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tail",
+                    repos=["api"], repo_paths={"api": "/work/api"},
+                )
+            ],
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+            pipeline=PipelineConfig(auto_loop=True, escalate_fix_model=False),
+        )
+        payload, fix = self._dispatch(cfg, tmp_path)
+        assert "model" not in payload  # legacy behaviour: no model key
+        assert fix.model is None
+
+
 # ── Unit tests: config parsing ───────────────────────────────────────────────
 
 
@@ -479,6 +596,43 @@ class TestPipelineConfigParsing:
         )
         with pytest.raises(
             ConfigError, match="pipeline.max_review_iterations must be a positive integer"
+        ):
+            load(p)
+
+    def test_escalate_fix_model_defaults_to_true(self, tmp_path) -> None:
+        from coord.config import load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        )
+        cfg = load(p)
+        assert cfg.pipeline.escalate_fix_model is True
+
+    def test_can_disable_escalate_fix_model(self, tmp_path) -> None:
+        from coord.config import load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+            "pipeline:\n  escalate_fix_model: false\n"
+        )
+        cfg = load(p)
+        assert cfg.pipeline.escalate_fix_model is False
+
+    def test_invalid_escalate_fix_model_raises(self, tmp_path) -> None:
+        from coord.config import ConfigError, load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+            "pipeline:\n  escalate_fix_model: maybe\n"
+        )
+        with pytest.raises(
+            ConfigError, match="pipeline.escalate_fix_model must be a boolean"
         ):
             load(p)
 
