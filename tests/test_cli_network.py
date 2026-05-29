@@ -12,6 +12,8 @@ from click.testing import CliRunner
 from coord import network, state as state_mod
 from coord.cli import main
 
+from .conftest import output_and_stderr
+
 
 CONFIG_YAML = """\
 repos:
@@ -285,7 +287,7 @@ class TestLog:
                 ["log", "missing", "--config", str(config_file), "--machine", "laptop"],
             )
         assert result.exit_code == 1
-        assert "no log" in result.output.lower() or "no log" in result.stderr if hasattr(result, "stderr") else "no log" in result.output
+        assert "no log" in output_and_stderr(result).lower()
 
     def test_local_fallback_when_no_dispatched_record(
         self,

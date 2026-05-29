@@ -22,6 +22,46 @@ from coord.cli import main
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
+def _wait_until(predicate, timeout: float = 30.0, interval: float = 0.02) -> bool:
+    """Poll ``predicate`` until it returns truthy or ``timeout`` elapses.
+
+    Exits as soon as the condition holds (so the happy path stays fast) but
+    tolerates background-thread work that runs slowly under full-suite CPU
+    contention.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+def _wait_for_last_update(server, timeout: float = 30.0) -> dict:
+    """Block until last_update.json exists AND parses as valid JSON, returning
+    the parsed dict.
+
+    ``_write_last_update`` does a plain ``write_text`` (truncate-then-write),
+    so a reader that fires between the truncate and the write sees empty or
+    partial content.  Waiting for a successful parse (not mere existence)
+    closes that race without touching production code.
+    """
+    path = server.state_dir / "last_update.json"
+    result: dict = {}
+
+    def _parsed() -> bool:
+        try:
+            import json as _json
+            result.update(_json.loads(path.read_text()))
+            return True
+        except Exception:
+            return False
+
+    assert _wait_until(_parsed, timeout=timeout), \
+        "background update thread never wrote a parseable last_update.json"
+    return result
+
+
 def _init_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-b", "main"], cwd=str(path), check=True, capture_output=True)
@@ -120,17 +160,14 @@ class TestUpdateEndpoint:
                 mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
                 client, server = _make_client(tmp_path, exec_restart=restarted.append)
                 client.post("/update")
-                deadline = time.time() + 5
-                while not restarted and time.time() < deadline:
-                    time.sleep(0.05)
+                assert _wait_until(lambda: bool(restarted)), \
+                    "exec_restart was never called"
 
-        assert restarted, "exec_restart was never called"
         server.shutdown()
 
     def test_update_skips_restart_when_pip_no_change(self, tmp_path: Path) -> None:
         """If pip succeeds but resolves to the same version, no restart and
         a no_change result is persisted for the next /health to surface."""
-        import json
         restarted: list[list[str]] = []
         with patch("coord.agent_app._detect_install_mode") as mock_detect:
             mock_detect.return_value = (False, None)  # pip path
@@ -139,11 +176,11 @@ class TestUpdateEndpoint:
                     mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
                     client, server = _make_client(tmp_path, exec_restart=restarted.append)
                     client.post("/update")
-                # Wait a bit to confirm no restart occurred.
-                time.sleep(0.5)
+                    # Wait for the background thread to finish (it persists
+                    # last_update.json); then confirm no restart occurred.
+                    last = _wait_for_last_update(server)
 
         assert not restarted, "exec_restart fired even though version didn't change"
-        last = json.loads((server.state_dir / "last_update.json").read_text())
         assert last["result"] == "no_change"
         assert last["version_before"] == "0.3.0"
         assert last["version_after"] == "0.3.0"
@@ -156,9 +193,13 @@ class TestUpdateEndpoint:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
             client, server = _make_client(tmp_path, exec_restart=restarted.append)
             client.post("/update")
+            # The failure path persists last_update.json; wait for the
+            # background thread to finish (inside the patch context, since it
+            # reads subprocess.run lazily) before asserting no restart.
+            assert _wait_until(
+                lambda: (server.state_dir / "last_update.json").exists()
+            ), "background update thread never wrote last_update.json"
 
-        # Wait a bit to confirm no restart occurred.
-        time.sleep(0.5)
         assert not restarted, "exec_restart should not have been called on failure"
         server.shutdown()
 
@@ -178,9 +219,7 @@ class TestUpdateEndpoint:
             client.post("/update")
 
         # Give the background thread time to run.
-        deadline = time.time() + 3
-        while not any("git" in " ".join(c) for c in calls) and time.time() < deadline:
-            time.sleep(0.05)
+        _wait_until(lambda: any("git" in " ".join(c) for c in calls))
 
         git_cmds = [c for c in calls if "git" in c]
         assert git_cmds, "expected a git call"
@@ -202,9 +241,7 @@ class TestUpdateEndpoint:
             client, server = _make_client(tmp_path)
             client.post("/update")
 
-        deadline = time.time() + 3
-        while not calls and time.time() < deadline:
-            time.sleep(0.05)
+        _wait_until(lambda: bool(calls))
 
         pip_cmds = [c for c in calls if "pip" in " ".join(c)]
         assert pip_cmds, "expected a pip call"
@@ -221,8 +258,6 @@ class TestUpdateEndpoint:
         so the coordinator can distinguish a clean upgrade + dead-restart from
         a failed pip step.  Regression test for issue #280.
         """
-        import json as _json
-
         def boom(_argv: list[str]) -> None:
             raise RuntimeError("simulated exec_restart failure")
 
@@ -233,12 +268,10 @@ class TestUpdateEndpoint:
             mock_run.return_value = MagicMock(returncode=0, stdout="Already up to date.", stderr="")
             client, server = _make_client(tmp_path, exec_restart=boom)
             client.post("/update")
-            # Give the background thread time to complete.
-            deadline = time.time() + 5
-            while not (server.state_dir / "last_update.json").exists() and time.time() < deadline:
-                time.sleep(0.05)
+            # Give the background thread time to complete (inside the patch
+            # context — it reads subprocess.run lazily).
+            last = _wait_for_last_update(server)
 
-        last = _json.loads((server.state_dir / "last_update.json").read_text())
         # The upgrade step succeeded; result must be "upgraded" even though
         # exec_restart itself raised an exception.
         assert last["result"] == "upgraded", (
@@ -256,8 +289,6 @@ class TestUpdateEndpoint:
         last_update.json should record result='failed'.  Regression test for
         issue #280.
         """
-        import json as _json
-
         restarted: list = []
 
         # Build the server (and the underlying git repo) BEFORE patching
@@ -278,13 +309,13 @@ class TestUpdateEndpoint:
             patch("coord.agent_app.subprocess.run", side_effect=fake_run),
         ):
             client.post("/update")
-            # Wait for the background thread to write last_update.json.
-            deadline = time.time() + 5
-            while not (server.state_dir / "last_update.json").exists() and time.time() < deadline:
-                time.sleep(0.05)
+            # Wait for the background thread to write last_update.json.  This
+            # must stay INSIDE the patch context (see NOTE in
+            # test_update_triggers_exec_restart_after_success): the background
+            # thread reads subprocess.run lazily.
+            last = _wait_for_last_update(server)
 
         assert not restarted, "exec_restart must not fire when git pull raises"
-        last = _json.loads((server.state_dir / "last_update.json").read_text())
         assert last["result"] == "failed"
         assert "FileNotFoundError" in (last.get("error") or "")
         server.shutdown()
@@ -326,11 +357,7 @@ class TestRestartEndpoint:
         client, server = _make_client(tmp_path, exec_restart=restarted.append)
         client.post("/restart", json={"cancel_timeout": 5})
 
-        deadline = time.time() + 5
-        while not restarted and time.time() < deadline:
-            time.sleep(0.05)
-
-        assert restarted, "exec_restart was never called"
+        assert _wait_until(lambda: bool(restarted)), "exec_restart was never called"
         server.shutdown()
 
     def test_restart_reports_active_worker_count(self, tmp_path: Path) -> None:
@@ -399,11 +426,7 @@ class TestRestartEndpoint:
         # Request restart with very short cancel_timeout so the worker is cancelled.
         client.post("/restart", json={"cancel_timeout": 0})
 
-        deadline = time.time() + 10
-        while not restarted and time.time() < deadline:
-            time.sleep(0.1)
-
-        assert restarted, "exec_restart was never called"
+        assert _wait_until(lambda: bool(restarted)), "exec_restart was never called"
         assert server.get(a.id).status == "cancelled"
         server.shutdown()
 

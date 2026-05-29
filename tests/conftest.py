@@ -8,6 +8,16 @@ from pathlib import Path
 import pytest
 
 
+def output_and_stderr(result) -> str:
+    """CLI text across click versions: newer click separates stderr; older
+    mixes it into .output and raises on .stderr access."""
+    try:
+        err = result.stderr or ""
+    except ValueError:
+        err = ""
+    return result.output + err
+
+
 VALID_CONFIG = """\
 repos:
   - name: api

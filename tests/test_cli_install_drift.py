@@ -17,6 +17,8 @@ from click.testing import CliRunner
 
 from coord.cli import main
 
+from .conftest import output_and_stderr
+
 
 def _run_with_fake_install(coord_file: str, cwd_has_source: bool, tmp_path: Path):
     """Invoke `coord version` with a patched coord module attribute and cwd."""
@@ -45,8 +47,9 @@ def test_warning_fires_when_non_editable_inside_source_checkout(tmp_path: Path) 
         tmp_path=tmp_path,
     )
     assert result.exit_code == 0
-    assert "non-editable install" in result.stderr
-    assert "pip install -e ." in result.stderr
+    text = output_and_stderr(result)
+    assert "non-editable install" in text
+    assert "pip install -e ." in text
 
 
 def test_no_warning_for_editable_install(tmp_path: Path) -> None:
@@ -57,7 +60,7 @@ def test_no_warning_for_editable_install(tmp_path: Path) -> None:
         tmp_path=tmp_path,
     )
     assert result.exit_code == 0
-    assert "non-editable" not in result.stderr
+    assert "non-editable" not in output_and_stderr(result)
 
 
 def test_no_warning_when_not_in_source_checkout(tmp_path: Path) -> None:
@@ -69,4 +72,4 @@ def test_no_warning_when_not_in_source_checkout(tmp_path: Path) -> None:
         tmp_path=tmp_path,
     )
     assert result.exit_code == 0
-    assert "non-editable" not in result.stderr
+    assert "non-editable" not in output_and_stderr(result)
