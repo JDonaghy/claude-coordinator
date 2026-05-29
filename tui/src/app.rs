@@ -1018,12 +1018,12 @@ fn fmt_dur(secs: u64) -> String {
     }
 }
 
-/// Format elapsed seconds as mm:ss (under 1 hour) or h:mm:ss (≥1 hour).
+/// Format elapsed seconds as mm:ss (under 1 hour) or h:mm (≥1 hour).
 fn fmt_elapsed_mmss(secs: u64) -> String {
     if secs < 3600 {
         format!("{}:{:02}", secs / 60, secs % 60)
     } else {
-        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!("{}:{:02}", secs / 3600, (secs % 3600) / 60)
     }
 }
 
