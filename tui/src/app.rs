@@ -10757,6 +10757,26 @@ impl CoordApp {
             validation: None,
         });
 
+        // ── Keybindings ────────────────────────────────────────────────
+        fields.push(settings_label("Keybindings"));
+        let refresh_key = self.settings.keybindings
+            .get(ACTION_PIPELINE_REFRESH)
+            .map(|s| s.as_str())
+            .unwrap_or("Ctrl+R");
+        fields.push(FormField {
+            id: WidgetId::new("settings:keybind:pipeline_refresh"),
+            label: StyledText::plain("Pipeline refresh"),
+            kind: FieldKind::TextInput {
+                value: refresh_key.to_string(),
+                placeholder: "e.g. Ctrl+R or <C-r> or F5".to_string(),
+                cursor: None,
+                selection_anchor: None,
+            },
+            hint: StyledText::plain("Key to force-refresh issues from GitHub. Empty = disabled."),
+            disabled: false,
+            validation: None,
+        });
+
         // ── Machine Models ─────────────────────────────────────────────
         fields.push(settings_label("Per-Machine Model Overrides"));
         if self.data.machines.is_empty() {
@@ -10908,6 +10928,18 @@ impl CoordApp {
                 } else {
                     false
                 }
+            }
+            FormEvent::TextInputChanged { id, value }
+            | FormEvent::TextInputCommitted { id, value }
+                if id.as_str().starts_with("settings:keybind:") =>
+            {
+                let action = &id.as_str()["settings:keybind:".len()..];
+                self.settings.keybindings.insert(action.to_string(), value.clone());
+                self.parsed_keybindings = parse_keybindings(&self.settings);
+                if let Err(e) = self.settings.save() {
+                    self.push_toast("Settings", &format!("could not persist settings: {e}"), ToastSeverity::Error);
+                }
+                true
             }
             _ => false,
         }
