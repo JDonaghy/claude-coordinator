@@ -3069,7 +3069,7 @@ impl CoordApp {
         let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
         let local_repo = issue.coord_repo.as_deref();
 
-        let pick = self
+        let candidates: Vec<_> = self
             .data
             .assignments
             .iter()
@@ -3078,17 +3078,16 @@ impl CoordApp {
                 Some(r) => a.repo == r,
                 None => true,
             })
-            .find(|a| a.status == "running")
+            .collect();
+
+        // Prefer running → any non-done → most-recent done (read-only log review).
+        let pick = candidates.iter().copied().find(|a| a.status == "running")
+            .or_else(|| candidates.iter().copied().find(|a| a.status != "done"))
             .or_else(|| {
-                self.data
-                    .assignments
-                    .iter()
-                    .filter(|a| a.issue_number == issue.number)
-                    .filter(|a| match local_repo {
-                        Some(r) => a.repo == r,
-                        None => true,
-                    })
-                    .find(|a| a.status != "done")
+                candidates.iter().copied().max_by(|a, b| {
+                    a.dispatched_at.partial_cmp(&b.dispatched_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
             });
 
         match pick {
