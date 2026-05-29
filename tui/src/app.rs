@@ -2636,6 +2636,9 @@ pub struct CoordApp {
     pipeline_repo_names: Vec<String>,
     /// Filter state (query / cursor / focus) for the Pipeline sidebar's FILTER box.
     pipeline_search: SidebarFilter,
+    /// Expanded state for each (repo_key, lifecycle_key) pair in the Pipeline sidebar.
+    /// Default: true (expanded). Persists across rebuilds so collapse survives refresh.
+    pipeline_lifecycle_expanded: std::collections::HashMap<(String, String), bool>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
     /// Selected issue index into `pipeline_issues`, if any.
@@ -2891,6 +2894,7 @@ impl CoordApp {
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
             pipeline_search: SidebarFilter::default(),
+            pipeline_lifecycle_expanded: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_loader: None,
@@ -3984,6 +3988,9 @@ impl CoordApp {
                     self.board_sidebar.set_collapsed(i + new_offset, was_collapsed);
                 }
             }
+        }
+        if self.board_search.focused {
+            self.board_sidebar.set_active_section(Some(0));
         }
     }
 
@@ -5101,6 +5108,11 @@ impl CoordApp {
                     _             => Color::rgb(140, 140, 160),
                 };
 
+                let is_expanded = self.pipeline_lifecycle_expanded
+                    .get(&(repo_key.clone(), lc_key.to_string()))
+                    .copied()
+                    .unwrap_or(true);
+
                 rows.push(TreeRow {
                     path: vec![li as u16],
                     indent: 1,
@@ -5112,10 +5124,14 @@ impl CoordApp {
                         )],
                     },
                     badge: None,
-                    is_expanded: Some(true),
+                    is_expanded: Some(is_expanded),
                     decoration: Decoration::Header,
                     edit: None,
                 });
+
+                if !is_expanded {
+                    continue;
+                }
 
                 for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
                     let issue = &self.pipeline_issues[issue_idx];
@@ -5219,6 +5235,15 @@ impl CoordApp {
         if new_issue_num != prev_issue_num {
             self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
             self.pipeline_stage_content_scroll = 0;
+        }
+        // If the filter had focus before the rebuild, restore it.  A fresh
+        // SidebarSystem starts with no active section (FocusGroup::active =
+        // None), so the form renders with has_focus:false even though
+        // pipeline_search.focused is still true — the cursor and focus ring
+        // disappear and typing stops working.  Re-activating section 0 makes
+        // build_view emit has_focus:true for the form again.
+        if self.pipeline_search.focused {
+            self.pipeline_sidebar.set_active_section(Some(0));
         }
     }
 
@@ -8596,13 +8621,33 @@ impl CoordApp {
                         self.rebuild_pipeline_sidebar(None);
                         true
                     }
+                    SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
+                        let search_offset = 1usize;
+                        if section >= search_offset {
+                            let repo_idx = section - search_offset;
+                            if let Some(repo_key) = self.pipeline_repo_names.get(repo_idx).cloned() {
+                                let li = path[0] as usize;
+                                let groups = self.pipeline_groups_for_repo(&repo_key);
+                                if let Some((lc_key, _)) = groups.get(li) {
+                                    let lc_key = lc_key.to_string();
+                                    let entry = self.pipeline_lifecycle_expanded
+                                        .entry((repo_key, lc_key))
+                                        .or_insert(true);
+                                    *entry = !*entry;
+                                    self.rebuild_pipeline_sidebar(None);
+                                }
+                            }
+                        }
+                        true
+                    }
                     SidebarEvent::RowSelected { .. }
                     | SidebarEvent::RowActivated { .. }
                     | SidebarEvent::HeaderActivated { .. }
                     | SidebarEvent::StateChanged
                     | SidebarEvent::Consumed
                     | SidebarEvent::ScrollChanged { .. }
-                    | SidebarEvent::FormEvent { .. } => true,
+                    | SidebarEvent::FormEvent { .. }
+                    | SidebarEvent::RowToggleExpand { .. } => true,
                     _ => false,
                 }
             }
@@ -12414,6 +12459,7 @@ mod tests {
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
             pipeline_search: SidebarFilter::default(),
+            pipeline_lifecycle_expanded: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_loader: None,
