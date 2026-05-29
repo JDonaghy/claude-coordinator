@@ -8505,22 +8505,22 @@ impl CoordApp {
             // host having to track button bounds across frames.  A
             // change in the hovered id triggers a redraw.
             UiEvent::MouseMoved { .. } => {
-                // Forward to the active sidebar so scrollbar drag tracks the cursor.
-                // SidebarSystem.handle(MouseMoved) calls drag_to() internally.
-                if let Some(sidebar_b) = ctx.sidebar_bounds() {
-                    match self.active_view {
-                        SidebarView::Board => {
-                            self.board_sidebar.handle(event, backend, sidebar_b);
-                        }
-                        SidebarView::Pipeline => {
-                            self.pipeline_sidebar.handle(event, backend, sidebar_b);
-                        }
-                        _ => {}
-                    }
-                }
                 let pos = if let UiEvent::MouseMoved { position, .. } = event { *position } else { return false; };
                 let lh = backend.line_height();
                 let mut redraw = false;
+                // Forward to the active sidebar so scrollbar drag tracks the cursor.
+                // SidebarSystem.handle(MouseMoved) calls drag_to() internally and
+                // returns Consumed when scroll state changed — use that to trigger redraw.
+                if let Some(sidebar_b) = ctx.sidebar_bounds() {
+                    let result = match self.active_view {
+                        SidebarView::Board => self.board_sidebar.handle(event, backend, sidebar_b),
+                        SidebarView::Pipeline => self.pipeline_sidebar.handle(event, backend, sidebar_b),
+                        _ => SidebarEvent::Ignored,
+                    };
+                    if result != SidebarEvent::Ignored {
+                        redraw = true;
+                    }
+                }
                 if ctx.in_sidebar(pos.x, pos.y) {
                     if let Some(sidebar_b) = ctx.sidebar_bounds() {
                         let panel = self.build_sidebar_action_panel(lh);
