@@ -8504,8 +8504,21 @@ impl CoordApp {
             // hovered toolbar button gets a background tint without the
             // host having to track button bounds across frames.  A
             // change in the hovered id triggers a redraw.
-            UiEvent::MouseMoved { position, .. } => {
-                let pos = *position;
+            UiEvent::MouseMoved { .. } => {
+                // Forward to the active sidebar so scrollbar drag tracks the cursor.
+                // SidebarSystem.handle(MouseMoved) calls drag_to() internally.
+                if let Some(sidebar_b) = ctx.sidebar_bounds() {
+                    match self.active_view {
+                        SidebarView::Board => {
+                            self.board_sidebar.handle(event, backend, sidebar_b);
+                        }
+                        SidebarView::Pipeline => {
+                            self.pipeline_sidebar.handle(event, backend, sidebar_b);
+                        }
+                        _ => {}
+                    }
+                }
+                let pos = if let UiEvent::MouseMoved { position, .. } = event { *position } else { return false; };
                 let lh = backend.line_height();
                 let mut redraw = false;
                 if ctx.in_sidebar(pos.x, pos.y) {
@@ -8551,6 +8564,22 @@ impl CoordApp {
                     redraw |= self.panel_toolbar_hover.clear();
                 }
                 redraw
+            }
+
+            // Forward MouseUp to the active sidebar to release any scrollbar drag.
+            UiEvent::MouseUp { .. } => {
+                if let Some(sidebar_b) = ctx.sidebar_bounds() {
+                    match self.active_view {
+                        SidebarView::Board => {
+                            self.board_sidebar.handle(event, backend, sidebar_b);
+                        }
+                        SidebarView::Pipeline => {
+                            self.pipeline_sidebar.handle(event, backend, sidebar_b);
+                        }
+                        _ => {}
+                    }
+                }
+                false
             }
 
             _ => false,
@@ -8636,10 +8665,33 @@ impl CoordApp {
                         self.rebuild_board_sidebar();
                         true
                     }
+                    // Chevron click on a status-group header row — same
+                    // toggle logic as RowSelected/RowActivated with path.len()==1.
+                    SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
+                        let offset = self.board_repo_offset();
+                        if section >= offset {
+                            let repo_idx = section - offset;
+                            if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
+                                let group_idx = path[0] as usize;
+                                let cache = self.board_issues_cache.clone();
+                                let groups = self.board_grouped_for_repo(&cache, &repo);
+                                if let Some((key, _)) = groups.get(group_idx) {
+                                    let key = key.to_string();
+                                    let entry = self.board_status_expanded
+                                        .entry((repo, key))
+                                        .or_insert(true);
+                                    *entry = !*entry;
+                                    self.rebuild_board_sidebar();
+                                }
+                            }
+                        }
+                        true
+                    }
                     SidebarEvent::StateChanged
                     | SidebarEvent::Consumed
                     | SidebarEvent::ScrollChanged { .. }
-                    | SidebarEvent::FormEvent { .. } => true,
+                    | SidebarEvent::FormEvent { .. }
+                    | SidebarEvent::RowToggleExpand { .. } => true,
                     _ => false,
                 }
             }
