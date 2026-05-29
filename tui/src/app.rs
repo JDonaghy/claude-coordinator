@@ -241,6 +241,12 @@ struct WatchSseState {
     rx: std::sync::mpsc::Receiver<SseWatchMsg>,
     /// Accumulated raw log lines, appended as `Lines` messages arrive.
     lines: Vec<String>,
+    /// Wall-clock arrival time for each entry in `lines` (parallel vec).
+    /// Used to compute per-turn elapsed time in the watch overlay.
+    line_times: Vec<Instant>,
+    /// Count of `"type":"assistant"` events seen so far — drives the
+    /// live turn-count badge on the Active stage box.
+    current_turn: usize,
     /// Byte offset of the last received event, for `Last-Event-Id` on reconnect.
     last_event_id: u64,
     /// Number of connection failures in the current 10-second window.
@@ -1264,12 +1270,45 @@ fn extract_text_block(json: &str) -> String {
     String::new()
 }
 
+/// Parse SSE log lines with per-turn timing.  For each `[assistant]` event
+/// the elapsed time since the *previous* assistant event is appended to the
+/// label so slow turns stand out at a glance.
+fn parse_sse_log_with_timing(lines: &[String], times: &[Instant]) -> Vec<ListItem> {
+    let mut items = Vec::new();
+    let mut turn_n: usize = 0;
+    let mut last_assistant_time: Option<Instant> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = times.get(i).copied();
+        // Compute elapsed since last assistant turn for assistant events.
+        let elapsed = if json_str(line, "type").as_deref() == Some("assistant") {
+            let e = t.and_then(|now| last_assistant_time.map(|prev| now.duration_since(prev)));
+            last_assistant_time = t;
+            e
+        } else {
+            None
+        };
+        if let Some(item) = parse_json_event_timed(line, &mut turn_n, elapsed) {
+            items.push(item);
+        }
+    }
+    items
+}
+
 /// Parse one stream-json event line into a displayable `ListItem`.
 ///
 /// Returns `None` for event types that are too noisy to surface (e.g.
 /// `tool_result`, `system/task_*`, `rate_limit_event`).
 /// `turn_n` is a mutable counter incremented for each `assistant` event.
+/// `elapsed` is the time since the previous assistant turn, shown on the label.
+fn parse_json_event_timed(line: &str, turn_n: &mut usize, elapsed: Option<std::time::Duration>) -> Option<ListItem> {
+    parse_json_event_inner(line, turn_n, elapsed)
+}
+
 fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
+    parse_json_event_inner(line, turn_n, None)
+}
+
+fn parse_json_event_inner(line: &str, turn_n: &mut usize, elapsed: Option<std::time::Duration>) -> Option<ListItem> {
     let type_val = json_str(line, "type")?;
     match type_val.as_str() {
         "system" => {
@@ -1306,13 +1345,17 @@ fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
 
             // Summarise tool calls in this turn.
             let tools = extract_tool_names(line);
+            let elapsed_str = match elapsed {
+                Some(d) if d.as_secs() >= 1 => format!("  +{}s", d.as_secs()),
+                _ => String::new(),
+            };
             let summary = if !tools.is_empty() {
-                format!("[assistant] Turn {}: tool_use={}", n, tools.join(","))
+                format!("[assistant] Turn {}{}  tool_use={}", n, elapsed_str, tools.join(","))
             } else if !text.is_empty() {
-                let display = trunc(&text, 80);
-                format!("[assistant] Turn {}: {:?}", n, display)
+                let display = trunc(&text, 60);
+                format!("[assistant] Turn {}{}  {:?}", n, elapsed_str, display)
             } else {
-                format!("[assistant] Turn {}", n)
+                format!("[assistant] Turn {}{}", n, elapsed_str)
             };
             Some(activity_item(&summary, Color::rgb(150, 180, 240)))
         }
@@ -3185,6 +3228,8 @@ impl CoordApp {
                             host: m.host.clone(),
                             assignment_id: a.id.clone(),
                             pending_tail: String::new(),
+                        line_times: Vec::new(),
+                        current_turn: 0,
                         });
                     }
                 }
@@ -3230,6 +3275,8 @@ impl CoordApp {
             host,
             assignment_id: id,
             pending_tail: String::new(),
+                        line_times: Vec::new(),
+                        current_turn: 0,
         });
     }
 
@@ -3389,8 +3436,7 @@ impl CoordApp {
                             Some(Color::rgb(140, 140, 140)),
                         ));
                     } else {
-                        let content = sse.lines.join("\n");
-                        items.extend(parse_log_content(&content));
+                        items.extend(parse_sse_log_with_timing(&sse.lines, &sse.line_times));
                     }
                     if sse.done {
                         items.push(kv_item(
@@ -5716,6 +5762,19 @@ impl CoordApp {
                     {
                         if self.test_build_in_flight(&work_id) {
                             label = "Building".to_string();
+                        }
+                    }
+                }
+                // Show live turn count on the Active stage box when the SSE
+                // watch is streaming for this stage's running assignment.
+                if status == StageStatus::Active {
+                    if let Some(sse) = &self.watch_sse {
+                        let watched_id = self.watch.as_ref().map(|w| w.assignment_id.as_str());
+                        let stage_running = self.assignments_for_stage(issue, name)
+                            .iter()
+                            .any(|a| a.status == "running" && Some(a.id.as_str()) == watched_id);
+                        if stage_running && sse.current_turn > 0 {
+                            label = format!("{} T{}", label, sse.current_turn);
                         }
                     }
                 }
@@ -10654,8 +10713,13 @@ impl CoordApp {
                         } else {
                             (String::new(), payload.clone())
                         };
+                        let now = Instant::now();
                         for line in complete.lines() {
+                            if json_str(line, "type").as_deref() == Some("assistant") {
+                                sse.current_turn += 1;
+                            }
                             sse.lines.push(line.to_string());
+                            sse.line_times.push(now);
                         }
                         sse.pending_tail = tail;
                         got_new = true;
@@ -10666,8 +10730,13 @@ impl CoordApp {
                         // result line whose terminating `\n` never reached us
                         // (worker exited mid-write) would be invisible.
                         let tail = std::mem::take(&mut sse.pending_tail);
+                        let now = Instant::now();
                         for line in tail.lines() {
+                            if json_str(line, "type").as_deref() == Some("assistant") {
+                                sse.current_turn += 1;
+                            }
                             sse.lines.push(line.to_string());
+                            sse.line_times.push(now);
                         }
                         sse.last_event_id = last_id;
                         sse.done = true;
@@ -16915,6 +16984,8 @@ mod tests {
             host: "localhost".to_string(),
             assignment_id: "test-id".to_string(),
             pending_tail: String::new(),
+            line_times: Vec::new(),
+            current_turn: 0,
         };
         (state, tx)
     }
