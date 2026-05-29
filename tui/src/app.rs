@@ -70,6 +70,128 @@ const NOTIFY_EVERY: Duration = Duration::from_secs(30);
 /// How long a toast stays visible before auto-dismissing.
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
+// ─── Shared sidebar filter ────────────────────────────────────────────────────
+
+/// State + logic for a sidebar "FILTER" search box.
+///
+/// Both the Board and Pipeline panels embed a quadraui `FieldKind::TextInput`
+/// form at section 0 that filters issues by a case-insensitive substring on
+/// issue number/title. This struct owns the query string, the cursor byte
+/// offset (always kept at a UTF-8 char boundary), and the focus flag, and
+/// centralises every edit/match operation so the two panels behave
+/// identically rather than duplicating the keyboard arms.
+#[derive(Default, Clone)]
+struct SidebarFilter {
+    /// Current value in the filter input (always lowercased on match, not here).
+    query: String,
+    /// Cursor byte offset into `query` (kept on a char boundary).
+    cursor: usize,
+    /// Whether the input is accepting keyboard input.
+    focused: bool,
+}
+
+impl SidebarFilter {
+    /// True if an issue matches the current query (empty query → all match).
+    /// Case-insensitive substring on the decimal issue number or the title.
+    fn matches(&self, num: u64, title: &str) -> bool {
+        if self.query.is_empty() {
+            return true;
+        }
+        let query = self.query.to_lowercase();
+        let num_str = num.to_string();
+        num_str.contains(&query) || title.to_lowercase().contains(&query)
+    }
+
+    /// Insert a printable char at the cursor and advance past it.
+    fn insert_char(&mut self, c: char) {
+        self.query.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the char before the cursor (UTF-8 aware), if any.
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            // Find the start of the previous char (UTF-8 aware).
+            let mut prev = self.cursor - 1;
+            while prev > 0 && !self.query.is_char_boundary(prev) {
+                prev -= 1;
+            }
+            self.query.remove(prev);
+            self.cursor = prev;
+        }
+    }
+
+    /// Clear the query, reset the cursor, and drop focus.
+    fn clear(&mut self) {
+        self.query.clear();
+        self.cursor = 0;
+        self.focused = false;
+    }
+
+    /// Move the cursor one Unicode scalar left.
+    fn cursor_left(&mut self) {
+        let chars: Vec<char> = self.query.chars().collect();
+        let char_pos = chars.len().min(self.cursor);
+        if char_pos > 0 {
+            self.cursor = chars[..char_pos - 1].iter().collect::<String>().len();
+        }
+    }
+
+    /// Move the cursor one Unicode scalar right.
+    fn cursor_right(&mut self) {
+        let max = self.query.len();
+        if self.cursor < max {
+            // Advance past the next char boundary.
+            let rest = &self.query[self.cursor..];
+            if let Some(ch) = rest.chars().next() {
+                self.cursor += ch.len_utf8();
+            }
+        }
+    }
+
+    /// Replace the value (e.g. from a FormEvent) and park the cursor at the end.
+    fn set_value(&mut self, value: &str) {
+        self.query = value.to_string();
+        self.cursor = value.len();
+    }
+
+    /// Whether the query is empty (no active filter).
+    fn is_empty(&self) -> bool {
+        self.query.is_empty()
+    }
+
+    /// Build the quadraui `Form` rendered in the FILTER section.
+    ///
+    /// `id_prefix` namespaces the widget ids so two filters on screen at
+    /// once (Board vs Pipeline sidebars) don't collide. `placeholder` is the
+    /// greyed hint shown when the query is empty.
+    fn form(&self, id_prefix: &str, placeholder: &str) -> Form {
+        Form {
+            id: WidgetId::new(format!("{id_prefix}-form")),
+            fields: vec![FormField {
+                id: WidgetId::new(format!("{id_prefix}-input")),
+                label: StyledText::plain(""),
+                kind: FieldKind::TextInput {
+                    value: self.query.clone(),
+                    placeholder: placeholder.to_string(),
+                    cursor: Some(self.cursor),
+                    selection_anchor: None,
+                },
+                hint: StyledText::plain(""),
+                disabled: false,
+                validation: None,
+            }],
+            focused_field: if self.focused {
+                Some(WidgetId::new(format!("{id_prefix}-input")))
+            } else {
+                None
+            },
+            scroll_offset: 0,
+            has_focus: self.focused,
+        }
+    }
+}
+
 // ─── Detail panel tabs ────────────────────────────────────────────────────────
 
 /// Per-assignment context for the live watch overlay (Pipeline > Stages
@@ -2502,12 +2624,8 @@ pub struct CoordApp {
     /// Last time `coord sync --quiet` was spawned (to rate-limit kicks).
     issue_sync_last: Option<Instant>,
     // ── Board search / status-group state ───────────────────────────────
-    /// Current value in the board filter input.
-    board_search: String,
-    /// Cursor byte offset into `board_search` (always kept at end of value).
-    board_search_cursor: usize,
-    /// Whether the search input is accepting keyboard input.
-    board_search_focused: bool,
+    /// Filter state (query / cursor / focus) for the Board sidebar's FILTER box.
+    board_search: SidebarFilter,
     /// Expanded state for each (repo, status_group) pair. Default: true.
     board_status_expanded: std::collections::HashMap<(String, String), bool>,
     // ── Pipeline panel state ────────────────────────────────────────────
@@ -2516,6 +2634,8 @@ pub struct CoordApp {
     /// Ordered list of repo keys (coord_repo or repo_slug) used as section IDs
     /// in the pipeline sidebar.  Rebuilt on each `rebuild_pipeline_sidebar()`.
     pipeline_repo_names: Vec<String>,
+    /// Filter state (query / cursor / focus) for the Pipeline sidebar's FILTER box.
+    pipeline_search: SidebarFilter,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
     /// Selected issue index into `pipeline_issues`, if any.
@@ -2759,12 +2879,11 @@ impl CoordApp {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             issue_sync_last: None,
-            board_search: String::new(),
-            board_search_cursor: 0,
-            board_search_focused: false,
+            board_search: SidebarFilter::default(),
             board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
+            pipeline_search: SidebarFilter::default(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_loader: None,
@@ -3639,29 +3758,8 @@ impl CoordApp {
         self.board_sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
         // Populate search form (section 0).
-        self.board_sidebar.set_form(0, Form {
-            id: WidgetId::new("board-search-form"),
-            fields: vec![FormField {
-                id: WidgetId::new("board-search-input"),
-                label: StyledText::plain(""),
-                kind: FieldKind::TextInput {
-                    value: self.board_search.clone(),
-                    placeholder: "Filter issues…".to_string(),
-                    cursor: Some(self.board_search_cursor),
-                    selection_anchor: None,
-                },
-                hint: StyledText::plain(""),
-                disabled: false,
-                validation: None,
-            }],
-            focused_field: if self.board_search_focused {
-                Some(WidgetId::new("board-search-input"))
-            } else {
-                None
-            },
-            scroll_offset: 0,
-            has_focus: self.board_search_focused,
-        });
+        self.board_sidebar
+            .set_form(0, self.board_search.form("board-search", "Filter issues…"));
 
         let offset = search_offset + if self.has_proposals_section { 1 } else { 0 };
 
@@ -3702,15 +3800,8 @@ impl CoordApp {
         }
 
         // Helper: fuzzy filter — true if the issue matches the search query.
-        let query = self.board_search.to_lowercase();
-
-        let issue_matches = |num: u64, title: &str| -> bool {
-            if query.is_empty() {
-                return true;
-            }
-            let num_str = num.to_string();
-            num_str.contains(&query) || title.to_lowercase().contains(&query)
-        };
+        let filter = self.board_search.clone();
+        let issue_matches = |num: u64, title: &str| -> bool { filter.matches(num, title) };
 
         // Build per-repo status groups.
         for (cache_idx, (repo, issues)) in grouped.iter().enumerate() {
@@ -3918,18 +4009,14 @@ impl CoordApp {
             Some(v) => v,
             None => return Vec::new(),
         };
-        let query = self.board_search.to_lowercase();
         let mut backlog = Vec::new();
         let mut refining = Vec::new();
         let mut refined = Vec::new();
         let mut in_flight = Vec::new();
         let mut completed = Vec::new();
         for (i, g) in flat.iter().enumerate() {
-            if !query.is_empty() {
-                let num_str = g.issue_number.to_string();
-                if !num_str.contains(&query) && !g.issue_title.to_lowercase().contains(&query) {
-                    continue;
-                }
+            if !self.board_search.matches(g.issue_number, &g.issue_title) {
+                continue;
             }
             match g.lifecycle_section() {
                 "backlog" => backlog.push((i, g)),
@@ -4060,18 +4147,14 @@ impl CoordApp {
         // `board_grouped_for_repo` and `rebuild_board_sidebar` so a
         // `select_issue` lookup lands on the same `[group, issue]`
         // path the click handler resolves to.
-        let query = self.board_search.to_lowercase();
         let mut backlog: Vec<(usize, u64)> = Vec::new();
         let mut refining: Vec<(usize, u64)> = Vec::new();
         let mut refined: Vec<(usize, u64)> = Vec::new();
         let mut in_flight: Vec<(usize, u64)> = Vec::new();
         let mut completed: Vec<(usize, u64)> = Vec::new();
         for (i, g) in flat.iter().enumerate() {
-            if !query.is_empty() {
-                let num_str = g.issue_number.to_string();
-                if !num_str.contains(&query) && !g.issue_title.to_lowercase().contains(&query) {
-                    continue;
-                }
+            if !self.board_search.matches(g.issue_number, &g.issue_title) {
+                continue;
             }
             match g.lifecycle_section() {
                 "backlog" => backlog.push((i, g.issue_number)),
@@ -4838,6 +4921,10 @@ impl CoordApp {
                         && !self
                             .pipeline_dismissed
                             .contains(&(issue.repo_slug.clone(), issue.number))
+                        // FILTER box: drop non-matching issues so empty
+                        // lifecycle groups (and, in the rebuild, empty repo
+                        // sections) fall away — matching Board behavior.
+                        && self.pipeline_search.matches(issue.number, &issue.title)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -4889,15 +4976,22 @@ impl CoordApp {
         // area back to the top, even when the selection itself is restored
         // correctly. The user wants "the view should not change on refresh".
         let prev_panel_scroll = self.pipeline_sidebar.panel_scroll();
+        // Section 0 is always the FILTER form; repo sections start at
+        // `search_offset`.  Mirrors `rebuild_board_sidebar`'s offset.
+        let search_offset = 1usize;
         // Preserve per-section collapse state by repo name (section indices
         // may shift if repos are added/removed between rebuilds, so we key
         // by the repo identifier rather than the section index).  Mirrors
-        // the pattern already used by rebuild_board_sidebar.
+        // the pattern already used by rebuild_board_sidebar.  The previous
+        // sidebar already carries the search section at index 0, so repo
+        // sections sit at `i + search_offset`.
         let prev_collapsed: std::collections::HashMap<String, bool> = self
             .pipeline_repo_names
             .iter()
             .enumerate()
-            .map(|(i, name)| (name.clone(), self.pipeline_sidebar.is_collapsed(i)))
+            .map(|(i, name)| {
+                (name.clone(), self.pipeline_sidebar.is_collapsed(i + search_offset))
+            })
             .collect();
 
         // Collect unique repo keys in stable order (issues are already sorted
@@ -4910,8 +5004,9 @@ impl CoordApp {
             }
         }
 
-        // One section per repo.
+        // Section 0: search/filter form; then one section per repo.
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
+        defs.push(SidebarSectionDef::form("pipeline-search", "FILTER"));
         for repo in &repos {
             let mut def =
                 SidebarSectionDef::new(format!("section:repo:{}", repo), repo.clone());
@@ -4925,6 +5020,9 @@ impl CoordApp {
         sidebar.set_allow_collapse(true);
         sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
+        // Populate search form (section 0).
+        sidebar.set_form(0, self.pipeline_search.form("pipeline-search", "Filter issues…"));
+
         // Lifecycle display labels.  #225 + #256: Pipeline only renders
         // three sections (New / In-progress / Done).  The classifier
         // key `"pending"` corresponds to the umbrella's "New" — keeping
@@ -4936,13 +5034,16 @@ impl CoordApp {
             ("done",        "Done"),
         ];
 
-        // Populate rows for each repo section.
+        // Populate rows for each repo section.  Repo `sec_idx` lives at the
+        // sidebar section index `sec_idx + search_offset` (section 0 is the
+        // FILTER form).
         for (sec_idx, repo_key) in repos.iter().enumerate() {
+            let section_idx = sec_idx + search_offset;
             let groups = self.pipeline_groups_for_repo(repo_key);
             let total: usize = groups.iter().map(|(_, v)| v.len()).sum();
             if total > 0 {
                 sidebar.set_section_badge(
-                    sec_idx,
+                    section_idx,
                     Some(StyledText::plain(format!("({})", total))),
                 );
             }
@@ -5013,7 +5114,7 @@ impl CoordApp {
                     });
                 }
             }
-            sidebar.set_rows(sec_idx, rows);
+            sidebar.set_rows(section_idx, rows);
         }
 
         // Default-select the first issue in the first non-empty repo section.
@@ -5021,10 +5122,11 @@ impl CoordApp {
             'find_default: for sec_idx in 0..repos.len() {
                 let groups = self.pipeline_groups_for_repo(&repos[sec_idx]);
                 if !groups.is_empty() {
-                    sidebar.set_active_section(Some(sec_idx));
+                    let section_idx = sec_idx + search_offset;
+                    sidebar.set_active_section(Some(section_idx));
                     // Select the first issue row (path [0, 0] = first lifecycle
                     // group header expanded → first issue).
-                    sidebar.set_selected_path(sec_idx, Some(vec![0u16, 0u16]));
+                    sidebar.set_selected_path(section_idx, Some(vec![0u16, 0u16]));
                     break 'find_default;
                 }
             }
@@ -5033,7 +5135,8 @@ impl CoordApp {
         self.pipeline_repo_names = repos;
         self.pipeline_sidebar = sidebar;
 
-        // Restore previous selection if the issue still exists.
+        // Restore previous selection if the issue still exists.  Repo
+        // `sec_idx` maps to sidebar section `sec_idx + search_offset`.
         if let Some((repo, num)) = prev_sel {
             'outer: for (sec_idx, repo_key) in self.pipeline_repo_names.iter().enumerate() {
                 let groups = self.pipeline_groups_for_repo(repo_key);
@@ -5041,10 +5144,11 @@ impl CoordApp {
                     for (ii, &idx) in issue_idxs.iter().enumerate() {
                         let issue = &self.pipeline_issues[idx];
                         if issue.repo_slug == repo && issue.number == num {
+                            let section_idx = sec_idx + search_offset;
                             self.pipeline_sel = Some(idx);
-                            self.pipeline_sidebar.set_active_section(Some(sec_idx));
+                            self.pipeline_sidebar.set_active_section(Some(section_idx));
                             self.pipeline_sidebar
-                                .set_selected_path(sec_idx, Some(vec![li as u16, ii as u16]));
+                                .set_selected_path(section_idx, Some(vec![li as u16, ii as u16]));
                             break 'outer;
                         }
                     }
@@ -5058,7 +5162,7 @@ impl CoordApp {
         // appearing shouldn't be hidden from the user).
         for (i, name) in self.pipeline_repo_names.iter().enumerate() {
             if let Some(&was_collapsed) = prev_collapsed.get(name) {
-                self.pipeline_sidebar.set_collapsed(i, was_collapsed);
+                self.pipeline_sidebar.set_collapsed(i + search_offset, was_collapsed);
             }
         }
         // Restore panel scroll so the visible area doesn't jump back to the
@@ -5073,14 +5177,19 @@ impl CoordApp {
     /// index.  Paths are two-level: `[lifecycle_group_idx, issue_idx_in_group]`.
     /// A one-level path (group header selected) returns `None`.
     fn selected_pipeline_index(&self) -> Option<usize> {
+        // Section 0 is the FILTER form; repo sections start at search_offset.
+        let search_offset = 1usize;
         let section = self.pipeline_sidebar.active_section()?;
+        if section < search_offset {
+            return None; // search section selected, not a repo
+        }
         let path = self.pipeline_sidebar.selected_path(section)?;
         if path.len() < 2 {
             return None; // group header selected, not an issue
         }
         let li = path[0] as usize;
         let ii = path[1] as usize;
-        let repo_key = self.pipeline_repo_names.get(section)?;
+        let repo_key = self.pipeline_repo_names.get(section - search_offset)?;
         let groups = self.pipeline_groups_for_repo(repo_key);
         let (_, issue_idxs) = groups.get(li)?;
         issue_idxs.get(ii).copied()
@@ -8140,8 +8249,7 @@ impl CoordApp {
                     }
                     SidebarEvent::HeaderActivated { section: _ } => true,
                     SidebarEvent::FormEvent { section: 0, event: FormEvent::TextInputChanged { ref value, .. } } => {
-                        self.board_search = value.clone();
-                        self.board_search_cursor = value.len();
+                        self.board_search.set_value(value);
                         self.rebuild_board_sidebar();
                         true
                     }
@@ -8170,12 +8278,18 @@ impl CoordApp {
                 let result = self.pipeline_sidebar.handle(event, backend, sidebar_b);
                 self.pipeline_sel = self.selected_pipeline_index();
                 match result {
+                    SidebarEvent::FormEvent { section: 0, event: FormEvent::TextInputChanged { ref value, .. } } => {
+                        self.pipeline_search.set_value(value);
+                        self.rebuild_pipeline_sidebar(None);
+                        true
+                    }
                     SidebarEvent::RowSelected { .. }
                     | SidebarEvent::RowActivated { .. }
                     | SidebarEvent::HeaderActivated { .. }
                     | SidebarEvent::StateChanged
                     | SidebarEvent::Consumed
-                    | SidebarEvent::ScrollChanged { .. } => true,
+                    | SidebarEvent::ScrollChanged { .. }
+                    | SidebarEvent::FormEvent { .. } => true,
                     _ => false,
                 }
             }
@@ -10734,45 +10848,76 @@ impl ShellApp for CoordApp {
                             && !self.board_search.is_empty() =>
                     {
                         self.board_search.clear();
-                        self.board_search_cursor = 0;
-                        self.board_search_focused = false;
                         self.rebuild_board_sidebar();
                         needs_redraw = true;
                     }
                     // Backspace while search is active removes char before cursor.
                     Key::Named(NamedKey::Backspace)
                         if self.active_view == SidebarView::Board
-                            && self.board_search_focused =>
+                            && self.board_search.focused =>
                     {
-                        if self.board_search_cursor > 0 {
-                            // Find the start of the previous char (UTF-8 aware).
-                            let mut prev = self.board_search_cursor - 1;
-                            while prev > 0 && !self.board_search.is_char_boundary(prev) {
-                                prev -= 1;
-                            }
-                            self.board_search.remove(prev);
-                            self.board_search_cursor = prev;
-                        }
+                        self.board_search.backspace();
                         self.rebuild_board_sidebar();
                         needs_redraw = true;
                     }
                     // Any printable char while search is active inserts at cursor.
                     Key::Char(ch)
                         if self.active_view == SidebarView::Board
-                            && self.board_search_focused =>
+                            && self.board_search.focused =>
                     {
-                        self.board_search.insert(self.board_search_cursor, *ch);
-                        self.board_search_cursor += ch.len_utf8();
+                        self.board_search.insert_char(*ch);
                         self.rebuild_board_sidebar();
                         needs_redraw = true;
                     }
                     // '/' activates search when not already active.
                     Key::Char('/')
                         if self.active_view == SidebarView::Board
-                            && !self.board_search_focused =>
+                            && !self.board_search.focused =>
                     {
-                        self.board_search_focused = true;
+                        self.board_search.focused = true;
                         self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+
+                    // ── Pipeline search input ────────────────────────────
+                    // Mirror the Board search arms for the Pipeline view so
+                    // typing in the filter never falls through to the
+                    // Pipeline keybinds (r/R/D/m/f/…) further down.
+                    // Escape clears search (when non-empty); empty falls
+                    // through to the global quit handler.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Pipeline
+                            && !self.pipeline_search.is_empty() =>
+                    {
+                        self.pipeline_search.clear();
+                        self.rebuild_pipeline_sidebar(None);
+                        needs_redraw = true;
+                    }
+                    // Backspace while search is active removes char before cursor.
+                    Key::Named(NamedKey::Backspace)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_search.focused =>
+                    {
+                        self.pipeline_search.backspace();
+                        self.rebuild_pipeline_sidebar(None);
+                        needs_redraw = true;
+                    }
+                    // Any printable char while search is active inserts at cursor.
+                    Key::Char(ch)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_search.focused =>
+                    {
+                        self.pipeline_search.insert_char(*ch);
+                        self.rebuild_pipeline_sidebar(None);
+                        needs_redraw = true;
+                    }
+                    // '/' activates search when not already active.
+                    Key::Char('/')
+                        if self.active_view == SidebarView::Pipeline
+                            && !self.pipeline_search.focused =>
+                    {
+                        self.pipeline_search.focused = true;
+                        self.rebuild_pipeline_sidebar(None);
                         needs_redraw = true;
                     }
 
@@ -11087,7 +11232,7 @@ impl ShellApp for CoordApp {
                     | Key::Named(NamedKey::Left)
                     | Key::Named(NamedKey::Right)
                         if self.active_view == SidebarView::Board
-                            && !self.board_search_focused =>
+                            && !self.board_search.focused =>
                     {
                         self.board_detail_tab = match self.board_detail_tab {
                             BoardDetailTab::Board => BoardDetailTab::Issue,
@@ -11261,31 +11406,34 @@ impl ShellApp for CoordApp {
                     // ── Arrow cursor movement inside the search box ───────
                     Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Board
-                            && self.board_search_focused =>
+                            && self.board_search.focused =>
                     {
-                        // Move cursor one Unicode scalar left.
-                        let chars: Vec<char> = self.board_search.chars().collect();
-                        let char_pos = chars.len().min(self.board_search_cursor);
-                        if char_pos > 0 {
-                            self.board_search_cursor =
-                                chars[..char_pos - 1].iter().collect::<String>().len();
-                        }
+                        self.board_search.cursor_left();
                         self.rebuild_board_sidebar();
                         needs_redraw = true;
                     }
                     Key::Named(NamedKey::Right)
                         if self.active_view == SidebarView::Board
-                            && self.board_search_focused =>
+                            && self.board_search.focused =>
                     {
-                        let max = self.board_search.len();
-                        if self.board_search_cursor < max {
-                            // Advance past the next char boundary.
-                            let rest = &self.board_search[self.board_search_cursor..];
-                            if let Some(ch) = rest.chars().next() {
-                                self.board_search_cursor += ch.len_utf8();
-                            }
-                        }
+                        self.board_search.cursor_right();
                         self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Left)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_search.focused =>
+                    {
+                        self.pipeline_search.cursor_left();
+                        self.rebuild_pipeline_sidebar(None);
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_search.focused =>
+                    {
+                        self.pipeline_search.cursor_right();
+                        self.rebuild_pipeline_sidebar(None);
                         needs_redraw = true;
                     }
 
@@ -11417,7 +11565,7 @@ impl ShellApp for CoordApp {
                     // prompt; the early-intercept block above handles 'y'/cancel.
                     Key::Char('P')
                         if self.active_view == SidebarView::Board
-                            && !self.board_search_focused
+                            && !self.board_search.focused
                             && self.board_selection_in_completed_group() =>
                     {
                         let secs = self.purge_days as f64 * 86_400.0;
@@ -11899,12 +12047,11 @@ mod tests {
             command_runner: crate::commands::CommandRunner::new(),
             last_notify: Instant::now(),
             issue_sync_last: None,
-            board_search: String::new(),
-            board_search_cursor: 0,
-            board_search_focused: false,
+            board_search: SidebarFilter::default(),
             board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
+            pipeline_search: SidebarFilter::default(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_loader: None,
@@ -12681,8 +12828,7 @@ mod tests {
             make_assignment_typed("done", 99, "repo-a", Some("work")),
         ];
         let mut app = make_app_with_assignments(assignments);
-        app.board_search = "42".to_string();
-        app.board_search_cursor = 2;
+        app.board_search.set_value("42");
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
@@ -13425,23 +13571,24 @@ mod tests {
     #[test]
     fn rebuild_pipeline_sidebar_preserves_section_collapsed_state() {
         let mut app = make_pipeline_app();
-        // make_pipeline_app has two sections: "api" (index 0) and "other/repo"
-        // (index 1). Collapse the first one.
-        app.pipeline_sidebar.set_collapsed(0, true);
-        assert!(app.pipeline_sidebar.is_collapsed(0));
-        assert!(!app.pipeline_sidebar.is_collapsed(1));
+        // Section 0 is the FILTER form; repo sections start at index 1.
+        // make_pipeline_app has two repos: "api" (index 1) and "other/repo"
+        // (index 2). Collapse the first repo.
+        app.pipeline_sidebar.set_collapsed(1, true);
+        assert!(app.pipeline_sidebar.is_collapsed(1));
+        assert!(!app.pipeline_sidebar.is_collapsed(2));
 
         // Rebuild — without the fix this resets collapse state to default
         // (expanded) for every section.
         app.rebuild_pipeline_sidebar(None);
 
         assert!(
-            app.pipeline_sidebar.is_collapsed(0),
-            "section 0 collapse state must survive rebuild",
+            app.pipeline_sidebar.is_collapsed(1),
+            "api collapse state must survive rebuild",
         );
         assert!(
-            !app.pipeline_sidebar.is_collapsed(1),
-            "section 1 stays expanded as it was",
+            !app.pipeline_sidebar.is_collapsed(2),
+            "other/repo stays expanded as it was",
         );
     }
 
@@ -13452,10 +13599,11 @@ mod tests {
     #[test]
     fn rebuild_pipeline_sidebar_collapse_state_follows_repo_through_reorder() {
         let mut app = make_pipeline_app();
-        // Collapse "api" (index 0 in the fixture).
-        app.pipeline_sidebar.set_collapsed(0, true);
+        // Section 0 is the FILTER form; "api" is repo index 0 → section 1.
+        app.pipeline_sidebar.set_collapsed(1, true);
 
-        // Inject a new repo's issue at the front so its section becomes index 0.
+        // Inject a new repo's issue at the front so its section becomes the
+        // first repo (section 1, after the FILTER form at section 0).
         app.pipeline_issues.insert(0, PipelineIssue {
             number: 1,
             title: "New repo issue".to_string(),
@@ -13469,17 +13617,17 @@ mod tests {
 
         app.rebuild_pipeline_sidebar(None);
 
-        // After rebuild: pipeline_repo_names should be [new/repo, api, other/repo].
-        // The new repo at index 0 stays expanded; "api" (now index 1) keeps its
-        // collapsed=true; "other/repo" (now index 2) stays expanded.
+        // After rebuild: pipeline_repo_names should be [new/repo, api, other/repo],
+        // mapping to sidebar sections [1, 2, 3].  The new repo (section 1) stays
+        // expanded; "api" (now repo index 1 → section 2) keeps its collapsed=true.
         let names = &app.pipeline_repo_names;
         assert_eq!(names.iter().position(|n| n == "api"), Some(1));
         assert!(
-            app.pipeline_sidebar.is_collapsed(1),
-            "api's collapsed state followed it from index 0 to index 1",
+            app.pipeline_sidebar.is_collapsed(2),
+            "api's collapsed state followed it from section 1 to section 2",
         );
         assert!(
-            !app.pipeline_sidebar.is_collapsed(0),
+            !app.pipeline_sidebar.is_collapsed(1),
             "new section is not retroactively collapsed",
         );
     }
@@ -13521,6 +13669,134 @@ mod tests {
             17.5,
             "scroll preserved alongside selection",
         );
+    }
+
+    // ── Shared SidebarFilter helper ───────────────────────────────────────
+
+    #[test]
+    fn sidebar_filter_matches_empty_query_matches_all() {
+        let f = SidebarFilter::default();
+        assert!(f.matches(42, "anything"));
+        assert!(f.matches(1, ""));
+    }
+
+    #[test]
+    fn sidebar_filter_matches_on_number_and_title_case_insensitively() {
+        let mut f = SidebarFilter::default();
+        f.set_value("42");
+        assert!(f.matches(42, "unrelated title"), "matches on issue number");
+        assert!(!f.matches(99, "unrelated title"), "no substring → no match");
+
+        f.set_value("COOL");
+        assert!(f.matches(7, "Add cool thing"), "case-insensitive title match");
+        assert!(!f.matches(7, "boring"), "no title substring → no match");
+    }
+
+    #[test]
+    fn sidebar_filter_edit_ops_track_cursor() {
+        let mut f = SidebarFilter::default();
+        f.insert_char('a');
+        f.insert_char('b');
+        assert_eq!(f.query, "ab");
+        assert_eq!(f.cursor, 2);
+        f.backspace();
+        assert_eq!(f.query, "a");
+        assert_eq!(f.cursor, 1);
+        f.cursor_left();
+        assert_eq!(f.cursor, 0);
+        f.cursor_right();
+        assert_eq!(f.cursor, 1);
+        f.set_value("hello");
+        assert_eq!(f.query, "hello");
+        assert_eq!(f.cursor, 5);
+        f.focused = true;
+        f.clear();
+        assert_eq!(f.query, "");
+        assert_eq!(f.cursor, 0);
+        assert!(!f.focused, "clear drops focus");
+    }
+
+    // ── Pipeline FILTER box ───────────────────────────────────────────────
+
+    #[test]
+    fn pipeline_search_section_is_section_zero() {
+        let app = make_pipeline_app();
+        assert!(
+            app.pipeline_sidebar.form(0).is_some(),
+            "section 0 should be the FILTER form",
+        );
+    }
+
+    #[test]
+    fn pipeline_filter_hides_non_matching_issues() {
+        let mut app = make_pipeline_app();
+        // Two issues on "api": #42 "Add cool thing" and #43 "Other work".
+        app.pipeline_issues.push(PipelineIssue {
+            number: 43,
+            title: "Other work".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        });
+        // No filter: both visible under "api".
+        app.pipeline_search.clear();
+        app.rebuild_pipeline_sidebar(None);
+        let groups = app.pipeline_groups_for_repo("api");
+        let visible: Vec<u64> = groups
+            .iter()
+            .flat_map(|(_, idxs)| idxs.iter().map(|i| app.pipeline_issues[*i].number))
+            .collect();
+        assert!(visible.contains(&42) && visible.contains(&43));
+
+        // Filter on "cool": only #42 survives, #43 drops out.
+        app.pipeline_search.set_value("cool");
+        app.rebuild_pipeline_sidebar(None);
+        let groups = app.pipeline_groups_for_repo("api");
+        let visible: Vec<u64> = groups
+            .iter()
+            .flat_map(|(_, idxs)| idxs.iter().map(|i| app.pipeline_issues[*i].number))
+            .collect();
+        assert_eq!(visible, vec![42], "only the matching issue is visible");
+    }
+
+    #[test]
+    fn pipeline_filter_empty_repo_section_falls_away() {
+        let mut app = make_pipeline_app();
+        // "other/repo" has only issue #99 "Mystery repo issue".  A filter
+        // that matches nothing in that repo should yield no visible groups.
+        app.pipeline_search.set_value("zzznomatch");
+        app.rebuild_pipeline_sidebar(None);
+        assert!(
+            app.pipeline_groups_for_repo("other/repo").is_empty(),
+            "non-matching repo section has no visible lifecycle groups",
+        );
+        assert!(
+            app.pipeline_groups_for_repo("api").is_empty(),
+            "non-matching repo section has no visible lifecycle groups",
+        );
+    }
+
+    #[test]
+    fn pipeline_search_section_offset_keeps_selection_and_collapse_correct() {
+        // With the FILTER section at index 0, repo "api" sits at sidebar
+        // section 1.  Selection must resolve to the right issue and collapse
+        // state must be keyed against the offset index.
+        let app = make_pipeline_app();
+        // Default selection lands on the first issue (#42) of the first repo.
+        assert_eq!(
+            app.pipeline_sel.and_then(|i| app.pipeline_issues.get(i)).map(|i| i.number),
+            Some(42),
+        );
+        // The active section is a repo section, i.e. >= search_offset (1),
+        // never the FILTER form at section 0.
+        let active = app.pipeline_sidebar.active_section().unwrap();
+        assert!(active >= 1, "active section is a repo, not the FILTER form");
+        // "api" is repo index 0 → section 1; selecting through the offset
+        // resolves back to issue #42.
+        assert_eq!(app.selected_pipeline_index(), app.pipeline_sel);
     }
 
     #[test]
