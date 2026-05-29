@@ -10197,6 +10197,21 @@ impl CoordApp {
 
         // Poll background command runner
         if self.command_runner.poll() {
+            // #290 recovery: a coord command just finished.  If this was a
+            // merge dispatch and no merge_queue row appeared yet (CI gate
+            // blocked, queue empty, or transient read error), the optimistic
+            // inflight flag would otherwise stay set forever — permanently
+            // showing the Merge box as blue with no way to retry.  Clear any
+            // inflight entry that still has no matching row in the current
+            // data so the Go button returns and the user can retry.  Entries
+            // whose DB rows already arrived are handled (and cleared earlier)
+            // by apply_pending_data; this only fires for the stuck case.
+            self.pipeline_inflight_merges.retain(|(_, issue_number)| {
+                self.data
+                    .merge_queue
+                    .iter()
+                    .any(|m| m.issue_number == Some(*issue_number))
+            });
             self.refresh();
             // A coord command just finished — most of them mutate labels
             // (track, refine, ready, backlog, bounce) or assignment state.
@@ -13633,8 +13648,11 @@ mod tests {
 
     #[test]
     fn merge_stage_active_real_state_takes_over_when_db_entry_arrives() {
-        // #290: once a real merge_queue entry lands (any state), the
-        // optimistic inflight flag is superseded by the real state.
+        // #290: once a real merge_queue entry lands, the optimistic inflight
+        // flag must be superseded by the real state.  We use state "merged"
+        // (→ Done) so the assertion result differs from the optimistic Active
+        // — if the flag were NOT ignored, the function would still return
+        // Active and the test would fail, proving genuine supersession.
         let mut app = make_pipeline_app();
         let issue = app.pipeline_issues[0].clone();
 
@@ -13643,22 +13661,91 @@ mod tests {
             .insert((issue.repo_slug.clone(), issue.number));
         assert_eq!(app.merge_stage_status_for(&issue), StageStatus::Active);
 
-        // Real DB entry arrives with state "open" (coord merge enqueued it).
+        // Real DB entry arrives with state "merged" (merge completed).
         app.data.merge_queue.push(MergeQueueEntry {
             assignment_id: "w1".to_string(),
             issue_number: Some(42),
-            state: "open".to_string(),
+            state: "merged".to_string(),
             pr_number: Some(101),
             pr_url: None,
             repo_github: "acme/api".to_string(),
         });
 
-        // Real state takes over — inflight flag is now ignored because the
-        // merge_queue entry exists.  "open" → Active is still correct.
+        // Real state takes over — the merge_queue entry exists, so the
+        // inflight flag is ignored and "merged" → Done is returned.
+        // (If the flag were NOT superseded, Active would be returned instead.)
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Done,
+            "real 'merged' state must supersede the optimistic Active flag",
+        );
+    }
+
+    #[test]
+    fn apply_pending_data_clears_inflight_flag_when_merge_queue_row_arrives() {
+        // #290: the retain() in apply_pending_data must remove an inflight
+        // entry once fresh BoardData contains a matching merge_queue row.
+        // This test drives the actual code path via the pending_data channel
+        // rather than manipulating data directly, so the clearing mechanism
+        // itself is covered (not just merge_stage_status_for's read-through).
+        let mut app = make_pipeline_app();
+        let issue = app.pipeline_issues[0].clone();
+
+        // Simulate a dispatch: mark the issue as inflight.
+        app.pipeline_inflight_merges
+            .insert((issue.repo_slug.clone(), issue.number));
         assert_eq!(
             app.merge_stage_status_for(&issue),
             StageStatus::Active,
-            "real 'open' state must also produce Active",
+            "pre-condition: inflight flag makes status Active",
+        );
+
+        // Prepare fresh BoardData that includes a matching merge_queue entry.
+        let fresh_data = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            machines: vec![Machine {
+                name: "m1".to_string(),
+                host: String::new(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["api".to_string()],
+                version: None,
+                worktree_bytes: 0,
+            }],
+            merge_queue: vec![MergeQueueEntry {
+                assignment_id: "w1".to_string(),
+                issue_number: Some(issue.number),
+                state: "merged".to_string(),
+                pr_number: Some(101),
+                pr_url: None,
+                repo_github: "acme/api".to_string(),
+            }],
+            ..BoardData::default()
+        };
+
+        // Wire up the channel and deliver data to apply_pending_data.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(fresh_data).unwrap();
+        app.pending_data = Some(rx);
+
+        // apply_pending_data must: (a) consume the channel, (b) clear the
+        // inflight flag because a matching merge_queue row now exists.
+        assert!(
+            app.apply_pending_data(),
+            "apply_pending_data must return true when data was consumed",
+        );
+        assert!(
+            !app.pipeline_inflight_merges
+                .contains(&(issue.repo_slug.clone(), issue.number)),
+            "inflight flag must be cleared once the merge_queue row lands",
+        );
+        // The real state (merged → Done) should now govern.
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Done,
+            "after clearing, real 'merged' state must be returned",
         );
     }
 
