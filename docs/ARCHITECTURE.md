@@ -111,7 +111,7 @@ The most coordinated path through the system is the review/fix/re-review loop. I
 
 1. `coord assign laptop myrepo 42` posts to `POST /assign` on laptop. Agent spawns `claude -p`.
 2. Worker finishes, pushes branch, exits. Agent records `status=done`.
-3. `coord notify` (run periodically) polls laptop, sees the completion, posts a GH comment, and (if `reviews.enabled`) calls `dispatch_review`. A new `type="review"` assignment is sent to a *different* machine.
+3. `coord notify` (run periodically) polls laptop, sees the completion, posts a GH comment. **Review auto-dispatch is gated on the Test stage:** when `default_gates` includes `"test"` (the default), `dispatch_review` only fires once the work has a `passed`/`skipped` Test verdict — recorded with `coord test <work_id> --passed|--skipped` (or the **P/S** keys on the Test stage in the TUI). A work assignment left at *Pending Test* gets no review, so it never merges and the TUI "Go" does nothing — this is the single most common reason a story silently stops progressing. With the gate satisfied (and `reviews.enabled`), `dispatch_review` sends a `type="review"` assignment to a *different* machine.
 4. Reviewer reads the diff, runs tests, posts `gh pr review` with `--approve` / `--request-changes` / `--comment`. The reviewer's log carries a machine-parseable verdict header.
 5. `coord notify` runs again. Sees the review completion, parses the verdict, persists `review_verdict` and `review_findings` to the DB.
 6. **If `request-changes`**: `run_for_review_transition` calls `_dispatch_fix`, which posts a `type="work"` `[fix-N]` assignment with `target_branch=<original work's branch>` so the fix lands on the same branch (not an orphan).
@@ -120,6 +120,19 @@ The most coordinated path through the system is the review/fix/re-review loop. I
 9. Re-review approves → merge gate passes. `coord merge` rebases and merges. Conflict on rebase → conflict-fix worker auto-dispatched (`#241`), pinned to the original branch via `target_branch` (`#277`), pushes the rebase, merge re-enqueues, succeeds.
 
 If any single link is broken — most often `coord notify` not running — the whole loop stalls. The TUI helps spot this because completed assignments without comments are visible in the pipeline view, but the fix is always "run `coord notify`."
+
+## When a merge isn't happening
+
+A story that won't merge — the TUI "Go" does nothing, `coord merge` skips it, the box stays grey/pending — almost always traces to one of these gates. Check in order:
+
+1. **Test gate (the #1 cause).** No review is dispatched until the work's Test stage has a verdict (see step 3 of the auto-loop above). **Symptom:** work `done`, but no `type="review"` assignment exists and `review_state` is null. **Fix:** `coord test <work_assignment_id> --passed` (`--skipped` for trivial, `--fail --reason "…"` for broken), then `coord pr <id>` opens/reuses the PR and dispatches the review. In the TUI: **P / S / F** on the Test stage.
+2. **Review not approved.** The merge gate is `has_approved_review` — a `type="review"` assignment with `review_verdict="approve"` for the work behind the queue entry. No review or `request-changes` → merge refuses with *"review required but not approved"*.
+3. **CI red.** Merge is gated on `gh pr checks` (#240). Failing/pending checks block it (surfaced in the queue entry's `error`). `coord merge --force-merge` overrides.
+4. **PR conflicts.** `mergeable=CONFLICTING` → `coord merge` auto-dispatches a conflict-fix worker (#241) to rebase; on success it re-enqueues and merges, on a semantic conflict it marks the entry `HUMAN_REQUIRED`. This worker runs invisibly — check for a `type="conflict-fix"` running assignment before assuming nothing happened.
+5. **Queue clog / group halt.** `coord merge` processes each `(repo, target_branch)` group together; pre-#292 it `break`s on the first blocked entry (now skip-and-`continue`). A queue full of stale entries (for already-closed issues) can stall everything behind them. To merge one issue past a clog: `coord merge --repo <r> --order <assignment_id>` jumps it to the front. To declog: delete `merge_queue` rows whose GitHub issue is already closed — they are never auto-pruned (the closed-issue filter only blocks *new* enqueues).
+6. **Post-bounce keying (#292).** After a review bounce (request-changes → fix → approve), the queue entry can be keyed to the *original* (request-changes) work while the approval sits on the *fix* assignment, so `has_approved_review` fails. Fixed in #292; the pre-fix manual workaround was re-keying `merge_queue.assignment_id` to the approved fix.
+
+**Live-on-pull vs needs-release:** the merge/review/auto-loop logic (`merge_queue.py`, `auto_loop.py`, `reconcile.py`, `cli.py`) runs in fresh `coord` CLI invocations, so a `git pull` of the coordinator clone makes fixes live immediately. Only agent-side code (`agent.py` / `agent_app.py`, the long-running `coord agent` service) needs a release + `coord agent update` — see [AGENT_OPERATIONS.md](AGENT_OPERATIONS.md).
 
 ## Divergence risk
 
