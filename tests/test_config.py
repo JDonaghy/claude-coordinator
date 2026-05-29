@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from coord.config import ConfigError, load
+from coord.config import ConfigError, _parse_concurrency, load
 
 
 def test_load_valid_config(valid_config_path: Path) -> None:
@@ -272,3 +272,37 @@ def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
     # Default default_gates: Test gate sits between Work and Review (#200).
     assert cfg.pipeline.gates_for_label("coord") == ["test", "review", "merge"]
     assert cfg.pipeline.gates_for_label(None) == ["test", "review", "merge"]
+
+
+# ── concurrency: daemon-spawn stall mitigations (#299) ───────────────────────
+
+def test_concurrency_defaults() -> None:
+    cfg = _parse_concurrency(None)
+    assert cfg.bash_wrap_spawn is True
+    assert cfg.first_output_timeout == 600.0
+
+
+def test_concurrency_bash_wrap_spawn_parses() -> None:
+    assert _parse_concurrency({"bash_wrap_spawn": False}).bash_wrap_spawn is False
+    assert _parse_concurrency({"bash_wrap_spawn": True}).bash_wrap_spawn is True
+
+
+def test_concurrency_bash_wrap_spawn_rejects_non_bool() -> None:
+    with pytest.raises(ConfigError, match="bash_wrap_spawn must be a boolean"):
+        _parse_concurrency({"bash_wrap_spawn": "yes"})
+
+
+def test_concurrency_first_output_timeout_parses() -> None:
+    assert _parse_concurrency({"first_output_timeout": 0}).first_output_timeout == 0
+    assert _parse_concurrency({"first_output_timeout": 120}).first_output_timeout == 120
+    assert _parse_concurrency({"first_output_timeout": 90.5}).first_output_timeout == 90.5
+
+
+def test_concurrency_first_output_timeout_rejects_negative() -> None:
+    with pytest.raises(ConfigError, match="first_output_timeout must be a non-negative number"):
+        _parse_concurrency({"first_output_timeout": -1})
+
+
+def test_concurrency_first_output_timeout_rejects_bool() -> None:
+    with pytest.raises(ConfigError, match="first_output_timeout must be a non-negative number"):
+        _parse_concurrency({"first_output_timeout": True})

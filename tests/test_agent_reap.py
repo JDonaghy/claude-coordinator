@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Callable, List, Tuple
 
 from coord.agent import (
+    NO_FIRST_OUTPUT_EXIT,
+    _log_has_output,
     _log_has_result,
+    _maybe_bash_wrap,
     _wait_for_proc_or_result,
     _RESULT_LINE_MARKER,
 )
@@ -250,3 +253,151 @@ def test_result_detected_mid_wait_only_kills_after_grace(tmp_path: Path) -> None
     # The SIGTERM should not have fired on the first iteration where result
     # wasn't yet detected.
     assert calls, "expected SIGTERM to fire eventually"
+
+
+# ── _log_has_output ──────────────────────────────────────────────────────────
+
+def test_log_has_output_false_for_header_only(tmp_path: Path) -> None:
+    """A log containing only the spawn header (# comments) has no output yet."""
+    log = tmp_path / "log"
+    log.write_text(
+        "# agent=m repo=r issue=#1 argv=claude -p\n"
+        "# all pulls succeeded; starting worker\n"
+    )
+    assert not _log_has_output(str(log))
+
+
+def test_log_has_output_true_for_stream_json_line(tmp_path: Path) -> None:
+    """A worker stream-json line counts as output."""
+    log = tmp_path / "log"
+    log.write_text(
+        "# agent=m repo=r issue=#1 argv=claude -p\n"
+        '{"type":"assistant","message":{}}\n'
+    )
+    assert _log_has_output(str(log))
+
+
+def test_log_has_output_false_for_missing_file(tmp_path: Path) -> None:
+    assert not _log_has_output(str(tmp_path / "nonexistent"))
+
+
+def test_log_has_output_false_for_blank_lines(tmp_path: Path) -> None:
+    log = tmp_path / "log"
+    log.write_text("# header\n\n   \n")
+    assert not _log_has_output(str(log))
+
+
+# ── first-output (TTFT) watchdog ─────────────────────────────────────────────
+
+def _clock_advancing_proc(proc: _FakeProc, clock) -> None:
+    """Patch proc.wait so each poll advances the fake clock by `timeout`."""
+    real_wait = proc.wait
+
+    def wait_advances(timeout: float | None = None) -> int:
+        clock.advance(timeout or 0.0)  # type: ignore[attr-defined]
+        return real_wait(timeout=timeout)
+
+    proc.wait = wait_advances  # type: ignore[assignment]
+
+
+def test_watchdog_fires_when_no_first_output(tmp_path: Path) -> None:
+    """No output within first_output_timeout → killpg once + NO_FIRST_OUTPUT_EXIT."""
+    log_path = str(tmp_path / "log")
+    proc = _FakeProc(exit_after_calls=None, exit_after_kill=True, exit_code=0)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    clock = _fake_clock()
+    _clock_advancing_proc(proc, clock)
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,
+        max_wait=10_000.0,  # well past the watchdog so the watchdog is what fires
+        first_output_timeout=2.0,  # → 3rd iteration trips the watchdog
+        killpg=record,
+        log_has_result=lambda _: False,
+        log_has_output=lambda _: False,  # truly silent worker
+        clock=clock,
+    )
+    assert code == NO_FIRST_OUTPUT_EXIT
+    # Exactly one kill (SIGKILL) on the process group.
+    assert calls == [(proc.pid, signal.SIGKILL)]
+    text = Path(log_path).read_text()
+    assert "no first output" in text
+
+
+def test_watchdog_does_not_fire_when_output_appears(tmp_path: Path) -> None:
+    """A worker that emits output before the timeout is never killed by the
+    watchdog — even if it keeps running a while (rate-limited-but-emitting)."""
+    log_path = str(tmp_path / "log")
+    # Worker exits cleanly later, after the watchdog window would have passed.
+    proc = _FakeProc(exit_after_calls=5, exit_after_kill=True, exit_code=0)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    clock = _fake_clock()
+    _clock_advancing_proc(proc, clock)
+
+    # Output is visible from the very first poll, satisfying the watchdog
+    # permanently; the proc then keeps running past first_output_timeout.
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,
+        max_wait=10_000.0,
+        first_output_timeout=2.0,
+        killpg=record,
+        log_has_result=lambda _: False,
+        log_has_output=lambda _: True,  # rate-limited worker DOES emit output
+        clock=clock,
+    )
+    assert code == 0  # clean exit
+    assert calls == []  # watchdog never killed anything
+
+
+def test_watchdog_disabled_when_timeout_zero(tmp_path: Path) -> None:
+    """first_output_timeout=0 disables the watchdog even with zero output."""
+    log_path = str(tmp_path / "log")
+    # Worker exits cleanly after a few polls; without the watchdog disabled a
+    # silent worker would otherwise be killed.
+    proc = _FakeProc(exit_after_calls=3, exit_after_kill=True, exit_code=7)
+    record, calls, set_proc = _make_killpg_recorder()
+    set_proc(proc)
+    clock = _fake_clock()
+    _clock_advancing_proc(proc, clock)
+
+    code = _wait_for_proc_or_result(
+        proc,  # type: ignore[arg-type]
+        log_path,
+        poll_interval=1.0,
+        grace_after_result=0.5,
+        max_wait=10_000.0,
+        first_output_timeout=0.0,  # disabled
+        killpg=record,
+        log_has_result=lambda _: False,
+        log_has_output=lambda _: False,  # silent, but watchdog is off
+        clock=clock,
+    )
+    assert code == 7  # proc's own exit code — watchdog never intervened
+    assert calls == []
+
+
+# ── _maybe_bash_wrap ─────────────────────────────────────────────────────────
+
+def test_maybe_bash_wrap_enabled_wraps_with_exec() -> None:
+    argv = ["claude", "-p", "--system-prompt", "be nice", "--allowedTools", "Read,Bash"]
+    wrapped = _maybe_bash_wrap(argv, enabled=True)
+    assert wrapped[0] == "bash"
+    assert wrapped[1] == "-c"
+    assert wrapped[2].startswith("exec ")
+    # The joined command must round-trip the original argv via shlex.
+    import shlex
+    assert shlex.split(wrapped[2])[0] == "exec"
+    assert shlex.split(wrapped[2])[1:] == argv
+
+
+def test_maybe_bash_wrap_disabled_returns_bare_argv() -> None:
+    argv = ["claude", "-p"]
+    assert _maybe_bash_wrap(argv, enabled=False) == argv

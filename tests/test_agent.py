@@ -99,11 +99,30 @@ def test_assign_failure_marks_failed(tmp_path: Path) -> None:
 
 def test_assign_unknown_binary_marks_failed(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
-    server = _server(tmp_path, argv=["/no/such/binary"], repo_path=repo)
+    # bash_wrap_spawn=False so the unknown binary surfaces as a FileNotFoundError
+    # at Popen time (the spawn-failed path sets assignment.error). With the
+    # bash-wrap on, bash spawns fine and `exec` fails inside the child, which is
+    # covered separately as a non-zero exit → FAILED.
+    server = _server(
+        tmp_path, argv=["/no/such/binary"], repo_path=repo, bash_wrap_spawn=False
+    )
     a = server.assign(_spec(repo))
     final = server.wait_for(a.id)
     assert final.status == FAILED
     assert final.error is not None
+
+
+def test_assign_unknown_binary_bash_wrapped_marks_failed(tmp_path: Path) -> None:
+    """With the bash-wrap on, an unknown binary fails via bash exec's non-zero
+    exit (#299) — the assignment still ends up FAILED."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path, argv=["/no/such/binary"], repo_path=repo, bash_wrap_spawn=True
+    )
+    a = server.assign(_spec(repo))
+    final = server.wait_for(a.id)
+    assert final.status == FAILED
+    assert final.exit_code not in (0, None)
 
 
 def test_initial_briefing_is_written_to_worker_stdin(tmp_path: Path) -> None:
@@ -141,6 +160,92 @@ def test_inject_message_writes_to_worker_stdin(tmp_path: Path) -> None:
     assert "got1=" in log and "first" in log
     assert "got2=" in log and "second message" in log
     assert "# inject: second message" in log, "inject marker missing from log"
+
+
+def test_maybe_bash_wrap_helper() -> None:
+    """The pure wrap helper produces bash -c 'exec ...' when enabled (#299)."""
+    from coord.agent import _maybe_bash_wrap
+
+    argv = ["claude", "-p", "--allowedTools", "Read,Bash"]
+    assert _maybe_bash_wrap(argv, enabled=False) == argv
+    wrapped = _maybe_bash_wrap(argv, enabled=True)
+    assert wrapped == ["bash", "-c", "exec claude -p --allowedTools Read,Bash"]
+
+
+def test_spawn_bash_wrap_enabled_routes_through_bash(tmp_path: Path) -> None:
+    """With bash_wrap_spawn=True, _spawn launches via bash -c 'exec ...'."""
+    import coord.agent as agent_mod
+
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "echo worker-output"],
+        repo_path=repo,
+        bash_wrap_spawn=True,
+    )
+    captured: list[list[str]] = []
+    real_popen = agent_mod.subprocess.Popen
+
+    def recording_popen(spawn_argv, *args, **kwargs):
+        # Only record the worker spawn (started in its own session); the
+        # assign flow also runs git via Popen-backed subprocess.run.
+        if kwargs.get("start_new_session"):
+            captured.append(spawn_argv)
+        return real_popen(spawn_argv, *args, **kwargs)
+
+    agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+    try:
+        a = server.assign(_spec(repo))
+        final = server.wait_for(a.id)
+    finally:
+        agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+    assert final.status == DONE
+    assert captured, "Popen was not called"
+    assert captured[0][:2] == ["bash", "-c"]
+    assert captured[0][2] == "exec /bin/sh -c 'echo worker-output'"
+    # The wrapped command still produced the worker's output.
+    assert "worker-output" in Path(final.log_path).read_text()
+    server.shutdown()
+
+
+def test_spawn_bash_wrap_disabled_uses_bare_argv(tmp_path: Path) -> None:
+    """With bash_wrap_spawn=False, _spawn launches the bare argv."""
+    import coord.agent as agent_mod
+
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "echo worker-output"],
+        repo_path=repo,
+        bash_wrap_spawn=False,
+    )
+    captured: list[list[str]] = []
+    real_popen = agent_mod.subprocess.Popen
+
+    def recording_popen(spawn_argv, *args, **kwargs):
+        # Only record the worker spawn (started in its own session); the
+        # assign flow also runs git via Popen-backed subprocess.run.
+        if kwargs.get("start_new_session"):
+            captured.append(spawn_argv)
+        return real_popen(spawn_argv, *args, **kwargs)
+
+    agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+    try:
+        a = server.assign(_spec(repo))
+        final = server.wait_for(a.id)
+    finally:
+        agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+    assert final.status == DONE
+    assert captured and captured[0] == ["/bin/sh", "-c", "echo worker-output"]
+    server.shutdown()
+
+
+def test_agent_server_defaults_bash_wrap_and_timeout(tmp_path: Path) -> None:
+    """AgentServer defaults: bash_wrap_spawn on, first_output_timeout 600 (#299)."""
+    server = _server(tmp_path)
+    assert server.bash_wrap_spawn is True
+    assert server.first_output_timeout == 600.0
+    server.shutdown()
 
 
 def test_inject_message_unknown_id_raises(tmp_path: Path) -> None:

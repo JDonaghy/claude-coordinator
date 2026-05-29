@@ -70,6 +70,13 @@ _REAP_GRACE_AFTER_RESULT = 30.0  # grace period after result line before SIGTERM
 _REAP_MAX_WAIT = 2 * 60 * 60.0   # absolute max wait (2 hours) — last-resort safety net
 _RESULT_LINE_MARKER = b'"type":"result"'
 
+# First-output (TTFT) watchdog default and the distinct exit code used when it
+# fires, so `_reap` records the assignment as FAILED (any non-zero exit) and the
+# `concurrency.auto_reassign` path re-dispatches it. See #299 and the upstream
+# daemon-spawn stall report (anthropics/claude-code#56268).
+_FIRST_OUTPUT_TIMEOUT = 600.0    # seconds of zero output before the watchdog kills
+NO_FIRST_OUTPUT_EXIT = 124       # exit code reported when the TTFT watchdog fires
+
 
 def _append_log_line(log_path: str, line: str) -> None:
     """Best-effort append of a single line to the assignment log. Never raises."""
@@ -97,6 +104,45 @@ def _log_has_result(log_path: str) -> bool:
         return False
 
 
+def _log_has_output(log_path: str) -> bool:
+    """Return True once the worker has produced any output beyond the spawn header.
+
+    `_spawn` writes `# ...` comment lines (the argv header and any pull notes)
+    before the worker starts; the worker's stream-json output is never a
+    `#`-comment. So the watchdog considers the worker to have produced output
+    as soon as the log contains any non-blank, non-`#`-comment line. A
+    rate-limited worker emits turn / `[rate_limit]` events, so it trips this
+    check and is never killed by the TTFT watchdog — only truly silent (zero
+    output) hangs are caught.
+    """
+    try:
+        with open(log_path, "rb") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(b"#"):
+                    continue
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _maybe_bash_wrap(argv: list[str], enabled: bool) -> list[str]:
+    """Optionally wrap *argv* in a transient `bash -c 'exec ...'` parent.
+
+    When enabled, the immediate parent of `claude` is a short-lived bash that
+    `exec`s into claude — same PID, so `start_new_session`, `proc.pid`, the
+    stdin pipe, and process-group kills all behave identically to a bare
+    spawn. This is the upstream headline fix for the daemon-spawn freeze
+    (anthropics/claude-code#56268). When disabled, the bare argv is returned.
+    """
+    if not enabled:
+        return argv
+    return ["bash", "-c", "exec " + shlex.join(argv)]
+
+
 def _wait_for_proc_or_result(
     proc: subprocess.Popen,
     log_path: str,
@@ -104,8 +150,10 @@ def _wait_for_proc_or_result(
     poll_interval: float = _REAP_POLL_INTERVAL,
     grace_after_result: float = _REAP_GRACE_AFTER_RESULT,
     max_wait: float = _REAP_MAX_WAIT,
+    first_output_timeout: float = _FIRST_OUTPUT_TIMEOUT,
     killpg: Callable[[int, int], None] = _killpg_safe,
     log_has_result: Callable[[str], bool] = _log_has_result,
+    log_has_output: Callable[[str], bool] = _log_has_output,
     clock: Callable[[], float] = time.monotonic,
 ) -> int:
     """Wait for `proc` to exit; force-kill its process group if it hangs after
@@ -116,11 +164,19 @@ def _wait_for_proc_or_result(
     line was observed before we killed it, returns 0 — the work is logically
     complete, only the runtime is being torn down.
 
+    First-output (TTFT) watchdog: if ``first_output_timeout > 0`` and the
+    worker produces no output at all within that many seconds, its process
+    group is killed and :data:`NO_FIRST_OUTPUT_EXIT` is returned so `_reap`
+    marks the assignment FAILED. Once any output is seen the watchdog is
+    satisfied permanently — it never re-arms — so a slow-but-emitting (e.g.
+    rate-limited) worker is never killed by it. See #299.
+
     The keyword-only parameters exist for tests to inject short timeouts and
     mock kill/clock behavior.
     """
     start = clock()
     result_seen_at: float | None = None
+    output_seen = False
 
     while True:
         try:
@@ -129,6 +185,25 @@ def _wait_for_proc_or_result(
             pass
 
         elapsed = clock() - start
+
+        # First-output / TTFT watchdog: catch a worker that emits zero bytes.
+        # Once any output is seen the watchdog is satisfied forever (never
+        # re-armed) so slow-but-emitting workers pass.
+        if first_output_timeout > 0 and not output_seen:
+            if log_has_output(log_path):
+                output_seen = True
+            elif elapsed >= first_output_timeout:
+                _append_log_line(
+                    log_path,
+                    f"# reap: no first output in {first_output_timeout:.0f}s — "
+                    "killing process group (suspected daemon-spawn stall)\n",
+                )
+                killpg(proc.pid, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                return NO_FIRST_OUTPUT_EXIT
 
         # Detect logical completion: worker emitted its final result event.
         if result_seen_at is None and log_has_result(log_path):
@@ -456,6 +531,8 @@ class AgentServer:
         state_dir: Path = DEFAULT_STATE_DIR,
         worker_command: WorkerCommandBuilder | None = None,
         repo_paths: dict[str, str] | None = None,
+        bash_wrap_spawn: bool = True,
+        first_output_timeout: float = _FIRST_OUTPUT_TIMEOUT,
     ) -> None:
         self.machine_name = machine_name
         self.capabilities = list(capabilities)
@@ -465,6 +542,11 @@ class AgentServer:
         self.log_dir = self.state_dir / "logs"
         self.state_path = self.state_dir / "agent_state.json"
         self.worker_command = worker_command or default_worker_command
+        # Daemon-spawn stall mitigations (#299). bash_wrap_spawn routes the
+        # spawn through a transient `bash -c 'exec ...'` parent; the TTFT
+        # watchdog kills workers that emit zero output within the timeout.
+        self.bash_wrap_spawn = bash_wrap_spawn
+        self.first_output_timeout = first_output_timeout
 
         self._lock = threading.Lock()
         self._assignments: dict[str, AgentAssignment] = {}
@@ -1071,9 +1153,15 @@ class AgentServer:
         log_fh.write(header)
         log_fh.flush()
 
+        # Optionally route the spawn through a transient `bash -c 'exec ...'`
+        # parent (#299). `exec` keeps the PID, so start_new_session, proc.pid,
+        # the stdin pipe, and process-group kills all behave as for a bare
+        # spawn — only the immediate parent of claude changes.
+        spawn_argv = _maybe_bash_wrap(argv, self.bash_wrap_spawn)
+
         try:
             proc = subprocess.Popen(
-                argv,
+                spawn_argv,
                 cwd=str(repo_path),
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
@@ -1127,7 +1215,9 @@ class AgentServer:
         # Use a polling wait that handles claude-cli's well-known habit of
         # not exiting after emitting its final result event (a child of the
         # process group keeps the session alive). See #228.
-        exit_code = _wait_for_proc_or_result(proc, log_path)
+        exit_code = _wait_for_proc_or_result(
+            proc, log_path, first_output_timeout=self.first_output_timeout
+        )
         log_fh.close()
 
         # Capture the branch the worker left the repo on. For worktree-based

@@ -65,6 +65,16 @@ class ConcurrencyConfig:
     max_retries: int = 3
     auto_reassign: bool = False
     stale_threshold: int = 3
+    # Spawn `claude -p` through a transient `bash -c 'exec ...'` parent so the
+    # immediate parent of claude is a short-lived shell. This is the upstream
+    # headline fix for the daemon-spawn freeze (anthropics/claude-code#56268).
+    bash_wrap_spawn: bool = True
+    # First-output (TTFT) watchdog: if a worker produces zero output within
+    # this many seconds, kill its process group and fail the assignment so the
+    # auto_reassign path re-dispatches it. 0 disables the watchdog. This only
+    # catches truly silent hangs — a rate-limited worker still emits output and
+    # therefore passes the check.
+    first_output_timeout: float = 600.0
 
 
 @dataclass
@@ -528,7 +538,10 @@ def _parse_concurrency(raw: Any) -> ConcurrencyConfig:
     if not isinstance(raw, dict):
         raise ConfigError("'concurrency' must be a mapping")
     cfg = ConcurrencyConfig()
-    for key in ("max_workers", "stagger_seconds", "backoff_base", "max_retries", "stale_threshold"):
+    for key in (
+        "max_workers", "stagger_seconds", "backoff_base", "max_retries",
+        "stale_threshold", "first_output_timeout",
+    ):
         val = raw.get(key)
         if val is None:
             continue
@@ -536,7 +549,8 @@ def _parse_concurrency(raw: Any) -> ConcurrencyConfig:
             if not isinstance(val, int) or val < 0:
                 raise ConfigError(f"concurrency.{key} must be a non-negative integer")
         else:
-            if not isinstance(val, (int, float)) or val < 0:
+            # bool is a subclass of int — reject it explicitly for numeric keys.
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or val < 0:
                 raise ConfigError(f"concurrency.{key} must be a non-negative number")
         setattr(cfg, key, val)
     if "auto_reassign" in raw:
@@ -544,6 +558,11 @@ def _parse_concurrency(raw: Any) -> ConcurrencyConfig:
         if not isinstance(val, bool):
             raise ConfigError("concurrency.auto_reassign must be a boolean")
         cfg.auto_reassign = val
+    if "bash_wrap_spawn" in raw:
+        val = raw["bash_wrap_spawn"]
+        if not isinstance(val, bool):
+            raise ConfigError("concurrency.bash_wrap_spawn must be a boolean")
+        cfg.bash_wrap_spawn = val
     return cfg
 
 

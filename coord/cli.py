@@ -662,6 +662,8 @@ def _start_agent_server(
     # Config-free mode: when --machine is supplied and coordinator.yml doesn't
     # exist (typical on a dedicated worker node), run with empty capabilities
     # and repos. The coordinator sends repo details at dispatch time.
+    from coord.config import ConcurrencyConfig as _ConcurrencyConfig
+    concurrency = _ConcurrencyConfig()
     if not config_path.exists() and machine_name:
         from coord.models import Machine as _Machine
         machine = _Machine(
@@ -674,12 +676,15 @@ def _start_agent_server(
     else:
         cfg = _load_config(config_path)
         machine = _resolve_machine(cfg, machine_name)
+        concurrency = cfg.concurrency
 
     server = AgentServer(
         machine_name=machine.name,
         capabilities=machine.capabilities,
         repos=machine.repos,
         repo_paths=machine.repo_paths,
+        bash_wrap_spawn=concurrency.bash_wrap_spawn,
+        first_output_timeout=concurrency.first_output_timeout,
     )
     app = build_app(server)
     click.echo(
