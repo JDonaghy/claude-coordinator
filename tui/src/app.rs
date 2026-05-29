@@ -5337,8 +5337,32 @@ impl CoordApp {
             // #241: HUMAN_REQUIRED (failed conflict-fix) — the merge needs a
             // human, so Failed.  `failed` (legacy / direct) is also Failed.
             Some("failed") | Some("human_required") => StageStatus::Failed,
-            _ => if issue.is_closed { StageStatus::Skipped } else { StageStatus::Pending },
+            _ => {
+                // A pending (not yet merged/active) entry whose PR has failing
+                // CI checks goes Failed so the Merge box is red at a glance —
+                // the user shouldn't have to open the detail row or wait for a
+                // GitHub email to learn a check broke.
+                if entry.is_some_and(|e| self.ci_failed_for_entry(e)) {
+                    StageStatus::Failed
+                } else if issue.is_closed {
+                    StageStatus::Skipped
+                } else {
+                    StageStatus::Pending
+                }
+            }
         }
+    }
+
+    /// True when *entry*'s PR has a fetched CI summary with failing checks.
+    /// Looks up `pipeline_ci_checks` by `(repo_github, pr_number)`; returns
+    /// false when the entry has no PR yet or no summary has been fetched.
+    fn ci_failed_for_entry(&self, entry: &MergeQueueEntry) -> bool {
+        let Some(pr) = entry.pr_number else {
+            return false;
+        };
+        self.pipeline_ci_checks
+            .get(&(entry.repo_github.clone(), pr))
+            .is_some_and(|s| s.has_failures())
     }
 
     /// #241: is there a conflict-fix worker currently in flight for *issue*?
@@ -6387,6 +6411,24 @@ impl CoordApp {
             };
             self.pipeline_ci_loader.remove(&key);
             if let Ok(summary) = result {
+                // Toast only on the *transition* into failure: the new summary
+                // has failures and either there was no prior summary or the
+                // prior summary was clean.  Without the transition guard we'd
+                // re-toast every 30s poll while CI stays red.
+                let prev_failed = self
+                    .pipeline_ci_checks
+                    .get(&key)
+                    .is_some_and(|s| s.has_failures());
+                if summary.has_failures() && !prev_failed {
+                    let (repo_github, pr) = &key;
+                    let names = summary.failed_names.join(", ");
+                    let body = if names.is_empty() {
+                        format!("{repo_github} #{pr}")
+                    } else {
+                        format!("{repo_github} #{pr} — {names}")
+                    };
+                    self.push_toast("⚠ CI failed", &body, ToastSeverity::Warning);
+                }
                 self.pipeline_ci_checks.insert(key, summary);
                 changed = true;
             }
@@ -15469,6 +15511,100 @@ mod tests {
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Active);
+    }
+
+    /// A pending merge entry whose PR has failing CI checks makes the Merge
+    /// badge Failed (red) so the broken check is glanceable; a clean summary
+    /// leaves it Pending. (CI must not override a completed `merged` entry —
+    /// covered by `merge_stage_status_done_from_merge_queue`.)
+    #[test]
+    fn merge_stage_status_failed_from_ci_when_pending() {
+        let mut app = make_pipeline_app();
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+
+        // Failing CI → Failed.
+        app.pipeline_ci_checks.insert(
+            ("acme/api".to_string(), 7),
+            CiCheckSummary {
+                passed: 2,
+                failed: 1,
+                running: 0,
+                failed_names: vec!["build".to_string()],
+                first_failed_url: None,
+                fetched_at: Instant::now(),
+            },
+        );
+        {
+            let issue = &app.pipeline_issues[0];
+            assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Failed);
+        }
+
+        // Clean CI → back to Pending (no failures).
+        app.pipeline_ci_checks.insert(
+            ("acme/api".to_string(), 7),
+            CiCheckSummary {
+                passed: 3,
+                failed: 0,
+                running: 0,
+                failed_names: vec![],
+                first_failed_url: None,
+                fetched_at: Instant::now(),
+            },
+        );
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Pending);
+    }
+
+    /// `poll_ci_check_loaders` toasts on the transition into CI failure, and
+    /// does NOT re-toast while the PR stays red on a subsequent poll.
+    #[test]
+    fn poll_ci_check_loaders_toasts_on_flip_to_failed_once() {
+        let mut app = make_pipeline_app();
+        let key = ("acme/api".to_string(), 7);
+
+        let failing = || CiCheckSummary {
+            passed: 1,
+            failed: 1,
+            running: 0,
+            failed_names: vec!["build".to_string()],
+            first_failed_url: None,
+            fetched_at: Instant::now(),
+        };
+
+        // First poll: no prior summary → flip into failure → one toast.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(failing())).unwrap();
+        app.pipeline_ci_loader.insert(key.clone(), rx);
+        let before = app.toasts.len();
+        assert!(app.poll_ci_check_loaders());
+        assert_eq!(
+            app.toasts.len(),
+            before + 1,
+            "flip from clean → failed should toast once",
+        );
+        let body = app.toasts.last().expect("toast").0.body.to_string();
+        assert!(body.contains("acme/api"), "toast names the repo, got {body:?}");
+        assert!(body.contains("#7"), "toast names the PR, got {body:?}");
+        assert!(body.contains("build"), "toast names the check, got {body:?}");
+
+        // Second poll: still failing → no new toast (transition guard).
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        tx2.send(Ok(failing())).unwrap();
+        app.pipeline_ci_loader.insert(key.clone(), rx2);
+        let before2 = app.toasts.len();
+        app.poll_ci_check_loaders();
+        assert_eq!(
+            app.toasts.len(),
+            before2,
+            "staying red across polls must not re-toast",
+        );
     }
 
     /// Merge stage already merged → no [Go] anywhere; full pipeline Done.
