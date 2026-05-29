@@ -3566,6 +3566,19 @@ impl CoordApp {
         }
     }
 
+    /// Force-run `coord sync` immediately, bypassing the 5-minute guard.
+    /// Used by the Sync toolbar button and the `S` keybind in the Board panel.
+    fn force_issue_sync(&mut self) {
+        if self.command_runner.is_running() {
+            self.push_toast("Sync", "Another command is running — try again in a moment.", ToastSeverity::Info);
+            return;
+        }
+        if self.command_runner.spawn(&["sync", "--quiet"]) {
+            self.issue_sync_last = Some(Instant::now());
+            self.push_toast("Sync", "Fetching open issues from GitHub…", ToastSeverity::Info);
+        }
+    }
+
     /// Drain any completed background data load, applying results to
     /// `self.data`.  Returns `true` if data was updated (caller should
     /// trigger a redraw).
@@ -10142,11 +10155,24 @@ impl CoordApp {
     /// value rather than a `&SidebarPanel` because the toolbar buttons
     /// are derived from current state (selected row's lifecycle).
     fn build_sidebar_action_panel(&self, lh: f32) -> SidebarPanel {
-        let toolbar = self.sidebar_action_bar().unwrap_or_else(|| Toolbar {
+        let mut toolbar = self.sidebar_action_bar().unwrap_or_else(|| Toolbar {
             id: WidgetId::new("sidebar-action-bar-empty"),
             buttons: Vec::new(),
             bg: None,
         });
+        // Board panel always shows a Sync button so the user can pull fresh
+        // issues from GitHub on demand without needing a terminal.
+        if self.active_view == SidebarView::Board {
+            toolbar.buttons.push(ToolbarButton::Action {
+                id: WidgetId::new("sidebar-action:sync-issues"),
+                label: "Sync".to_string(),
+                icon: Some("↻".to_string()),
+                key_hint: Some("S".to_string()),
+                enabled: true,
+                is_active: false,
+                tooltip: "coord sync — fetch all open issues from GitHub".to_string(),
+            });
+        }
         SidebarPanel {
             id: WidgetId::new("sidebar-panel"),
             toolbar: Some(toolbar),
@@ -10288,7 +10314,10 @@ impl CoordApp {
             SidebarPanelHit::ToolbarButton(id) => {
                 if let Some(action) = id.as_str().strip_prefix("sidebar-action:") {
                     let action = action.to_string();
-                    if let Some(target) = self.target_for_selected_sidebar_row() {
+                    // Panel-level actions that don't need a row target.
+                    if action == "sync-issues" {
+                        self.force_issue_sync();
+                    } else if let Some(target) = self.target_for_selected_sidebar_row() {
                         self.dispatch_context_menu_action(&action, &target);
                     }
                 }
@@ -12169,6 +12198,15 @@ impl ShellApp for CoordApp {
                     Key::Char('r') if self.active_view != SidebarView::Machines => {
                         self.refresh();
                         self.kick_issue_sync();
+                        needs_redraw = true;
+                    }
+
+                    // ── S — force issue sync (Board panel) ───────────────
+                    Key::Char('S')
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search.focused =>
+                    {
+                        self.force_issue_sync();
                         needs_redraw = true;
                     }
 
