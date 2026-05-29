@@ -3256,6 +3256,22 @@ impl CoordApp {
         self.watch_sse = None;
     }
 
+    /// Called whenever the Log tab becomes active.  Opens (or keeps open)
+    /// the SSE stream for the selected issue's assignment so the Log tab
+    /// shows live content without the HTTP-cache-TTL "Loading log…" flicker.
+    fn ensure_log_tab_sse(&mut self) {
+        // If SSE is already open for the right assignment, leave it alone.
+        if let (Some(w), Some(sse)) = (&self.watch, &self.watch_sse) {
+            let issue_id = self.pipeline_sel
+                .and_then(|i| self.pipeline_issues.get(i))
+                .map(|iss| iss.number);
+            if issue_id == Some(w.issue_number) && sse.assignment_id == w.assignment_id {
+                return;
+            }
+        }
+        self.open_watch_for_selected_issue();
+    }
+
     /// Force a fresh SSE connection for the watch overlay (manual refresh, R key).
     ///
     /// Drops the current SSE state (if any) and spawns a new connection from
@@ -8153,21 +8169,19 @@ impl CoordApp {
         rows
     }
 
-    /// Log tab: show the running (or most-recent) assignment's worker log
-    /// for the selected pipeline issue.  Uses `get_activity_log` so it
-    /// works from the local file cache or remote HTTP fetch — no SSE watch
-    /// needed.
+    /// Log tab: show the worker log for the selected pipeline issue.
+    ///
+    /// Prefers the live SSE stream when open for this issue's assignment
+    /// (avoids the polling "Loading log…" flicker every cache-TTL seconds).
+    /// Falls back to `get_activity_log` (local file or remote HTTP cache)
+    /// when no SSE is active.
     fn pipeline_log_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
-        let issue = self
-            .pipeline_sel
-            .and_then(|i| self.pipeline_issues.get(i));
+        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
         if let Some(issue) = issue {
             let local_repo = issue.coord_repo.as_deref();
             let assignment = self
-                .data
-                .assignments
-                .iter()
+                .data.assignments.iter()
                 .filter(|a| a.issue_number == issue.number)
                 .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
                 .find(|a| a.status == "running")
@@ -8179,7 +8193,24 @@ impl CoordApp {
                             .unwrap_or(std::cmp::Ordering::Equal))
                 });
             if let Some(a) = assignment {
-                items.extend(self.get_activity_log(&a.id, &a.machine));
+                // Use SSE if the watch is open for this exact assignment —
+                // avoids the HTTP-cache-TTL "Loading log…" flicker.
+                let sse_for_this = self.watch_sse.as_ref().filter(|sse| {
+                    self.watch.as_ref().map(|w| w.assignment_id == a.id).unwrap_or(false)
+                        && sse.assignment_id == a.id
+                });
+                if let Some(sse) = sse_for_this {
+                    if sse.lines.is_empty() && !sse.done {
+                        items.push(kv_item("", "  Connecting to log stream…", Some(Color::rgb(140, 140, 140))));
+                    } else {
+                        items.extend(parse_sse_log_with_timing(&sse.lines, &sse.line_times));
+                    }
+                    if sse.done {
+                        items.push(kv_item("", "  ── stream ended ──", Some(Color::rgb(90, 90, 90))));
+                    }
+                } else {
+                    items.extend(self.get_activity_log(&a.id, &a.machine));
+                }
             } else {
                 items.push(kv_item("", "  (no assignment log available)", Some(Color::rgb(100, 100, 100))));
             }
@@ -9003,6 +9034,9 @@ impl CoordApp {
                     if new_tab != self.pipeline_detail_tab {
                         self.pipeline_detail_tab = new_tab;
                         self.pipeline_detail_scroll = 0;
+                        if new_tab == PipelineDetailTab::Log {
+                            self.ensure_log_tab_sse();
+                        }
                         return true;
                     }
                     return false;
@@ -11950,6 +11984,9 @@ impl ShellApp for CoordApp {
                             PipelineDetailTab::Log => PipelineDetailTab::Stages,
                         };
                         self.pipeline_detail_scroll = 0;
+                        if self.pipeline_detail_tab == PipelineDetailTab::Log {
+                            self.ensure_log_tab_sse();
+                        }
                         needs_redraw = true;
                     }
                     Key::Char('l') | Key::Named(NamedKey::Right)
@@ -11962,6 +11999,9 @@ impl ShellApp for CoordApp {
                             PipelineDetailTab::Log => PipelineDetailTab::Pipeline,
                         };
                         self.pipeline_detail_scroll = 0;
+                        if self.pipeline_detail_tab == PipelineDetailTab::Log {
+                            self.ensure_log_tab_sse();
+                        }
                         needs_redraw = true;
                     }
 
@@ -12065,6 +12105,7 @@ impl ShellApp for CoordApp {
                         if self.pipeline_detail_tab == PipelineDetailTab::Stages {
                             self.pipeline_detail_tab = PipelineDetailTab::Log;
                             self.pipeline_detail_scroll = 0;
+                            self.ensure_log_tab_sse();
                         } else {
                             self.dispatch_pipeline_active_go();
                         }
