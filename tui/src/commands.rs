@@ -1,12 +1,21 @@
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Maximum stderr bytes captured per command.  Bounds memory + toast size when
+/// a worker is extremely verbose; the head is the most useful bit for diagnosing
+/// shell-level failures (`gh: not found`, missing label, auth prompt, etc.).
+const STDERR_CAPTURE_BYTES: usize = 2048;
+
 pub struct CommandResult {
     pub label: String,
     pub exit_code: i32,
     pub duration: Duration,
+    /// Captured tail of the child's stderr (bounded by `STDERR_CAPTURE_BYTES`).
+    /// Empty when the spawn itself failed before stderr could be read.
+    pub stderr: String,
 }
 
 enum CommandState {
@@ -137,26 +146,57 @@ impl CommandRunner {
             // ssh BatchMode=yes so descendants can't prompt, but explicitly
             // null-out stdin here so even a directly-invoked credential
             // helper can't grab the TUI's TTY.
-            // #251: status-only — stdout/stderr aren't surfaced now that the
-            // bottom COMMANDS panel is gone; piping to /dev/null keeps the
-            // child from blocking on a full pipe buffer when it produces lots
-            // of output.
-            let status = Command::new("coord")
+            //
+            // stdout stays piped to /dev/null (#251 — keeps a chatty child
+            // from blocking on a full pipe buffer).  stderr is captured up
+            // to STDERR_CAPTURE_BYTES so failure reasons (gh errors, missing
+            // labels, auth prompts, etc.) can be toasted instead of vanishing
+            // into the void.
+            let spawn_result = Command::new("coord")
                 .args(&full_args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let result = match status {
-                Ok(s) => CommandResult {
-                    label: label_clone,
-                    exit_code: s.code().unwrap_or(-1),
-                    duration: started.elapsed(),
-                },
+                .stderr(Stdio::piped())
+                .spawn();
+            let result = match spawn_result {
+                Ok(mut child) => {
+                    // Drain stderr concurrently with wait — otherwise a child
+                    // that writes more than the pipe buffer (~64 KiB) blocks
+                    // forever waiting for us to read.
+                    let stderr_handle = child.stderr.take();
+                    let reader = std::thread::spawn(move || {
+                        let mut buf = String::new();
+                        if let Some(mut s) = stderr_handle {
+                            // Drain fully so the child isn't blocked on a
+                            // full pipe; truncate after.  Coord shellouts
+                            // emit kilobytes at most, so the transient memory
+                            // cost is bounded in practice.
+                            let mut sink: Vec<u8> = Vec::new();
+                            let _ = s.read_to_end(&mut sink);
+                            buf = String::from_utf8_lossy(&sink).into_owned();
+                            if buf.len() > STDERR_CAPTURE_BYTES {
+                                buf.truncate(STDERR_CAPTURE_BYTES);
+                                buf.push_str("…[truncated]");
+                            }
+                        }
+                        buf
+                    });
+                    let exit_code = child.wait()
+                        .map(|s| s.code().unwrap_or(-1))
+                        .unwrap_or(-1);
+                    let stderr = reader.join().unwrap_or_default();
+                    CommandResult {
+                        label: label_clone,
+                        exit_code,
+                        duration: started.elapsed(),
+                        stderr,
+                    }
+                }
                 Err(_) => CommandResult {
                     label: label_clone,
                     exit_code: -1,
                     duration: started.elapsed(),
+                    stderr: String::new(),
                 },
             };
             let _ = tx.send(result);
@@ -170,11 +210,14 @@ impl CommandRunner {
     }
 
     /// Non-blocking check for command completion.
-    /// Returns `true` if a command just finished.
-    pub fn poll(&mut self) -> bool {
+    ///
+    /// Returns `Some(result)` when a command just finished (caller can inspect
+    /// `exit_code` and `stderr` to surface failure toasts); returns `None`
+    /// while the command is still running or no command is queued.
+    pub fn poll(&mut self) -> Option<CommandResult> {
         let rx = match &self.state {
             CommandState::Running { rx, .. } => rx,
-            CommandState::Idle => return false,
+            CommandState::Idle => return None,
         };
         match rx.try_recv() {
             Ok(result) => {
@@ -185,13 +228,13 @@ impl CommandRunner {
                 };
                 self.message = Some((msg, Instant::now()));
                 self.state = CommandState::Idle;
-                true
+                Some(result)
             }
-            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.message = Some(("command thread lost".into(), Instant::now()));
                 self.state = CommandState::Idle;
-                true
+                None
             }
         }
     }
@@ -226,7 +269,7 @@ mod tests {
         // contention (coord --version spawns Python which can take >500ms to
         // boot when CPU is busy).
         std::thread::sleep(Duration::from_millis(2000));
-        assert!(runner.poll());
+        assert!(runner.poll().is_some());
     }
 
     #[test]
@@ -235,8 +278,9 @@ mod tests {
         runner.spawn(&["--version"]);
         // Wait for it to finish.
         std::thread::sleep(Duration::from_millis(2000));
-        assert!(runner.poll());
+        let result = runner.poll().expect("poll should return result after completion");
         assert!(!runner.is_running());
+        assert_eq!(result.exit_code, 0, "coord --version should succeed");
         // After a successful run the status-bar message records "done".
         let (msg, _) = runner.message.as_ref().expect("message set on completion");
         assert!(msg.contains("done"), "expected success message, got: {msg}");

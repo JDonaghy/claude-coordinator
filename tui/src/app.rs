@@ -11236,7 +11236,23 @@ impl CoordApp {
         }
 
         // Poll background command runner
-        if self.command_runner.poll() {
+        if let Some(result) = self.command_runner.poll() {
+            // Surface command failures via toast — previously they only set
+            // a green status-bar message that was easy to miss (and styled
+            // the same as success).  Without this, e.g. `coord refine`
+            // failing because a label doesn't exist on the repo would leave
+            // the user staring at an unchanged board with no feedback.
+            if result.exit_code != 0 {
+                let reason = first_meaningful_stderr_line(&result.stderr)
+                    .unwrap_or_else(|| {
+                        format!("exit {} — no stderr captured", result.exit_code)
+                    });
+                self.push_toast(
+                    "Command failed",
+                    &format!("{}\n{}", result.label, reason),
+                    ToastSeverity::Error,
+                );
+            }
             // #290 recovery: a coord command just finished.  If this was a
             // merge dispatch and no merge_queue row appeared yet (CI gate
             // blocked, queue empty, or transient read error), the optimistic
@@ -13336,6 +13352,35 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
     }
     let content_h = (panel.height - lh).max(0.0); // minus list title row
     (content_h / lh) as usize
+}
+
+/// Pick a single short line out of a child command's stderr suitable for a
+/// toast body.  Skips blank lines and Python/Click tracebacks/prefixes (which
+/// the coord CLI emits before the actual error message) so the user gets the
+/// real reason — e.g. `gh failed: 'status:refining' not found` rather than
+/// the wrapping `Error:`/`Traceback…` boilerplate.
+fn first_meaningful_stderr_line(stderr: &str) -> Option<String> {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Prefer the LAST non-empty line — coord error paths end with the
+    // operative message (`gh failed: …`, `failed to update N issues`), and
+    // Click tracebacks tend to pile prelude lines before it.
+    let last = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .last()?;
+    // Cap length for a toast.
+    let max = 200usize;
+    if last.len() > max {
+        let mut out = last[..max].to_string();
+        out.push('…');
+        Some(out)
+    } else {
+        Some(last.to_string())
+    }
 }
 
 /// #303: Strip every stage's `action` field so quadraui's `draw_pipeline_view`
