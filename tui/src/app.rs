@@ -1067,6 +1067,14 @@ fn format_cost_usd(cost: f64) -> String {
     }
 }
 
+/// Collapse all runs of whitespace (including newlines and tabs) into single
+/// spaces and trim the ends. Used to render a multi-line assistant text block
+/// as one horizontally-scrollable Log row (#302) without embedded newlines
+/// breaking the single-line list item.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn trunc(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => &s[..byte_idx],
