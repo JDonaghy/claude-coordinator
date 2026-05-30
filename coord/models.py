@@ -27,6 +27,10 @@ class Repo:
     default_branch: str = "main"
     build_command: str | None = None
     test_command: str | None = None
+    # #296: optional shell command to interactively run the app for manual
+    # smoke testing.  Surfaced in the TUI Test stage detail panel so the
+    # tester knows exactly what to launch.
+    run_cmd: str | None = None
     worker_permissions: WorkerPermissionsConfig | None = None
     housekeeping: list[str] = field(default_factory=list)
     coordinator_only_files: list[str] = field(default_factory=list)

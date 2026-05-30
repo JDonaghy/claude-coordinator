@@ -340,6 +340,11 @@ def _parse_repos(raw: Any) -> list[Repo]:
         test_command = entry.get("test_command")
         if test_command is not None and not isinstance(test_command, str):
             raise ConfigError(f"repos[{i}].test_command must be a string")
+        # #296: run_cmd — optional shell command to launch the app for manual
+        # smoke testing.  Surfaced in the TUI Test stage detail panel.
+        run_cmd = entry.get("run_cmd")
+        if run_cmd is not None and not isinstance(run_cmd, str):
+            raise ConfigError(f"repos[{i}].run_cmd must be a string")
 
         worker_permissions = _parse_worker_permissions(entry.get("worker_permissions"), i)
 
@@ -365,6 +370,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 default_branch=default_branch,
                 build_command=build_command,
                 test_command=test_command,
+                run_cmd=run_cmd,
                 worker_permissions=worker_permissions,
                 housekeeping=housekeeping,
                 coordinator_only_files=coordinator_only_files,
