@@ -1366,13 +1366,26 @@ fn parse_json_event_inner(line: &str, turn_n: &mut usize, elapsed: Option<std::t
                 Some(d) if d.as_secs() >= 1 => format!("  +{}s", d.as_secs()),
                 _ => String::new(),
             };
-            let summary = if !tools.is_empty() {
-                format!("[assistant] Turn {}{}  tool_use={}", n, elapsed_str, tools.join(","))
-            } else if !text.is_empty() {
-                let display = trunc(&text, 60);
-                format!("[assistant] Turn {}{}  {:?}", n, elapsed_str, display)
-            } else {
-                format!("[assistant] Turn {}{}", n, elapsed_str)
+            // #302: don't clip the turn text at 60 chars or debug-quote it —
+            // the Log tab is horizontally scrollable, so show the assistant's
+            // text in full on one line (newlines collapsed to spaces so it
+            // stays a single scrollable row). Show BOTH text and tools when a
+            // turn has both, so a turn that thinks *and* calls a tool isn't
+            // rendered as bare "Turn N" with no visible output.
+            let text_line = collapse_ws(&text);
+            let summary = match (!text_line.is_empty(), !tools.is_empty()) {
+                (true, true) => format!(
+                    "[assistant] Turn {}{}  {}  tool_use={}",
+                    n, elapsed_str, text_line, tools.join(",")
+                ),
+                (true, false) => {
+                    format!("[assistant] Turn {}{}  {}", n, elapsed_str, text_line)
+                }
+                (false, true) => format!(
+                    "[assistant] Turn {}{}  tool_use={}",
+                    n, elapsed_str, tools.join(",")
+                ),
+                (false, false) => format!("[assistant] Turn {}{}", n, elapsed_str),
             };
             Some(activity_item(&summary, Color::rgb(150, 180, 240)))
         }
@@ -13222,6 +13235,43 @@ mod tests {
         // chars: ['🎉', ' ', 'h', 'e', 'l', 'l', 'o']
         // first 3 chars → "🎉 h"
         assert_eq!(trunc(s, 3), "🎉 h");
+    }
+
+    #[test]
+    fn collapse_ws_flattens_newlines_and_runs() {
+        assert_eq!(collapse_ws("a\n\nb   c\t d"), "a b c d");
+        assert_eq!(collapse_ws("  leading and trailing  "), "leading and trailing");
+        assert_eq!(collapse_ws(""), "");
+    }
+
+    #[test]
+    fn assistant_turn_shows_full_text_not_clipped_at_60() {
+        // #302: a long thinking line must appear in full (no 60-char clip,
+        // no debug quoting) so horizontal scroll can reveal it.
+        let long = "x".repeat(120);
+        let line = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{long}\"}}]}}}}"
+        );
+        let mut turn = 0;
+        let item = parse_json_event(&line, &mut turn).expect("assistant item");
+        let text: String = item.text.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains(&long), "full text should be present: {text:?}");
+        assert!(!text.contains('"'), "should not be debug-quoted: {text:?}");
+    }
+
+    #[test]
+    fn assistant_turn_shows_both_text_and_tools() {
+        // #302: a turn that both thinks and calls a tool must show the text
+        // AND the tool list — previously the text was dropped (bare summary).
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[\
+            {\"type\":\"text\",\"text\":\"planning the edit\"},\
+            {\"type\":\"tool_use\",\"name\":\"Edit\"}]}}";
+        let mut turn = 0;
+        let item = parse_json_event(line, &mut turn).expect("assistant item");
+        let text: String = item.text.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("planning the edit"), "text missing: {text:?}");
+        assert!(text.contains("tool_use="), "tools missing: {text:?}");
+        assert!(text.contains("Edit"), "tool name missing: {text:?}");
     }
 
     // ── Board helpers ──────────────────────────────────────────────────────
