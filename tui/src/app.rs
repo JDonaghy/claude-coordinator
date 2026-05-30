@@ -12995,17 +12995,45 @@ fn purge_done_assignments_db(older_than_secs: f64) -> rusqlite::Result<(usize, u
 /// #200: Record a Test gate verdict on the given work assignment id.
 /// `verdict` is "passed" | "failed" | "skipped". `reason` is only stored for
 /// failures (ignored otherwise).
+///
+/// Also mirrors `smoke_test` / `smoke_test_reason` so `coord fix` can see the
+/// verdict — `coord fix` guards on `smoke_test == "fail"` (cli.py:4285-4291).
+/// Without this mirror, a report+fix dispatched from the TUI would immediately
+/// exit-1 with "smoke_test is None, expected 'fail'".  Mirrors the same logic
+/// as `coord test --fail/--pass` (cli.py:3308-3312).
+///
+/// Inner function accepts an explicit connection so tests can run against an
+/// in-memory DB without touching the real coord.db.
+fn record_test_verdict_conn(
+    conn: &Connection,
+    assignment_id: &str,
+    verdict: &str,
+    reason: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE assignments SET test_state = ?1, test_reason = ?2 WHERE assignment_id = ?3",
+        rusqlite::params![verdict, reason, assignment_id],
+    )?;
+    // Mirror smoke_test for "passed" and "failed" verdicts only (same as CLI).
+    if matches!(verdict, "failed" | "passed") {
+        let smoke_val: &str = if verdict == "failed" { "fail" } else { "pass" };
+        let smoke_reason: Option<&str> = if verdict == "failed" { reason } else { None };
+        conn.execute(
+            "UPDATE assignments SET smoke_test = ?1, smoke_test_reason = ?2 \
+             WHERE assignment_id = ?3",
+            rusqlite::params![smoke_val, smoke_reason, assignment_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn record_test_verdict_db(
     assignment_id: &str,
     verdict: &str,
     reason: Option<&str>,
 ) -> rusqlite::Result<()> {
     let conn = open_purge_conn()?;
-    conn.execute(
-        "UPDATE assignments SET test_state = ?1, test_reason = ?2 WHERE assignment_id = ?3",
-        rusqlite::params![verdict, reason, assignment_id],
-    )?;
-    Ok(())
+    record_test_verdict_conn(&conn, assignment_id, verdict, reason)
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -17347,6 +17375,82 @@ mod tests {
         assert_eq!(counted, (2, 2));
     }
 
+    // ── record_test_verdict_conn ──────────────────────────────────────────────
+
+    /// Build an in-memory DB with the columns `record_test_verdict_conn` writes.
+    fn make_verdict_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE assignments (
+                assignment_id      TEXT PRIMARY KEY,
+                test_state         TEXT,
+                test_reason        TEXT,
+                smoke_test         TEXT,
+                smoke_test_reason  TEXT
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_verdict_row(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO assignments (assignment_id) VALUES (?1)",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    fn read_verdict(conn: &Connection, id: &str) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT test_state, test_reason, smoke_test, smoke_test_reason \
+             FROM assignments WHERE assignment_id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    // #296 Blocker 2: record_test_verdict_conn must mirror smoke_test so that
+    // `coord fix` (which guards on smoke_test == "fail") can proceed after a
+    // report+fix action from the TUI.
+    fn record_test_verdict_conn_sets_smoke_test_on_failure() {
+        let conn = make_verdict_db();
+        insert_verdict_row(&conn, "w1");
+        record_test_verdict_conn(&conn, "w1", "failed", Some("scroll broken")).unwrap();
+        let (test_state, test_reason, smoke_test, smoke_reason) = read_verdict(&conn, "w1");
+        assert_eq!(test_state.as_deref(), Some("failed"), "test_state must be 'failed'");
+        assert_eq!(test_reason.as_deref(), Some("scroll broken"), "test_reason must be stored");
+        assert_eq!(
+            smoke_test.as_deref(),
+            Some("fail"),
+            "smoke_test must be mirrored to 'fail' so coord fix can dispatch",
+        );
+        assert_eq!(smoke_reason.as_deref(), Some("scroll broken"), "smoke_test_reason must match");
+    }
+
+    #[test]
+    fn record_test_verdict_conn_sets_smoke_test_pass_on_passed() {
+        let conn = make_verdict_db();
+        insert_verdict_row(&conn, "w2");
+        record_test_verdict_conn(&conn, "w2", "passed", None).unwrap();
+        let (test_state, _test_reason, smoke_test, smoke_reason) = read_verdict(&conn, "w2");
+        assert_eq!(test_state.as_deref(), Some("passed"));
+        assert_eq!(smoke_test.as_deref(), Some("pass"));
+        assert_eq!(smoke_reason, None, "no smoke_test_reason for a pass");
+    }
+
+    #[test]
+    fn record_test_verdict_conn_skipped_does_not_set_smoke_test() {
+        let conn = make_verdict_db();
+        insert_verdict_row(&conn, "w3");
+        record_test_verdict_conn(&conn, "w3", "skipped", None).unwrap();
+        let (test_state, _test_reason, smoke_test, _smoke_reason) = read_verdict(&conn, "w3");
+        assert_eq!(test_state.as_deref(), Some("skipped"));
+        assert_eq!(smoke_test, None, "smoke_test must not be set for skipped verdict");
+    }
+
     // ── board_selection_in_completed_group ────────────────────────────────────
 
     /// #265 helper: build an app where issue #10 is closed (on GitHub)
@@ -18227,7 +18331,11 @@ mod tests {
     // #296: run_cmd row appears in test guidance when the repo has a run_cmd
     // set, and is absent when the repo has none.
     fn test_guidance_shows_run_cmd_row_when_configured() {
-        let mut app = make_pipeline_app();
+        // Need the "test" gate in the pipeline so test_gate_actionable() returns
+        // true; make_pipeline_app() only has review+merge gates.
+        let mut app = make_pipeline_app_with_test_gate();
+        // Select issue #42 (index 0) so pipeline_sel is set.
+        app.pipeline_sel = Some(0);
         // Seed a done Work assignment so the Test stage is actionable.
         let mut work = _stage_assignment("w1", "work", 100.0, "done");
         work.branch = Some("issue-42-run-cmd".to_string());
@@ -18260,7 +18368,11 @@ mod tests {
 
     #[test]
     fn test_guidance_omits_run_cmd_row_when_not_configured() {
-        let mut app = make_pipeline_app();
+        // Use the test-gate app + select issue #42 so the guidance block actually
+        // renders — we want to verify no Run row appears (not just that the block
+        // is empty because test_gate_actionable() returned false).
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0);
         // Seed a done Work assignment so the Test stage is actionable.
         let mut work = _stage_assignment("w2", "work", 100.0, "done");
         work.branch = Some("issue-42-no-run-cmd".to_string());
@@ -18273,14 +18385,18 @@ mod tests {
             .iter()
             .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
             .collect();
-        let joined = texts.join("\n");
+        // Guidance block must render (we have actionable Test stage).
+        assert!(
+            texts.iter().any(|t| t.contains("Test")),
+            "guidance block did not render at all; got rows: {:?}",
+            texts,
+        );
         // The "Run" row should not appear because no run_cmd is configured.
         assert!(
             !texts.iter().any(|t| t.trim_start().starts_with("Run") && !t.contains("Smoke")),
             "spurious Run row appeared when no run_cmd is configured; got rows: {:?}",
             texts,
         );
-        let _ = joined; // used by the assertion above
     }
 
     // ── #270: selected-item action bar (no-mouse / SSH-friendly) ────────
