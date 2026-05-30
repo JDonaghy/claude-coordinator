@@ -232,11 +232,15 @@ enum SseWatchMsg {
     Heartbeat,
 }
 
+/// Maximum number of concurrent SSE watch sessions held in `CoordApp.watch_pool`.
+/// When adding a new session would exceed this limit the least-recently-focused
+/// entry is evicted (dropping its `Receiver` cancels the background thread).
+const WATCH_POOL_CAP: usize = 8;
+
 /// State for the live SSE log-stream connection backing the watch overlay.
 ///
-/// Held on `CoordApp` separately from `WatchState` because `Receiver<T>`
-/// is not `Clone` and `WatchState` must be.  Dropped (and thus the background
-/// thread cancelled) when the overlay closes via `close_watch()`.
+/// Held inside `WatchContext` in the `watch_pool` map.  Dropped (and thus the
+/// background thread cancelled) when the context is evicted from the pool.
 struct WatchSseState {
     /// Receive end of the channel from the background SSE thread.
     rx: std::sync::mpsc::Receiver<SseWatchMsg>,
@@ -257,10 +261,9 @@ struct WatchSseState {
     /// True once a clean `end` event arrives or the failure limit is hit.
     /// When true, no further reconnect attempts are made.
     done: bool,
-    /// Machine hostname, stored here so reconnect doesn't need `self.watch`.
+    /// Machine hostname, stored here so reconnect doesn't need to look up the
+    /// machine list again.
     host: String,
-    /// Assignment ID, stored here so reconnect doesn't need `self.watch`.
-    assignment_id: String,
     /// Partial trailing line carried over between SSE chunks. The agent reads
     /// the log in fixed 4 KB chunks (events.LOG_CHUNK_SIZE), so a long JSON
     /// line (e.g. a `{"type":"result"...}` event with the full review body)
@@ -268,6 +271,21 @@ struct WatchSseState {
     /// broken halves and lose `total_cost_usd` / `stop_reason` from the
     /// metrics line. Held here until the next chunk arrives.
     pending_tail: String,
+}
+
+/// One active SSE watch session.  Stored in `CoordApp.watch_pool` keyed by
+/// `assignment_id`.  Background sessions (not currently focused) keep their
+/// background thread alive and accumulate lines so switching back requires no
+/// reconnect.
+struct WatchContext {
+    state: WatchState,
+    sse: WatchSseState,
+    /// Per-assignment inject transcript.  Persists while the context lives in
+    /// the pool; cleared on eviction.
+    inject_transcript: Vec<ChatTurn>,
+    /// Wall-clock time this context was most recently focused.  Used for LRU
+    /// eviction when the pool would exceed `WATCH_POOL_CAP`.
+    last_focused_at: Instant,
 }
 
 /// #235 Phase 1: in-flight `coord test <work_id>` build job spawned from
@@ -2383,6 +2401,26 @@ fn spawn_sse_watch(host: &str, id: &str, last_event_id: u64) -> std::sync::mpsc:
     rx
 }
 
+/// Build a placeholder `WatchSseState` for assignments on the local machine
+/// (no host ⇒ no SSE endpoint). The state starts as `done` so the watch
+/// overlay falls back to the polling path without showing "Connecting…".
+fn make_local_sse_state(_assignment_id: &str) -> WatchSseState {
+    // Create a disconnected channel — we'll never use the receiver for real data.
+    let (_tx, rx) = std::sync::mpsc::channel::<SseWatchMsg>();
+    WatchSseState {
+        rx,
+        lines: Vec::new(),
+        last_event_id: 0,
+        fail_count: 0,
+        first_fail_at: None,
+        done: true, // Treat as done so the log fallback path is used.
+        host: String::new(),
+        pending_tail: String::new(),
+        line_times: Vec::new(),
+        current_turn: 0,
+    }
+}
+
 /// Width of one arrow connector between stages, in TUI cells. Mirrors the
 /// constant used by quadraui's `tui_pipeline_view_layout` so host
 /// hit-testing matches the painted geometry.
@@ -2789,13 +2827,17 @@ pub struct CoordApp {
     toasts: Vec<(ToastItem, Instant, ToastSeverity)>,
     /// Monotonic counter for toast widget IDs (must be unique per toast).
     next_toast_id: u64,
-    /// Active watch overlay (live log + kill controls). `None` when no
-    /// assignment is being watched.
-    watch: Option<WatchState>,
+    /// Pool of concurrent SSE watch sessions keyed by `assignment_id`.
+    /// Sessions remain alive (accumulating lines) even when not focused, so
+    /// switching between issues requires no reconnect.  Capped at
+    /// `WATCH_POOL_CAP`; the least-recently-focused entry is evicted when
+    /// the pool would exceed the cap.
+    watch_pool: std::collections::HashMap<String, WatchContext>,
+    /// The `assignment_id` of the currently-focused watch context, or `None`
+    /// when the watch overlay is closed.
+    watch_focused: Option<String>,
     /// Chat overlay for mid-flight worker guidance. `None` when closed.
     inject_chat: Option<ChatController>,
-    /// Transcript of past injections (User turns) for the current watch session.
-    inject_transcript: Vec<ChatTurn>,
     /// Animation frame counter for the inject chat spinner.
     inject_spinner_frame: usize,
     /// Which tab is active in the Pipeline detail pane.
@@ -2891,13 +2933,6 @@ pub struct CoordApp {
     /// TODO: wire from coordinator.yml `purge_days` key (e.g. under a top-level
     /// `tui:` section) once the Python config layer supports it.
     purge_days: u32,
-    /// Background SSE log-stream state for the watch overlay.
-    ///
-    /// `Some` while the overlay is open; `None` when closed.  Dropping this
-    /// field drops the `Receiver`, which signals the background thread to exit
-    /// (it detects the disconnect on the next `tx.send()` call).
-    watch_sse: Option<WatchSseState>,
-
     /// Hover state for the sidebar action bar (above the Board / Pipeline
     /// tree).  Driven by `UiEvent::MouseMoved`; read at render time and
     /// passed to `backend.draw_sidebar_panel` so the rasteriser can tint
@@ -3102,9 +3137,9 @@ impl CoordApp {
             pipeline_status: None,
             toasts: Vec::new(),
             next_toast_id: 0,
-            watch: None,
+            watch_pool: std::collections::HashMap::new(),
+            watch_focused: None,
             inject_chat: None,
-            inject_transcript: Vec::new(),
             inject_spinner_frame: 0,
             pipeline_detail_tab: PipelineDetailTab::default(),
             board_detail_tab: BoardDetailTab::default(),
@@ -3127,7 +3162,6 @@ impl CoordApp {
             local_coord_version: fetch_local_coord_version(),
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
-            watch_sse: None,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
             pipeline_focused_stage: None,
@@ -3272,6 +3306,12 @@ impl CoordApp {
     /// selected Pipeline issue. Falls back to the most recent non-done
     /// assignment when nothing is actively running; pushes a toast and
     /// returns `false` when there's nothing to watch.
+    ///
+    /// If the assignment already has a live context in `watch_pool` (because
+    /// the user switched away from it earlier), we simply re-focus it without
+    /// disturbing the background stream.  Otherwise we open a new SSE
+    /// connection and insert it into the pool (evicting the LRU entry if the
+    /// pool has reached `WATCH_POOL_CAP`).
     fn open_watch_for_selected_issue(&mut self) -> bool {
         let Some(idx) = self.pipeline_sel else { return false; };
         let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
@@ -3300,7 +3340,17 @@ impl CoordApp {
 
         match pick {
             Some(a) => {
-                self.watch = Some(WatchState {
+                let aid = a.id.clone();
+                // Re-focus an existing stream without touching it.
+                if self.watch_pool.contains_key(&aid) {
+                    if let Some(ctx) = self.watch_pool.get_mut(&aid) {
+                        ctx.last_focused_at = Instant::now();
+                    }
+                    self.watch_focused = Some(aid);
+                    return true;
+                }
+                // New stream — build WatchState and open SSE.
+                let state = WatchState {
                     assignment_id: a.id.clone(),
                     machine: a.machine.clone(),
                     repo: a.repo.clone(),
@@ -3310,13 +3360,11 @@ impl CoordApp {
                         .clone()
                         .unwrap_or_else(|| "work".to_string()),
                     scroll: usize::MAX,
-                });
-                // Open an SSE log stream for remote machines.
-                self.watch_sse = None; // clear any previous
-                if let Some(m) = self.data.machines.iter().find(|m| m.name == a.machine) {
+                };
+                let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == a.machine) {
                     if !m.host.is_empty() {
                         let rx = spawn_sse_watch(&m.host, &a.id, 0);
-                        self.watch_sse = Some(WatchSseState {
+                        WatchSseState {
                             rx,
                             lines: Vec::new(),
                             last_event_id: 0,
@@ -3324,13 +3372,33 @@ impl CoordApp {
                             first_fail_at: None,
                             done: false,
                             host: m.host.clone(),
-                            assignment_id: a.id.clone(),
                             pending_tail: String::new(),
-                        line_times: Vec::new(),
-                        current_turn: 0,
-                        });
+                            line_times: Vec::new(),
+                            current_turn: 0,
+                        }
+                    } else {
+                        make_local_sse_state(&a.id)
+                    }
+                } else {
+                    make_local_sse_state(&a.id)
+                };
+                // Evict the LRU entry if the pool is at capacity.
+                if self.watch_pool.len() >= WATCH_POOL_CAP {
+                    let lru_id = self.watch_pool
+                        .iter()
+                        .min_by_key(|(_, ctx)| ctx.last_focused_at)
+                        .map(|(id, _)| id.clone());
+                    if let Some(id) = lru_id {
+                        self.watch_pool.remove(&id);
                     }
                 }
+                self.watch_pool.insert(aid.clone(), WatchContext {
+                    state,
+                    sse,
+                    inject_transcript: Vec::new(),
+                    last_focused_at: Instant::now(),
+                });
+                self.watch_focused = Some(aid);
                 true
             }
             None => {
@@ -3343,35 +3411,37 @@ impl CoordApp {
         }
     }
 
-    /// Close the watch overlay and cancel the background SSE thread.
+    /// Close the watch overlay (clear focus).  The background SSE stream for
+    /// the previously-focused assignment is kept alive in `watch_pool` so the
+    /// user can switch back without a reconnect.
     fn close_watch(&mut self) {
-        self.watch = None;
-        // Dropping watch_sse drops the Receiver; the background thread detects
-        // the disconnect on its next tx.send() and exits cleanly.
-        self.watch_sse = None;
+        self.watch_focused = None;
         self.inject_chat = None;
-        self.inject_transcript.clear();
     }
 
-    /// Called whenever the Log tab becomes active.  Opens (or keeps open)
-    /// the SSE stream for the selected issue's assignment so the Log tab
-    /// shows live content without the HTTP-cache-TTL "Loading log…" flicker.
-    /// True when the Pipeline view's Log tab is the active scroller. On this
+    /// True when the Pipeline view's Log tab is the active scroller.  On this
     /// tab the visible content is `pipeline_log_list` (scrolled via
-    /// `pipeline_detail_scroll`), even though a watch is open for SSE — so
-    /// scroll input must route to the Log list, not the watch overlay (#308).
+    /// `pipeline_detail_scroll`); used by the periodic `tick` to re-attach
+    /// SSE when the running assignment under the cursor changes.
     fn on_pipeline_log_tab(&self) -> bool {
         self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Log
     }
 
+    /// Called whenever the Log tab becomes active (and on each tick while it's
+    /// active).  Ensures `watch_pool` holds an SSE stream for the assignment
+    /// `pipeline_log_list` would currently render — without setting
+    /// `watch_focused`, so the watch-overlay j/k arms don't shadow the Log-tab
+    /// scroll arms (#308).
+    ///
+    /// The pool check is keyed on the *picked* assignment id, not just the
+    /// issue number.  Without that, auto_loop transitions
+    /// (work→review→work→review on the same issue) leave a stale pool entry
+    /// for the old assignment and the new running one would fall back to
+    /// HTTP polling — reintroducing the "Loading log…" flicker.
     fn ensure_log_tab_sse(&mut self) {
-        // Compute the assignment id that pipeline_log_list would render for the
-        // current selection. The picker MUST stay in sync with pipeline_log_list
-        // (prefer running, fall back to most recent by dispatched_at). Without
-        // this, auto_loop transitions (work→review→work→review on the same issue)
-        // leave the SSE pinned to a stale assignment_id and the Log tab falls
-        // back to HTTP polling with its 'Loading log…' flicker.
+        // Pick the same assignment pipeline_log_list does (running → most
+        // recent by dispatched_at) so the pool entry tracks the visible row.
         let pick_id = self.pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
             .and_then(|issue| {
@@ -3389,49 +3459,170 @@ impl CoordApp {
                     })
                     .map(|a| a.id.clone())
             });
-        // SSE already open for the exact assignment we'd render? Keep it
-        // (live or done — done shows "stream ended" footer).
-        if let (Some(w), Some(sse), Some(target)) = (&self.watch, &self.watch_sse, pick_id.as_ref()) {
-            if w.assignment_id == *target && sse.assignment_id == *target {
-                return;
-            }
+        let Some(target) = pick_id else { return; };
+        // Pool already has the picked assignment? Leave it (live or done).
+        if self.watch_pool.contains_key(&target) {
+            return;
         }
-        // No SSE, or attached to a stale assignment — re-open for current pick.
-        self.open_watch_for_selected_issue();
+        // No entry for the picked assignment — open one without focusing.
+        self.open_sse_in_pool_for_selected_issue();
     }
 
-    /// Force a fresh SSE connection for the watch overlay (manual refresh, R key).
-    ///
-    /// Drops the current SSE state (if any) and spawns a new connection from
-    /// byte offset 0, so the full log is streamed from the start.
-    fn reset_sse_watch(&mut self) {
-        let Some(w) = self.watch.as_ref() else { return; };
-        let host = match self.data.machines.iter().find(|m| m.name == w.machine) {
-            Some(m) if !m.host.is_empty() => m.host.clone(),
-            _ => return,
+    /// Open (or reuse) an SSE stream in `watch_pool` for the selected issue
+    /// WITHOUT setting `watch_focused`.  Used by the Log tab and any other
+    /// caller that wants background accumulation but not the watch overlay.
+    fn open_sse_in_pool_for_selected_issue(&mut self) {
+        let Some(idx) = self.pipeline_sel else { return; };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return; };
+        let local_repo = issue.coord_repo.as_deref();
+
+        let candidates: Vec<_> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .collect();
+
+        let pick = candidates.iter().copied().find(|a| a.status == "running")
+            .or_else(|| candidates.iter().copied().find(|a| a.status != "done"))
+            .or_else(|| candidates.iter().copied().max_by(|a, b| {
+                a.dispatched_at.partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }));
+
+        let Some(a) = pick else { return; };
+        let aid = a.id.clone();
+
+        // Already in the pool — nothing to do.
+        if self.watch_pool.contains_key(&aid) {
+            return;
+        }
+        let state = WatchState {
+            assignment_id: a.id.clone(),
+            machine: a.machine.clone(),
+            repo: a.repo.clone(),
+            issue_number: a.issue_number,
+            assignment_type: a.assignment_type.clone().unwrap_or_else(|| "work".to_string()),
+            scroll: usize::MAX,
         };
-        let id = w.assignment_id.clone();
-        let rx = spawn_sse_watch(&host, &id, 0);
-        self.watch_sse = Some(WatchSseState {
-            rx,
-            lines: Vec::new(),
-            last_event_id: 0,
-            fail_count: 0,
-            first_fail_at: None,
-            done: false,
-            host,
-            assignment_id: id,
-            pending_tail: String::new(),
-                        line_times: Vec::new(),
-                        current_turn: 0,
+        let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == a.machine) {
+            if !m.host.is_empty() {
+                let rx = spawn_sse_watch(&m.host, &a.id, 0);
+                WatchSseState {
+                    rx,
+                    lines: Vec::new(),
+                    last_event_id: 0,
+                    fail_count: 0,
+                    first_fail_at: None,
+                    done: false,
+                    host: m.host.clone(),
+                    pending_tail: String::new(),
+                    line_times: Vec::new(),
+                    current_turn: 0,
+                }
+            } else {
+                make_local_sse_state(&a.id)
+            }
+        } else {
+            make_local_sse_state(&a.id)
+        };
+        if self.watch_pool.len() >= WATCH_POOL_CAP {
+            let lru_id = self.watch_pool
+                .iter()
+                .min_by_key(|(_, ctx)| ctx.last_focused_at)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = lru_id {
+                self.watch_pool.remove(&id);
+            }
+        }
+        self.watch_pool.insert(aid, WatchContext {
+            state,
+            sse,
+            inject_transcript: Vec::new(),
+            last_focused_at: Instant::now(),
         });
+    }
+
+    /// Force a fresh SSE connection for the focused watch session (R key).
+    ///
+    /// Replaces the existing `WatchSseState` with a fresh connection starting
+    /// from byte offset 0, so the full log is streamed from the beginning.
+    fn reset_sse_watch(&mut self) {
+        let id = match &self.watch_focused {
+            Some(id) => id.clone(),
+            None => return,
+        };
+        let (host, machine) = match self.watch_pool.get(&id) {
+            Some(ctx) => (ctx.sse.host.clone(), ctx.state.machine.clone()),
+            None => return,
+        };
+        // If we don't have a host yet (local machine), try to derive it.
+        let host = if host.is_empty() {
+            match self.data.machines.iter().find(|m| m.name == machine) {
+                Some(m) if !m.host.is_empty() => m.host.clone(),
+                _ => return,
+            }
+        } else {
+            host
+        };
+        let rx = spawn_sse_watch(&host, &id, 0);
+        if let Some(ctx) = self.watch_pool.get_mut(&id) {
+            ctx.sse = WatchSseState {
+                rx,
+                lines: Vec::new(),
+                last_event_id: 0,
+                fail_count: 0,
+                first_fail_at: None,
+                done: false,
+                host,
+                pending_tail: String::new(),
+                line_times: Vec::new(),
+                current_turn: 0,
+            };
+        }
+    }
+
+    // ── Focused-context accessors ─────────────────────────────────────────────
+
+    /// Borrow the `WatchState` for the focused session, if any.
+    fn focused_watch_state(&self) -> Option<&WatchState> {
+        self.watch_focused.as_ref()
+            .and_then(|id| self.watch_pool.get(id))
+            .map(|ctx| &ctx.state)
+    }
+
+    /// Mutably borrow the `WatchState` for the focused session, if any.
+    fn focused_watch_state_mut(&mut self) -> Option<&mut WatchState> {
+        let id = self.watch_focused.clone()?;
+        self.watch_pool.get_mut(&id).map(|ctx| &mut ctx.state)
+    }
+
+    /// Borrow the inject transcript for the focused session (empty slice if none).
+    fn focused_transcript(&self) -> &[ChatTurn] {
+        self.watch_focused.as_ref()
+            .and_then(|id| self.watch_pool.get(id))
+            .map(|ctx| ctx.inject_transcript.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Mutably borrow the inject transcript for the focused session, if any.
+    fn focused_transcript_mut(&mut self) -> Option<&mut Vec<ChatTurn>> {
+        let id = self.watch_focused.clone()?;
+        self.watch_pool.get_mut(&id).map(|ctx| &mut ctx.inject_transcript)
     }
 
     /// Accept the plan being watched: dispatches `coord approve-plan <id>`.
     /// No-op when the watched assignment isn't a plan; toasts otherwise.
     fn approve_watched_plan(&mut self) -> bool {
-        let Some(w) = self.watch.clone() else { return false; };
-        if w.assignment_type != "plan" {
+        let (aid, issue_number, atype) = match self.focused_watch_state() {
+            Some(w) => (w.assignment_id.clone(), w.issue_number, w.assignment_type.clone()),
+            None => return false,
+        };
+        if atype != "plan" {
             self.pipeline_status = Some((
                 "approve only works on a plan-type assignment".to_string(),
                 Instant::now(),
@@ -3440,10 +3631,10 @@ impl CoordApp {
         }
         let spawned = self
             .command_runner
-            .spawn(&["approve-plan", &w.assignment_id]);
+            .spawn(&["approve-plan", &aid]);
         if spawned {
             self.pipeline_status = Some((
-                format!("approving plan #{} → dispatching work", w.issue_number),
+                format!("approving plan #{} → dispatching work", issue_number),
                 Instant::now(),
             ));
             // Close the watch so the user returns to Stages and can see the
@@ -3546,11 +3737,14 @@ impl CoordApp {
     /// Stop the assignment being watched: dispatches `coord stop <id>`.
     /// Pushes a toast on success or when another command is running.
     fn kill_watched(&mut self) -> bool {
-        let Some(w) = self.watch.clone() else { return false; };
-        let spawned = self.command_runner.spawn(&["stop", &w.assignment_id]);
+        let (aid, issue_number) = match self.focused_watch_state() {
+            Some(w) => (w.assignment_id.clone(), w.issue_number),
+            None => return false,
+        };
+        let spawned = self.command_runner.spawn(&["stop", &aid]);
         if spawned {
             self.pipeline_status = Some((
-                format!("stop dispatched for #{}", w.issue_number),
+                format!("stop dispatched for #{}", issue_number),
                 Instant::now(),
             ));
         } else {
@@ -3566,16 +3760,20 @@ impl CoordApp {
     /// from the worker.  Title carries the repo/issue/machine context.
     /// Inject prompt (when open) is rendered as the last list row.
     ///
-    /// Log content is driven by the SSE stream when `watch_sse` is `Some`;
-    /// falls back to the polling path (`get_activity_log`) when SSE is
-    /// unavailable (e.g. machine host unknown or local assignment).
+    /// Log content is driven by the SSE stream when the focused context has
+    /// a live stream; falls back to the polling path (`get_activity_log`)
+    /// when SSE is unavailable (e.g. local assignment, no host).
     fn watch_log_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
-        let title = match &self.watch {
+        let ctx = self.watch_focused.as_ref()
+            .and_then(|id| self.watch_pool.get(id));
+        let title = match ctx {
             None => " WATCH ".to_string(),
-            Some(w) => {
-                // Prefer SSE-accumulated lines when available.
-                if let Some(sse) = &self.watch_sse {
+            Some(ctx) => {
+                let w = &ctx.state;
+                let sse = &ctx.sse;
+                // SSE stream: show accumulated lines or "Connecting…" placeholder.
+                if !sse.done || !sse.lines.is_empty() {
                     if sse.lines.is_empty() && !sse.done {
                         items.push(kv_item(
                             "",
@@ -3615,14 +3813,13 @@ impl CoordApp {
         // a literal `items.len() - 40`, which clipped the latest lines on
         // smaller terminals.
         let visible_rows = self.last_main_visible_rows.get().max(1);
-        let scroll = self
-            .watch
-            .as_ref()
-            .map(|w| {
-                if w.scroll == usize::MAX {
+        let scroll = self.watch_focused.as_ref()
+            .and_then(|id| self.watch_pool.get(id))
+            .map(|ctx| {
+                if ctx.state.scroll == usize::MAX {
                     items.len().saturating_sub(visible_rows)
                 } else {
-                    w.scroll
+                    ctx.state.scroll
                 }
             })
             .unwrap_or(0);
@@ -3642,28 +3839,35 @@ impl CoordApp {
     /// Send `text` to the watched worker via `coord inject`.
     /// Appends the text to the inject transcript and clears the chat input on success.
     fn submit_inject(&mut self, text: String) -> bool {
-        let Some(w) = self.watch.clone() else { return false; };
+        let (aid, issue_number) = match self.focused_watch_state() {
+            Some(w) => (w.assignment_id.clone(), w.issue_number),
+            None => return false,
+        };
         let text = text.trim().to_string();
         if text.is_empty() { return false; }
         let spawned = self
             .command_runner
-            .spawn(&["inject", &w.assignment_id, &text]);
+            .spawn(&["inject", &aid, &text]);
         if spawned {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs_f64());
-            self.inject_transcript.push(ChatTurn {
+            let turn = ChatTurn {
                 role: ChatRole::User,
                 text: StyledText::plain(text.clone()),
                 timestamp_unix: now,
-            });
+            };
+            if let Some(t) = self.focused_transcript_mut() {
+                t.push(turn);
+            }
+            let transcript = self.focused_transcript().to_vec();
             if let Some(ref mut chat) = self.inject_chat {
-                chat.set_transcript(self.inject_transcript.clone());
+                chat.set_transcript(transcript);
                 chat.clear_input();
             }
             self.pipeline_status = Some((
-                format!("asked worker #{}: {}", w.issue_number, text),
+                format!("asked worker #{}: {}", issue_number, text),
                 Instant::now(),
             ));
         } else {
@@ -5402,15 +5606,23 @@ impl CoordApp {
                     } else {
                         Color::rgb(140, 140, 140)
                     };
-                    let text = StyledText {
-                        spans: vec![
-                            StyledSpan::with_fg(
-                                format!("#{:<5}", issue.number),
-                                Color::rgb(150, 150, 240),
-                            ),
-                            StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
-                        ],
-                    };
+                    // Show a live-stream indicator (▶) if a non-done SSE
+                    // stream exists for this issue in the watch pool — covers
+                    // both the focused stream and background streams.
+                    let has_live_stream = self.watch_pool.values().any(|ctx| {
+                        ctx.state.issue_number == issue.number && !ctx.sse.done
+                    });
+                    let mut spans = vec![
+                        StyledSpan::with_fg(
+                            format!("#{:<5}", issue.number),
+                            Color::rgb(150, 150, 240),
+                        ),
+                        StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
+                    ];
+                    if has_live_stream {
+                        spans.push(StyledSpan::with_fg(" ▶".to_string(), Color::rgb(60, 200, 80)));
+                    }
+                    let text = StyledText { spans };
                     rows.push(TreeRow {
                         path: vec![li as u16, ii as u16],
                         indent: 2,
@@ -5947,11 +6159,11 @@ impl CoordApp {
                         .into_iter()
                         .find(|a| a.status == "running");
                     if let Some(a) = running {
-                        let turns = if let Some(sse) = &self.watch_sse {
-                            let watching = self.watch.as_ref()
-                                .map(|w| w.assignment_id == a.id)
-                                .unwrap_or(false);
-                            if watching && sse.current_turn > 0 { sse.current_turn }
+                        // Use cached SSE turn count from any pool entry for
+                        // this assignment (not just the focused stream), so
+                        // the badge updates even for background watches.
+                        let turns = if let Some(ctx) = self.watch_pool.get(&a.id) {
+                            if ctx.sse.current_turn > 0 { ctx.sse.current_turn }
                             else { self.turn_count_from_log(&a.id) }
                         } else {
                             self.turn_count_from_log(&a.id)
@@ -8398,13 +8610,11 @@ impl CoordApp {
                 items.push(kv_item("", &elapsed_header, Some(Color::rgb(120, 120, 140))));
                 items.push(kv_item("", "", None));
 
-                // Use SSE if the watch is open for this exact assignment —
-                // avoids the HTTP-cache-TTL "Loading log…" flicker.
-                let sse_for_this = self.watch_sse.as_ref().filter(|sse| {
-                    self.watch.as_ref().map(|w| w.assignment_id == a.id).unwrap_or(false)
-                        && sse.assignment_id == a.id
-                });
-                if let Some(sse) = sse_for_this {
+                // Use SSE from the watch pool if a stream exists for this
+                // assignment (focused or background) — avoids the
+                // HTTP-cache-TTL "Loading log…" flicker.
+                if let Some(ctx) = self.watch_pool.get(&a.id) {
+                    let sse = &ctx.sse;
                     if sse.lines.is_empty() && !sse.done {
                         items.push(kv_item("", "  Connecting to log stream…", Some(Color::rgb(140, 140, 140))));
                     } else {
@@ -9373,33 +9583,35 @@ impl CoordApp {
         // a stick-to-bottom offset that keeps the last line on screen.
         self.last_main_visible_rows.set(visible.max(1));
         // Watch overlay takes over the main panel; route scrollwheel to it
-        // regardless of which view is active underneath. Exception (#308): on
-        // the Pipeline Log tab the watch is only SSE bookkeeping — the visible
-        // scroller is the Log list, so let the match below handle the wheel.
-        if self.watch.is_some() && !self.on_pipeline_log_tab() {
+        // regardless of which view is active underneath.  The Log tab is
+        // unaffected: it only seeds `watch_pool` (no `watch_focused`), so this
+        // gate is false there and the wheel falls through to the Log scroller.
+        if self.watch_focused.is_some() {
             // SSE log lines drive the count when present; fall back to the
             // remote-log cache when SSE isn't yet connected.
-            let items = self
-                .watch_sse
-                .as_ref()
-                .map(|s| s.lines.len())
+            let items = self.watch_focused.as_ref()
+                .and_then(|id| self.watch_pool.get(id))
+                .map(|ctx| ctx.sse.lines.len())
                 .unwrap_or_else(|| self.watch_log_list().items.len());
             let max = items.saturating_sub(visible.saturating_sub(1));
-            if let Some(w) = self.watch.as_mut() {
-                // Anchor the current scroll position: a usize::MAX sentinel
-                // means stick-to-bottom; convert that to the explicit max
-                // before applying the wheel delta so wheel-up actually moves.
-                if w.scroll == usize::MAX {
-                    w.scroll = max;
-                }
-                if delta.y > 0.0 {
-                    // Wheel up → older lines.
-                    w.scroll = w.scroll.saturating_sub(3);
-                } else if delta.y < 0.0 {
-                    // Wheel down → newer; once at the bottom, re-enable
-                    // stick-to-bottom so future appends keep auto-scrolling.
-                    let new_scroll = (w.scroll + 3).min(max);
-                    w.scroll = if new_scroll >= max { usize::MAX } else { new_scroll };
+            if let Some(id) = self.watch_focused.clone() {
+                if let Some(ctx) = self.watch_pool.get_mut(&id) {
+                    let w = &mut ctx.state;
+                    // Anchor the current scroll position: a usize::MAX sentinel
+                    // means stick-to-bottom; convert that to the explicit max
+                    // before applying the wheel delta so wheel-up actually moves.
+                    if w.scroll == usize::MAX {
+                        w.scroll = max;
+                    }
+                    if delta.y > 0.0 {
+                        // Wheel up → older lines.
+                        w.scroll = w.scroll.saturating_sub(3);
+                    } else if delta.y < 0.0 {
+                        // Wheel down → newer; once at the bottom, re-enable
+                        // stick-to-bottom so future appends keep auto-scrolling.
+                        let new_scroll = (w.scroll + 3).min(max);
+                        w.scroll = if new_scroll >= max { usize::MAX } else { new_scroll };
+                    }
                 }
             }
             return true;
@@ -10650,7 +10862,7 @@ impl CoordApp {
         // Toolbar suppressed while the watch overlay or any inline confirm
         // prompt has the keyboard — these modes consume every keystroke
         // and a clickable toolbar above them would be misleading.
-        if self.watch.is_some()
+        if self.watch_focused.is_some()
             || self.pending_purge.is_some()
             || self.pending_force_merge.is_some()
             || self.pending_test_fail.is_some()
@@ -11030,11 +11242,12 @@ impl CoordApp {
             self.last_notify = Instant::now();
         }
 
-        // Drain the SSE watch channel when the overlay is open. Any new lines
-        // arriving from the background thread trigger a redraw so the UI
-        // updates within one tick period without requiring user input.
-        if self.watch_sse.is_some() {
-            needs_redraw |= self.drain_sse_watch();
+        // Drain all SSE watch channels in the pool (including background
+        // sessions not currently focused).  Any new lines arriving from any
+        // background thread trigger a redraw so turn-count badges and the Log
+        // tab stay fresh even while the watch overlay is closed.
+        if !self.watch_pool.is_empty() {
+            needs_redraw |= self.drain_watch_pool();
         }
 
         // Advance inject chat spinner when the overlay is open.
@@ -11057,21 +11270,37 @@ impl CoordApp {
         needs_redraw
     }
 
-    /// Drain pending messages from the SSE watch channel, accumulate lines,
-    /// and handle reconnect/error logic.  Returns `true` when new data
-    /// arrived and a redraw is needed.
+    /// Drain pending messages from every SSE stream in `watch_pool`,
+    /// accumulate lines, and handle per-entry reconnect/error logic.
+    /// Returns `true` when new data arrived on any stream (redraw needed).
     ///
-    /// Reconnect strategy: on transient errors, reopen the stream using
-    /// `Last-Event-Id` so replay starts from the last received byte offset.
-    /// After **3 failures within 10 seconds**, a toast is shown and
-    /// reconnection stops — the user must press `R` to retry manually.
-    fn drain_sse_watch(&mut self) -> bool {
+    /// Reconnect strategy (per entry): on transient errors, reopen the stream
+    /// using `Last-Event-Id` so replay starts from the last received byte
+    /// offset.  After **3 failures within 10 seconds** a toast is shown
+    /// (keyed to the affected issue) and reconnection stops — the user must
+    /// press `R` while watching that issue to retry.  Background streams
+    /// (not currently focused) show the toast with the issue number so the
+    /// user can switch to them to diagnose the failure.
+    ///
+    /// Maximum pool size is `WATCH_POOL_CAP` (currently 8 concurrent streams).
+    fn drain_watch_pool(&mut self) -> bool {
+        let ids: Vec<String> = self.watch_pool.keys().cloned().collect();
+        let mut got_new = false;
+        for id in ids {
+            got_new |= self.drain_pool_entry(&id);
+        }
+        got_new
+    }
+
+    /// Drain one pool entry.  Returns `true` when new data arrived.
+    fn drain_pool_entry(&mut self, id: &str) -> bool {
         let mut got_new = false;
         let mut needs_reconnect = false;
         let mut fail_limit_hit = false;
 
-        // Drain all pending messages — borrow watch_sse mutably.
-        if let Some(sse) = &mut self.watch_sse {
+        // First pass: drain all pending messages while we hold a mutable ref.
+        if let Some(ctx) = self.watch_pool.get_mut(id) {
+            let sse = &mut ctx.sse;
             if sse.done {
                 return false;
             }
@@ -11160,11 +11389,11 @@ impl CoordApp {
                         got_new = true;
                         break;
                     }
-                    SseWatchMsg::Error(msg) => {
+                    SseWatchMsg::Error(err_msg) => {
                         // Surface the actual error in the log so the user
                         // can diagnose connection issues without grepping
                         // agent journalctl. Capped to one line in the panel.
-                        sse.lines.push(format!("[sse error] {}", msg));
+                        sse.lines.push(format!("[sse error] {}", err_msg));
                         // Connection failure. Update the failure window.
                         sse.fail_count += 1;
                         match sse.first_fail_at {
@@ -11192,26 +11421,42 @@ impl CoordApp {
             }
         }
 
-        // Post-drain: reconnect or show error toast (no watch_sse borrow held).
+        // Post-drain: reconnect or show error toast (no pool borrow held).
         if fail_limit_hit {
-            self.push_toast(
-                "SSE stream error",
-                "Lost connection 3× in 10 s — press R to reconnect",
-                ToastSeverity::Error,
-            );
+            // Include issue number so background-stream failures are identifiable.
+            let issue_num = self.watch_pool.get(id)
+                .map(|ctx| ctx.state.issue_number);
+            let is_focused = self.watch_focused.as_deref() == Some(id);
+            let msg = if is_focused {
+                "Lost connection 3× in 10 s — press R to reconnect".to_string()
+            } else if let Some(n) = issue_num {
+                format!("Lost connection to #{} 3× in 10 s — switch to it and press R", n)
+            } else {
+                "Lost SSE connection 3× in 10 s".to_string()
+            };
+            self.push_toast("SSE stream error", &msg, ToastSeverity::Error);
         } else if needs_reconnect {
             // Clone what we need before taking a new mutable borrow.
-            let (host, assignment_id, last_id) = match &self.watch_sse {
-                Some(s) => (s.host.clone(), s.assignment_id.clone(), s.last_event_id),
+            let (host, last_id) = match self.watch_pool.get(id) {
+                Some(ctx) => (ctx.sse.host.clone(), ctx.sse.last_event_id),
                 None => return got_new,
             };
-            let new_rx = spawn_sse_watch(&host, &assignment_id, last_id);
-            if let Some(sse) = &mut self.watch_sse {
-                sse.rx = new_rx;
+            if !host.is_empty() {
+                let new_rx = spawn_sse_watch(&host, id, last_id);
+                if let Some(ctx) = self.watch_pool.get_mut(id) {
+                    ctx.sse.rx = new_rx;
+                }
             }
         }
 
         got_new
+    }
+
+    /// Compatibility alias used by unit tests that still call `drain_sse_watch`.
+    /// Delegates to `drain_watch_pool` so all pool entries are processed.
+    #[cfg(test)]
+    fn drain_sse_watch(&mut self) -> bool {
+        self.drain_watch_pool()
     }
 
     // ─── Settings panel ───────────────────────────────────────────────────────
@@ -12047,56 +12292,57 @@ impl ShellApp for CoordApp {
                     // 'b' opens the ChatController guidance overlay. When the
                     // overlay is open, ALL events are intercepted earlier in
                     // handle() — these arms only fire when it is closed.
-                    Key::Char('b') if self.watch.is_some() && self.inject_chat.is_none() => {
-                        if let Some(w) = &self.watch {
+                    Key::Char('b') if self.watch_focused.is_some() && self.inject_chat.is_none() => {
+                        if let Some(w) = self.focused_watch_state() {
+                            let atype = w.assignment_type.clone();
+                            let issue_n = w.issue_number;
+                            let machine = w.machine.clone();
                             let mut chat = ChatController::new("inject");
                             chat.set_status(StyledText::plain(format!(
                                 "  Guidance → {} #{} on {}  (Ctrl+S or Alt+Enter = send · Esc = close)",
-                                w.assignment_type, w.issue_number, w.machine
+                                atype, issue_n, machine
                             )));
-                            chat.set_transcript(self.inject_transcript.clone());
+                            chat.set_transcript(self.focused_transcript().to_vec());
                             self.inject_chat = Some(chat);
                         }
                         needs_redraw = true;
                     }
-                    Key::Char('K') if self.watch.is_some() => {
+                    Key::Char('K') if self.watch_focused.is_some() => {
                         self.kill_watched();
                         needs_redraw = true;
                     }
-                    Key::Char('A') if self.watch.is_some() => {
+                    Key::Char('A') if self.watch_focused.is_some() => {
                         self.approve_watched_plan();
                         needs_redraw = true;
                     }
                     // R = force a fresh SSE connection from byte 0.
-                    Key::Char('R') if self.watch.is_some() => {
+                    Key::Char('R') if self.watch_focused.is_some() => {
                         self.reset_sse_watch();
                         needs_redraw = true;
                     }
                     Key::Char('q') | Key::Named(NamedKey::Escape)
-                        if self.watch.is_some() =>
+                        if self.watch_focused.is_some() =>
                     {
                         self.close_watch();
                         needs_redraw = true;
                     }
-                    // #308: the Pipeline Log tab always opens a watch (for SSE
-                    // streaming) but renders the `pipeline_log_list` scroller,
-                    // driven by `pipeline_detail_scroll` — NOT the watch
-                    // overlay's `w.scroll`. So on that tab these watch j/k arms
-                    // must yield to the dedicated Log-tab arms below; otherwise
-                    // they swallow j/k and the visible list never moves.
+                    // j/k scroll the watch-overlay log (not the Log detail tab).
+                    // The Log tab only seeds `watch_pool` without focusing, so
+                    // `watch_focused.is_some()` is false there and j/k falls
+                    // through to the dedicated Log-tab arms below (#308).
                     Key::Char('j') | Key::Named(NamedKey::Down)
-                        if self.watch.is_some() && !self.on_pipeline_log_tab() =>
+                        if self.watch_focused.is_some() =>
                     {
-                        if let Some(w) = self.watch.as_mut() {
+                        if let Some(w) = self.focused_watch_state_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
                             w.scroll = current.saturating_add(1);
                         }
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
-                        if self.watch.is_some() && !self.on_pipeline_log_tab() =>
+                        if self.watch_focused.is_some() =>
                     {
-                        if let Some(w) = self.watch.as_mut() {
+                        if let Some(w) = self.focused_watch_state_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
                             w.scroll = current.saturating_sub(1);
                         }
@@ -12279,6 +12525,38 @@ impl ShellApp for CoordApp {
                     {
                         self.pipeline_log_hscroll =
                             self.pipeline_log_hscroll.saturating_sub(8);
+                        needs_redraw = true;
+                    }
+
+                    // ── PageDown — scroll Log tab one page down (#307) ────
+                    Key::Named(NamedKey::PageDown)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                    {
+                        let items = self.pipeline_log_list().items.len();
+                        let visible = self.last_main_visible_rows.get().max(1);
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if self.pipeline_detail_scroll != usize::MAX {
+                            let new = self.pipeline_detail_scroll.saturating_add(visible);
+                            self.pipeline_detail_scroll = if new >= max { usize::MAX } else { new };
+                        }
+                        needs_redraw = true;
+                    }
+
+                    // ── PageUp — scroll Log tab one page up (#307) ────────
+                    Key::Named(NamedKey::PageUp)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                    {
+                        let items = self.pipeline_log_list().items.len();
+                        let visible = self.last_main_visible_rows.get().max(1);
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        let current = if self.pipeline_detail_scroll == usize::MAX {
+                            max
+                        } else {
+                            self.pipeline_detail_scroll
+                        };
+                        self.pipeline_detail_scroll = current.saturating_sub(visible);
                         needs_redraw = true;
                     }
 
@@ -13383,9 +13661,9 @@ mod tests {
             pipeline_status: None,
             toasts: Vec::new(),
             next_toast_id: 0,
-            watch: None,
+            watch_pool: std::collections::HashMap::new(),
+            watch_focused: None,
             inject_chat: None,
-            inject_transcript: Vec::new(),
             inject_spinner_frame: 0,
             pipeline_detail_tab: PipelineDetailTab::default(),
             board_detail_tab: BoardDetailTab::default(),
@@ -13408,7 +13686,6 @@ mod tests {
             local_coord_version: None,
             last_main_visible_rows: std::cell::Cell::new(40),
             purge_days: 7,
-            watch_sse: None,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
             pipeline_focused_stage: None,
@@ -17771,6 +18048,9 @@ mod tests {
 
     // ── SSE watch overlay ────────────────────────────────────────────────────
 
+    /// The canonical assignment id used by test watch contexts.
+    const TEST_AID: &str = "test-id";
+
     /// Build a `WatchSseState` with a test sender and receiver pair.
     fn make_sse_state_pair() -> (WatchSseState, std::sync::mpsc::Sender<SseWatchMsg>) {
         let (tx, rx) = std::sync::mpsc::channel::<SseWatchMsg>();
@@ -17782,7 +18062,6 @@ mod tests {
             first_fail_at: None,
             done: false,
             host: "localhost".to_string(),
-            assignment_id: "test-id".to_string(),
             pending_tail: String::new(),
             line_times: Vec::new(),
             current_turn: 0,
@@ -17790,11 +18069,35 @@ mod tests {
         (state, tx)
     }
 
+    /// Build a focused `WatchContext` in the app's pool.
+    ///
+    /// Sets `watch_focused` so all watch-overlay code paths (j/k scroll, chat
+    /// opener, drain, etc.) behave as if the user pressed Enter on issue 42.
+    fn install_watch_ctx(app: &mut CoordApp, sse: WatchSseState) {
+        let aid = TEST_AID.to_string();
+        let state = WatchState {
+            assignment_id: aid.clone(),
+            machine: "remote".to_string(),
+            repo: "myrepo".to_string(),
+            issue_number: 42,
+            assignment_type: "work".to_string(),
+            scroll: usize::MAX,
+        };
+        let ctx = WatchContext {
+            state,
+            sse,
+            inject_transcript: Vec::new(),
+            last_focused_at: Instant::now(),
+        };
+        app.watch_pool.insert(aid.clone(), ctx);
+        app.watch_focused = Some(aid);
+    }
+
     #[test]
     fn drain_sse_watch_accumulates_lines() {
         let mut app = make_app_default();
         let (state, tx) = make_sse_state_pair();
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         // Each chunk's text has a trailing `\n` — that's what the agent
         // emits when the source bytes ended at a line boundary.
@@ -17804,7 +18107,7 @@ mod tests {
         let changed = app.drain_sse_watch();
         assert!(changed, "new lines should trigger redraw");
 
-        let sse = app.watch_sse.as_ref().unwrap();
+        let sse = &app.watch_pool[TEST_AID].sse;
         assert_eq!(sse.last_event_id, 200);
         assert_eq!(sse.lines, vec!["line one", "line two", "line three"]);
         assert!(!sse.done);
@@ -17819,7 +18122,7 @@ mod tests {
         // stop=? in the watch overlay.
         let mut app = make_app_default();
         let (state, tx) = make_sse_state_pair();
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         // Chunk 1 has the first half of a JSON line (NO trailing newline).
         tx.send(SseWatchMsg::Lines {
@@ -17834,7 +18137,7 @@ mod tests {
 
         app.drain_sse_watch();
 
-        let sse = app.watch_sse.as_ref().unwrap();
+        let sse = &app.watch_pool[TEST_AID].sse;
         assert_eq!(sse.last_event_id, 200);
         assert_eq!(
             sse.lines,
@@ -17848,7 +18151,7 @@ mod tests {
     fn drain_sse_watch_marks_done_on_end_event() {
         let mut app = make_app_default();
         let (state, tx) = make_sse_state_pair();
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         // Trailing `\n` so the chunk is complete (no partial line to flush).
         tx.send(SseWatchMsg::Lines { last_id: 50, text: "some output\n".to_string() }).unwrap();
@@ -17857,7 +18160,7 @@ mod tests {
         let changed = app.drain_sse_watch();
         assert!(changed);
 
-        let sse = app.watch_sse.as_ref().unwrap();
+        let sse = &app.watch_pool[TEST_AID].sse;
         assert!(sse.done, "done should be set after End event");
         assert_eq!(sse.last_event_id, 99);
         assert_eq!(sse.lines, vec!["some output"]);
@@ -17870,13 +18173,13 @@ mod tests {
         // result line).
         let mut app = make_app_default();
         let (state, tx) = make_sse_state_pair();
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         tx.send(SseWatchMsg::Lines { last_id: 10, text: "trailing partial".to_string() }).unwrap();
         tx.send(SseWatchMsg::Done { last_id: 11 }).unwrap();
 
         app.drain_sse_watch();
-        let sse = app.watch_sse.as_ref().unwrap();
+        let sse = &app.watch_pool[TEST_AID].sse;
         assert!(sse.done);
         assert_eq!(sse.lines, vec!["trailing partial"]);
     }
@@ -17885,14 +18188,14 @@ mod tests {
     fn drain_sse_watch_heartbeat_is_silent() {
         let mut app = make_app_default();
         let (state, tx) = make_sse_state_pair();
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         // Only heartbeat — channel still live.
         tx.send(SseWatchMsg::Heartbeat).unwrap();
         // Drain; no new content should be reported.
         let _ = app.drain_sse_watch();
 
-        let sse = app.watch_sse.as_ref().unwrap();
+        let sse = &app.watch_pool[TEST_AID].sse;
         assert!(sse.lines.is_empty());
         assert!(!sse.done);
         assert_eq!(sse.fail_count, 0);
@@ -17902,53 +18205,42 @@ mod tests {
     fn drain_sse_watch_reconnects_on_first_error() {
         let mut app = make_app_default();
         let (state, tx) = make_sse_state_pair();
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         // One error — should schedule reconnect but not set done.
         tx.send(SseWatchMsg::Error("connection refused".to_string())).unwrap();
         let changed = app.drain_sse_watch();
         assert!(changed);
 
-        let sse = app.watch_sse.as_ref().unwrap();
+        let sse = &app.watch_pool[TEST_AID].sse;
         assert_eq!(sse.fail_count, 1);
         assert!(!sse.done, "one error should not permanently stop reconnect");
-        // A new rx should have been installed (fail_count < 3 → reconnect).
-        // We can't inspect the new thread, but we can verify watch_sse is Some.
-        assert!(app.watch_sse.is_some());
+        // A pool entry should still exist (reconnect was attempted).
+        assert!(app.watch_pool.contains_key(TEST_AID));
     }
 
     #[test]
     fn drain_sse_watch_stops_after_three_errors() {
         let mut app = make_app_default();
         let (state, _tx) = make_sse_state_pair(); // tx unused; rx gets replaced below
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
-        // First two errors — reconnect each time.
-        for _ in 0..2 {
-            // Re-fetch the sender for the new rx installed by reconnect.
-            // Since we can't, we'll drive via Error on the *original* tx as
-            // long as it's still connected. The reconnect installs a new rx,
-            // but the old tx becomes orphaned. So subsequent drains on the
-            // new rx will eventually see Disconnected (which also counts as
-            // error). To keep the test simple, we manipulate fail_count
-            // directly for errors 2 and 3.
-            if let Some(sse) = &mut app.watch_sse {
-                sse.fail_count += 1;
-                sse.first_fail_at = Some(Instant::now());
-            }
+        // First two errors — manipulate fail_count directly.
+        if let Some(ctx) = app.watch_pool.get_mut(TEST_AID) {
+            ctx.sse.fail_count = 2;
+            ctx.sse.first_fail_at = Some(Instant::now());
         }
         // Now fail_count = 2; send one more error to push it to 3.
         let (state2, tx2) = make_sse_state_pair();
-        if let Some(sse) = &mut app.watch_sse {
-            sse.rx = state2.rx;
-            sse.fail_count = 2;
+        if let Some(ctx) = app.watch_pool.get_mut(TEST_AID) {
+            ctx.sse.rx = state2.rx;
         }
         tx2.send(SseWatchMsg::Error("third failure".to_string())).unwrap();
 
         let changed = app.drain_sse_watch();
         assert!(changed);
 
-        let sse = app.watch_sse.as_ref().unwrap();
+        let sse = &app.watch_pool[TEST_AID].sse;
         assert!(sse.done, "three errors should set done");
         assert_eq!(sse.fail_count, 3);
         // A toast should have been pushed.
@@ -17960,49 +18252,36 @@ mod tests {
         let mut app = make_app_default();
         let (mut state, tx) = make_sse_state_pair();
         state.done = true;
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         // Send lines — should be ignored because done=true.
         tx.send(SseWatchMsg::Lines { last_id: 10, text: "ignored".to_string() }).unwrap();
         let changed = app.drain_sse_watch();
         assert!(!changed, "done state should not trigger redraw");
-        assert!(app.watch_sse.as_ref().unwrap().lines.is_empty());
+        assert!(app.watch_pool[TEST_AID].sse.lines.is_empty());
     }
 
     #[test]
-    fn close_watch_drops_sse_state() {
+    fn close_watch_clears_focus_but_keeps_pool() {
+        // close_watch() should clear watch_focused (hiding the overlay) but
+        // leave the pool entry alive so background accumulation continues.
         let mut app = make_app_default();
         let (state, _tx) = make_sse_state_pair();
-        app.watch = Some(WatchState {
-            assignment_id: "x".to_string(),
-            machine: "m".to_string(),
-            repo: "r".to_string(),
-            issue_number: 1,
-            assignment_type: "work".to_string(),
-            scroll: usize::MAX,
-        });
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
+        assert!(app.watch_focused.is_some(), "should be focused after install");
 
         app.close_watch();
 
-        assert!(app.watch.is_none(), "watch should be cleared");
-        assert!(app.watch_sse.is_none(), "watch_sse should be dropped on close");
+        assert!(app.watch_focused.is_none(), "watch_focused should be cleared");
+        assert!(app.watch_pool.contains_key(TEST_AID), "pool entry should survive close_watch");
     }
 
     #[test]
     fn watch_log_list_shows_connecting_when_lines_empty() {
         let mut app = make_app_default();
-        app.watch = Some(WatchState {
-            assignment_id: "abc".to_string(),
-            machine: "remote".to_string(),
-            repo: "myrepo".to_string(),
-            issue_number: 42,
-            assignment_type: "work".to_string(),
-            scroll: usize::MAX,
-        });
         let (state, _tx) = make_sse_state_pair();
         // No lines yet, not done → "Connecting…" placeholder.
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         let list = app.watch_log_list();
         let first_text: String = list.items.iter()
@@ -18015,18 +18294,11 @@ mod tests {
     #[test]
     fn watch_log_list_shows_stream_ended_when_done() {
         let mut app = make_app_default();
-        app.watch = Some(WatchState {
-            assignment_id: "abc".to_string(),
-            machine: "remote".to_string(),
-            repo: "myrepo".to_string(),
-            issue_number: 42,
-            assignment_type: "work".to_string(),
-            scroll: usize::MAX,
-        });
         let (mut state, _tx) = make_sse_state_pair();
         state.lines.push("STATUS: done → done → confidence: high".to_string());
+        state.line_times.push(Instant::now());
         state.done = true;
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         let list = app.watch_log_list();
         let all_text: String = list.items.iter()
@@ -18039,16 +18311,8 @@ mod tests {
     #[test]
     fn watch_log_list_title_includes_refresh_hint() {
         let mut app = make_app_default();
-        app.watch = Some(WatchState {
-            assignment_id: "abc".to_string(),
-            machine: "remote".to_string(),
-            repo: "myrepo".to_string(),
-            issue_number: 42,
-            assignment_type: "work".to_string(),
-            scroll: usize::MAX,
-        });
         let (state, _tx) = make_sse_state_pair();
-        app.watch_sse = Some(state);
+        install_watch_ctx(&mut app, state);
 
         let list = app.watch_log_list();
         let title = list.title.as_ref().map(|t| {
