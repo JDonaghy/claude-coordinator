@@ -1295,6 +1295,22 @@ fn extract_text_block(json: &str) -> String {
     String::new()
 }
 
+/// Extract the first `thinking` block's text from an assistant message.
+///
+/// Reasoning-only turns (`"type":"thinking"` with no `text`/`tool_use` block)
+/// otherwise render as a bare "Turn N" with no visible output (#302 "empty
+/// turns"). Returns an empty string if no thinking block is found.
+fn extract_thinking_block(json: &str) -> String {
+    let marker = "\"type\":\"thinking\"";
+    if let Some(pos) = json.find(marker) {
+        let after = &json[pos + marker.len()..];
+        if let Some(text) = json_str(after, "thinking") {
+            return text;
+        }
+    }
+    String::new()
+}
+
 /// Parse SSE log lines with per-turn timing.  For each `[assistant]` event
 /// the elapsed time since the *previous* assistant event is appended to the
 /// label so slow turns stand out at a glance.
@@ -1393,7 +1409,16 @@ fn parse_json_event_inner(line: &str, turn_n: &mut usize, elapsed: Option<std::t
                     "[assistant] Turn {}{}  tool_use={}",
                     n, elapsed_str, tools.join(",")
                 ),
-                (false, false) => format!("[assistant] Turn {}{}", n, elapsed_str),
+                (false, false) => {
+                    // No text block and no tool call — a reasoning-only turn.
+                    // Surface the thinking text so the row isn't blank (#302).
+                    let thinking = collapse_ws(&extract_thinking_block(line));
+                    if thinking.is_empty() {
+                        format!("[assistant] Turn {}{}", n, elapsed_str)
+                    } else {
+                        format!("[assistant] Turn {}{}  💭 {}", n, elapsed_str, thinking)
+                    }
+                }
             };
             Some(activity_item(&summary, Color::rgb(150, 180, 240)))
         }
@@ -13265,6 +13290,19 @@ mod tests {
         let text: String = item.text.spans.iter().map(|s| s.text.as_str()).collect();
         assert!(text.contains(&long), "full text should be present: {text:?}");
         assert!(!text.contains('"'), "should not be debug-quoted: {text:?}");
+    }
+
+    #[test]
+    fn assistant_turn_shows_thinking_when_no_text_or_tools() {
+        // #302 "empty turns": a reasoning-only turn (thinking block, no text,
+        // no tool_use) must surface the thinking text, not render as bare
+        // "Turn N".
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[\
+            {\"type\":\"thinking\",\"thinking\":\"weighing the two options here\"}]}}";
+        let mut turn = 0;
+        let item = parse_json_event(line, &mut turn).expect("assistant item");
+        let text: String = item.text.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("weighing the two options"), "thinking missing: {text:?}");
     }
 
     #[test]
