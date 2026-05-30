@@ -2758,6 +2758,10 @@ pub struct CoordApp {
     board_detail_tab: BoardDetailTab,
     /// Scroll offset for the issue body on the Issue tab.
     pipeline_detail_scroll: usize,
+    /// Horizontal scroll offset (chars) for the Log tab list (#302). Left/Right
+    /// (and h/l) adjust it; the quadraui ListView rasteriser honors `h_scroll`
+    /// and paints a horizontal scrollbar when content overflows the viewport.
+    pipeline_log_hscroll: usize,
     /// Cache of remotely-fetched log items, keyed by assignment ID.
     ///
     /// Each entry stores `(fetched_at, items)`. Entries older than 30 s are
