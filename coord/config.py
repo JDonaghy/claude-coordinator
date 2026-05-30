@@ -117,6 +117,13 @@ class ModelsConfig:
     high); when a worker fails or gets stuck, the coordinator escalates to
     the next entry via `next_model`.  `labels` is a per-issue-label override
     (e.g. ``documentation: haiku``) consumed by the brain / planner.
+
+    `versions` pins an alias to an exact model id, e.g.
+    ``{sonnet: claude-sonnet-4-6, opus: claude-opus-4-7}``.  When set, the
+    coordinator translates the alias to the exact id before passing it to
+    ``claude -p --model`` on the worker.  Aliases not present in the map
+    pass through unchanged, so ``claude -p`` falls back to its CLI default
+    (which today is whatever the installed claude-cli treats as latest).
     """
 
     default: str = "sonnet"
@@ -124,6 +131,7 @@ class ModelsConfig:
         default_factory=lambda: ["haiku", "sonnet", "opus"]
     )
     labels: dict[str, str] = field(default_factory=dict)
+    versions: dict[str, str] = field(default_factory=dict)
 
     def next_model(self, current: str) -> str:
         """Return the next model in the escalation ladder.
@@ -138,6 +146,16 @@ class ModelsConfig:
         if idx + 1 < len(self.escalation):
             return self.escalation[idx + 1]
         return current
+
+    def resolve(self, alias: str | None) -> str | None:
+        """Resolve an alias to its pinned exact model id, if configured.
+
+        Returns *alias* unchanged when no mapping exists, and ``None`` when
+        *alias* is ``None`` (preserves the "omit --model" code path).
+        """
+        if alias is None:
+            return None
+        return self.versions.get(alias, alias)
 
 
 @dataclass
@@ -657,6 +675,17 @@ def _parse_models(raw: Any) -> ModelsConfig:
                 "models.labels must be a mapping of label name → model alias"
             )
         cfg.labels = dict(value)
+
+    if "versions" in raw:
+        value = raw["versions"]
+        if not isinstance(value, dict) or not all(
+            isinstance(k, str) and k and isinstance(v, str) and v
+            for k, v in value.items()
+        ):
+            raise ConfigError(
+                "models.versions must be a mapping of alias → exact model id"
+            )
+        cfg.versions = dict(value)
 
     return cfg
 

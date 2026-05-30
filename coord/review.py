@@ -661,6 +661,15 @@ def dispatch_review(
         default_branch=repo.default_branch,
     )
 
+    # Pin the reviewer's model.  Without this the payload omits `model`
+    # and the agent lets `claude -p` pick its CLI default, which became
+    # Opus 4.8 in claude-code 2.1.x — silently making every review the
+    # most expensive model available.  Use the configured default
+    # (typically sonnet) and resolve through models.versions so the wire
+    # carries an exact id when one is pinned.
+    review_model_alias = config.models.default
+    review_model_wire = config.models.resolve(review_model_alias)
+
     payload = {
         "repo_name": completed.repo_name,
         "repo_path": repo_path,
@@ -671,6 +680,7 @@ def dispatch_review(
         "files_forbidden": [],
         "pull_repos": [],
         "type": "review",
+        "model": review_model_wire,
         "system_prompt": REVIEWER_SYSTEM_PROMPT,
         "review_target": str(pr["number"]) if pr else completed.branch,
         # #255: review checkout uses the PR branch, but the agent's worktree
@@ -704,6 +714,7 @@ def dispatch_review(
         type="review",
         review_target=str(pr["number"]) if pr else completed.branch,
         review_of_assignment_id=completed.assignment_id,
+        model=review_model_alias,
     )
     board.active.append(review_assignment)
 

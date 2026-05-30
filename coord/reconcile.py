@@ -59,6 +59,9 @@ def _reassign(
     repo_path = machine.repo_path(failed.repo_name)
 
     retry_model = model if model is not None else failed.model
+    # The Assignment keeps the alias for legibility; the wire payload is
+    # resolved through models.versions when an exact id is pinned.
+    retry_model_wire = config.models.resolve(retry_model)
 
     repo_cfg = config.repo(failed.repo_name)
     payload = {
@@ -71,7 +74,7 @@ def _reassign(
         "files_forbidden": failed.files_forbidden,
         "pull_repos": [],
         "type": "work",
-        "model": retry_model,
+        "model": retry_model_wire,
         # #255: retry inherits the repo's configured default branch as the
         # worker's integration base.
         "branch": (repo_cfg.default_branch if repo_cfg is not None else None) or "main",

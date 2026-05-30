@@ -56,7 +56,10 @@ def dispatch(
         files_forbidden = list(repo.coordinator_only_files)
 
     # Resolve model: proposal override → config default → None (let claude pick).
+    # The board/DB stores the alias for legibility; only the wire payload is
+    # translated to an exact model id via models.versions (when configured).
     model = proposal.model if proposal.model else config.models.default
+    wire_model = config.models.resolve(model)
 
     # #255: pin the worker's branch base to the repo's configured default
     # branch.  Without this the agent fell back to a hardcoded "main", which
@@ -76,7 +79,7 @@ def dispatch(
         "files_forbidden": files_forbidden,
         "pull_repos": list(pull_repos),
         "deny_commands": deny_commands,
-        "model": model,
+        "model": wire_model,
         "type": proposal.type,
         "branch": default_branch,
     }

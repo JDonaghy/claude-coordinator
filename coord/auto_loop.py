@@ -430,8 +430,11 @@ def _dispatch_fix(
     }
     # Escalated model per bounce iteration (None when pipeline
     # .escalate_fix_model is disabled — preserves today's no-model behaviour).
+    # The board record keeps the alias for legibility; the wire payload is
+    # resolved through models.versions so claude -p gets an exact id when
+    # one is pinned.
     if model is not None:
-        payload["model"] = model
+        payload["model"] = config.models.resolve(model)
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     client = http_client or httpx
