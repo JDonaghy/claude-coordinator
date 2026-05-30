@@ -3305,6 +3305,15 @@ impl CoordApp {
     /// Called whenever the Log tab becomes active.  Opens (or keeps open)
     /// the SSE stream for the selected issue's assignment so the Log tab
     /// shows live content without the HTTP-cache-TTL "Loading log…" flicker.
+    /// True when the Pipeline view's Log tab is the active scroller. On this
+    /// tab the visible content is `pipeline_log_list` (scrolled via
+    /// `pipeline_detail_scroll`), even though a watch is open for SSE — so
+    /// scroll input must route to the Log list, not the watch overlay (#308).
+    fn on_pipeline_log_tab(&self) -> bool {
+        self.active_view == SidebarView::Pipeline
+            && self.pipeline_detail_tab == PipelineDetailTab::Log
+    }
+
     fn ensure_log_tab_sse(&mut self) {
         // If SSE is already open (or done) for the right assignment, leave it alone.
         if let (Some(w), Some(sse)) = (&self.watch, &self.watch_sse) {
@@ -5658,7 +5667,23 @@ impl CoordApp {
                 return StageStatus::Active;
             }
         }
-        match latest.and_then(|a| a.test_state.as_deref()) {
+        // #310: a review bounce creates a new fix-work assignment that carries
+        // an *empty* test_state. The test genuinely passed on the earlier work,
+        // so don't revert Test to Pending (which would strand the Merge "Go"
+        // button via prior_all_done). Resolve the verdict from the most recent
+        // work assignment that actually carries one. A later re-test that
+        // failed will itself carry test_state="failed" and win as the most
+        // recent verdict; an in-flight re-test is handled above.
+        let verdict = work
+            .iter()
+            .filter(|a| a.test_state.as_deref().map(|s| !s.is_empty()).unwrap_or(false))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .and_then(|a| a.test_state.as_deref());
+        match verdict {
             Some("passed") | Some("skipped") => StageStatus::Done,
             Some("failed") => StageStatus::Failed,
             _ => StageStatus::Pending,
@@ -9238,8 +9263,10 @@ impl CoordApp {
         // a stick-to-bottom offset that keeps the last line on screen.
         self.last_main_visible_rows.set(visible.max(1));
         // Watch overlay takes over the main panel; route scrollwheel to it
-        // regardless of which view is active underneath.
-        if self.watch.is_some() {
+        // regardless of which view is active underneath. Exception (#308): on
+        // the Pipeline Log tab the watch is only SSE bookkeeping — the visible
+        // scroller is the Log list, so let the match below handle the wheel.
+        if self.watch.is_some() && !self.on_pipeline_log_tab() {
             // SSE log lines drive the count when present; fall back to the
             // remote-log cache when SSE isn't yet connected.
             let items = self
@@ -11939,8 +11966,14 @@ impl ShellApp for CoordApp {
                         self.close_watch();
                         needs_redraw = true;
                     }
+                    // #308: the Pipeline Log tab always opens a watch (for SSE
+                    // streaming) but renders the `pipeline_log_list` scroller,
+                    // driven by `pipeline_detail_scroll` — NOT the watch
+                    // overlay's `w.scroll`. So on that tab these watch j/k arms
+                    // must yield to the dedicated Log-tab arms below; otherwise
+                    // they swallow j/k and the visible list never moves.
                     Key::Char('j') | Key::Named(NamedKey::Down)
-                        if self.watch.is_some() =>
+                        if self.watch.is_some() && !self.on_pipeline_log_tab() =>
                     {
                         if let Some(w) = self.watch.as_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
@@ -11949,7 +11982,7 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
-                        if self.watch.is_some() =>
+                        if self.watch.is_some() && !self.on_pipeline_log_tab() =>
                     {
                         if let Some(w) = self.watch.as_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
@@ -15300,6 +15333,30 @@ mod tests {
     }
 
     #[test]
+    fn test_stage_survives_review_bounce_fix_work_with_no_verdict() {
+        // #310: a review bounce creates a new fix-work assignment (dispatched
+        // later) that carries no test_state. The earlier work genuinely passed.
+        // Test must stay Done — reverting to Pending strands the Merge "Go"
+        // button via prior_all_done.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data.assignments.push(_work_assignment("w2", 200.0, "done", None));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Done);
+    }
+
+    #[test]
+    fn test_stage_failed_when_later_retest_failed_after_prior_pass() {
+        // A later fix-work that was actually re-tested and FAILED must win over
+        // the earlier pass — the most recent carrier of a verdict decides.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data.assignments.push(_work_assignment("w2", 200.0, "done", Some("failed")));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Failed);
+    }
+
+    #[test]
     fn test_stage_failed_when_failed_verdict() {
         let mut app = make_pipeline_app_with_test_gate();
         app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
@@ -15318,13 +15375,16 @@ mod tests {
 
     #[test]
     fn test_stage_uses_latest_work_verdict() {
-        // If Work is re-dispatched, the new Work's test_state controls.
-        // The stale older Work's verdict must not leak through.
+        // When a re-dispatched Work carries its OWN verdict, that latest
+        // verdict controls — a stale older verdict must not leak through.
+        // (The case where the latest fix-work has NO verdict is #310:
+        // the prior pass is inherited — see
+        // `test_stage_survives_review_bounce_fix_work_with_no_verdict`.)
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
-        app.data.assignments.push(_work_assignment("w2", 300.0, "done", None));
+        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        app.data.assignments.push(_work_assignment("w2", 300.0, "done", Some("passed")));
         let issue = &app.pipeline_issues[0];
-        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Pending);
+        assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Done);
     }
 
     #[test]
