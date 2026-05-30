@@ -3563,6 +3563,8 @@ impl CoordApp {
             scroll_offset: scroll,
             has_focus: false,
             bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -4478,6 +4480,8 @@ impl CoordApp {
             scroll_offset: self.machine_scroll,
             has_focus,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -4526,6 +4530,8 @@ impl CoordApp {
                 scroll_offset: self.detail_scroll,
                 has_focus: false,
                 bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
             };
         }
 
@@ -4678,6 +4684,8 @@ impl CoordApp {
             scroll_offset: self.detail_scroll,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -4977,6 +4985,8 @@ impl CoordApp {
             scroll_offset: self.machine_detail_scroll,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -7202,6 +7212,8 @@ impl CoordApp {
             scroll_offset: 0,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -7434,6 +7446,8 @@ impl CoordApp {
             scroll_offset: 0,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -7532,6 +7546,8 @@ impl CoordApp {
             scroll_offset: self.pipeline_stage_content_scroll,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -8348,6 +8364,8 @@ impl CoordApp {
             scroll_offset: scroll,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -8377,6 +8395,8 @@ impl CoordApp {
                 scroll_offset: 0,
                 has_focus: false,
                 bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
             };
         };
 
@@ -8395,6 +8415,8 @@ impl CoordApp {
                 scroll_offset: 0,
                 has_focus: false,
                 bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
             };
         }
 
@@ -8478,6 +8500,8 @@ impl CoordApp {
             scroll_offset: self.pipeline_stage_content_scroll,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -11118,6 +11142,8 @@ impl CoordApp {
             scroll_offset: 0,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -12914,6 +12940,8 @@ fn issue_body_list(
         scroll_offset,
         has_focus: false,
         bordered: false,
+        h_scroll: 0,
+        max_content_width: None,
     }
 }
 
