@@ -3059,6 +3059,7 @@ impl CoordApp {
             pipeline_detail_tab: PipelineDetailTab::default(),
             board_detail_tab: BoardDetailTab::default(),
             pipeline_detail_scroll: 0,
+            pipeline_log_hscroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: Some(start_data_load()),
             fetch_error: None,
@@ -8267,7 +8268,10 @@ impl CoordApp {
             rows.push(kv_item("", "", None));
         }
         for line in &lines[tail_start..] {
-            let trimmed: String = line.chars().take(180).collect();
+            // #302: don't hard-clip at 180 — the Log tab is horizontally
+            // scrollable. Keep a generous cap so a pathological single-line
+            // blob can't blow up the row, but let normal lines through whole.
+            let trimmed: String = line.chars().take(4000).collect();
             rows.push(kv_item("", &format!("   {trimmed}"), None));
         }
         rows
@@ -8356,6 +8360,18 @@ impl CoordApp {
         } else {
             self.pipeline_detail_scroll
         };
+        // #302: measure the widest row so the rasteriser knows when content
+        // overflows and should paint a horizontal scrollbar. Width = the 3-char
+        // "   " indent the rows carry + the item's visible text width.
+        let max_content_width = items
+            .iter()
+            .map(|it| 3 + it.text.visible_width())
+            .max();
+        // Clamp the horizontal offset so it can't scroll past the content.
+        let h_scroll = match max_content_width {
+            Some(w) => self.pipeline_log_hscroll.min(w.saturating_sub(1)),
+            None => 0,
+        };
         ListView {
             id: WidgetId::new("pipeline-log"),
             title: None,
@@ -8364,8 +8380,8 @@ impl CoordApp {
             scroll_offset: scroll,
             has_focus: false,
             bordered: false,
-            h_scroll: 0,
-            max_content_width: None,
+            h_scroll,
+            max_content_width,
         }
     }
 
@@ -12175,6 +12191,27 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── h/l (Left/Right) — horizontal scroll the Log tab (#302)
+                    // Lines are no longer clipped at 60 chars; scroll sideways
+                    // to read long turn text / commands. The rasteriser clamps
+                    // the offset to content width and paints an h-scrollbar.
+                    Key::Char('l') | Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                    {
+                        self.pipeline_log_hscroll =
+                            self.pipeline_log_hscroll.saturating_add(8);
+                        needs_redraw = true;
+                    }
+                    Key::Char('h') | Key::Named(NamedKey::Left)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                    {
+                        self.pipeline_log_hscroll =
+                            self.pipeline_log_hscroll.saturating_sub(8);
+                        needs_redraw = true;
+                    }
+
                     // ── Down / j ─────────────────────────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down) => {
                         match self.active_view {
@@ -13227,6 +13264,7 @@ mod tests {
             pipeline_detail_tab: PipelineDetailTab::default(),
             board_detail_tab: BoardDetailTab::default(),
             pipeline_detail_scroll: 0,
+            pipeline_log_hscroll: 0,
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: None,
             fetch_error: None,
