@@ -3366,17 +3366,37 @@ impl CoordApp {
     }
 
     fn ensure_log_tab_sse(&mut self) {
-        // If SSE is already open (or done) for the right assignment, leave it alone.
-        if let (Some(w), Some(sse)) = (&self.watch, &self.watch_sse) {
-            let issue_id = self.pipeline_sel
-                .and_then(|i| self.pipeline_issues.get(i))
-                .map(|iss| iss.number);
-            if issue_id == Some(w.issue_number) && sse.assignment_id == w.assignment_id {
-                // SSE matches — keep it whether live or done (done shows "stream ended" footer).
+        // Compute the assignment id that pipeline_log_list would render for the
+        // current selection. The picker MUST stay in sync with pipeline_log_list
+        // (prefer running, fall back to most recent by dispatched_at). Without
+        // this, auto_loop transitions (work→review→work→review on the same issue)
+        // leave the SSE pinned to a stale assignment_id and the Log tab falls
+        // back to HTTP polling with its 'Loading log…' flicker.
+        let pick_id = self.pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .and_then(|issue| {
+                let local_repo = issue.coord_repo.as_deref();
+                self.data.assignments.iter()
+                    .filter(|a| a.issue_number == issue.number)
+                    .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+                    .find(|a| a.status == "running")
+                    .or_else(|| {
+                        self.data.assignments.iter()
+                            .filter(|a| a.issue_number == issue.number)
+                            .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+                            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
+                                .unwrap_or(std::cmp::Ordering::Equal))
+                    })
+                    .map(|a| a.id.clone())
+            });
+        // SSE already open for the exact assignment we'd render? Keep it
+        // (live or done — done shows "stream ended" footer).
+        if let (Some(w), Some(sse), Some(target)) = (&self.watch, &self.watch_sse, pick_id.as_ref()) {
+            if w.assignment_id == *target && sse.assignment_id == *target {
                 return;
             }
         }
-        // No SSE yet, or it's for a different assignment — open for the current issue.
+        // No SSE, or attached to a stale assignment — re-open for current pick.
         self.open_watch_for_selected_issue();
     }
 
@@ -12941,6 +12961,12 @@ impl ShellApp for CoordApp {
         // doesn't reflect until the user moves the mouse or presses a key.
         let mut needs_redraw = self.apply_pending_data();
         needs_redraw |= self.run_periodic_work();
+        // After data has been applied, the Log tab's preferred assignment may
+        // have changed (e.g. auto_loop dispatched a new review/fix). Re-attach
+        // SSE so we don't fall back to the polling 'Loading log…' flicker.
+        if self.on_pipeline_log_tab() {
+            self.ensure_log_tab_sse();
+        }
         if needs_redraw {
             Reaction::Redraw
         } else {
