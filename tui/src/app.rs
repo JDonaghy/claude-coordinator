@@ -6099,6 +6099,20 @@ impl CoordApp {
         self.pipeline_stage_content_scroll = 0;
     }
 
+    /// #303: The single button rendered in the pipeline button bar above the
+    /// stage row.  Returns `(label, stage_index)` for the stage that owns the
+    /// action (today: at most one `[Go]` or `[Retry]` per pipeline), or
+    /// `None` when no stage is dispatchable.
+    ///
+    /// Uses the same widget builder as `dispatch_pipeline_active_go` so the
+    /// bar and the Enter keybind dispatch the exact same stage.
+    fn pipeline_action_button(&self) -> Option<(String, usize)> {
+        let view = self.build_pipeline_widget()?;
+        view.stages.iter().enumerate().find_map(|(i, s)| {
+            s.action.as_ref().map(|label| (label.clone(), i))
+        })
+    }
+
     fn build_pipeline_widget(&self) -> Option<QuiPipelineView> {
         let idx = self.pipeline_sel?;
         let issue = self.pipeline_issues.get(idx)?;
@@ -9510,17 +9524,45 @@ impl CoordApp {
                         main_b.width,
                         (main_b.height - tab_h).max(0.0),
                     );
-                    let pv_rect = pipeline_detail_pv_rect(content_rect, lh);
-                    let layout = tui_pipeline_layout(&view, pv_rect);
+                    // #303: click on the button bar dispatches the active
+                    // action. Bar lives at the top of content_rect when any
+                    // stage has a dispatchable action.
+                    let action_btn = self.pipeline_action_button();
+                    let bar_h = pipeline_action_bar_height(action_btn.is_some(), lh);
+                    if bar_h > 0.0
+                        && pos.y >= content_rect.y
+                        && pos.y < content_rect.y + bar_h
+                        && pos.x >= content_rect.x
+                        && pos.x < content_rect.x + content_rect.width
+                    {
+                        if let Some((_, stage_idx)) = action_btn {
+                            self.dispatch_pipeline_stage(stage_idx);
+                            return true;
+                        }
+                    }
+                    // Stage row sits below the bar.
+                    let pv_origin = Rect::new(
+                        content_rect.x,
+                        content_rect.y + bar_h,
+                        content_rect.width,
+                        (content_rect.height - bar_h).max(0.0),
+                    );
+                    let pv_rect = pipeline_detail_pv_rect(pv_origin, lh);
+                    // Match the render path: stripped view → action_height=0,
+                    // so action_bounds is always None and only Body hits fire.
+                    let render_view = pipeline_view_for_render(&view);
+                    let layout = tui_pipeline_layout(&render_view, pv_rect);
                     match layout.hit_test(pos.x, pos.y) {
                         PipelineHit::Action(stage_idx) => {
+                            // Defensive: with action-stripped view this branch
+                            // shouldn't fire, but keep the dispatch path wired
+                            // in case a future stage carries an action again.
                             self.dispatch_pipeline_stage(stage_idx);
                             return true;
                         }
                         PipelineHit::Body(stage_idx) => {
-                            // Click on a stage box (outside the action
-                            // button) — set focus so the content panel
-                            // below switches to this stage's output.
+                            // Click on a stage box — set focus so the content
+                            // panel below switches to this stage's output.
                             self.pipeline_focused_stage = Some(stage_idx);
                             self.pipeline_stage_content_scroll = 0;
                             return true;
@@ -11865,15 +11907,47 @@ impl ShellApp for CoordApp {
 
                     match self.pipeline_detail_tab {
                         PipelineDetailTab::Pipeline => {
-                            let pv_rect = pipeline_detail_pv_rect(content_rect, lh);
+                            // #303: button bar above the stage row when a
+                            // stage is dispatchable.  Eats `bar_h` from the
+                            // top of `content_rect`; the stage row and meta
+                            // body shift down by the same amount.
+                            let action_btn = self.pipeline_action_button();
+                            let bar_h = pipeline_action_bar_height(action_btn.is_some(), lh);
+                            let bar_rect = Rect::new(content_rect.x, content_rect.y, content_rect.width, bar_h);
+                            let pv_origin = Rect::new(
+                                content_rect.x,
+                                content_rect.y + bar_h,
+                                content_rect.width,
+                                (content_rect.height - bar_h).max(0.0),
+                            );
+                            let pv_rect = pipeline_detail_pv_rect(pv_origin, lh);
                             let meta_rect = Rect::new(
                                 content_rect.x,
                                 pv_rect.y + pv_rect.height,
                                 content_rect.width,
-                                (content_rect.height - pv_rect.height).max(0.0),
+                                (content_rect.height - bar_h - pv_rect.height).max(0.0),
                             );
+                            if let Some((label, _)) = action_btn {
+                                let toolbar = Toolbar {
+                                    id: WidgetId::new("pipeline-action-bar"),
+                                    buttons: vec![ToolbarButton::Action {
+                                        id: WidgetId::new("pipeline-action:dispatch"),
+                                        label: label.clone(),
+                                        icon: None,
+                                        key_hint: Some("⏎".to_string()),
+                                        enabled: true,
+                                        is_active: false,
+                                        tooltip: format!(
+                                            "Dispatch {} for the active stage (Enter)",
+                                            label.to_lowercase()
+                                        ),
+                                    }],
+                                    bg: None,
+                                };
+                                backend.draw_toolbar(bar_rect, &toolbar, None, None);
+                            }
                             if let Some(view) = self.build_pipeline_widget() {
-                                backend.draw_pipeline_view(pv_rect, &view);
+                                backend.draw_pipeline_view(pv_rect, &pipeline_view_for_render(&view));
                             } else {
                                 backend.draw_list(pv_rect, &self.pipeline_placeholder_list());
                             }
@@ -13264,6 +13338,34 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
     (content_h / lh) as usize
 }
 
+/// #303: Strip every stage's `action` field so quadraui's `draw_pipeline_view`
+/// renders the boxes as purely informational (status icon + label + elapsed),
+/// no inline `[Go]`/`[Retry]` button.  The action info lives on the widget
+/// returned by `build_pipeline_widget` (used by `dispatch_pipeline_active_go`
+/// and `pipeline_action_button`); the visible buttons move to the bar above.
+///
+/// Pass the *stripped* view to both `draw_pipeline_view` AND
+/// `tui_pipeline_layout` so paint and hit-test agree on the (now-shrunk)
+/// stage-box bounds — quadraui drops the action row when no stage has one.
+fn pipeline_view_for_render(view: &QuiPipelineView) -> QuiPipelineView {
+    QuiPipelineView {
+        id: view.id.clone(),
+        stages: view.stages.iter().map(|s| QuiPipelineStage {
+            label: s.label.clone(),
+            status: s.status.clone(),
+            action: None,
+        }).collect(),
+        focused_stage: view.focused_stage,
+    }
+}
+
+/// #303: Height of the pipeline button bar strip above the stage row when
+/// any stage has a dispatchable action.  Zero when the bar is empty (no
+/// vertical space stolen from the stage row in that case).
+fn pipeline_action_bar_height(has_button: bool, lh: f32) -> f32 {
+    if has_button { lh * 1.5 } else { 0.0 }
+}
+
 /// Carve out the rect used by the PipelineView primitive at the top of the
 /// Pipeline detail pane.  Reserves 6 rows by default (icon row + label row
 /// + action row + 1 row of padding/border), clamped to ≤ 50 % of the
@@ -14258,56 +14360,87 @@ mod tests {
         assert!(!changed);
     }
 
-    // #201: clicking a Pipeline stage's action button must dispatch.
-    // The wiring goes through PipelineHit::Action(stage_idx) →
-    // dispatch_pipeline_stage(idx). This test verifies the click reaches
-    // the dispatcher; an integration test of dispatch itself lives elsewhere.
+    // #303: with the inline `[Go]` button moved to the bar above the row,
+    // clicking inside a stage box sets focus (Body hit) rather than
+    // dispatching. The dispatch path now lives behind the button bar — see
+    // `mouse_click_on_pipeline_action_bar_dispatches` below.
     #[test]
-    fn mouse_click_on_pipeline_stage_action_dispatches() {
+    fn mouse_click_on_pipeline_stage_body_focuses() {
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
         app.pipeline_sel = Some(0);
-        // No assignments → Work stage is Pending with no predecessors, so it
-        // gets a [Go] action button per build_pipeline_widget.
 
         // Use a large content rect so the layout produces well-separated stages.
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let lh: f32 = 1.0;
-        // #272: panel toolbar is now 2 cells tall (was 1.4) since the
-        // quadraui rasteriser paints multi-row toolbars.
         let tb_h = lh * 2.0;
-        let tab_h = lh * 1.4; // pipeline detail tab bar below toolbar
-        let after_toolbar = Rect::new(
-            main_b.x,
-            main_b.y + tb_h,
-            main_b.width,
-            (main_b.height - tb_h).max(0.0),
-        );
+        let tab_h = lh * 1.4;
         let content_rect = Rect::new(
-            after_toolbar.x,
-            after_toolbar.y + tab_h,
-            after_toolbar.width,
-            (after_toolbar.height - tab_h).max(0.0),
+            main_b.x,
+            main_b.y + tb_h + tab_h,
+            main_b.width,
+            (main_b.height - tb_h - tab_h).max(0.0),
         );
-        let pv_rect = pipeline_detail_pv_rect(content_rect, lh);
+        // Skip the bar; the stage row sits below it.
+        let bar_h = pipeline_action_bar_height(
+            app.pipeline_action_button().is_some(), lh);
+        let pv_origin = Rect::new(
+            content_rect.x,
+            content_rect.y + bar_h,
+            content_rect.width,
+            (content_rect.height - bar_h).max(0.0),
+        );
+        let pv_rect = pipeline_detail_pv_rect(pv_origin, lh);
+        // Match the production hit-test: stripped view, no action bounds.
         let view = app.build_pipeline_widget().expect("widget");
-        let layout = tui_pipeline_layout(&view, pv_rect);
+        let layout = tui_pipeline_layout(&pipeline_view_for_render(&view), pv_rect);
 
-        // Work is stage index 0 and should carry the [Go] action.
         let work_stage = &layout.stages[0];
-        let ab = work_stage
-            .action_bounds
-            .expect("Work stage should have a [Go] action button");
-        let click_pos = Point::new(ab.x + ab.width / 2.0, ab.y + ab.height / 2.0);
+        let bb = work_stage.box_bounds;
+        let click_pos = Point::new(bb.x + bb.width / 2.0, bb.y + bb.height / 2.0);
 
-        // mouse_main_click returns true if state changed (dispatch attempted).
-        // The dispatch may toast an error if no machine is reachable in tests,
-        // but the wiring itself is what we're verifying — the click reaches
-        // dispatch_pipeline_stage, which is the integration the user lost in
-        // a prior session.
         let result = app.mouse_main_click(click_pos, main_b, lh);
-        assert!(result, "click on stage action button should be handled");
+        assert!(result, "click on stage body should be handled");
+        assert_eq!(app.pipeline_focused_stage, Some(0),
+            "click on Work box should set pipeline_focused_stage = 0");
+    }
+
+    // #303: clicking the pipeline action bar (above the stage row) dispatches
+    // the active stage's action — same path the inline `[Go]` button used to
+    // own. With no assignments, Work is Pending and carries the [Go]; the bar
+    // click should reach `dispatch_pipeline_stage(0)`.
+    #[test]
+    fn mouse_click_on_pipeline_action_bar_dispatches() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        // Sanity: with no assignments, Work owns the [Go] action.
+        let (label, idx) = app.pipeline_action_button()
+            .expect("Work should carry a [Go] action when pristine");
+        assert_eq!(label, "Go");
+        assert_eq!(idx, 0);
+
+        let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
+        let lh: f32 = 1.0;
+        let tb_h = lh * 2.0;
+        let tab_h = lh * 1.4;
+        let content_rect = Rect::new(
+            main_b.x,
+            main_b.y + tb_h + tab_h,
+            main_b.width,
+            (main_b.height - tb_h - tab_h).max(0.0),
+        );
+        let bar_h = pipeline_action_bar_height(true, lh);
+        // Click in the middle of the bar strip.
+        let click_pos = Point::new(
+            content_rect.x + content_rect.width / 2.0,
+            content_rect.y + bar_h / 2.0,
+        );
+        let result = app.mouse_main_click(click_pos, main_b, lh);
+        assert!(result, "click on action bar should be handled");
     }
 
     // ── Scroll offset preservation across refresh ─────────────────────────────
