@@ -978,6 +978,10 @@ struct BoardData {
     /// Coord-local repo name → GitHub `owner/repo` slug (and inverse).
     /// Empty when no config snapshot has been written yet.
     pipeline_repos: Vec<(String, String)>,
+    /// #296: coord-local repo name → `run_cmd` shell command from
+    /// `coordinator.yml`.  Only repos that define `run_cmd` are present.
+    /// Surfaced in the Test stage detail panel as the "Run" row.
+    pipeline_repo_run_cmds: std::collections::HashMap<String, String>,
     /// Mirror of `dispatch.require_plan` from coordinator.yml.  When true,
     /// the pipeline prepends a Plan stage before Work, and Work [Go]
     /// becomes "approve the plan and dispatch work" rather than fresh
@@ -1920,6 +1924,7 @@ fn load_data() -> BoardData {
         pipeline_tracked_labels,
         pipeline_repos,
         pipeline_require_plan,
+        pipeline_repo_run_cmds,
     ) = load_pipeline_meta(&conn);
 
     // ── Query cached structured plans ──────────────────────────────────────
@@ -1957,6 +1962,7 @@ fn load_data() -> BoardData {
         pipeline_tracked_labels,
         pipeline_repos,
         pipeline_require_plan,
+        pipeline_repo_run_cmds,
         plans,
     }
 }
@@ -2602,15 +2608,21 @@ fn fetch_ci_check_summary(repo_slug: &str, pr_number: i64) -> Result<CiCheckSumm
 
 /// Read pipeline-related entries from the `board_meta` table.
 ///
-/// Returns ``(default_gates, tracked_labels, repos, require_plan)`` with
-/// the documented fallbacks when the keys are missing or unparseable:
-/// gates default to ``["review", "merge"]``, tracked labels to
-/// ``["coord"]``, repos to an empty list, and require_plan to ``false``.
-/// Repos are returned as ``(coord_name, github_slug)`` pairs preserving
-/// insertion order.
+/// Returns ``(default_gates, tracked_labels, repos, require_plan,
+/// repo_run_cmds)`` with the documented fallbacks when the keys are missing
+/// or unparseable: gates default to ``["review", "merge"]``, tracked labels
+/// to ``["coord"]``, repos to an empty list, require_plan to ``false``, and
+/// repo_run_cmds to an empty map.  Repos are returned as
+/// ``(coord_name, github_slug)`` pairs preserving insertion order.
 fn load_pipeline_meta(
     conn: &Connection,
-) -> (Vec<String>, Vec<String>, Vec<(String, String)>, bool) {
+) -> (
+    Vec<String>,
+    Vec<String>,
+    Vec<(String, String)>,
+    bool,
+    std::collections::HashMap<String, String>,
+) {
     fn read_key(conn: &Connection, key: &str) -> Option<String> {
         conn.query_row(
             "SELECT value FROM board_meta WHERE key = ?1",
@@ -2644,7 +2656,22 @@ fn load_pipeline_meta(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    (default_gates, tracked_labels, repos, require_plan)
+    // #296: repo_name → run_cmd map from coordinator.yml.  Only present
+    // for repos that set `run_cmd`; others are absent from the map.
+    let repo_run_cmds: std::collections::HashMap<String, String> =
+        read_key(conn, "pipeline_repo_run_cmds")
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|val| match val {
+                serde_json::Value::Object(map) => Some(
+                    map.into_iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+    (default_gates, tracked_labels, repos, require_plan, repo_run_cmds)
 }
 
 // ─── CoordApp ─────────────────────────────────────────────────────────────────
@@ -2769,6 +2796,11 @@ pub struct CoordApp {
     /// `usize` is the work-assignment index in `self.data.assignments` that
     /// the verdict will be applied to.
     pending_test_fail: Option<(usize, String)>,
+    /// #296: inline reason input for "report & dispatch fix" (key `r` in
+    /// Pipeline view when Test gate is actionable).  `Some(buf)` means we are
+    /// accumulating the description; Enter records test_state=failed AND
+    /// dispatches `coord fix <work_id> --guidance <buf>`.  Esc cancels.
+    pending_report_fix: Option<String>,
     /// #245: pending `coord merge --force-merge` confirmation.  `Some(repo)`
     /// means the user pressed `m` while the "Checks failed" hint was visible
     /// and we're waiting for one-key confirmation before bypassing the CI
@@ -3035,6 +3067,7 @@ impl CoordApp {
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
+            pending_report_fix: None,
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
@@ -7527,6 +7560,17 @@ impl CoordApp {
                 Some(Color::rgb(160, 160, 180)),
             ));
         }
+        // #296: run_cmd — show the manual launch command when defined for
+        // this repo.  Absent repos (no run_cmd set) silently skip.
+        if let Some(local) = &issue.coord_repo {
+            if let Some(cmd) = self.data.pipeline_repo_run_cmds.get(local.as_str()) {
+                items.push(kv_item(
+                    "  Run",
+                    cmd,
+                    Some(Color::rgb(200, 220, 160)),
+                ));
+            }
+        }
         // Persistent build status.  Three states surfaced.
         if in_flight {
             // The job is still going; show elapsed.
@@ -7792,7 +7836,7 @@ impl CoordApp {
         // Suggested next steps.
         let test_label = match test_status {
             StageStatus::Failed => "previously failed — press R to re-dispatch Work, or P/F/S to re-record",
-            _ => "press P=pass, F=fail, S=skip after manual verification",
+            _ => "press P=pass, F=fail, r=report+fix, S=skip after manual verification",
         };
         items.push(kv_item(
             "  Next",
@@ -9409,7 +9453,10 @@ impl CoordApp {
             }
         }
         let proposals = self.data.proposals.len();
-        let hints = if let Some((_, ref buf)) = self.pending_test_fail {
+        let hints = if let Some(ref buf) = self.pending_report_fix {
+            // #296: inline description input for report+fix takes precedence.
+            format!(" Report failure — description: {}_  Enter=submit+dispatch  Esc=cancel ", buf)
+        } else if let Some((_, ref buf)) = self.pending_test_fail {
             // #200: inline reason input takes precedence over the purge prompt
             // and normal hints.
             format!(" Test failure reason: {}_  Enter=submit  Esc=cancel ", buf)
@@ -9459,9 +9506,9 @@ impl CoordApp {
             // #235: include B (Phase 1 build) when no build is already in
             // flight for this work id.
             if self.can_trigger_test_build() {
-                " Test gate: B=build  P=pass  F=fail  S=skip  q=quit ".to_string()
+                " Test gate: B=build  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             } else {
-                " Test gate: P=pass  F=fail  S=skip  q=quit ".to_string()
+                " Test gate: P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             }
         } else if self.can_bounce_work_after_test_fail() {
             // #236: Test just failed — the user's next step is to fix the
@@ -10470,6 +10517,7 @@ impl CoordApp {
             || self.pending_purge.is_some()
             || self.pending_force_merge.is_some()
             || self.pending_test_fail.is_some()
+            || self.pending_report_fix.is_some()
         {
             return None;
         }
@@ -11562,6 +11610,76 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── #296 Pending "report & dispatch fix" input: intercept all keys ───
+        // `r` in Pipeline/Test-gate-actionable opens this buffer.
+        // Enter records test_state=failed AND dispatches `coord fix`.
+        // Esc cancels without recording anything.
+        if self.pending_report_fix.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        let description = self
+                            .pending_report_fix
+                            .take()
+                            .unwrap_or_default();
+                        let description = description.trim().to_string();
+                        let reason_opt = if description.is_empty() { None } else { Some(description.as_str()) };
+                        // Record the failure verdict first.
+                        if self.record_test_verdict("failed", reason_opt) {
+                            // Then dispatch a fix worker via `coord fix`.
+                            if let Some(work_id) = self.pipeline_selected_work_id() {
+                                let args: Vec<String> = if description.is_empty() {
+                                    vec!["fix".to_string(), work_id.clone()]
+                                } else {
+                                    vec![
+                                        "fix".to_string(),
+                                        work_id.clone(),
+                                        "--guidance".to_string(),
+                                        description.clone(),
+                                    ]
+                                };
+                                let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                                let issue_num = self
+                                    .pipeline_sel
+                                    .and_then(|i| self.pipeline_issues.get(i))
+                                    .map(|iss| iss.number)
+                                    .unwrap_or(0);
+                                if self.command_runner.spawn(&args_ref) {
+                                    self.push_toast(
+                                        "Fix worker dispatched",
+                                        &format!("Fix worker dispatched for #{}", issue_num),
+                                        ToastSeverity::Info,
+                                    );
+                                } else {
+                                    self.push_toast(
+                                        "Another command is running",
+                                        "Wait for the current command to finish.",
+                                        ToastSeverity::Warning,
+                                    );
+                                }
+                            }
+                        }
+                        self.pending_report_fix = None;
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_report_fix = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(ref mut buf) = self.pending_report_fix {
+                            buf.pop();
+                        }
+                    }
+                    Key::Char(ch) => {
+                        if let Some(ref mut buf) = self.pending_report_fix {
+                            buf.push(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── Pending restart confirmation: intercept ALL key presses ──────────
         // While a restart is pending, 'y'/'Y' fires the restart; every other
         // key cancels.  We return early so normal key dispatch never fires.
@@ -12234,6 +12352,33 @@ impl ShellApp for CoordApp {
                             self.dispatch_pipeline_active_go();
                         }
                         needs_redraw = true;
+                    }
+
+                    // ── r — #296: report failure + dispatch fix worker ───────
+                    // When the Test gate is actionable, `r` opens an inline
+                    // text input.  On Enter, the failure is recorded AND
+                    // `coord fix <work_id> --guidance <description>` is
+                    // dispatched.  This shadows the "mark ready" binding
+                    // below when the test gate is active — that's intentional
+                    // (an issue in the Test stage can't usefully be "marked
+                    // ready" simultaneously).
+                    Key::Char('r')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.test_gate_actionable()
+                            && self.pending_test_fail.is_none()
+                            && self.pending_report_fix.is_none() =>
+                    {
+                        if self.pipeline_selected_work_id().is_some() {
+                            self.pending_report_fix = Some(String::new());
+                            needs_redraw = true;
+                        } else {
+                            self.push_toast(
+                                "No work assignment",
+                                "Dispatch Work first before reporting a failure.",
+                                ToastSeverity::Info,
+                            );
+                            needs_redraw = true;
+                        }
                     }
 
                     // ── r — mark refined issue ready for dispatch ────────
@@ -13001,6 +13146,7 @@ mod tests {
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
+            pending_report_fix: None,
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
@@ -17060,11 +17206,12 @@ mod tests {
             "CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);",
         )
         .unwrap();
-        let (gates, labels, repos, require_plan) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds) = load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["review".to_string(), "merge".to_string()]);
         assert_eq!(labels, vec!["coord".to_string()]);
         assert!(repos.is_empty());
         assert!(!require_plan);
+        assert!(run_cmds.is_empty(), "no run_cmds configured → empty map");
     }
 
     #[test]
@@ -17076,14 +17223,20 @@ mod tests {
               ('pipeline_default_gates', '[\"plan\",\"work\",\"smoke\"]'), \
               ('pipeline_tracked_labels', '[\"hotfix\",\"feature\"]'), \
               ('pipeline_repos', '{\"api\":\"acme/api\"}'), \
+              ('pipeline_repo_run_cmds', '{\"api\":\"cargo run --example gtk_panel\"}'), \
               ('pipeline_require_plan', '1');",
         )
         .unwrap();
-        let (gates, labels, repos, require_plan) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds) = load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["plan", "work", "smoke"]);
         assert_eq!(labels, vec!["hotfix", "feature"]);
         assert_eq!(repos, vec![("api".to_string(), "acme/api".to_string())]);
         assert!(require_plan);
+        assert_eq!(
+            run_cmds.get("api").map(|s| s.as_str()),
+            Some("cargo run --example gtk_panel"),
+            "run_cmds parsed from board_meta",
+        );
     }
 
     // ── Purge helpers ─────────────────────────────────────────────────────────
@@ -18068,6 +18221,66 @@ mod tests {
                 text,
             );
         }
+    }
+
+    #[test]
+    // #296: run_cmd row appears in test guidance when the repo has a run_cmd
+    // set, and is absent when the repo has none.
+    fn test_guidance_shows_run_cmd_row_when_configured() {
+        let mut app = make_pipeline_app();
+        // Seed a done Work assignment so the Test stage is actionable.
+        let mut work = _stage_assignment("w1", "work", 100.0, "done");
+        work.branch = Some("issue-42-run-cmd".to_string());
+        app.data.assignments.push(work);
+        // Set run_cmd for the "api" repo that issue #42 is mapped to.
+        app.data.pipeline_repo_run_cmds.insert(
+            "api".to_string(),
+            "cargo run --example gtk_panel --features gtk".to_string(),
+        );
+
+        let summary = app.pipeline_issue_summary();
+        let texts: Vec<String> = summary
+            .items
+            .iter()
+            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .collect();
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("cargo run --example gtk_panel --features gtk"),
+            "run_cmd not surfaced in test guidance; got rows: {:?}",
+            texts,
+        );
+        // The row label should be "Run".
+        assert!(
+            texts.iter().any(|t| t.contains("Run")),
+            "Run row label missing; got rows: {:?}",
+            texts,
+        );
+    }
+
+    #[test]
+    fn test_guidance_omits_run_cmd_row_when_not_configured() {
+        let mut app = make_pipeline_app();
+        // Seed a done Work assignment so the Test stage is actionable.
+        let mut work = _stage_assignment("w2", "work", 100.0, "done");
+        work.branch = Some("issue-42-no-run-cmd".to_string());
+        app.data.assignments.push(work);
+        // No run_cmd entry for "api".
+
+        let summary = app.pipeline_issue_summary();
+        let texts: Vec<String> = summary
+            .items
+            .iter()
+            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .collect();
+        let joined = texts.join("\n");
+        // The "Run" row should not appear because no run_cmd is configured.
+        assert!(
+            !texts.iter().any(|t| t.trim_start().starts_with("Run") && !t.contains("Smoke")),
+            "spurious Run row appeared when no run_cmd is configured; got rows: {:?}",
+            texts,
+        );
+        let _ = joined; // used by the assertion above
     }
 
     // ── #270: selected-item action bar (no-mouse / SSH-friendly) ────────

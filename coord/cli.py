@@ -72,6 +72,14 @@ def _save_config_snapshot(config: Config) -> None:
             "('pipeline_repos', ?)",
             (json.dumps({r.name: r.github for r in config.repos}),),
         )
+        # #296: run_cmd per repo — TUI surfaces this in the Test stage
+        # detail panel as the "Run" row so the tester knows what to launch.
+        # Only repos that have a run_cmd are included; absent → no entry.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_repo_run_cmds', ?)",
+            (json.dumps({r.name: r.run_cmd for r in config.repos if r.run_cmd is not None}),),
+        )
         # Whether the pipeline includes a Plan gate before Work. Sourced
         # from dispatch.require_plan — when true, the TUI prepends a Plan
         # stage and Work [Go] becomes "approve plan" rather than fresh

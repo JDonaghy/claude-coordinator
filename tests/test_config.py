@@ -306,3 +306,46 @@ def test_concurrency_first_output_timeout_rejects_negative() -> None:
 def test_concurrency_first_output_timeout_rejects_bool() -> None:
     with pytest.raises(ConfigError, match="first_output_timeout must be a non-negative number"):
         _parse_concurrency({"first_output_timeout": True})
+
+
+# ── run_cmd per repo (#296) ────────────────────────────────────────────────────
+
+def test_repo_run_cmd_absent(tmp_path: Path) -> None:
+    """run_cmd defaults to None when omitted."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").run_cmd is None
+
+
+def test_repo_run_cmd_present(tmp_path: Path) -> None:
+    """run_cmd is parsed and stored on the Repo when provided."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: ui\n"
+        "    github: acme/ui\n"
+        "    run_cmd: 'cargo run --example gtk_panel --features gtk'\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [ui]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("ui").run_cmd == "cargo run --example gtk_panel --features gtk"
+
+
+def test_repo_run_cmd_non_string_rejected(tmp_path: Path) -> None:
+    """run_cmd must be a string; non-string values raise ConfigError."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n    run_cmd: 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="run_cmd must be a string"):
+        load(p)
