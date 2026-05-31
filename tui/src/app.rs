@@ -3906,7 +3906,18 @@ impl CoordApp {
             if let Some(t) = self.focused_transcript_mut() {
                 t.push(turn);
             }
-            let transcript = self.focused_transcript().to_vec();
+            // #264: build the chat transcript by merging user turns from
+            // inject_transcript with assistant turns parsed from the SSE
+            // stream-json lines, so the chat shows both sides of the
+            // conversation.  The previous behaviour (user turns only)
+            // worked for worker-guidance chat — the user assumed the
+            // assistant was "doing the work" via the Log tab — but for
+            // refinement-chat the assistant's reply IS the deliverable.
+            let transcript = self.focused_watch_state()
+                .map(|w| w.assignment_id.clone())
+                .and_then(|id| self.watch_pool.get(&id))
+                .map(chat_transcript_from_pool)
+                .unwrap_or_else(|| self.focused_transcript().to_vec());
             if let Some(ref mut chat) = self.inject_chat {
                 chat.set_transcript(transcript);
                 chat.clear_input();
@@ -12241,7 +12252,23 @@ impl ShellApp for CoordApp {
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
+        // #264: paint an opaque backing list first so the underlying panel
+        // (Issue tab, Board detail, etc.) doesn't show through the chat's
+        // empty zones.  Without this, when the user opens Refine with chat
+        // from a non-Log panel, the issue body bleeds through the
+        // transcript area until it's filled with enough turns to cover it.
         if let Some(ref chat) = self.inject_chat {
+            backend.draw_list(m, &ListView {
+                id: WidgetId::new("chat-backing"),
+                title: None,
+                items: Vec::new(),
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: true,
+                h_scroll: 0,
+                max_content_width: None,
+            });
             chat.render(backend, m);
         }
 
@@ -13603,6 +13630,20 @@ impl ShellApp for CoordApp {
         if self.on_pipeline_log_tab() {
             self.ensure_log_tab_sse();
         }
+        // #264: while a chat overlay is open, refresh its transcript from
+        // the focused pool entry every tick so newly streamed assistant
+        // turns appear without the user having to type something to force
+        // a redraw.
+        if self.inject_chat.is_some() {
+            if let Some(id) = self.watch_focused.clone() {
+                if let Some(ctx) = self.watch_pool.get(&id) {
+                    let transcript = chat_transcript_from_pool(ctx);
+                    if let Some(ref mut chat) = self.inject_chat {
+                        chat.set_transcript(transcript);
+                    }
+                }
+            }
+        }
         if needs_redraw {
             Reaction::Redraw
         } else {
@@ -13620,6 +13661,38 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
     }
     let content_h = (panel.height - lh).max(0.0); // minus list title row
     (content_h / lh) as usize
+}
+
+/// #264: Build a chat transcript from a pool entry — merges the
+/// developer-typed user turns (`inject_transcript`) with the assistant
+/// turns parsed from the SSE stream-json lines.  Tool calls / system
+/// events are intentionally excluded — those belong in the Log tab, not
+/// the chat.
+///
+/// Order is "all user turns, then all assistant turns" rather than
+/// interleaved — the proper chronological merge needs per-turn sequence
+/// numbers we don't carry yet (follow-up: track `sse_offset_at_send` on
+/// each user turn so we can partition the assistant turns between them).
+/// Until then this at least surfaces the assistant's words so the chat
+/// stops feeling one-way.
+fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
+    let mut turns: Vec<ChatTurn> = ctx.inject_transcript.clone();
+    for line in &ctx.sse.lines {
+        if json_str(line, "type").as_deref() != Some("assistant") {
+            continue;
+        }
+        let text = extract_text_block(line);
+        let collapsed = collapse_ws(&text);
+        if collapsed.is_empty() {
+            continue;
+        }
+        turns.push(ChatTurn {
+            role: ChatRole::Assistant,
+            text: StyledText::plain(collapsed),
+            timestamp_unix: None,
+        });
+    }
+    turns
 }
 
 /// Pick a single short line out of a child command's stderr suitable for a
