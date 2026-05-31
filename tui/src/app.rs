@@ -10221,11 +10221,23 @@ impl CoordApp {
             .open_issues
             .iter()
             .find(|oi| oi.repo_name == repo_name && oi.number == issue_number);
+        // #264: refinement assignments are conversational scoping, not
+        // real work — they shouldn't make `board_row_lifecycle` flip
+        // to In-flight or hide the Refine menu.  Mirrors the same
+        // filter `IssueGroup::lifecycle_section` applies for section
+        // bucketing.  Without this the right-click menu and action
+        // bar both treated refined-once-then-rolled-back issues as
+        // In-flight (no Refine option) even though they visually sit
+        // in the Backlog section.
         let has_assignment = self
             .data
             .assignments
             .iter()
-            .any(|a| a.repo == repo_name && a.issue_number == issue_number);
+            .any(|a| {
+                a.repo == repo_name
+                    && a.issue_number == issue_number
+                    && a.assignment_type.as_deref() != Some("refinement")
+            });
         let Some(issue) = issue else {
             // No cache row — fall back on assignment presence; without
             // either signal we don't know the state.
