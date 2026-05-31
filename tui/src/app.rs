@@ -283,6 +283,14 @@ struct WatchContext {
     /// Per-assignment inject transcript.  Persists while the context lives in
     /// the pool; cleared on eviction.
     inject_transcript: Vec<ChatTurn>,
+    /// #264: parallel to `inject_transcript` — for each user turn, the
+    /// `sse.lines.len()` at the moment of submit.  Used to interleave
+    /// user + assistant turns chronologically in `chat_transcript_from_pool`
+    /// (assistant turns at sse position N appear after any user turns whose
+    /// offset ≤ N).  Without this, all user turns piled at the top and all
+    /// assistant turns followed, breaking the conversational order the user
+    /// expects.
+    inject_sse_offsets: Vec<usize>,
     /// Wall-clock time this context was most recently focused.  Used for LRU
     /// eviction when the pool would exceed `WATCH_POOL_CAP`.
     last_focused_at: Instant,
@@ -3523,6 +3531,7 @@ impl CoordApp {
                     state,
                     sse,
                     inject_transcript: Vec::new(),
+                    inject_sse_offsets: Vec::new(),
                     last_focused_at: Instant::now(),
                 });
                 self.watch_focused = Some(aid);
@@ -3670,6 +3679,7 @@ impl CoordApp {
             state,
             sse,
             inject_transcript: Vec::new(),
+            inject_sse_offsets: Vec::new(),
             last_focused_at: Instant::now(),
         });
     }
@@ -3734,12 +3744,6 @@ impl CoordApp {
             .and_then(|id| self.watch_pool.get(id))
             .map(|ctx| ctx.inject_transcript.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Mutably borrow the inject transcript for the focused session, if any.
-    fn focused_transcript_mut(&mut self) -> Option<&mut Vec<ChatTurn>> {
-        let id = self.watch_focused.clone()?;
-        self.watch_pool.get_mut(&id).map(|ctx| &mut ctx.inject_transcript)
     }
 
     /// Accept the plan being watched: dispatches `coord approve-plan <id>`.
@@ -3994,6 +3998,15 @@ impl CoordApp {
         // come back (which can be several seconds for the model's
         // first-token latency).
         self.chat_last_activity = Some(Instant::now());
+        // Capture the SSE stream position at submit time so the transcript
+        // can interleave this user turn between the right pair of
+        // assistant turns when it rebuilds.  Without this the user turns
+        // all pile at the top of the transcript regardless of when they
+        // were sent (the bug the user reported: "my message goes above
+        // the ai messages not inline in order").
+        let sse_offset_at_send = self.watch_pool.get(&aid)
+            .map(|ctx| ctx.sse.lines.len())
+            .unwrap_or(0);
         {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4004,8 +4017,9 @@ impl CoordApp {
                 text: StyledText::plain(text.clone()),
                 timestamp_unix: now,
             };
-            if let Some(t) = self.focused_transcript_mut() {
-                t.push(turn);
+            if let Some(ctx) = self.watch_pool.get_mut(&aid) {
+                ctx.inject_transcript.push(turn);
+                ctx.inject_sse_offsets.push(sse_offset_at_send);
             }
             // #264: build the chat transcript by merging user turns from
             // inject_transcript with assistant turns parsed from the SSE
@@ -10830,6 +10844,7 @@ impl CoordApp {
                 state,
                 sse,
                 inject_transcript: Vec::new(),
+                inject_sse_offsets: Vec::new(),
                 last_focused_at: Instant::now(),
             });
         }
@@ -14063,22 +14078,30 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
 
 /// #264: Build a chat transcript from a pool entry — merges the
 /// developer-typed user turns (`inject_transcript`) with the assistant
-/// turns parsed from the SSE stream-json lines.  Tool calls / system
-/// events are intentionally excluded — those belong in the Log tab, not
-/// the chat.
+/// turns parsed from the SSE stream-json lines, in chronological order.
 ///
-/// For refinement chats (`assignment_type == "refinement"`) the
-/// transcript opens with a System turn that explains what the assistant
-/// was seeded with.  Without it the worker's first reply (a clarifying
-/// question about the seeded issue) reads as a message-from-nowhere
-/// because the developer never sees the seed payload that triggered it.
+/// Tool calls / system events are excluded — those belong in the Log tab,
+/// not the chat.
 ///
-/// Order is "system [refinement only] → all user turns → all assistant
-/// turns" rather than strictly chronological — proper interleaving needs
-/// per-turn sequence numbers we don't carry yet (follow-up: track
-/// `sse_offset_at_send` on each user turn so we can partition the
-/// assistant turns between them).  Until then this at least surfaces the
-/// assistant's words and explains where the first reply came from.
+/// For refinement chats the transcript opens with a System turn that
+/// explains what the assistant was seeded with so the worker's first
+/// reply (a clarifying question about the seeded issue) doesn't read as
+/// a message-from-nowhere.
+///
+/// Ordering rule:
+///   * Each user turn carries an `sse_offset_at_send` (its position in
+///     `ctx.sse.lines` at submit time).
+///   * Each assistant text event has an implicit offset = its index in
+///     `ctx.sse.lines`.
+///   * Walk both lists in parallel: emit user turns whose offset ≤ the
+///     next assistant index, then advance through assistants.  Ties
+///     prefer user (the user submitted *just before* the next assistant
+///     turn arrived).
+///
+/// Assistant text events are split on `\n` so multi-line replies (numbered
+/// lists, paragraph breaks) render as separate rows in the chat —
+/// quadraui's `MessageList` doesn't honour embedded newlines inside a
+/// single `StyledText`, so each line has to be its own `ChatTurn`.
 fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
     let mut turns: Vec<ChatTurn> = Vec::new();
     if ctx.state.assignment_type == "refinement" {
@@ -14092,26 +14115,44 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
             timestamp_unix: None,
         });
     }
-    turns.extend(ctx.inject_transcript.iter().cloned());
-    for line in &ctx.sse.lines {
+    let mut user_idx = 0usize;
+    for (sse_idx, line) in ctx.sse.lines.iter().enumerate() {
+        // Emit any user turns submitted at or before this SSE position.
+        while user_idx < ctx.inject_transcript.len()
+            && ctx.inject_sse_offsets.get(user_idx).copied().unwrap_or(0) <= sse_idx
+        {
+            turns.push(ctx.inject_transcript[user_idx].clone());
+            user_idx += 1;
+        }
         if json_str(line, "type").as_deref() != Some("assistant") {
             continue;
         }
         let text = extract_text_block(line);
-        // Preserve newlines so numbered lists and multi-line questions
-        // stay readable — the Log-tab path collapses whitespace because
-        // each turn is rendered as a single horizontal-scrollable row,
-        // but the chat transcript wraps per-row and benefits from real
-        // line breaks.  Trim outer whitespace; leave inner structure.
         let body = text.trim();
         if body.is_empty() {
             continue;
         }
-        turns.push(ChatTurn {
-            role: ChatRole::Assistant,
-            text: StyledText::plain(body.to_string()),
-            timestamp_unix: None,
-        });
+        // Split on newlines so each line is its own row — MessageList
+        // wraps single rows but doesn't honour embedded `\n`, so a
+        // numbered list rendered as one big row jams everything onto a
+        // single wrapped paragraph.
+        for chunk in body.split('\n') {
+            let line = chunk.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            turns.push(ChatTurn {
+                role: ChatRole::Assistant,
+                text: StyledText::plain(line.to_string()),
+                timestamp_unix: None,
+            });
+        }
+    }
+    // Tail: any user turns submitted *after* the last SSE line we've seen
+    // (assistant hasn't replied yet) still belong in the transcript.
+    while user_idx < ctx.inject_transcript.len() {
+        turns.push(ctx.inject_transcript[user_idx].clone());
+        user_idx += 1;
     }
     turns
 }
@@ -19092,6 +19133,7 @@ mod tests {
             state,
             sse,
             inject_transcript: Vec::new(),
+            inject_sse_offsets: Vec::new(),
             last_focused_at: Instant::now(),
         };
         app.watch_pool.insert(aid.clone(), ctx);
