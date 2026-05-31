@@ -365,6 +365,71 @@ struct PendingRefineReady {
     assignment_id: String,
 }
 
+/// #319 Phase A: synth prompt injected into the refinement chat when the
+/// user presses Ctrl+N to draft refinement notes.  `{DATE}` is substituted
+/// with today's date before sending so the chat's header is dated even if
+/// the assistant misreads the placeholder.
+const REFINEMENT_NOTES_SYNTH_PROMPT: &str = "The developer has marked this refinement complete.  Write a concise \"refinement notes\" comment summarising what we settled on:\n  - Scope decisions (what's in, what's out)\n  - File / module boundaries that came up\n  - Acceptance criteria the developer confirmed\n  - Open questions left for the implementing worker\n\nOutput the comment body in markdown.  Start with a `## Refinement notes ({DATE})` header.  Stop after the comment — the developer's TUI will post it.";
+
+/// #319 Phase A: ceiling on how long to wait for the assistant's reply
+/// before dropping back to the chat.  Generous — long refinements can
+/// take a minute to settle, and the user can still cancel manually.
+const REFINEMENT_NOTES_SYNTH_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// #319 Phase A: state held while we wait for the chat to reply to the
+/// synth prompt.  Populated by [`CoordApp::trigger_refinement_notes_synth`]
+/// and cleared once the review modal opens or the wait times out.
+#[derive(Clone)]
+struct PendingRefinementNotesSynth {
+    /// Assignment id at trigger time.  May be superseded by a chat-continue
+    /// resume — the poll re-fetches `watch_focused` to find the live id.
+    aid_at_trigger: String,
+    /// Issue number — used to address the `gh issue comment` shell-out.
+    issue_number: u64,
+    /// Coord-local repo name (only used in toasts; the slug is below).
+    #[allow(dead_code)]
+    repo_coord: String,
+    /// GitHub `owner/name` slug for the `gh` command's `--repo` flag.
+    repo_github: String,
+    /// `sse.lines.len()` at trigger time — assistant lines past this index
+    /// are the reply we want to capture.  Becomes meaningless if the chat
+    /// rebinds (new ctx starts at 0); the poll handles that by floor=0.
+    baseline_sse_lines: usize,
+    /// Wall-clock arm time.  Bounds the wait at
+    /// [`REFINEMENT_NOTES_SYNTH_TIMEOUT`].
+    armed_at: Instant,
+}
+
+/// #319 Phase A: review-and-post modal for the proposed refinement-notes
+/// comment.  When `Some` on [`CoordApp`], intercepts all keyboard input and
+/// renders an overlay above the chat.  The body is editable inline:
+/// Backspace pops, Enter inserts a newline, printable chars append.  Ctrl+Y
+/// posts via `gh issue comment`; Esc cancels.
+#[derive(Clone)]
+struct RefinementNotesModal {
+    /// Issue number — for the `gh` command and the modal title.
+    issue_number: u64,
+    /// GitHub `owner/name` slug for the `--repo` flag.
+    repo_github: String,
+    /// The proposed comment body.  Mutated by edits.
+    body: String,
+    /// True while a `gh issue comment` shell-out is in flight.  Modal
+    /// stays visible to capture the result; new keypresses are ignored
+    /// so a fast user can't double-post.
+    posting: bool,
+}
+
+/// #319 Phase A: outcome of the background `gh issue comment` shell-out,
+/// sent over the mpsc back to the main thread.
+struct RefinementNotesPostResult {
+    success: bool,
+    /// First non-empty stderr line — surfaced in the failure toast so the
+    /// user knows whether it was a missing label, auth issue, etc.
+    stderr_first_line: String,
+    /// Echoed so the result-handler doesn't need to read modal state.
+    issue_number: u64,
+}
+
 struct TestBuildJob {
     /// Work assignment id this build is verifying. Also the HashMap key.
     #[allow(dead_code)]
@@ -3277,6 +3342,20 @@ pub struct CoordApp {
     /// immediately — without waiting for the next DB refresh.  Cleared in
     /// `apply_pending_data` once the real merge_queue row lands.
     pipeline_inflight_merges: std::collections::HashSet<(String, u64)>,
+    /// #319 Phase A: armed when the user triggers the refinement-notes
+    /// finaliser (Ctrl+N in a refinement chat).  The tick poll watches the
+    /// focused chat for the assistant's reply, captures it on `end_turn`,
+    /// and opens [`Self::refinement_notes_modal`] for review-and-post.
+    /// Cleared on modal open, timeout, or empty reply.
+    pending_refinement_notes_synth: Option<PendingRefinementNotesSynth>,
+    /// #319 Phase A: review-and-post modal showing the proposed
+    /// refinement-notes comment.  When `Some`, intercepts all keyboard
+    /// input — see [`Self::handle_refinement_notes_modal_key`].
+    refinement_notes_modal: Option<RefinementNotesModal>,
+    /// #319 Phase A: receiver for the background `gh issue comment` thread
+    /// spawned by [`Self::post_refinement_notes`].  Drained on tick; the
+    /// modal stays open on failure so the typed text isn't lost.
+    refinement_notes_post_rx: Option<std::sync::mpsc::Receiver<RefinementNotesPostResult>>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -3442,6 +3521,9 @@ impl CoordApp {
             pipeline_ci_loader: std::collections::HashMap::new(),
             pipeline_dismissed: std::collections::HashSet::new(),
             pipeline_inflight_merges: std::collections::HashSet::new(),
+            pending_refinement_notes_synth: None,
+            refinement_notes_modal: None,
+            refinement_notes_post_rx: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -10936,6 +11018,363 @@ impl CoordApp {
         );
     }
 
+    /// #319 Phase A: trigger the "Add refinement notes" finaliser.  Called
+    /// when the user presses Ctrl+N in a refinement chat.  Composes the
+    /// synth prompt with today's date, dispatches it as a user turn via
+    /// [`Self::submit_inject`], and arms `pending_refinement_notes_synth`
+    /// so the tick poll can capture the assistant's reply and open the
+    /// review modal.
+    fn trigger_refinement_notes_synth(&mut self) {
+        if self.refinement_notes_modal.is_some() || self.pending_refinement_notes_synth.is_some() {
+            self.push_toast(
+                "Refinement notes",
+                "Notes flow already in progress — finish it or Esc to cancel.",
+                ToastSeverity::Info,
+            );
+            return;
+        }
+        let (aid, issue_number, repo_coord) = match self.focused_watch_state() {
+            Some(w) => (w.assignment_id.clone(), w.issue_number, w.repo.clone()),
+            None => {
+                self.push_toast(
+                    "Refinement notes",
+                    "No focused chat — open a refinement chat first.",
+                    ToastSeverity::Info,
+                );
+                return;
+            }
+        };
+        // Resolve coord-local repo name → GitHub `owner/name` slug.  The
+        // pipeline_repos map is the same one the merge-queue uses for
+        // `gh pr` calls, so the slug is authoritative.
+        let repo_github = match self.data.pipeline_repos.iter()
+            .find(|(coord, _)| coord == &repo_coord)
+            .map(|(_, slug)| slug.clone())
+        {
+            Some(slug) => slug,
+            None => {
+                self.push_toast(
+                    "Refinement notes",
+                    &format!(
+                        "No GitHub slug found for repo '{}' — check coordinator.yml.",
+                        repo_coord,
+                    ),
+                    ToastSeverity::Warning,
+                );
+                return;
+            }
+        };
+        // Snapshot the SSE baseline BEFORE submit_inject runs.  Without
+        // this, the assistant's reply lines couldn't be distinguished from
+        // earlier turns.
+        let baseline_sse_lines = self.watch_pool.get(&aid)
+            .map(|c| c.sse.lines.len())
+            .unwrap_or(0);
+        let today = today_yyyy_mm_dd();
+        let prompt = REFINEMENT_NOTES_SYNTH_PROMPT.replace("{DATE}", &today);
+        if !self.submit_inject(prompt) {
+            self.push_toast(
+                "Refinement notes",
+                "Couldn't send the synth prompt — chat busy or unavailable.",
+                ToastSeverity::Warning,
+            );
+            return;
+        }
+        self.pending_refinement_notes_synth = Some(PendingRefinementNotesSynth {
+            aid_at_trigger: aid,
+            issue_number,
+            repo_coord,
+            repo_github,
+            baseline_sse_lines,
+            armed_at: Instant::now(),
+        });
+        self.push_toast(
+            "Refinement notes",
+            &format!("#{}: asking the chat to draft notes…", issue_number),
+            ToastSeverity::Info,
+        );
+    }
+
+    /// #319 Phase A: called each tick while `pending_refinement_notes_synth`
+    /// is armed.  Watches the focused chat for the assistant's reply to the
+    /// synth prompt and, once `end_turn` lands, opens the review modal with
+    /// the captured body.  Returns true when state changed (caller redraws).
+    fn poll_refinement_notes_synth(&mut self) -> bool {
+        let pending = match self.pending_refinement_notes_synth.clone() {
+            Some(p) => p,
+            None => return false,
+        };
+        if pending.armed_at.elapsed() > REFINEMENT_NOTES_SYNTH_TIMEOUT {
+            self.pending_refinement_notes_synth = None;
+            self.push_toast(
+                "Refinement notes timed out",
+                &format!(
+                    "No reply in {}s — try again.",
+                    REFINEMENT_NOTES_SYNTH_TIMEOUT.as_secs(),
+                ),
+                ToastSeverity::Warning,
+            );
+            return true;
+        }
+        // If a chat-resume is in flight, the old worker already exited
+        // (sse.done=true on the still-focused old ctx) but the resume
+        // worker hasn't replied yet.  Reading now would extract nothing
+        // and toast "empty reply".  Wait for the rebind to finish.
+        if self.pending_chat_resume.is_some() {
+            return false;
+        }
+        // The focused chat may have rebound to a new aid after a
+        // chat-continue resume — track the live focused id, not the
+        // trigger-time one.  baseline_sse_lines only applies when the
+        // ctx is the same one; otherwise use 0.
+        let focused_id = match self.watch_focused.clone() {
+            Some(id) => id,
+            None => return false,
+        };
+        let ctx = match self.watch_pool.get(&focused_id) {
+            Some(c) => c,
+            None => return false,
+        };
+        if !ctx.sse.done {
+            return false;
+        }
+        let floor = if focused_id == pending.aid_at_trigger {
+            pending.baseline_sse_lines
+        } else {
+            0
+        };
+        let body = extract_assistant_text_after(ctx, floor);
+        if body.trim().is_empty() {
+            self.pending_refinement_notes_synth = None;
+            self.push_toast(
+                "Refinement notes",
+                "Chat reply was empty — try again after a fuller refinement.",
+                ToastSeverity::Warning,
+            );
+            return true;
+        }
+        self.refinement_notes_modal = Some(RefinementNotesModal {
+            issue_number: pending.issue_number,
+            repo_github: pending.repo_github.clone(),
+            body,
+            posting: false,
+        });
+        self.pending_refinement_notes_synth = None;
+        true
+    }
+
+    /// #319 Phase A: handle a keypress while the review-and-post modal is
+    /// open.  All keys land here exclusively — the inject_chat overlay
+    /// and the rest of the app don't see them.  Returns true if anything
+    /// changed (caller redraws).
+    fn handle_refinement_notes_modal_key(
+        &mut self,
+        key: &Key,
+        modifiers: &quadraui::Modifiers,
+    ) -> bool {
+        // `posting` lockout is read first so we don't accidentally
+        // mutate the body while gh is in flight.
+        let posting = self.refinement_notes_modal.as_ref()
+            .map(|m| m.posting)
+            .unwrap_or(false);
+        if posting {
+            return false;
+        }
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.refinement_notes_modal = None;
+                self.push_toast(
+                    "Refinement notes",
+                    "Cancelled — nothing posted.",
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            Key::Char('y') | Key::Char('Y') if modifiers.ctrl => {
+                self.post_refinement_notes();
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(m) = self.refinement_notes_modal.as_mut() {
+                    m.body.push('\n');
+                }
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(m) = self.refinement_notes_modal.as_mut() {
+                    m.body.pop();
+                }
+                true
+            }
+            Key::Char(ch) if !modifiers.ctrl && !modifiers.alt && !modifiers.cmd => {
+                if let Some(m) = self.refinement_notes_modal.as_mut() {
+                    m.body.push(*ch);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// #319 Phase A: spawn `gh issue comment` in a background thread.
+    /// Mirrors [`spawn_chat_continue`]'s fire-and-forget shape — the result
+    /// lands on `refinement_notes_post_rx` and is drained on the next tick
+    /// so the TUI never blocks on the network.
+    fn post_refinement_notes(&mut self) {
+        let (issue_number, repo_github, body) = match self.refinement_notes_modal.as_mut() {
+            Some(m) => {
+                m.posting = true;
+                (m.issue_number, m.repo_github.clone(), m.body.clone())
+            }
+            None => return,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.refinement_notes_post_rx = Some(rx);
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("gh");
+            cmd.arg("issue").arg("comment").arg(issue_number.to_string());
+            cmd.arg("--repo").arg(&repo_github);
+            cmd.arg("--body").arg(&body);
+            let out = cmd
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output();
+            let result = match out {
+                Ok(o) => RefinementNotesPostResult {
+                    success: o.status.success(),
+                    stderr_first_line: first_meaningful_stderr_line(
+                        &String::from_utf8_lossy(&o.stderr),
+                    ).unwrap_or_default(),
+                    issue_number,
+                },
+                Err(e) => RefinementNotesPostResult {
+                    success: false,
+                    stderr_first_line: format!("spawn failed: {}", e),
+                    issue_number,
+                },
+            };
+            let _ = tx.send(result);
+        });
+        self.push_toast(
+            "Refinement notes",
+            &format!("#{}: posting comment…", issue_number),
+            ToastSeverity::Info,
+        );
+    }
+
+    /// #319 Phase A: drain the post-result receiver if a `gh` shell-out is
+    /// in flight.  On success the modal closes; on failure it stays open
+    /// (with `posting` cleared) so the user can retry without retyping.
+    /// Returns true when state changed (caller redraws).
+    fn poll_refinement_notes_post(&mut self) -> bool {
+        let result = match self.refinement_notes_post_rx.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.refinement_notes_post_rx = None;
+                    return false;
+                }
+            },
+            None => return false,
+        };
+        self.refinement_notes_post_rx = None;
+        if result.success {
+            self.refinement_notes_modal = None;
+            self.push_toast(
+                "Refinement notes posted",
+                &format!("#{}: comment added.", result.issue_number),
+                ToastSeverity::Info,
+            );
+        } else {
+            if let Some(ref mut m) = self.refinement_notes_modal {
+                m.posting = false;
+            }
+            let reason = if result.stderr_first_line.is_empty() {
+                "gh failed (no stderr captured)".to_string()
+            } else {
+                result.stderr_first_line.clone()
+            };
+            self.push_toast(
+                "Post failed — modal kept open",
+                &format!("#{}: {}", result.issue_number, reason),
+                ToastSeverity::Error,
+            );
+        }
+        true
+    }
+
+    /// #319 Phase A: render the review-and-post modal as a centered
+    /// bordered list overlay above the chat.  Each line of `body` is one
+    /// list item; a trailing hints row tells the user the keybinds.  The
+    /// `_` caret on the last content line marks the edit cursor.
+    fn render_refinement_notes_modal(&self, backend: &mut dyn Backend, viewport: Rect) {
+        let modal = match self.refinement_notes_modal.as_ref() {
+            Some(m) => m,
+            None => return,
+        };
+        // Centre the box at 80% of the viewport, clamped so it stays
+        // sensible on a wide panel and doesn't disappear on a narrow one.
+        let width = (viewport.width * 0.8).clamp(40.0, 120.0).min(viewport.width.max(20.0));
+        let height = (viewport.height * 0.8).clamp(10.0, viewport.height.max(10.0));
+        let x = viewport.x + ((viewport.width - width) / 2.0).max(0.0);
+        let y = viewport.y + ((viewport.height - height) / 2.0).max(0.0);
+        let modal_rect = Rect::new(x, y, width, height);
+
+        let mut items: Vec<ListItem> = modal.body.split('\n').map(|line| ListItem {
+            text: StyledText::plain(line.to_string()),
+            icon: None,
+            detail: None,
+            decoration: Decoration::default(),
+        }).collect();
+        // Append a visible caret on the last line so the user can see
+        // where their next char will land.  Hidden while posting.
+        if !modal.posting {
+            if let Some(last) = items.last_mut() {
+                let plain: String = last.text.spans.iter()
+                    .map(|s| s.text.as_str())
+                    .collect();
+                last.text = StyledText::plain(format!("{}_", plain));
+            }
+        }
+        // Blank separator + hints row.
+        items.push(ListItem {
+            text: StyledText::plain(String::new()),
+            icon: None,
+            detail: None,
+            decoration: Decoration::default(),
+        });
+        let hints = if modal.posting {
+            "  Posting to GitHub…  ".to_string()
+        } else {
+            "  Ctrl+Y = post   Enter = newline   Backspace = delete   Esc = cancel  ".to_string()
+        };
+        items.push(ListItem {
+            text: StyledText::plain(hints),
+            icon: None,
+            detail: None,
+            decoration: Decoration::default(),
+        });
+
+        let title = StyledText::plain(format!(
+            " Refinement notes → #{} ",
+            modal.issue_number,
+        ));
+        let list = ListView {
+            id: WidgetId::new("refinement-notes-modal"),
+            title: Some(title),
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
+        };
+        backend.draw_list(modal_rect, &list);
+    }
+
     /// #264: shell `coord refine-chat <repo> <issue>` and arm
     /// `pending_refinement` so the next tick can bind the chat overlay to
     /// the new assignment row when it appears in the DB.
@@ -12225,6 +12664,16 @@ impl CoordApp {
             needs_redraw = true;
         }
 
+        // #319 Phase A: capture the chat's reply to the refinement-notes
+        // synth prompt and open the review modal when it's complete.
+        if self.pending_refinement_notes_synth.is_some() && self.poll_refinement_notes_synth() {
+            needs_redraw = true;
+        }
+        // #319 Phase A: drain the `gh issue comment` shell-out result.
+        if self.refinement_notes_post_rx.is_some() && self.poll_refinement_notes_post() {
+            needs_redraw = true;
+        }
+
         // #315: drain InjectFallback signals from `spawn_inject_post`.
         // These fire when /inject/{id} returned 409/410 — the worker
         // exited mid-flight after submit_inject's gate.  Transparently
@@ -13020,6 +13469,14 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── #319 Phase A: refinement-notes review modal ────────────────
+        // Renders on top of the chat so the user can compare the proposed
+        // body against what's in the chat transcript above.  Drawn before
+        // toasts/context-menu so those still appear over it if relevant.
+        if self.refinement_notes_modal.is_some() {
+            self.render_refinement_notes_modal(backend, layout.main_content_bounds);
+        }
+
         // ── Toast overlay (bottom-right of main content) ────────────────
         if let Some(stack) = self.toast_stack() {
             backend.draw_toast_stack(layout.main_content_bounds, &stack);
@@ -13054,6 +13511,18 @@ impl ShellApp for CoordApp {
 
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
+
+        // ── #319 Phase A: refinement-notes review modal owns ALL input ──
+        // When the modal is up the user is reviewing/editing the proposed
+        // comment; chat input, view nav, and shortcuts are all locked out
+        // so a stray keypress can't fire some background action or stuff
+        // chars into the chat instead of the modal.
+        if self.refinement_notes_modal.is_some() {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                self.handle_refinement_notes_modal_key(key, modifiers);
+            }
+            return Reaction::Redraw;
+        }
 
         // ── Inject chat overlay — intercepts events when open ──────────────
         // Two routing modes:
@@ -13094,6 +13563,21 @@ impl ShellApp for CoordApp {
                 } else {
                     ctx.main_bounds()
                 };
+                // #319 Phase A: Ctrl+N triggers the refinement-notes
+                // finaliser.  Intercept BEFORE forwarding to ChatController
+                // so the chat input doesn't see Ctrl+N as a literal char.
+                if chat_is_refinement {
+                    if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                        if matches!(key, Key::Char('n') | Key::Char('N'))
+                            && modifiers.ctrl
+                            && !modifiers.alt
+                            && !modifiers.cmd
+                        {
+                            self.trigger_refinement_notes_synth();
+                            return Reaction::Redraw;
+                        }
+                    }
+                }
                 let result = self.inject_chat.as_mut().unwrap().handle(&event, backend, main_rect);
                 match result {
                     ChatControllerEvent::Submit { text } => {
@@ -14461,12 +14945,12 @@ impl ShellApp for CoordApp {
                                 // a "read-only" warning here; the prompt
                                 // suffix stays send-enabled.
                                 (Some("refinement"), _) => {
-                                    "  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)"
+                                    "  (Ctrl+S/Alt+Enter = send · Ctrl+N = add notes · Esc = done & mark ready)"
                                 }
                                 (_, "done") | (_, "failed") | (_, "cancelled") => {
                                     "  ⚠ Worker exited — chat is read-only.  Esc to close."
                                 }
-                                _ => "  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)",
+                                _ => "  (Ctrl+S/Alt+Enter = send · Ctrl+N = add notes · Esc = done & mark ready)",
                             }
                         };
                         chat.set_status(StyledText::plain(format!(
@@ -14548,6 +15032,55 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
 /// lists, paragraph breaks) render as separate rows in the chat —
 /// quadraui's `MessageList` doesn't honour embedded newlines inside a
 /// single `StyledText`, so each line has to be its own `ChatTurn`.
+/// #319 Phase A: walk the focused chat's SSE log from `floor` forward,
+/// concatenating assistant `text` blocks into the proposed comment body.
+/// Newlines between blocks preserve markdown paragraph separation; an
+/// empty result means the assistant exited without emitting any text.
+fn extract_assistant_text_after(ctx: &WatchContext, floor: usize) -> String {
+    let mut out = String::new();
+    for line in ctx.sse.lines.iter().skip(floor) {
+        if json_str(line, "type").as_deref() != Some("assistant") {
+            continue;
+        }
+        let text = extract_text_block(line);
+        let body = text.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(body);
+    }
+    out
+}
+
+/// #319 Phase A: today's date as `YYYY-MM-DD`, computed from `SystemTime`
+/// via Howard Hinnant's `days_from_civil` algorithm (the same one chrono,
+/// time-rs, and the C++ standard library use).  Pulled in by hand to
+/// avoid a chrono dependency for a single use site.
+fn today_yyyy_mm_dd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Days since 1970-01-01 (UTC).  Local time is "close enough" for a
+    // header date stamp; off-by-a-day at most.
+    let days = secs.div_euclid(86_400);
+    // Shift so the epoch is 0000-03-01 (start of a Hinnant "era").
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
 fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
     let mut turns: Vec<ChatTurn> = Vec::new();
     // #315: if this context inherited frozen turns from a prior worker in
@@ -15174,6 +15707,9 @@ mod tests {
             pipeline_ci_loader: std::collections::HashMap::new(),
             pipeline_dismissed: std::collections::HashSet::new(),
             pipeline_inflight_merges: std::collections::HashSet::new(),
+            pending_refinement_notes_synth: None,
+            refinement_notes_modal: None,
+            refinement_notes_post_rx: None,
         }
     }
 
