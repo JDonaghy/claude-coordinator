@@ -2680,6 +2680,72 @@ def _apply_label_change(
 
 
 @main.command(
+    "refine-chat",
+    help=(
+        "#264: dispatch a refinement-chat session for an issue.\n\n"
+        "Seeds a `type=\"refinement\"` `claude -p` worker with the issue "
+        "body + recent comments + the repo's CLAUDE.md + a bounded file-tree "
+        "snapshot, then prints the new assignment id to stdout.  The TUI "
+        "captures the id and opens a ChatController overlay bound to it; "
+        "developer-typed turns flow via `POST /inject/{id}` and assistant "
+        "replies stream back via the existing SSE watch.\n\n"
+        "Read-only — refinement workers have only the `Read` tool; they "
+        "cannot mutate the repo or talk to GitHub.  The Done button in the "
+        "TUI calls `coord ready` to flip `status:refining` → `status:ready` "
+        "on session end.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the GH "
+        "issue number."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--machine",
+    default=None,
+    help="Override machine selection (default: first reachable machine that lists the repo).",
+)
+@_CONFIG_OPTION
+def refine_chat(repo: str, issue: int, machine: str | None, config_path: Path) -> None:
+    cfg = _load_config(config_path)
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.echo(
+            f"error: repo {repo!r} not in coordinator.yml "
+            f"(have: {[r.name for r in cfg.repos]})",
+            err=True,
+        )
+        sys.exit(2)
+
+    from coord.refine_chat import dispatch_refinement
+    try:
+        assignment_id, _picked_machine = dispatch_refinement(
+            cfg=cfg,
+            repo_cfg=repo_cfg,
+            repo=repo,
+            issue_number=issue,
+            machine_override=machine,
+        )
+    except RuntimeError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+
+    # Also flip status:backlog → status:refining so the lifecycle view
+    # shows the issue is being actively refined.  Best-effort; the chat
+    # session itself is the actual refinement work.
+    _apply_label_change(
+        repo, issue, config_path,
+        add={"status:refining"},
+        remove_if_present={"status:ready", "status:backlog"},
+        success_message="",  # no echo — keep stdout clean for the TUI
+    )
+
+    # Print the assignment_id as the LAST line on stdout so callers (the
+    # TUI) can capture it with a simple "last non-empty line" parse.  Any
+    # warnings or progress lines must be written to stderr.
+    click.echo(assignment_id)
+
+
+@main.command(
     help=(
         "Mark a refined issue as ready for dispatch.\n\n"
         "Sets the GitHub `status:ready` label and removes `status:refining` / "

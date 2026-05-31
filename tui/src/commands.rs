@@ -259,29 +259,36 @@ impl CommandRunner {
 mod tests {
     use super::*;
 
+    /// Poll the runner up to ~10 s waiting for completion.  Replaces the
+    /// fixed `sleep(2s) + poll()` pattern that flaked under parallel-suite
+    /// CPU contention (coord --version boots Python and can take >2 s when
+    /// 360 tests share cores).
+    fn wait_for_result(runner: &mut CommandRunner) -> Option<CommandResult> {
+        for _ in 0..100 {
+            if let Some(r) = runner.poll() {
+                return Some(r);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+
     #[test]
     fn spawn_returns_false_when_busy() {
         let mut runner = CommandRunner::new();
         assert!(runner.spawn(&["--version"]));
         assert!(!runner.spawn(&["--version"]));
-        // Let it finish so the thread is cleaned up. 2s matches the sibling
-        // tests — 500ms was tight enough that the test flaked under suite
-        // contention (coord --version spawns Python which can take >500ms to
-        // boot when CPU is busy).
-        std::thread::sleep(Duration::from_millis(2000));
-        assert!(runner.poll().is_some());
+        assert!(wait_for_result(&mut runner).is_some(), "command did not finish within 10s");
     }
 
     #[test]
     fn poll_captures_result() {
         let mut runner = CommandRunner::new();
         runner.spawn(&["--version"]);
-        // Wait for it to finish.
-        std::thread::sleep(Duration::from_millis(2000));
-        let result = runner.poll().expect("poll should return result after completion");
+        let result = wait_for_result(&mut runner)
+            .expect("command did not finish within 10s");
         assert!(!runner.is_running());
         assert_eq!(result.exit_code, 0, "coord --version should succeed");
-        // After a successful run the status-bar message records "done".
         let (msg, _) = runner.message.as_ref().expect("message set on completion");
         assert!(msg.contains("done"), "expected success message, got: {msg}");
     }
@@ -320,8 +327,7 @@ mod tests {
         let mut runner = CommandRunner::new();
         runner.config_path = Some(PathBuf::from("/nonexistent/coordinator.yml"));
         assert!(runner.spawn(&["--version"]));
-        std::thread::sleep(Duration::from_millis(2000));
-        runner.poll();
+        assert!(wait_for_result(&mut runner).is_some(), "command did not finish within 10s");
         // coord --version should succeed regardless of the config path —
         // the completion message records "done" rather than "failed".
         let (msg, _) = runner.message.as_ref().expect("message set on completion");

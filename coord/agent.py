@@ -444,6 +444,36 @@ Rules:
 - After reading the issue body and relevant code, output the plan and stop.\
 """
 
+REFINEMENT_SYSTEM_PROMPT = """\
+You are a refinement assistant helping a developer scope a GitHub issue \
+before any code is written. You are NOT a worker — you do not implement, \
+edit, or create files. Your job is to clarify intent.
+
+The first user message contains the issue body, recent comments, the repo's \
+CLAUDE.md, and a top-level file-tree snapshot. Use the Read tool to inspect \
+specific files when the conversation calls for it.
+
+In each reply:
+- Ask focused clarifying questions about scope, acceptance, and edge cases \
+the issue doesn't yet pin down. One or two questions per turn — do not flood.
+- When you propose files or modules the change would touch, name them \
+explicitly so the developer can confirm or correct.
+- Surface unknowns: behaviours that depend on context the issue doesn't \
+mention, places where existing code could conflict, follow-up work the \
+change might imply.
+- Keep replies short. The developer is typing live; long monologues slow \
+the loop.
+
+Rules:
+- Do NOT run gh, git, npm, cargo, or any tool that mutates the repository or \
+the GitHub state. Use Read only.
+- Do NOT write or edit files. Do NOT propose a diff.
+- Do NOT decide the issue is ready on the developer's behalf. They mark it \
+ready by closing the chat with Done.
+- If asked to write code, decline politely and reframe as "what behaviour \
+should that code produce?" — refinement is about intent, not implementation.\
+"""
+
 WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 
@@ -492,6 +522,13 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     if spec.type == "plan":
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
         allowed_tools = "Read,Bash"
+    elif spec.type == "refinement":
+        # #264: refinement is a developer-driven chat for scoping an issue.
+        # Read-only — no Edit/Write/Bash, since this session must not mutate
+        # the repo or shell out to gh.  The developer drives the conversation
+        # via inject_message; the worker just asks clarifying questions.
+        system_prompt = spec.system_prompt if spec.system_prompt else REFINEMENT_SYSTEM_PROMPT
+        allowed_tools = "Read"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)

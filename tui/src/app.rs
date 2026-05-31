@@ -293,6 +293,39 @@ struct WatchContext {
 /// checkout + `repo.build_command`, so no Rust-side git/build logic is
 /// duplicated here. Job state lives in-memory only — restarting the TUI
 /// drops it; the user can re-press `B` to retrigger.
+/// #264: state for a refinement-chat dispatch that has been shelled but
+/// whose assignment row hasn't appeared in the DB yet.  Polled each tick;
+/// on bind we add the new assignment to `watch_pool`, focus it, and open
+/// the inject_chat overlay.  On timeout we drop and toast.
+#[derive(Clone)]
+struct PendingRefinement {
+    /// Coord-local repo name (matches `coordinator.yml`).
+    repo: String,
+    /// Issue number under refinement.
+    issue_number: u64,
+    /// Wall-clock dispatch instant — used to bound the wait at
+    /// `REFINEMENT_BIND_TIMEOUT`.
+    dispatched_at: Instant,
+}
+
+/// How long to wait for the refinement assignment row to appear before
+/// giving up on the chat overlay.  `coord refine-chat` typically writes
+/// the row within ~1 s; 30 s is a generous ceiling for slow agents.
+const REFINEMENT_BIND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// #264: after the refinement chat closes we issue `coord stop` first,
+/// then `coord ready` once the stop returns.  CommandRunner is single-slot
+/// so we can't chain them in one call without a shell wrapper; this state
+/// queues the follow-up `ready` for the next tick after `stop` completes.
+#[derive(Clone)]
+struct PendingRefineReady {
+    repo: String,
+    issue_number: u64,
+    /// The assignment id of the refinement worker — only used to recognise
+    /// "this is the stop we were waiting on" when CommandResult lands.
+    assignment_id: String,
+}
+
 struct TestBuildJob {
     /// Work assignment id this build is verifying. Also the HashMap key.
     #[allow(dead_code)]
@@ -2893,6 +2926,16 @@ pub struct CoordApp {
     /// accumulating the description; Enter records test_state=failed AND
     /// dispatches `coord fix <work_id> --guidance <buf>`.  Esc cancels.
     pending_report_fix: Option<String>,
+    /// #264: refinement-chat dispatch is pending — we've shelled `coord
+    /// refine-chat <repo> <issue>` and are polling the DB for the new
+    /// `type="refinement"` assignment to appear so we can open the chat
+    /// overlay bound to its id.  Cleared on bind or timeout.
+    pending_refinement: Option<PendingRefinement>,
+    /// #264: queued follow-up `coord ready` after `coord stop` completes
+    /// at the end of a refinement chat.  Single-slot CommandRunner forces
+    /// sequential dispatch; the poll handler fires this once stop's
+    /// CommandResult arrives.
+    pending_refine_ready: Option<PendingRefineReady>,
     /// #245: pending `coord merge --force-merge` confirmation.  `Some(repo)`
     /// means the user pressed `m` while the "Checks failed" hint was visible
     /// and we're waiting for one-key confirmation before bypassing the CI
@@ -3154,6 +3197,8 @@ impl CoordApp {
             pending_purge: None,
             pending_test_fail: None,
             pending_report_fix: None,
+            pending_refinement: None,
+            pending_refine_ready: None,
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
@@ -10024,6 +10069,11 @@ impl CoordApp {
         // Completed would be confusing.
         if matches!(lifecycle, BoardRowLifecycle::Backlog) {
             items.push(ContextMenuItem::action("refine", "Refine"));
+            // #264: chat-driven refinement. Spawns a `type="refinement"`
+            // claude -p worker seeded with the issue + CLAUDE.md, opens a
+            // chat overlay bound to it.  Separate from label-only Refine
+            // because it burns agent-pool credits (#264 plan).
+            items.push(ContextMenuItem::action("refine-chat", "Refine with chat"));
             items.push(ContextMenuItem::separator());
         }
         // #266: Refining rows get the forward path (Mark Refined) and
@@ -10407,6 +10457,184 @@ impl CoordApp {
     /// number) drive the dispatch toast; on missing target data, the
     /// helper surfaces a guidance toast and returns `false` without
     /// spawning anything.
+    /// #264: finalise an active refinement chat — close the worker and
+    /// flip the GitHub label so the issue moves Refining → Refined.  Best
+    /// effort: failures surface via the existing command-runner toast on
+    /// non-zero exit (`bead06a`).
+    ///
+    /// Called when Esc closes the refinement chat overlay.  Reads the
+    /// focused watch context for the worker id + repo + issue rather than
+    /// re-parsing — that state is already in `watch_pool` from
+    /// `maybe_bind_pending_refinement`.
+    fn finalise_refinement_chat(&mut self) {
+        let (aid, repo, issue_n) = match self.focused_watch_state() {
+            Some(w) => (w.assignment_id.clone(), w.repo.clone(), w.issue_number),
+            None => return,
+        };
+        // CommandRunner is single-slot.  We fire `coord stop` now and
+        // queue the follow-up `coord ready` for the post-stop poll handler
+        // — leaves a clean sequence (stop → ready), and a failed stop
+        // keeps the issue in status:refining rather than racing the label
+        // flip.
+        self.command_runner.spawn(&["stop", &aid]);
+        self.pending_refine_ready = Some(PendingRefineReady {
+            repo,
+            issue_number: issue_n,
+            assignment_id: aid,
+        });
+        self.push_toast(
+            "Refine with chat",
+            &format!("#{}: stopping worker, then marking ready…", issue_n),
+            ToastSeverity::Info,
+        );
+    }
+
+    /// #264: shell `coord refine-chat <repo> <issue>` and arm
+    /// `pending_refinement` so the next tick can bind the chat overlay to
+    /// the new assignment row when it appears in the DB.
+    fn dispatch_refine_chat(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo, num) = match target {
+            ContextMenuTarget::BoardRow {
+                issue_number: Some(num),
+                repo_name: Some(repo),
+                ..
+            } => (repo.clone(), *num),
+            _ => {
+                self.push_toast(
+                    "Refine with chat unavailable",
+                    "No issue + repo target — focus a row first.",
+                    ToastSeverity::Info,
+                );
+                return false;
+            }
+        };
+        let num_str = num.to_string();
+        if !self.command_runner.spawn(&["refine-chat", &repo, &num_str]) {
+            self.push_toast(
+                "Another command is running",
+                "Wait for the current command to finish, then try again.",
+                ToastSeverity::Info,
+            );
+            return false;
+        }
+        // Arm the bind so the next tick that sees the new assignment row
+        // can open the chat overlay.
+        self.pending_refinement = Some(PendingRefinement {
+            repo,
+            issue_number: num,
+            dispatched_at: Instant::now(),
+        });
+        self.push_toast(
+            "Refine with chat",
+            &format!("#{}: starting refinement chat…", num),
+            ToastSeverity::Info,
+        );
+        true
+    }
+
+    /// #264: called each tick while `pending_refinement` is armed.  Looks
+    /// for the freshly-dispatched `type="refinement"` row in
+    /// `self.data.assignments` matching the pending issue; on hit, adds it
+    /// to `watch_pool`, focuses it, and opens the inject_chat overlay.
+    /// Returns true when the overlay was opened (caller redraws).
+    fn maybe_bind_pending_refinement(&mut self) -> bool {
+        let pending = match &self.pending_refinement {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+        // Timeout — drop and toast.  Common cause: `coord refine-chat`
+        // failed (the command's stderr-to-toast plumbing landed in
+        // `bead06a`, so the user already saw the underlying error).
+        if pending.dispatched_at.elapsed() > REFINEMENT_BIND_TIMEOUT {
+            self.pending_refinement = None;
+            self.push_toast(
+                "Refine with chat timed out",
+                &format!(
+                    "No refinement assignment appeared for #{} within {}s.",
+                    pending.issue_number,
+                    REFINEMENT_BIND_TIMEOUT.as_secs()
+                ),
+                ToastSeverity::Warning,
+            );
+            return true;
+        }
+        // Find the matching assignment.  Prefer the newest dispatched
+        // one in case there were prior aborted attempts on the same issue.
+        let pick = self.data.assignments.iter()
+            .filter(|a| a.issue_number == pending.issue_number)
+            .filter(|a| a.assignment_type.as_deref() == Some("refinement"))
+            .filter(|a| a.status == "running")
+            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal))
+            .cloned();
+        let Some(asg) = pick else { return false; };
+
+        // Add to watch_pool (if not already), focus it, open chat.  Reuses
+        // the worker-guidance overlay shape — refinement is a chat too.
+        let aid = asg.id.clone();
+        if !self.watch_pool.contains_key(&aid) {
+            let state = WatchState {
+                assignment_id: aid.clone(),
+                machine: asg.machine.clone(),
+                repo: asg.repo.clone(),
+                issue_number: asg.issue_number,
+                assignment_type: asg.assignment_type.clone().unwrap_or_else(|| "refinement".to_string()),
+                scroll: usize::MAX,
+            };
+            let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
+                if !m.host.is_empty() {
+                    let rx = spawn_sse_watch(&m.host, &aid, 0);
+                    WatchSseState {
+                        rx,
+                        lines: Vec::new(),
+                        last_event_id: 0,
+                        fail_count: 0,
+                        first_fail_at: None,
+                        done: false,
+                        host: m.host.clone(),
+                        pending_tail: String::new(),
+                        line_times: Vec::new(),
+                        current_turn: 0,
+                    }
+                } else {
+                    make_local_sse_state(&aid)
+                }
+            } else {
+                make_local_sse_state(&aid)
+            };
+            if self.watch_pool.len() >= WATCH_POOL_CAP {
+                let lru_id = self.watch_pool.iter()
+                    .min_by_key(|(_, ctx)| ctx.last_focused_at)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = lru_id {
+                    self.watch_pool.remove(&id);
+                }
+            }
+            self.watch_pool.insert(aid.clone(), WatchContext {
+                state,
+                sse,
+                inject_transcript: Vec::new(),
+                last_focused_at: Instant::now(),
+            });
+        }
+        self.watch_focused = Some(aid.clone());
+        // Open the inject_chat overlay so the user can type immediately.
+        let mut chat = ChatController::new("refinement-chat");
+        chat.set_status(StyledText::plain(format!(
+            "  Refinement chat → {} #{}  (Ctrl+S or Alt+Enter = send · D = done & ready · Esc = close)",
+            pending.repo, pending.issue_number
+        )));
+        chat.set_transcript(Vec::new());
+        self.inject_chat = Some(chat);
+        self.pending_refinement = None;
+        self.push_toast(
+            "Refine with chat",
+            &format!("#{}: chat ready — type to refine.", pending.issue_number),
+            ToastSeverity::Info,
+        );
+        true
+    }
+
     fn dispatch_board_row_command(
         &mut self,
         target: &ContextMenuTarget,
@@ -10481,6 +10709,9 @@ impl CoordApp {
                 "Refine",
                 "#{}: tagging status:refining…",
             ),
+            // #264: Refine with chat — dispatch a refinement-chat worker
+            // and open a ChatController bound to it.
+            "refine-chat" => self.dispatch_refine_chat(target),
             // #261: Send to Pipeline — add the `coord` label so the
             // issue moves Refined → Pipeline:New.  Wraps the new
             // `coord track <repo> <num>` Python command.
@@ -11253,6 +11484,26 @@ impl CoordApp {
                     ToastSeverity::Error,
                 );
             }
+            // #264: chain the queued `coord ready` after `coord stop`
+            // finished cleanly at the end of a refinement chat.  We only
+            // fire it on successful stop — leaving the issue in
+            // status:refining when the worker couldn't be killed is the
+            // safer default (the user can drop to backlog manually).
+            if let Some(p) = self.pending_refine_ready.clone() {
+                if result.label.contains(&format!("stop {}", p.assignment_id))
+                    && result.exit_code == 0
+                {
+                    self.pending_refine_ready = None;
+                    let issue_str = p.issue_number.to_string();
+                    if !self.command_runner.spawn(&["ready", &p.repo, &issue_str]) {
+                        self.push_toast(
+                            "Refine with chat",
+                            "Couldn't mark ready — coord runner busy.",
+                            ToastSeverity::Warning,
+                        );
+                    }
+                }
+            }
             // #290 recovery: a coord command just finished.  If this was a
             // merge dispatch and no merge_queue row appeared yet (CI gate
             // blocked, queue empty, or transient read error), the optimistic
@@ -11281,6 +11532,12 @@ impl CoordApp {
 
         // Poll background gh issue loader
         if self.poll_pipeline_loader() {
+            needs_redraw = true;
+        }
+
+        // #264: bind a pending refinement-chat dispatch to its new
+        // assignment row as soon as it appears in the DB.
+        if self.pending_refinement.is_some() && self.maybe_bind_pending_refinement() {
             needs_redraw = true;
         }
 
@@ -12035,6 +12292,17 @@ impl ShellApp for CoordApp {
                     self.submit_inject(text);
                 }
                 ChatControllerEvent::Cancelled => {
+                    // #264: Esc on a refinement chat finalises — kill the
+                    // refinement worker AND flip the GitHub label
+                    // status:refining → status:ready.  For non-refinement
+                    // chats (worker guidance) Esc just closes the overlay;
+                    // the worker keeps running because the user is mid-task.
+                    let is_refinement = self.focused_watch_state()
+                        .map(|w| w.assignment_type == "refinement")
+                        .unwrap_or(false);
+                    if is_refinement {
+                        self.finalise_refinement_chat();
+                    }
                     self.inject_chat = None;
                 }
                 _ => {}
@@ -13825,6 +14093,8 @@ mod tests {
             pending_purge: None,
             pending_test_fail: None,
             pending_report_fix: None,
+            pending_refinement: None,
+            pending_refine_ready: None,
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
