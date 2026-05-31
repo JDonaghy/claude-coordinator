@@ -659,7 +659,15 @@ impl IssueGroup {
     ///   (`done`/`merged`) → **Completed**.
     /// - Otherwise (with assignments) → **In-flight**.
     fn lifecycle_section(&self) -> &'static str {
-        if self.assignments.is_empty() {
+        // #264: refinement assignments are conversational scoping, not real
+        // work — they shouldn't drag an issue out of the Backlog/Refining/
+        // Refined buckets into In-flight just because a chat ran.  Filter
+        // them out for the "has real work?" check (but they still count
+        // toward the per-row activity badges elsewhere).
+        let has_real_work = self.assignments.iter().any(|a| {
+            a.assignment_type.as_deref() != Some("refinement")
+        });
+        if !has_real_work {
             // #226: split Pending by `status:*` label.
             if self.labels.iter().any(|l| l == "status:refining") {
                 return "refining";
