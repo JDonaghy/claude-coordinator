@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from coord.models import Proposal
-from coord.state import save_proposals, load_proposals, clear_proposals
+from coord.state import (
+    save_proposals,
+    load_proposals,
+    clear_proposals,
+    record_dispatched,
+    update_assignment_claude_session_id,
+)
 
 
 @pytest.fixture
@@ -63,3 +71,65 @@ class TestStatePersistence:
         loaded = load_proposals()
         assert len(loaded) == 1
         assert loaded[0].id == 1
+
+
+class TestClaudeSessionId:
+    """#315: claude_session_id column on the assignments table."""
+
+    def test_schema_has_claude_session_id_column(self, coord_db) -> None:
+        """The assignments table must have a claude_session_id column."""
+        from coord.db import get_connection
+        conn = get_connection()
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()}
+        assert "claude_session_id" in cols, (
+            "assignments table is missing claude_session_id column — "
+            "check _migrate_add_columns in coord/db.py"
+        )
+
+    def test_update_assignment_claude_session_id(self, coord_db) -> None:
+        """update_assignment_claude_session_id persists the value on the row."""
+        # Insert a minimal assignment row using record_dispatched.
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Chat test",
+            rationale="test",
+            briefing="hello",
+            type="refinement",
+        )
+        assignment_id = "test-sess-001"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
+
+        # Starts as NULL.
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT claude_session_id FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None
+
+        # Persist the session ID.
+        update_assignment_claude_session_id(assignment_id, "ses-xyz-42")
+
+        row = conn.execute(
+            "SELECT claude_session_id FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row[0] == "ses-xyz-42"
+
+    def test_update_assignment_claude_session_id_noop_on_missing(self, coord_db) -> None:
+        """Calling with a nonexistent assignment_id silently does nothing."""
+        update_assignment_claude_session_id("no-such-id", "ses-123")  # must not raise
+
+    def test_update_assignment_claude_session_id_noop_on_empty(self, coord_db) -> None:
+        """Calling with empty strings silently does nothing."""
+        update_assignment_claude_session_id("", "ses-123")  # must not raise
+        update_assignment_claude_session_id("some-id", "")  # must not raise

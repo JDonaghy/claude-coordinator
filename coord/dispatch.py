@@ -91,6 +91,10 @@ def dispatch(
     # (and the AssignmentSpec(**body) kwargs check) reject unknown fields.
     if proposal.target_branch:
         payload["target_branch"] = proposal.target_branch
+    # #315: only send resume_session_id when set — older agents without the
+    # field reject unknown payload keys with a 400.
+    if getattr(proposal, "resume_session_id", None):
+        payload["resume_session_id"] = proposal.resume_session_id
 
     resp = httpx.post(url, json=payload, timeout=15)
     resp.raise_for_status()

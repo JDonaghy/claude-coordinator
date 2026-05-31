@@ -321,6 +321,22 @@ struct PendingRefinement {
 /// the row within ~1 s; 30 s is a generous ceiling for slow agents.
 const REFINEMENT_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// #315: state carried while we wait for a re-dispatched `coord chat-continue`
+/// assignment to appear in the local DB so the inject-chat overlay can rebind
+/// to the new assignment (and keep the session alive across `end_turn` exits).
+#[derive(Clone)]
+struct PendingChatResume {
+    /// The prior (completed) assignment id — used to avoid rebinding to the
+    /// same row that just exited.
+    old_assignment_id: String,
+    /// Issue number, for filtering `self.data.assignments`.
+    issue_number: u64,
+    /// Wall-clock instant when `coord chat-continue` was launched.  Used
+    /// both for timeout and to reject assignments dispatched before this
+    /// point.
+    dispatched_at: Instant,
+}
+
 /// #264: after the refinement chat closes we issue `coord stop` first,
 /// then `coord ready` once the stop returns.  CommandRunner is single-slot
 /// so we can't chain them in one call without a shell wrapper; this state
@@ -604,6 +620,40 @@ fn spawn_inject_post(host: &str, assignment_id: &str, text: &str) {
                 eprintln!("[chat inject] POST {} failed: {}", url, e);
             }
         }
+    });
+}
+
+/// #315: shell `coord [--config <path>] chat-continue <old_aid> <text>` in a
+/// background thread.  Fire-and-forget — the TUI does not capture stdout here;
+/// instead, `maybe_bind_pending_resume` polls `self.data.assignments` each tick
+/// for the new row that `coord chat-continue` inserts into the coordinator DB.
+///
+/// Uses a raw thread rather than `CommandRunner` so the auto-`coord notify`
+/// cycle (single-slot) is never blocked during an active chat session.
+fn spawn_chat_continue(
+    config_path: Option<std::path::PathBuf>,
+    old_assignment_id: String,
+    text: String,
+) {
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new("coord");
+        // Inject --config immediately after the subcommand name, mirroring the
+        // CommandRunner pattern so `coord` finds coordinator.yml.
+        cmd.arg("chat-continue");
+        if let Some(ref cfg) = config_path {
+            cmd.args(["--config", &cfg.to_string_lossy()]);
+        }
+        cmd.arg(&old_assignment_id);
+        // Append each word of the user message as a separate argument so
+        // shell-special characters (quotes, semicolons, etc.) are never
+        // interpreted.
+        for word in text.split_whitespace() {
+            cmd.arg(word);
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let _ = cmd.status(); // fire-and-forget; errors surface as "no new assignment"
     });
 }
 
@@ -2991,6 +3041,12 @@ pub struct CoordApp {
     /// `type="refinement"` assignment to appear so we can open the chat
     /// overlay bound to its id.  Cleared on bind or timeout.
     pending_refinement: Option<PendingRefinement>,
+    /// #315: chat-continue dispatch is pending — the prior worker exited after
+    /// `end_turn`, the user typed another message, and we've shelled
+    /// `coord chat-continue <old_aid> <text>`.  We poll `self.data.assignments`
+    /// each tick for the new running refinement row and rebind the open chat
+    /// overlay to it when it appears.  Cleared on bind or timeout.
+    pending_chat_resume: Option<PendingChatResume>,
     /// #264: queued follow-up `coord ready` after `coord stop` completes
     /// at the end of a refinement chat.  Single-slot CommandRunner forces
     /// sequential dispatch; the poll handler fires this once stop's
@@ -3284,6 +3340,7 @@ impl CoordApp {
             pending_test_fail: None,
             pending_report_fix: None,
             pending_refinement: None,
+            pending_chat_resume: None,
             pending_refine_ready: None,
             chat_transcript_cache_key: None,
             chat_last_activity: None,
@@ -3985,23 +4042,57 @@ impl CoordApp {
         // #264: claude -p exits after `stop_reason: end_turn` (it doesn't
         // stay alive waiting for more injects), so once the assignment is
         // in `done` state any new POST /inject/{id} will return 410
-        // BrokenPipeError.  Refuse the submit up-front and tell the user
-        // the worker is gone — without this we silently swallowed the
-        // error and the chat looked frozen.
+        // BrokenPipeError.
+        //
+        // #315: Instead of refusing, fall back to `coord chat-continue` which
+        // re-dispatches the worker with `--resume <session_id>` so it loads
+        // the full prior conversation before seeing this message as the next
+        // user turn.  The TUI polls for the new assignment row and rebinds the
+        // chat overlay to it via `maybe_bind_pending_resume`.
         let worker_done = self.data.assignments.iter().any(|a| {
             a.id == aid && (a.status == "done" || a.status == "failed" || a.status == "cancelled")
         });
         if worker_done {
-            self.push_toast(
-                "Chat ended",
-                "The worker exited (stop_reason: end_turn).  Esc to close and start a new chat — the model decided the conversation was done.",
-                ToastSeverity::Warning,
-            );
-            // Clear the input so the message doesn't sit there forever.
+            // Record the user turn in the transcript before the shell-out so
+            // the typed text is visible immediately and can't disappear even
+            // if the dispatch takes a moment.
+            let sse_offset_at_send = self.watch_pool.get(&aid)
+                .map(|ctx| ctx.sse.lines.len())
+                .unwrap_or(0);
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs_f64());
+                let turn = ChatTurn {
+                    role: ChatRole::User,
+                    text: StyledText::plain(text.clone()),
+                    timestamp_unix: now,
+                };
+                if let Some(ctx) = self.watch_pool.get_mut(&aid) {
+                    ctx.inject_transcript.push(turn);
+                    ctx.inject_sse_offsets.push(sse_offset_at_send);
+                }
+            }
+            // Clear the input field.
             if let Some(ref mut chat) = self.inject_chat {
                 chat.clear_input();
             }
-            return false;
+            // Dispatch the resume in a background thread.
+            let config_path = self.command_runner.config_path.clone();
+            spawn_chat_continue(config_path, aid.clone(), text.clone());
+            // Arm the pending-resume poll so the overlay rebinds on the next
+            // data refresh that surfaces the new assignment row.
+            self.pending_chat_resume = Some(PendingChatResume {
+                old_assignment_id: aid.clone(),
+                issue_number,
+                dispatched_at: Instant::now(),
+            });
+            self.pipeline_status = Some((
+                format!("⏳ Resuming chat #{issue_number}…"),
+                Instant::now(),
+            ));
+            return true;
         }
         let host = match self.data.machines.iter().find(|m| m.name == machine_name) {
             Some(m) if !m.host.is_empty() => m.host.clone(),
@@ -10899,6 +10990,121 @@ impl CoordApp {
         true
     }
 
+    /// #315: called each tick while `pending_chat_resume` is armed.  Looks for
+    /// a NEW running refinement assignment for the same issue (dispatched AFTER
+    /// the prior worker exited) and, when found, rebinds the open `inject_chat`
+    /// overlay to it so the conversation continues seamlessly.
+    ///
+    /// Returns true when the overlay was rebound (caller should redraw).
+    fn maybe_bind_pending_resume(&mut self) -> bool {
+        let pending = match &self.pending_chat_resume {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+        // Timeout — the resume dispatch likely failed; clear and warn the user.
+        if pending.dispatched_at.elapsed() > REFINEMENT_BIND_TIMEOUT {
+            self.pending_chat_resume = None;
+            self.push_toast(
+                "Chat resume timed out",
+                &format!(
+                    "No new assignment appeared for #{} within {}s. \
+                     Try 'coord chat-continue' manually.",
+                    pending.issue_number,
+                    REFINEMENT_BIND_TIMEOUT.as_secs(),
+                ),
+                ToastSeverity::Warning,
+            );
+            return true;
+        }
+        // Find the newest running refinement assignment for this issue that is
+        // NOT the prior assignment (which just exited).  We filter by
+        // assignment_id != old_id rather than by dispatched_at because
+        // Instant → unix-ts conversion is lossy; the id filter is precise.
+        let pick = self.data.assignments.iter()
+            .filter(|a| a.issue_number == pending.issue_number)
+            .filter(|a| a.assignment_type.as_deref() == Some("refinement"))
+            .filter(|a| a.status == "running")
+            .filter(|a| a.id != pending.old_assignment_id)
+            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal))
+            .cloned();
+        let Some(asg) = pick else { return false; };
+        let new_aid = asg.id.clone();
+
+        // Carry the existing inject_transcript and inject_sse_offsets from
+        // the old context into the new one so the user's turn history survives
+        // the assignment rebind.  Reset all SSE offsets to 0 — the new SSE
+        // stream starts at byte 0, so all prior user turns should appear before
+        // any new assistant output.
+        let (old_transcript, old_sse_offsets) = if let Some(old_ctx) = self.watch_pool.get(&pending.old_assignment_id) {
+            let t = old_ctx.inject_transcript.clone();
+            let o = old_ctx.inject_sse_offsets.iter().map(|_| 0usize).collect::<Vec<_>>();
+            (t, o)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // Build the new WatchContext for the new assignment (mirrors
+        // maybe_bind_pending_refinement, but the overlay stays open).
+        if !self.watch_pool.contains_key(&new_aid) {
+            let state = WatchState {
+                assignment_id: new_aid.clone(),
+                machine: asg.machine.clone(),
+                repo: asg.repo.clone(),
+                issue_number: asg.issue_number,
+                assignment_type: asg.assignment_type.clone().unwrap_or_else(|| "refinement".to_string()),
+                scroll: usize::MAX,
+            };
+            let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
+                if !m.host.is_empty() {
+                    let rx = spawn_sse_watch(&m.host, &new_aid, 0);
+                    WatchSseState {
+                        rx,
+                        lines: Vec::new(),
+                        last_event_id: 0,
+                        fail_count: 0,
+                        first_fail_at: None,
+                        done: false,
+                        host: m.host.clone(),
+                        pending_tail: String::new(),
+                        line_times: Vec::new(),
+                        current_turn: 0,
+                    }
+                } else {
+                    make_local_sse_state(&new_aid)
+                }
+            } else {
+                make_local_sse_state(&new_aid)
+            };
+            if self.watch_pool.len() >= WATCH_POOL_CAP {
+                let lru_id = self.watch_pool.iter()
+                    .min_by_key(|(_, ctx)| ctx.last_focused_at)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = lru_id {
+                    self.watch_pool.remove(&id);
+                }
+            }
+            self.watch_pool.insert(new_aid.clone(), WatchContext {
+                state,
+                sse,
+                inject_transcript: old_transcript,
+                inject_sse_offsets: old_sse_offsets,
+                last_focused_at: Instant::now(),
+            });
+        }
+        // Rebind the overlay to the new assignment.
+        self.watch_focused = Some(new_aid.clone());
+        // Invalidate the transcript cache so the next tick rebuilds from the
+        // new context (avoids displaying stale content for a frame).
+        self.chat_transcript_cache_key = None;
+        self.pending_chat_resume = None;
+        self.pipeline_status = Some((
+            format!("✓ Chat resumed — #{}", pending.issue_number),
+            Instant::now(),
+        ));
+        true
+    }
+
     fn dispatch_board_row_command(
         &mut self,
         target: &ContextMenuTarget,
@@ -11872,6 +12078,12 @@ impl CoordApp {
         // #264: bind a pending refinement-chat dispatch to its new
         // assignment row as soon as it appears in the DB.
         if self.pending_refinement.is_some() && self.maybe_bind_pending_refinement() {
+            needs_redraw = true;
+        }
+
+        // #315: rebind the open chat overlay to the new assignment when a
+        // `coord chat-continue` re-dispatch has landed in the DB.
+        if self.pending_chat_resume.is_some() && self.maybe_bind_pending_resume() {
             needs_redraw = true;
         }
 
@@ -14066,11 +14278,17 @@ impl ShellApp for CoordApp {
                             Some("refinement") => "Refinement chat",
                             _ => "Chat",
                         };
-                        let suffix = match status.as_str() {
-                            "done" | "failed" | "cancelled" => {
-                                "  ⚠ Worker exited — chat is read-only.  Esc to close."
+                        let suffix = if self.pending_chat_resume.is_some() {
+                            // #315: a resume dispatch is in-flight — tell the
+                            // user we're spinning up a new worker.
+                            "  ⏳ Resuming session…"
+                        } else {
+                            match status.as_str() {
+                                "done" | "failed" | "cancelled" => {
+                                    "  ⚠ Worker exited — chat is read-only.  Esc to close."
+                                }
+                                _ => "  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)",
                             }
-                            _ => "  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)",
                         };
                         chat.set_status(StyledText::plain(format!(
                             "  {} → #{}{}",
@@ -14737,6 +14955,7 @@ mod tests {
             pending_test_fail: None,
             pending_report_fix: None,
             pending_refinement: None,
+            pending_chat_resume: None,
             pending_refine_ready: None,
             chat_transcript_cache_key: None,
             chat_last_activity: None,

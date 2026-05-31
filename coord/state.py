@@ -645,6 +645,28 @@ def update_assignment_smoke_tests(
     conn.commit()
 
 
+def update_assignment_claude_session_id(
+    assignment_id: str, claude_session_id: str
+) -> None:
+    """#315: persist the worker's claude session ID on the assignment row.
+
+    Called by ``coord notify`` once the agent reports the worker's completed
+    session ID from its ``system.init`` event.  Best-effort: silently does
+    nothing when the row doesn't exist or the ID is empty.  COALESCE-based
+    UPDATE so the first writer wins (two concurrent notifies can't clobber
+    a valid value with NULL).
+    """
+    if not assignment_id or not claude_session_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET claude_session_id=? WHERE assignment_id=? "
+        "AND claude_session_id IS NULL",
+        (claude_session_id, assignment_id),
+    )
+    conn.commit()
+
+
 def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     """#208: record the worker's final cost on an existing assignment row.
 
