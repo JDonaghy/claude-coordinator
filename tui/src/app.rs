@@ -430,6 +430,20 @@ struct RefinementNotesPostResult {
     issue_number: u64,
 }
 
+/// #328: Y/N/Esc prompt that appears when the user presses Esc on a
+/// non-empty refinement chat.  The chat overlay stays visible behind the
+/// prompt; the prompt is rendered as a status-bar hint (mirrors
+/// `pending_test_fail` / `pending_force_merge`).  Cleared when the user
+/// picks Y (chain into notes finaliser), N (immediate finalise), or Esc
+/// (cancel — chat stays open).
+#[derive(Clone)]
+struct PendingRefinementClosePrompt {
+    /// Issue number — only used for the prompt copy.  finalise_refinement_chat
+    /// and trigger_refinement_notes_synth both re-resolve via
+    /// `focused_watch_state`, so we don't need to carry the aid.
+    issue_number: u64,
+}
+
 struct TestBuildJob {
     /// Work assignment id this build is verifying. Also the HashMap key.
     #[allow(dead_code)]
@@ -3356,6 +3370,15 @@ pub struct CoordApp {
     /// spawned by [`Self::post_refinement_notes`].  Drained on tick; the
     /// modal stays open on failure so the typed text isn't lost.
     refinement_notes_post_rx: Option<std::sync::mpsc::Receiver<RefinementNotesPostResult>>,
+    /// #328: Y/N/Esc prompt shown when the user presses Esc on a refinement
+    /// chat that has any user turns.  `None` ⇒ Esc finalises immediately,
+    /// matching the empty-chat fast-exit.
+    pending_refinement_close_prompt: Option<PendingRefinementClosePrompt>,
+    /// #328: when true, a successful `gh issue comment` post triggers the
+    /// finalise (stop + ready) chain — used to make the close-prompt Y
+    /// path "draft, post, then mark ready" rather than leaving the chat
+    /// open after a successful post.  Cleared on modal Esc or failure.
+    finalise_after_notes_post: bool,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -3524,6 +3547,8 @@ impl CoordApp {
             pending_refinement_notes_synth: None,
             refinement_notes_modal: None,
             refinement_notes_post_rx: None,
+            pending_refinement_close_prompt: None,
+            finalise_after_notes_post: false,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -10396,7 +10421,14 @@ impl CoordApp {
             }
         }
         let proposals = self.data.proposals.len();
-        let hints = if let Some(ref buf) = self.pending_report_fix {
+        let hints = if let Some(ref p) = self.pending_refinement_close_prompt {
+            // #328: refinement-chat close prompt — Y/N/Esc takes precedence
+            // over every other hint while the user decides.
+            format!(
+                " Save refinement notes to #{} before closing?  Y=draft+post then mark ready  N=mark ready without notes  Esc=keep chatting ",
+                p.issue_number,
+            )
+        } else if let Some(ref buf) = self.pending_report_fix {
             // #296: inline description input for report+fix takes precedence.
             format!(" Report failure — description: {}_  Enter=submit+dispatch  Esc=cancel ", buf)
         } else if let Some((_, ref buf)) = self.pending_test_fail {
@@ -11183,6 +11215,11 @@ impl CoordApp {
         match key {
             Key::Named(NamedKey::Escape) => {
                 self.refinement_notes_modal = None;
+                // #328: clear the close-prompt's finalise commitment too —
+                // the user backed out, so don't quietly finalise on the
+                // next post.  Their next Esc returns to the close prompt
+                // afresh.
+                self.finalise_after_notes_post = false;
                 self.push_toast(
                     "Refinement notes",
                     "Cancelled — nothing posted.",
@@ -11287,6 +11324,16 @@ impl CoordApp {
                 &format!("#{}: comment added.", result.issue_number),
                 ToastSeverity::Info,
             );
+            // #328: when the close-prompt's Y path triggered this post,
+            // chain the finalise (stop + ready) now that the comment is on
+            // the issue.  Y committed to "draft, post, then mark ready" —
+            // skipping finalise here would leave the chat open after
+            // success, which contradicts the choice the user made.
+            if self.finalise_after_notes_post {
+                self.finalise_after_notes_post = false;
+                self.finalise_refinement_chat();
+                self.inject_chat = None;
+            }
         } else {
             if let Some(ref mut m) = self.refinement_notes_modal {
                 m.posting = false;
@@ -11509,7 +11556,7 @@ impl CoordApp {
         // Open the inject_chat overlay so the user can type immediately.
         let mut chat = ChatController::new("refinement-chat");
         chat.set_status(StyledText::plain(format!(
-            "  Refinement chat → {} #{}  (Ctrl+S/Alt+Enter = send · Ctrl+N = add notes · Esc = done & mark ready)",
+            "  Refinement chat → {} #{}  (Ctrl+S/Alt+Enter = send · Ctrl+N = post notes · Esc = finish)",
             pending.repo, pending.issue_number
         )));
         chat.set_transcript(Vec::new());
@@ -12238,6 +12285,7 @@ impl CoordApp {
             || self.pending_force_merge.is_some()
             || self.pending_test_fail.is_some()
             || self.pending_report_fix.is_some()
+            || self.pending_refinement_close_prompt.is_some()
         {
             return None;
         }
@@ -13524,6 +13572,41 @@ impl ShellApp for CoordApp {
             return Reaction::Redraw;
         }
 
+        // ── #328: refinement-chat close prompt — Y/N/Esc on the status bar
+        // owns all input while the user decides whether to draft notes.
+        // The chat overlay stays rendered behind the hint so the user can
+        // read the transcript before answering.  Y triggers the notes
+        // synth and chains finalise on successful post; N finalises
+        // immediately; Esc cancels and returns the user to the chat.
+        if self.pending_refinement_close_prompt.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        self.pending_refinement_close_prompt = None;
+                        self.finalise_after_notes_post = true;
+                        self.trigger_refinement_notes_synth();
+                        // If synth bailed out (no slug, dispatch busy,
+                        // etc.) it toasted and didn't arm — clear the
+                        // commitment so it can't quietly finalise on a
+                        // later Phase-A Ctrl+N flow.
+                        if self.pending_refinement_notes_synth.is_none() {
+                            self.finalise_after_notes_post = false;
+                        }
+                    }
+                    Key::Char('n') | Key::Char('N') => {
+                        self.pending_refinement_close_prompt = None;
+                        self.finalise_refinement_chat();
+                        self.inject_chat = None;
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_refinement_close_prompt = None;
+                    }
+                    _ => {}
+                }
+            }
+            return Reaction::Redraw;
+        }
+
         // ── Inject chat overlay — intercepts events when open ──────────────
         // Two routing modes:
         //   - **Worker-guidance** (chat opened with `b` over a watch overlay)
@@ -13589,7 +13672,28 @@ impl ShellApp for CoordApp {
                         // mid-task).  Refinement chat: Esc finalises —
                         // stop the worker + flip status:refining →
                         // status:ready.
+                        //
+                        // #328: when the refinement chat has any user
+                        // turns, defer the finalise and offer the notes
+                        // finaliser via a Y/N/Esc status-bar prompt.  The
+                        // chat overlay stays visible so the user can read
+                        // the transcript while deciding.  Empty chats
+                        // (user hit Esc without engaging) still fast-exit.
                         if chat_is_refinement {
+                            let has_user_turns = self.watch_focused.as_ref()
+                                .and_then(|id| self.watch_pool.get(id))
+                                .map(|ctx| !ctx.inject_transcript.is_empty())
+                                .unwrap_or(false);
+                            let issue_n = self.focused_watch_state()
+                                .map(|w| w.issue_number)
+                                .unwrap_or(0);
+                            if has_user_turns && issue_n != 0 {
+                                self.pending_refinement_close_prompt =
+                                    Some(PendingRefinementClosePrompt { issue_number: issue_n });
+                                // Leave inject_chat open — the prompt is a
+                                // status-bar overlay above it.
+                                return Reaction::Redraw;
+                            }
                             self.finalise_refinement_chat();
                         }
                         self.inject_chat = None;
@@ -14945,12 +15049,12 @@ impl ShellApp for CoordApp {
                                 // a "read-only" warning here; the prompt
                                 // suffix stays send-enabled.
                                 (Some("refinement"), _) => {
-                                    "  (Ctrl+S/Alt+Enter = send · Ctrl+N = add notes · Esc = done & mark ready)"
+                                    "  (Ctrl+S/Alt+Enter = send · Ctrl+N = post notes · Esc = finish)"
                                 }
                                 (_, "done") | (_, "failed") | (_, "cancelled") => {
                                     "  ⚠ Worker exited — chat is read-only.  Esc to close."
                                 }
-                                _ => "  (Ctrl+S/Alt+Enter = send · Ctrl+N = add notes · Esc = done & mark ready)",
+                                _ => "  (Ctrl+S/Alt+Enter = send · Ctrl+N = post notes · Esc = finish)",
                             }
                         };
                         chat.set_status(StyledText::plain(format!(
@@ -15755,6 +15859,8 @@ mod tests {
             pending_refinement_notes_synth: None,
             refinement_notes_modal: None,
             refinement_notes_post_rx: None,
+            pending_refinement_close_prompt: None,
+            finalise_after_notes_post: false,
         }
     }
 
