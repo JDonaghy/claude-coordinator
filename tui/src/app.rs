@@ -6204,22 +6204,6 @@ impl CoordApp {
             .unwrap_or(false)
     }
 
-    /// #264: True when `inject_chat` is a refinement chat AND its bound
-    /// assignment's issue matches the currently-selected pipeline row.
-    /// The Refinement tab only shows the chat in this state; when the
-    /// user navigates to a different issue while the chat is open they
-    /// see the placeholder instead, so the chat can't be mistaken for
-    /// belonging to a different issue.
-    fn chat_is_refinement_for_selected_issue(&self) -> bool {
-        if !self.chat_is_refinement() {
-            return false;
-        }
-        let Some(w) = self.focused_watch_state() else { return false; };
-        let Some(sel) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(sel) else { return false; };
-        issue.number == w.issue_number
-    }
-
     /// #264: True when any `type="refinement"` assignment is currently
     /// running on the selected pipeline issue.  Drives the Refinement
     /// tab's accent dot so the tab is discoverable without forcing focus.
@@ -12483,12 +12467,13 @@ impl ShellApp for CoordApp {
                             // #264: refinement chat lives in its own tab so
                             // the user can flip back to Issue / Stages / Log
                             // while the chat keeps streaming in the
-                            // background.  Three render states:
-                            //   - chat bound to this issue → render it
-                            //   - no chat / chat for a different issue but
-                            //     a refinement assignment exists → "binding…"
-                            //   - no refinement at all → empty placeholder
-                            if self.chat_is_refinement_for_selected_issue() {
+                            // background.  Render the chat whenever it's
+                            // open — its status strip already names the
+                            // repo + issue, and Backlog rows the user
+                            // refines aren't in `pipeline_issues` (they
+                            // lack the `coord` label), so a per-pipeline-
+                            // sel match would never fire for those.
+                            if self.chat_is_refinement() {
                                 // Paint an opaque backing first so the chat's
                                 // empty transcript zone doesn't bleed
                                 // through.
@@ -12588,7 +12573,6 @@ impl ShellApp for CoordApp {
             let route_to_chat = if chat_is_refinement {
                 self.active_view == SidebarView::Pipeline
                     && self.pipeline_detail_tab == PipelineDetailTab::Refinement
-                    && self.chat_is_refinement_for_selected_issue()
             } else {
                 true
             };
