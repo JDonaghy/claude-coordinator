@@ -11509,7 +11509,7 @@ impl CoordApp {
         // Open the inject_chat overlay so the user can type immediately.
         let mut chat = ChatController::new("refinement-chat");
         chat.set_status(StyledText::plain(format!(
-            "  Refinement chat → {} #{}  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)",
+            "  Refinement chat → {} #{}  (Ctrl+S/Alt+Enter = send · Ctrl+N = add notes · Esc = done & mark ready)",
             pending.repo, pending.issue_number
         )));
         chat.set_transcript(Vec::new());
@@ -15032,17 +15032,62 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
 /// lists, paragraph breaks) render as separate rows in the chat —
 /// quadraui's `MessageList` doesn't honour embedded newlines inside a
 /// single `StyledText`, so each line has to be its own `ChatTurn`.
+/// #319 Phase A: extract the `text` field of a stream-json `assistant`
+/// event with `\n` escapes preserved as real newlines.  Mirrors
+/// [`extract_text_block`] but uses a newline-preserving unescaper —
+/// the shared [`json_str`] helper converts `\n` to spaces so the Log
+/// tab can render a multi-line block on one row (#302), which would
+/// otherwise flatten markdown structure when we post the body to
+/// GitHub.  Returns the empty string if no `text` block is found.
+fn extract_text_block_keep_newlines(json: &str) -> String {
+    let marker = "\"type\":\"text\"";
+    let pos = match json.find(marker) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    let after = &json[pos + marker.len()..];
+    let key = "\"text\":\"";
+    let start = match after.find(key) {
+        Some(p) => p + key.len(),
+        None => return String::new(),
+    };
+    let rest = &after[start..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => {}
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// #319 Phase A: walk the focused chat's SSE log from `floor` forward,
 /// concatenating assistant `text` blocks into the proposed comment body.
-/// Newlines between blocks preserve markdown paragraph separation; an
-/// empty result means the assistant exited without emitting any text.
+/// Uses [`extract_text_block_keep_newlines`] so the markdown structure
+/// (headings, lists, code fences) survives the trip into the
+/// `gh issue comment` body.  An empty result means the assistant exited
+/// without emitting any text.
 fn extract_assistant_text_after(ctx: &WatchContext, floor: usize) -> String {
     let mut out = String::new();
     for line in ctx.sse.lines.iter().skip(floor) {
         if json_str(line, "type").as_deref() != Some("assistant") {
             continue;
         }
-        let text = extract_text_block(line);
+        let text = extract_text_block_keep_newlines(line);
         let body = text.trim();
         if body.is_empty() {
             continue;
