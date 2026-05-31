@@ -568,6 +568,37 @@ fn spawn_machine_health(host: &str, port: u16) -> std::sync::mpsc::Receiver<Resu
     rx
 }
 
+/// #264: POST a chat user-turn to a remote agent's `/inject/{id}` endpoint
+/// in a background thread.  Used by `submit_inject` to bypass the
+/// single-slot `command_runner` so chat submits aren't blocked by the
+/// auto-`coord notify` cycle (every 30 s while any assignment is running).
+///
+/// Fire-and-forget: errors are written to stderr (the user sees them
+/// indirectly through the worker not replying), since the chat surface
+/// has no obvious place to toast HTTP errors mid-conversation.  The user
+/// can retry by resubmitting the same message.
+fn spawn_inject_post(host: &str, assignment_id: &str, text: &str) {
+    let url = format!("http://{}:7433/inject/{}", host, assignment_id);
+    let payload = serde_json::json!({ "text": text });
+    let body = payload.to_string();
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(15))
+            .build();
+        match agent
+            .post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+        {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[chat inject] POST {} failed: {}", url, e);
+            }
+        }
+    });
+}
+
 /// An issue grouped with all its assignments and a summary status.
 #[derive(Clone)]
 struct IssueGroup {
@@ -3910,19 +3941,33 @@ impl CoordApp {
         }
     }
 
-    /// Send `text` to the watched worker via `coord inject`.
-    /// Appends the text to the inject transcript and clears the chat input on success.
+    /// Send `text` to the watched worker by POSTing to the agent's
+    /// `/inject/{id}` endpoint directly.  Bypasses the single-slot
+    /// `command_runner` so chat submits aren't blocked by the periodic
+    /// `coord notify` (which fires every 30 s while any assignment is
+    /// running and otherwise gives a guaranteed "another command is
+    /// running" lockout every cycle for a long-lived refinement chat).
+    /// Appends the text to the inject transcript and clears the chat
+    /// input on success.
     fn submit_inject(&mut self, text: String) -> bool {
-        let (aid, issue_number) = match self.focused_watch_state() {
-            Some(w) => (w.assignment_id.clone(), w.issue_number),
+        let (aid, issue_number, machine_name) = match self.focused_watch_state() {
+            Some(w) => (w.assignment_id.clone(), w.issue_number, w.machine.clone()),
             None => return false,
         };
         let text = text.trim().to_string();
         if text.is_empty() { return false; }
-        let spawned = self
-            .command_runner
-            .spawn(&["inject", &aid, &text]);
-        if spawned {
+        let host = match self.data.machines.iter().find(|m| m.name == machine_name) {
+            Some(m) if !m.host.is_empty() => m.host.clone(),
+            _ => {
+                self.pipeline_status = Some((
+                    format!("no host for machine {}", machine_name),
+                    Instant::now(),
+                ));
+                return false;
+            }
+        };
+        spawn_inject_post(&host, &aid, &text);
+        {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
@@ -3955,13 +4000,8 @@ impl CoordApp {
                 format!("asked worker #{}: {}", issue_number, text),
                 Instant::now(),
             ));
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
         }
-        spawned
+        true
     }
 
     /// Spawn `coord sync --quiet` in the background if not already running
