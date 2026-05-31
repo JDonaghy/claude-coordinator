@@ -12028,9 +12028,20 @@ impl CoordApp {
         // Auto-refresh: kick off background data load when interval elapses.
         // Uses the user-configured cadence from settings (default 5 s); when
         // the cadence is "Off" no automatic reload happens (manual `r` still works).
-        let should_refresh = match self.settings.refresh_cadence.as_duration() {
-            Some(cadence) => self.refreshed_at.elapsed() >= cadence,
-            None => false,
+        //
+        // #315: while a chat resume is pending we override the cadence with a
+        // 300 ms floor.  Without this, the bind waits up to a full refresh
+        // interval (default 5 s) for the new assignment row to appear in
+        // `data.assignments` — which feels like "the chat is frozen" to the
+        // user even though the worker is already replying.
+        let cadence = self.settings.refresh_cadence.as_duration();
+        let should_refresh = if self.pending_chat_resume.is_some() {
+            self.refreshed_at.elapsed() >= Duration::from_millis(300)
+        } else {
+            match cadence {
+                Some(c) => self.refreshed_at.elapsed() >= c,
+                None => false,
+            }
         };
         if should_refresh && self.pending_data.is_none() {
             self.pending_data = Some(start_data_load());
@@ -14325,8 +14336,17 @@ impl ShellApp for CoordApp {
                             // user we're spinning up a new worker.
                             "  ⏳ Resuming session…"
                         } else {
-                            match status.as_str() {
-                                "done" | "failed" | "cancelled" => {
+                            match (atype.as_deref(), status.as_str()) {
+                                // #315: refinement chats are resumable from
+                                // any terminal state — typing triggers
+                                // chat-continue, claude reloads the session,
+                                // the chat continues seamlessly.  Never show
+                                // a "read-only" warning here; the prompt
+                                // suffix stays send-enabled.
+                                (Some("refinement"), _) => {
+                                    "  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)"
+                                }
+                                (_, "done") | (_, "failed") | (_, "cancelled") => {
                                     "  ⚠ Worker exited — chat is read-only.  Esc to close."
                                 }
                                 _ => "  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)",
