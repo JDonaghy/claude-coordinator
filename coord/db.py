@@ -230,6 +230,11 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # the review is first parsed.  NULL = not yet parsed; populated
         # = full findings.body text.
         "ALTER TABLE assignments ADD COLUMN review_findings TEXT",
+        # #315: claude session ID captured from the worker's `system.init`
+        # event.  Set by notify.py after the agent reports completion.  Used
+        # by `coord chat-continue` to pass `--resume <id>` to the next
+        # worker so it loads the prior conversation and continues it.
+        "ALTER TABLE assignments ADD COLUMN claude_session_id TEXT",
     ]
     for sql in migrations:
         try:

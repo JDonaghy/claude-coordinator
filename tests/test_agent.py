@@ -19,6 +19,7 @@ from coord.agent import (
     RUNNING,
     AgentServer,
     AssignmentSpec,
+    default_worker_command,
 )
 
 
@@ -523,3 +524,114 @@ def test_clean_worktrees_removes_stale_done(tmp_path: Path) -> None:
     assert result["cleaned"] >= 1
     assert not stale_wt.exists()
     server.shutdown()
+
+
+# ── #315: resume_session_id / claude_session_id ────────────────────────────
+
+
+def test_default_worker_command_resume_flag_absent_by_default() -> None:
+    """No --resume flag when resume_session_id is not set."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+    )
+    argv = default_worker_command(spec)
+    assert "--resume" not in argv
+
+
+def test_default_worker_command_resume_flag_present() -> None:
+    """--resume <session_id> appended when resume_session_id is set."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        resume_session_id="ses-abc123",
+    )
+    argv = default_worker_command(spec)
+    assert "--resume" in argv
+    idx = argv.index("--resume")
+    assert argv[idx + 1] == "ses-abc123"
+
+
+def test_reap_captures_claude_session_id(tmp_path: Path) -> None:
+    """_reap populates AgentAssignment.claude_session_id from a system.init log line."""
+    repo = _init_repo(tmp_path / "repo")
+    session_id = "ses-xyz-test"
+
+    # Worker emits a stream-json system.init line with the session_id then exits.
+    init_line = json.dumps({
+        "type": "system",
+        "subtype": "init",
+        "session_id": session_id,
+        "apiKeySource": "test",
+    })
+    worker_sh = f'echo \'{init_line}\'; exit 0'
+    server = AgentServer(
+        machine_name="test",
+        repos=["api"],
+        repo_paths={"api": str(repo)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+    )
+
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo),
+        issue_number=42,
+        issue_title="t",
+        briefing="b",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == DONE
+    assert final.claude_session_id == session_id
+
+    # Also visible in the /status serialisation (to_dict)
+    status = server.list_assignments()
+    completed = status["completed"]
+    assert any(c["claude_session_id"] == session_id for c in completed)
+    server.shutdown()
+
+
+def test_assignment_spec_accepts_resume_session_id() -> None:
+    """AssignmentSpec round-trips resume_session_id through to_dict / from dict."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        resume_session_id="ses-resume",
+    )
+    assert spec.resume_session_id == "ses-resume"
+
+
+def test_claude_session_id_survives_persist_load(tmp_path: Path) -> None:
+    """claude_session_id round-trips through the agent state JSON."""
+    from dataclasses import asdict
+    from coord.agent import AgentAssignment
+
+    a = AgentAssignment(
+        id="test-123",
+        spec=AssignmentSpec(
+            repo_name="api",
+            repo_path="/tmp",
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+        ),
+        claude_session_id="ses-persist",
+    )
+    d = a.to_dict()
+    assert d["claude_session_id"] == "ses-persist"
+
+    # Reconstruct from dict (mirrors _load_state logic).
+    spec_data = d.pop("spec")
+    spec = AssignmentSpec(**spec_data)
+    a2 = AgentAssignment(spec=spec, **d)
+    assert a2.claude_session_id == "ses-persist"

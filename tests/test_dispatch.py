@@ -204,3 +204,39 @@ class TestPostBriefing:
         post_briefing(proposal, config)  # must not raise
         mock_comment.assert_called_once()
         mock_add_labels.assert_called_once()
+
+
+class TestResumeSessionId:
+    """#315: resume_session_id flows from Proposal through dispatch payload."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_resume_session_id_when_set(
+        self, mock_post: MagicMock, config: Config,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Chat",
+            rationale="continuation",
+            type="refinement",
+            resume_session_id="ses-abc-123",
+        )
+        dispatch(p, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["resume_session_id"] == "ses-abc-123"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_omits_resume_session_id_when_unset(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Older agents reject unknown keys — the field must be absent when None."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "resume_session_id" not in payload

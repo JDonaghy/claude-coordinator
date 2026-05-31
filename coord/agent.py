@@ -289,6 +289,12 @@ class AssignmentSpec:
     # the `[fix-N]` issue-title prefix.  When set, the agent checks out
     # this branch directly instead of deriving from issue_number + title.
     target_branch: str | None = None
+    # #315: when set, pass `--resume <session_id>` to claude -p so it loads
+    # the prior conversation and continues it.  The `briefing` field IS the
+    # new user message; claude reads the prior conversation via --resume and
+    # then sees this as the next user turn.  Only set for chat-continue
+    # re-dispatches; regular work/plan/review dispatches leave this None.
+    resume_session_id: str | None = None
 
 
 class _GitError(RuntimeError):
@@ -329,6 +335,12 @@ class AgentAssignment:
     error: str | None = None
     branch: str | None = None
     worktree_path: str | None = None
+    # #315: claude session ID captured from the `system.init` event in the
+    # worker log.  Set by `_reap` after the worker exits.  Exposed via
+    # `/status` and persisted in the agent state JSON so it survives agent
+    # restart.  The coordinator reads it from the `/status` response and
+    # writes it to the coordinator DB (see coord/notify.py).
+    claude_session_id: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -547,6 +559,11 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     ]
     if spec.model:
         argv.extend(["--model", spec.model])
+    # #315: when resuming a prior chat session, load the prior conversation so
+    # the model has full context.  The briefing field IS the new user message;
+    # claude sees it as the next user turn after the restored history.
+    if spec.resume_session_id:
+        argv.extend(["--resume", spec.resume_session_id])
     return argv
 
 
@@ -1218,6 +1235,11 @@ class AgentServer:
         # Send the initial briefing as the first stream-json user message.
         # If this fails (worker exited immediately), let `_reap` capture the
         # exit code — we just stop trying to write.
+        #
+        # #315: this line does double duty — for a regular dispatch it IS the
+        # initial briefing; for a --resume re-dispatch (`spec.resume_session_id`
+        # set) it is the next user turn written into the restored conversation.
+        # Either way the worker sees it as a stream-json user message.
         try:
             assert proc.stdin is not None
             proc.stdin.write(_user_message_line(assignment.spec.briefing))
@@ -1326,6 +1348,23 @@ class AgentServer:
             if assignment.status == RUNNING:
                 assignment.status = DONE if exit_code == 0 else FAILED
             self._processes.pop(assignment_id, None)
+
+        # #315: parse the log for the worker's claude session_id (from the
+        # `system.init` event emitted by `claude -p --output-format stream-json`).
+        # Done OUTSIDE the lock so the log parse (I/O + JSON) doesn't stall
+        # other threads; the field write is the only mutation, and assignment
+        # objects are only dropped under the lock so the reference is safe.
+        if assignment is not None and assignment.claude_session_id is None:
+            try:
+                from coord.worker_events import is_stream_json, parse_log  # noqa: PLC0415
+                lp = assignment.log_path
+                if lp and is_stream_json(lp):
+                    summary = parse_log(lp, tail_bytes=0)
+                    if summary.session_id:
+                        assignment.claude_session_id = summary.session_id
+            except Exception:  # noqa: BLE001
+                pass  # best-effort; a missing session_id just means chat-continue will refuse
+
         self._persist()
         try:
             with open(assignment.log_path, "a") as reopen:

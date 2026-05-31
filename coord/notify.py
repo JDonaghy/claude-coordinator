@@ -588,6 +588,28 @@ def _try_parse_and_post_plan(
     return True
 
 
+def _capture_claude_session_id(transition: Transition, entry: dict) -> None:
+    """#315: persist the worker's claude session ID to the coordinator DB.
+
+    The agent captures this from the ``system.init`` event in the worker log
+    and includes it in the ``/status`` response.  Once stored in the DB,
+    ``coord chat-continue`` can read it and pass ``--resume <id>`` to the
+    next worker so it loads the prior conversation.  Best-effort; a missing
+    ID just means chat-continue will refuse with a clear error.
+    """
+    session_id = entry.get("claude_session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return
+    try:
+        from coord.state import update_assignment_claude_session_id  # noqa: PLC0415
+        update_assignment_claude_session_id(transition.assignment_id, session_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "_capture_claude_session_id: failed for %s: %s",
+            transition.assignment_id, exc,
+        )
+
+
 def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     """Post the GitHub comment for one transition and mark it notified."""
     started = entry.get("started_at")
@@ -602,6 +624,9 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     # moment so the TUI can render it under the Test stage.  Same
     # best-effort discipline — failure is silent.
     _capture_smoke_tests(transition, entry)
+    # #315: persist the worker's claude session ID so chat-continue can
+    # pass --resume to the next worker.  Best-effort; silent on failure.
+    _capture_claude_session_id(transition, entry)
     common = dict(
         assignment_id=transition.assignment_id,
         machine_name=transition.machine_name,
@@ -612,7 +637,17 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         log_path=entry.get("log_path"),
     )
     assignment_type = record.get("type", "work")
-    if transition.event == EVENT_COMPLETION and assignment_type == "plan":
+    if transition.event == EVENT_COMPLETION and assignment_type == "refinement":
+        # #315: refinement chat turns are developer-side conversation — do NOT
+        # post completion comments to GitHub.  Each turn would spam the issue
+        # with identical "assignment completed" noise.  We still capture cost,
+        # smoke tests, and session ID above; just skip the GitHub post.
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+    elif transition.event == EVENT_COMPLETION and assignment_type == "plan":
         # For plan assignments, post the structured plan comment.  Fall back
         # to a standard completion comment if the log can't be parsed.
         posted = _try_parse_and_post_plan(transition, record, entry, duration)

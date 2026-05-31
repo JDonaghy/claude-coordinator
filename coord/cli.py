@@ -2280,6 +2280,112 @@ def inject(assignment_id: str, text: tuple[str, ...], config_path: Path) -> None
         sys.exit(1)
 
 
+@main.command(name="chat-continue", help="Continue a finished chat session with a new message.")
+@click.argument("prior_assignment_id")
+@click.argument("text", nargs=-1, required=True)
+@_CONFIG_OPTION
+def chat_continue(
+    prior_assignment_id: str,
+    text: tuple[str, ...],
+    config_path: Path,
+) -> None:
+    """Re-dispatch a finished refinement assignment with TEXT as the next user turn.
+
+    Looks up the claude session ID from the prior assignment and passes
+    ``--resume <session_id>`` to the next worker so it loads the full
+    conversation history before seeing TEXT as the next user message.
+
+    Prints the new assignment ID on stdout so the TUI can bind to it.
+    Does NOT post a GitHub briefing comment (chat turns are developer-side
+    conversation, not issue activity).
+    """
+    from coord.db import get_connection
+    from coord.dispatch import dispatch
+    from coord.models import Proposal
+    from coord.state import record_dispatched
+
+    cfg = _load_config(config_path)
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, "
+        "claude_session_id FROM assignments WHERE assignment_id=?",
+        (prior_assignment_id,),
+    ).fetchone()
+    if row is None:
+        click.echo(
+            f"error: assignment {prior_assignment_id!r} not found in DB", err=True
+        )
+        sys.exit(1)
+
+    # column may not exist on very old DBs that haven't migrated yet
+    try:
+        claude_session_id = row["claude_session_id"]
+    except (IndexError, KeyError):
+        claude_session_id = None
+
+    if not claude_session_id:
+        click.echo(
+            f"error: assignment {prior_assignment_id!r} has no session ID captured — "
+            "run 'coord notify' first, or the worker may not have emitted system.init",
+            err=True,
+        )
+        sys.exit(1)
+
+    machine_name = row["machine_name"]
+    repo_name = row["repo_name"]
+    issue_number = row["issue_number"]
+    issue_title = row["issue_title"]
+    message_text = " ".join(text).strip()
+
+    repo_cfg = cfg.repo(repo_name)
+    if repo_cfg is None:
+        click.echo(f"error: repo {repo_name!r} not found in config", err=True)
+        sys.exit(1)
+
+    # Verify the target machine exists; warn but don't abort if missing
+    # (the agent might still be reachable by name even if not in this config).
+    machine = next((m for m in cfg.machines if m.name == machine_name), None)
+    if machine is None:
+        click.echo(
+            f"warning: machine {machine_name!r} not in config — dispatch may fail",
+            err=True,
+        )
+
+    # #315: type="refinement" so the agent uses the read-only REFINEMENT_SYSTEM_PROMPT
+    # and the worker exits cleanly after responding.  resume_session_id passes
+    # --resume so the full prior conversation is loaded.
+    proposal = Proposal(
+        id=0,  # not inserted into proposals table; dummy value
+        machine_name=machine_name,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        rationale="chat continuation",
+        briefing=message_text,
+        type="refinement",
+        resume_session_id=claude_session_id,
+    )
+
+    try:
+        response = dispatch(proposal, cfg)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: dispatch failed: {e}", err=True)
+        sys.exit(1)
+
+    assignment_id = response.get("id", "pending")
+
+    # Record in coordinator DB so the board / TUI / notify see it.
+    record_dispatched(
+        assignment_id=assignment_id,
+        proposal=proposal,
+        repo_github=repo_cfg.github,
+    )
+
+    # Print the new assignment ID on stdout so callers (e.g. TUI) can bind.
+    click.echo(assignment_id)
+
+
 @main.command(help="Cancel a running assignment.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION

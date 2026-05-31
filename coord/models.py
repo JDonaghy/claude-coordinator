@@ -167,6 +167,10 @@ class Proposal:
     # branch — the worker must land commits on the parent assignment's
     # branch instead.
     target_branch: str | None = None
+    # #315: when set, the dispatch payload includes `--resume <session_id>`
+    # so the worker loads the prior claude conversation and continues it.
+    # Only set by `coord chat-continue`; regular dispatches leave this None.
+    resume_session_id: str | None = None
 
 
 @dataclass
