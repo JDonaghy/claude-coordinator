@@ -191,6 +191,12 @@ pub fn default_keybinding(action: &str) -> Option<&'static str> {
     }
 }
 
+/// Returns `true` — used as a `#[serde(default = "…")]` helper so that
+/// missing boolean fields in `settings.toml` default to `true`.
+fn default_true() -> bool {
+    true
+}
+
 /// Build the default keybindings map used when no `[keybindings]` section
 /// exists in `settings.toml`.
 pub fn default_keybindings() -> HashMap<String, String> {
@@ -229,6 +235,15 @@ pub struct TuiSettings {
     /// silently ignored.  An action with an empty string disables the binding.
     #[serde(default = "default_keybindings")]
     pub keybindings: HashMap<String, String>,
+
+    /// Whether the **Done** section in the Pipeline panel starts collapsed.
+    ///
+    /// Defaults to `true` — the Done section is collapsed when the TUI first
+    /// opens, showing only the count in the header (`▶ Done (N)`).  The user
+    /// can toggle it with Enter/click; this preference is persisted so the
+    /// last-chosen state survives restarts.
+    #[serde(default = "default_true")]
+    pub pipeline_done_collapsed: bool,
 }
 
 impl Default for TuiSettings {
@@ -240,6 +255,7 @@ impl Default for TuiSettings {
             log_cache_ttl: LogCacheTtl::default(),
             machine_model: HashMap::new(),
             keybindings: default_keybindings(),
+            pipeline_done_collapsed: true,
         }
     }
 }
@@ -422,6 +438,7 @@ mod tests {
             log_cache_ttl: LogCacheTtl::FiveSec,
             machine_model,
             keybindings: default_keybindings(),
+            pipeline_done_collapsed: false,
         };
 
         original.save_to_path(&path).expect("save should succeed");
@@ -438,6 +455,7 @@ mod tests {
             loaded.keybindings.get(ACTION_PIPELINE_REFRESH).map(|s| s.as_str()),
             Some("Ctrl+R"),
         );
+        assert!(!loaded.pipeline_done_collapsed, "pipeline_done_collapsed should persist");
     }
 
     #[test]
@@ -462,6 +480,47 @@ mod tests {
             loaded.keybindings.get(ACTION_PIPELINE_REFRESH).map(|s| s.as_str()),
             Some(""),
             "empty string binding should survive round-trip"
+        );
+    }
+
+    // ── pipeline_done_collapsed ───────────────────────────────────────────────
+
+    #[test]
+    fn pipeline_done_collapsed_defaults_to_true() {
+        let s = TuiSettings::default();
+        assert!(
+            s.pipeline_done_collapsed,
+            "Done section should be collapsed by default (#317)"
+        );
+    }
+
+    #[test]
+    fn pipeline_done_collapsed_round_trip_false() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("coord_settings_test_done_{}.toml", std::process::id()));
+        let mut s = TuiSettings::default();
+        s.pipeline_done_collapsed = false; // user expanded Done
+        s.save_to_path(&path).expect("save");
+        let loaded = TuiSettings::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !loaded.pipeline_done_collapsed,
+            "expanded preference should survive a save/load round-trip"
+        );
+    }
+
+    #[test]
+    fn pipeline_done_collapsed_missing_from_toml_defaults_to_true() {
+        // Simulate an old settings.toml that predates this field.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("coord_settings_test_legacy_{}.toml", std::process::id()));
+        // Write a minimal TOML without pipeline_done_collapsed.
+        std::fs::write(&path, b"[machine_model]\n").unwrap();
+        let loaded = TuiSettings::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            loaded.pipeline_done_collapsed,
+            "absent field should default to true (collapsed) for backward compatibility"
         );
     }
 

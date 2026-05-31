@@ -2901,7 +2901,8 @@ pub struct CoordApp {
     /// Filter state (query / cursor / focus) for the Pipeline sidebar's FILTER box.
     pipeline_search: SidebarFilter,
     /// Expanded state for each (repo_key, lifecycle_key) pair in the Pipeline sidebar.
-    /// Default: true (expanded). Persists across rebuilds so collapse survives refresh.
+    /// Non-"done" keys default to expanded; "done" uses `settings.pipeline_done_collapsed`.
+    /// Persists across rebuilds so collapse survives a data refresh within a session.
     pipeline_lifecycle_expanded: std::collections::HashMap<(String, String), bool>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
@@ -5766,10 +5767,14 @@ impl CoordApp {
                     _             => Color::rgb(140, 140, 160),
                 };
 
+                // "done" collapses by default (the whole point of #317).
+                // All other lifecycle sections start expanded.
+                let default_expanded = *lc_key != "done"
+                    || !self.settings.pipeline_done_collapsed;
                 let is_expanded = self.pipeline_lifecycle_expanded
                     .get(&(repo_key.clone(), lc_key.to_string()))
                     .copied()
-                    .unwrap_or(true);
+                    .unwrap_or(default_expanded);
 
                 rows.push(TreeRow {
                     path: vec![li as u16],
@@ -9649,10 +9654,31 @@ impl CoordApp {
                                 let groups = self.pipeline_groups_for_repo(&repo_key);
                                 if let Some((lc_key, _)) = groups.get(li) {
                                     let lc_key = lc_key.to_string();
-                                    let entry = self.pipeline_lifecycle_expanded
-                                        .entry((repo_key, lc_key))
-                                        .or_insert(true);
-                                    *entry = !*entry;
+                                    // Use the correct initial-state default so the
+                                    // first toggle of a "done" section (which starts
+                                    // collapsed) correctly expands rather than
+                                    // double-collapsing.
+                                    let default_expanded = lc_key != "done"
+                                        || !self.settings.pipeline_done_collapsed;
+                                    let new_expanded = {
+                                        let entry = self.pipeline_lifecycle_expanded
+                                            .entry((repo_key, lc_key.clone()))
+                                            .or_insert(default_expanded);
+                                        *entry = !*entry;
+                                        *entry
+                                    };
+                                    // Persist the Done-section preference so it
+                                    // survives a TUI restart.
+                                    if lc_key == "done" {
+                                        self.settings.pipeline_done_collapsed = !new_expanded;
+                                        if let Err(e) = self.settings.save() {
+                                            self.push_toast(
+                                                "Settings",
+                                                &format!("could not persist settings: {e}"),
+                                                ToastSeverity::Error,
+                                            );
+                                        }
+                                    }
                                     self.rebuild_pipeline_sidebar(None);
                                 }
                             }
