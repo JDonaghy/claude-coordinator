@@ -2936,6 +2936,13 @@ pub struct CoordApp {
     /// sequential dispatch; the poll handler fires this once stop's
     /// CommandResult arrives.
     pending_refine_ready: Option<PendingRefineReady>,
+    /// #264: cache key for the last chat-transcript rebuild so tick()
+    /// can skip the JSON-parsing pass when nothing changed.  Tuple is
+    /// `(focused_assignment_id, sse.lines.len(), inject_transcript.len())`.
+    /// Without this the rebuild ran at 60 fps over every accumulated
+    /// stream-json line — quadratic in chat duration and the dominant CPU
+    /// cost when the refinement overlay sat open for minutes.
+    chat_transcript_cache_key: Option<(String, usize, usize)>,
     /// #245: pending `coord merge --force-merge` confirmation.  `Some(repo)`
     /// means the user pressed `m` while the "Checks failed" hint was visible
     /// and we're waiting for one-key confirmation before bypassing the CI
@@ -3199,6 +3206,7 @@ impl CoordApp {
             pending_report_fix: None,
             pending_refinement: None,
             pending_refine_ready: None,
+            chat_transcript_cache_key: None,
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
@@ -11577,10 +11585,19 @@ impl CoordApp {
         }
 
         // Advance inject chat spinner when the overlay is open.
+        // NOTE: previously this set `needs_redraw = true` unconditionally,
+        // forcing a 60 fps repaint whenever the chat was open even though
+        // nothing in the chat ever set `chat.set_busy(true)` — so the
+        // spinner is invisible and the redraw was pure waste.  That waste
+        // was unnoticed when the chat was used only for short worker-
+        // guidance bursts; the #264 refinement chat keeps the overlay open
+        // for minutes and surfaced it as ~50 % CPU.  Until any caller
+        // actually animates a visible spinner here, just advance the frame
+        // counter without forcing a repaint — repaints are driven by real
+        // content changes (transcript / SSE drain) below.
         if let Some(ref mut chat) = self.inject_chat {
             self.inject_spinner_frame = self.inject_spinner_frame.wrapping_add(1);
             chat.set_spinner_frame(self.inject_spinner_frame);
-            needs_redraw = true;
         }
 
         // #235: Drain Phase 1 build completions and toast the outcome.
@@ -13631,18 +13648,28 @@ impl ShellApp for CoordApp {
             self.ensure_log_tab_sse();
         }
         // #264: while a chat overlay is open, refresh its transcript from
-        // the focused pool entry every tick so newly streamed assistant
-        // turns appear without the user having to type something to force
-        // a redraw.
+        // the focused pool entry when there is new content.  Skip the
+        // rebuild on ticks where neither sse.lines nor inject_transcript
+        // grew — at 60 fps with a long-running chat this was scanning and
+        // JSON-parsing thousands of accumulated lines every 16 ms and
+        // dominated the TUI's CPU budget.
         if self.inject_chat.is_some() {
             if let Some(id) = self.watch_focused.clone() {
                 if let Some(ctx) = self.watch_pool.get(&id) {
-                    let transcript = chat_transcript_from_pool(ctx);
-                    if let Some(ref mut chat) = self.inject_chat {
-                        chat.set_transcript(transcript);
+                    let key = (id.clone(), ctx.sse.lines.len(), ctx.inject_transcript.len());
+                    if self.chat_transcript_cache_key.as_ref() != Some(&key) {
+                        let transcript = chat_transcript_from_pool(ctx);
+                        if let Some(ref mut chat) = self.inject_chat {
+                            chat.set_transcript(transcript);
+                        }
+                        self.chat_transcript_cache_key = Some(key);
                     }
                 }
             }
+        } else if self.chat_transcript_cache_key.is_some() {
+            // Chat closed — drop the cache key so the next open starts
+            // fresh and doesn't false-hit against a stale state.
+            self.chat_transcript_cache_key = None;
         }
         if needs_redraw {
             Reaction::Redraw
@@ -14186,6 +14213,7 @@ mod tests {
             pending_report_fix: None,
             pending_refinement: None,
             pending_refine_ready: None,
+            chat_transcript_cache_key: None,
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
