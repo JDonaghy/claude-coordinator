@@ -340,9 +340,16 @@ struct PendingChatResume {
     /// Issue number, for filtering `self.data.assignments`.
     issue_number: u64,
     /// Wall-clock instant when `coord chat-continue` was launched.  Used
-    /// both for timeout and to reject assignments dispatched before this
-    /// point.
+    /// for the timeout (`REFINEMENT_BIND_TIMEOUT`).
     dispatched_at: Instant,
+    /// Unix-time floor for matching new assignments.  Bind only accepts
+    /// rows whose `dispatched_at >= arm_unix_secs - clock-skew grace`.
+    /// Without this, the bind picks ANY older refinement on the same
+    /// issue that happens to pass the `id != old` filter — bug spotted
+    /// in repro logs where the second submit immediately bound BACKWARDS
+    /// to the original (initial) refinement assignment because the new
+    /// resume row hadn't been written to the DB yet.
+    arm_unix_secs: f64,
 }
 
 /// #264: after the refinement chat closes we issue `coord stop` first,
@@ -600,19 +607,40 @@ fn spawn_machine_health(host: &str, port: u16) -> std::sync::mpsc::Receiver<Resu
     rx
 }
 
+/// #315: signal that `spawn_inject_post` sends to the main thread when
+/// the /inject POST returns HTTP 409 ("assignment is `done`") or 410
+/// (BrokenPipeError — worker stdin closed).  Both mean the worker exited
+/// after submit_inject's `worker_done` check but before the HTTP request
+/// landed — a race window of a few hundred ms.  The main thread reacts
+/// by dispatching `coord chat-continue` so the message isn't lost.
+#[derive(Clone)]
+struct InjectFallback {
+    aid: String,
+    text: String,
+    issue_number: u64,
+}
+
 /// #264: POST a chat user-turn to a remote agent's `/inject/{id}` endpoint
 /// in a background thread.  Used by `submit_inject` to bypass the
 /// single-slot `command_runner` so chat submits aren't blocked by the
 /// auto-`coord notify` cycle (every 30 s while any assignment is running).
 ///
-/// Fire-and-forget: errors are written to stderr (the user sees them
-/// indirectly through the worker not replying), since the chat surface
-/// has no obvious place to toast HTTP errors mid-conversation.  The user
-/// can retry by resubmitting the same message.
-fn spawn_inject_post(host: &str, assignment_id: &str, text: &str) {
+/// #315: on HTTP 409/410 (worker exited mid-flight), sends an
+/// `InjectFallback` over `fallback_tx` so the main thread can transparently
+/// trigger `coord chat-continue` — otherwise the typed message would be
+/// silently lost when the racing worker-exit beats the inject POST.
+fn spawn_inject_post(
+    host: &str,
+    assignment_id: &str,
+    text: &str,
+    issue_number: u64,
+    fallback_tx: std::sync::mpsc::Sender<InjectFallback>,
+) {
     let url = format!("http://{}:7433/inject/{}", host, assignment_id);
     let payload = serde_json::json!({ "text": text });
     let body = payload.to_string();
+    let aid = assignment_id.to_string();
+    let text_owned = text.to_string();
     std::thread::spawn(move || {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(5))
@@ -624,6 +652,18 @@ fn spawn_inject_post(host: &str, assignment_id: &str, text: &str) {
             .send_string(&body)
         {
             Ok(_) => {}
+            Err(ureq::Error::Status(code, _)) if code == 409 || code == 410 => {
+                eprintln!(
+                    "[chat inject] POST {} returned {} — worker exited mid-flight, \
+                     sending InjectFallback so main thread can chat-continue",
+                    url, code
+                );
+                let _ = fallback_tx.send(InjectFallback {
+                    aid,
+                    text: text_owned,
+                    issue_number,
+                });
+            }
             Err(e) => {
                 eprintln!("[chat inject] POST {} failed: {}", url, e);
             }
@@ -658,10 +698,39 @@ fn spawn_chat_continue(
         for word in text.split_whitespace() {
             cmd.arg(word);
         }
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _ = cmd.status(); // fire-and-forget; errors surface as "no new assignment"
+        // #315 diagnostic: capture stdout+stderr so failures don't disappear
+        // into /dev/null.  spawn_chat_continue used to pipe both to null,
+        // which silently swallowed errors like "session_id missing" or
+        // "config not found" — turning a chat-continue failure into a
+        // mysterious 30s bind timeout.
+        let aid_short: String = old_assignment_id.chars().take(6).collect();
+        match cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if !out.status.success() {
+                    eprintln!(
+                        "[#315] coord chat-continue FAILED for old_aid={} status={:?}\n         stdout={}\n         stderr={}",
+                        aid_short, out.status.code(), stdout, stderr,
+                    );
+                } else {
+                    eprintln!(
+                        "[#315] coord chat-continue ok for old_aid={} → new_aid={}",
+                        aid_short, stdout,
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[#315] coord chat-continue could not spawn for old_aid={}: {}",
+                    aid_short, e,
+                );
+            }
+        }
     });
 }
 
@@ -3055,6 +3124,13 @@ pub struct CoordApp {
     /// each tick for the new running refinement row and rebind the open chat
     /// overlay to it when it appears.  Cleared on bind or timeout.
     pending_chat_resume: Option<PendingChatResume>,
+    /// #315: channel for `spawn_inject_post` to signal worker-exit races
+    /// (HTTP 409/410 from /inject/{id}).  The TX side is cloned and handed
+    /// to each spawned POST thread; the RX side is drained on tick and the
+    /// signals trigger transparent `coord chat-continue` fallbacks so the
+    /// typed message isn't lost when the worker exited mid-submit.
+    inject_fallback_tx: std::sync::mpsc::Sender<InjectFallback>,
+    inject_fallback_rx: std::sync::mpsc::Receiver<InjectFallback>,
     /// #264: queued follow-up `coord ready` after `coord stop` completes
     /// at the end of a refinement chat.  Single-slot CommandRunner forces
     /// sequential dispatch; the poll handler fires this once stop's
@@ -3301,6 +3377,7 @@ impl CoordApp {
         let mut pipeline_sidebar = SidebarSystem::new(Vec::new());
         pipeline_sidebar.set_navigation_mode(NavigationMode::Selection);
         pipeline_sidebar.set_allow_collapse(true);
+        let (inject_fallback_tx, inject_fallback_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             data: BoardData::default(),
             active_view: SidebarView::default(),
@@ -3349,6 +3426,8 @@ impl CoordApp {
             pending_report_fix: None,
             pending_refinement: None,
             pending_chat_resume: None,
+            inject_fallback_tx,
+            inject_fallback_rx,
             pending_refine_ready: None,
             chat_transcript_cache_key: None,
             chat_last_activity: None,
@@ -4043,12 +4122,35 @@ impl CoordApp {
     /// Appends the text to the inject transcript and clears the chat
     /// input on success.
     fn submit_inject(&mut self, text: String) -> bool {
+        let foc_sse_done = self.watch_focused.as_ref()
+            .and_then(|id| self.watch_pool.get(id))
+            .map(|c| c.sse.done);
+        let foc_status = self.watch_focused.as_ref().and_then(|id| {
+            self.data.assignments.iter().find(|a| &a.id == id).map(|a| a.status.clone())
+        });
+        eprintln!(
+            "[#315] submit_inject called: text_len={} text={:?} watch_focused={:?} \
+             foc_sse_done={:?} foc_data_status={:?} inject_chat_open={} pending_resume_armed={}",
+            text.len(),
+            &text[..40.min(text.len())],
+            self.watch_focused.as_ref().map(|a| &a[..6.min(a.len())]),
+            foc_sse_done,
+            foc_status,
+            self.inject_chat.is_some(),
+            self.pending_chat_resume.is_some(),
+        );
         let (aid, issue_number, machine_name) = match self.focused_watch_state() {
             Some(w) => (w.assignment_id.clone(), w.issue_number, w.machine.clone()),
-            None => return false,
+            None => {
+                eprintln!("[#315] submit_inject early return — no focused_watch_state");
+                return false;
+            }
         };
         let text = text.trim().to_string();
-        if text.is_empty() { return false; }
+        if text.is_empty() {
+            eprintln!("[#315] submit_inject early return — empty text");
+            return false;
+        }
         // #264: claude -p exits after `stop_reason: end_turn` (it doesn't
         // stay alive waiting for more injects), so once the assignment is
         // in `done` state any new POST /inject/{id} will return 410
@@ -4076,6 +4178,10 @@ impl CoordApp {
         // chat-continue against the same session (which would race the
         // first and confuse claude's session storage).
         if worker_done && self.pending_chat_resume.is_some() {
+            eprintln!(
+                "[#315] submit_inject refused — resume already in flight for aid={}",
+                &aid[..6.min(aid.len())]
+            );
             self.pipeline_status = Some((
                 "⏳ Resume in flight — wait for assistant reply before sending again".to_string(),
                 Instant::now(),
@@ -4110,6 +4216,17 @@ impl CoordApp {
             }
             // Dispatch the resume in a background thread.
             let config_path = self.command_runner.config_path.clone();
+            let arm_unix_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            eprintln!(
+                "[#315] arming pending_chat_resume — old_aid={} issue=#{} arm_t={:.0} text={:?}",
+                &aid[..6.min(aid.len())],
+                issue_number,
+                arm_unix_secs,
+                &text[..40.min(text.len())],
+            );
             spawn_chat_continue(config_path, aid.clone(), text.clone());
             // Arm the pending-resume poll so the overlay rebinds on the next
             // data refresh that surfaces the new assignment row.
@@ -4117,6 +4234,7 @@ impl CoordApp {
                 old_assignment_id: aid.clone(),
                 issue_number,
                 dispatched_at: Instant::now(),
+                arm_unix_secs,
             });
             self.pipeline_status = Some((
                 format!("⏳ Resuming chat #{issue_number}…"),
@@ -4134,7 +4252,7 @@ impl CoordApp {
                 return false;
             }
         };
-        spawn_inject_post(&host, &aid, &text);
+        spawn_inject_post(&host, &aid, &text, issue_number, self.inject_fallback_tx.clone());
         // Stamp activity NOW so the busy spinner appears the instant the
         // user sends — without this we'd wait for the first SSE byte to
         // come back (which can be several seconds for the model's
@@ -10449,8 +10567,15 @@ impl CoordApp {
         // the backward path (Drop to Backlog).  Without these the
         // Refining state is a dead-end in the TUI — the user has to
         // shell out to `coord ready` to move forward.
+        //
+        // #315 follow-up: also offer "Refine with chat" here so a row
+        // that's already in Refining (because the user clicked Refine
+        // first, or because `status:refining` was set out of band) can
+        // still spawn a chat session.  The chat doesn't change the
+        // label, so re-opening it on an already-Refining row is fine.
         if matches!(lifecycle, BoardRowLifecycle::Refining) {
             items.push(ContextMenuItem::action("mark-refined", "Mark Refined"));
+            items.push(ContextMenuItem::action("refine-chat", "Refine with chat"));
             items.push(ContextMenuItem::action("drop-to-backlog", "Drop to Backlog"));
             items.push(ContextMenuItem::separator());
         }
@@ -11034,6 +11159,13 @@ impl CoordApp {
         };
         // Timeout — the resume dispatch likely failed; clear and warn the user.
         if pending.dispatched_at.elapsed() > REFINEMENT_BIND_TIMEOUT {
+            eprintln!(
+                "[#315] bind TIMEOUT after {}s for #{} (old_aid={}) — pool has {} entries",
+                pending.dispatched_at.elapsed().as_secs(),
+                pending.issue_number,
+                pending.old_assignment_id,
+                self.data.assignments.len(),
+            );
             self.pending_chat_resume = None;
             self.push_toast(
                 "Chat resume timed out",
@@ -11053,15 +11185,52 @@ impl CoordApp {
         // (fast workers may complete before our bind poll fires, leaving the
         // status already terminal — e.g. trivial replies in <2s).  We still
         // bind so the overlay can render the worker's reply from its SSE log.
-        let pick = self.data.assignments.iter()
+        // 5-second grace on the dispatch floor — accounts for clock skew
+        // between this machine and whichever machine wrote the row, and for
+        // the time between `coord chat-continue` starting and the DB write
+        // landing.  Without this floor, the bind picks the OLDEST matching
+        // refinement that passes the `id != old` filter, which on a 2nd
+        // submit is the FIRST refinement (original `coord refine-chat`).
+        let dispatch_floor = pending.arm_unix_secs - 5.0;
+        let matching: Vec<_> = self.data.assignments.iter()
             .filter(|a| a.issue_number == pending.issue_number)
             .filter(|a| a.assignment_type.as_deref() == Some("refinement"))
-            .filter(|a| a.status == "running" || a.status == "done")
             .filter(|a| a.id != pending.old_assignment_id)
+            .filter(|a| a.dispatched_at.map(|d| d >= dispatch_floor).unwrap_or(false))
+            .collect();
+        let pick = matching.iter().copied()
+            .filter(|a| a.status == "running" || a.status == "done")
             .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
                 .unwrap_or(std::cmp::Ordering::Equal))
             .cloned();
-        let Some(asg) = pick else { return false; };
+        let Some(asg) = pick else {
+            // Log every 2s to avoid flooding stderr.
+            let elapsed = pending.dispatched_at.elapsed().as_secs();
+            if elapsed > 0 && elapsed % 2 == 0 {
+                let statuses: Vec<String> = matching.iter()
+                    .map(|a| format!("{}:{}", &a.id[..6.min(a.id.len())], a.status))
+                    .collect();
+                eprintln!(
+                    "[#315] bind waiting — #{} (old_aid={}) — {}s elapsed — \
+                     matching refinements for issue (excl old): [{}] — \
+                     total data.assignments: {}",
+                    pending.issue_number,
+                    &pending.old_assignment_id[..6.min(pending.old_assignment_id.len())],
+                    elapsed,
+                    statuses.join(", "),
+                    self.data.assignments.len(),
+                );
+            }
+            return false;
+        };
+        eprintln!(
+            "[#315] bind picked aid={} status={} for #{} (old={}, took {}s)",
+            &asg.id[..6.min(asg.id.len())],
+            asg.status,
+            pending.issue_number,
+            &pending.old_assignment_id[..6.min(pending.old_assignment_id.len())],
+            pending.dispatched_at.elapsed().as_secs(),
+        );
         let new_aid = asg.id.clone();
 
         // Capture the *full* chat history (user + assistant turns) from the
@@ -12137,6 +12306,48 @@ impl CoordApp {
         // #315: rebind the open chat overlay to the new assignment when a
         // `coord chat-continue` re-dispatch has landed in the DB.
         if self.pending_chat_resume.is_some() && self.maybe_bind_pending_resume() {
+            needs_redraw = true;
+        }
+
+        // #315: drain InjectFallback signals from `spawn_inject_post`.
+        // These fire when /inject/{id} returned 409/410 — the worker
+        // exited mid-flight after submit_inject's gate.  Transparently
+        // trigger chat-continue so the typed message isn't lost.
+        loop {
+            let fb = match self.inject_fallback_rx.try_recv() {
+                Ok(fb) => fb,
+                Err(_) => break,
+            };
+            // Suppress if a resume is already in flight for this issue.
+            if self.pending_chat_resume.is_some() {
+                eprintln!(
+                    "[#315] inject fallback for {} arrived while resume already pending — dropping",
+                    &fb.aid[..6.min(fb.aid.len())]
+                );
+                continue;
+            }
+            let arm_unix_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            eprintln!(
+                "[#315] inject 409/410 → reactive chat-continue: aid={} issue=#{} text={:?}",
+                &fb.aid[..6.min(fb.aid.len())],
+                fb.issue_number,
+                &fb.text[..40.min(fb.text.len())],
+            );
+            let config_path = self.command_runner.config_path.clone();
+            spawn_chat_continue(config_path, fb.aid.clone(), fb.text.clone());
+            self.pending_chat_resume = Some(PendingChatResume {
+                old_assignment_id: fb.aid.clone(),
+                issue_number: fb.issue_number,
+                dispatched_at: Instant::now(),
+                arm_unix_secs,
+            });
+            self.pipeline_status = Some((
+                format!("⏳ Resuming chat #{}…", fb.issue_number),
+                Instant::now(),
+            ));
             needs_redraw = true;
         }
 
@@ -14977,6 +15188,7 @@ mod tests {
         let mut pipeline_sidebar = SidebarSystem::new(Vec::new());
         pipeline_sidebar.set_navigation_mode(NavigationMode::Selection);
         pipeline_sidebar.set_allow_collapse(true);
+        let (inject_fallback_tx, inject_fallback_rx) = std::sync::mpsc::channel();
         CoordApp {
             data,
             active_view: SidebarView::default(),
@@ -15024,6 +15236,8 @@ mod tests {
             pending_report_fix: None,
             pending_refinement: None,
             pending_chat_resume: None,
+            inject_fallback_tx,
+            inject_fallback_rx,
             pending_refine_ready: None,
             chat_transcript_cache_key: None,
             chat_last_activity: None,
