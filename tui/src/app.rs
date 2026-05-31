@@ -2987,6 +2987,18 @@ pub struct CoordApp {
     /// stream-json line — quadratic in chat duration and the dominant CPU
     /// cost when the refinement overlay sat open for minutes.
     chat_transcript_cache_key: Option<(String, usize, usize)>,
+    /// #264: timestamp of the most recent transcript change (user submit
+    /// or assistant turn arrival).  Drives the chat's `set_busy()` —
+    /// busy is true while activity is recent (≤2 s), false once the
+    /// stream goes quiet.  Without this the spinner never animates so
+    /// the user can't tell whether the worker is mid-reply or done.
+    chat_last_activity: Option<Instant>,
+    /// #264: spinner-redraw throttle.  When the chat is busy we need to
+    /// force redraws to animate the spinner — but at 60 fps that burns
+    /// CPU for no benefit (the spinner glyph only changes ~10 times a
+    /// second).  Increment per tick, redraw every Nth, so spinner is
+    /// visually smooth without a full 60 fps repaint while busy.
+    chat_spinner_throttle: u8,
     /// #pause: set of machine names the user has paused via
     /// right-click → Pause routing.  Loaded from
     /// `~/.coord/paused_machines.json` (shared with the Python coordinator)
@@ -3258,6 +3270,8 @@ impl CoordApp {
             pending_refinement: None,
             pending_refine_ready: None,
             chat_transcript_cache_key: None,
+            chat_last_activity: None,
+            chat_spinner_throttle: 0,
             paused_machines: read_paused_machines(),
             pending_force_merge: None,
             pending_context_menu: None,
@@ -3967,6 +3981,11 @@ impl CoordApp {
             }
         };
         spawn_inject_post(&host, &aid, &text);
+        // Stamp activity NOW so the busy spinner appears the instant the
+        // user sends — without this we'd wait for the first SSE byte to
+        // come back (which can be several seconds for the model's
+        // first-token latency).
+        self.chat_last_activity = Some(Instant::now());
         {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -13973,13 +13992,35 @@ impl ShellApp for CoordApp {
                             chat.set_transcript(transcript);
                         }
                         self.chat_transcript_cache_key = Some(key);
+                        // Activity stamp drives the busy indicator below.
+                        self.chat_last_activity = Some(Instant::now());
                     }
+                }
+            }
+            // Busy = activity in the last 2 s.  Animates the chat's
+            // spinner so the user can tell the worker is mid-reply.
+            // Throttle the spinner-driven redraw to ~10 fps so we don't
+            // burn the 60 fps repaint budget on a glyph that only
+            // changes ten times a second.
+            let busy = self.chat_last_activity
+                .map(|t| t.elapsed() < std::time::Duration::from_secs(2))
+                .unwrap_or(false);
+            if let Some(ref mut chat) = self.inject_chat {
+                chat.set_busy(busy);
+            }
+            if busy {
+                self.chat_spinner_throttle = self.chat_spinner_throttle.wrapping_add(1);
+                // 6 × 16 ms ≈ 96 ms ⇒ ~10 fps spinner.
+                if self.chat_spinner_throttle % 6 == 0 {
+                    needs_redraw = true;
                 }
             }
         } else if self.chat_transcript_cache_key.is_some() {
             // Chat closed — drop the cache key so the next open starts
             // fresh and doesn't false-hit against a stale state.
             self.chat_transcript_cache_key = None;
+            self.chat_last_activity = None;
+            self.chat_spinner_throttle = 0;
         }
         if needs_redraw {
             Reaction::Redraw
@@ -14588,6 +14629,8 @@ mod tests {
             pending_refinement: None,
             pending_refine_ready: None,
             chat_transcript_cache_key: None,
+            chat_last_activity: None,
+            chat_spinner_throttle: 0,
             paused_machines: read_paused_machines(),
             pending_force_merge: None,
             pending_context_menu: None,
