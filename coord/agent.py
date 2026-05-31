@@ -866,9 +866,14 @@ class AgentServer:
         )
         assignment.log_path = str(self.log_dir / f"{assignment.id}.log")
 
-        if spec.type == "plan":
-            # Read-only planning run — skip worktree creation, run directly in
-            # the main repo checkout so no branch is created or modified.
+        if spec.type in ("plan", "refinement"):
+            # Read-only run (plan or refinement chat) — skip worktree creation,
+            # run directly in the main repo checkout. No branch is created or
+            # modified. For refinement specifically (#315), the stable cwd is
+            # also required so claude-cli's `--resume <session_id>` finds the
+            # prior session file on subsequent turns: claude scopes sessions
+            # by cwd (mangled into ~/.claude/projects/<cwd-key>/), and a
+            # per-assignment worktree gives every turn a different cwd.
             with self._lock:
                 self._assignments[assignment.id] = assignment
             self._persist()
