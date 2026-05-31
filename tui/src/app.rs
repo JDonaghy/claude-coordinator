@@ -291,6 +291,14 @@ struct WatchContext {
     /// assistant turns followed, breaking the conversational order the user
     /// expects.
     inject_sse_offsets: Vec<usize>,
+    /// #315: frozen transcript turns carried over from prior workers in the
+    /// same chat session.  Populated by `maybe_bind_pending_resume` when a
+    /// `--resume` re-dispatch lands: it captures the prior context's full
+    /// rendered chat (user + assistant turns) and stashes it here so the
+    /// rebound overlay shows the prior conversation rather than starting
+    /// from a blank slate.  Always rendered first by
+    /// `chat_transcript_from_pool`; empty on first-dispatch contexts.
+    history_turns: Vec<ChatTurn>,
     /// Wall-clock time this context was most recently focused.  Used for LRU
     /// eviction when the pool would exceed `WATCH_POOL_CAP`.
     last_focused_at: Instant,
@@ -3589,6 +3597,7 @@ impl CoordApp {
                     sse,
                     inject_transcript: Vec::new(),
                     inject_sse_offsets: Vec::new(),
+                    history_turns: Vec::new(),
                     last_focused_at: Instant::now(),
                 });
                 self.watch_focused = Some(aid);
@@ -3737,6 +3746,7 @@ impl CoordApp {
             sse,
             inject_transcript: Vec::new(),
             inject_sse_offsets: Vec::new(),
+            history_turns: Vec::new(),
             last_focused_at: Instant::now(),
         });
     }
@@ -4049,9 +4059,29 @@ impl CoordApp {
         // the full prior conversation before seeing this message as the next
         // user turn.  The TUI polls for the new assignment row and rebinds the
         // chat overlay to it via `maybe_bind_pending_resume`.
+        //
+        // We OR two signals: (1) `data.assignments` status — authoritative
+        // but updated only on the coordinator's notify cycle (seconds of
+        // lag), and (2) `sse.done` — flips the instant the SSE stream
+        // closes, which happens immediately when the worker exits.  Without
+        // the SSE check, a user submit within the few-second lag window
+        // after `end_turn` would slip through the worker_done gate and hit
+        // the agent's `/inject/{id}` endpoint, which returns HTTP 409
+        // ("assignment is `done`, not running") and the message was lost.
         let worker_done = self.data.assignments.iter().any(|a| {
             a.id == aid && (a.status == "done" || a.status == "failed" || a.status == "cancelled")
-        });
+        }) || self.watch_pool.get(&aid).map(|ctx| ctx.sse.done).unwrap_or(false);
+        // Guard against double-dispatch: if a resume is already in flight,
+        // refuse new submits with a hint rather than firing a second
+        // chat-continue against the same session (which would race the
+        // first and confuse claude's session storage).
+        if worker_done && self.pending_chat_resume.is_some() {
+            self.pipeline_status = Some((
+                "⏳ Resume in flight — wait for assistant reply before sending again".to_string(),
+                Instant::now(),
+            ));
+            return false;
+        }
         if worker_done {
             // Record the user turn in the transcript before the shell-out so
             // the typed text is visible immediately and can't disappear even
@@ -10957,6 +10987,7 @@ impl CoordApp {
                 sse,
                 inject_transcript: Vec::new(),
                 inject_sse_offsets: Vec::new(),
+                history_turns: Vec::new(),
                 last_focused_at: Instant::now(),
             });
         }
@@ -11016,14 +11047,16 @@ impl CoordApp {
             );
             return true;
         }
-        // Find the newest running refinement assignment for this issue that is
-        // NOT the prior assignment (which just exited).  We filter by
-        // assignment_id != old_id rather than by dispatched_at because
-        // Instant → unix-ts conversion is lossy; the id filter is precise.
+        // Find the newest refinement assignment for this issue that is NOT
+        // the prior assignment (which just exited).  Accept either "running"
+        // (typical case — the resume worker is still mid-reply) or "done"
+        // (fast workers may complete before our bind poll fires, leaving the
+        // status already terminal — e.g. trivial replies in <2s).  We still
+        // bind so the overlay can render the worker's reply from its SSE log.
         let pick = self.data.assignments.iter()
             .filter(|a| a.issue_number == pending.issue_number)
             .filter(|a| a.assignment_type.as_deref() == Some("refinement"))
-            .filter(|a| a.status == "running")
+            .filter(|a| a.status == "running" || a.status == "done")
             .filter(|a| a.id != pending.old_assignment_id)
             .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
                 .unwrap_or(std::cmp::Ordering::Equal))
@@ -11031,17 +11064,21 @@ impl CoordApp {
         let Some(asg) = pick else { return false; };
         let new_aid = asg.id.clone();
 
-        // Carry the existing inject_transcript and inject_sse_offsets from
-        // the old context into the new one so the user's turn history survives
-        // the assignment rebind.  Reset all SSE offsets to 0 — the new SSE
-        // stream starts at byte 0, so all prior user turns should appear before
-        // any new assistant output.
-        let (old_transcript, old_sse_offsets) = if let Some(old_ctx) = self.watch_pool.get(&pending.old_assignment_id) {
-            let t = old_ctx.inject_transcript.clone();
-            let o = old_ctx.inject_sse_offsets.iter().map(|_| 0usize).collect::<Vec<_>>();
-            (t, o)
+        // Capture the *full* chat history (user + assistant turns) from the
+        // old context via the existing transcript builder, drop the synthetic
+        // System seed (we only want one of those per chat session — the
+        // history itself serves as the seed for the rebound chat), and stash
+        // on the new context as `history_turns`.  Without this, only the
+        // user's turns survived rebind and the assistant's prior replies
+        // visibly vanished — what the user reported as "blew away the
+        // previous messages".
+        let history_turns: Vec<ChatTurn> = if let Some(old_ctx) = self.watch_pool.get(&pending.old_assignment_id) {
+            chat_transcript_from_pool(old_ctx)
+                .into_iter()
+                .filter(|t| !matches!(t.role, ChatRole::System))
+                .collect()
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
 
         // Build the new WatchContext for the new assignment (mirrors
@@ -11087,8 +11124,13 @@ impl CoordApp {
             self.watch_pool.insert(new_aid.clone(), WatchContext {
                 state,
                 sse,
-                inject_transcript: old_transcript,
-                inject_sse_offsets: old_sse_offsets,
+                // inject_transcript / inject_sse_offsets are for NEW turns
+                // submitted in this worker's window; prior turns live in
+                // history_turns (already-rendered ChatTurns) so they survive
+                // every subsequent rebind without re-walking offsets.
+                inject_transcript: Vec::new(),
+                inject_sse_offsets: Vec::new(),
+                history_turns,
                 last_focused_at: Instant::now(),
             });
         }
@@ -14371,7 +14413,13 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
 /// single `StyledText`, so each line has to be its own `ChatTurn`.
 fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
     let mut turns: Vec<ChatTurn> = Vec::new();
-    if ctx.state.assignment_type == "refinement" {
+    // #315: if this context inherited frozen turns from a prior worker in
+    // the same chat session (via `maybe_bind_pending_resume`), render them
+    // first.  The history itself is the seed for the rebound chat, so we
+    // skip the synthetic System seed in that case.
+    if !ctx.history_turns.is_empty() {
+        turns.extend(ctx.history_turns.iter().cloned());
+    } else if ctx.state.assignment_type == "refinement" {
         turns.push(ChatTurn {
             role: ChatRole::System,
             text: StyledText::plain(format!(
@@ -19402,6 +19450,7 @@ mod tests {
             sse,
             inject_transcript: Vec::new(),
             inject_sse_offsets: Vec::new(),
+            history_turns: Vec::new(),
             last_focused_at: Instant::now(),
         };
         app.watch_pool.insert(aid.clone(), ctx);
