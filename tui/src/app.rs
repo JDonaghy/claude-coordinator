@@ -9278,6 +9278,19 @@ impl CoordApp {
                                 lifecycle,
                             })
                         }
+                        SidebarView::Machines => {
+                            // #pause: right-click on a Machines row opens
+                            // the Pause routing / Resume routing toggle.
+                            // Synthetic-left above already selected the
+                            // row, so `machine_sel` points at the right
+                            // entry.
+                            self.data.machines.get(self.machine_sel).map(|m| {
+                                ContextMenuTarget::MachineRow {
+                                    name: m.name.clone(),
+                                    is_paused: self.paused_machines.contains(&m.name),
+                                }
+                            })
+                        }
                         _ => None,
                     };
                     if let Some(target) = target {
