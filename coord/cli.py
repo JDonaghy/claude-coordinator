@@ -2324,19 +2324,56 @@ def chat_continue(
     except (IndexError, KeyError):
         claude_session_id = None
 
-    if not claude_session_id:
-        click.echo(
-            f"error: assignment {prior_assignment_id!r} has no session ID captured — "
-            "run 'coord notify' first, or the worker may not have emitted system.init",
-            err=True,
-        )
-        sys.exit(1)
-
     machine_name = row["machine_name"]
     repo_name = row["repo_name"]
     issue_number = row["issue_number"]
     issue_title = row["issue_title"]
     message_text = " ".join(text).strip()
+
+    # #315: if the DB doesn't have the session_id yet, fetch it directly
+    # from the agent's /status endpoint.  The notify cycle (typically every
+    # 30s) is what syncs session_id from agent → DB; if the user types a
+    # second chat message before notify catches up, the DB row is still
+    # NULL even though the agent captured the session_id in memory.
+    # Without this fallback every fast follow-up submit fails with
+    # "no session ID captured" and the TUI's bind waits 30s and times out.
+    if not claude_session_id:
+        from coord.network import fetch_status  # noqa: PLC0415
+        machine_for_status = next(
+            (m for m in cfg.machines if m.name == machine_name), None,
+        )
+        if machine_for_status is not None:
+            status_result = fetch_status(machine_for_status)
+            if status_result.ok and status_result.data:
+                # /status returns {"active": [...], "completed": [...]}
+                # each entry is AgentAssignment.to_dict() with an `id` field
+                for bucket in ("active", "completed"):
+                    for entry in status_result.data.get(bucket, []):
+                        if entry.get("id") == prior_assignment_id:
+                            sid = entry.get("claude_session_id")
+                            if isinstance(sid, str) and sid:
+                                claude_session_id = sid
+                                # Persist to DB so subsequent calls (and the
+                                # coordinator's notify loop) don't re-fetch.
+                                try:
+                                    from coord.state import update_assignment_claude_session_id  # noqa: PLC0415
+                                    update_assignment_claude_session_id(
+                                        prior_assignment_id, sid,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            break
+                    if claude_session_id:
+                        break
+
+    if not claude_session_id:
+        click.echo(
+            f"error: assignment {prior_assignment_id!r} has no session ID captured — "
+            "agent has no session_id for this assignment (worker may not have "
+            "emitted system.init, or the agent has restarted and forgotten it)",
+            err=True,
+        )
+        sys.exit(1)
 
     repo_cfg = cfg.repo(repo_name)
     if repo_cfg is None:
