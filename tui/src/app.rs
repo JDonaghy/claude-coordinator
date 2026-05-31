@@ -13669,14 +13669,32 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
 /// events are intentionally excluded — those belong in the Log tab, not
 /// the chat.
 ///
-/// Order is "all user turns, then all assistant turns" rather than
-/// interleaved — the proper chronological merge needs per-turn sequence
-/// numbers we don't carry yet (follow-up: track `sse_offset_at_send` on
-/// each user turn so we can partition the assistant turns between them).
-/// Until then this at least surfaces the assistant's words so the chat
-/// stops feeling one-way.
+/// For refinement chats (`assignment_type == "refinement"`) the
+/// transcript opens with a System turn that explains what the assistant
+/// was seeded with.  Without it the worker's first reply (a clarifying
+/// question about the seeded issue) reads as a message-from-nowhere
+/// because the developer never sees the seed payload that triggered it.
+///
+/// Order is "system [refinement only] → all user turns → all assistant
+/// turns" rather than strictly chronological — proper interleaving needs
+/// per-turn sequence numbers we don't carry yet (follow-up: track
+/// `sse_offset_at_send` on each user turn so we can partition the
+/// assistant turns between them).  Until then this at least surfaces the
+/// assistant's words and explains where the first reply came from.
 fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
-    let mut turns: Vec<ChatTurn> = ctx.inject_transcript.clone();
+    let mut turns: Vec<ChatTurn> = Vec::new();
+    if ctx.state.assignment_type == "refinement" {
+        turns.push(ChatTurn {
+            role: ChatRole::System,
+            text: StyledText::plain(format!(
+                "Refinement chat seeded with #{}'s issue body + CLAUDE.md + repo file tree. \
+                 The assistant has read all of that; ask it questions about scope.",
+                ctx.state.issue_number
+            )),
+            timestamp_unix: None,
+        });
+    }
+    turns.extend(ctx.inject_transcript.iter().cloned());
     for line in &ctx.sse.lines {
         if json_str(line, "type").as_deref() != Some("assistant") {
             continue;
