@@ -1752,6 +1752,17 @@ def assign(
         )
         sys.exit(2)
 
+    # Refuse direct assignment to a paused machine — `coord pause` exists
+    # so the user can explicitly steer work away.  If they meant to dispatch
+    # anyway they should `coord unpause` first.
+    from coord.machine_pause import is_paused as _is_paused
+    if _is_paused(machine):
+        click.echo(
+            f"error: machine {machine!r} is paused; run `coord unpause {machine}` first",
+            err=True,
+        )
+        sys.exit(2)
+
     # Fetch the issue title from GitHub
     try:
         issue_data = github_ops.get_issue(repo_cfg.github, issue)
@@ -2677,6 +2688,40 @@ def _apply_label_change(
     update_issue_labels(repo, issue, new_labels)
 
     click.echo(success_message)
+
+
+@main.command(
+    help=(
+        "Pause a machine — no new agents will be routed to it until "
+        "`coord unpause` is called.  In-flight assignments are NOT "
+        "cancelled (use `coord stop` for that).\n\n"
+        "MACHINE is the local name from coordinator.yml."
+    ),
+)
+@click.argument("machine")
+def pause(machine: str) -> None:
+    from coord.machine_pause import pause as _pause
+    changed = _pause(machine)
+    if changed:
+        click.echo(f"paused: {machine}")
+    else:
+        click.echo(f"already paused: {machine}")
+
+
+@main.command(
+    help=(
+        "Resume a paused machine — new assignments can be routed to it "
+        "again.  No-op if the machine wasn't paused."
+    ),
+)
+@click.argument("machine")
+def unpause(machine: str) -> None:
+    from coord.machine_pause import unpause as _unpause
+    changed = _unpause(machine)
+    if changed:
+        click.echo(f"resumed: {machine}")
+    else:
+        click.echo(f"not paused: {machine}")
 
 
 @main.command(

@@ -112,12 +112,18 @@ def build_prompt(config: Config, context: dict) -> str:
         lines.append(f"- {repo.name} ({repo.github}){deps}")
 
     lines.append("")
+    from coord.machine_pause import paused_set
+    paused = paused_set()
     lines.append("## Machines")
     for machine in config.machines:
         caps = ", ".join(machine.capabilities) if machine.capabilities else "none"
         repos = ", ".join(machine.repos) if machine.repos else "none"
         status = context["machine_status"].get(machine.name, {})
-        if status.get("status") == "offline":
+        if machine.name in paused:
+            # Routing-pause: do not propose work for this machine until
+            # the user runs `coord unpause`.  Reachability is unchanged.
+            state = "paused (do not propose work)"
+        elif status.get("status") == "offline":
             state = "offline"
         elif status.get("assignment"):
             state = f"busy (working on: {status['assignment'].get('issue_title', '?')})"

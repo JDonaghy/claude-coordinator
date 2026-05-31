@@ -386,15 +386,26 @@ def _dispatch_fix(
     machine = next(
         (m for m in config.machines if m.name == work.machine_name), None
     )
-    if machine is None or not machine.can_work_on(work.repo_name) or machine.repo_path(work.repo_name) is None:
-        # Fallback: any machine capable of working on this repo.
+    from coord.machine_pause import paused_set
+    paused = paused_set()
+    if (
+        machine is None
+        or not machine.can_work_on(work.repo_name)
+        or machine.repo_path(work.repo_name) is None
+        or machine.name in paused
+    ):
+        # Fallback: any machine capable of working on this repo, minus
+        # any the user has paused via `coord pause` (routing-pause).
         candidates = [
             m for m in config.machines
-            if m.can_work_on(work.repo_name) and m.repo_path(work.repo_name) is not None
+            if m.can_work_on(work.repo_name)
+            and m.repo_path(work.repo_name) is not None
+            and m.name not in paused
         ]
         if not candidates:
             log.warning(
-                "auto_loop: no machine can handle repo %r", work.repo_name
+                "auto_loop: no machine can handle repo %r (paused=%r)",
+                work.repo_name, sorted(paused)
             )
             return None
         machine = candidates[0]

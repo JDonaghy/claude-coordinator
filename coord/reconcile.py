@@ -37,6 +37,8 @@ def _reassign(
     original assignment's model is reused (escalation happens at the call
     site).
     """
+    from coord.machine_pause import paused_set
+    paused = paused_set()
     busy = {a.machine_name for a in board.active if a.status == "running"}
     candidates = [
         m for m in config.machines
@@ -44,13 +46,17 @@ def _reassign(
         and m.repo_path(failed.repo_name) is not None
         and m.name not in busy
         and m.name != failed.machine_name
+        and m.name not in paused
     ]
     if not candidates:
+        # Fall back to including the same machine that failed last time —
+        # paused machines stay excluded even from the fallback.
         candidates = [
             m for m in config.machines
             if m.can_work_on(failed.repo_name)
             and m.repo_path(failed.repo_name) is not None
             and m.name not in busy
+            and m.name not in paused
         ]
     if not candidates:
         return None

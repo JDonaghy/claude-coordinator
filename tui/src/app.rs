@@ -684,6 +684,13 @@ enum ContextMenuTarget {
         /// Plan / Skip Plan only on New rows).
         lifecycle: PipelineRowLifecycle,
     },
+    /// Right-click on a Machines sidebar row.  Used for the routing-pause
+    /// menu (`Pause` / `Resume`) — the user can steer agents away from a
+    /// machine without editing coordinator.yml or shelling out.
+    MachineRow {
+        name: String,
+        is_paused: bool,
+    },
 }
 
 /// #262: lifecycle bucket for a Pipeline sidebar row at right-click
@@ -2949,6 +2956,13 @@ pub struct CoordApp {
     /// stream-json line — quadratic in chat duration and the dominant CPU
     /// cost when the refinement overlay sat open for minutes.
     chat_transcript_cache_key: Option<(String, usize, usize)>,
+    /// #pause: set of machine names the user has paused via
+    /// right-click → Pause routing.  Loaded from
+    /// `~/.coord/paused_machines.json` (shared with the Python coordinator)
+    /// and refreshed each periodic data load so out-of-band changes
+    /// (`coord pause foo` from another terminal) propagate within a few
+    /// seconds.
+    paused_machines: std::collections::HashSet<String>,
     /// #245: pending `coord merge --force-merge` confirmation.  `Some(repo)`
     /// means the user pressed `m` while the "Checks failed" hint was visible
     /// and we're waiting for one-key confirmation before bypassing the CI
@@ -3213,6 +3227,7 @@ impl CoordApp {
             pending_refinement: None,
             pending_refine_ready: None,
             chat_transcript_cache_key: None,
+            paused_machines: read_paused_machines(),
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
@@ -4786,6 +4801,13 @@ impl CoordApp {
                 ];
                 if !ver_str.is_empty() {
                     spans.push(StyledSpan::with_fg(&ver_str, ver_col));
+                }
+                // #pause: badge a paused machine so the user sees at a
+                // glance which rows are excluded from routing.  Amber so
+                // it doesn't read as a failure (machine is healthy, just
+                // deliberately offline for new work).
+                if self.paused_machines.contains(&m.name) {
+                    spans.push(StyledSpan::with_fg(" [PAUSED]", Color::rgb(230, 180, 60)));
                 }
 
                 let text = StyledText { spans };
@@ -6391,6 +6413,7 @@ impl CoordApp {
             .machines
             .iter()
             .filter(|m| m.reachable && m.repos.iter().any(|r| r == coord_repo))
+            .filter(|m| !self.paused_machines.contains(&m.name))
             .min_by_key(|m| m.active_count)
     }
 
@@ -10436,6 +10459,9 @@ impl CoordApp {
                 issue_number,
                 lifecycle,
             } => self.context_menu_items_for_pipeline_row(*issue_number, lifecycle),
+            ContextMenuTarget::MachineRow { name, is_paused } => {
+                self.context_menu_items_for_machine_row(name, *is_paused)
+            }
         };
         if items.is_empty() {
             return false;
@@ -10812,6 +10838,7 @@ impl CoordApp {
                     ContextMenuTarget::PipelineRow { issue_number, .. } => {
                         issue_number.unwrap_or(0)
                     }
+                    ContextMenuTarget::MachineRow { .. } => 0,
                 };
                 self.push_toast(
                     "Copy",
@@ -10838,6 +10865,37 @@ impl CoordApp {
             // #264: Refine with chat — dispatch a refinement-chat worker
             // and open a ChatController bound to it.
             "refine-chat" => self.dispatch_refine_chat(target),
+            // #pause: toggle routing-pause for a machine.
+            "machine-pause" | "machine-resume" => {
+                let name = match target {
+                    ContextMenuTarget::MachineRow { name, .. } => name.clone(),
+                    _ => return false,
+                };
+                let cmd = if action_id == "machine-pause" { "pause" } else { "unpause" };
+                if !self.command_runner.spawn(&[cmd, &name]) {
+                    self.push_toast(
+                        "Another command is running",
+                        "Wait for the current command to finish, then try again.",
+                        ToastSeverity::Info,
+                    );
+                    return false;
+                }
+                // Optimistic local update — the file write is fast and the
+                // next periodic refresh re-reads to catch any concurrent
+                // edits.  Without this the badge would lag by ~1 s.
+                if action_id == "machine-pause" {
+                    self.paused_machines.insert(name.clone());
+                } else {
+                    self.paused_machines.remove(&name);
+                }
+                let verb = if action_id == "machine-pause" { "paused" } else { "resumed" };
+                self.push_toast(
+                    "Machine routing",
+                    &format!("{}: {}", name, verb),
+                    ToastSeverity::Info,
+                );
+                true
+            }
             // #261: Send to Pipeline — add the `coord` label so the
             // issue moves Refined → Pipeline:New.  Wraps the new
             // `coord track <repo> <num>` Python command.
@@ -11115,6 +11173,9 @@ impl CoordApp {
             ContextMenuTarget::PipelineRow { issue_number, lifecycle } => {
                 self.context_menu_items_for_pipeline_row(*issue_number, lifecycle)
             }
+            ContextMenuTarget::MachineRow { name, is_paused } => {
+                self.context_menu_items_for_machine_row(name, *is_paused)
+            }
         };
         // The menu always includes Copy + Refresh — those aren't
         // interesting in the action bar (Refresh has its own keybind,
@@ -11188,8 +11249,35 @@ impl CoordApp {
                     lifecycle,
                 })
             }
+            SidebarView::Machines => {
+                let m = self.data.machines.get(self.machine_sel)?;
+                let is_paused = self.paused_machines.contains(&m.name);
+                Some(ContextMenuTarget::MachineRow {
+                    name: m.name.clone(),
+                    is_paused,
+                })
+            }
             _ => None,
         }
+    }
+
+    /// #pause: right-click menu for a Machines panel row.  One toggle
+    /// item ("Pause routing" / "Resume routing") plus a separator so the
+    /// menu reads as a "single verb" affordance rather than a junk drawer.
+    fn context_menu_items_for_machine_row(
+        &self,
+        _name: &str,
+        is_paused: bool,
+    ) -> Vec<ContextMenuItem> {
+        let mut items: Vec<ContextMenuItem> = Vec::new();
+        if is_paused {
+            items.push(ContextMenuItem::action("machine-resume", "Resume routing"));
+        } else {
+            items.push(ContextMenuItem::action("machine-pause", "Pause routing"));
+        }
+        items.push(ContextMenuItem::separator());
+        items.push(ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"));
+        items
     }
 
     /// Hit-test a left-click against the sidebar action bar at the top
@@ -11588,6 +11676,14 @@ impl CoordApp {
             self.pending_data = Some(start_data_load());
             if self.active_view == SidebarView::Pipeline {
                 self.maybe_kick_pipeline_loader();
+            }
+            // #pause: rescan the paused-machines file at the same cadence
+            // as the rest of the data refresh.  Picks up out-of-band edits
+            // (`coord pause foo` from another terminal) without polling on
+            // every tick.
+            let fresh = read_paused_machines();
+            if fresh != self.paused_machines {
+                self.paused_machines = fresh;
             }
             needs_redraw = true;
         }
@@ -13922,6 +14018,65 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
     turns
 }
 
+/// #pause: read the set of paused machines from disk.  Shared with the
+/// Python coordinator (`coord pause` / `coord unpause` write the same
+/// file) so the TUI's filter agrees with `coord plan`, auto_loop,
+/// reconcile, review, and refine-chat dispatches.  Returns empty on any
+/// I/O or parse failure — failure to read should never block routing.
+fn read_paused_machines() -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let home = match std::env::var_os("HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => return out,
+    };
+    let path = home.join(".coord").join("paused_machines.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    // Tiny hand-rolled extract — the file is `{"paused": ["foo", "bar"]}`
+    // and pulling in serde just for this would inflate dependencies.
+    // Walk the `paused` array, collect bare-string entries.
+    let lower = content.to_string();
+    let key_pos = match lower.find("\"paused\"") {
+        Some(p) => p,
+        None => return out,
+    };
+    let after_key = &content[key_pos..];
+    let bracket_start = match after_key.find('[') {
+        Some(p) => p,
+        None => return out,
+    };
+    let bracket_end = match after_key[bracket_start..].find(']') {
+        Some(p) => bracket_start + p,
+        None => return out,
+    };
+    let inner = &after_key[bracket_start + 1..bracket_end];
+    let mut chars = inner.chars().peekable();
+    let mut current = String::new();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            if c == '"' {
+                if !current.is_empty() {
+                    out.insert(std::mem::take(&mut current));
+                }
+                in_string = false;
+            } else if c == '\\' {
+                if let Some(esc) = chars.next() {
+                    current.push(esc);
+                }
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' {
+            in_string = true;
+            current.clear();
+        }
+    }
+    out
+}
+
 /// Pick a single short line out of a child command's stderr suitable for a
 /// toast body.  Skips blank lines and Python/Click tracebacks/prefixes (which
 /// the coord CLI emits before the actual error message) so the user gets the
@@ -14396,6 +14551,7 @@ mod tests {
             pending_refinement: None,
             pending_refine_ready: None,
             chat_transcript_cache_key: None,
+            paused_machines: read_paused_machines(),
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),

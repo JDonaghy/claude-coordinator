@@ -33,13 +33,20 @@ MAX_CLAUDE_MD_CHARS = 8000
 def pick_refinement_machine(cfg: Config, repo: str) -> Machine | None:
     """Pick a machine to run the refinement session on.
 
-    Returns the first reachable machine that lists *repo*.  Refinement is
-    read-only and short-lived, so we don't need the freshness / capacity
-    weighting `coord plan` uses for work dispatch — any qualified machine
-    works.  Returns `None` when no machine claims the repo.
+    Returns the first reachable machine that lists *repo* and is not
+    paused (via `coord pause <name>`).  Refinement is read-only and
+    short-lived, so we don't need the freshness / capacity weighting
+    `coord plan` uses for work dispatch — any qualified machine works.
+    Returns `None` when no machine claims the repo.
     """
+    from coord.machine_pause import paused_set
+    paused = paused_set()
     for m in cfg.machines:
-        if m.can_work_on(repo) and m.repo_path(repo) is not None:
+        if (
+            m.can_work_on(repo)
+            and m.repo_path(repo) is not None
+            and m.name not in paused
+        ):
             return m
     return None
 

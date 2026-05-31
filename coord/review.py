@@ -365,8 +365,11 @@ def pick_reviewer_machine(
 
     Returns None when no machine can handle this repo.
     """
+    from coord.machine_pause import paused_set
+    paused = paused_set()
     candidates = [
-        m for m in config.machines if m.can_work_on(repo_name)
+        m for m in config.machines
+        if m.can_work_on(repo_name) and m.name not in paused
     ]
     if not candidates:
         return None
