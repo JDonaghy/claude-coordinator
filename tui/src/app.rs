@@ -391,6 +391,12 @@ enum PipelineDetailTab {
     /// Live worker log — same content as the watch overlay but inline
     /// so the pipeline stage boxes remain visible above.
     Log,
+    /// #264: refinement chat for the selected issue.  Empty placeholder
+    /// when no `type="refinement"` assignment is active for the row; an
+    /// embedded `ChatController` when one is — so the user can flip back
+    /// to Issue / Stages / Log while the chat keeps streaming in the
+    /// background.
+    Refinement,
 }
 
 /// The tabs shown in the Board view detail panel.
@@ -6163,6 +6169,74 @@ impl CoordApp {
         self.pipeline_stage_content_scroll = 0;
     }
 
+    /// #264: True when the currently-open `inject_chat` overlay is bound to
+    /// a `type="refinement"` assignment (rather than a worker-guidance
+    /// session).  Refinement chats render inline in the Refinement tab so
+    /// tab-switching keeps working; worker-guidance chats stay modal.
+    fn chat_is_refinement(&self) -> bool {
+        if self.inject_chat.is_none() {
+            return false;
+        }
+        self.focused_watch_state()
+            .map(|w| w.assignment_type == "refinement")
+            .unwrap_or(false)
+    }
+
+    /// #264: True when `inject_chat` is a refinement chat AND its bound
+    /// assignment's issue matches the currently-selected pipeline row.
+    /// The Refinement tab only shows the chat in this state; when the
+    /// user navigates to a different issue while the chat is open they
+    /// see the placeholder instead, so the chat can't be mistaken for
+    /// belonging to a different issue.
+    fn chat_is_refinement_for_selected_issue(&self) -> bool {
+        if !self.chat_is_refinement() {
+            return false;
+        }
+        let Some(w) = self.focused_watch_state() else { return false; };
+        let Some(sel) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(sel) else { return false; };
+        issue.number == w.issue_number
+    }
+
+    /// #264: True when any `type="refinement"` assignment is currently
+    /// running on the selected pipeline issue.  Drives the Refinement
+    /// tab's accent dot so the tab is discoverable without forcing focus.
+    fn has_active_refinement_for_selected_issue(&self) -> bool {
+        let Some(sel) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(sel) else { return false; };
+        self.data.assignments.iter().any(|a| {
+            a.issue_number == issue.number
+                && a.assignment_type.as_deref() == Some("refinement")
+                && a.status == "running"
+        })
+    }
+
+    /// #264: Placeholder rendered in the Refinement tab when no chat is
+    /// bound to the current issue.  Keeps the tab a useful surface even
+    /// when empty — tells the user how to start one.
+    fn refinement_tab_placeholder_list(&self) -> ListView {
+        let items = vec![
+            kv_item("", "", None),
+            kv_item("", "  No refinement chat is open for this issue.", Some(Color::rgb(180, 180, 200))),
+            kv_item("", "", None),
+            kv_item("", "  To start one, right-click the issue on the Board panel and pick", Some(Color::rgb(140, 140, 160))),
+            kv_item("", "  \"Refine with chat\".  A claude -p worker will be seeded with the", Some(Color::rgb(140, 140, 160))),
+            kv_item("", "  issue + CLAUDE.md + repo file tree; this tab will switch to the", Some(Color::rgb(140, 140, 160))),
+            kv_item("", "  chat UI as soon as the worker is ready.", Some(Color::rgb(140, 140, 160))),
+        ];
+        ListView {
+            id: WidgetId::new("refinement-placeholder"),
+            title: None,
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
+        }
+    }
+
     /// #303: The single button rendered in the pipeline button bar above the
     /// stage row.  Returns `(label, stage_index)` for the stage that owns the
     /// action (today: at most one `[Go]` or `[Retry]` per pipeline), or
@@ -7734,6 +7808,19 @@ impl CoordApp {
                 TabItem {
                     label: " Log ".to_string(),
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Log,
+                    is_dirty: false,
+                    is_preview: false,
+                },
+                TabItem {
+                    // #264: an indicator dot when a refinement worker is
+                    // actively talking on this issue makes the tab
+                    // discoverable without forcing the user back onto it.
+                    label: if self.has_active_refinement_for_selected_issue() {
+                        " Refinement ● ".to_string()
+                    } else {
+                        " Refinement ".to_string()
+                    },
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Refinement,
                     is_dirty: false,
                     is_preview: false,
                 },
@@ -9562,7 +9649,8 @@ impl CoordApp {
                         0 => PipelineDetailTab::Pipeline,
                         1 => PipelineDetailTab::Issue,
                         2 => PipelineDetailTab::Stages,
-                        _ => PipelineDetailTab::Log,
+                        3 => PipelineDetailTab::Log,
+                        _ => PipelineDetailTab::Refinement,
                     };
                     if new_tab != self.pipeline_detail_tab {
                         self.pipeline_detail_tab = new_tab;
@@ -9805,6 +9893,13 @@ impl CoordApp {
                             // Re-stick when reaching the bottom.
                             self.pipeline_detail_scroll = if new >= max { usize::MAX } else { new };
                         }
+                    }
+                    PipelineDetailTab::Refinement => {
+                        // #264: ChatController owns its own scroll inside
+                        // the embedded transcript when the chat is bound
+                        // to this issue; the parent panel-scroll path is
+                        // a no-op so wheel events here don't fight with
+                        // the chat's internal scrollbar.
                     }
                 }
                 let _ = visible;
@@ -10640,11 +10735,23 @@ impl CoordApp {
         // Open the inject_chat overlay so the user can type immediately.
         let mut chat = ChatController::new("refinement-chat");
         chat.set_status(StyledText::plain(format!(
-            "  Refinement chat → {} #{}  (Ctrl+S or Alt+Enter = send · D = done & ready · Esc = close)",
+            "  Refinement chat → {} #{}  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)",
             pending.repo, pending.issue_number
         )));
         chat.set_transcript(Vec::new());
         self.inject_chat = Some(chat);
+        // #264: route the user straight into the Refinement tab on the
+        // Pipeline view so the chat is visible immediately.  Also switch
+        // pipeline_sel to the refinement issue if it's in the loaded
+        // list — without this, the bind succeeds but the user has to hunt
+        // for the row before the tab shows the chat.
+        self.active_view = SidebarView::Pipeline;
+        self.pipeline_detail_tab = PipelineDetailTab::Refinement;
+        if let Some(idx) = self.pipeline_issues.iter()
+            .position(|i| i.number == pending.issue_number)
+        {
+            self.pipeline_sel = Some(idx);
+        }
         self.pending_refinement = None;
         self.push_toast(
             "Refine with chat",
@@ -12263,30 +12370,63 @@ impl ShellApp for CoordApp {
                         PipelineDetailTab::Log => {
                             backend.draw_list(content_rect, &self.pipeline_log_list());
                         }
+                        PipelineDetailTab::Refinement => {
+                            // #264: refinement chat lives in its own tab so
+                            // the user can flip back to Issue / Stages / Log
+                            // while the chat keeps streaming in the
+                            // background.  Three render states:
+                            //   - chat bound to this issue → render it
+                            //   - no chat / chat for a different issue but
+                            //     a refinement assignment exists → "binding…"
+                            //   - no refinement at all → empty placeholder
+                            if self.chat_is_refinement_for_selected_issue() {
+                                // Paint an opaque backing first so the chat's
+                                // empty transcript zone doesn't bleed
+                                // through.
+                                backend.draw_list(content_rect, &ListView {
+                                    id: WidgetId::new("refinement-tab-bg"),
+                                    title: None,
+                                    items: Vec::new(),
+                                    selected_idx: 0,
+                                    scroll_offset: 0,
+                                    has_focus: false,
+                                    bordered: true,
+                                    h_scroll: 0,
+                                    max_content_width: None,
+                                });
+                                if let Some(ref chat) = self.inject_chat {
+                                    chat.render(backend, content_rect);
+                                }
+                            } else {
+                                backend.draw_list(content_rect, &self.refinement_tab_placeholder_list());
+                            }
+                        }
                     }
                 }
             }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
-        // #264: paint an opaque backing list first so the underlying panel
-        // (Issue tab, Board detail, etc.) doesn't show through the chat's
-        // empty zones.  Without this, when the user opens Refine with chat
-        // from a non-Log panel, the issue body bleeds through the
-        // transcript area until it's filled with enough turns to cover it.
+        // #264: refinement chats render in the Refinement tab above (so the
+        // user can navigate freely between tabs while the chat is live).
+        // Worker-guidance chats (`b` over a watched worker) stay modal —
+        // those are short bursts where modal hijacking matches intent.
+        let chat_is_refinement = self.chat_is_refinement();
         if let Some(ref chat) = self.inject_chat {
-            backend.draw_list(m, &ListView {
-                id: WidgetId::new("chat-backing"),
-                title: None,
-                items: Vec::new(),
-                selected_idx: 0,
-                scroll_offset: 0,
-                has_focus: false,
-                bordered: true,
-                h_scroll: 0,
-                max_content_width: None,
-            });
-            chat.render(backend, m);
+            if !chat_is_refinement {
+                backend.draw_list(m, &ListView {
+                    id: WidgetId::new("chat-backing"),
+                    title: None,
+                    items: Vec::new(),
+                    selected_idx: 0,
+                    scroll_offset: 0,
+                    has_focus: false,
+                    bordered: true,
+                    h_scroll: 0,
+                    max_content_width: None,
+                });
+                chat.render(backend, m);
+            }
         }
 
         // ── Toast overlay (bottom-right of main content) ────────────────
@@ -12324,34 +12464,69 @@ impl ShellApp for CoordApp {
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
 
-        // ── Inject chat overlay — intercepts ALL events when open ───────────
-        // When the chat is open it takes over input; normal sidebar/pipeline
-        // handlers are bypassed. handle_mouse is also skipped so a click on
-        // the sidebar doesn't change selection while the user is typing.
+        // ── Inject chat overlay — intercepts events when open ──────────────
+        // Two routing modes:
+        //   - **Worker-guidance** (chat opened with `b` over a watch overlay)
+        //     keeps the original modal behaviour: chat captures ALL events
+        //     until closed.  This matches its short-burst usage.
+        //   - **Refinement** (#264, opened via Refine with chat) routes
+        //     events to the chat only when the user is actively on the
+        //     Refinement tab — otherwise the user can navigate Issue /
+        //     Stages / Log freely while the chat keeps streaming in the
+        //     background.
         if self.inject_chat.is_some() {
-            let main_rect = ctx.main_bounds();
-            let result = self.inject_chat.as_mut().unwrap().handle(&event, backend, main_rect);
-            match result {
-                ChatControllerEvent::Submit { text } => {
-                    self.submit_inject(text);
-                }
-                ChatControllerEvent::Cancelled => {
-                    // #264: Esc on a refinement chat finalises — kill the
-                    // refinement worker AND flip the GitHub label
-                    // status:refining → status:ready.  For non-refinement
-                    // chats (worker guidance) Esc just closes the overlay;
-                    // the worker keeps running because the user is mid-task.
-                    let is_refinement = self.focused_watch_state()
-                        .map(|w| w.assignment_type == "refinement")
-                        .unwrap_or(false);
-                    if is_refinement {
-                        self.finalise_refinement_chat();
+            let chat_is_refinement = self.chat_is_refinement();
+            let route_to_chat = if chat_is_refinement {
+                self.active_view == SidebarView::Pipeline
+                    && self.pipeline_detail_tab == PipelineDetailTab::Refinement
+                    && self.chat_is_refinement_for_selected_issue()
+            } else {
+                true
+            };
+            if route_to_chat {
+                let main_rect = if chat_is_refinement {
+                    // Match the Refinement tab's content_rect so handle()'s
+                    // layout maths agree with what's painted.
+                    let m = ctx.main_bounds();
+                    let lh = backend.line_height();
+                    let tab_h = lh * 1.4;
+                    // Account for the panel toolbar carve-out done in
+                    // render_content (#272).  When panel_toolbar() returns
+                    // None we just shave the tab bar.
+                    let after_panel = if self.panel_toolbar().is_some() {
+                        Rect::new(m.x, m.y + self.toolbar_height(lh), m.width,
+                            (m.height - self.toolbar_height(lh)).max(0.0))
+                    } else {
+                        m
+                    };
+                    Rect::new(after_panel.x, after_panel.y + tab_h,
+                        after_panel.width, (after_panel.height - tab_h).max(0.0))
+                } else {
+                    ctx.main_bounds()
+                };
+                let result = self.inject_chat.as_mut().unwrap().handle(&event, backend, main_rect);
+                match result {
+                    ChatControllerEvent::Submit { text } => {
+                        self.submit_inject(text);
                     }
-                    self.inject_chat = None;
+                    ChatControllerEvent::Cancelled => {
+                        // Worker-guidance chat: Esc just closes the modal
+                        // (worker keeps running because the user is
+                        // mid-task).  Refinement chat: Esc finalises —
+                        // stop the worker + flip status:refining →
+                        // status:ready.
+                        if chat_is_refinement {
+                            self.finalise_refinement_chat();
+                        }
+                        self.inject_chat = None;
+                    }
+                    _ => {}
                 }
-                _ => {}
+                return Reaction::Redraw;
             }
-            return Reaction::Redraw;
+            // Refinement chat is open but the user is on another tab —
+            // fall through so normal navigation works (h/l/1-4, mouse on
+            // sidebar etc.).
         }
 
         // ── Mouse / scroll dispatch (before consuming the event) ─────────────
@@ -13061,15 +13236,16 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── h/l — cycle Pipeline detail tabs ─────────────────
-                    // Order: Pipeline → Issue → Stages → Log → Pipeline …
+                    // Order: Pipeline → Issue → Stages → Log → Refinement → Pipeline …
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
                         self.pipeline_detail_tab = match self.pipeline_detail_tab {
-                            PipelineDetailTab::Pipeline => PipelineDetailTab::Log,
+                            PipelineDetailTab::Pipeline => PipelineDetailTab::Refinement,
                             PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
                             PipelineDetailTab::Stages => PipelineDetailTab::Issue,
                             PipelineDetailTab::Log => PipelineDetailTab::Stages,
+                            PipelineDetailTab::Refinement => PipelineDetailTab::Log,
                         };
                         self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
                         if self.pipeline_detail_tab == PipelineDetailTab::Log {
@@ -13084,7 +13260,8 @@ impl ShellApp for CoordApp {
                             PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
                             PipelineDetailTab::Issue => PipelineDetailTab::Stages,
                             PipelineDetailTab::Stages => PipelineDetailTab::Log,
-                            PipelineDetailTab::Log => PipelineDetailTab::Pipeline,
+                            PipelineDetailTab::Log => PipelineDetailTab::Refinement,
+                            PipelineDetailTab::Refinement => PipelineDetailTab::Pipeline,
                         };
                         self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
                         if self.pipeline_detail_tab == PipelineDetailTab::Log {
@@ -13727,13 +13904,18 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
             continue;
         }
         let text = extract_text_block(line);
-        let collapsed = collapse_ws(&text);
-        if collapsed.is_empty() {
+        // Preserve newlines so numbered lists and multi-line questions
+        // stay readable — the Log-tab path collapses whitespace because
+        // each turn is rendered as a single horizontal-scrollable row,
+        // but the chat transcript wraps per-row and benefits from real
+        // line breaks.  Trim outer whitespace; leave inner structure.
+        let body = text.trim();
+        if body.is_empty() {
             continue;
         }
         turns.push(ChatTurn {
             role: ChatRole::Assistant,
-            text: StyledText::plain(collapsed),
+            text: StyledText::plain(body.to_string()),
             timestamp_unix: None,
         });
     }
