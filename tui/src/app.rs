@@ -3982,6 +3982,27 @@ impl CoordApp {
         };
         let text = text.trim().to_string();
         if text.is_empty() { return false; }
+        // #264: claude -p exits after `stop_reason: end_turn` (it doesn't
+        // stay alive waiting for more injects), so once the assignment is
+        // in `done` state any new POST /inject/{id} will return 410
+        // BrokenPipeError.  Refuse the submit up-front and tell the user
+        // the worker is gone — without this we silently swallowed the
+        // error and the chat looked frozen.
+        let worker_done = self.data.assignments.iter().any(|a| {
+            a.id == aid && (a.status == "done" || a.status == "failed" || a.status == "cancelled")
+        });
+        if worker_done {
+            self.push_toast(
+                "Chat ended",
+                "The worker exited (stop_reason: end_turn).  Esc to close and start a new chat — the model decided the conversation was done.",
+                ToastSeverity::Warning,
+            );
+            // Clear the input so the message doesn't sit there forever.
+            if let Some(ref mut chat) = self.inject_chat {
+                chat.clear_input();
+            }
+            return false;
+        }
         let host = match self.data.machines.iter().find(|m| m.name == machine_name) {
             Some(m) if !m.host.is_empty() => m.host.clone(),
             _ => {
@@ -14029,6 +14050,34 @@ impl ShellApp for CoordApp {
                         self.chat_transcript_cache_key = Some(key);
                         // Activity stamp drives the busy indicator below.
                         self.chat_last_activity = Some(Instant::now());
+                    }
+                }
+                // #264: reflect worker state in the chat status strip so the
+                // user can see when claude -p has exited (stop_reason:
+                // end_turn).  Otherwise the strip stays on its initial
+                // "Refinement chat → repo #N" label and the chat looks like
+                // it's just slow when really the session is dead.
+                let assignment_state = self.data.assignments.iter()
+                    .find(|a| a.id == id)
+                    .map(|a| (a.status.clone(), a.assignment_type.clone()));
+                if let Some((status, atype)) = assignment_state {
+                    if let Some(ref mut chat) = self.inject_chat {
+                        let label = match atype.as_deref() {
+                            Some("refinement") => "Refinement chat",
+                            _ => "Chat",
+                        };
+                        let suffix = match status.as_str() {
+                            "done" | "failed" | "cancelled" => {
+                                "  ⚠ Worker exited — chat is read-only.  Esc to close."
+                            }
+                            _ => "  (Ctrl+S/Alt+Enter = send · Esc = done & mark ready)",
+                        };
+                        chat.set_status(StyledText::plain(format!(
+                            "  {} → #{}{}",
+                            label,
+                            self.watch_pool.get(&id).map(|c| c.state.issue_number).unwrap_or(0),
+                            suffix
+                        )));
                     }
                 }
             }
