@@ -653,11 +653,9 @@ fn spawn_inject_post(
         {
             Ok(_) => {}
             Err(ureq::Error::Status(code, _)) if code == 409 || code == 410 => {
-                eprintln!(
-                    "[chat inject] POST {} returned {} — worker exited mid-flight, \
-                     sending InjectFallback so main thread can chat-continue",
-                    url, code
-                );
+                // Worker exited mid-flight — signal the main thread so it can
+                // transparently fall back to `coord chat-continue`.  The user's
+                // typed message is preserved on the channel.
                 let _ = fallback_tx.send(InjectFallback {
                     aid,
                     text: text_owned,
@@ -698,36 +696,22 @@ fn spawn_chat_continue(
         for word in text.split_whitespace() {
             cmd.arg(word);
         }
-        // #315 diagnostic: capture stdout+stderr so failures don't disappear
-        // into /dev/null.  spawn_chat_continue used to pipe both to null,
-        // which silently swallowed errors like "session_id missing" or
-        // "config not found" — turning a chat-continue failure into a
-        // mysterious 30s bind timeout.
+        // #315: capture stderr (only) and surface non-zero exits.  Success
+        // is silent; failure logs a single line so a future regression
+        // can't disappear into /dev/null the way the original
+        // fire-and-forget did.  Failures still surface to the user via
+        // the bind-timeout toast even without this log.
         let aid_short: String = old_assignment_id.chars().take(6).collect();
-        match cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
+        if let Ok(out) = cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output()
         {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                if !out.status.success() {
-                    eprintln!(
-                        "[#315] coord chat-continue FAILED for old_aid={} status={:?}\n         stdout={}\n         stderr={}",
-                        aid_short, out.status.code(), stdout, stderr,
-                    );
-                } else {
-                    eprintln!(
-                        "[#315] coord chat-continue ok for old_aid={} → new_aid={}",
-                        aid_short, stdout,
-                    );
-                }
-            }
-            Err(e) => {
                 eprintln!(
-                    "[#315] coord chat-continue could not spawn for old_aid={}: {}",
-                    aid_short, e,
+                    "[chat-continue] FAILED for old_aid={} status={:?}: {}",
+                    aid_short, out.status.code(), stderr,
                 );
             }
         }
@@ -4122,35 +4106,12 @@ impl CoordApp {
     /// Appends the text to the inject transcript and clears the chat
     /// input on success.
     fn submit_inject(&mut self, text: String) -> bool {
-        let foc_sse_done = self.watch_focused.as_ref()
-            .and_then(|id| self.watch_pool.get(id))
-            .map(|c| c.sse.done);
-        let foc_status = self.watch_focused.as_ref().and_then(|id| {
-            self.data.assignments.iter().find(|a| &a.id == id).map(|a| a.status.clone())
-        });
-        eprintln!(
-            "[#315] submit_inject called: text_len={} text={:?} watch_focused={:?} \
-             foc_sse_done={:?} foc_data_status={:?} inject_chat_open={} pending_resume_armed={}",
-            text.len(),
-            &text[..40.min(text.len())],
-            self.watch_focused.as_ref().map(|a| &a[..6.min(a.len())]),
-            foc_sse_done,
-            foc_status,
-            self.inject_chat.is_some(),
-            self.pending_chat_resume.is_some(),
-        );
         let (aid, issue_number, machine_name) = match self.focused_watch_state() {
             Some(w) => (w.assignment_id.clone(), w.issue_number, w.machine.clone()),
-            None => {
-                eprintln!("[#315] submit_inject early return — no focused_watch_state");
-                return false;
-            }
+            None => return false,
         };
         let text = text.trim().to_string();
-        if text.is_empty() {
-            eprintln!("[#315] submit_inject early return — empty text");
-            return false;
-        }
+        if text.is_empty() { return false; }
         // #264: claude -p exits after `stop_reason: end_turn` (it doesn't
         // stay alive waiting for more injects), so once the assignment is
         // in `done` state any new POST /inject/{id} will return 410
@@ -4178,10 +4139,6 @@ impl CoordApp {
         // chat-continue against the same session (which would race the
         // first and confuse claude's session storage).
         if worker_done && self.pending_chat_resume.is_some() {
-            eprintln!(
-                "[#315] submit_inject refused — resume already in flight for aid={}",
-                &aid[..6.min(aid.len())]
-            );
             self.pipeline_status = Some((
                 "⏳ Resume in flight — wait for assistant reply before sending again".to_string(),
                 Instant::now(),
@@ -4220,13 +4177,6 @@ impl CoordApp {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
-            eprintln!(
-                "[#315] arming pending_chat_resume — old_aid={} issue=#{} arm_t={:.0} text={:?}",
-                &aid[..6.min(aid.len())],
-                issue_number,
-                arm_unix_secs,
-                &text[..40.min(text.len())],
-            );
             spawn_chat_continue(config_path, aid.clone(), text.clone());
             // Arm the pending-resume poll so the overlay rebinds on the next
             // data refresh that surfaces the new assignment row.
@@ -11159,13 +11109,6 @@ impl CoordApp {
         };
         // Timeout — the resume dispatch likely failed; clear and warn the user.
         if pending.dispatched_at.elapsed() > REFINEMENT_BIND_TIMEOUT {
-            eprintln!(
-                "[#315] bind TIMEOUT after {}s for #{} (old_aid={}) — pool has {} entries",
-                pending.dispatched_at.elapsed().as_secs(),
-                pending.issue_number,
-                pending.old_assignment_id,
-                self.data.assignments.len(),
-            );
             self.pending_chat_resume = None;
             self.push_toast(
                 "Chat resume timed out",
@@ -11203,34 +11146,7 @@ impl CoordApp {
             .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
                 .unwrap_or(std::cmp::Ordering::Equal))
             .cloned();
-        let Some(asg) = pick else {
-            // Log every 2s to avoid flooding stderr.
-            let elapsed = pending.dispatched_at.elapsed().as_secs();
-            if elapsed > 0 && elapsed % 2 == 0 {
-                let statuses: Vec<String> = matching.iter()
-                    .map(|a| format!("{}:{}", &a.id[..6.min(a.id.len())], a.status))
-                    .collect();
-                eprintln!(
-                    "[#315] bind waiting — #{} (old_aid={}) — {}s elapsed — \
-                     matching refinements for issue (excl old): [{}] — \
-                     total data.assignments: {}",
-                    pending.issue_number,
-                    &pending.old_assignment_id[..6.min(pending.old_assignment_id.len())],
-                    elapsed,
-                    statuses.join(", "),
-                    self.data.assignments.len(),
-                );
-            }
-            return false;
-        };
-        eprintln!(
-            "[#315] bind picked aid={} status={} for #{} (old={}, took {}s)",
-            &asg.id[..6.min(asg.id.len())],
-            asg.status,
-            pending.issue_number,
-            &pending.old_assignment_id[..6.min(pending.old_assignment_id.len())],
-            pending.dispatched_at.elapsed().as_secs(),
-        );
+        let Some(asg) = pick else { return false; };
         let new_aid = asg.id.clone();
 
         // Capture the *full* chat history (user + assistant turns) from the
@@ -12320,22 +12236,12 @@ impl CoordApp {
             };
             // Suppress if a resume is already in flight for this issue.
             if self.pending_chat_resume.is_some() {
-                eprintln!(
-                    "[#315] inject fallback for {} arrived while resume already pending — dropping",
-                    &fb.aid[..6.min(fb.aid.len())]
-                );
                 continue;
             }
             let arm_unix_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
-            eprintln!(
-                "[#315] inject 409/410 → reactive chat-continue: aid={} issue=#{} text={:?}",
-                &fb.aid[..6.min(fb.aid.len())],
-                fb.issue_number,
-                &fb.text[..40.min(fb.text.len())],
-            );
             let config_path = self.command_runner.config_path.clone();
             spawn_chat_continue(config_path, fb.aid.clone(), fb.text.clone());
             self.pending_chat_resume = Some(PendingChatResume {
