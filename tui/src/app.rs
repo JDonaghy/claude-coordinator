@@ -826,12 +826,13 @@ fn spawn_chat_continue(
             cmd.args(["--config", &cfg.to_string_lossy()]);
         }
         cmd.arg(&old_assignment_id);
-        // Append each word of the user message as a separate argument so
-        // shell-special characters (quotes, semicolons, etc.) are never
-        // interpreted.
-        for word in text.split_whitespace() {
-            cmd.arg(word);
-        }
+        // #335: pass the whole message as a single argv entry. `Command` does
+        // not go through a shell, so quotes/semicolons/dollar signs are already
+        // literal. Splitting on whitespace was actively harmful: tokens
+        // beginning with `-` (e.g. user types "claude -p" or "-v for verbose")
+        // arrive at Click as unknown options and chat-continue aborts before
+        // dispatching, silently dropping the user's turn.
+        cmd.arg(&text);
         // #315: capture stderr (only) and surface non-zero exits.  Success
         // is silent; failure logs a single line so a future regression
         // can't disappear into /dev/null the way the original
