@@ -2309,7 +2309,7 @@ def chat_continue(
     conn = get_connection()
     row = conn.execute(
         "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, "
-        "claude_session_id FROM assignments WHERE assignment_id=?",
+        "claude_session_id, type FROM assignments WHERE assignment_id=?",
         (prior_assignment_id,),
     ).fetchone()
     if row is None:
@@ -2389,9 +2389,17 @@ def chat_continue(
             err=True,
         )
 
-    # #315: type="refinement" so the agent uses the read-only REFINEMENT_SYSTEM_PROMPT
-    # and the worker exits cleanly after responding.  resume_session_id passes
-    # --resume so the full prior conversation is loaded.
+    # #315/#314: round-trip the prior assignment's type so a test-chat stays
+    # type="test-chat" and a refinement stays type="refinement".  Older DB
+    # rows that predate the `type` column default to "refinement".
+    prior_type: str = "refinement"
+    try:
+        raw_type = row["type"]
+        if raw_type in ("refinement", "test-chat"):
+            prior_type = raw_type
+    except (IndexError, KeyError):
+        pass
+
     proposal = Proposal(
         id=0,  # not inserted into proposals table; dummy value
         machine_name=machine_name,
@@ -2400,7 +2408,7 @@ def chat_continue(
         issue_title=issue_title,
         rationale="chat continuation",
         briefing=message_text,
-        type="refinement",
+        type=prior_type,
         resume_session_id=claude_session_id,
     )
 
@@ -2930,6 +2938,77 @@ def refine_chat(repo: str, issue: int, machine: str | None, config_path: Path) -
     # Print the assignment_id as the LAST line on stdout so callers (the
     # TUI) can capture it with a simple "last non-empty line" parse.  Any
     # warnings or progress lines must be written to stderr.
+    click.echo(assignment_id)
+
+
+@main.command(
+    "test-chat",
+    help=(
+        "#314 Phase B: dispatch a test-chat session for a completed work assignment.\n\n"
+        "Seeds a `type=\"test-chat\"` `claude -p` worker with the PR diff, "
+        "most recent build log, the worker's SMOKE_TESTS block, the repo's "
+        "run command, and the repo's CLAUDE.md.  Prints the new assignment id "
+        "to stdout.  The TUI captures the id and opens a ChatController overlay "
+        "bound to it; developer-typed turns flow via `POST /inject/{id}`.\n\n"
+        "Read-plus-Bash — test-chat workers have `Read` and `Bash` tools but "
+        "write-side Bash commands (gh, git push, etc.) are blocked by the deny "
+        "list in the system prompt.\n\n"
+        "WORK_ASSIGNMENT_ID is the id of the work assignment to test (visible "
+        "in `coord status` or the TUI Pipeline > Stages tab)."
+    ),
+)
+@click.argument("work_assignment_id")
+@click.option(
+    "--machine",
+    default=None,
+    help="Override machine selection (default: first reachable machine that lists the repo).",
+)
+@_CONFIG_OPTION
+def test_chat(work_assignment_id: str, machine: str | None, config_path: Path) -> None:
+    """Dispatch a test-chat session for a completed work assignment."""
+    from coord.db import get_connection  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+
+    # Look up the work assignment to resolve the repo name.
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT repo_name FROM assignments WHERE assignment_id=?",
+        (work_assignment_id,),
+    ).fetchone()
+    if row is None:
+        click.echo(
+            f"error: assignment {work_assignment_id!r} not found in DB",
+            err=True,
+        )
+        sys.exit(1)
+
+    repo = row["repo_name"]
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.echo(
+            f"error: repo {repo!r} not in coordinator.yml "
+            f"(have: {[r.name for r in cfg.repos]})",
+            err=True,
+        )
+        sys.exit(2)
+
+    from coord.test_chat import dispatch_test_chat  # noqa: PLC0415
+
+    try:
+        assignment_id, _picked_machine = dispatch_test_chat(
+            cfg=cfg,
+            repo_cfg=repo_cfg,
+            repo=repo,
+            work_assignment_id=work_assignment_id,
+            machine_override=machine,
+        )
+    except RuntimeError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+
+    # Print the assignment_id as the LAST line on stdout so callers (the TUI)
+    # can capture it with a simple "last non-empty line" parse.
     click.echo(assignment_id)
 
 

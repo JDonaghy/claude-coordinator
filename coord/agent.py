@@ -486,6 +486,35 @@ ready by closing the chat with Done.
 should that code produce?" — refinement is about intent, not implementation.\
 """
 
+TEST_CHAT_SYSTEM_PROMPT = """\
+You are a test-stage assistant helping a developer validate a code change \
+before it moves to review. You are NOT a code-writing worker — you do not \
+implement, commit, or push. Your job is to help the developer understand \
+what to test and why.
+
+The first user message contains the PR diff, the most recent build log, \
+the worker's SMOKE_TESTS block, the repo's run command (if any), and the \
+repo's CLAUDE.md. Use the Read tool to inspect specific files and the Bash \
+tool to run read-only diagnostic commands (builds, tests, lint) when the \
+conversation calls for it.
+
+In each reply:
+- Explain what the diff changes and which behaviours to verify.
+- Surface which smoke-test bullets are highest-risk given the diff.
+- Suggest specific manual steps or automated checks (commands, test filters).
+- If a build or test command fails, help the developer diagnose the root cause.
+- Keep replies focused. The developer is validating live; long walls of \
+text slow the loop.
+
+Rules:
+- Do NOT run gh commands. The coordinator owns all GitHub interactions.
+- Do NOT run git push, git commit, or any command that writes to the repo.
+- Do NOT write or edit files.
+- Do NOT call coord sub-commands.
+- Do NOT decide the change is ready on the developer's behalf — they \
+record Pass/Fail via the TUI (P=pass / F=fail).\
+"""
+
 WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 
@@ -541,6 +570,13 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # via inject_message; the worker just asks clarifying questions.
         system_prompt = spec.system_prompt if spec.system_prompt else REFINEMENT_SYSTEM_PROMPT
         allowed_tools = "Read"
+    elif spec.type == "test-chat":
+        # #314 Phase B: test-stage chat for validating a completed work
+        # assignment.  Allows Read + Bash for read-only diagnostics (builds,
+        # tests, lint) but blocks write-side commands via deny_commands.
+        system_prompt = spec.system_prompt if spec.system_prompt else TEST_CHAT_SYSTEM_PROMPT
+        system_prompt += build_deny_prompt(spec.deny_commands)
+        allowed_tools = "Read,Bash"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
@@ -866,14 +902,14 @@ class AgentServer:
         )
         assignment.log_path = str(self.log_dir / f"{assignment.id}.log")
 
-        if spec.type in ("plan", "refinement"):
-            # Read-only run (plan or refinement chat) — skip worktree creation,
-            # run directly in the main repo checkout. No branch is created or
-            # modified. For refinement specifically (#315), the stable cwd is
-            # also required so claude-cli's `--resume <session_id>` finds the
-            # prior session file on subsequent turns: claude scopes sessions
-            # by cwd (mangled into ~/.claude/projects/<cwd-key>/), and a
-            # per-assignment worktree gives every turn a different cwd.
+        if spec.type in ("plan", "refinement", "test-chat"):
+            # Read-only run (plan, refinement, or test-chat) — skip worktree
+            # creation, run directly in the main repo checkout. No branch is
+            # created or modified. For chat sessions (#315 / #314), the stable
+            # cwd is also required so claude-cli's `--resume <session_id>`
+            # finds the prior session file on subsequent turns: claude scopes
+            # sessions by cwd (mangled into ~/.claude/projects/<cwd-key>/),
+            # and a per-assignment worktree gives every turn a different cwd.
             with self._lock:
                 self._assignments[assignment.id] = assignment
             self._persist()
