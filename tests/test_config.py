@@ -192,6 +192,69 @@ def test_repo_housekeeping_invalid_element(tmp_path: Path) -> None:
         load(p)
 
 
+# ── artifact_paths (#305) ──────────────────────────────────────────────────
+
+
+def test_artifact_paths_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    artifact_paths:\n"
+        "      - target/debug/examples/gui_*\n"
+        "      - target/debug/mybin\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").artifact_paths == [
+        "target/debug/examples/gui_*",
+        "target/debug/mybin",
+    ]
+
+
+def test_artifact_paths_default_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").artifact_paths == []
+
+
+def test_artifact_paths_not_a_list(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    artifact_paths: target/debug/mybin\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="artifact_paths must be a list"):
+        load(p)
+
+
+def test_artifact_paths_non_string_element(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    artifact_paths:\n"
+        "      - 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="artifact_paths\\[0\\] must be a string"):
+        load(p)
+
+
 # ── PipelineConfig helpers ──────────────────────────────────────────────────
 
 

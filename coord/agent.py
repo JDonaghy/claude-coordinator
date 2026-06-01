@@ -320,6 +320,17 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len].rstrip("-")
 
 
+def _sanitize_branch(branch: str) -> str:
+    """Sanitize a git branch name for use as a filesystem / URL path component.
+
+    Replaces any character that isn't alphanumeric, ``-``, ``_``, or ``.``
+    with a dash.  This converts slashes (``feature/my-thing`` →
+    ``feature-my-thing``) and any other URL-unsafe characters.  The result
+    is safe to use as a single path segment (no embedded ``/``).
+    """
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", branch).strip("-")
+
+
 @dataclass
 class AgentAssignment:
     """Server-side record. Carries the spec plus runtime metadata."""
@@ -686,11 +697,15 @@ class AgentServer:
         repo_paths: dict[str, str] | None = None,
         bash_wrap_spawn: bool = True,
         first_output_timeout: float = _FIRST_OUTPUT_TIMEOUT,
+        # #305: per-repo artifact glob patterns; repo_name → list of globs.
+        # Populated from coordinator.yml Repo.artifact_paths at startup.
+        artifact_paths: dict[str, list[str]] | None = None,
     ) -> None:
         self.machine_name = machine_name
         self.capabilities = list(capabilities)
         self.repos = list(repos)
         self.repo_paths = dict(repo_paths or {})
+        self.artifact_paths: dict[str, list[str]] = dict(artifact_paths or {})
         self.state_dir = Path(state_dir)
         self.log_dir = self.state_dir / "logs"
         self.state_path = self.state_dir / "agent_state.json"
@@ -713,6 +728,11 @@ class AgentServer:
         # so polling clients don't pin the agent in an rglob.
         self._worktree_bytes_cache: tuple[float, int] | None = None  # (computed_at, bytes)
         self._worktree_bytes_ttl: float = 30.0  # seconds
+        # #305: cache for /health artifact_bytes — artifact dirs are smaller
+        # than worktrees but still warrant a short TTL to avoid hammering
+        # the filesystem on every health poll.
+        self._artifact_bytes_cache: tuple[float, int] | None = None  # (computed_at, bytes)
+        self._artifact_bytes_ttl: float = 30.0  # seconds
 
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -729,6 +749,7 @@ class AgentServer:
                 if a.status in (DONE, FAILED, CANCELLED)
             )
         worktree_bytes = self._cached_worktree_bytes()
+        artifact_bytes = self._cached_artifact_bytes()
         return {
             "machine": self.machine_name,
             "capabilities": self.capabilities,
@@ -742,6 +763,8 @@ class AgentServer:
             "agent_started_at": _PROCESS_STARTED_AT,
             # Total disk usage of all git worktrees managed by this agent.
             "worktree_bytes": worktree_bytes,
+            # #305: total disk usage of all stashed artifact directories.
+            "artifact_bytes": artifact_bytes,
         }
 
     def _cached_worktree_bytes(self) -> int:
@@ -763,6 +786,175 @@ class AgentServer:
         # Single-writer assignment is atomic in CPython; no lock needed.
         self._worktree_bytes_cache = (now, size)
         return size
+
+    def _cached_artifact_bytes(self) -> int:
+        """Return total artifact disk usage with a short TTL cache.
+
+        Mirrors :meth:`_cached_worktree_bytes` — keeps /health polling
+        cheap even when artifacts accumulate many small files.
+        """
+        artifacts_base = self.state_dir / "artifacts"
+        now = time.time()
+        cached = self._artifact_bytes_cache
+        if cached is not None and (now - cached[0]) < self._artifact_bytes_ttl:
+            return cached[1]
+        size = _dir_size(artifacts_base)
+        self._artifact_bytes_cache = (now, size)
+        return size
+
+    def _stash_artifacts(self, assignment: AgentAssignment) -> None:
+        """Copy build artifacts from a worktree into the persistent stash.
+
+        Called immediately before worktree removal so the compiled outputs
+        survive the cleanup.  Only acts on DONE assignments (successful
+        workers) with a recorded branch and at least one configured glob
+        pattern for the repo.
+
+        The stash is at ``~/.coord/artifacts/<repo>/<sanitized_branch>/``.
+        A ``.assignment_id`` marker is written so the manifest endpoint can
+        report which assignment produced the stash.  Existing stash contents
+        for the same (repo, branch) pair are overwritten — latest-wins.
+        """
+        if assignment.status != DONE:
+            return
+        if not assignment.worktree_path:
+            return
+        repo_name = assignment.spec.repo_name
+        patterns = self.artifact_paths.get(repo_name, [])
+        if not patterns:
+            return
+        branch = assignment.branch or assignment.spec.branch
+        if not branch:
+            return
+
+        sanitized = _sanitize_branch(branch)
+        stash_dir = self.state_dir / "artifacts" / repo_name / sanitized
+        stash_dir.mkdir(parents=True, exist_ok=True)
+
+        wt_path = Path(assignment.worktree_path)
+        if not wt_path.exists():
+            return
+
+        copied = 0
+        for pattern in patterns:
+            try:
+                matches = list(wt_path.glob(pattern))
+            except (ValueError, OSError):
+                continue
+            for src in matches:
+                if not src.is_file():
+                    continue
+                # Skip by suffix (.d = compiler dependency files)
+                if src.suffix == ".d":
+                    continue
+                try:
+                    st = src.stat()
+                except OSError:
+                    continue
+                # Skip tiny files (< 100 bytes — not a real binary)
+                if st.st_size < 100:
+                    continue
+                dst = stash_dir / src.name
+                try:
+                    shutil.copy2(src, dst)
+                    copied += 1
+                except (OSError, shutil.Error):
+                    pass
+
+        # Write the assignment_id marker so the manifest endpoint can surface
+        # which build produced this stash without iterating all assignments.
+        try:
+            (stash_dir / ".assignment_id").write_text(assignment.id)
+        except OSError:
+            pass
+
+        # Invalidate the artifact_bytes cache so health() picks up the new files.
+        self._artifact_bytes_cache = None
+
+        if assignment.log_path:
+            _append_log_line(
+                assignment.log_path,
+                f"# stash: {copied} artifact(s) → {stash_dir}\n",
+            )
+
+    def _gc_artifacts(self, ttl_days: float = 3.0) -> int:
+        """Remove artifact stash directories older than *ttl_days* days.
+
+        Uses the stash directory's ``mtime`` as the age proxy — each
+        successful ``_stash_artifacts`` call updates mtime via
+        ``shutil.copy2``, so the TTL is effectively a "last-written" window.
+
+        Returns the count of directories removed.
+        """
+        artifacts_base = self.state_dir / "artifacts"
+        if not artifacts_base.exists():
+            return 0
+
+        cutoff = time.time() - ttl_days * 86400
+        removed = 0
+
+        try:
+            repo_dirs = list(artifacts_base.iterdir())
+        except OSError:
+            return 0
+
+        for repo_dir in repo_dirs:
+            if not repo_dir.is_dir():
+                continue
+            try:
+                branch_dirs = list(repo_dir.iterdir())
+            except OSError:
+                continue
+            for branch_dir in branch_dirs:
+                if not branch_dir.is_dir():
+                    continue
+                try:
+                    mtime = branch_dir.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime < cutoff:
+                    try:
+                        shutil.rmtree(branch_dir, ignore_errors=True)
+                        removed += 1
+                    except OSError:
+                        pass
+
+        if removed:
+            # Invalidate the artifact_bytes cache after GC.
+            self._artifact_bytes_cache = None
+
+        return removed
+
+    def artifact_manifest(self, repo: str, branch: str) -> dict | None:
+        """Return the artifact manifest for a stash, or ``None`` if missing.
+
+        *branch* must already be sanitized (i.e. the path component form,
+        no slashes).  Returns a dict with keys ``files``, ``total_bytes``,
+        and ``built_by_assignment_id``, or ``None`` when no stash exists.
+        """
+        stash_dir = self.state_dir / "artifacts" / repo / branch
+        if not stash_dir.exists():
+            return None
+
+        files = []
+        for f in sorted(stash_dir.iterdir()):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            try:
+                st = f.stat()
+                files.append({"name": f.name, "size": st.st_size, "mtime": st.st_mtime})
+            except OSError:
+                pass
+
+        aid_path = stash_dir / ".assignment_id"
+        built_by: str | None = None
+        try:
+            built_by = aid_path.read_text().strip()
+        except OSError:
+            pass
+
+        total_bytes = sum(item["size"] for item in files)
+        return {"files": files, "total_bytes": total_bytes, "built_by_assignment_id": built_by}
 
     def clean_worktrees(self, *, recent_secs: float = 300.0) -> dict:
         """Remove git worktrees for assignments in terminal states.
@@ -833,6 +1025,13 @@ class AgentServer:
             # Compute size before removal so the caller knows bytes freed.
             dir_size = _dir_size(entry)
 
+            # #305: stash any configured artifacts before removing the
+            # worktree.  Idempotent — if the reap thread already stashed
+            # these files, _stash_artifacts is a no-op (the worktree won't
+            # exist or the stash dir is simply overwritten).
+            if a is not None:
+                self._stash_artifacts(a)
+
             # Try a proper git worktree remove first (updates the main
             # repo's worktree bookkeeping).  Fall back to brute-force rmtree
             # if git isn't available or the main repo has moved.
@@ -859,6 +1058,10 @@ class AgentServer:
                 cleaned += 1
             else:
                 kept += 1
+
+        # #305: GC old artifact stashes in the same pass so callers don't
+        # need a separate endpoint.  Default TTL is 3 days.
+        self._gc_artifacts()
 
         return {"cleaned": cleaned, "kept": kept, "bytes_freed": bytes_freed}
 
@@ -1477,6 +1680,12 @@ class AgentServer:
                 reopen.write(f"# reap: done (exit_code={exit_code} status={final_status})\n")
         except (OSError, AttributeError):
             pass
+
+        # #305: stash artifacts BEFORE removing the worktree so the compiled
+        # outputs survive cleanup.  Only runs for DONE assignments (workers
+        # that exited cleanly) with configured artifact_paths for this repo.
+        if assignment is not None:
+            self._stash_artifacts(assignment)
 
         # Clean up worktree AFTER updating status
         if assignment is not None:

@@ -15,6 +15,13 @@ repos:
     default_branch: main
     build_command: "cargo build --features tui --features gtk"
     test_command: "cargo test --features tui"
+    # #305: stash compiled binaries before the worktree is removed so
+    # `coord pull-artifact` can rsync them to the coordinator machine
+    # for manual smoke testing without a local rebuild.
+    artifact_paths:
+      - target/debug/examples/tui_*
+      - target/debug/examples/gtk_*
+      - target/debug/coord-tui
 
   - name: claude-coordinator
     github: JDonaghy/claude-coordinator
@@ -28,6 +35,7 @@ repos:
     build_command: "~/.coord-venv/bin/pip install -e ."
     # test_command omitted: pytest isn't installed in ~/.coord-venv
     # (runtime-only) and the human Test gate (#200) handles verification.
+    # artifact_paths: []  # no compiled binaries to stash for a Python package
 
 machines:
   # Desktop A — Dell Precision, full GTK builds

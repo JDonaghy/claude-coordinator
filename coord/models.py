@@ -65,6 +65,12 @@ class Repo:
     # an inline markdown string OR a file path relative to the repo root
     # (e.g. `docs/ISSUE_GUIDANCE.md`). See `resolve_new_issue_guidance`.
     new_issue_guidance: str | None = None
+    # #305: glob patterns (relative to the worktree root) for build artifacts
+    # to stash before the worktree is removed.  Matches are copied to
+    # ~/.coord/artifacts/<repo>/<branch>/ on the agent with latest-wins
+    # semantics per (repo, branch) pair.  Files under 100 bytes or ending
+    # in `.d` are excluded (dependency files, not binaries).
+    artifact_paths: list[str] = field(default_factory=list)
 
     def resolve_new_issue_guidance(self, repo_path: Path) -> str:
         """Return the new-issue guidance string for this repo.

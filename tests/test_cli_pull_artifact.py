@@ -1,0 +1,252 @@
+"""Tests for `coord pull-artifact` CLI command (#305)."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from click.testing import CliRunner
+
+from coord.cli import main
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _write_config(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: myrepo\n"
+        "    github: acme/myrepo\n"
+        "    artifact_paths:\n"
+        "      - target/debug/mybinary\n"
+        "machines:\n"
+        "  - name: builder\n"
+        "    host: builder.tailnet\n"
+        "    capabilities: [rust]\n"
+        "    repos: [myrepo]\n"
+    )
+    return p
+
+
+def _insert_assignment(
+    coord_db,
+    *,
+    assignment_id: str = "asgn-abc123",
+    machine_name: str = "builder",
+    repo_name: str = "myrepo",
+    branch: str | None = "issue-42-my-feature",
+    issue_number: int = 42,
+    issue_title: str = "my feature",
+    status: str = "done",
+) -> None:
+    coord_db.execute(
+        """INSERT INTO assignments
+           (assignment_id, machine_name, repo_name, issue_number, issue_title,
+            status, type, branch)
+           VALUES (?, ?, ?, ?, ?, ?, 'work', ?)""",
+        (assignment_id, machine_name, repo_name, issue_number, issue_title,
+         status, branch),
+    )
+    coord_db.commit()
+
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+
+
+def test_pull_artifact_not_found_in_db(tmp_path: Path, coord_db) -> None:
+    """Non-existent assignment_id should produce a clear error."""
+    cfg = _write_config(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["pull-artifact", "notanid", "--config", str(cfg)],
+    )
+    assert result.exit_code != 0
+    assert "not found" in (result.output + (result.exception and "" or "")).lower() or \
+           result.exit_code == 1
+
+
+def test_pull_artifact_machine_not_in_config(tmp_path: Path, coord_db) -> None:
+    """Assignment on an unknown machine should error."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db, assignment_id="asgn-1", machine_name="ghost-machine")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["pull-artifact", "asgn-1", "--config", str(cfg)],
+    )
+    assert result.exit_code != 0
+
+
+def test_pull_artifact_404_from_agent(tmp_path: Path, coord_db) -> None:
+    """HTTP 404 from agent manifest endpoint → clear 'stash gone' message."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    mock_resp.text = "not found"
+
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp):
+        result = runner.invoke(
+            main,
+            ["pull-artifact", "asgn-abc123", "--config", str(cfg)],
+        )
+
+    assert result.exit_code != 0
+    output = result.output
+    assert "no artifacts" in output.lower() or "gc" in output.lower() or \
+           "not found" in output.lower() or "stash" in output.lower()
+
+
+def test_pull_artifact_agent_unreachable(tmp_path: Path, coord_db) -> None:
+    """Network error reaching agent should exit non-zero with message."""
+    import httpx
+
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    runner = CliRunner()
+    with patch("httpx.get", side_effect=httpx.ConnectError("connection refused")):
+        result = runner.invoke(
+            main,
+            ["pull-artifact", "asgn-abc123", "--config", str(cfg)],
+        )
+
+    assert result.exit_code != 0
+    assert "could not reach" in result.output.lower() or \
+           "error" in result.output.lower()
+
+
+def test_pull_artifact_success_rsync(tmp_path: Path, coord_db) -> None:
+    """Happy path: manifest returns files, rsync succeeds → 0 exit, path printed."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    manifest_payload = {
+        "files": [{"name": "mybinary", "size": 204800, "mtime": 1700000000.0}],
+        "total_bytes": 204800,
+        "built_by_assignment_id": "asgn-abc123",
+    }
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = manifest_payload
+
+    dest = tmp_path / "out"
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp), \
+         patch("subprocess.run", return_value=mock_proc) as mock_run:
+        result = runner.invoke(
+            main,
+            ["pull-artifact", "asgn-abc123", "--into", str(dest), "--config", str(cfg)],
+        )
+
+    assert result.exit_code == 0, result.output
+    # rsync should have been called
+    mock_run.assert_called_once()
+    rsync_cmd = mock_run.call_args[0][0]
+    assert rsync_cmd[0] == "rsync"
+    assert "-az" in rsync_cmd
+    # Path should be printed
+    assert str(dest) in result.output
+
+
+def test_pull_artifact_rsync_failure(tmp_path: Path, coord_db) -> None:
+    """When rsync fails, exit non-zero with clear message."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    manifest_payload = {
+        "files": [{"name": "mybinary", "size": 204800, "mtime": 1700000000.0}],
+        "total_bytes": 204800,
+        "built_by_assignment_id": "asgn-abc123",
+    }
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = manifest_payload
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 23  # rsync partial failure
+
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp), \
+         patch("subprocess.run", return_value=mock_proc):
+        result = runner.invoke(
+            main,
+            ["pull-artifact", "asgn-abc123", "--into", str(tmp_path / "out"),
+             "--config", str(cfg)],
+        )
+
+    assert result.exit_code != 0
+    assert "rsync" in result.output.lower() or "error" in result.output.lower()
+
+
+def test_pull_artifact_uses_sanitized_branch_in_url(tmp_path: Path, coord_db) -> None:
+    """Slashes in branch names should be sanitized in the URL."""
+    cfg = _write_config(tmp_path)
+    # Branch name with a slash
+    _insert_assignment(coord_db, branch="feature/cool-thing")
+
+    captured_url: list[str] = []
+
+    def fake_get(url: str, **kwargs):
+        captured_url.append(url)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.text = "not found"
+        return mock_resp
+
+    runner = CliRunner()
+    with patch("httpx.get", side_effect=fake_get):
+        runner.invoke(
+            main,
+            ["pull-artifact", "asgn-abc123", "--config", str(cfg)],
+        )
+
+    assert captured_url, "httpx.get was never called"
+    url = captured_url[0]
+    # Slash should have been replaced with dash
+    assert "/artifact/myrepo/feature-cool-thing" in url
+
+
+def test_pull_artifact_branch_fallback_when_db_null(tmp_path: Path, coord_db) -> None:
+    """When DB branch is NULL, CLI should compute it from issue_number+title."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(
+        coord_db,
+        branch=None,  # branch not yet recorded
+        issue_number=99,
+        issue_title="do the thing",
+    )
+
+    captured_url: list[str] = []
+
+    def fake_get(url: str, **kwargs):
+        captured_url.append(url)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.text = "not found"
+        return mock_resp
+
+    runner = CliRunner()
+    with patch("httpx.get", side_effect=fake_get):
+        runner.invoke(
+            main,
+            ["pull-artifact", "asgn-abc123", "--config", str(cfg)],
+        )
+
+    assert captured_url, "httpx.get was never called"
+    url = captured_url[0]
+    # Should derive branch as issue-99-do-the-thing (slugified)
+    assert "/artifact/myrepo/issue-99-do-the-thing" in url
