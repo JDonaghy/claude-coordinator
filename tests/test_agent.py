@@ -778,6 +778,104 @@ def test_stash_artifacts_noop_when_no_patterns(tmp_path: Path) -> None:
     assert not stash_base.exists(), "no stash dir should be created when no patterns"
 
 
+def test_stash_artifacts_prefers_spec_over_server_config(tmp_path: Path) -> None:
+    """_stash_artifacts should prefer spec's artifact_paths over server
+    self.artifact_paths (the local-dev config fallback).  #305."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = state_dir / "worktrees" / "asgn-spec-override"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    # Server has self.artifact_paths configured (local-dev case)
+    server = AgentServer(
+        machine_name="test",
+        repos=["api"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"api": str(tmp_path / "repo")},
+        artifact_paths={"api": ["old_pattern/*.txt"]},  # Server's fallback config
+    )
+
+    # But the spec has its own artifact_paths (from coordinator dispatch)
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        branch="main",
+        artifact_paths=["new_pattern/*.bin"],  # Spec overrides server config
+    )
+    a = AgentAssignment(id="asgn-spec-override", spec=spec, status=DONE, branch="issue-1-t")
+    a.worktree_path = str(wt_path)
+
+    # Create a file that matches the SPEC's pattern (not server's pattern)
+    target_dir = wt_path / "new_pattern"
+    target_dir.mkdir(parents=True)
+    bin_file = target_dir / "test.bin"
+    bin_file.write_bytes(b"\x00" * 200)
+
+    server._stash_artifacts(a)
+
+    # Should copy the file matched by spec's pattern
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-1-t"
+    assert (stash_dir / "test.bin").exists(), (
+        "spec's artifact_paths should be used, not server's self.artifact_paths"
+    )
+
+
+def test_stash_artifacts_falls_back_to_server_config_when_spec_empty(
+    tmp_path: Path,
+) -> None:
+    """_stash_artifacts should fall back to server self.artifact_paths when
+    spec's artifact_paths is empty.  #305: local-dev backward compat."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = state_dir / "worktrees" / "asgn-fallback"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    # Server has self.artifact_paths configured
+    server = AgentServer(
+        machine_name="test",
+        repos=["api"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"api": str(tmp_path / "repo")},
+        artifact_paths={"api": ["fallback_pattern/*.txt"]},
+    )
+
+    # Spec has empty artifact_paths (old dispatch or local-dev)
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=2,
+        issue_title="t2",
+        briefing="b",
+        branch="main",
+        artifact_paths=[],  # Empty: should fall back to server config
+    )
+    a = AgentAssignment(id="asgn-fallback", spec=spec, status=DONE, branch="issue-2-t2")
+    a.worktree_path = str(wt_path)
+
+    # Create a file that matches the SERVER's fallback pattern
+    fallback_dir = wt_path / "fallback_pattern"
+    fallback_dir.mkdir(parents=True)
+    txt_file = fallback_dir / "data.txt"
+    txt_file.write_bytes(b"x" * 200)
+
+    server._stash_artifacts(a)
+
+    # Should copy the file matched by server's fallback pattern
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-2-t2"
+    assert (stash_dir / "data.txt").exists(), (
+        "should fall back to server's self.artifact_paths when spec is empty"
+    )
+
+
 def test_gc_artifacts_removes_old_directories(tmp_path: Path) -> None:
     """_gc_artifacts should remove stash dirs older than ttl_days."""
     import os

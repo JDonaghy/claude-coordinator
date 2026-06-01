@@ -68,6 +68,12 @@ def dispatch(
     # branches.
     default_branch = (repo.default_branch if repo is not None else None) or "main"
 
+    # #305: artifact_paths are only relevant for work assignments.  Skip for
+    # review, smoke, refinement, and other non-work types.
+    artifact_paths: list[str] = []
+    if proposal.type == "work" and repo is not None:
+        artifact_paths = list(repo.artifact_paths)
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
         "repo_name": proposal.repo_name,
@@ -82,6 +88,7 @@ def dispatch(
         "model": wire_model,
         "type": proposal.type,
         "branch": default_branch,
+        "artifact_paths": artifact_paths,
     }
     # Only send fresh_branch when True — older agents don't have this field
     # and will reject the payload with a 400.

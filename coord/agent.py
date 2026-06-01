@@ -265,6 +265,7 @@ class AssignmentSpec:
     files_forbidden: list[str] = field(default_factory=list)
     branch: str | None = None
     pull_repos: list[str] = field(default_factory=list)
+    artifact_paths: list[str] = field(default_factory=list)
     # "work" (default) or "review". The agent treats both the same — what
     # differs is the briefing and (for reviewers) the system prompt.
     type: str = "work"
@@ -820,7 +821,7 @@ class AgentServer:
         if not assignment.worktree_path:
             return
         repo_name = assignment.spec.repo_name
-        patterns = self.artifact_paths.get(repo_name, [])
+        patterns = assignment.spec.artifact_paths or self.artifact_paths.get(repo_name, [])
         if not patterns:
             return
         branch = assignment.branch or assignment.spec.branch
