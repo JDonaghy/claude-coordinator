@@ -8161,12 +8161,14 @@ impl CoordApp {
                     is_active: self.board_detail_tab == BoardDetailTab::Board,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     label: " Issue ".to_string(),
                     is_active: self.board_detail_tab == BoardDetailTab::Issue,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     // #316: dot indicator when a board chat is live so the
@@ -8179,6 +8181,7 @@ impl CoordApp {
                     is_active: self.board_detail_tab == BoardDetailTab::Chat,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
             ],
             scroll_offset: 0,
@@ -8304,24 +8307,28 @@ impl CoordApp {
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Pipeline,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     label: " Issue ".to_string(),
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Issue,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     label: " Stages ".to_string(),
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Stages,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     label: " Log ".to_string(),
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Log,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     // #264: an indicator dot when a refinement worker is
@@ -8335,6 +8342,7 @@ impl CoordApp {
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Refinement,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
             ],
             scroll_offset: 0,
