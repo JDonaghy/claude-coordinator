@@ -685,6 +685,53 @@ def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     conn.commit()
 
 
+def set_test_plan(assignment_id: str, plan: dict) -> None:
+    """#342 Phase A: persist a generated smoke-test plan on the assignment row.
+
+    ``plan`` must be a valid plan dict (keys ``steps`` and ``blockers``).
+    Stored as JSON-encoded TEXT in the ``test_plan`` column.  Silently
+    no-ops when the row doesn't exist — matches the pattern used by the
+    other ``update_assignment_*`` helpers.
+
+    Idempotent: calling again with a new plan overwrites the previous value.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET test_plan=? WHERE assignment_id=?",
+        (json.dumps(plan), assignment_id),
+    )
+    conn.commit()
+
+
+def get_test_plan(assignment_id: str) -> dict | None:
+    """#342 Phase A: read back the cached smoke-test plan for an assignment.
+
+    Returns ``None`` when the row doesn't exist, the column is NULL
+    (plan not yet generated), or the stored JSON is malformed.
+    """
+    if not assignment_id:
+        return None
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT test_plan FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row["test_plan"] if hasattr(row, "keys") else row[0]
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
 def mark_review_posted(assignment_id: str) -> None:
     """Record that this review assignment's findings have been successfully posted.
 
