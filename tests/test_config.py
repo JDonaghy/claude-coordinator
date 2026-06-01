@@ -406,6 +406,59 @@ def test_resolve_guidance_txt_extension_treated_as_path(tmp_path: Path) -> None:
     assert result == "Plain text guidance"
 
 
+def test_resolve_guidance_rejects_absolute_path(tmp_path: Path) -> None:
+    """#316: an absolute path like `/etc/passwd.md` must not escape `repo_path`.
+
+    `Path("/repo") / "/etc/passwd.md"` silently discards the base, so the
+    repo-root confinement has to be enforced separately from the relative
+    `../` check.  We expect the value to fall through to the inline branch
+    rather than reading the absolute file.
+    """
+    from coord.models import Repo, _GUIDANCE_PATH_RE
+
+    # Regex-level: absolute paths must not match the path-shaped pattern.
+    assert not _GUIDANCE_PATH_RE.match("/etc/passwd.md")
+    assert not _GUIDANCE_PATH_RE.match("/home/user/file.md")
+    assert not _GUIDANCE_PATH_RE.match("\\windows\\system32\\config.md")
+
+    # Behaviour: even if a future regex regression let the value through, the
+    # `Path.resolve()` containment check inside `resolve_new_issue_guidance`
+    # still prevents reading the absolute file.  Verify the public method
+    # returns the value verbatim (inline-text path) rather than file contents.
+    repo = Repo(name="r", github="o/r", new_issue_guidance="/etc/hostname.md")
+    result = repo.resolve_new_issue_guidance(tmp_path)
+    assert result == "/etc/hostname.md"
+
+
+def test_resolve_guidance_rejects_symlink_escape(tmp_path: Path) -> None:
+    """#316: a symlink under `repo_path` pointing outside must not be read.
+
+    The `Path.resolve()` + `relative_to(base)` check inside
+    `resolve_new_issue_guidance` catches symlink escapes that the regex alone
+    cannot see.
+    """
+    from coord.models import Repo
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "SECRET.md"
+    secret.write_text("top secret", encoding="utf-8")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    link = repo_root / "leak.md"
+    try:
+        link.symlink_to(secret)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported on this platform")
+
+    repo = Repo(name="r", github="o/r", new_issue_guidance="leak.md")
+    result = repo.resolve_new_issue_guidance(repo_root)
+    # Symlink resolves outside repo_root — treated as inline, NOT read.
+    assert "top secret" not in result
+    assert result == "leak.md"
+
+
 def test_new_issue_guidance_loaded_from_config(tmp_path: Path) -> None:
     """new_issue_guidance is parsed from coordinator.yml and stored on Repo."""
     p = tmp_path / "coordinator.yml"

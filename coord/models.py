@@ -9,10 +9,15 @@ from pathlib import Path
 # #316: pattern that distinguishes a file-path value for `new_issue_guidance`
 # from inline markdown text.  Matches paths like `docs/ISSUE_GUIDANCE.md` or
 # `GUIDANCE.txt` but not multi-line or space-containing strings.
-# The negative lookahead rejects traversal sequences (`../`) so a misconfigured
-# value like `../../../etc/passwd.md` cannot escape the repo root.
+#
+# The negative lookaheads reject (a) traversal sequences (`../`) and (b) any
+# value starting with `/` or `\` (an absolute path).  Both protections matter
+# because `Path("/repo") / "/etc/passwd.md"` silently discards the base and
+# returns `Path("/etc/passwd.md")`, so absolute paths would otherwise escape
+# the repo root just as effectively as `../`.  `resolve_new_issue_guidance`
+# adds a second belt-and-braces check via `Path.resolve()` containment.
 _GUIDANCE_PATH_RE: re.Pattern[str] = re.compile(
-    r"^(?!.*\.\.[/\\])[\w./\-]+\.(md|txt)$", re.IGNORECASE
+    r"^(?![/\\])(?!.*\.\.[/\\])[\w./\-]+\.(md|txt)$", re.IGNORECASE
 )
 
 
@@ -85,7 +90,23 @@ class Repo:
             return _DEFAULT
         value = self.new_issue_guidance.strip()
         if _GUIDANCE_PATH_RE.match(value):
-            candidate = repo_path / value
+            # Belt-and-braces against an escape from `repo_path`: resolve the
+            # candidate and the base, then confirm the candidate stays under
+            # the base.  This guards against any future regex regression as
+            # well as edge cases like symlinks pointing outside the tree.
+            try:
+                base = repo_path.resolve()
+                candidate = (repo_path / value).resolve()
+            except (OSError, RuntimeError):
+                # Resolution failure (e.g. permission denied, symlink loop) —
+                # treat as inline so we never silently read a surprising file.
+                return value
+            try:
+                candidate.relative_to(base)
+            except ValueError:
+                # Path escapes the repo root — treat as inline rather than
+                # reading a file outside the trusted tree.
+                return value
             try:
                 return candidate.read_text(encoding="utf-8", errors="replace")
             except (OSError, FileNotFoundError):

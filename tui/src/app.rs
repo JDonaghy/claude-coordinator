@@ -561,6 +561,11 @@ struct PendingBoardChat {
 
 /// #316 Phase B: state for the file-issue finaliser modal.
 /// Shown when the user confirms filing a new issue drafted by a new-issue-chat.
+///
+/// **Current scope: preview-only.**  The modal renders the parsed title + body
+/// for confirmation but does not yet accept edits — Ctrl+Y files via
+/// `gh issue create`, Esc cancels.  Inline editing is tracked separately and
+/// will reuse the existing notes-modal text-edit primitives when wired up.
 #[derive(Clone)]
 struct FileIssueModal {
     /// Parsed title from the `TITLE: …` line in the chat transcript.
@@ -569,8 +574,6 @@ struct FileIssueModal {
     body: String,
     /// GitHub `owner/name` slug for `--repo`.
     repo_github: String,
-    /// Whether the title field is being edited (vs the body field).
-    editing_title: bool,
     /// True while `gh issue create` is in flight.
     submitting: bool,
 }
@@ -12079,7 +12082,6 @@ impl CoordApp {
             title,
             body,
             repo_github,
-            editing_title: false,
             submitting: false,
         });
     }
@@ -12098,7 +12100,6 @@ impl CoordApp {
         let title = modal.title.clone();
         let body = modal.body.clone();
         let repo_github = modal.repo_github.clone();
-        let config_path = self.command_runner.config_path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.file_issue_post_rx = Some(rx);
 
@@ -12109,10 +12110,6 @@ impl CoordApp {
                 "--title", &title,
                 "--body", &body,
             ]);
-            if let Some(cp) = config_path {
-                // Carry the env for `gh` auth consistency.
-                let _ = cp; // gh doesn't need coord config; just informational
-            }
             match cmd.output() {
                 Ok(out) => {
                     let success = out.status.success();
@@ -12213,8 +12210,7 @@ impl CoordApp {
         items.push(kv_item("", "", None));
         items.push(kv_item("", &format!("  Repo: {}", modal.repo_github), Some(Color::rgb(140, 180, 140))));
         items.push(kv_item("", "", None));
-        let title_label = if modal.editing_title { "  TITLE (editing) ▸" } else { "  TITLE ▸" };
-        items.push(kv_item("", title_label, Some(Color::rgb(200, 200, 100))));
+        items.push(kv_item("", "  TITLE ▸", Some(Color::rgb(200, 200, 100))));
         items.push(kv_item("", &format!("  {}", modal.title), None));
         items.push(kv_item("", "", None));
         items.push(kv_item("", "  BODY ▸", Some(Color::rgb(200, 200, 100))));
