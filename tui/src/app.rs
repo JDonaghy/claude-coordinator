@@ -743,6 +743,124 @@ fn spawn_machine_health(host: &str, port: u16) -> std::sync::mpsc::Receiver<Resu
     rx
 }
 
+// ─── #336: Artifact manifest types ──────────────────────────────────────────
+
+/// One file entry from the agent's `/artifact/<repo>/<branch>` manifest.
+/// Fields are parsed from JSON for completeness; the current UI uses only
+/// the count and `ArtifactManifest::total_bytes` for the badge line.
+#[derive(Clone)]
+struct ArtifactFile {
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    size: u64,
+}
+
+/// Parsed manifest returned by `GET /artifact/<repo>/<branch>` on an agent.
+#[derive(Clone)]
+struct ArtifactManifest {
+    files: Vec<ArtifactFile>,
+    total_bytes: u64,
+    /// The assignment that produced this stash (may differ from the current
+    /// work assignment when the branch was rebuilt on a later push).
+    built_by_assignment_id: Option<String>,
+}
+
+/// A cached manifest entry with a fetch timestamp for 30-second TTL eviction.
+struct ArtifactCacheEntry {
+    fetched_at: Instant,
+    /// `None` = 404 response (no stash for this branch on the agent).
+    manifest: Option<ArtifactManifest>,
+}
+
+/// #336: Sanitize a git branch name for use as a URL path component.
+///
+/// Mirrors Python's `coord.agent._sanitize_branch`: replaces runs of
+/// characters that are not alphanumeric, `.`, `_`, or `-` with a single dash,
+/// then strips any leading/trailing dashes from the result.
+fn sanitize_branch(branch: &str) -> String {
+    let mut result = String::with_capacity(branch.len());
+    let mut in_run = false;
+    for c in branch.chars() {
+        if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' {
+            in_run = false;
+            result.push(c);
+        } else if !in_run {
+            result.push('-');
+            in_run = true;
+        }
+    }
+    result.trim_matches('-').to_string()
+}
+
+/// #336: Spawn a background thread that queries `GET /artifact/<repo>/<branch>`
+/// on a remote agent.  Returns a channel that delivers:
+/// - `Ok(Some(manifest))` — 200 with at least one file
+/// - `Ok(None)` — 404 (no stash for this branch) or 200 with empty files
+/// - `Err(msg)` — network / JSON error
+fn spawn_artifact_fetch(
+    host: &str,
+    repo: &str,
+    branch: &str,
+) -> std::sync::mpsc::Receiver<Result<Option<ArtifactManifest>, String>> {
+    let url = format!("http://{}:7433/artifact/{}/{}", host, repo, branch);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
+            .build();
+        let result = match agent.get(&url).call() {
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(e.to_string()),
+            Ok(resp) => match resp.into_string() {
+                Err(e) => Err(e.to_string()),
+                Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                    Err(e) => Err(format!("json: {e}")),
+                    Ok(v) => {
+                        let files: Vec<ArtifactFile> = v
+                            .get("files")
+                            .and_then(|f| f.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|item| {
+                                        let name =
+                                            item.get("name")?.as_str()?.to_string();
+                                        let size = item
+                                            .get("size")
+                                            .and_then(|s| s.as_u64())
+                                            .unwrap_or(0);
+                                        Some(ArtifactFile { name, size })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let total_bytes = v
+                            .get("total_bytes")
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(0);
+                        let built_by_assignment_id = v
+                            .get("built_by_assignment_id")
+                            .and_then(|b| b.as_str())
+                            .map(|s| s.to_string());
+                        if files.is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(ArtifactManifest {
+                                files,
+                                total_bytes,
+                                built_by_assignment_id,
+                            }))
+                        }
+                    }
+                },
+            },
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
 /// #315: signal that `spawn_inject_post` sends to the main thread when
 /// the /inject POST returns HTTP 409 ("assignment is `done`") or 410
 /// (BrokenPipeError — worker stdin closed).  Both mean the worker exited
@@ -3468,6 +3586,18 @@ pub struct CoordApp {
     file_issue_modal: Option<FileIssueModal>,
     /// #316 Phase B: receiver for the background `gh issue create` thread.
     file_issue_post_rx: Option<std::sync::mpsc::Receiver<FileIssuePostResult>>,
+    /// #336: Cache of artifact manifests keyed by `(repo, sanitized_branch)`.
+    /// Entries have a 30-second TTL; stale entries trigger a background re-fetch.
+    artifact_cache: std::collections::HashMap<(String, String), ArtifactCacheEntry>,
+    /// #336: In-flight artifact manifest fetch.  `None` when idle.
+    artifact_fetch_rx: Option<(
+        (String, String),
+        std::sync::mpsc::Receiver<Result<Option<ArtifactManifest>, String>>,
+    )>,
+    /// #336: Tracks a pending `coord pull-artifact` dispatch.
+    /// Contains `(work_id, repo, sanitized_branch)` so we can show the
+    /// destination path in a completion toast.
+    pending_artifact_pull: Option<(String, String, String)>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -3642,6 +3772,9 @@ impl CoordApp {
             pending_board_chat: None,
             file_issue_modal: None,
             file_issue_post_rx: None,
+            artifact_cache: std::collections::HashMap::new(),
+            artifact_fetch_rx: None,
+            pending_artifact_pull: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -4963,12 +5096,35 @@ impl CoordApp {
                                 StyledSpan::plain(trunc(&g.issue_title, 20)),
                             ],
                         };
+                        // #336: Show the machine name as a muted badge on Completed
+                        // rows so the user can see at a glance which agent did the
+                        // work without opening the detail panel.
+                        let badge = if *key == "completed" {
+                            g.assignments
+                                .iter()
+                                .filter(|a| {
+                                    a.assignment_type.as_deref() != Some("refinement")
+                                })
+                                .max_by(|a, b| {
+                                    a.dispatched_at
+                                        .partial_cmp(&b.dispatched_at)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .map(|a| {
+                                    Badge::colored(
+                                        &a.machine,
+                                        Color::rgb(100, 150, 120),
+                                    )
+                                })
+                        } else {
+                            None
+                        };
                         rows.push(TreeRow {
                             path: vec![gi, issue_idx as u16],
                             indent: 2,
                             icon: None,
                             text,
-                            badge: None,
+                            badge,
                             is_expanded: None,
                             decoration: if g.status_summary == "failed" {
                                 Decoration::Error
@@ -6986,6 +7142,62 @@ impl CoordApp {
             && self.stage_status_for_internal_work(issue) == StageStatus::Done
     }
 
+    // ── #336 artifact helpers ────────────────────────────────────────────────
+
+    /// #336: Resolve the artifact fetch target for the currently-selected
+    /// pipeline issue.  Returns `(agent_host, repo, sanitized_branch, work_id)`
+    /// when a work assignment with a known branch + machine is found, or `None`.
+    fn artifact_fetch_target(&self) -> Option<(String, String, String, String)> {
+        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let work = self.assignments_for_stage(issue, "work");
+        let latest = work.iter().max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        let branch = latest.branch.as_ref()?;
+        let sanitized = sanitize_branch(branch);
+        let host = self
+            .data
+            .machines
+            .iter()
+            .find(|m| m.name == latest.machine)
+            .map(|m| m.host.clone())?;
+        if host.is_empty() {
+            return None;
+        }
+        Some((host, latest.repo.clone(), sanitized, latest.id.clone()))
+    }
+
+    /// #336: True when the selected pipeline issue has a non-empty artifact
+    /// manifest in the 30-second TTL cache — i.e. the artifact badge is
+    /// currently rendered and the `a` keybind should be live.
+    fn artifact_badge_visible(&self) -> bool {
+        let issue = match self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) {
+            Some(i) => i,
+            None => return false,
+        };
+        let work = self.assignments_for_stage(issue, "work");
+        let latest = match work.iter().max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            Some(a) => a,
+            None => return false,
+        };
+        let branch = match &latest.branch {
+            Some(b) => b,
+            None => return false,
+        };
+        let key = (latest.repo.clone(), sanitize_branch(branch));
+        self.artifact_cache
+            .get(&key)
+            .and_then(|e| e.manifest.as_ref())
+            .map(|m| !m.files.is_empty())
+            .unwrap_or(false)
+    }
+
     /// #236: True when the Test gate just passed (or was skipped) and the
     /// Review stage is Pending — the user can press `R` to dispatch the
     /// review immediately instead of waiting for the reconcile auto-dispatch.
@@ -8872,6 +9084,44 @@ impl CoordApp {
                     "(worker did not provide a list — inspect the diff)",
                     Some(Color::rgb(160, 160, 180)),
                 ));
+            }
+        }
+
+        // #336: Artifact badge — show when the manifest is cached and non-empty
+        // for this branch.  The `a` keybind pulls when the badge is visible.
+        if let Some(branch) = &latest.branch {
+            let sanitized = sanitize_branch(branch);
+            let key = (latest.repo.clone(), sanitized.clone());
+            if let Some(entry) = self.artifact_cache.get(&key) {
+                if let Some(manifest) = &entry.manifest {
+                    let file_count = manifest.files.len();
+                    let total_mb = manifest.total_bytes as f64 / 1_048_576.0;
+                    // Warn when the stash was built by a different assignment —
+                    // e.g. the branch was re-pushed and a newer worker ran.
+                    let built_by_note =
+                        if manifest.built_by_assignment_id.as_deref() != Some(latest.id.as_str()) {
+                            if let Some(id) = &manifest.built_by_assignment_id {
+                                format!(" [built by {}]", &id[..8.min(id.len())])
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+                    items.push(kv_item("", "", None));
+                    items.push(kv_item(
+                        "  Artifacts",
+                        &format!(
+                            "📦 {} file{}, {:.1} MB on {}{} — press a to pull",
+                            file_count,
+                            if file_count == 1 { "" } else { "s" },
+                            total_mb,
+                            latest.machine,
+                            built_by_note,
+                        ),
+                        Some(Color::rgb(200, 180, 100)),
+                    ));
+                }
             }
         }
 
@@ -13483,6 +13733,23 @@ impl CoordApp {
                     }
                 }
             }
+            // #336: pull-artifact completion — show the local destination path.
+            if let Some((work_id, repo, sanitized)) = &self.pending_artifact_pull.clone() {
+                if result.label.contains(&format!("pull-artifact {}", work_id)) {
+                    self.pending_artifact_pull = None;
+                    if result.exit_code == 0 {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                        let path = format!("{home}/.coord/artifacts/{repo}/{sanitized}/");
+                        self.push_toast(
+                            "Artifacts ready",
+                            &format!("Saved to {path}"),
+                            ToastSeverity::Info,
+                        );
+                    }
+                    // Non-zero exit: the generic failure toast from
+                    // command_runner.poll() above already fired.
+                }
+            }
             // #290 recovery: a coord command just finished.  If this was a
             // merge dispatch and no merge_queue row appeared yet (CI gate
             // blocked, queue empty, or transient read error), the optimistic
@@ -13631,6 +13898,43 @@ impl CoordApp {
         // into the cache so the Test guidance block picks them up.
         if self.poll_pending_pr_fetches() {
             needs_redraw = true;
+        }
+
+        // #336: Poll the in-flight artifact manifest fetch and populate cache.
+        if let Some((key, rx)) = &self.artifact_fetch_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    let entry = ArtifactCacheEntry {
+                        fetched_at: Instant::now(),
+                        manifest: result.ok().flatten(),
+                    };
+                    let key_clone = key.clone();
+                    self.artifact_cache.insert(key_clone, entry);
+                    self.artifact_fetch_rx = None;
+                    needs_redraw = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.artifact_fetch_rx = None;
+                }
+            }
+        }
+        // #336: Trigger a fresh manifest fetch when the pipeline Test-stage
+        // context is visible and the cache entry is absent or older than 30 s.
+        if self.artifact_fetch_rx.is_none()
+            && self.active_view == SidebarView::Pipeline
+        {
+            if let Some((host, repo, sanitized, _work_id)) = self.artifact_fetch_target() {
+                let key = (repo.clone(), sanitized.clone());
+                let needs_fetch = match self.artifact_cache.get(&key) {
+                    None => true,
+                    Some(e) => e.fetched_at.elapsed() > Duration::from_secs(30),
+                };
+                if needs_fetch {
+                    let rx = spawn_artifact_fetch(&host, &repo, &sanitized);
+                    self.artifact_fetch_rx = Some((key, rx));
+                }
+            }
         }
 
         needs_redraw
@@ -15912,6 +16216,32 @@ impl ShellApp for CoordApp {
                         }
                     }
 
+                    // ── #336: a — pull artifacts from agent machine ────────
+                    // Only fires when the artifact badge is visible (non-empty
+                    // manifest in the 30 s TTL cache) — guards against a stale
+                    // `a` press when no artifacts have been stashed.
+                    Key::Char('a')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.artifact_badge_visible() =>
+                    {
+                        if self.command_runner.is_running() {
+                            self.push_toast(
+                                "Pull artifacts",
+                                "Another command is running — try again in a moment.",
+                                ToastSeverity::Warning,
+                            );
+                        } else if let Some((_, repo, sanitized, work_id)) =
+                            self.artifact_fetch_target()
+                        {
+                            self.pending_artifact_pull =
+                                Some((work_id.clone(), repo, sanitized));
+                            self.command_runner.spawn(&["pull-artifact", &work_id]);
+                            self.pipeline_status =
+                                Some(("Pulling artifacts…".into(), Instant::now()));
+                        }
+                        needs_redraw = true;
+                    }
+
                     _ => {}
                 }
             }
@@ -16917,6 +17247,9 @@ mod tests {
             pending_board_chat: None,
             file_issue_modal: None,
             file_issue_post_rx: None,
+            artifact_cache: std::collections::HashMap::new(),
+            artifact_fetch_rx: None,
+            pending_artifact_pull: None,
         }
     }
 
@@ -23693,5 +24026,154 @@ mod tests {
         assert!(!is_workable_type("new-issue-chat"));
         assert!(!is_workable_type("plan"));
         assert!(!is_workable_type("unknown-type"));
+    }
+
+    // ── #336: sanitize_branch ──────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_branch_passthrough_clean() {
+        assert_eq!(sanitize_branch("issue-305"), "issue-305");
+        assert_eq!(sanitize_branch("feature_foo.bar"), "feature_foo.bar");
+        assert_eq!(sanitize_branch("abc123"), "abc123");
+    }
+
+    #[test]
+    fn sanitize_branch_replaces_slash_runs() {
+        // feature/my-thing → feature-my-thing (single dash per run)
+        assert_eq!(sanitize_branch("feature/my-thing"), "feature-my-thing");
+        // Double slash → single dash
+        assert_eq!(sanitize_branch("a//b"), "a-b");
+    }
+
+    #[test]
+    fn sanitize_branch_strips_leading_trailing_dashes() {
+        assert_eq!(sanitize_branch("/leading"), "leading");
+        assert_eq!(sanitize_branch("trailing/"), "trailing");
+        assert_eq!(sanitize_branch("/both/"), "both");
+    }
+
+    #[test]
+    fn sanitize_branch_matches_python_examples() {
+        // issue-305-artifact-pull-rsync-built-binaries-from → unchanged (all allowed)
+        let branch = "issue-305-artifact-pull-rsync-built-binaries-from";
+        assert_eq!(sanitize_branch(branch), branch);
+        // A branch with spaces (unusual but handled)
+        assert_eq!(sanitize_branch("my branch name"), "my-branch-name");
+    }
+
+    // ── #336: artifact_badge_visible ──────────────────────────────────────
+
+    /// Helper: build a minimal CoordApp with a pipeline issue that has
+    /// a work assignment with a branch on a known machine.
+    fn make_app_for_artifact_tests() -> CoordApp {
+        let work_assignment = Assignment {
+            id: "work-abc123".to_string(),
+            repo: "my-repo".to_string(),
+            issue_number: 42,
+            issue_title: "Test issue".to_string(),
+            machine: "testmachine".to_string(),
+            status: "done".to_string(),
+            branch: Some("issue-42-test".to_string()),
+            model: None,
+            dispatched_at: Some(1_000_000.0),
+            finished_at: Some(1_001_000.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+        };
+        let mut app = make_test_app(BoardData {
+            assignments: vec![work_assignment],
+            machines: vec![Machine {
+                name: "testmachine".to_string(),
+                host: "testmachine.example.com".to_string(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["my-repo".to_string()],
+                version: None,
+                worktree_bytes: 0,
+            }],
+            ..BoardData::default()
+        });
+        // Seed the pipeline issues directly — no real gh call.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Test issue".to_string(),
+            body: String::new(),
+            repo_slug: "owner/my-repo".to_string(),
+            coord_repo: Some("my-repo".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        app
+    }
+
+    #[test]
+    fn artifact_badge_not_visible_when_cache_empty() {
+        let app = make_app_for_artifact_tests();
+        // No entry in cache yet → badge must not be visible.
+        assert!(!app.artifact_badge_visible());
+    }
+
+    #[test]
+    fn artifact_badge_visible_when_manifest_non_empty() {
+        let mut app = make_app_for_artifact_tests();
+        // Populate cache with a non-empty manifest.
+        let key = ("my-repo".to_string(), "issue-42-test".to_string());
+        app.artifact_cache.insert(
+            key,
+            ArtifactCacheEntry {
+                fetched_at: Instant::now(),
+                manifest: Some(ArtifactManifest {
+                    files: vec![ArtifactFile {
+                        name: "coord-tui".to_string(),
+                        size: 5_000_000,
+                    }],
+                    total_bytes: 5_000_000,
+                    built_by_assignment_id: Some("work-abc123".to_string()),
+                }),
+            },
+        );
+        assert!(app.artifact_badge_visible());
+    }
+
+    #[test]
+    fn artifact_badge_not_visible_when_manifest_is_none() {
+        let mut app = make_app_for_artifact_tests();
+        // 404 response → manifest is None → badge must not render.
+        let key = ("my-repo".to_string(), "issue-42-test".to_string());
+        app.artifact_cache.insert(
+            key,
+            ArtifactCacheEntry {
+                fetched_at: Instant::now(),
+                manifest: None,
+            },
+        );
+        assert!(!app.artifact_badge_visible());
+    }
+
+    #[test]
+    fn artifact_fetch_target_returns_none_when_no_pipeline_selection() {
+        let mut app = make_app_for_artifact_tests();
+        app.pipeline_sel = None;
+        assert!(app.artifact_fetch_target().is_none());
+    }
+
+    #[test]
+    fn artifact_fetch_target_returns_host_repo_branch_id() {
+        let app = make_app_for_artifact_tests();
+        let target = app.artifact_fetch_target();
+        assert!(target.is_some());
+        let (host, repo, sanitized, work_id) = target.unwrap();
+        assert_eq!(host, "testmachine.example.com");
+        assert_eq!(repo, "my-repo");
+        assert_eq!(sanitized, "issue-42-test");
+        assert_eq!(work_id, "work-abc123");
     }
 }
