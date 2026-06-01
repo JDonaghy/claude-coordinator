@@ -7805,6 +7805,23 @@ impl CoordApp {
             work_ids.insert(id);
         }
 
+        // #331: self-approval / PR-comment-fallback — review_verdict='approve'
+        // may be stamped directly on a work assignment when no separate review
+        // worker was dispatched (coordinator manual approval) or when GitHub
+        // rejected `gh pr review` as a self-review (findings posted to the
+        // issue comment instead, verdict still persisted to the DB).
+        //
+        // Treat review_verdict='approve' on any work assignment in work_ids as
+        // approved — this matches the intent of coord/merge_queue.py's
+        // has_approved_review: the DB verdict is the source of truth regardless
+        // of whether a formal GitHub PR review exists.
+        if self.data.assignments.iter().any(|a| {
+            work_ids.contains(a.id.as_str())
+                && a.review_verdict.as_deref() == Some("approve")
+        }) {
+            return true;
+        }
+
         if work_ids.is_empty() {
             return false;
         }
@@ -19416,6 +19433,48 @@ mod tests {
                 assert_eq!(repo, "api");
             }
             other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_merge_state_ready_when_work_has_db_approve_verdict() {
+        // #331: self-approval / PR-comment-fallback regression test.
+        //
+        // When review_verdict='approve' is stamped directly on the work
+        // assignment (no separate review-type assignment exists — e.g.
+        // coordinator approved without dispatching a review worker, or
+        // GitHub rejected `gh pr review` as a self-review and the verdict
+        // was only persisted to the DB), the Merge stage must classify as
+        // Ready so the [Go]/[M]erge button appears.
+        //
+        // Before the #331 fix, issue_has_any_approved_review only scanned
+        // review-type assignments, missing the DB-only verdict on the work row.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        // Work assignment carries review_verdict='approve' directly — no
+        // separate review assignment is present (the self-approval case).
+        let mut work = _stage_assignment("w42", "work", 100.0, "done");
+        work.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(work);
+        // Classifier must return Ready, not BlockedOnReview.
+        match app.pipeline_merge_state() {
+            PipelineMergeState::Ready { issue, repo } => {
+                assert_eq!(issue, 42);
+                assert_eq!(repo, "api");
+            }
+            other => panic!(
+                "#331 regression: expected Ready (DB approve verdict on work \
+                 assignment should unblock merge), got {other:?}"
+            ),
         }
     }
 
