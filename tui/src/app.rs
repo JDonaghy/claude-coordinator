@@ -886,6 +886,19 @@ struct IssueGroup {
     labels: Vec<String>,
 }
 
+/// #337: returns `true` for assignment types that represent real work
+/// dispatched to a worker — `work`, `review`, `smoke`, `conflict-fix`,
+/// and any `fix-N` variant.  Chat/scoping types (`refinement`,
+/// `test-chat`, `new-issue-chat`) return `false`.
+///
+/// Used by `IssueGroup::lifecycle_section` so that an issue that only
+/// has chat-type assignments still lands in Backlog / Refining / Refined
+/// rather than being dragged into In-flight.
+fn is_workable_type(ty: &str) -> bool {
+    matches!(ty, "work" | "review" | "smoke" | "conflict-fix")
+        || ty.starts_with("fix-")
+}
+
 impl IssueGroup {
     fn status_color(&self) -> Color {
         match self.status_summary.as_str() {
@@ -907,21 +920,23 @@ impl IssueGroup {
     ///   assignment with no open cache record)
     ///
     /// Rules (in order):
-    /// - No assignments → split into Backlog/Refining/Refined by label.
+    /// - No real-work assignments → split into Backlog/Refining/Refined by label.
     /// - Issue cache says closed → **Completed**.
     /// - Issue is `merged` (PR closed the issue via `fixes #N`) →
     ///   **Completed**, even when the brain hasn't synced yet.
     /// - Issue has no open-cache record AND assignment is settled
     ///   (`done`/`merged`) → **Completed**.
-    /// - Otherwise (with assignments) → **In-flight**.
+    /// - Otherwise (with real-work assignments) → **In-flight**.
     fn lifecycle_section(&self) -> &'static str {
-        // #264: refinement assignments are conversational scoping, not real
-        // work — they shouldn't drag an issue out of the Backlog/Refining/
-        // Refined buckets into In-flight just because a chat ran.  Filter
-        // them out for the "has real work?" check (but they still count
-        // toward the per-row activity badges elsewhere).
+        // #337 / #264: chat/scoping assignment types (`refinement`,
+        // `test-chat`, `new-issue-chat`) are conversational — they must
+        // not drag an issue out of the Backlog/Refining/Refined buckets
+        // into In-flight.  Only workable types count (see
+        // `is_workable_type`).  None defaults to "work" which is workable.
         let has_real_work = self.assignments.iter().any(|a| {
-            a.assignment_type.as_deref() != Some("refinement")
+            a.assignment_type.as_deref()
+                .map(is_workable_type)
+                .unwrap_or(true) // None → "work" → workable
         });
         if !has_real_work {
             // #226: split Pending by `status:*` label.
@@ -23564,5 +23579,119 @@ mod tests {
     fn parse_issue_proposal_returns_none_when_no_title() {
         let payload = stream_text("Some chat\n---\nstuff\n");
         assert!(parse_issue_proposal(&payload).is_none());
+    }
+
+    // ── #337: chat-type assignments must not drag issues into In-flight ────────
+
+    /// Repro for quadraui #294 / coord #337: an issue with 3 done
+    /// refinement assignments and `status:ready` label was showing up as
+    /// In-progress in the TUI.  It should land in the Refined bucket.
+    #[test]
+    fn chat_type_assignments_do_not_drag_issue_into_in_flight() {
+        // Three done refinement assignments (the exact repro from #294).
+        let mut app = make_test_app(BoardData {
+            assignments: vec![
+                make_assignment_typed("done", 294, "repo-a", Some("refinement")),
+                make_assignment_typed("done", 294, "repo-a", Some("refinement")),
+                make_assignment_typed("done", 294, "repo-a", Some("refinement")),
+            ],
+            ..BoardData::default()
+        });
+        // Open issue with status:ready label — should be Refined, not In-flight.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 294,
+            title: "refine me".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:ready".to_string()],
+        });
+        app.rebuild_board_sidebar();
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        let sections: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
+        assert!(
+            !sections.contains(&"in-flight"),
+            "#337 regression: refinement-only issue must not appear in In-flight; got {:?}",
+            sections,
+        );
+        assert!(
+            sections.contains(&"refined"),
+            "#337: refinement-only + status:ready issue must appear in Refined; got {:?}",
+            sections,
+        );
+    }
+
+    /// Same fix, but verify `test-chat` and `new-issue-chat` are also
+    /// excluded — they are the other chat types that should not trigger
+    /// In-flight placement.
+    #[test]
+    fn test_chat_and_new_issue_chat_do_not_drag_issue_into_in_flight() {
+        let mut app = make_test_app(BoardData {
+            assignments: vec![
+                make_assignment_typed("done", 1, "repo-a", Some("test-chat")),
+                make_assignment_typed("done", 2, "repo-a", Some("new-issue-chat")),
+            ],
+            ..BoardData::default()
+        });
+        // Issue 1: test-chat only + status:ready → Refined.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 1,
+            title: "test-chat issue".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec!["status:ready".to_string()],
+        });
+        // Issue 2: new-issue-chat only, no label → Backlog.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 2,
+            title: "new-issue-chat issue".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+        });
+        app.rebuild_board_sidebar();
+        let cache = app.board_issues_cache.clone();
+        let groups = app.board_grouped_for_repo(&cache, "repo-a");
+        let by_key: std::collections::HashMap<&str, usize> =
+            groups.iter().map(|(k, v)| (*k, v.len())).collect();
+        assert!(
+            !by_key.contains_key("in-flight"),
+            "#337: chat-type assignments must not produce an In-flight section; got {:?}",
+            by_key,
+        );
+        assert_eq!(
+            by_key.get("refined"),
+            Some(&1),
+            "#337: test-chat + status:ready → Refined",
+        );
+        assert_eq!(
+            by_key.get("backlog"),
+            Some(&1),
+            "#337: new-issue-chat + no label → Backlog",
+        );
+    }
+
+    /// Verify the `is_workable_type` helper covers the canonical workable
+    /// types and rejects all chat/scoping types.
+    #[test]
+    fn is_workable_type_covers_all_canonical_types() {
+        // workable
+        assert!(is_workable_type("work"));
+        assert!(is_workable_type("review"));
+        assert!(is_workable_type("smoke"));
+        assert!(is_workable_type("conflict-fix"));
+        assert!(is_workable_type("fix-1"));
+        assert!(is_workable_type("fix-42"));
+        assert!(is_workable_type("fix-"));
+
+        // not workable
+        assert!(!is_workable_type("refinement"));
+        assert!(!is_workable_type("test-chat"));
+        assert!(!is_workable_type("new-issue-chat"));
+        assert!(!is_workable_type("plan"));
+        assert!(!is_workable_type("unknown-type"));
     }
 }
