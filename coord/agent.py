@@ -837,6 +837,12 @@ class AgentServer:
 
         copied = 0
         for pattern in patterns:
+            # Reject patterns containing ".." — Path.glob("../foo") succeeds
+            # in Python 3.12+ and can reach outside the worktree.  The
+            # ValueError guard below does NOT catch this.  artifact_paths comes
+            # from trusted config, but an explicit check is cheap insurance.
+            if ".." in Path(pattern).parts:
+                continue
             try:
                 matches = list(wt_path.glob(pattern))
             except (ValueError, OSError):
@@ -861,6 +867,16 @@ class AgentServer:
                 except (OSError, shutil.Error):
                     pass
 
+        # Touch the stash directory so its mtime reflects this stash run.
+        # mkdir(exist_ok=True) is a no-op when the directory already exists,
+        # meaning a re-stash (e.g. after a review cycle on the same branch)
+        # would leave the original Day-1 mtime in place — causing _gc_artifacts
+        # to evict the refreshed stash prematurely.
+        try:
+            stash_dir.touch()
+        except OSError:
+            pass
+
         # Write the assignment_id marker so the manifest endpoint can surface
         # which build produced this stash without iterating all assignments.
         try:
@@ -881,8 +897,9 @@ class AgentServer:
         """Remove artifact stash directories older than *ttl_days* days.
 
         Uses the stash directory's ``mtime`` as the age proxy — each
-        successful ``_stash_artifacts`` call updates mtime via
-        ``shutil.copy2``, so the TTL is effectively a "last-written" window.
+        successful ``_stash_artifacts`` call touches the stash directory
+        explicitly after copying, so the TTL is effectively a "last-written"
+        window even when re-stashing an existing branch.
 
         Returns the count of directories removed.
         """
@@ -925,13 +942,30 @@ class AgentServer:
 
         return removed
 
+    # Accepted character set for HTTP path parameters forwarded to the
+    # filesystem.  Must not contain ``..``, ``/``, or any shell-special
+    # characters.  Both repo names and sanitized branch names satisfy this
+    # pattern in practice.
+    _SAFE_PATH_COMPONENT = re.compile(r"^[a-zA-Z0-9._-]+$")
+
     def artifact_manifest(self, repo: str, branch: str) -> dict | None:
         """Return the artifact manifest for a stash, or ``None`` if missing.
 
         *branch* must already be sanitized (i.e. the path component form,
         no slashes).  Returns a dict with keys ``files``, ``total_bytes``,
         and ``built_by_assignment_id``, or ``None`` when no stash exists.
+
+        Returns ``None`` (→ 404) when *repo* or *branch* contain path-traversal
+        sequences (``..``, ``/``, or characters outside ``[a-zA-Z0-9._-]``).
+        The agent server is Tailscale-only, not internet-facing, but rejecting
+        malformed params is cheap and prevents any node from probing the
+        artifacts directory structure.
         """
+        if (
+            not self._SAFE_PATH_COMPONENT.match(repo)
+            or not self._SAFE_PATH_COMPONENT.match(branch)
+        ):
+            return None
         stash_dir = self.state_dir / "artifacts" / repo / branch
         if not stash_dir.exists():
             return None

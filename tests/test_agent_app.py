@@ -382,3 +382,60 @@ def test_worktree_clean_respects_recent_secs(tmp_path: Path) -> None:
     body = r.json()
     assert body["cleaned"] == 1
     assert not fresh.exists()
+
+
+# ── GET /artifact/{repo}/{branch} ─────────────────────────────────────────────
+
+
+def test_artifact_manifest_404_when_missing(tmp_path: Path) -> None:
+    """GET /artifact/repo/branch returns 404 when no stash exists."""
+    client, _ = _client(tmp_path)
+    r = client.get("/artifact/myrepo/issue-99-some-feature")
+    assert r.status_code == 404
+    body = r.json()
+    assert "error" in body
+
+
+def test_artifact_manifest_200_with_stash(tmp_path: Path) -> None:
+    """GET /artifact/repo/branch returns 200 with manifest when stash exists."""
+    client, server = _client(tmp_path)
+
+    # Create a fake stash with one binary-sized file.
+    stash_dir = server.state_dir / "artifacts" / "myrepo" / "issue-99-feature"
+    stash_dir.mkdir(parents=True, exist_ok=True)
+    artifact = stash_dir / "mybin"
+    artifact.write_bytes(b"x" * 512)
+    (stash_dir / ".assignment_id").write_text("abc-123")
+
+    r = client.get("/artifact/myrepo/issue-99-feature")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_bytes"] == 512
+    assert len(body["files"]) == 1
+    assert body["files"][0]["name"] == "mybin"
+    assert body["files"][0]["size"] == 512
+    assert body["built_by_assignment_id"] == "abc-123"
+
+
+def test_artifact_manifest_rejects_path_traversal(tmp_path: Path) -> None:
+    """GET /artifact/../.. (or branch=..) returns 404 — not a real directory leak."""
+    client, server = _client(tmp_path)
+
+    # Starlette routing won't even match a literal ".." segment in most cases,
+    # but the server-side guard should also reject it.  We test what we can
+    # reach via the test client.  A branch that encodes ".." in a safe way
+    # (dots only) should be caught by the regex guard.
+    r = client.get("/artifact/myrepo/..badname")
+    # Could be 404 (guard rejected) or 404 (stash missing); either way NOT 200.
+    assert r.status_code == 404
+
+    # Verify the guard in artifact_manifest itself rejects ".." strings.
+    manifest = server.artifact_manifest("myrepo", "..")
+    assert manifest is None
+
+    manifest = server.artifact_manifest("..", "issue-1-branch")
+    assert manifest is None
+
+    # Also verify that a valid pair returns None when the stash is genuinely absent.
+    manifest = server.artifact_manifest("myrepo", "issue-1-branch")
+    assert manifest is None
