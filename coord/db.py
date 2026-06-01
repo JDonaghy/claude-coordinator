@@ -97,7 +97,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             test_reason TEXT,
             cost_usd REAL,
             smoke_tests TEXT,
-            review_findings TEXT
+            review_findings TEXT,
+            test_plan TEXT
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -235,6 +236,10 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # by `coord chat-continue` to pass `--resume <id>` to the next
         # worker so it loads the prior conversation and continues it.
         "ALTER TABLE assignments ADD COLUMN claude_session_id TEXT",
+        # #342 Phase A: AI-generated smoke test plan (JSON-encoded).
+        # NULL = not yet generated.  Set by `coord test-plan` and read back
+        # by the CLI (cache hit) and eventually by the TUI (Phase B).
+        "ALTER TABLE assignments ADD COLUMN test_plan TEXT",
     ]
     for sql in migrations:
         try:
