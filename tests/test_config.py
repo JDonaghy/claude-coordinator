@@ -349,3 +349,139 @@ def test_repo_run_cmd_non_string_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="run_cmd must be a string"):
         load(p)
+
+
+# ── Repo.resolve_new_issue_guidance (#316) ───────────────────────────────────
+
+
+def test_resolve_guidance_returns_default_when_none(tmp_path: Path) -> None:
+    """When new_issue_guidance is None, a generic default is returned."""
+    from coord.models import Repo
+
+    repo = Repo(name="r", github="o/r", new_issue_guidance=None)
+    guidance = repo.resolve_new_issue_guidance(tmp_path)
+    assert "Title" in guidance
+    assert "Acceptance" in guidance
+
+
+def test_resolve_guidance_returns_inline_text(tmp_path: Path) -> None:
+    """When the value doesn't look like a path, it is returned verbatim."""
+    from coord.models import Repo
+
+    text = "**Required:** Title (≤80 chars), What, Acceptance criteria"
+    repo = Repo(name="r", github="o/r", new_issue_guidance=text)
+    assert repo.resolve_new_issue_guidance(tmp_path) == text
+
+
+def test_resolve_guidance_reads_file_when_path_exists(tmp_path: Path) -> None:
+    """When the value is a path and the file exists, the file contents are returned."""
+    from coord.models import Repo
+
+    guidance_dir = tmp_path / "docs"
+    guidance_dir.mkdir()
+    (guidance_dir / "ISSUE_GUIDANCE.md").write_text("## Guidance\n- Step 1", encoding="utf-8")
+    repo = Repo(name="r", github="o/r", new_issue_guidance="docs/ISSUE_GUIDANCE.md")
+    result = repo.resolve_new_issue_guidance(tmp_path)
+    assert "## Guidance" in result
+    assert "Step 1" in result
+
+
+def test_resolve_guidance_falls_back_to_inline_when_file_missing(tmp_path: Path) -> None:
+    """When the value looks like a path but the file is absent, return the value verbatim."""
+    from coord.models import Repo
+
+    repo = Repo(name="r", github="o/r", new_issue_guidance="docs/MISSING.md")
+    result = repo.resolve_new_issue_guidance(tmp_path)
+    # File doesn't exist — value is returned as-is (path string).
+    assert result == "docs/MISSING.md"
+
+
+def test_resolve_guidance_txt_extension_treated_as_path(tmp_path: Path) -> None:
+    """A .txt path is also resolved as a file."""
+    from coord.models import Repo
+
+    (tmp_path / "GUIDANCE.txt").write_text("Plain text guidance", encoding="utf-8")
+    repo = Repo(name="r", github="o/r", new_issue_guidance="GUIDANCE.txt")
+    result = repo.resolve_new_issue_guidance(tmp_path)
+    assert result == "Plain text guidance"
+
+
+def test_resolve_guidance_rejects_absolute_path(tmp_path: Path) -> None:
+    """#316: an absolute path like `/etc/passwd.md` must not escape `repo_path`.
+
+    `Path("/repo") / "/etc/passwd.md"` silently discards the base, so the
+    repo-root confinement has to be enforced separately from the relative
+    `../` check.  We expect the value to fall through to the inline branch
+    rather than reading the absolute file.
+    """
+    from coord.models import Repo, _GUIDANCE_PATH_RE
+
+    # Regex-level: absolute paths must not match the path-shaped pattern.
+    assert not _GUIDANCE_PATH_RE.match("/etc/passwd.md")
+    assert not _GUIDANCE_PATH_RE.match("/home/user/file.md")
+    assert not _GUIDANCE_PATH_RE.match("\\windows\\system32\\config.md")
+
+    # Behaviour: even if a future regex regression let the value through, the
+    # `Path.resolve()` containment check inside `resolve_new_issue_guidance`
+    # still prevents reading the absolute file.  Verify the public method
+    # returns the value verbatim (inline-text path) rather than file contents.
+    repo = Repo(name="r", github="o/r", new_issue_guidance="/etc/hostname.md")
+    result = repo.resolve_new_issue_guidance(tmp_path)
+    assert result == "/etc/hostname.md"
+
+
+def test_resolve_guidance_rejects_symlink_escape(tmp_path: Path) -> None:
+    """#316: a symlink under `repo_path` pointing outside must not be read.
+
+    The `Path.resolve()` + `relative_to(base)` check inside
+    `resolve_new_issue_guidance` catches symlink escapes that the regex alone
+    cannot see.
+    """
+    from coord.models import Repo
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "SECRET.md"
+    secret.write_text("top secret", encoding="utf-8")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    link = repo_root / "leak.md"
+    try:
+        link.symlink_to(secret)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported on this platform")
+
+    repo = Repo(name="r", github="o/r", new_issue_guidance="leak.md")
+    result = repo.resolve_new_issue_guidance(repo_root)
+    # Symlink resolves outside repo_root — treated as inline, NOT read.
+    assert "top secret" not in result
+    assert result == "leak.md"
+
+
+def test_new_issue_guidance_loaded_from_config(tmp_path: Path) -> None:
+    """new_issue_guidance is parsed from coordinator.yml and stored on Repo."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "    new_issue_guidance: 'Title, What, Acceptance'\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").new_issue_guidance == "Title, What, Acceptance"
+
+
+def test_new_issue_guidance_non_string_rejected(tmp_path: Path) -> None:
+    """new_issue_guidance must be a string; non-string raises ConfigError."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n    new_issue_guidance: 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="new_issue_guidance must be a string"):
+        load(p)

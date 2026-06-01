@@ -515,6 +515,61 @@ Rules:
 record Pass/Fail via the TUI (P=pass / F=fail).\
 """
 
+NEW_ISSUE_CHAT_SYSTEM_PROMPT = """\
+You are a new-issue assistant helping a developer draft a well-structured \
+GitHub issue before it is filed. You are NOT a worker — you do not \
+implement, edit, or create files. Your job is to help articulate what \
+should be built or fixed.
+
+The first user message contains:
+- The repo's CLAUDE.md (project conventions and rules)
+- Per-repo issue guidance (required sections, style rules)
+- A list of recently open issues (for near-duplicate detection)
+
+Your goal is to guide the developer through a focused conversation and \
+produce a finished issue draft. When the draft is ready, present it in \
+this exact format:
+
+  TITLE: <active-voice title, ≤80 chars>
+  ---
+  <full issue body in Markdown>
+
+In each reply:
+- Ask ONE or TWO focused questions per turn — do not flood with a wall \
+of questions.
+- Flag if the described issue closely resembles an existing open issue.
+- Keep replies short. The developer is typing live.
+
+Rules:
+- Do NOT call `gh issue create`, `gh pr`, or any mutating `gh` command. \
+The developer's client handles submission — your job is to produce the draft.
+- Do NOT write, edit, or commit any files.
+- Do NOT implement the feature described in the issue.
+- Use `Read` and read-only `Bash` commands (e.g. `grep`, `find`, `cat`) \
+to look up relevant code context when the conversation calls for it.\
+"""
+
+# Deny list applied to new-issue-chat workers.  Allows read-only gh
+# (e.g. `gh issue list`, `gh issue view`) while blocking all mutations.
+NEW_ISSUE_CHAT_DENY_COMMANDS: list[str] = [
+    "Bash(gh issue create *)",
+    "Bash(gh issue delete *)",
+    "Bash(gh issue edit *)",
+    "Bash(gh pr create *)",
+    "Bash(gh pr merge *)",
+    "Bash(gh pr close *)",
+    "Bash(gh pr edit *)",
+    "Bash(gh repo *)",
+    "Bash(git push *)",
+    "Bash(git commit *)",
+    "Bash(git reset --hard *)",
+    "Bash(git branch -D *)",
+    "Bash(git checkout -- .)",
+    "Bash(git clean -f *)",
+    "Bash(rm -rf *)",
+]
+
+
 WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 
@@ -576,6 +631,14 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # tests, lint) but blocks write-side commands via deny_commands.
         system_prompt = spec.system_prompt if spec.system_prompt else TEST_CHAT_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
+        allowed_tools = "Read,Bash"
+    elif spec.type == "new-issue-chat":
+        # #316: new-issue-chat helps the developer draft a new GitHub issue.
+        # Read + Bash allowed (read-only lookups like grep/find/gh issue list);
+        # a deny list blocks all mutations (gh issue create, git push, etc.)
+        # so the coordinator's TUI handles the actual gh submission.
+        system_prompt = spec.system_prompt if spec.system_prompt else NEW_ISSUE_CHAT_SYSTEM_PROMPT
+        system_prompt += build_deny_prompt(NEW_ISSUE_CHAT_DENY_COMMANDS)
         allowed_tools = "Read,Bash"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
@@ -902,14 +965,15 @@ class AgentServer:
         )
         assignment.log_path = str(self.log_dir / f"{assignment.id}.log")
 
-        if spec.type in ("plan", "refinement", "test-chat"):
-            # Read-only run (plan, refinement, or test-chat) — skip worktree
-            # creation, run directly in the main repo checkout. No branch is
-            # created or modified. For chat sessions (#315 / #314), the stable
-            # cwd is also required so claude-cli's `--resume <session_id>`
-            # finds the prior session file on subsequent turns: claude scopes
-            # sessions by cwd (mangled into ~/.claude/projects/<cwd-key>/),
-            # and a per-assignment worktree gives every turn a different cwd.
+        if spec.type in ("plan", "refinement", "test-chat", "new-issue-chat"):
+            # Read-only run (plan, refinement, test-chat, or new-issue-chat) —
+            # skip worktree creation, run directly in the main repo checkout.
+            # No branch is created or modified. For chat sessions (#315 / #314
+            # / #316), the stable cwd is also required so claude-cli's
+            # `--resume <session_id>` finds the prior session file on
+            # subsequent turns: claude scopes sessions by cwd (mangled into
+            # ~/.claude/projects/<cwd-key>/), and a per-assignment worktree
+            # gives every turn a different cwd.
             with self._lock:
                 self._assignments[assignment.id] = assignment
             self._persist()
