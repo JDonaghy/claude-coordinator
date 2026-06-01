@@ -2682,7 +2682,8 @@ def retry(assignment_id: str, config_path: Path) -> None:
     default=None,
     help=(
         "Local directory to rsync artifacts into.  "
-        "Defaults to ./artifacts/<assignment_id>/."
+        "Defaults to ~/.coord/artifacts/<repo>/<branch>/ (stable per-branch "
+        "path; pulling the same branch twice overwrites the same location)."
     ),
 )
 @_CONFIG_OPTION
@@ -2776,13 +2777,20 @@ def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path)
 
     # ── Determine destination ─────────────────────────────────────────────
     if dest_path is None:
-        dest_path = Path.cwd() / "artifacts" / assignment_id
+        # Default to a stable per-branch location so pulling the same branch
+        # twice overwrites the same local path rather than creating new
+        # directories each time.
+        dest_path = Path.home() / ".coord" / "artifacts" / repo_name / sanitized
     dest_path.mkdir(parents=True, exist_ok=True)
 
     # ── rsync ─────────────────────────────────────────────────────────────
     remote = f"{machine.host}:~/.coord/artifacts/{repo_name}/{sanitized}/"
     cmd = [
         "rsync", "-az", "--info=progress2",
+        # accept-new: auto-accept the host key on first contact so the pull
+        # is non-interactive on a fresh agent machine.  This is safe on
+        # Tailscale where the network is already authenticated.
+        "-e", "ssh -o StrictHostKeyChecking=accept-new",
         "--exclude=.assignment_id",
         remote,
         str(dest_path) + "/",
