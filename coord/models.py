@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# #316: pattern that distinguishes a file-path value for `new_issue_guidance`
+# from inline markdown text.  Matches paths like `docs/ISSUE_GUIDANCE.md` or
+# `GUIDANCE.txt` but not multi-line or space-containing strings.
+_GUIDANCE_PATH_RE: re.Pattern[str] = re.compile(
+    r"^[\w./\-]+\.(md|txt)$", re.IGNORECASE
+)
 
 
 @dataclass
@@ -45,6 +54,43 @@ class Repo:
     # validator.  Reference entries do NOT walk transitively — they're
     # a flat list.
     reference_repos: list[str] = field(default_factory=list)
+    # #316: per-repo guidance for drafting new GitHub issues. Accepts either
+    # an inline markdown string OR a file path relative to the repo root
+    # (e.g. `docs/ISSUE_GUIDANCE.md`). See `resolve_new_issue_guidance`.
+    new_issue_guidance: str | None = None
+
+    def resolve_new_issue_guidance(self, repo_path: Path) -> str:
+        """Return the new-issue guidance string for this repo.
+
+        Resolution order:
+        1. If ``new_issue_guidance`` is ``None`` (or empty), return a
+           generic default describing the required issue sections.
+        2. If the value matches ``[\\w/.-]+\\.(md|txt)$`` **and** the file
+           exists at ``repo_path / value``, return the file contents.
+        3. If the pattern matches but the file is missing, return the value
+           verbatim as inline text (so a misconfigured path is still visible
+           to the worker rather than silently replaced).
+        4. Otherwise, return the value verbatim (it is inline markdown).
+        """
+        _DEFAULT = (
+            "Required sections: "
+            "Title (active voice, ≤80 chars), "
+            "What (1-3 sentences), "
+            "Acceptance (bulleted, observable), "
+            "Out of scope"
+        )
+        if not self.new_issue_guidance or not self.new_issue_guidance.strip():
+            return _DEFAULT
+        value = self.new_issue_guidance.strip()
+        if _GUIDANCE_PATH_RE.match(value):
+            candidate = repo_path / value
+            try:
+                return candidate.read_text(encoding="utf-8", errors="replace")
+            except (OSError, FileNotFoundError):
+                # File missing — fall back to inline so the value is at least
+                # surfaced in the prompt rather than silently defaulting.
+                return value
+        return value
 
 
 @dataclass

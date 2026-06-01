@@ -2309,7 +2309,7 @@ def chat_continue(
     conn = get_connection()
     row = conn.execute(
         "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, "
-        "claude_session_id FROM assignments WHERE assignment_id=?",
+        "claude_session_id, type FROM assignments WHERE assignment_id=?",
         (prior_assignment_id,),
     ).fetchone()
     if row is None:
@@ -2329,6 +2329,18 @@ def chat_continue(
     issue_number = row["issue_number"]
     issue_title = row["issue_title"]
     message_text = " ".join(text).strip()
+
+    # #316: preserve the chat type so the agent server uses the right system
+    # prompt and tool restrictions on continuation.  The known chat types are
+    # "refinement", "test-chat", and "new-issue-chat"; anything else falls
+    # back to "refinement" (the original behaviour before type-preservation).
+    _CHAT_TYPES = {"refinement", "test-chat", "new-issue-chat"}
+    try:
+        prior_type: str = row["type"] or "refinement"
+    except (IndexError, KeyError):
+        prior_type = "refinement"
+    if prior_type not in _CHAT_TYPES:
+        prior_type = "refinement"
 
     # #315: if the DB doesn't have the session_id yet, fetch it directly
     # from the agent's /status endpoint.  The notify cycle (typically every
@@ -2389,9 +2401,10 @@ def chat_continue(
             err=True,
         )
 
-    # #315: type="refinement" so the agent uses the read-only REFINEMENT_SYSTEM_PROMPT
-    # and the worker exits cleanly after responding.  resume_session_id passes
-    # --resume so the full prior conversation is loaded.
+    # #315/#316: use the type from the prior assignment so the agent server
+    # uses the right system prompt and tool restrictions on continuation.
+    # resume_session_id passes --resume so the full prior conversation is
+    # loaded before the new user message is appended.
     proposal = Proposal(
         id=0,  # not inserted into proposals table; dummy value
         machine_name=machine_name,
@@ -2400,7 +2413,7 @@ def chat_continue(
         issue_title=issue_title,
         rationale="chat continuation",
         briefing=message_text,
-        type="refinement",
+        type=prior_type,
         resume_session_id=claude_session_id,
     )
 
@@ -2930,6 +2943,56 @@ def refine_chat(repo: str, issue: int, machine: str | None, config_path: Path) -
     # Print the assignment_id as the LAST line on stdout so callers (the
     # TUI) can capture it with a simple "last non-empty line" parse.  Any
     # warnings or progress lines must be written to stderr.
+    click.echo(assignment_id)
+
+
+@main.command(
+    "new-issue-chat",
+    help=(
+        "#316: dispatch a new-issue-chat session for drafting a GitHub issue.\n\n"
+        "Seeds a `type=\"new-issue-chat\"` `claude -p` worker with the repo's "
+        "CLAUDE.md, the per-repo issue guidance from coordinator.yml, and a "
+        "list of recently open issues for near-duplicate detection.  Prints "
+        "the new assignment id to stdout — the TUI shells this out and binds "
+        "a ChatController overlay to the returned id.\n\n"
+        "The worker helps the developer draft a well-structured issue body in "
+        "the TITLE: / --- / body format.  It does NOT call `gh issue create`; "
+        "submission is handled by the TUI.\n\n"
+        "REPO is the local repo name from coordinator.yml."
+    ),
+)
+@click.argument("repo")
+@click.option(
+    "--machine",
+    default=None,
+    help="Override machine selection (default: first unpaused machine that lists the repo).",
+)
+@_CONFIG_OPTION
+def new_issue_chat(repo: str, machine: str | None, config_path: Path) -> None:
+    cfg = _load_config(config_path)
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.echo(
+            f"error: repo {repo!r} not in coordinator.yml "
+            f"(have: {[r.name for r in cfg.repos]})",
+            err=True,
+        )
+        sys.exit(2)
+
+    from coord.new_issue_chat import dispatch_new_issue_chat
+
+    try:
+        assignment_id, _picked_machine = dispatch_new_issue_chat(
+            repo,
+            cfg,
+            machine_override=machine,
+        )
+    except RuntimeError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+
+    # Print the assignment id as the LAST stdout line so the TUI can capture
+    # it with a simple "last non-empty line" parse.
     click.echo(assignment_id)
 
 

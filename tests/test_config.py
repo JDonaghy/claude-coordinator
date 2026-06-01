@@ -349,3 +349,86 @@ def test_repo_run_cmd_non_string_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="run_cmd must be a string"):
         load(p)
+
+
+# ── Repo.resolve_new_issue_guidance (#316) ───────────────────────────────────
+
+
+def test_resolve_guidance_returns_default_when_none(tmp_path: Path) -> None:
+    """When new_issue_guidance is None, a generic default is returned."""
+    from coord.models import Repo
+
+    repo = Repo(name="r", github="o/r", new_issue_guidance=None)
+    guidance = repo.resolve_new_issue_guidance(tmp_path)
+    assert "Title" in guidance
+    assert "Acceptance" in guidance
+
+
+def test_resolve_guidance_returns_inline_text(tmp_path: Path) -> None:
+    """When the value doesn't look like a path, it is returned verbatim."""
+    from coord.models import Repo
+
+    text = "**Required:** Title (≤80 chars), What, Acceptance criteria"
+    repo = Repo(name="r", github="o/r", new_issue_guidance=text)
+    assert repo.resolve_new_issue_guidance(tmp_path) == text
+
+
+def test_resolve_guidance_reads_file_when_path_exists(tmp_path: Path) -> None:
+    """When the value is a path and the file exists, the file contents are returned."""
+    from coord.models import Repo
+
+    guidance_dir = tmp_path / "docs"
+    guidance_dir.mkdir()
+    (guidance_dir / "ISSUE_GUIDANCE.md").write_text("## Guidance\n- Step 1", encoding="utf-8")
+    repo = Repo(name="r", github="o/r", new_issue_guidance="docs/ISSUE_GUIDANCE.md")
+    result = repo.resolve_new_issue_guidance(tmp_path)
+    assert "## Guidance" in result
+    assert "Step 1" in result
+
+
+def test_resolve_guidance_falls_back_to_inline_when_file_missing(tmp_path: Path) -> None:
+    """When the value looks like a path but the file is absent, return the value verbatim."""
+    from coord.models import Repo
+
+    repo = Repo(name="r", github="o/r", new_issue_guidance="docs/MISSING.md")
+    result = repo.resolve_new_issue_guidance(tmp_path)
+    # File doesn't exist — value is returned as-is (path string).
+    assert result == "docs/MISSING.md"
+
+
+def test_resolve_guidance_txt_extension_treated_as_path(tmp_path: Path) -> None:
+    """A .txt path is also resolved as a file."""
+    from coord.models import Repo
+
+    (tmp_path / "GUIDANCE.txt").write_text("Plain text guidance", encoding="utf-8")
+    repo = Repo(name="r", github="o/r", new_issue_guidance="GUIDANCE.txt")
+    result = repo.resolve_new_issue_guidance(tmp_path)
+    assert result == "Plain text guidance"
+
+
+def test_new_issue_guidance_loaded_from_config(tmp_path: Path) -> None:
+    """new_issue_guidance is parsed from coordinator.yml and stored on Repo."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "    new_issue_guidance: 'Title, What, Acceptance'\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").new_issue_guidance == "Title, What, Acceptance"
+
+
+def test_new_issue_guidance_non_string_rejected(tmp_path: Path) -> None:
+    """new_issue_guidance must be a string; non-string raises ConfigError."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: acme/api\n    new_issue_guidance: 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="new_issue_guidance must be a string"):
+        load(p)

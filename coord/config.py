@@ -380,6 +380,11 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if not isinstance(reference_repos, list) or not all(isinstance(r, str) for r in reference_repos):
             raise ConfigError(f"repos[{i}].reference_repos must be a list of repo names")
 
+        # #316: new_issue_guidance — inline markdown or repo-relative file path.
+        new_issue_guidance = entry.get("new_issue_guidance")
+        if new_issue_guidance is not None and not isinstance(new_issue_guidance, str):
+            raise ConfigError(f"repos[{i}].new_issue_guidance must be a string")
+
         repos.append(
             Repo(
                 name=name,
@@ -393,6 +398,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 housekeeping=housekeeping,
                 coordinator_only_files=coordinator_only_files,
                 reference_repos=reference_repos,
+                new_issue_guidance=new_issue_guidance,
             )
         )
     return repos

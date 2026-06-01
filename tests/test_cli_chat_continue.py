@@ -43,12 +43,13 @@ def _insert_assignment(
     issue_title: str = "Test issue",
     status: str = "done",
     claude_session_id: str | None = None,
+    type: str = "refinement",
 ) -> None:
     conn.execute(
         """INSERT INTO assignments (
             assignment_id, machine_name, repo_name, issue_number, issue_title,
             status, type, dispatched_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'refinement', ?)""",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             assignment_id,
             machine_name,
@@ -56,6 +57,7 @@ def _insert_assignment(
             issue_number,
             issue_title,
             status,
+            type,
             time.time(),
         ),
     )
@@ -188,3 +190,99 @@ class TestChatContinue:
         ).fetchone()
         assert row is not None
         assert row[0] == "new-aid-3"
+
+
+class TestChatContinueTypePreservation:
+    """Type round-trip tests for `coord chat-continue` (#316)."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_new_issue_chat_type_round_trips(
+        self, mock_post, coord_db, simple_config
+    ) -> None:
+        """chat-continue sends type='new-issue-chat' when prior assignment has that type."""
+        from coord.db import get_connection
+
+        conn = get_connection()
+        _insert_assignment(
+            conn,
+            assignment_id="nic-old-1",
+            claude_session_id="ses-nic-1",
+            type="new-issue-chat",
+            issue_number=0,
+            issue_title="(new issue draft)",
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "nic-new-1"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["chat-continue", "--config", str(simple_config), "nic-old-1", "describe the feature"],
+        )
+        assert result.exit_code == 0, result.output
+
+        mock_post.assert_called_once()
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["type"] == "new-issue-chat"
+        assert payload["resume_session_id"] == "ses-nic-1"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_refinement_type_still_round_trips(
+        self, mock_post, coord_db, simple_config
+    ) -> None:
+        """Existing refinement type still round-trips after the type-preservation change."""
+        from coord.db import get_connection
+
+        conn = get_connection()
+        _insert_assignment(
+            conn,
+            assignment_id="ref-old-rt",
+            claude_session_id="ses-ref-rt",
+            type="refinement",
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "ref-new-rt"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["chat-continue", "--config", str(simple_config), "ref-old-rt", "another question"],
+        )
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["type"] == "refinement"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_unknown_type_falls_back_to_refinement(
+        self, mock_post, coord_db, simple_config
+    ) -> None:
+        """A non-chat type (e.g. 'work') falls back to 'refinement' on continuation."""
+        from coord.db import get_connection
+
+        conn = get_connection()
+        _insert_assignment(
+            conn,
+            assignment_id="work-old-fb",
+            claude_session_id="ses-work-fb",
+            type="work",
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "work-new-fb"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["chat-continue", "--config", str(simple_config), "work-old-fb", "follow up"],
+        )
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["type"] == "refinement"
