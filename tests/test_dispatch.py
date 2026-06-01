@@ -240,3 +240,111 @@ class TestResumeSessionId:
         dispatch(proposal, config)
         payload = mock_post.call_args.kwargs["json"]
         assert "resume_session_id" not in payload
+
+
+class TestArtifactPaths:
+    """#305: artifact_paths flows from repo config through dispatch payload."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_artifact_paths_for_work_assignment(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Dispatch payload for a work proposal should include the repo's
+        artifact_paths so remote agents can stash artifacts without coordinator.yml."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(
+                name="api",
+                github="acme/api",
+                artifact_paths=["target/debug/mybinary*", "dist/*.tar.gz"],
+            )],
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Build release",
+            rationale="build",
+            type="work",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["artifact_paths"] == ["target/debug/mybinary*", "dist/*.tar.gz"]
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_includes_empty_artifact_paths_for_work_when_not_configured(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Dispatch payload should include empty artifact_paths for work
+        assignments when the repo has no artifact_paths configured."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],  # no artifact_paths
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Fix bug",
+            rationale="fix",
+            type="work",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["artifact_paths"] == []
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_excludes_artifact_paths_for_review_assignment(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Dispatch payload for a review proposal should have empty artifact_paths
+        since reviews don't build artifacts."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(
+                name="api",
+                github="acme/api",
+                artifact_paths=["target/debug/mybinary*"],
+            )],
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Review PR",
+            rationale="review",
+            type="review",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["artifact_paths"] == []
