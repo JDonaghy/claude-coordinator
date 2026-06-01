@@ -406,15 +406,14 @@ def dispatch_board_refinement(
     # Fetch open issue titles for near-duplicate awareness (best-effort).
     open_titles: list[str] = []
     try:
-        import json as _json
-        raw = __import__("coord.github_ops", fromlist=["_gh"])._gh(
+        raw = github_ops._gh(
             "issue", "list",
             "--repo", repo_cfg.github,
             "--state", "open",
             "--limit", "20",
             "--json", "title",
         )
-        data = _json.loads(raw)
+        data = json.loads(raw)
         open_titles = [item.get("title", "") for item in data if item.get("title")]
     except Exception:
         pass  # Not critical — session still useful without the list.
