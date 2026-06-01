@@ -9,8 +9,10 @@ from pathlib import Path
 # #316: pattern that distinguishes a file-path value for `new_issue_guidance`
 # from inline markdown text.  Matches paths like `docs/ISSUE_GUIDANCE.md` or
 # `GUIDANCE.txt` but not multi-line or space-containing strings.
+# The negative lookahead rejects traversal sequences (`../`) so a misconfigured
+# value like `../../../etc/passwd.md` cannot escape the repo root.
 _GUIDANCE_PATH_RE: re.Pattern[str] = re.compile(
-    r"^[\w./\-]+\.(md|txt)$", re.IGNORECASE
+    r"^(?!.*\.\.[/\\])[\w./\-]+\.(md|txt)$", re.IGNORECASE
 )
 
 

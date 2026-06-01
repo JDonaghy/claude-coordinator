@@ -526,6 +526,44 @@ enum BoardDetailTab {
     /// Full issue body text + labels (scrollable with j/k or scrollwheel).
     /// Reuses `issue_body_list` so the rendering matches the Pipeline view.
     Issue,
+    /// #316 Phase A: board-level chat (new-issue or refine-board).
+    /// Shows an empty state with Refine / New Issue CTAs when no chat is
+    /// open; shows the ChatController when a board chat is live.
+    Chat,
+}
+
+/// #316 Phase A+C: pending board-chat dispatch.  Armed by
+/// `dispatch_board_chat_new_issue()` / `dispatch_board_chat_refine()`; cleared
+/// on bind or timeout (same poll + bind lifecycle as `PendingRefinement`).
+#[derive(Clone)]
+struct PendingBoardChat {
+    repo: String,
+    /// "new-issue-chat" or "refinement"
+    assignment_type: String,
+    dispatched_at: Instant,
+}
+
+/// #316 Phase B: state for the file-issue finaliser modal.
+/// Shown when the user confirms filing a new issue drafted by a new-issue-chat.
+#[derive(Clone)]
+struct FileIssueModal {
+    /// Parsed title from the `TITLE: …` line in the chat transcript.
+    title: String,
+    /// Issue body text (everything after the `---` separator).
+    body: String,
+    /// GitHub `owner/name` slug for `--repo`.
+    repo_github: String,
+    /// Whether the title field is being edited (vs the body field).
+    editing_title: bool,
+    /// True while `gh issue create` is in flight.
+    submitting: bool,
+}
+
+/// Result sent from the background `gh issue create` thread.
+struct FileIssuePostResult {
+    success: bool,
+    issue_url: String,
+    stderr_first_line: String,
 }
 
 // ─── Sidebar views ────────────────────────────────────────────────────────────
@@ -3379,6 +3417,17 @@ pub struct CoordApp {
     /// path "draft, post, then mark ready" rather than leaving the chat
     /// open after a successful post.  Cleared on modal Esc or failure.
     finalise_after_notes_post: bool,
+    /// #316 Phase A+C: pending board-chat dispatch — armed when the user
+    /// clicks Refine or New Issue in the Board Chat tab and `coord
+    /// refine-board` / `coord new-issue-chat` is running.  Polled each
+    /// tick; on bind we open the chat overlay in the Board Chat tab.
+    pending_board_chat: Option<PendingBoardChat>,
+    /// #316 Phase B: file-issue edit modal.  Shown after the user chooses
+    /// to file the issue drafted in a new-issue-chat.  Intercepts all
+    /// keyboard input while open.
+    file_issue_modal: Option<FileIssueModal>,
+    /// #316 Phase B: receiver for the background `gh issue create` thread.
+    file_issue_post_rx: Option<std::sync::mpsc::Receiver<FileIssuePostResult>>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -3549,6 +3598,9 @@ impl CoordApp {
             refinement_notes_post_rx: None,
             pending_refinement_close_prompt: None,
             finalise_after_notes_post: false,
+            pending_board_chat: None,
+            file_issue_modal: None,
+            file_issue_post_rx: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -6590,15 +6642,31 @@ impl CoordApp {
     }
 
     /// #264: True when the currently-open `inject_chat` overlay is bound to
-    /// a `type="refinement"` assignment (rather than a worker-guidance
-    /// session).  Refinement chats render inline in the Refinement tab so
-    /// tab-switching keeps working; worker-guidance chats stay modal.
+    /// a `type="refinement"` assignment for a specific issue (rather than a
+    /// board-level or worker-guidance session).  Refinement chats render
+    /// inline in the Pipeline Refinement tab so tab-switching keeps working.
+    ///
+    /// #316: Board-level chats (`issue_number == 0`) are excluded here and
+    /// handled separately by `chat_is_board_chat()`.
     fn chat_is_refinement(&self) -> bool {
         if self.inject_chat.is_none() {
             return false;
         }
         self.focused_watch_state()
-            .map(|w| w.assignment_type == "refinement")
+            .map(|w| w.assignment_type == "refinement" && w.issue_number > 0)
+            .unwrap_or(false)
+    }
+
+    /// #316: True when the currently-open `inject_chat` overlay is a
+    /// board-level chat (`issue_number == 0`).  Board chats render inline in
+    /// `BoardDetailTab::Chat` rather than a Pipeline Refinement tab.  Covers
+    /// both `type="new-issue-chat"` and board `type="refinement"` sessions.
+    fn chat_is_board_chat(&self) -> bool {
+        if self.inject_chat.is_none() {
+            return false;
+        }
+        self.focused_watch_state()
+            .map(|w| w.issue_number == 0)
             .unwrap_or(false)
     }
 
@@ -8058,6 +8126,8 @@ impl CoordApp {
     }
 
     fn board_detail_tab_bar(&self) -> TabBar {
+        // #316: show an active-dot on the Chat tab while a board chat is live.
+        let board_chat_live = self.chat_is_board_chat();
         TabBar {
             id: WidgetId::new("board-detail-tabs"),
             tabs: vec![
@@ -8070,6 +8140,18 @@ impl CoordApp {
                 TabItem {
                     label: " Issue ".to_string(),
                     is_active: self.board_detail_tab == BoardDetailTab::Issue,
+                    is_dirty: false,
+                    is_preview: false,
+                },
+                TabItem {
+                    // #316: dot indicator when a board chat is live so the
+                    // tab is discoverable without forcing the user back to it.
+                    label: if board_chat_live {
+                        " Chat ● ".to_string()
+                    } else {
+                        " Chat ".to_string()
+                    },
+                    is_active: self.board_detail_tab == BoardDetailTab::Chat,
                     is_dirty: false,
                     is_preview: false,
                 },
@@ -10044,7 +10126,8 @@ impl CoordApp {
                 if let Some(idx) = hit_tab_index_from_labels(&labels, main_b.x, pos.x) {
                     let new_tab = match idx {
                         0 => BoardDetailTab::Board,
-                        _ => BoardDetailTab::Issue,
+                        1 => BoardDetailTab::Issue,
+                        _ => BoardDetailTab::Chat,
                     };
                     if new_tab != self.board_detail_tab {
                         self.board_detail_tab = new_tab;
@@ -10053,6 +10136,31 @@ impl CoordApp {
                     }
                 }
                 return false;
+            }
+            // #316: click in Chat tab content area — handle CTA button clicks.
+            if self.board_detail_tab == BoardDetailTab::Chat
+                && self.inject_chat.is_none()
+            {
+                let content_rect = Rect::new(
+                    main_b.x,
+                    main_b.y + tab_h,
+                    main_b.width,
+                    (main_b.height - tab_h).max(0.0),
+                );
+                let bar_h = lh * 2.0;
+                let bar_rect = Rect::new(content_rect.x, content_rect.y, content_rect.width, bar_h);
+                if pos.y >= bar_rect.y && pos.y < bar_rect.y + bar_rect.height
+                    && pos.x >= bar_rect.x && pos.x < bar_rect.x + bar_rect.width
+                {
+                    // Two equal-width buttons: left half → Refine, right half → New Issue.
+                    let mid = bar_rect.x + bar_rect.width / 2.0;
+                    let action_id = if pos.x < mid {
+                        "board-chat:refine"
+                    } else {
+                        "board-chat:new-issue"
+                    };
+                    return self.dispatch_toolbar_action(action_id);
+                }
             }
             return false;
         }
@@ -10232,9 +10340,11 @@ impl CoordApp {
             SidebarView::Board => {
                 // Use the active tab's actual list so the scroll max matches
                 // what's rendered. Board tab → detail_list; Issue tab → body.
+                // Chat tab scroll is handled by ChatController itself.
                 let items = match self.board_detail_tab {
                     BoardDetailTab::Board => self.detail_list().items.len(),
                     BoardDetailTab::Issue => self.board_issue_body_list().items.len(),
+                    BoardDetailTab::Chat => 0,
                 };
                 let max = items.saturating_sub(visible.saturating_sub(1));
                 if delta.y > 0.0 {
@@ -11582,6 +11692,472 @@ impl CoordApp {
         true
     }
 
+    // ── #316 Board Chat dispatch + bind ──────────────────────────────────────
+
+    /// #316 Phase C: shell `coord refine-board <repo>` and arm
+    /// `pending_board_chat` so the next tick can bind the chat overlay.
+    fn dispatch_board_chat_refine(&mut self, repo: &str) -> bool {
+        if !self.command_runner.spawn(&["refine-board", repo]) {
+            self.push_toast(
+                "Another command is running",
+                "Wait for the current command to finish, then try again.",
+                ToastSeverity::Info,
+            );
+            return false;
+        }
+        self.pending_board_chat = Some(PendingBoardChat {
+            repo: repo.to_string(),
+            assignment_type: "refinement".to_string(),
+            dispatched_at: Instant::now(),
+        });
+        self.push_toast(
+            "Board refinement chat",
+            &format!("Starting board-level refinement chat for {}…", repo),
+            ToastSeverity::Info,
+        );
+        true
+    }
+
+    /// #316 Phase A: shell `coord new-issue-chat <repo>` and arm
+    /// `pending_board_chat` so the next tick can bind the chat overlay.
+    fn dispatch_board_chat_new_issue(&mut self, repo: &str) -> bool {
+        if !self.command_runner.spawn(&["new-issue-chat", repo]) {
+            self.push_toast(
+                "Another command is running",
+                "Wait for the current command to finish, then try again.",
+                ToastSeverity::Info,
+            );
+            return false;
+        }
+        self.pending_board_chat = Some(PendingBoardChat {
+            repo: repo.to_string(),
+            assignment_type: "new-issue-chat".to_string(),
+            dispatched_at: Instant::now(),
+        });
+        self.push_toast(
+            "New issue chat",
+            &format!("Starting new-issue chat for {}…", repo),
+            ToastSeverity::Info,
+        );
+        true
+    }
+
+    /// #316 Phase A: called each tick while `pending_board_chat` is armed.
+    /// Looks for the freshly-dispatched board-chat assignment in
+    /// `self.data.assignments` (matching by repo + assignment_type +
+    /// `issue_number == 0`); on hit, adds it to `watch_pool`, focuses it,
+    /// and opens the inject_chat overlay in the Board Chat tab.
+    /// Returns true when the overlay was opened (caller redraws).
+    fn maybe_bind_pending_board_chat(&mut self) -> bool {
+        let pending = match &self.pending_board_chat {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+        if pending.dispatched_at.elapsed() > REFINEMENT_BIND_TIMEOUT {
+            self.pending_board_chat = None;
+            self.push_toast(
+                "Board chat timed out",
+                &format!(
+                    "No board-chat assignment appeared for {} within {}s.",
+                    pending.repo,
+                    REFINEMENT_BIND_TIMEOUT.as_secs(),
+                ),
+                ToastSeverity::Warning,
+            );
+            return true;
+        }
+        let pick = self.data.assignments.iter()
+            .filter(|a| a.issue_number == 0)
+            .filter(|a| a.repo == pending.repo)
+            .filter(|a| a.assignment_type.as_deref() == Some(&*pending.assignment_type))
+            .filter(|a| a.status == "running")
+            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal))
+            .cloned();
+        let Some(asg) = pick else { return false; };
+
+        let aid = asg.id.clone();
+        if !self.watch_pool.contains_key(&aid) {
+            let state = WatchState {
+                assignment_id: aid.clone(),
+                machine: asg.machine.clone(),
+                repo: asg.repo.clone(),
+                issue_number: 0,
+                assignment_type: asg.assignment_type.clone()
+                    .unwrap_or_else(|| pending.assignment_type.clone()),
+                scroll: usize::MAX,
+            };
+            let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
+                if !m.host.is_empty() {
+                    let rx = spawn_sse_watch(&m.host, &aid, 0);
+                    WatchSseState {
+                        rx,
+                        lines: Vec::new(),
+                        last_event_id: 0,
+                        fail_count: 0,
+                        first_fail_at: None,
+                        done: false,
+                        host: m.host.clone(),
+                        pending_tail: String::new(),
+                        line_times: Vec::new(),
+                        current_turn: 0,
+                    }
+                } else {
+                    make_local_sse_state(&aid)
+                }
+            } else {
+                make_local_sse_state(&aid)
+            };
+            if self.watch_pool.len() >= WATCH_POOL_CAP {
+                let lru_id = self.watch_pool.iter()
+                    .min_by_key(|(_, ctx)| ctx.last_focused_at)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = lru_id {
+                    self.watch_pool.remove(&id);
+                }
+            }
+            self.watch_pool.insert(aid.clone(), WatchContext {
+                state,
+                sse,
+                inject_transcript: Vec::new(),
+                inject_sse_offsets: Vec::new(),
+                history_turns: Vec::new(),
+                last_focused_at: Instant::now(),
+            });
+        }
+        self.watch_focused = Some(aid.clone());
+
+        let is_new_issue = pending.assignment_type == "new-issue-chat";
+        let status_hint = if is_new_issue {
+            format!(
+                "  New issue chat → {}  (Ctrl+S/Alt+Enter = send · f = file issue · Esc = close)",
+                pending.repo
+            )
+        } else {
+            format!(
+                "  Board refinement → {}  (Ctrl+S/Alt+Enter = send · Esc = close)",
+                pending.repo
+            )
+        };
+
+        let mut chat = ChatController::new("board-chat");
+        chat.set_status(StyledText::plain(status_hint));
+        chat.set_transcript(Vec::new());
+        self.inject_chat = Some(chat);
+
+        // Route to Board Chat tab immediately.
+        self.active_view = SidebarView::Board;
+        self.board_detail_tab = BoardDetailTab::Chat;
+
+        self.pending_board_chat = None;
+        let label = if is_new_issue { "New issue chat" } else { "Board refinement" };
+        self.push_toast(
+            label,
+            &format!("{}: chat ready — type to start.", pending.repo),
+            ToastSeverity::Info,
+        );
+        true
+    }
+
+    // ── #316 Phase B: file-issue finaliser ───────────────────────────────────
+
+    /// #316 Phase B: scan the focused chat transcript for a `TITLE: …` line
+    /// followed by a `---` separator.  Returns `(title, body)` on success.
+    fn detect_file_issue_proposal(&self) -> Option<(String, String)> {
+        let id = self.watch_focused.as_ref()?;
+        let ctx = self.watch_pool.get(id)?;
+        // Only applies to new-issue-chat sessions.
+        if ctx.state.assignment_type != "new-issue-chat" {
+            return None;
+        }
+        // Scan lines for the TITLE: / --- / body format.
+        // The worker emits: TITLE: <title>\n---\n<body>
+        let text = ctx.sse.lines.join("\n");
+        parse_issue_proposal(&text)
+    }
+
+    /// #316 Phase B: open the file-issue modal after the user requests to
+    /// file the drafted issue.  Scans the transcript for TITLE: format;
+    /// if found, opens the edit modal.  Shows a toast if no proposal found.
+    fn open_file_issue_modal(&mut self) {
+        let Some((title, body)) = self.detect_file_issue_proposal() else {
+            self.push_toast(
+                "No issue proposal found",
+                "The chat hasn't produced a TITLE: / --- / body block yet.",
+                ToastSeverity::Info,
+            );
+            return;
+        };
+        let repo_github = self.watch_focused.as_ref()
+            .and_then(|id| self.watch_pool.get(id))
+            .map(|ctx| {
+                let repo = ctx.state.repo.clone();
+                // Look up the GitHub slug from the pipeline_repos map.
+                self.data.pipeline_repos.iter()
+                    .find(|(name, _)| *name == repo)
+                    .map(|(_, slug)| slug.clone())
+                    .unwrap_or(repo)
+            })
+            .unwrap_or_default();
+        self.file_issue_modal = Some(FileIssueModal {
+            title,
+            body,
+            repo_github,
+            editing_title: false,
+            submitting: false,
+        });
+    }
+
+    /// #316 Phase B: shell `gh issue create` with the modal's title + body.
+    fn submit_file_issue(&mut self) {
+        let modal = match &mut self.file_issue_modal {
+            Some(m) => m,
+            None => return,
+        };
+        if modal.submitting {
+            return;
+        }
+        modal.submitting = true;
+
+        let title = modal.title.clone();
+        let body = modal.body.clone();
+        let repo_github = modal.repo_github.clone();
+        let config_path = self.command_runner.config_path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.file_issue_post_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("gh");
+            cmd.args(["issue", "create",
+                "--repo", &repo_github,
+                "--title", &title,
+                "--body", &body,
+            ]);
+            if let Some(cp) = config_path {
+                // Carry the env for `gh` auth consistency.
+                let _ = cp; // gh doesn't need coord config; just informational
+            }
+            match cmd.output() {
+                Ok(out) => {
+                    let success = out.status.success();
+                    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let first_err = stderr.lines()
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("")
+                        .to_string();
+                    let _ = tx.send(FileIssuePostResult {
+                        success,
+                        issue_url: url,
+                        stderr_first_line: first_err,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(FileIssuePostResult {
+                        success: false,
+                        issue_url: String::new(),
+                        stderr_first_line: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// #316 Phase B: drain the file-issue post receiver.  Called each tick.
+    fn poll_file_issue_post(&mut self) -> bool {
+        let Some(rx) = &self.file_issue_post_rx else { return false; };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.file_issue_post_rx = None;
+                if let Some(m) = &mut self.file_issue_modal {
+                    m.submitting = false;
+                }
+                if result.success {
+                    let url = result.issue_url.clone();
+                    self.file_issue_modal = None;
+                    self.inject_chat = None;
+                    self.watch_focused = None;
+                    self.push_toast(
+                        "Issue filed",
+                        &if url.is_empty() {
+                            "Issue created successfully.".to_string()
+                        } else {
+                            format!("Issue created: {}", url)
+                        },
+                        ToastSeverity::Info,
+                    );
+                } else {
+                    self.push_toast(
+                        "Failed to file issue",
+                        &if result.stderr_first_line.is_empty() {
+                            "gh issue create failed — check gh auth status.".to_string()
+                        } else {
+                            result.stderr_first_line.clone()
+                        },
+                        ToastSeverity::Warning,
+                    );
+                }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.file_issue_post_rx = None;
+                if let Some(m) = &mut self.file_issue_modal {
+                    m.submitting = false;
+                }
+                false
+            }
+        }
+    }
+
+    /// #316 Phase B: render the file-issue edit modal as an overlay over the
+    /// Board Chat tab content area.
+    fn render_file_issue_modal(&self, backend: &mut dyn Backend, content_rect: Rect) {
+        let Some(modal) = &self.file_issue_modal else { return; };
+        let lh = backend.line_height();
+
+        // Modal background (reuse the refinement-notes-modal pattern).
+        let modal_rect = shrink_rect(content_rect, lh * 2.0);
+        backend.draw_list(modal_rect, &ListView {
+            id: WidgetId::new("file-issue-modal-bg"),
+            title: None,
+            items: Vec::new(),
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
+        });
+
+        let inner = shrink_rect(modal_rect, lh * 0.5);
+        let mut items: Vec<ListItem> = Vec::new();
+
+        items.push(kv_item("", "  File New GitHub Issue", Some(Color::rgb(100, 200, 255))));
+        items.push(kv_item("", "", None));
+        items.push(kv_item("", &format!("  Repo: {}", modal.repo_github), Some(Color::rgb(140, 180, 140))));
+        items.push(kv_item("", "", None));
+        let title_label = if modal.editing_title { "  TITLE (editing) ▸" } else { "  TITLE ▸" };
+        items.push(kv_item("", title_label, Some(Color::rgb(200, 200, 100))));
+        items.push(kv_item("", &format!("  {}", modal.title), None));
+        items.push(kv_item("", "", None));
+        items.push(kv_item("", "  BODY ▸", Some(Color::rgb(200, 200, 100))));
+        // Show first 6 lines of body.
+        for line in modal.body.lines().take(6) {
+            items.push(kv_item("", &format!("  {}", line), None));
+        }
+        if modal.body.lines().count() > 6 {
+            items.push(kv_item("", "  …", Some(Color::rgb(140, 140, 160))));
+        }
+        items.push(kv_item("", "", None));
+        if modal.submitting {
+            items.push(kv_item("", "  Submitting…", Some(Color::rgb(200, 180, 60))));
+        } else {
+            items.push(kv_item("", "  Ctrl+Y — file issue  ·  Esc — cancel", Some(Color::rgb(140, 140, 160))));
+        }
+
+        backend.draw_list(inner, &ListView {
+            id: WidgetId::new("file-issue-modal"),
+            title: None,
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+        });
+    }
+
+    /// #316 Phase A: render the Board Chat tab content.
+    /// Shows the chat when a board chat is live, or an empty state with
+    /// "Refine" and "New Issue" CTAs when no chat is active.
+    fn render_board_chat_tab(&self, backend: &mut dyn Backend, content_rect: Rect) {
+        let lh = backend.line_height();
+        if self.chat_is_board_chat() {
+            // Draw an opaque backing so the empty transcript area doesn't bleed through.
+            backend.draw_list(content_rect, &ListView {
+                id: WidgetId::new("board-chat-tab-bg"),
+                title: None,
+                items: Vec::new(),
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: true,
+                h_scroll: 0,
+                max_content_width: None,
+            });
+            if let Some(ref chat) = self.inject_chat {
+                chat.render(backend, content_rect);
+            }
+        } else {
+            // Empty state: CTA buttons + explanatory text.
+            let repo = self.board_active_repo();
+            let bar_h = lh * 2.0;
+            let bar_rect = Rect::new(content_rect.x, content_rect.y, content_rect.width, bar_h);
+            let text_rect = Rect::new(
+                content_rect.x,
+                content_rect.y + bar_h,
+                content_rect.width,
+                (content_rect.height - bar_h).max(0.0),
+            );
+
+            // Action bar with Refine + New Issue buttons.
+            let repo_known = repo.is_some();
+            let toolbar = Toolbar {
+                id: WidgetId::new("board-chat-cta"),
+                buttons: vec![
+                    ToolbarButton::Action {
+                        id: WidgetId::new("board-chat:refine"),
+                        label: "Refine".to_string(),
+                        icon: None,
+                        key_hint: Some("r".to_string()),
+                        enabled: repo_known,
+                        is_active: false,
+                        tooltip: "Start a board-level refinement chat for the selected repo".to_string(),
+                    },
+                    ToolbarButton::Action {
+                        id: WidgetId::new("board-chat:new-issue"),
+                        label: "New Issue".to_string(),
+                        icon: None,
+                        key_hint: Some("n".to_string()),
+                        enabled: repo_known,
+                        is_active: false,
+                        tooltip: "Draft a new issue with AI assistance".to_string(),
+                    },
+                ],
+                bg: None,
+            };
+            backend.draw_toolbar(bar_rect, &toolbar, None, None);
+
+            // Descriptive text below the buttons.
+            let mut items: Vec<ListItem> = Vec::new();
+            items.push(kv_item("", "", None));
+            if let Some(r) = repo {
+                items.push(kv_item("", &format!("  Repo: {}", r), Some(Color::rgb(140, 180, 140))));
+            } else {
+                items.push(kv_item("", "  Select a repo in the sidebar first.", Some(Color::rgb(200, 140, 60))));
+            }
+            items.push(kv_item("", "", None));
+            items.push(kv_item("", "  Refine — explore ideas or discuss the codebase without", Some(Color::rgb(140, 140, 160))));
+            items.push(kv_item("", "  being tied to a specific issue.", Some(Color::rgb(140, 140, 160))));
+            items.push(kv_item("", "", None));
+            items.push(kv_item("", "  New Issue — chat with an AI to draft a well-structured", Some(Color::rgb(140, 140, 160))));
+            items.push(kv_item("", "  issue body.  Press f when done to file it on GitHub.", Some(Color::rgb(140, 140, 160))));
+            backend.draw_list(text_rect, &ListView {
+                id: WidgetId::new("board-chat-empty"),
+                title: None,
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
+            });
+        }
+    }
+
     /// #315: called each tick while `pending_chat_resume` is armed.  Looks for
     /// a NEW running refinement assignment for the same issue (dispatched AFTER
     /// the prior worker exited) and, when found, rebinds the open `inject_chat`
@@ -12497,6 +13073,31 @@ impl CoordApp {
                 }
                 true
             }
+            // #316 Phase A: Board Chat tab CTA buttons.
+            "board-chat:refine" => {
+                if let Some(repo) = self.board_active_repo().map(str::to_string) {
+                    self.dispatch_board_chat_refine(&repo)
+                } else {
+                    self.push_toast(
+                        "No repo selected",
+                        "Select a repo in the sidebar before starting a chat.",
+                        ToastSeverity::Info,
+                    );
+                    false
+                }
+            }
+            "board-chat:new-issue" => {
+                if let Some(repo) = self.board_active_repo().map(str::to_string) {
+                    self.dispatch_board_chat_new_issue(&repo)
+                } else {
+                    self.push_toast(
+                        "No repo selected",
+                        "Select a repo in the sidebar before starting a chat.",
+                        ToastSeverity::Info,
+                    );
+                    false
+                }
+            }
             _ => false,
         }
     }
@@ -12706,6 +13307,12 @@ impl CoordApp {
             needs_redraw = true;
         }
 
+        // #316: bind a pending board-chat dispatch (new-issue or refine-board)
+        // to its assignment row when it appears in the DB.
+        if self.pending_board_chat.is_some() && self.maybe_bind_pending_board_chat() {
+            needs_redraw = true;
+        }
+
         // #315: rebind the open chat overlay to the new assignment when a
         // `coord chat-continue` re-dispatch has landed in the DB.
         if self.pending_chat_resume.is_some() && self.maybe_bind_pending_resume() {
@@ -12719,6 +13326,10 @@ impl CoordApp {
         }
         // #319 Phase A: drain the `gh issue comment` shell-out result.
         if self.refinement_notes_post_rx.is_some() && self.poll_refinement_notes_post() {
+            needs_redraw = true;
+        }
+        // #316 Phase B: drain the `gh issue create` shell-out result.
+        if self.file_issue_post_rx.is_some() && self.poll_file_issue_post() {
             needs_redraw = true;
         }
 
@@ -13360,7 +13971,7 @@ impl ShellApp for CoordApp {
             .set(content_visible_rows(m, lh).max(1));
         match self.active_view {
             SidebarView::Board => {
-                // Tab bar (Board / Issue), then the active tab's content.
+                // Tab bar (Board / Issue / Chat), then the active tab's content.
                 let tab_bar = self.board_detail_tab_bar();
                 let tab_h = lh * 1.4;
                 let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
@@ -13373,6 +13984,16 @@ impl ShellApp for CoordApp {
                     }
                     BoardDetailTab::Issue => {
                         backend.draw_list(content_rect, &self.board_issue_body_list());
+                    }
+                    // #316: Chat tab — empty state CTA or live board chat.
+                    BoardDetailTab::Chat => {
+                        self.render_board_chat_tab(backend, content_rect);
+                    }
+                }
+                // #316 Phase B: file-issue modal renders on top of the Chat tab.
+                if self.board_detail_tab == BoardDetailTab::Chat {
+                    if self.file_issue_modal.is_some() {
+                        self.render_file_issue_modal(backend, m);
                     }
                 }
             }
@@ -13495,13 +14116,14 @@ impl ShellApp for CoordApp {
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
-        // #264: refinement chats render in the Refinement tab above (so the
-        // user can navigate freely between tabs while the chat is live).
+        // #264: refinement chats render in the Pipeline Refinement tab above.
+        // #316: board chats render in the Board Chat tab above.
         // Worker-guidance chats (`b` over a watched worker) stay modal —
         // those are short bursts where modal hijacking matches intent.
         let chat_is_refinement = self.chat_is_refinement();
+        let chat_is_board = self.chat_is_board_chat();
         if let Some(ref chat) = self.inject_chat {
-            if !chat_is_refinement {
+            if !chat_is_refinement && !chat_is_board {
                 backend.draw_list(m, &ListView {
                     id: WidgetId::new("chat-backing"),
                     title: None,
@@ -13559,6 +14181,25 @@ impl ShellApp for CoordApp {
 
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
+
+        // ── #316 Phase B: file-issue modal owns ALL input while open ───
+        // Esc cancels; Ctrl+Y submits via `gh issue create`.
+        if self.file_issue_modal.is_some() {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Escape) => {
+                        if self.file_issue_modal.as_ref().map(|m| !m.submitting).unwrap_or(false) {
+                            self.file_issue_modal = None;
+                        }
+                    }
+                    Key::Char('y') | Key::Char('Y') if modifiers.ctrl && !modifiers.alt => {
+                        self.submit_file_issue();
+                    }
+                    _ => {}
+                }
+            }
+            return Reaction::Redraw;
+        }
 
         // ── #319 Phase A: refinement-notes review modal owns ALL input ──
         // When the modal is up the user is reviewing/editing the proposed
@@ -13619,9 +14260,18 @@ impl ShellApp for CoordApp {
         //     background.
         if self.inject_chat.is_some() {
             let chat_is_refinement = self.chat_is_refinement();
+            let chat_is_board = self.chat_is_board_chat();
+            // Three routing modes:
+            //   - **Worker-guidance**: modal — captures ALL events.
+            //   - **Refinement** (#264): routed only on Pipeline > Refinement tab.
+            //   - **Board chat** (#316): routed only on Board > Chat tab.
             let route_to_chat = if chat_is_refinement {
                 self.active_view == SidebarView::Pipeline
                     && self.pipeline_detail_tab == PipelineDetailTab::Refinement
+            } else if chat_is_board {
+                self.active_view == SidebarView::Board
+                    && self.board_detail_tab == BoardDetailTab::Chat
+                    && self.file_issue_modal.is_none() // modal intercepts first
             } else {
                 true
             };
@@ -13643,9 +14293,28 @@ impl ShellApp for CoordApp {
                     };
                     Rect::new(after_panel.x, after_panel.y + tab_h,
                         after_panel.width, (after_panel.height - tab_h).max(0.0))
+                } else if chat_is_board {
+                    // Match the Board Chat tab's content_rect.
+                    let m = ctx.main_bounds();
+                    let lh = backend.line_height();
+                    let tab_h = lh * 1.4;
+                    Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0))
                 } else {
                     ctx.main_bounds()
                 };
+                // #316 Phase B: `f` key in a board new-issue-chat opens the
+                // file-issue modal.  Intercept before ChatController so the
+                // chat input doesn't see `f` as a literal character.
+                if chat_is_board {
+                    if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                        if matches!(key, Key::Char('f') | Key::Char('F'))
+                            && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd
+                        {
+                            self.open_file_issue_modal();
+                            return Reaction::Redraw;
+                        }
+                    }
+                }
                 // #319 Phase A: Ctrl+N triggers the refinement-notes
                 // finaliser.  Intercept BEFORE forwarding to ChatController
                 // so the chat input doesn't see Ctrl+N as a literal char.
@@ -13679,6 +14348,9 @@ impl ShellApp for CoordApp {
                         // chat overlay stays visible so the user can read
                         // the transcript while deciding.  Empty chats
                         // (user hit Esc without engaging) still fast-exit.
+                        //
+                        // #316 Board chat: Esc just closes the overlay;
+                        // no status label to flip since there's no issue.
                         if chat_is_refinement {
                             let has_user_turns = self.watch_focused.as_ref()
                                 .and_then(|id| self.watch_pool.get(id))
@@ -13695,6 +14367,13 @@ impl ShellApp for CoordApp {
                                 return Reaction::Redraw;
                             }
                             self.finalise_refinement_chat();
+                        }
+                        // Board chats: stop the worker, clear chat.
+                        if chat_is_board {
+                            if let Some(id) = self.watch_focused.clone() {
+                                self.command_runner.spawn(&["stop", &id]);
+                            }
+                            self.watch_focused = None;
                         }
                         self.inject_chat = None;
                     }
@@ -14449,18 +15128,67 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── h/l — cycle Board detail tabs ────────────────────
-                    // Board ↔ Issue (no third tab — toggle on either key).
-                    Key::Char('h') | Key::Char('l')
-                    | Key::Named(NamedKey::Left)
-                    | Key::Named(NamedKey::Right)
+                    // Board → Issue → Chat → Board (h goes backward, l forward).
+                    Key::Char('l') | Key::Named(NamedKey::Right)
                         if self.active_view == SidebarView::Board
-                            && !self.board_search.focused =>
+                            && !self.board_search.focused
+                            && self.inject_chat.is_none() =>
                     {
                         self.board_detail_tab = match self.board_detail_tab {
                             BoardDetailTab::Board => BoardDetailTab::Issue,
-                            BoardDetailTab::Issue => BoardDetailTab::Board,
+                            BoardDetailTab::Issue => BoardDetailTab::Chat,
+                            BoardDetailTab::Chat => BoardDetailTab::Board,
                         };
                         self.detail_scroll = 0;
+                        needs_redraw = true;
+                    }
+                    Key::Char('h') | Key::Named(NamedKey::Left)
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search.focused
+                            && self.inject_chat.is_none() =>
+                    {
+                        self.board_detail_tab = match self.board_detail_tab {
+                            BoardDetailTab::Board => BoardDetailTab::Chat,
+                            BoardDetailTab::Issue => BoardDetailTab::Board,
+                            BoardDetailTab::Chat => BoardDetailTab::Issue,
+                        };
+                        self.detail_scroll = 0;
+                        needs_redraw = true;
+                    }
+
+                    // ── #316: Board Chat tab CTA shortcuts (r = Refine, n = New Issue) ──
+                    Key::Char('r') | Key::Char('R')
+                        if self.active_view == SidebarView::Board
+                            && self.board_detail_tab == BoardDetailTab::Chat
+                            && self.inject_chat.is_none()
+                            && self.pending_board_chat.is_none() =>
+                    {
+                        if let Some(repo) = self.board_active_repo().map(str::to_string) {
+                            self.dispatch_board_chat_refine(&repo);
+                        } else {
+                            self.push_toast(
+                                "No repo selected",
+                                "Select a repo in the sidebar before starting a chat.",
+                                ToastSeverity::Info,
+                            );
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Char('n') | Key::Char('N')
+                        if self.active_view == SidebarView::Board
+                            && self.board_detail_tab == BoardDetailTab::Chat
+                            && self.inject_chat.is_none()
+                            && self.pending_board_chat.is_none() =>
+                    {
+                        if let Some(repo) = self.board_active_repo().map(str::to_string) {
+                            self.dispatch_board_chat_new_issue(&repo);
+                        } else {
+                            self.push_toast(
+                                "No repo selected",
+                                "Select a repo in the sidebar before starting a chat.",
+                                ToastSeverity::Info,
+                            );
+                        }
                         needs_redraw = true;
                     }
 
@@ -15031,9 +15759,13 @@ impl ShellApp for CoordApp {
                     .find(|a| a.id == id)
                     .map(|a| (a.status.clone(), a.assignment_type.clone()));
                 if let Some((status, atype)) = assignment_state {
+                    let issue_number = self.watch_pool.get(&id).map(|c| c.state.issue_number).unwrap_or(0);
+                    let is_board_chat = issue_number == 0;
                     if let Some(ref mut chat) = self.inject_chat {
                         let label = match atype.as_deref() {
-                            Some("refinement") => "Refinement chat",
+                            Some("refinement") if !is_board_chat => "Refinement chat",
+                            Some("refinement") => "Board refinement",
+                            Some("new-issue-chat") => "New issue chat",
                             _ => "Chat",
                         };
                         let suffix = if self.pending_chat_resume.is_some() {
@@ -15041,28 +15773,36 @@ impl ShellApp for CoordApp {
                             // user we're spinning up a new worker.
                             "  ⏳ Resuming session…"
                         } else {
-                            match (atype.as_deref(), status.as_str()) {
+                            match (atype.as_deref(), status.as_str(), is_board_chat) {
                                 // #315: refinement chats are resumable from
                                 // any terminal state — typing triggers
                                 // chat-continue, claude reloads the session,
                                 // the chat continues seamlessly.  Never show
                                 // a "read-only" warning here; the prompt
                                 // suffix stays send-enabled.
-                                (Some("refinement"), _) => {
+                                (Some("refinement"), _, false) => {
                                     "  (Ctrl+S/Alt+Enter = send · Ctrl+N = post notes · Esc = finish)"
                                 }
-                                (_, "done") | (_, "failed") | (_, "cancelled") => {
+                                // #316: board chats — no notes, but f = file issue for new-issue-chat.
+                                (Some("new-issue-chat"), _, true) => {
+                                    "  (Ctrl+S/Alt+Enter = send · f = file issue · Esc = close)"
+                                }
+                                (_, _, true) => {
+                                    "  (Ctrl+S/Alt+Enter = send · Esc = close)"
+                                }
+                                (_, "done", _) | (_, "failed", _) | (_, "cancelled", _) => {
                                     "  ⚠ Worker exited — chat is read-only.  Esc to close."
                                 }
                                 _ => "  (Ctrl+S/Alt+Enter = send · Ctrl+N = post notes · Esc = finish)",
                             }
                         };
-                        chat.set_status(StyledText::plain(format!(
-                            "  {} → #{}{}",
-                            label,
-                            self.watch_pool.get(&id).map(|c| c.state.issue_number).unwrap_or(0),
-                            suffix
-                        )));
+                        let target = if is_board_chat {
+                            let repo = self.watch_pool.get(&id).map(|c| c.state.repo.clone()).unwrap_or_default();
+                            format!("  {} → {}{}", label, repo, suffix)
+                        } else {
+                            format!("  {} → #{}{}", label, issue_number, suffix)
+                        };
+                        chat.set_status(StyledText::plain(target));
                     }
                 }
             }
@@ -15108,6 +15848,80 @@ fn content_visible_rows(panel: Rect, lh: f32) -> usize {
     }
     let content_h = (panel.height - lh).max(0.0); // minus list title row
     (content_h / lh) as usize
+}
+
+/// #316 Phase B: scan raw SSE log text for the first `TITLE: …` / `---` /
+/// body block emitted by a `new-issue-chat` worker.  The worker is
+/// instructed to produce exactly this format so the TUI can file the issue.
+///
+/// Returns `(title, body)` when found, or `None` when no proposal exists yet.
+fn parse_issue_proposal(text: &str) -> Option<(String, String)> {
+    // Extract JSON "text" content from stream-json lines, then scan for TITLE:.
+    let mut full_text = String::new();
+    for line in text.lines() {
+        if let Some(extracted) = extract_json_text_content(line) {
+            full_text.push_str(&extracted);
+            full_text.push('\n');
+        }
+    }
+    // Find TITLE: line.
+    let title_prefix = "TITLE:";
+    let title_line = full_text.lines()
+        .rfind(|l| l.trim_start().starts_with(title_prefix))?;
+    let title = title_line.trim_start()
+        .trim_start_matches(title_prefix)
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return None;
+    }
+    // Body is everything after the first `---` separator that follows the TITLE: line.
+    let after_title = full_text.lines()
+        .skip_while(|l| !l.trim_start().starts_with(title_prefix))
+        .skip(1)
+        .collect::<Vec<_>>();
+    let sep_idx = after_title.iter().position(|l| l.trim() == "---")?;
+    let body_lines = &after_title[sep_idx + 1..];
+    let body = body_lines.join("\n").trim().to_string();
+    Some((title, body))
+}
+
+/// Extract the text content from a single stream-json line (type=text events).
+fn extract_json_text_content(line: &str) -> Option<String> {
+    // Lines look like: {"type":"content_block_delta","delta":{"type":"text_delta","text":"…"}}
+    // or {"type":"text","value":"…"} depending on streaming mode.
+    // Use a simple substring search rather than full JSON parsing.
+    if !line.contains("\"text\"") {
+        return None;
+    }
+    // Try to find `"text":"<value>"` pattern.
+    let needle = "\"text\":\"";
+    let start = line.find(needle)? + needle.len();
+    let rest = &line[start..];
+    // Collect until unescaped closing quote.
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    loop {
+        match chars.next() {
+            None | Some('"') => break,
+            Some('\\') => {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(c) => out.push(c),
+                    None => break,
+                }
+            }
+            Some(c) => out.push(c),
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Shrink a `Rect` inward on all sides by `margin` (clamped to zero).
+fn shrink_rect(r: Rect, margin: f32) -> Rect {
+    let m = margin.min(r.width / 2.0).min(r.height / 2.0).max(0.0);
+    Rect::new(r.x + m, r.y + m, (r.width - 2.0 * m).max(0.0), (r.height - 2.0 * m).max(0.0))
 }
 
 /// #264: Build a chat transcript from a pool entry — merges the
@@ -15861,6 +16675,9 @@ mod tests {
             refinement_notes_post_rx: None,
             pending_refinement_close_prompt: None,
             finalise_after_notes_post: false,
+            pending_board_chat: None,
+            file_issue_modal: None,
+            file_issue_post_rx: None,
         }
     }
 

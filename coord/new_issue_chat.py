@@ -15,6 +15,8 @@ handles the actual ``gh issue create`` submission.
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from pathlib import Path
 
 from coord import github_ops
@@ -127,9 +129,6 @@ def dispatch_new_issue_chat(
     Raises ``RuntimeError`` when the repo is unknown, no machine claims it,
     or the agent rejects the dispatch.
     """
-    import time
-    import uuid
-
     repo_cfg = config.repo(repo_name)
     if repo_cfg is None:
         raise RuntimeError(

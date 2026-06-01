@@ -2997,6 +2997,56 @@ def new_issue_chat(repo: str, machine: str | None, config_path: Path) -> None:
 
 
 @main.command(
+    "refine-board",
+    help=(
+        "#316 Phase C: dispatch a board-level refinement chat for a repo.\n\n"
+        "Unlike `refine-chat` (which targets a specific issue), this starts an "
+        "open-ended `type=\"refinement\"` session for brainstorming new work, "
+        "exploring the codebase, or discussing ideas without being tied to any "
+        "particular issue.\n\n"
+        "Uses ``issue_number=0`` as the sentinel so the TUI routes the chat to "
+        "the Board Chat tab rather than a pipeline issue's Refinement tab.  "
+        "Prints the new assignment id to stdout — the TUI shells this out and "
+        "binds a ChatController overlay to the returned id.\n\n"
+        "REPO is the local repo name from coordinator.yml."
+    ),
+)
+@click.argument("repo")
+@click.option(
+    "--machine",
+    default=None,
+    help="Override machine selection (default: first unpaused machine that lists the repo).",
+)
+@_CONFIG_OPTION
+def refine_board(repo: str, machine: str | None, config_path: Path) -> None:
+    cfg = _load_config(config_path)
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.echo(
+            f"error: repo {repo!r} not in coordinator.yml "
+            f"(have: {[r.name for r in cfg.repos]})",
+            err=True,
+        )
+        sys.exit(2)
+
+    from coord.refine_chat import dispatch_board_refinement
+
+    try:
+        assignment_id, _picked_machine = dispatch_board_refinement(
+            cfg=cfg,
+            repo=repo,
+            machine_override=machine,
+        )
+    except RuntimeError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+
+    # Print the assignment id as the LAST stdout line so the TUI can capture
+    # it with a simple "last non-empty line" parse.
+    click.echo(assignment_id)
+
+
+@main.command(
     help=(
         "Mark a refined issue as ready for dispatch.\n\n"
         "Sets the GitHub `status:ready` label and removes `status:refining` / "
