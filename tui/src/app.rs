@@ -329,6 +329,22 @@ struct PendingRefinement {
 /// the row within ~1 s; 30 s is a generous ceiling for slow agents.
 const REFINEMENT_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// #314 Phase B: state carried while we wait for a `coord test-chat
+/// <work_assignment_id>` dispatch to appear in the local DB so the inject-chat
+/// overlay can be bound to it.  Mirrors `PendingRefinement`.
+#[derive(Clone)]
+struct PendingTestChat {
+    /// Coord-local repo name — used in toast copy.
+    repo: String,
+    /// The work assignment id passed to `coord test-chat`.
+    work_assignment_id: String,
+    /// Issue number — used to filter `self.data.assignments`.
+    issue_number: u64,
+    /// Wall-clock dispatch instant — bounds the wait at
+    /// `REFINEMENT_BIND_TIMEOUT`.
+    dispatched_at: Instant,
+}
+
 /// #315: state carried while we wait for a re-dispatched `coord chat-continue`
 /// assignment to appear in the local DB so the inject-chat overlay can rebind
 /// to the new assignment (and keep the session alive across `end_turn` exits).
@@ -3181,6 +3197,11 @@ pub struct CoordApp {
     /// `type="refinement"` assignment to appear so we can open the chat
     /// overlay bound to its id.  Cleared on bind or timeout.
     pending_refinement: Option<PendingRefinement>,
+    /// #314 Phase B: test-chat dispatch is pending — we've shelled `coord
+    /// test-chat <work_assignment_id>` and are polling the DB for the new
+    /// `type="test-chat"` assignment to appear so we can open the chat
+    /// overlay bound to its id.  Cleared on bind or timeout.
+    pending_test_chat: Option<PendingTestChat>,
     /// #315: chat-continue dispatch is pending — the prior worker exited after
     /// `end_turn`, the user typed another message, and we've shelled
     /// `coord chat-continue <old_aid> <text>`.  We poll `self.data.assignments`
@@ -3511,6 +3532,7 @@ impl CoordApp {
             pending_test_fail: None,
             pending_report_fix: None,
             pending_refinement: None,
+            pending_test_chat: None,
             pending_chat_resume: None,
             inject_fallback_tx,
             inject_fallback_rx,
@@ -10479,11 +10501,11 @@ impl CoordApp {
             // #200: surface the Test gate keybinds when actionable for the
             // currently-selected pipeline issue.
             // #235: include B (Phase 1 build) when no build is already in
-            // flight for this work id.
+            // flight for this work id.  #314: always include T=test-chat.
             if self.can_trigger_test_build() {
-                " Test gate: B=build  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
+                " Test gate: B=build  T=chat  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             } else {
-                " Test gate: P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
+                " Test gate: T=chat  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             }
         } else if self.can_bounce_work_after_test_fail() {
             // #236: Test just failed — the user's next step is to fix the
@@ -11577,6 +11599,160 @@ impl CoordApp {
         self.push_toast(
             "Refine with chat",
             &format!("#{}: chat ready — type to refine.", pending.issue_number),
+            ToastSeverity::Info,
+        );
+        true
+    }
+
+    /// #314 Phase B: shell `coord test-chat <work_assignment_id>` and arm
+    /// `pending_test_chat` so the next tick can bind the chat overlay to the
+    /// new assignment row when it appears in the DB.
+    ///
+    /// Returns true when the dispatch was successfully initiated.
+    fn spawn_test_chat(&mut self) -> bool {
+        let Some(work_id) = self.pipeline_selected_work_id() else {
+            self.push_toast(
+                "Test chat unavailable",
+                "No work assignment found — dispatch Work first.",
+                ToastSeverity::Info,
+            );
+            return false;
+        };
+        // Resolve the issue number and repo for the pending state.
+        let (issue_number, repo) = self.data.assignments.iter()
+            .find(|a| a.id == work_id)
+            .map(|a| (a.issue_number, a.repo.clone()))
+            .unwrap_or((0, String::new()));
+
+        if !self.command_runner.spawn(&["test-chat", &work_id]) {
+            self.push_toast(
+                "Another command is running",
+                "Wait for the current command to finish, then try again.",
+                ToastSeverity::Info,
+            );
+            return false;
+        }
+        self.pending_test_chat = Some(PendingTestChat {
+            repo: repo.clone(),
+            work_assignment_id: work_id.clone(),
+            issue_number,
+            dispatched_at: Instant::now(),
+        });
+        self.push_toast(
+            "Test chat",
+            &format!("#{}: starting test chat…", issue_number),
+            ToastSeverity::Info,
+        );
+        true
+    }
+
+    /// #314 Phase B: called each tick while `pending_test_chat` is armed.
+    /// Looks for the freshly-dispatched `type="test-chat"` row in
+    /// `self.data.assignments` matching the pending issue; on hit, adds it
+    /// to `watch_pool`, focuses it, and opens the inject_chat overlay.
+    /// Returns true when the overlay was opened (caller redraws).
+    fn maybe_bind_pending_test_chat(&mut self) -> bool {
+        let pending = match &self.pending_test_chat {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+        // Timeout — drop and toast.
+        if pending.dispatched_at.elapsed() > REFINEMENT_BIND_TIMEOUT {
+            self.pending_test_chat = None;
+            self.push_toast(
+                "Test chat timed out",
+                &format!(
+                    "No test-chat assignment appeared for #{} within {}s.",
+                    pending.issue_number,
+                    REFINEMENT_BIND_TIMEOUT.as_secs()
+                ),
+                ToastSeverity::Warning,
+            );
+            return true;
+        }
+        // Find the matching assignment — newest running test-chat for this issue.
+        let pick = self.data.assignments.iter()
+            .filter(|a| a.issue_number == pending.issue_number)
+            .filter(|a| a.assignment_type.as_deref() == Some("test-chat"))
+            .filter(|a| a.status == "running")
+            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal))
+            .cloned();
+        let Some(asg) = pick else { return false; };
+
+        let aid = asg.id.clone();
+        if !self.watch_pool.contains_key(&aid) {
+            let state = WatchState {
+                assignment_id: aid.clone(),
+                machine: asg.machine.clone(),
+                repo: asg.repo.clone(),
+                issue_number: asg.issue_number,
+                assignment_type: asg.assignment_type.clone().unwrap_or_else(|| "test-chat".to_string()),
+                scroll: usize::MAX,
+            };
+            let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
+                if !m.host.is_empty() {
+                    let rx = spawn_sse_watch(&m.host, &aid, 0);
+                    WatchSseState {
+                        rx,
+                        lines: Vec::new(),
+                        last_event_id: 0,
+                        fail_count: 0,
+                        first_fail_at: None,
+                        done: false,
+                        host: m.host.clone(),
+                        pending_tail: String::new(),
+                        line_times: Vec::new(),
+                        current_turn: 0,
+                    }
+                } else {
+                    make_local_sse_state(&aid)
+                }
+            } else {
+                make_local_sse_state(&aid)
+            };
+            if self.watch_pool.len() >= WATCH_POOL_CAP {
+                let lru_id = self.watch_pool.iter()
+                    .min_by_key(|(_, ctx)| ctx.last_focused_at)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = lru_id {
+                    self.watch_pool.remove(&id);
+                }
+            }
+            self.watch_pool.insert(aid.clone(), WatchContext {
+                state,
+                sse,
+                inject_transcript: Vec::new(),
+                inject_sse_offsets: Vec::new(),
+                history_turns: Vec::new(),
+                last_focused_at: Instant::now(),
+            });
+        }
+        self.watch_focused = Some(aid.clone());
+        // Open the inject_chat overlay.
+        let mut chat = ChatController::new("test-chat");
+        chat.set_status(StyledText::plain(format!(
+            "  Test chat → {} #{}  (Ctrl+S/Alt+Enter = send · Esc = close)",
+            pending.repo, pending.issue_number
+        )));
+        chat.set_transcript(Vec::new());
+        self.inject_chat = Some(chat);
+        // Switch to the Refinement tab (the chat tab) on the Pipeline view.
+        self.active_view = SidebarView::Pipeline;
+        self.pipeline_detail_tab = PipelineDetailTab::Refinement;
+        if let Some(idx) = self.pipeline_issues.iter()
+            .position(|i| i.number == pending.issue_number)
+        {
+            self.pipeline_sel = Some(idx);
+        }
+        self.pending_test_chat = None;
+        self.push_toast(
+            "Test chat",
+            &format!(
+                "#{}: chat ready (work: {}) — type to ask about the change.",
+                pending.issue_number,
+                &pending.work_assignment_id[..pending.work_assignment_id.len().min(8)],
+            ),
             ToastSeverity::Info,
         );
         true
@@ -12703,6 +12879,11 @@ impl CoordApp {
         // #264: bind a pending refinement-chat dispatch to its new
         // assignment row as soon as it appears in the DB.
         if self.pending_refinement.is_some() && self.maybe_bind_pending_refinement() {
+            needs_redraw = true;
+        }
+
+        // #314 Phase B: bind a pending test-chat dispatch to its new assignment row.
+        if self.pending_test_chat.is_some() && self.maybe_bind_pending_test_chat() {
             needs_redraw = true;
         }
 
@@ -14952,6 +15133,20 @@ impl ShellApp for CoordApp {
                         }
                     }
 
+                    // ── T — Pipeline / Test stage: open test-chat ─────────
+                    // #314 Phase B: spawn `coord test-chat <work_id>` and arm
+                    // the bind poll so the chat overlay opens once the
+                    // assignment row appears in the DB.
+                    Key::Char('T')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.test_gate_actionable()
+                            && self.pipeline_selected_work_id().is_some() =>
+                    {
+                        if self.spawn_test_chat() {
+                            needs_redraw = true;
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -15823,6 +16018,7 @@ mod tests {
             pending_test_fail: None,
             pending_report_fix: None,
             pending_refinement: None,
+            pending_test_chat: None,
             pending_chat_resume: None,
             inject_fallback_tx,
             inject_fallback_rx,
