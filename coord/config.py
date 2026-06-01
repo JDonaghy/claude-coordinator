@@ -385,6 +385,18 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if new_issue_guidance is not None and not isinstance(new_issue_guidance, str):
             raise ConfigError(f"repos[{i}].new_issue_guidance must be a string")
 
+        # #305: artifact_paths — glob patterns for build artifacts to stash.
+        artifact_paths_raw = entry.get("artifact_paths", []) or []
+        if not isinstance(artifact_paths_raw, list):
+            raise ConfigError(f"repos[{i}].artifact_paths must be a list of strings")
+        for j, p in enumerate(artifact_paths_raw):
+            if not isinstance(p, str):
+                raise ConfigError(
+                    f"repos[{i}].artifact_paths[{j}] must be a string, "
+                    f"got {type(p).__name__}"
+                )
+        artifact_paths: list[str] = list(artifact_paths_raw)
+
         repos.append(
             Repo(
                 name=name,
@@ -399,6 +411,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 coordinator_only_files=coordinator_only_files,
                 reference_repos=reference_repos,
                 new_issue_guidance=new_issue_guidance,
+                artifact_paths=artifact_paths,
             )
         )
     return repos

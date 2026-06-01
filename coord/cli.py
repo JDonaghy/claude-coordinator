@@ -672,6 +672,7 @@ def _start_agent_server(
     # and repos. The coordinator sends repo details at dispatch time.
     from coord.config import ConcurrencyConfig as _ConcurrencyConfig
     concurrency = _ConcurrencyConfig()
+    artifact_paths_by_repo: dict[str, list[str]] = {}
     if not config_path.exists() and machine_name:
         from coord.models import Machine as _Machine
         machine = _Machine(
@@ -685,6 +686,12 @@ def _start_agent_server(
         cfg = _load_config(config_path)
         machine = _resolve_machine(cfg, machine_name)
         concurrency = cfg.concurrency
+        # #305: collect artifact_paths per repo for the stash helper.
+        artifact_paths_by_repo = {
+            r.name: r.artifact_paths
+            for r in cfg.repos
+            if r.artifact_paths
+        }
 
     server = AgentServer(
         machine_name=machine.name,
@@ -693,6 +700,7 @@ def _start_agent_server(
         repo_paths=machine.repo_paths,
         bash_wrap_spawn=concurrency.bash_wrap_spawn,
         first_output_timeout=concurrency.first_output_timeout,
+        artifact_paths=artifact_paths_by_repo,
     )
     app = build_app(server)
     click.echo(
@@ -2653,6 +2661,145 @@ def retry(assignment_id: str, config_path: Path) -> None:
         f"Retried: {result.machine_name} → {result.repo_name} "
         f"#{result.issue_number} (assignment {result.assignment_id})"
     )
+
+
+@main.command(
+    "pull-artifact",
+    help=(
+        "Pull built artifacts from an agent machine after a work assignment "
+        "completes.  The agent stashes files matching `artifact_paths` globs "
+        "configured in coordinator.yml before the worktree is removed.  This "
+        "command queries the manifest and rsyncs the files locally.\n\n"
+        "Requires passwordless SSH access to the agent host (see "
+        "docs/AGENT_OPERATIONS.md for setup)."
+    ),
+)
+@click.argument("assignment_id")
+@click.option(
+    "--into",
+    "dest_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help=(
+        "Local directory to rsync artifacts into.  "
+        "Defaults to ./artifacts/<assignment_id>/."
+    ),
+)
+@_CONFIG_OPTION
+def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path) -> None:
+    """Rsync build artifacts from the agent machine that ran ASSIGNMENT_ID."""
+    from coord.agent import _sanitize_branch, _slugify
+    from coord.db import get_connection
+
+    cfg = _load_config(config_path)
+
+    # ── Look up (machine, repo, branch) from the coordinator DB ──────────
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT machine_name, repo_name, branch, issue_number, issue_title "
+        "FROM assignments WHERE assignment_id = ?",
+        (assignment_id,),
+    ).fetchone()
+
+    if row is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in database", err=True)
+        sys.exit(1)
+
+    machine_name: str = row["machine_name"]
+    repo_name: str = row["repo_name"]
+    branch: str | None = row["branch"]
+    issue_number: int = row["issue_number"]
+    issue_title: str = row["issue_title"]
+
+    machine = next((m for m in cfg.machines if m.name == machine_name), None)
+    if machine is None:
+        click.echo(
+            f"error: machine {machine_name!r} (from DB) not found in coordinator.yml",
+            err=True,
+        )
+        sys.exit(1)
+
+    # If branch is not yet recorded in the DB (notify hasn't run yet),
+    # fall back to the deterministic name derived from issue_number + title.
+    if not branch:
+        branch = f"issue-{issue_number}-{_slugify(issue_title)}"
+
+    sanitized = _sanitize_branch(branch)
+
+    # ── Query the manifest endpoint ───────────────────────────────────────
+    url = f"http://{machine.host}:{AGENT_PORT}/artifact/{repo_name}/{sanitized}"
+    try:
+        resp = httpx.get(url, timeout=10)
+    except (httpx.HTTPError, httpx.TimeoutException, OSError) as e:
+        click.echo(
+            f"error: could not reach agent on {machine.host}:{AGENT_PORT}: {e}",
+            err=True,
+        )
+        sys.exit(1)
+
+    if resp.status_code == 404:
+        click.echo(
+            f"error: no artifacts found for assignment {assignment_id!r} "
+            f"(repo={repo_name!r}, branch={sanitized!r}) on {machine.name}.\n"
+            "Possible causes: stash has been GC'd (default TTL 3 days), "
+            "the build did not match any artifact_paths globs, "
+            "or artifact_paths is not configured for this repo.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        click.echo(
+            f"error: agent returned HTTP {resp.status_code}: {resp.text[:200]}",
+            err=True,
+        )
+        sys.exit(1)
+
+    manifest = resp.json()
+    files = manifest.get("files", [])
+    if not files:
+        click.echo(
+            f"No artifact files in stash for {assignment_id!r}. "
+            "The build may have produced no files matching artifact_paths.",
+            err=True,
+        )
+        sys.exit(1)
+
+    total_bytes = manifest.get("total_bytes", 0)
+    built_by = manifest.get("built_by_assignment_id") or assignment_id
+    click.echo(
+        f"Found {len(files)} artifact(s) ({total_bytes:,} bytes) "
+        f"on {machine.name} (built by {built_by}):"
+    )
+    for f in files:
+        click.echo(f"  {f['name']}  ({f['size']:,} bytes)")
+
+    # ── Determine destination ─────────────────────────────────────────────
+    if dest_path is None:
+        dest_path = Path.cwd() / "artifacts" / assignment_id
+    dest_path.mkdir(parents=True, exist_ok=True)
+
+    # ── rsync ─────────────────────────────────────────────────────────────
+    remote = f"{machine.host}:~/.coord/artifacts/{repo_name}/{sanitized}/"
+    cmd = [
+        "rsync", "-az", "--info=progress2",
+        "--exclude=.assignment_id",
+        remote,
+        str(dest_path) + "/",
+    ]
+    click.echo(f"\nRsyncing {remote} → {dest_path}/")
+    result = subprocess.run(cmd)
+
+    if result.returncode != 0:
+        click.echo(
+            f"error: rsync exited {result.returncode}. "
+            "Ensure passwordless SSH is set up between coordinator and agent "
+            "(see docs/AGENT_OPERATIONS.md).",
+            err=True,
+        )
+        sys.exit(1)
+
+    click.echo(f"\nArtifacts saved to: {dest_path}")
 
 
 @main.command(

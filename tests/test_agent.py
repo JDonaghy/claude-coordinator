@@ -635,3 +635,242 @@ def test_claude_session_id_survives_persist_load(tmp_path: Path) -> None:
     spec = AssignmentSpec(**spec_data)
     a2 = AgentAssignment(spec=spec, **d)
     assert a2.claude_session_id == "ses-persist"
+
+
+# ── Artifact stash (#305) ───────────────────────────────────────────────────
+
+
+def _make_done_assignment(
+    tmp_path: Path,
+    *,
+    repo_name: str = "api",
+    branch: str = "issue-1-my-feature",
+) -> tuple[AgentServer, AgentAssignment, Path]:
+    """Create a server + a fake DONE assignment with a real worktree directory."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fake worktree with some files
+    wt_path = state_dir / "worktrees" / "asgn-abc123"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    server = AgentServer(
+        machine_name="test",
+        repos=[repo_name],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={repo_name: str(tmp_path / "repo")},
+        artifact_paths={repo_name: ["target/debug/mybinary*", "*.d"]},
+    )
+
+    spec = AssignmentSpec(
+        repo_name=repo_name,
+        repo_path=str(tmp_path / "repo"),
+        issue_number=1,
+        issue_title="my feature",
+        briefing="b",
+        branch="main",
+    )
+    a = AgentAssignment(id="asgn-abc123", spec=spec, status=DONE, branch=branch)
+    a.worktree_path = str(wt_path)
+
+    return server, a, wt_path
+
+
+def test_stash_artifacts_copies_matching_files(tmp_path: Path) -> None:
+    """Matching files over 100B should be copied to the stash dir."""
+    server, a, wt_path = _make_done_assignment(tmp_path)
+
+    # Create a file that matches the glob and is large enough
+    target_dir = wt_path / "target" / "debug"
+    target_dir.mkdir(parents=True)
+    bin_file = target_dir / "mybinary"
+    bin_file.write_bytes(b"\x7fELF" + b"\x00" * 200)  # fake ELF, 204 bytes
+
+    server._stash_artifacts(a)
+
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-1-my-feature"
+    assert (stash_dir / "mybinary").exists(), "binary not copied to stash"
+    assert (stash_dir / ".assignment_id").read_text() == "asgn-abc123"
+
+
+def test_stash_artifacts_skips_small_files(tmp_path: Path) -> None:
+    """Files under 100 bytes should be skipped (not real binaries)."""
+    server, a, wt_path = _make_done_assignment(tmp_path)
+
+    target_dir = wt_path / "target" / "debug"
+    target_dir.mkdir(parents=True)
+    tiny = target_dir / "mybinary"
+    tiny.write_bytes(b"hi")  # only 2 bytes
+
+    server._stash_artifacts(a)
+
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-1-my-feature"
+    assert not (stash_dir / "mybinary").exists(), "tiny file should have been skipped"
+
+
+def test_stash_artifacts_skips_dot_d_files(tmp_path: Path) -> None:
+    """.d suffix files (compiler dependency files) should always be skipped."""
+    server, a, wt_path = _make_done_assignment(tmp_path)
+
+    target_dir = wt_path / "target" / "debug"
+    target_dir.mkdir(parents=True)
+    dep_file = target_dir / "mybinary.d"
+    dep_file.write_bytes(b"dep " + b"x" * 200)  # large enough but .d suffix
+
+    server._stash_artifacts(a)
+
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-1-my-feature"
+    assert not (stash_dir / "mybinary.d").exists(), ".d file should have been skipped"
+
+
+def test_stash_artifacts_noop_for_failed_assignment(tmp_path: Path) -> None:
+    """FAILED assignments should not trigger any stash activity."""
+    from coord.agent import FAILED
+
+    server, a, wt_path = _make_done_assignment(tmp_path)
+    a.status = FAILED
+
+    target_dir = wt_path / "target" / "debug"
+    target_dir.mkdir(parents=True)
+    (target_dir / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    server._stash_artifacts(a)
+
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-1-my-feature"
+    assert not stash_dir.exists(), "stash dir should not have been created for FAILED"
+
+
+def test_stash_artifacts_noop_when_no_patterns(tmp_path: Path) -> None:
+    """No-op when the repo has no artifact_paths configured."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    wt_path = state_dir / "worktrees" / "asgn-xyz"
+    wt_path.mkdir(parents=True)
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["api"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"api": str(tmp_path / "repo")},
+        artifact_paths={},  # empty
+    )
+
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        branch="main",
+    )
+    a = AgentAssignment(id="asgn-xyz", spec=spec, status=DONE, branch="issue-1-t")
+    a.worktree_path = str(wt_path)
+
+    server._stash_artifacts(a)
+
+    stash_base = server.state_dir / "artifacts"
+    assert not stash_base.exists(), "no stash dir should be created when no patterns"
+
+
+def test_gc_artifacts_removes_old_directories(tmp_path: Path) -> None:
+    """_gc_artifacts should remove stash dirs older than ttl_days."""
+    import os
+    import time as _time
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    server = AgentServer(
+        machine_name="test",
+        repos=[],
+        state_dir=state_dir,
+        worker_command=lambda spec: [],
+    )
+
+    # Create an artifact stash dir and manually backdate its mtime
+    stash = state_dir / "artifacts" / "api" / "old-branch"
+    stash.mkdir(parents=True)
+    (stash / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    # Age the directory to 4 days ago (past the 3-day default TTL)
+    old_time = _time.time() - 4 * 86400
+    os.utime(stash, (old_time, old_time))
+
+    removed = server._gc_artifacts(ttl_days=3.0)
+    assert removed == 1
+    assert not stash.exists()
+
+
+def test_gc_artifacts_keeps_recent_directories(tmp_path: Path) -> None:
+    """_gc_artifacts must not remove stash dirs within the TTL window."""
+    import os
+    import time as _time
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    server = AgentServer(
+        machine_name="test",
+        repos=[],
+        state_dir=state_dir,
+        worker_command=lambda spec: [],
+    )
+
+    stash = state_dir / "artifacts" / "api" / "recent-branch"
+    stash.mkdir(parents=True)
+    (stash / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    # Age the directory to only 1 day ago (well within the 3-day TTL)
+    recent_time = _time.time() - 1 * 86400
+    os.utime(stash, (recent_time, recent_time))
+
+    removed = server._gc_artifacts(ttl_days=3.0)
+    assert removed == 0
+    assert stash.exists()
+
+
+def test_health_includes_artifact_bytes(tmp_path: Path) -> None:
+    """health() should include an artifact_bytes key."""
+    server = _server(tmp_path)
+    h = server.health()
+    assert "artifact_bytes" in h
+    assert isinstance(h["artifact_bytes"], int)
+    assert h["artifact_bytes"] == 0  # no stash yet
+
+
+def test_artifact_manifest_returns_none_when_missing(tmp_path: Path) -> None:
+    """artifact_manifest returns None when no stash dir exists."""
+    server = _server(tmp_path)
+    result = server.artifact_manifest("api", "issue-1-nonexistent")
+    assert result is None
+
+
+def test_artifact_manifest_returns_file_list(tmp_path: Path) -> None:
+    """artifact_manifest returns the correct manifest dict when files exist."""
+    server = _server(tmp_path)
+
+    # Manually create a stash directory
+    stash = server.state_dir / "artifacts" / "api" / "issue-1-my-feature"
+    stash.mkdir(parents=True)
+    (stash / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+    (stash / ".assignment_id").write_text("asgn-123")
+
+    manifest = server.artifact_manifest("api", "issue-1-my-feature")
+    assert manifest is not None
+    assert manifest["built_by_assignment_id"] == "asgn-123"
+    assert len(manifest["files"]) == 1
+    assert manifest["files"][0]["name"] == "mybinary"
+    assert manifest["total_bytes"] == manifest["files"][0]["size"]
+
+
+def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:
+    """_sanitize_branch should replace slashes with dashes."""
+    from coord.agent import _sanitize_branch
+
+    assert _sanitize_branch("feature/my-thing") == "feature-my-thing"
+    assert _sanitize_branch("issue-305-artifact-pull") == "issue-305-artifact-pull"
+    assert _sanitize_branch("refs/heads/main") == "refs-heads-main"

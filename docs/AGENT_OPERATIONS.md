@@ -194,3 +194,77 @@ for host in precision elitebook dellserver; do
   ssh $host '~/.coord-venv/bin/pip uninstall -y claude-coordinator && ~/.coord-venv/bin/pip install --upgrade claude-coordinator && systemctl --user restart coord-agent'
 done
 ```
+
+## Passwordless SSH between coordinator and agents
+
+`coord pull-artifact` rsyncs built binaries from the agent's
+`~/.coord/artifacts/` directory over SSH.  The coordinator machine must be
+able to `ssh <agent-host>` without a password prompt for rsync to work.
+
+### One-time setup (per coordinator→agent pair)
+
+**On the coordinator machine** (where you run `coord plan` / `coord pull-artifact`):
+
+```bash
+# 1. Generate a key if you don't already have one.
+ssh-keygen -t ed25519 -C "coord-coordinator" -f ~/.ssh/id_ed25519_coord
+# (or reuse an existing key — just make sure it isn't passphrase-protected,
+#  or add it to ssh-agent and keep ssh-agent running)
+
+# 2. Copy the public key to every agent machine.
+ssh-copy-id -i ~/.ssh/id_ed25519_coord.pub <agent-host>
+# e.g.:
+ssh-copy-id -i ~/.ssh/id_ed25519_coord.pub precision
+ssh-copy-id -i ~/.ssh/id_ed25519_coord.pub elitebook
+```
+
+**Verify:**
+
+```bash
+ssh precision true && echo "OK"
+```
+
+No password prompt → you're done.
+
+### First-time accept (StrictHostKeyChecking)
+
+On the very first SSH to a new agent, the client may prompt:
+
+```
+The authenticity of host 'precision' can't be established.
+Are you sure you want to continue connecting (yes/no/[fingerprint])?
+```
+
+Accept once (`yes`) or pre-accept all coordinator-managed hosts so
+unattended `coord pull-artifact` calls never stall:
+
+```bash
+# Option A: accept once interactively (safest)
+ssh precision true
+
+# Option B: add StrictHostKeyChecking=accept-new to ~/.ssh/config
+# so the first connection auto-accepts but rejects changed keys.
+cat >> ~/.ssh/config <<'EOF'
+
+Host precision elitebook dellserver
+    StrictHostKeyChecking accept-new
+EOF
+```
+
+### Required file permissions
+
+SSH is strict about key file modes.  If `ssh-copy-id` created the key,
+permissions are already correct.  If you manage keys manually:
+
+```bash
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/id_ed25519_coord
+chmod 644 ~/.ssh/id_ed25519_coord.pub
+chmod 600 ~/.ssh/authorized_keys   # on each agent
+```
+
+### Design context
+
+For background on why rsync-over-SSH was chosen over direct HTTP download
+(signed URL vs key-auth tradeoffs, GC behaviour, TTL defaults), see the
+original design in [GitHub issue #305](https://github.com/JDonaghy/claude-coordinator/issues/305).

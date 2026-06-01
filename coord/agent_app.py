@@ -377,6 +377,34 @@ def build_app(
         threading.Thread(target=_do_update, daemon=False, name="agent-update").start()
         return JSONResponse({"status": "updating", "mode": mode}, status_code=202)
 
+    async def artifact_manifest(request: Request) -> JSONResponse:
+        """Return a JSON manifest of stashed artifacts for a (repo, branch) pair.
+
+        Path parameters:
+            repo   — repo name (e.g. ``quadraui``)
+            branch — sanitized branch name (slashes already replaced with
+                     dashes, e.g. ``issue-305-artifact-pull``)
+
+        Response (200)::
+
+            {
+                "files": [{"name": "...", "size": N, "mtime": N}, ...],
+                "total_bytes": N,
+                "built_by_assignment_id": "abc123" | null
+            }
+
+        Returns 404 when no stash exists for the given (repo, branch) pair.
+        """
+        repo = request.path_params["repo"]
+        branch = request.path_params["branch"]
+        manifest = server.artifact_manifest(repo, branch)
+        if manifest is None:
+            return JSONResponse(
+                {"error": f"no artifacts for repo={repo!r} branch={branch!r}"},
+                status_code=404,
+            )
+        return JSONResponse(manifest)
+
     async def worktree_clean(request: Request) -> JSONResponse:
         """Remove stale git worktrees managed by this agent.
 
@@ -476,5 +504,7 @@ def build_app(
         Route("/update", update, methods=["POST"]),
         Route("/restart", restart, methods=["POST"]),
         Route("/worktree-clean", worktree_clean, methods=["POST"]),
+        # #305: artifact stash manifest (GET /artifact/<repo>/<branch>)
+        Route("/artifact/{repo}/{branch}", artifact_manifest, methods=["GET"]),
     ]
     return Starlette(routes=routes)
