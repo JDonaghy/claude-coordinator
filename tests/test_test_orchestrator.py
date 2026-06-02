@@ -510,6 +510,19 @@ class TestSetTestPlanBranchHead:
         set_test_plan("abc123", {"steps": [], "blockers": []}, branch_head="bbb")
         assert get_test_plan_branch_head("abc123") == "bbb"
 
+    def test_set_test_plan_none_clears_prior_branch_head(self, coord_db: sqlite3.Connection) -> None:
+        """If set_test_plan is called with branch_head=None after a previous SHA was
+        stored (e.g. git lookup fails during --refresh), the column must be reset to
+        NULL — not left holding the stale SHA."""
+        from coord.state import set_test_plan, get_test_plan_branch_head
+        _insert_assignment(coord_db)
+        set_test_plan("abc123", {"steps": [], "blockers": []}, branch_head="abc")
+        assert get_test_plan_branch_head("abc123") == "abc"  # precondition
+        set_test_plan("abc123", {"steps": [], "blockers": []}, branch_head=None)
+        assert get_test_plan_branch_head("abc123") is None, (
+            "branch_head=None should reset the column to NULL, not leave the old SHA"
+        )
+
     def test_get_test_plan_branch_head_missing_row(self, coord_db: sqlite3.Connection) -> None:
         """get_test_plan_branch_head returns None for unknown assignment IDs."""
         from coord.state import get_test_plan_branch_head

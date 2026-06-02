@@ -4080,7 +4080,7 @@ def test_plan_cmd(
     """Generate or display the smoke test plan for ASSIGNMENT_ID."""
     from coord.db import get_connection
     from coord.state import get_test_plan, set_test_plan
-    from coord.test_orchestrator import generate_plan, _find_local_repo_path
+    from coord.test_orchestrator import generate_plan, find_local_repo_path
 
     cfg = _load_config(config_path)
 
@@ -4111,7 +4111,7 @@ def test_plan_cmd(
             repo_name = row["repo_name"] if hasattr(row, "keys") else row[0]
             branch = (row["branch"] if hasattr(row, "keys") else row[1]) or ""
             if branch:
-                repo_path = _find_local_repo_path(repo_name, cfg)
+                repo_path = find_local_repo_path(repo_name, cfg)
                 if repo_path and repo_path.exists():
                     result = subprocess.run(
                         ["git", "-C", str(repo_path), "rev-parse", branch],

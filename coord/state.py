@@ -706,15 +706,13 @@ def set_test_plan(
     if not assignment_id:
         return
     conn = get_connection()
+    # Always write both columns together so test_plan_branch_head can never
+    # hold a stale SHA from a previous run when branch_head is None this time
+    # (e.g. git lookup failed during --refresh).
     conn.execute(
-        "UPDATE assignments SET test_plan=? WHERE assignment_id=?",
-        (json.dumps(plan), assignment_id),
+        "UPDATE assignments SET test_plan=?, test_plan_branch_head=? WHERE assignment_id=?",
+        (json.dumps(plan), branch_head, assignment_id),
     )
-    if branch_head is not None:
-        conn.execute(
-            "UPDATE assignments SET test_plan_branch_head=? WHERE assignment_id=?",
-            (branch_head, assignment_id),
-        )
     conn.commit()
 
 

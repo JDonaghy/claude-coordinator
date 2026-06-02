@@ -909,7 +909,13 @@ fn spawn_step_cmd(step_index: usize, cmd: &str) -> std::sync::mpsc::Receiver<Ste
                     (false, false) => format!("{}\n---\n{}", stdout.trim_end(), stderr.trim_end()),
                 };
                 let output = if raw.len() > 4096 {
-                    format!("{}…[truncated]", &raw[..4096])
+                    // Find the last valid char boundary at or before byte 4096 to
+                    // avoid panicking when a multi-byte character (emoji, box-drawing,
+                    // etc.) straddles the limit.
+                    let end = (0..=4096).rev()
+                        .find(|&i| raw.is_char_boundary(i))
+                        .unwrap_or(0);
+                    format!("{}…[truncated]", &raw[..end])
                 } else {
                     raw
                 };
@@ -25029,5 +25035,34 @@ mod tests {
         assert_eq!(states[0], TestStepState::Pending, "pull step state unchanged");
         assert_eq!(states[1], TestStepState::Running, "run step should be Running");
         assert_eq!(states[2], TestStepState::Pending, "verify step unchanged");
+    }
+
+    // ── #349 Phase B: spawn_step_cmd truncation ───────────────────────────────
+
+    #[test]
+    fn spawn_step_cmd_truncation_safe_at_multibyte_boundary() {
+        // Old code: `&raw[..4096]` panics when byte 4096 falls inside a multi-byte
+        // character.  New code uses `is_char_boundary` to find a safe cut point.
+        //
+        // Build a 4098-byte string: 4094 ASCII bytes followed by one 4-byte emoji
+        // (🎉 = U+1F389, UTF-8 bytes F0 9F 8E 89).  Byte 4096 falls inside the
+        // emoji — the old code would panic here; the new code should not.
+        let s: String = "a".repeat(4094) + "🎉";
+        assert_eq!(s.len(), 4098, "string should be 4098 bytes");
+        assert!(!s.is_char_boundary(4096), "byte 4096 should be mid-emoji");
+
+        // Mirror the fixed truncation logic.
+        let end = (0..=4096).rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0);
+        let result = format!("{}…[truncated]", &s[..end]);
+
+        // end should be 4094 (the boundary just before the emoji).
+        assert_eq!(end, 4094);
+        // The result should start with the 4094 'a' bytes and end with the marker.
+        assert!(result.starts_with(&"a".repeat(4094)));
+        assert!(result.ends_with("…[truncated]"));
+        // The emoji must NOT appear in the output (it was cut).
+        assert!(!result.contains('🎉'));
     }
 }

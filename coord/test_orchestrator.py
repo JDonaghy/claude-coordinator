@@ -228,7 +228,7 @@ def _get_issue_body(repo_github: str, issue_number: int) -> str:
     return ""
 
 
-def _find_local_repo_path(repo_name: str, config: Config) -> Path | None:
+def find_local_repo_path(repo_name: str, config: Config) -> Path | None:
     """Locate the repo on the local machine by matching against coordinator.yml.
 
     Tries the machine whose name or host prefix matches this machine's hostname
@@ -352,7 +352,7 @@ def generate_plan(
 
     # ── Read CLAUDE.md ────────────────────────────────────────────────────
     claude_md = ""
-    local_repo_dir = _find_local_repo_path(repo_name, config)
+    local_repo_dir = find_local_repo_path(repo_name, config)
     if local_repo_dir and local_repo_dir.exists():
         claude_md_path = local_repo_dir / "CLAUDE.md"
         try:
