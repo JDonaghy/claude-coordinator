@@ -4523,6 +4523,7 @@ impl CoordApp {
                     role: ChatRole::User,
                     text: StyledText::plain(text.clone()),
                     timestamp_unix: now,
+                    line_scales: Vec::new(),
                 };
                 if let Some(ctx) = self.watch_pool.get_mut(&aid) {
                     ctx.inject_transcript.push(turn);
@@ -4589,6 +4590,7 @@ impl CoordApp {
                 role: ChatRole::User,
                 text: StyledText::plain(text.clone()),
                 timestamp_unix: now,
+                line_scales: Vec::new(),
             };
             if let Some(ctx) = self.watch_pool.get_mut(&aid) {
                 ctx.inject_transcript.push(turn);
@@ -11932,26 +11934,26 @@ impl CoordApp {
             }
         };
         let num_str = num.to_string();
-        if !self.command_runner.spawn(&["refine-chat", &repo, &num_str]) {
-            self.push_toast(
-                "Another command is running",
-                "Wait for the current command to finish, then try again.",
-                ToastSeverity::Info,
-            );
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["refine-chat", &repo, &num_str]);
+        if outcome == SpawnQueuedOutcome::Deduped {
             return false;
         }
         // Arm the bind so the next tick that sees the new assignment row
-        // can open the chat overlay.
+        // can open the chat overlay.  Arm immediately regardless of whether
+        // the command started or was queued — the 30 s window is generous
+        // enough for any realistic queue depth.
         self.pending_refinement = Some(PendingRefinement {
             repo,
             issue_number: num,
             dispatched_at: Instant::now(),
         });
-        self.push_toast(
-            "Refine with chat",
-            &format!("#{}: starting refinement chat…", num),
-            ToastSeverity::Info,
-        );
+        let msg = if outcome == SpawnQueuedOutcome::Queued {
+            format!("#{}: refine-chat queued — will start after current command.", num)
+        } else {
+            format!("#{}: starting refinement chat…", num)
+        };
+        self.push_toast("Refine with chat", &msg, ToastSeverity::Info);
         true
     }
 
@@ -12257,25 +12259,24 @@ impl CoordApp {
             .map(|a| (a.issue_number, a.repo.clone()))
             .unwrap_or((0, String::new()));
 
-        if !self.command_runner.spawn(&["test-chat", &work_id]) {
-            self.push_toast(
-                "Another command is running",
-                "Wait for the current command to finish, then try again.",
-                ToastSeverity::Info,
-            );
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["test-chat", &work_id]);
+        if outcome == SpawnQueuedOutcome::Deduped {
             return false;
         }
+        // Arm immediately — the 30 s bind window covers any realistic queue wait.
         self.pending_test_chat = Some(PendingTestChat {
             repo: repo.clone(),
             work_assignment_id: work_id.clone(),
             issue_number,
             dispatched_at: Instant::now(),
         });
-        self.push_toast(
-            "Test chat",
-            &format!("#{}: starting test chat…", issue_number),
-            ToastSeverity::Info,
-        );
+        let msg = if outcome == SpawnQueuedOutcome::Queued {
+            format!("#{}: test-chat queued — will start after current command.", issue_number)
+        } else {
+            format!("#{}: starting test chat…", issue_number)
+        };
+        self.push_toast("Test chat", &msg, ToastSeverity::Info);
         true
     }
 
@@ -12846,15 +12847,21 @@ impl CoordApp {
             }
         };
         let num_str = num.to_string();
-        if self.command_runner.spawn(&[subcommand, &repo, &num_str]) {
-            let body = body_template.replace("{}", &num.to_string());
-            self.push_toast(toast_title, &body, ToastSeverity::Info);
-        } else {
-            self.push_toast(
-                "Another command is running",
-                "Wait for the current command to finish, then try again.",
-                ToastSeverity::Info,
-            );
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&[subcommand, &repo, &num_str]);
+        match outcome {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    toast_title,
+                    &format!("#{}: queued — will run after current command.", num),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                let body = body_template.replace("{}", &num.to_string());
+                self.push_toast(toast_title, &body, ToastSeverity::Info);
+            }
         }
         true
     }
@@ -12908,28 +12915,35 @@ impl CoordApp {
                     _ => return false,
                 };
                 let cmd = if action_id == "machine-pause" { "pause" } else { "unpause" };
-                if !self.command_runner.spawn(&[cmd, &name]) {
-                    self.push_toast(
-                        "Another command is running",
-                        "Wait for the current command to finish, then try again.",
-                        ToastSeverity::Info,
-                    );
-                    return false;
+                use crate::commands::SpawnQueuedOutcome;
+                let outcome = self.command_runner.spawn_queued(&[cmd, &name]);
+                match outcome {
+                    SpawnQueuedOutcome::Deduped => return false,
+                    SpawnQueuedOutcome::Queued => {
+                        let verb = if action_id == "machine-pause" { "pause" } else { "resume" };
+                        self.push_toast(
+                            "Machine routing",
+                            &format!("{}: {} queued — will run after current command.", name, verb),
+                            ToastSeverity::Info,
+                        );
+                    }
+                    SpawnQueuedOutcome::Started => {
+                        // Optimistic local update — the file write is fast and the
+                        // next periodic refresh re-reads to catch any concurrent
+                        // edits.  Without this the badge would lag by ~1 s.
+                        if action_id == "machine-pause" {
+                            self.paused_machines.insert(name.clone());
+                        } else {
+                            self.paused_machines.remove(&name);
+                        }
+                        let verb = if action_id == "machine-pause" { "paused" } else { "resumed" };
+                        self.push_toast(
+                            "Machine routing",
+                            &format!("{}: {}", name, verb),
+                            ToastSeverity::Info,
+                        );
+                    }
                 }
-                // Optimistic local update — the file write is fast and the
-                // next periodic refresh re-reads to catch any concurrent
-                // edits.  Without this the badge would lag by ~1 s.
-                if action_id == "machine-pause" {
-                    self.paused_machines.insert(name.clone());
-                } else {
-                    self.paused_machines.remove(&name);
-                }
-                let verb = if action_id == "machine-pause" { "paused" } else { "resumed" };
-                self.push_toast(
-                    "Machine routing",
-                    &format!("{}: {}", name, verb),
-                    ToastSeverity::Info,
-                );
                 true
             }
             // #261: Send to Pipeline — add the `coord` label so the
@@ -15112,18 +15126,23 @@ impl ShellApp for CoordApp {
                                     .and_then(|i| self.pipeline_issues.get(i))
                                     .map(|iss| iss.number)
                                     .unwrap_or(0);
-                                if self.command_runner.spawn(&args_ref) {
-                                    self.push_toast(
-                                        "Fix worker dispatched",
-                                        &format!("Fix worker dispatched for #{}", issue_num),
-                                        ToastSeverity::Info,
-                                    );
-                                } else {
-                                    self.push_toast(
-                                        "Another command is running",
-                                        "Wait for the current command to finish.",
-                                        ToastSeverity::Warning,
-                                    );
+                                use crate::commands::SpawnQueuedOutcome;
+                                match self.command_runner.spawn_queued(&args_ref) {
+                                    SpawnQueuedOutcome::Deduped => {}
+                                    SpawnQueuedOutcome::Queued => {
+                                        self.push_toast(
+                                            "Fix worker queued",
+                                            &format!("Fix worker queued for #{} — will dispatch after current command.", issue_num),
+                                            ToastSeverity::Info,
+                                        );
+                                    }
+                                    SpawnQueuedOutcome::Started => {
+                                        self.push_toast(
+                                            "Fix worker dispatched",
+                                            &format!("Fix worker dispatched for #{}", issue_num),
+                                            ToastSeverity::Info,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -16012,17 +16031,21 @@ impl ShellApp for CoordApp {
                                 let repo = issue.coord_repo.clone().unwrap();
                                 let num = issue.number;
                                 let num_str = num.to_string();
-                                if self.command_runner.spawn(&["ready", &repo, &num_str]) {
-                                    self.pipeline_status = Some((
-                                        format!("#{}: marking ready", num),
-                                        Instant::now(),
-                                    ));
-                                } else {
-                                    self.push_toast(
-                                        "Another command is running",
-                                        "Wait for the current command to finish before pressing r.",
-                                        ToastSeverity::Info,
-                                    );
+                                use crate::commands::SpawnQueuedOutcome;
+                                match self.command_runner.spawn_queued(&["ready", &repo, &num_str]) {
+                                    SpawnQueuedOutcome::Deduped => {}
+                                    SpawnQueuedOutcome::Queued => {
+                                        self.pipeline_status = Some((
+                                            format!("#{}: ready queued", num),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                    SpawnQueuedOutcome::Started => {
+                                        self.pipeline_status = Some((
+                                            format!("#{}: marking ready", num),
+                                            Instant::now(),
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -16770,6 +16793,7 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
                 ctx.state.issue_number
             )),
             timestamp_unix: None,
+            line_scales: Vec::new(),
         });
     }
     let mut user_idx = 0usize;
@@ -16805,6 +16829,7 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
             role: ChatRole::Assistant,
             text: StyledText { spans: md_spans },
             timestamp_unix: None,
+            line_scales: Vec::new(),
         });
     }
     // Tail: any user turns submitted *after* the last SSE line we've seen
