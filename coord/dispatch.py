@@ -74,6 +74,12 @@ def dispatch(
     if proposal.type == "work" and repo is not None:
         artifact_paths = list(repo.artifact_paths)
 
+    # #352: resolve new-issue guidance for new-issue-chat assignments.
+    new_issue_guidance: str = ""
+    if proposal.type == "new-issue-chat" and repo is not None:
+        from pathlib import Path
+        new_issue_guidance = repo.resolve_new_issue_guidance(Path(repo_path).expanduser())
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
         "repo_name": proposal.repo_name,
@@ -94,6 +100,10 @@ def dispatch(
     # self.artifact_paths (startup config).
     if artifact_paths:
         payload["artifact_paths"] = artifact_paths
+    # #352: only send new_issue_guidance when non-empty — older agents don't
+    # have this field and will reject the payload with a 400.
+    if new_issue_guidance:
+        payload["new_issue_guidance"] = new_issue_guidance
     # Only send fresh_branch when True — older agents don't have this field
     # and will reject the payload with a 400.
     if fresh_branch:

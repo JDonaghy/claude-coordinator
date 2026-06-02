@@ -266,6 +266,8 @@ class AssignmentSpec:
     branch: str | None = None
     pull_repos: list[str] = field(default_factory=list)
     artifact_paths: list[str] = field(default_factory=list)
+    # #352: per-repo new-issue guidance (only for type="new-issue-chat").
+    new_issue_guidance: str = ""
     # "work" (default) or "review". The agent treats both the same — what
     # differs is the briefing and (for reviewers) the system prompt.
     type: str = "work"
@@ -651,6 +653,16 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # so the coordinator's TUI handles the actual gh submission.
         system_prompt = spec.system_prompt if spec.system_prompt else NEW_ISSUE_CHAT_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(NEW_ISSUE_CHAT_DENY_COMMANDS)
+        # #352: append per-repo new-issue guidance when provided.
+        if spec.new_issue_guidance:
+            system_prompt += (
+                "\n\nThe user's repo has the following guidance for new-issue drafts. "
+                "Follow it: ask focused questions matched to the required sections, "
+                "then produce a finalised issue body using the same structure. "
+                "Do not invent sections that aren't there; do not omit required sections "
+                "(mark them `(TBD)` if the conversation hasn't covered them yet).\n\n"
+                + spec.new_issue_guidance
+            )
         allowed_tools = "Read,Bash"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT

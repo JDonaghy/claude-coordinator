@@ -349,3 +349,121 @@ class TestArtifactPaths:
         dispatch(p, cfg)
         payload = mock_post.call_args.kwargs["json"]
         assert "artifact_paths" not in payload
+
+
+class TestNewIssueGuidance:
+    """#352: new_issue_guidance flows from repo config through dispatch payload."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_new_issue_guidance_for_new_issue_chat(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Dispatch payload for a new-issue-chat proposal should include
+        the repo's resolved new_issue_guidance so the agent can include it
+        in the system prompt."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        guidance = "Required sections: Title, Description, Acceptance Criteria"
+        cfg = Config(
+            repos=[Repo(
+                name="api",
+                github="acme/api",
+                new_issue_guidance=guidance,
+            )],
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=0,
+            issue_title="(new issue draft)",
+            rationale="new-issue-chat",
+            type="new-issue-chat",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["new_issue_guidance"] == guidance
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_includes_default_guidance_when_not_configured(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """When the repo has no custom new_issue_guidance, the payload includes
+        the default guidance string provided by resolve_new_issue_guidance."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],  # no new_issue_guidance
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=0,
+            issue_title="(new issue draft)",
+            rationale="new-issue-chat",
+            type="new-issue-chat",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        # resolve_new_issue_guidance returns a default when not configured
+        assert payload["new_issue_guidance"] == (
+            "Required sections: "
+            "Title (active voice, ≤80 chars), "
+            "What (1-3 sentences), "
+            "Acceptance (bulleted, observable), "
+            "Out of scope"
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_excludes_new_issue_guidance_for_work_assignment(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Dispatch payload for a work proposal should not include
+        new_issue_guidance — it's only for new-issue-chat type."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        guidance = "Required sections: Title, Description, Acceptance Criteria"
+        cfg = Config(
+            repos=[Repo(
+                name="api",
+                github="acme/api",
+                new_issue_guidance=guidance,
+            )],
+            machines=[Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        p = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=10,
+            issue_title="Fix bug",
+            rationale="fix",
+            type="work",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "new_issue_guidance" not in payload

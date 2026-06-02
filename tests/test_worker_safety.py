@@ -326,3 +326,61 @@ class TestWorkerPermissionsConfigDataclass:
         )
         assert wp.allow == ["Bash(npm install)"]
         assert wp.deny == ["Bash(rm -rf *)"]
+
+
+# ── new_issue_guidance in system prompt ────────────────────────────────────
+
+
+class TestNewIssueGuidanceSystemPrompt:
+    """#352: new_issue_guidance is included in system prompt for new-issue-chat."""
+
+    def test_new_issue_chat_system_prompt_includes_guidance_when_provided(self) -> None:
+        """When spec.new_issue_guidance is non-empty, it's appended to the
+        NEW_ISSUE_CHAT_SYSTEM_PROMPT."""
+        guidance = "Required sections: Title, Description, Acceptance Criteria"
+        spec = _spec(
+            type="new-issue-chat",
+            new_issue_guidance=guidance,
+        )
+        argv = default_worker_command(spec)
+        idx = argv.index("--system-prompt")
+        system_prompt = argv[idx + 1]
+
+        # The base prompt should be there.
+        assert "new-issue assistant" in system_prompt
+        # The guidance should be appended.
+        assert guidance in system_prompt
+        # The guidance header should be there.
+        assert "repo has the following guidance" in system_prompt
+
+    def test_new_issue_chat_system_prompt_omits_guidance_when_empty(self) -> None:
+        """When spec.new_issue_guidance is empty, the system prompt has no
+        guidance block."""
+        spec = _spec(
+            type="new-issue-chat",
+            new_issue_guidance="",  # explicitly empty
+        )
+        argv = default_worker_command(spec)
+        idx = argv.index("--system-prompt")
+        system_prompt = argv[idx + 1]
+
+        # The base prompt should be there.
+        assert "new-issue assistant" in system_prompt
+        # The guidance header should NOT be there.
+        assert "repo has the following guidance" not in system_prompt
+
+    def test_new_issue_chat_system_prompt_has_deny_list(self) -> None:
+        """Even with guidance, NEW_ISSUE_CHAT still includes its deny list."""
+        guidance = "Some guidance text"
+        spec = _spec(
+            type="new-issue-chat",
+            new_issue_guidance=guidance,
+        )
+        argv = default_worker_command(spec)
+        idx = argv.index("--system-prompt")
+        system_prompt = argv[idx + 1]
+
+        # Both the deny list and guidance should be present.
+        assert "FORBIDDEN COMMANDS" in system_prompt
+        assert guidance in system_prompt
+        assert "gh issue create" in system_prompt
