@@ -240,6 +240,10 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # NULL = not yet generated.  Set by `coord test-plan` and read back
         # by the CLI (cache hit) and eventually by the TUI (Phase B).
         "ALTER TABLE assignments ADD COLUMN test_plan TEXT",
+        # #349 Phase B: branch HEAD SHA at the time `coord test-plan` cached
+        # the plan.  Used by the TUI to detect when the branch has advanced
+        # and the plan needs refreshing.  NULL = not captured yet.
+        "ALTER TABLE assignments ADD COLUMN test_plan_branch_head TEXT",
     ]
     for sql in migrations:
         try:

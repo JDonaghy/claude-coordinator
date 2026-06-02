@@ -685,13 +685,21 @@ def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     conn.commit()
 
 
-def set_test_plan(assignment_id: str, plan: dict) -> None:
-    """#342 Phase A: persist a generated smoke-test plan on the assignment row.
+def set_test_plan(
+    assignment_id: str,
+    plan: dict,
+    branch_head: str | None = None,
+) -> None:
+    """#342 Phase A / #349 Phase B: persist a generated smoke-test plan.
 
     ``plan`` must be a valid plan dict (keys ``steps`` and ``blockers``).
     Stored as JSON-encoded TEXT in the ``test_plan`` column.  Silently
     no-ops when the row doesn't exist — matches the pattern used by the
     other ``update_assignment_*`` helpers.
+
+    ``branch_head`` (#349 Phase B): optional SHA of the branch HEAD when
+    the plan was generated.  Written to ``test_plan_branch_head`` so the
+    TUI can detect stale plans when the branch is updated.
 
     Idempotent: calling again with a new plan overwrites the previous value.
     """
@@ -702,7 +710,31 @@ def set_test_plan(assignment_id: str, plan: dict) -> None:
         "UPDATE assignments SET test_plan=? WHERE assignment_id=?",
         (json.dumps(plan), assignment_id),
     )
+    if branch_head is not None:
+        conn.execute(
+            "UPDATE assignments SET test_plan_branch_head=? WHERE assignment_id=?",
+            (branch_head, assignment_id),
+        )
     conn.commit()
+
+
+def get_test_plan_branch_head(assignment_id: str) -> str | None:
+    """#349 Phase B: return the branch HEAD SHA stored alongside the plan.
+
+    Returns ``None`` when the row doesn't exist, the column is NULL (plan
+    was generated before Phase B), or the assignment ID is empty.
+    """
+    if not assignment_id:
+        return None
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT test_plan_branch_head FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = row["test_plan_branch_head"] if hasattr(row, "keys") else row[0]
+    return raw if raw else None
 
 
 def get_test_plan(assignment_id: str) -> dict | None:

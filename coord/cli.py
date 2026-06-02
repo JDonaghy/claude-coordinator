@@ -4078,8 +4078,9 @@ def test_plan_cmd(
     config_path: Path,
 ) -> None:
     """Generate or display the smoke test plan for ASSIGNMENT_ID."""
+    from coord.db import get_connection
     from coord.state import get_test_plan, set_test_plan
-    from coord.test_orchestrator import generate_plan
+    from coord.test_orchestrator import generate_plan, _find_local_repo_path
 
     cfg = _load_config(config_path)
 
@@ -4098,9 +4099,32 @@ def test_plan_cmd(
     )
     plan = generate_plan(assignment_id, cfg, model=model)
 
+    # ── Resolve branch HEAD for stale-plan detection (#349 Phase B) ──────
+    branch_head: str | None = None
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT repo_name, branch FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        if row:
+            repo_name = row["repo_name"] if hasattr(row, "keys") else row[0]
+            branch = (row["branch"] if hasattr(row, "keys") else row[1]) or ""
+            if branch:
+                repo_path = _find_local_repo_path(repo_name, cfg)
+                if repo_path and repo_path.exists():
+                    result = subprocess.run(
+                        ["git", "-C", str(repo_path), "rev-parse", branch],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if result.returncode == 0:
+                        branch_head = result.stdout.strip() or None
+    except Exception:  # noqa: BLE001
+        pass  # branch_head is best-effort; missing is fine
+
     # Persist (always, even the fallback — so a subsequent call without
     # --refresh shows the cached result rather than hitting Claude again).
-    set_test_plan(assignment_id, plan)
+    set_test_plan(assignment_id, plan, branch_head=branch_head)
 
     click.echo(json.dumps(plan, indent=2))
 

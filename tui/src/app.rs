@@ -773,6 +773,236 @@ struct ArtifactCacheEntry {
     manifest: Option<ArtifactManifest>,
 }
 
+// ─── #349 Phase B: smoke-test plan types ─────────────────────────────────────
+
+/// #349 Phase B: one step from the AI-generated smoke test plan.
+/// Mirrors the Python shape: `{"kind":..., "cmd":..., "label":..., "check":...}`.
+#[derive(Clone, Debug)]
+struct TestStep {
+    kind: String,           // "pull" | "run" | "verify"
+    cmd: Option<String>,
+    label: Option<String>,
+    check: Option<String>,
+}
+
+/// #349 Phase B: parsed smoke-test plan.  Mirrors Python's `generate_plan` shape:
+/// `{"steps":[...], "blockers":[...]}`.
+#[derive(Clone, Debug)]
+struct TestPlan {
+    steps: Vec<TestStep>,
+    blockers: Vec<String>,
+}
+
+/// #349 Phase B: per-step execution state in the test-chat overlay.
+#[derive(Clone, Debug, PartialEq)]
+enum TestStepState {
+    Pending,
+    Running,
+    Passed,   // cmd exited 0
+    Failed,   // cmd exited non-0
+    Checked,  // verify step acknowledged by the user
+}
+
+/// #349 Phase B: overlay state for the test-plan chat.
+/// Present while a test-chat inject_chat overlay is open.
+struct TestPlanOverlayState {
+    /// Assignment id of the WORK assignment that produced the plan.
+    work_assignment_id: String,
+    repo: String,
+    issue_number: u64,
+    issue_title: String,
+    branch: Option<String>,
+    machine: String,
+    plan: Option<TestPlan>,
+    /// Index-parallel with `plan.steps` — tracks each step's progress.
+    step_states: Vec<TestStepState>,
+    /// `test_plan_branch_head` from DB when the overlay opened — used for
+    /// stale-plan detection.  `None` when the column was NULL.
+    #[allow(dead_code)]
+    branch_head_from_db: Option<String>,
+    /// Set while `coord test-plan` is running via CommandRunner so we don't
+    /// double-spawn the plan fetch.
+    plan_fetch_pending: bool,
+}
+
+/// #349 Phase B: result returned by `spawn_step_cmd`.
+struct StepCmdResult {
+    step_index: usize,
+    exit_code: i32,
+    output: String,
+}
+
+/// #349 Phase B: parse the `test_plan` JSON column value into a `TestPlan`.
+/// Returns `None` on malformed JSON, missing keys, or wrong types.
+/// Extra keys on step objects are silently ignored (forward-compatibility).
+fn parse_test_plan_json(raw: &str) -> Option<TestPlan> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let steps_arr = v.get("steps")?.as_array()?;
+    let mut steps = Vec::with_capacity(steps_arr.len());
+    for s in steps_arr {
+        let kind = s.get("kind")?.as_str()?.to_string();
+        steps.push(TestStep {
+            kind,
+            cmd:   s.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            label: s.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            check: s.get("check").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        });
+    }
+    let blockers: Vec<String> = v.get("blockers")
+        .and_then(|b| b.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(TestPlan { steps, blockers })
+}
+
+/// #349 Phase B: open a read-only DB connection and query `test_plan` +
+/// `test_plan_branch_head` for a work assignment.  Returns `(plan_json, branch_head)`.
+/// Both are `None` on error, missing row, or NULL column.
+fn read_test_plan_from_db(work_id: &str) -> (Option<String>, Option<String>) {
+    let db_path = coord_dir().join("coord.db");
+    let conn = match Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    conn.query_row(
+        "SELECT test_plan, test_plan_branch_head FROM assignments WHERE assignment_id = ?1",
+        rusqlite::params![work_id],
+        |row| {
+            let plan: Option<String> = row.get(0)?;
+            let head: Option<String> = row.get(1)?;
+            Ok((plan, head))
+        },
+    ).unwrap_or((None, None))
+}
+
+/// #349 Phase B: spawn a background thread that runs `sh -c <cmd>` and captures
+/// combined stdout + stderr.  Delivers a `StepCmdResult` to the returned receiver.
+/// Output is capped at 4 KB to avoid flooding the chat with very verbose tools.
+fn spawn_step_cmd(step_index: usize, cmd: &str) -> std::sync::mpsc::Receiver<StepCmdResult> {
+    let cmd = cmd.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::process::{Command, Stdio};
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        let result = match out {
+            Ok(o) => {
+                let exit_code = o.status.code().unwrap_or(-1);
+                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                let raw = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+                    (true, true)   => "(no output)".to_string(),
+                    (false, true)  => stdout,
+                    (true, false)  => stderr,
+                    (false, false) => format!("{}\n---\n{}", stdout.trim_end(), stderr.trim_end()),
+                };
+                let output = if raw.len() > 4096 {
+                    format!("{}…[truncated]", &raw[..4096])
+                } else {
+                    raw
+                };
+                StepCmdResult { step_index, exit_code, output }
+            }
+            Err(e) => StepCmdResult {
+                step_index,
+                exit_code: -1,
+                output: format!("spawn error: {}", e),
+            },
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+/// #349 Phase B: format a `TestPlan` into the multi-line system message rendered
+/// at the top of the test-chat overlay.  Steps are numbered for `run`/`verify`
+/// ([1]–[9]); the `pull` step gets `[a]`.
+///
+/// `artifact_info` is `Some((file_count, machine_name))` when the artifact badge
+/// cache has a non-empty manifest for this assignment.
+fn format_test_plan_message(
+    plan: &TestPlan,
+    step_states: &[TestStepState],
+    repo: &str,
+    issue_number: u64,
+    issue_title: &str,
+    artifact_info: Option<(usize, &str)>,
+) -> String {
+    let title_frag: String = issue_title.chars().take(50).collect();
+    let mut out = format!(
+        "SMOKE TEST PLAN — {} #{} ({})\n",
+        repo, issue_number, title_frag
+    );
+
+    if !plan.blockers.is_empty() {
+        out.push('\n');
+        out.push_str("  ⚠ Blockers:\n");
+        for b in &plan.blockers {
+            out.push_str(&format!("    - {}\n", b));
+        }
+    }
+
+    out.push('\n');
+    let mut run_step_num = 0usize;
+    for (i, step) in plan.steps.iter().enumerate() {
+        let state = step_states.get(i).unwrap_or(&TestStepState::Pending);
+        let marker = match state {
+            TestStepState::Pending          => " ",
+            TestStepState::Running          => "⏳",
+            TestStepState::Passed
+            | TestStepState::Checked        => "✓",
+            TestStepState::Failed           => "✗",
+        };
+        match step.kind.as_str() {
+            "pull" => {
+                let label = step.label.as_deref().unwrap_or("Pull built binaries");
+                if let Some((count, machine)) = artifact_info {
+                    out.push_str(&format!(
+                        "  [a] {} {}   📦 {} file{} on {}\n",
+                        marker, label, count,
+                        if count == 1 { "" } else { "s" },
+                        machine
+                    ));
+                } else {
+                    out.push_str(&format!("  [a] {} {}\n", marker, label));
+                }
+            }
+            "run" | "verify" => {
+                run_step_num += 1;
+                let description = if step.kind == "verify" {
+                    let check = step.check.as_deref()
+                        .or(step.label.as_deref())
+                        .unwrap_or("(verify)");
+                    format!("(verify) {}", check)
+                } else {
+                    step.cmd.as_deref()
+                        .or(step.label.as_deref())
+                        .unwrap_or("(run)")
+                        .to_string()
+                };
+                out.push_str(&format!("  [{}] {} {}\n", run_step_num, marker, description));
+            }
+            _ => {}
+        }
+    }
+
+    out.push('\n');
+    out.push_str("Press a key to run a step, or type to chat.");
+    out
+}
+
 /// #336: Sanitize a git branch name for use as a URL path component.
 ///
 /// Mirrors Python's `coord.agent._sanitize_branch`: replaces runs of
@@ -3598,6 +3828,18 @@ pub struct CoordApp {
     /// Contains `(work_id, repo, sanitized_branch)` so we can show the
     /// destination path in a completion toast.
     pending_artifact_pull: Option<(String, String, String)>,
+    /// #349 Phase B: test-plan overlay state.  `Some` while a test-chat
+    /// inject_chat overlay is open; `None` otherwise.  Cleared whenever
+    /// inject_chat is closed.
+    test_plan_state: Option<TestPlanOverlayState>,
+    /// #349 Phase B: in-flight step command.  Set when the user presses a
+    /// 1–9 key in the test-chat overlay to run the corresponding step's cmd.
+    /// Delivers a `StepCmdResult` on completion.
+    step_cmd_rx: Option<std::sync::mpsc::Receiver<StepCmdResult>>,
+    /// #349 Phase B: true while `coord test-plan <id>` (or `--refresh`) is
+    /// running via CommandRunner — prevents double-spawning the plan fetch
+    /// on subsequent render ticks.
+    test_plan_cmd_pending: bool,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -3775,6 +4017,9 @@ impl CoordApp {
             artifact_cache: std::collections::HashMap::new(),
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
+            test_plan_state: None,
+            step_cmd_rx: None,
+            test_plan_cmd_pending: false,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -4015,6 +4260,9 @@ impl CoordApp {
     fn close_watch(&mut self) {
         self.watch_focused = None;
         self.inject_chat = None;
+        // #349 Phase B: clear test-plan overlay state when any chat closes.
+        self.test_plan_state = None;
+        self.step_cmd_rx = None;
     }
 
     /// True when the Pipeline view's Log tab is the active scroller.  On this
@@ -6866,6 +7114,161 @@ impl CoordApp {
             .map(|w| w.issue_number == 0)
             .unwrap_or(false)
     }
+
+    // ── #349 Phase B: test-plan overlay helpers ──────────────────────────────
+
+    /// #349 Phase B: true when the current inject_chat overlay is a test-chat session.
+    fn chat_is_test_chat(&self) -> bool {
+        if self.inject_chat.is_none() {
+            return false;
+        }
+        self.focused_watch_state()
+            .map(|w| w.assignment_type == "test-chat")
+            .unwrap_or(false)
+    }
+
+    /// #349 Phase B: reload the test plan from the DB into `test_plan_state`.
+    /// Called when `coord test-plan` or `coord test-plan --refresh` completes.
+    /// Clears `chat_transcript_cache_key` so the plan message rebuilds on the
+    /// next tick.
+    fn reload_test_plan_from_db(&mut self) {
+        let work_id = match &self.test_plan_state {
+            Some(s) => s.work_assignment_id.clone(),
+            None => return,
+        };
+        let (plan_json, _head) = read_test_plan_from_db(&work_id);
+        if let Some(state) = &mut self.test_plan_state {
+            state.plan = plan_json.as_deref().and_then(parse_test_plan_json);
+            let n = state.plan.as_ref().map(|p| p.steps.len()).unwrap_or(0);
+            state.step_states = vec![TestStepState::Pending; n];
+            state.plan_fetch_pending = false;
+        }
+        self.chat_transcript_cache_key = None;
+    }
+
+    /// #349 Phase B: invoke the pull-artifact logic shared between the top-level
+    /// `[a]` handler and the test-chat overlay shortcut.  Returns true when a
+    /// `coord pull-artifact` command was successfully spawned.
+    fn do_pull_artifact(&mut self) -> bool {
+        if self.command_runner.is_running() {
+            self.push_toast(
+                "Pull artifacts",
+                "Another command is running — try again in a moment.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        }
+        if let Some((_, repo, sanitized, work_id)) = self.artifact_fetch_target() {
+            self.pending_artifact_pull = Some((work_id.clone(), repo, sanitized));
+            self.command_runner.spawn(&["pull-artifact", &work_id]);
+            self.pipeline_status = Some(("Pulling artifacts…".into(), Instant::now()));
+            return true;
+        }
+        false
+    }
+
+    /// #349 Phase B: build the multi-line plan system message for the
+    /// test-chat overlay.  Incorporates step states and artifact cache info.
+    fn build_test_plan_system_message(&self, plan_state: &TestPlanOverlayState) -> String {
+        let plan = match &plan_state.plan {
+            Some(p) => p,
+            None => {
+                return if plan_state.plan_fetch_pending {
+                    "Preparing plan…".to_string()
+                } else {
+                    "Smoke test plan unavailable.\nType to chat about the change.".to_string()
+                };
+            }
+        };
+        // Check the artifact cache for a non-empty manifest.
+        let artifact_info = if let Some(branch) = &plan_state.branch {
+            let key = (plan_state.repo.clone(), sanitize_branch(branch));
+            self.artifact_cache
+                .get(&key)
+                .and_then(|e| e.manifest.as_ref())
+                .filter(|m| !m.files.is_empty())
+                .map(|m| (m.files.len(), plan_state.machine.as_str()))
+        } else {
+            None
+        };
+        format_test_plan_message(
+            plan,
+            &plan_state.step_states,
+            &plan_state.repo,
+            plan_state.issue_number,
+            &plan_state.issue_title,
+            artifact_info,
+        )
+    }
+
+    /// #349 Phase B: handle a 1–9 keypress in the test-chat overlay.
+    /// `key_index` is 0-indexed (key '1' → 0, '9' → 8) and counts only over
+    /// the non-pull steps in the plan (run + verify kinds).
+    fn handle_test_plan_step_key(&mut self, key_index: usize) -> bool {
+        // Disallow while a step is already running.
+        if self.step_cmd_rx.is_some() {
+            self.push_toast(
+                "Step running",
+                "A step is already in progress — wait for it to finish.",
+                ToastSeverity::Info,
+            );
+            return false;
+        }
+        // Collect run/verify steps (non-pull) with their original indices.
+        let plan_ref: Option<&TestPlan> = self.test_plan_state.as_ref()
+            .and_then(|s| s.plan.as_ref());
+        let Some(plan) = plan_ref else { return false; };
+        let runnable: Vec<(usize, String, String, Option<String>)> = plan.steps.iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind != "pull")
+            .map(|(i, s)| (i, s.kind.clone(), s.cmd.clone().unwrap_or_default(), s.check.clone().or(s.label.clone())))
+            .collect();
+        let Some((step_idx, kind, cmd, check_label)) = runnable.get(key_index).cloned() else {
+            return false;
+        };
+
+        match kind.as_str() {
+            "verify" => {
+                // Mark verified — no command to run.
+                if let Some(ref mut state) = self.test_plan_state {
+                    if let Some(st) = state.step_states.get_mut(step_idx) {
+                        *st = TestStepState::Checked;
+                    }
+                }
+                let label = check_label.unwrap_or_else(|| "verified".to_string());
+                if let Some(ref mut chat) = self.inject_chat {
+                    chat.push_turn(ChatRole::System, StyledText::plain(
+                        format!("✓ Marked verified: {}", label)
+                    ));
+                }
+                self.chat_transcript_cache_key = None;
+                true
+            }
+            "run" if !cmd.is_empty() => {
+                // Mark running, spawn background command.
+                if let Some(ref mut state) = self.test_plan_state {
+                    if let Some(st) = state.step_states.get_mut(step_idx) {
+                        *st = TestStepState::Running;
+                    }
+                }
+                let rx = spawn_step_cmd(step_idx, &cmd);
+                self.step_cmd_rx = Some(rx);
+                if let Some(ref mut chat) = self.inject_chat {
+                    chat.push_turn(ChatRole::System, StyledText::plain(
+                        format!("▶ Running: {}", cmd)
+                    ));
+                }
+                self.chat_transcript_cache_key = None;
+                true
+            }
+            _ => {
+                self.push_toast("No command", "This step has no cmd field.", ToastSeverity::Info);
+                false
+            }
+        }
+    }
+
+    // ── end #349 Phase B helpers ──────────────────────────────────────────────
 
     /// #264: True when any `type="refinement"` assignment is currently
     /// running on the selected pipeline issue.  Drives the Refinement
@@ -12326,6 +12729,80 @@ impl CoordApp {
             ),
             ToastSeverity::Info,
         );
+
+        // ── #349 Phase B: initialize test-plan overlay state ────────────────
+        {
+            let work_id = pending.work_assignment_id.clone();
+            // Look up the work assignment for branch/machine info.
+            let work_asg = self.data.assignments.iter()
+                .find(|a| a.id == work_id)
+                .cloned();
+            let (branch, machine, issue_title) = work_asg
+                .as_ref()
+                .map(|a| (a.branch.clone(), a.machine.clone(), a.issue_title.clone()))
+                .unwrap_or_default();
+
+            // Read plan + branch_head from DB (targeted query, not main load path).
+            let (plan_json, branch_head_from_db) = read_test_plan_from_db(&work_id);
+            let plan = plan_json.as_deref().and_then(parse_test_plan_json);
+            let step_count = plan.as_ref().map(|p| p.steps.len()).unwrap_or(0);
+
+            let mut overlay = TestPlanOverlayState {
+                work_assignment_id: work_id.clone(),
+                repo: pending.repo.clone(),
+                issue_number: pending.issue_number,
+                issue_title: issue_title.clone(),
+                branch: branch.clone(),
+                machine: machine.clone(),
+                plan,
+                step_states: vec![TestStepState::Pending; step_count],
+                branch_head_from_db: branch_head_from_db.clone(),
+                plan_fetch_pending: false,
+            };
+
+            // If no plan exists, schedule a fetch via CommandRunner.
+            if overlay.plan.is_none() && !self.test_plan_cmd_pending {
+                if self.command_runner.spawn(&["test-plan", &work_id]) {
+                    self.test_plan_cmd_pending = true;
+                    overlay.plan_fetch_pending = true;
+                }
+            }
+
+            // Stale-plan detection: if we have a plan AND a branch_head from DB,
+            // try to resolve the current branch HEAD using the ~/src/<repo> heuristic.
+            // On mismatch, spawn `coord test-plan --refresh`.
+            if overlay.plan.is_some()
+                && !self.test_plan_cmd_pending
+                && branch_head_from_db.is_some()
+            {
+                if let (Some(head_db), Some(br)) = (branch_head_from_db.as_deref(), branch.as_deref()) {
+                    let repo_name = pending.repo.clone();
+                    let stale = std::env::var("HOME").ok()
+                        .map(|h| std::path::PathBuf::from(h).join("src").join(&repo_name))
+                        .filter(|p| p.exists())
+                        .and_then(|repo_path| {
+                            std::process::Command::new("git")
+                                .args(["-C", &repo_path.to_string_lossy().into_owned(), "rev-parse", br])
+                                .output()
+                                .ok()
+                        })
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .map(|current_head| current_head != head_db)
+                        .unwrap_or(false);
+
+                    if stale && self.command_runner.spawn(&["test-plan", "--refresh", &work_id]) {
+                        self.test_plan_cmd_pending = true;
+                        overlay.plan_fetch_pending = true;
+                    }
+                }
+            }
+
+            self.test_plan_state = Some(overlay);
+            // Invalidate cache so the plan message appears on the next tick.
+            self.chat_transcript_cache_key = None;
+        }
+
         true
     }
 
@@ -13736,6 +14213,7 @@ impl CoordApp {
             // #336: pull-artifact completion — show the local destination path.
             if let Some((work_id, repo, sanitized)) = &self.pending_artifact_pull.clone() {
                 if result.label.contains(&format!("pull-artifact {}", work_id)) {
+                    let work_id_clone = work_id.clone();
                     self.pending_artifact_pull = None;
                     if result.exit_code == 0 {
                         let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
@@ -13745,9 +14223,45 @@ impl CoordApp {
                             &format!("Saved to {path}"),
                             ToastSeverity::Info,
                         );
+                        // #349 Phase B: if a test-plan pull step matches, mark it done.
+                        let plan_matches = self.test_plan_state.as_ref()
+                            .map(|s| s.work_assignment_id == work_id_clone)
+                            .unwrap_or(false);
+                        if plan_matches {
+                            if let Some(ref plan_state) = self.test_plan_state {
+                                if let Some(ref plan) = plan_state.plan {
+                                    let pull_idx = plan.steps.iter()
+                                        .position(|s| s.kind == "pull");
+                                    if let Some(idx) = pull_idx {
+                                        if let Some(ref mut state) = self.test_plan_state {
+                                            if let Some(st) = state.step_states.get_mut(idx) {
+                                                *st = TestStepState::Passed;
+                                            }
+                                        }
+                                        self.chat_transcript_cache_key = None;
+                                    }
+                                }
+                            }
+                        }
                     }
                     // Non-zero exit: the generic failure toast from
                     // command_runner.poll() above already fired.
+                }
+            }
+            // #349 Phase B: coord test-plan / test-plan --refresh completed.
+            // Re-read the plan from DB and refresh the overlay.
+            if self.test_plan_cmd_pending && result.label.contains("test-plan") {
+                self.test_plan_cmd_pending = false;
+                let is_refresh = result.label.contains("--refresh");
+                self.reload_test_plan_from_db();  // also clears cache key
+                if is_refresh {
+                    // Surface a system message so the user knows the plan was updated.
+                    if let Some(ref mut chat) = self.inject_chat {
+                        chat.push_turn(
+                            ChatRole::System,
+                            StyledText::plain("Plan refreshed (branch updated)".to_string()),
+                        );
+                    }
                 }
             }
             // #290 recovery: a coord command just finished.  If this was a
@@ -13898,6 +14412,44 @@ impl CoordApp {
         // into the cache so the Test guidance block picks them up.
         if self.poll_pending_pr_fetches() {
             needs_redraw = true;
+        }
+
+        // #349 Phase B: poll the in-flight step command result.
+        // One step runs at a time; when it completes, update the step state
+        // and append the output as a system message to the test-chat transcript.
+        if self.step_cmd_rx.is_some() {
+            let step_result = if let Some(ref rx) = self.step_cmd_rx {
+                match rx.try_recv() {
+                    Ok(r) => Some(r),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Channel lost without delivering a result — treat as failure.
+                        Some(StepCmdResult { step_index: usize::MAX, exit_code: -1, output: "command channel disconnected".to_string() })
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(result) = step_result {
+                self.step_cmd_rx = None;
+                let (new_state, status_msg) = if result.exit_code == 0 {
+                    (TestStepState::Passed, format!("✓ Exit 0\n\n{}", result.output))
+                } else {
+                    (TestStepState::Failed, format!("✗ Exit {}\n\n{}", result.exit_code, result.output))
+                };
+                // Update step state.
+                if let Some(ref mut plan_state) = self.test_plan_state {
+                    if let Some(st) = plan_state.step_states.get_mut(result.step_index) {
+                        *st = new_state;
+                    }
+                }
+                // Append output as a system message.
+                if let Some(ref mut chat) = self.inject_chat {
+                    chat.push_turn(ChatRole::System, StyledText::plain(status_msg));
+                }
+                self.chat_transcript_cache_key = None;
+                needs_redraw = true;
+            }
         }
 
         // #336: Poll the in-flight artifact manifest fetch and populate cache.
@@ -14852,6 +15404,50 @@ impl ShellApp for CoordApp {
                         }
                     }
                 }
+                // #349 Phase B: test-chat overlay shortcuts — 1–9 (run step)
+                // and 'a' (pull artifacts).  Intercept only when the chat
+                // input is empty so normal typing is unaffected.
+                if self.chat_is_test_chat() {
+                    if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                        let input_empty = self.inject_chat.as_ref()
+                            .map(|c| c.input_text().is_empty())
+                            .unwrap_or(true);
+                        if input_empty && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd {
+                            // [a] → pull artifact (reuses #336 handler) when a
+                            // pull step exists in the plan.
+                            if matches!(key, Key::Char('a') | Key::Char('A')) {
+                                let has_pull = self.test_plan_state.as_ref()
+                                    .and_then(|s| s.plan.as_ref())
+                                    .map(|p| p.steps.iter().any(|s| s.kind == "pull"))
+                                    .unwrap_or(false);
+                                if has_pull {
+                                    if self.do_pull_artifact() {
+                                        // Optimistically mark the pull step Running.
+                                        if let Some(ref plan) = self.test_plan_state.as_ref().and_then(|s| s.plan.as_ref()).cloned() {
+                                            if let Some(idx) = plan.steps.iter().position(|s| s.kind == "pull") {
+                                                if let Some(ref mut state) = self.test_plan_state {
+                                                    if let Some(st) = state.step_states.get_mut(idx) {
+                                                        *st = TestStepState::Running;
+                                                    }
+                                                }
+                                                self.chat_transcript_cache_key = None;
+                                            }
+                                        }
+                                    }
+                                    return Reaction::Redraw;
+                                }
+                            }
+                            // 1–9 → run the corresponding non-pull step.
+                            if let Key::Char(c) = key {
+                                if *c >= '1' && *c <= '9' {
+                                    let key_idx = (*c as usize) - ('1' as usize);
+                                    self.handle_test_plan_step_key(key_idx);
+                                    return Reaction::Redraw;
+                                }
+                            }
+                        }
+                    }
+                }
                 let result = self.inject_chat.as_mut().unwrap().handle(&event, backend, main_rect);
                 match result {
                     ChatControllerEvent::Submit { text } => {
@@ -14898,6 +15494,9 @@ impl ShellApp for CoordApp {
                             self.watch_focused = None;
                         }
                         self.inject_chat = None;
+                        // #349 Phase B: clear test-plan state on any chat close.
+                        self.test_plan_state = None;
+                        self.step_cmd_rx = None;
                     }
                     _ => {}
                 }
@@ -16220,25 +16819,13 @@ impl ShellApp for CoordApp {
                     // Only fires when the artifact badge is visible (non-empty
                     // manifest in the 30 s TTL cache) — guards against a stale
                     // `a` press when no artifacts have been stashed.
+                    // #349: logic extracted into do_pull_artifact() so the
+                    // test-chat overlay can reuse it without duplication.
                     Key::Char('a')
                         if self.active_view == SidebarView::Pipeline
                             && self.artifact_badge_visible() =>
                     {
-                        if self.command_runner.is_running() {
-                            self.push_toast(
-                                "Pull artifacts",
-                                "Another command is running — try again in a moment.",
-                                ToastSeverity::Warning,
-                            );
-                        } else if let Some((_, repo, sanitized, work_id)) =
-                            self.artifact_fetch_target()
-                        {
-                            self.pending_artifact_pull =
-                                Some((work_id.clone(), repo, sanitized));
-                            self.command_runner.spawn(&["pull-artifact", &work_id]);
-                            self.pipeline_status =
-                                Some(("Pulling artifacts…".into(), Instant::now()));
-                        }
+                        self.do_pull_artifact();
                         needs_redraw = true;
                     }
 
@@ -16303,7 +16890,20 @@ impl ShellApp for CoordApp {
                 if let Some(ctx) = self.watch_pool.get(&id) {
                     let key = (id.clone(), ctx.sse.lines.len(), ctx.inject_transcript.len());
                     if self.chat_transcript_cache_key.as_ref() != Some(&key) {
-                        let transcript = chat_transcript_from_pool(ctx);
+                        let mut transcript = chat_transcript_from_pool(ctx);
+                        // #349 Phase B: for test-chat sessions, prepend the plan
+                        // as the first system message so it appears above the
+                        // worker's replies and the user's turns.
+                        if ctx.state.assignment_type == "test-chat" {
+                            if let Some(ref plan_state) = self.test_plan_state {
+                                let plan_msg = self.build_test_plan_system_message(plan_state);
+                                transcript.insert(0, ChatTurn {
+                                    role: ChatRole::System,
+                                    text: StyledText::plain(plan_msg),
+                                    timestamp_unix: None,
+                                });
+                            }
+                        }
                         if let Some(ref mut chat) = self.inject_chat {
                             chat.set_transcript(transcript);
                         }
@@ -17250,6 +17850,9 @@ mod tests {
             artifact_cache: std::collections::HashMap::new(),
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
+            test_plan_state: None,
+            step_cmd_rx: None,
+            test_plan_cmd_pending: false,
         }
     }
 
@@ -24175,5 +24778,256 @@ mod tests {
         assert_eq!(repo, "my-repo");
         assert_eq!(sanitized, "issue-42-test");
         assert_eq!(work_id, "work-abc123");
+    }
+
+    // ── #349 Phase B: parse_test_plan_json ────────────────────────────────────
+
+    #[test]
+    fn parse_test_plan_json_valid_plan() {
+        let json = r#"{"steps":[
+            {"kind":"pull","label":"Pull coord-tui binary"},
+            {"kind":"run","cmd":"cargo test","label":"Unit tests"},
+            {"kind":"verify","check":"TUI renders without crash"}
+        ],"blockers":[]}"#;
+        let plan = parse_test_plan_json(json).expect("should parse");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].kind, "pull");
+        assert_eq!(plan.steps[0].label.as_deref(), Some("Pull coord-tui binary"));
+        assert_eq!(plan.steps[1].kind, "run");
+        assert_eq!(plan.steps[1].cmd.as_deref(), Some("cargo test"));
+        assert_eq!(plan.steps[2].kind, "verify");
+        assert_eq!(plan.steps[2].check.as_deref(), Some("TUI renders without crash"));
+        assert!(plan.blockers.is_empty());
+    }
+
+    #[test]
+    fn parse_test_plan_json_with_blockers() {
+        let json = r#"{"steps":[],"blockers":["Need GTK installed","Run as root"]}"#;
+        let plan = parse_test_plan_json(json).expect("should parse");
+        assert_eq!(plan.blockers.len(), 2);
+        assert_eq!(plan.blockers[0], "Need GTK installed");
+    }
+
+    #[test]
+    fn parse_test_plan_json_missing_steps_returns_none() {
+        let json = r#"{"blockers":[]}"#;
+        assert!(parse_test_plan_json(json).is_none());
+    }
+
+    #[test]
+    fn parse_test_plan_json_missing_kind_returns_none() {
+        let json = r#"{"steps":[{"cmd":"foo"}],"blockers":[]}"#;
+        // Step without "kind" → None for that step → Vec is shorter.
+        // The outer parse should still fail at the step level.
+        let result = parse_test_plan_json(json);
+        assert!(result.is_none(), "step missing 'kind' should fail");
+    }
+
+    #[test]
+    fn parse_test_plan_json_extra_keys_ignored() {
+        let json = r#"{"steps":[{"kind":"run","cmd":"foo","future_key":"bar"}],"blockers":[]}"#;
+        let plan = parse_test_plan_json(json).expect("should parse");
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].kind, "run");
+    }
+
+    #[test]
+    fn parse_test_plan_json_malformed_returns_none() {
+        assert!(parse_test_plan_json("not json").is_none());
+        assert!(parse_test_plan_json("").is_none());
+        assert!(parse_test_plan_json("null").is_none());
+    }
+
+    // ── #349 Phase B: format_test_plan_message ────────────────────────────────
+
+    #[test]
+    fn format_test_plan_header_contains_repo_and_issue() {
+        let plan = TestPlan {
+            steps: vec![],
+            blockers: vec![],
+        };
+        let msg = format_test_plan_message(&plan, &[], "my-repo", 42, "Fix the widget", None);
+        assert!(msg.contains("my-repo"), "should contain repo name");
+        assert!(msg.contains("#42"), "should contain issue number");
+        assert!(msg.contains("Fix the widget"), "should contain issue title fragment");
+    }
+
+    #[test]
+    fn format_test_plan_pull_step_uses_a_key() {
+        let plan = TestPlan {
+            steps: vec![TestStep {
+                kind: "pull".to_string(),
+                label: Some("coord-tui binary".to_string()),
+                cmd: None,
+                check: None,
+            }],
+            blockers: vec![],
+        };
+        let msg = format_test_plan_message(&plan, &[TestStepState::Pending], "r", 1, "t", None);
+        assert!(msg.contains("[a]"), "pull step should use [a] key");
+        assert!(msg.contains("coord-tui binary"), "pull step should show label");
+    }
+
+    #[test]
+    fn format_test_plan_run_steps_numbered_1_to_9() {
+        let plan = TestPlan {
+            steps: vec![
+                TestStep { kind: "run".to_string(), cmd: Some("cargo test".to_string()), label: None, check: None },
+                TestStep { kind: "verify".to_string(), cmd: None, label: None, check: Some("looks good".to_string()) },
+            ],
+            blockers: vec![],
+        };
+        let states = vec![TestStepState::Pending, TestStepState::Pending];
+        let msg = format_test_plan_message(&plan, &states, "r", 1, "t", None);
+        assert!(msg.contains("[1]"), "first run/verify step should be [1]");
+        assert!(msg.contains("[2]"), "second run/verify step should be [2]");
+        assert!(msg.contains("cargo test"), "run step should show cmd");
+        assert!(msg.contains("looks good"), "verify step should show check");
+    }
+
+    #[test]
+    fn format_test_plan_step_states_shown() {
+        let plan = TestPlan {
+            steps: vec![
+                TestStep { kind: "run".to_string(), cmd: Some("x".to_string()), label: None, check: None },
+                TestStep { kind: "run".to_string(), cmd: Some("y".to_string()), label: None, check: None },
+            ],
+            blockers: vec![],
+        };
+        let states = vec![TestStepState::Passed, TestStepState::Failed];
+        let msg = format_test_plan_message(&plan, &states, "r", 1, "t", None);
+        assert!(msg.contains('✓'), "passed step should show ✓");
+        assert!(msg.contains('✗'), "failed step should show ✗");
+    }
+
+    #[test]
+    fn format_test_plan_artifact_footnote_shown_when_present() {
+        let plan = TestPlan {
+            steps: vec![TestStep {
+                kind: "pull".to_string(),
+                label: Some("binaries".to_string()),
+                cmd: None, check: None,
+            }],
+            blockers: vec![],
+        };
+        let msg = format_test_plan_message(
+            &plan, &[TestStepState::Pending], "r", 1, "t", Some((3, "precision"))
+        );
+        assert!(msg.contains("📦"), "artifact footnote should show 📦");
+        assert!(msg.contains("precision"), "artifact footnote should name the machine");
+        assert!(msg.contains("3 files"), "artifact footnote should show file count");
+    }
+
+    #[test]
+    fn format_test_plan_blockers_shown() {
+        let plan = TestPlan {
+            steps: vec![],
+            blockers: vec!["GTK not installed".to_string()],
+        };
+        let msg = format_test_plan_message(&plan, &[], "r", 1, "t", None);
+        assert!(msg.contains("Blockers"), "blockers section header should appear");
+        assert!(msg.contains("GTK not installed"), "blocker text should appear");
+    }
+
+    // ── #349 Phase B: chat_is_test_chat ──────────────────────────────────────
+
+    #[test]
+    fn chat_is_test_chat_false_when_no_chat() {
+        let app = make_app_default();
+        assert!(!app.chat_is_test_chat());
+    }
+
+    // ── #349 Phase B: handle_test_plan_step_key – verify kind ───────────────
+
+    #[test]
+    fn handle_test_plan_step_key_verify_marks_checked_and_returns_true() {
+        let mut app = make_app_default();
+        // Set up a minimal test_plan_state with a verify step.
+        app.test_plan_state = Some(TestPlanOverlayState {
+            work_assignment_id: "w1".to_string(),
+            repo: "r".to_string(),
+            issue_number: 1,
+            issue_title: "t".to_string(),
+            branch: None,
+            machine: "m".to_string(),
+            plan: Some(TestPlan {
+                steps: vec![TestStep {
+                    kind: "verify".to_string(),
+                    cmd: None,
+                    label: None,
+                    check: Some("TUI looks good".to_string()),
+                }],
+                blockers: vec![],
+            }),
+            step_states: vec![TestStepState::Pending],
+            branch_head_from_db: None,
+            plan_fetch_pending: false,
+        });
+        let result = app.handle_test_plan_step_key(0);
+        assert!(result, "should return true for a valid verify step");
+        let state = &app.test_plan_state.as_ref().unwrap().step_states[0];
+        assert_eq!(*state, TestStepState::Checked, "verify step should be Checked");
+    }
+
+    #[test]
+    fn handle_test_plan_step_key_out_of_bounds_returns_false() {
+        let mut app = make_app_default();
+        app.test_plan_state = Some(TestPlanOverlayState {
+            work_assignment_id: "w1".to_string(),
+            repo: "r".to_string(),
+            issue_number: 1,
+            issue_title: "t".to_string(),
+            branch: None,
+            machine: "m".to_string(),
+            plan: Some(TestPlan {
+                steps: vec![TestStep {
+                    kind: "run".to_string(),
+                    cmd: Some("foo".to_string()),
+                    label: None,
+                    check: None,
+                }],
+                blockers: vec![],
+            }),
+            step_states: vec![TestStepState::Pending],
+            branch_head_from_db: None,
+            plan_fetch_pending: false,
+        });
+        // key index 5 is beyond the one step we have.
+        let result = app.handle_test_plan_step_key(5);
+        assert!(!result, "out-of-bounds key index should return false");
+    }
+
+    #[test]
+    fn handle_test_plan_step_key_pull_steps_skipped_in_numbering() {
+        // A plan with [pull, run, verify] → keys are [a], 1, 2 (not 1, 2, 3).
+        // handle_test_plan_step_key(0) → first non-pull = run at index 1.
+        let mut app = make_app_default();
+        app.test_plan_state = Some(TestPlanOverlayState {
+            work_assignment_id: "w1".to_string(),
+            repo: "r".to_string(),
+            issue_number: 1,
+            issue_title: "t".to_string(),
+            branch: None,
+            machine: "m".to_string(),
+            plan: Some(TestPlan {
+                steps: vec![
+                    TestStep { kind: "pull".to_string(), cmd: None, label: None, check: None },
+                    TestStep { kind: "run".to_string(), cmd: Some("cargo build".to_string()), label: None, check: None },
+                    TestStep { kind: "verify".to_string(), cmd: None, label: None, check: Some("check ok".to_string()) },
+                ],
+                blockers: vec![],
+            }),
+            step_states: vec![TestStepState::Pending, TestStepState::Pending, TestStepState::Pending],
+            branch_head_from_db: None,
+            plan_fetch_pending: false,
+        });
+        // Key '1' (index 0) should dispatch the run step (original index 1).
+        let result = app.handle_test_plan_step_key(0);
+        assert!(result, "should dispatch the run step");
+        // The run step should be Running now.
+        let states = &app.test_plan_state.as_ref().unwrap().step_states;
+        assert_eq!(states[0], TestStepState::Pending, "pull step state unchanged");
+        assert_eq!(states[1], TestStepState::Running, "run step should be Running");
+        assert_eq!(states[2], TestStepState::Pending, "verify step unchanged");
     }
 }

@@ -438,3 +438,84 @@ class TestSchemaMigration:
         cursor = conn.execute("PRAGMA table_info(assignments)")
         columns = {row["name"] for row in cursor}
         assert "test_plan" in columns
+
+    def test_test_plan_branch_head_column_exists_after_schema(self) -> None:
+        """#349 Phase B: test_plan_branch_head column must exist after migration."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        from coord.db import _ensure_schema
+        _ensure_schema(conn)
+
+        cursor = conn.execute("PRAGMA table_info(assignments)")
+        columns = {row["name"] for row in cursor}
+        assert "test_plan_branch_head" in columns, (
+            "test_plan_branch_head column not found — migration not applied"
+        )
+
+    def test_branch_head_migration_idempotent(self) -> None:
+        """Running _migrate_add_columns twice on a schema that already has
+        test_plan_branch_head must not raise."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        from coord.db import _ensure_schema, _migrate_add_columns
+        _ensure_schema(conn)
+        _migrate_add_columns(conn)  # second call — must be a no-op
+        # Confirm the column is writable.
+        conn.execute(
+            "UPDATE assignments SET test_plan_branch_head = ? WHERE 1=0",
+            ("abc123def456",),
+        )
+
+
+# ── set_test_plan branch_head parameter (#349 Phase B) ───────────────────────
+
+class TestSetTestPlanBranchHead:
+    """Tests for set_test_plan's branch_head parameter and get_test_plan_branch_head."""
+
+    def _make_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        from coord.db import _ensure_schema
+        _ensure_schema(conn)
+        return conn
+
+    def _insert(self, conn: sqlite3.Connection, aid: str = "abc123") -> None:
+        conn.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, status) VALUES (?, 'm', 'r', 1, 't', 'done')",
+            (aid,),
+        )
+        conn.commit()
+
+    def test_set_test_plan_without_branch_head(self, coord_db: sqlite3.Connection) -> None:
+        """Passing branch_head=None must leave test_plan_branch_head as NULL."""
+        from coord.state import set_test_plan, get_test_plan_branch_head
+        _insert_assignment(coord_db)
+        set_test_plan("abc123", {"steps": [], "blockers": []})
+        assert get_test_plan_branch_head("abc123") is None
+
+    def test_set_test_plan_with_branch_head(self, coord_db: sqlite3.Connection) -> None:
+        """branch_head written by set_test_plan is readable via get_test_plan_branch_head."""
+        from coord.state import set_test_plan, get_test_plan_branch_head
+        _insert_assignment(coord_db)
+        sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        set_test_plan("abc123", {"steps": [], "blockers": []}, branch_head=sha)
+        assert get_test_plan_branch_head("abc123") == sha
+
+    def test_set_test_plan_overwrites_branch_head(self, coord_db: sqlite3.Connection) -> None:
+        """A second call to set_test_plan with a new branch_head overwrites the previous one."""
+        from coord.state import set_test_plan, get_test_plan_branch_head
+        _insert_assignment(coord_db)
+        set_test_plan("abc123", {"steps": [], "blockers": []}, branch_head="aaa")
+        set_test_plan("abc123", {"steps": [], "blockers": []}, branch_head="bbb")
+        assert get_test_plan_branch_head("abc123") == "bbb"
+
+    def test_get_test_plan_branch_head_missing_row(self, coord_db: sqlite3.Connection) -> None:
+        """get_test_plan_branch_head returns None for unknown assignment IDs."""
+        from coord.state import get_test_plan_branch_head
+        assert get_test_plan_branch_head("no-such-id") is None
+
+    def test_get_test_plan_branch_head_empty_id(self, coord_db: sqlite3.Connection) -> None:
+        """get_test_plan_branch_head returns None for an empty assignment ID."""
+        from coord.state import get_test_plan_branch_head
+        assert get_test_plan_branch_head("") is None
