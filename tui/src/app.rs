@@ -559,6 +559,23 @@ struct PendingBoardChat {
     dispatched_at: Instant,
 }
 
+/// #353: pending repo picker for the [Add] button on the Board panel.
+/// When multiple repos exist, this shows a numeric picker (1, 2, …) for
+/// the user to select which repo to open a refine-board chat for.
+/// Armed when the user clicks the [Add] button and there are multiple repos.
+/// Cleared when the user selects a repo (numeric key), cancels (Esc), or
+/// the selection timeout expires.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct PendingRepoPicker {
+    /// List of available repos (from `board_repo_names`).
+    repos: Vec<String>,
+    /// Currently selected index (0-based). Used for visual feedback if desired.
+    selected: Option<usize>,
+    /// Time the picker was opened.
+    opened_at: Instant,
+}
+
 /// #316 Phase B: state for the file-issue finaliser modal.
 /// Shown when the user confirms filing a new issue drafted by a new-issue-chat.
 ///
@@ -3580,6 +3597,11 @@ pub struct CoordApp {
     /// refine-board` / `coord new-issue-chat` is running.  Polled each
     /// tick; on bind we open the chat overlay in the Board Chat tab.
     pending_board_chat: Option<PendingBoardChat>,
+    /// #353: pending repo picker for the [Add] button on the Board panel.
+    /// Armed when the user clicks [Add] and multiple repos exist. The picker
+    /// intercepts numeric keys (1, 2, …) to select a repo, or Esc to cancel.
+    /// Cleared when a repo is selected or the picker times out.
+    pending_repo_picker: Option<PendingRepoPicker>,
     /// #316 Phase B: file-issue edit modal.  Shown after the user chooses
     /// to file the issue drafted in a new-issue-chat.  Intercepts all
     /// keyboard input while open.
@@ -3770,6 +3792,7 @@ impl CoordApp {
             pending_refinement_close_prompt: None,
             finalise_after_notes_post: false,
             pending_board_chat: None,
+            pending_repo_picker: None,
             file_issue_modal: None,
             file_issue_post_rx: None,
             artifact_cache: std::collections::HashMap::new(),
@@ -10847,7 +10870,18 @@ impl CoordApp {
             }
         }
         let proposals = self.data.proposals.len();
-        let hints = if let Some(ref p) = self.pending_refinement_close_prompt {
+        let hints = if let Some(ref picker) = self.pending_repo_picker {
+            // #353: repo picker for the [Add] button — show numeric shortcuts.
+            let mut hint = " Select repo: ".to_string();
+            for (i, repo) in picker.repos.iter().enumerate() {
+                if i > 0 {
+                    hint.push_str("  ");
+                }
+                hint.push_str(&format!("{}={}", i + 1, repo));
+            }
+            hint.push_str("  Esc=cancel ");
+            hint
+        } else if let Some(ref p) = self.pending_refinement_close_prompt {
             // #328: refinement-chat close prompt — Y/N/Esc takes precedence
             // over every other hint while the user decides.
             format!(
@@ -13325,6 +13359,7 @@ impl CoordApp {
             || self.pending_test_fail.is_some()
             || self.pending_report_fix.is_some()
             || self.pending_refinement_close_prompt.is_some()
+            || self.pending_repo_picker.is_some()
         {
             return None;
         }
@@ -13337,6 +13372,7 @@ impl CoordApp {
         let buttons: Vec<ToolbarButton> = match self.active_view {
             SidebarView::Board => {
                 vec![
+                    toolbar_button("add", "[A]dd", !self.board_repo_names.is_empty()),
                     toolbar_button("notify", "[N]otify", true),
                     toolbar_button(
                         "retry",
@@ -13452,6 +13488,30 @@ impl CoordApp {
             // alongside the PROPOSALS section.  The `coord plan` CLI
             // still works for scripts; the TUI just doesn't surface
             // it any more.
+            "toolbar:add" => {
+                // #353: [Add] button opens a refine-board chat for the selected repo.
+                // If one repo exists, dispatch directly; if multiple, show picker.
+                if self.board_repo_names.is_empty() {
+                    self.push_toast(
+                        "No repos configured",
+                        "No repos found in coordinator.yml.",
+                        ToastSeverity::Info,
+                    );
+                    return true;
+                }
+                if self.board_repo_names.len() == 1 {
+                    let repo = self.board_repo_names[0].clone();
+                    self.dispatch_board_chat_refine(&repo)
+                } else {
+                    // Multiple repos — open the picker dialog.
+                    self.pending_repo_picker = Some(PendingRepoPicker {
+                        repos: self.board_repo_names.clone(),
+                        selected: None,
+                        opened_at: Instant::now(),
+                    });
+                    true
+                }
+            }
             "toolbar:notify" => {
                 self.command_runner.spawn(&["notify"]);
                 self.last_notify = Instant::now();
@@ -14914,6 +14974,32 @@ impl ShellApp for CoordApp {
         // ── Pre-compute panel bounds for keyboard visible-row estimates ───────
         let list_b = ctx.sidebar_bounds().unwrap_or(ctx.main_bounds());
         let lh = backend.line_height();
+
+        // ── #353: Pending repo picker for [Add] button ─────────────────────────
+        // When multiple repos exist, this shows a numeric picker (1, 2, …).
+        // Numeric keys select a repo, Enter dispatches, Esc cancels.
+        if self.pending_repo_picker.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char(ch) if ch.is_ascii_digit() && *ch != '0' => {
+                        let digit = (*ch as u32 - '1' as u32) as usize;
+                        if let Some(ref mut picker) = self.pending_repo_picker {
+                            if digit < picker.repos.len() {
+                                let repo = picker.repos[digit].clone();
+                                self.pending_repo_picker = None;
+                                self.dispatch_board_chat_refine(&repo);
+                                return Reaction::Redraw;
+                            }
+                        }
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_repo_picker = None;
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
 
         // ── #200 Pending test-fail reason: intercept all keys until submit ────
         // Enter submits and records test_state=failed. Esc cancels. Backspace
@@ -17245,6 +17331,7 @@ mod tests {
             pending_refinement_close_prompt: None,
             finalise_after_notes_post: false,
             pending_board_chat: None,
+            pending_repo_picker: None,
             file_issue_modal: None,
             file_issue_post_rx: None,
             artifact_cache: std::collections::HashMap::new(),
@@ -22733,6 +22820,91 @@ mod tests {
         app.pending_purge = None;
         app.pending_force_merge = Some("api".to_string());
         assert!(app.panel_toolbar().is_none());
+    }
+
+    #[test]
+    fn panel_toolbar_board_contains_add_button() {
+        // #353: Board toolbar now includes [A]dd button for opening
+        // refine-board chat.
+        let app = make_app_default();
+        let bar = app.panel_toolbar().expect("Board has a toolbar");
+        let labels = toolbar_action_labels(&bar);
+        assert!(
+            labels.iter().any(|l| l.contains("[A]dd")),
+            "Board toolbar missing [A]dd; got {:?}",
+            labels,
+        );
+    }
+
+    #[test]
+    fn panel_toolbar_suppressed_while_repo_picker_open() {
+        // #353: when the repo picker is open, the toolbar is suppressed
+        // so the picker's keyboard shortcuts aren't conflicted with.
+        let mut app = make_app_default();
+        app.board_repo_names.push("repo-a".to_string());
+        app.board_repo_names.push("repo-b".to_string());
+        assert!(app.panel_toolbar().is_some());
+        app.pending_repo_picker = Some(PendingRepoPicker {
+            repos: app.board_repo_names.clone(),
+            selected: None,
+            opened_at: Instant::now(),
+        });
+        assert!(app.panel_toolbar().is_none());
+    }
+
+    #[test]
+    fn dispatch_toolbar_add_single_repo_calls_refine_directly() {
+        // #353: when there's only one repo, [Add] directly calls
+        // dispatch_board_chat_refine without showing a picker.
+        let mut app = make_app_default();
+        app.board_repo_names.push("repo-a".to_string());
+        assert!(app.pending_board_chat.is_none());
+        assert!(app.pending_repo_picker.is_none());
+
+        app.dispatch_toolbar_action("toolbar:add");
+
+        // Should have opened a refine-board chat, not a picker.
+        assert!(app.pending_board_chat.is_some());
+        assert!(app.pending_repo_picker.is_none());
+        let chat = app.pending_board_chat.as_ref().unwrap();
+        assert_eq!(chat.repo, "repo-a");
+        assert_eq!(chat.assignment_type, "refinement");
+    }
+
+    #[test]
+    fn dispatch_toolbar_add_multiple_repos_opens_picker() {
+        // #353: when there are multiple repos, [Add] opens a picker
+        // dialog showing numeric shortcuts.
+        let mut app = make_app_default();
+        app.board_repo_names.push("repo-a".to_string());
+        app.board_repo_names.push("repo-b".to_string());
+        assert!(app.pending_board_chat.is_none());
+        assert!(app.pending_repo_picker.is_none());
+
+        app.dispatch_toolbar_action("toolbar:add");
+
+        // Should have opened a picker, not dispatched refine directly.
+        assert!(app.pending_board_chat.is_none());
+        let picker = app.pending_repo_picker.as_ref().expect("picker opened");
+        assert_eq!(picker.repos.len(), 2);
+        assert_eq!(picker.repos[0], "repo-a");
+        assert_eq!(picker.repos[1], "repo-b");
+    }
+
+    #[test]
+    fn dispatch_toolbar_add_no_repos_shows_toast() {
+        // #353: when there are no repos configured, [Add] shows a toast
+        // and returns without taking action.
+        let mut app = make_app_default();
+        assert!(app.board_repo_names.is_empty());
+        let toast_before = app.toasts.len();
+
+        app.dispatch_toolbar_action("toolbar:add");
+
+        // Should show a toast and not open picker or dispatch refine.
+        assert_eq!(app.toasts.len(), toast_before + 1);
+        assert!(app.pending_board_chat.is_none());
+        assert!(app.pending_repo_picker.is_none());
     }
 
     #[test]
