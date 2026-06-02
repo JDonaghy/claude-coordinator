@@ -282,11 +282,11 @@ class TestArtifactPaths:
         assert payload["artifact_paths"] == ["target/debug/mybinary*", "dist/*.tar.gz"]
 
     @patch("coord.dispatch.httpx.post")
-    def test_payload_includes_empty_artifact_paths_for_work_when_not_configured(
+    def test_payload_omits_artifact_paths_for_work_when_not_configured(
         self, mock_post: MagicMock,
     ) -> None:
-        """Dispatch payload should include empty artifact_paths for work
-        assignments when the repo has no artifact_paths configured."""
+        """Older agents reject unknown keys — artifact_paths must be absent
+        when the repo has no artifact_paths configured (empty list)."""
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"ok": True}
         mock_post.return_value = mock_resp
@@ -311,14 +311,15 @@ class TestArtifactPaths:
         )
         dispatch(p, cfg)
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["artifact_paths"] == []
+        assert "artifact_paths" not in payload
 
     @patch("coord.dispatch.httpx.post")
     def test_payload_excludes_artifact_paths_for_review_assignment(
         self, mock_post: MagicMock,
     ) -> None:
-        """Dispatch payload for a review proposal should have empty artifact_paths
-        since reviews don't build artifacts."""
+        """Dispatch payload for a review proposal should not include
+        artifact_paths at all — reviews don't build artifacts, and older
+        agents reject unknown payload keys with a 400."""
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"ok": True}
         mock_post.return_value = mock_resp
@@ -347,4 +348,4 @@ class TestArtifactPaths:
         )
         dispatch(p, cfg)
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["artifact_paths"] == []
+        assert "artifact_paths" not in payload
