@@ -4523,7 +4523,6 @@ impl CoordApp {
                     role: ChatRole::User,
                     text: StyledText::plain(text.clone()),
                     timestamp_unix: now,
-                    line_scales: Vec::new(),
                 };
                 if let Some(ctx) = self.watch_pool.get_mut(&aid) {
                     ctx.inject_transcript.push(turn);
@@ -4590,7 +4589,6 @@ impl CoordApp {
                 role: ChatRole::User,
                 text: StyledText::plain(text.clone()),
                 timestamp_unix: now,
-                line_scales: Vec::new(),
             };
             if let Some(ctx) = self.watch_pool.get_mut(&aid) {
                 ctx.inject_transcript.push(turn);
@@ -4640,13 +4638,18 @@ impl CoordApp {
     /// Force-run `coord sync` immediately, bypassing the 5-minute guard.
     /// Used by the Sync toolbar button and the `S` keybind in the Board panel.
     fn force_issue_sync(&mut self) {
-        if self.command_runner.is_running() {
-            self.push_toast("Sync", "Another command is running — try again in a moment.", ToastSeverity::Info);
-            return;
-        }
-        if self.command_runner.spawn(&["sync", "--quiet"]) {
-            self.issue_sync_last = Some(Instant::now());
-            self.push_toast("Sync", "Fetching open issues from GitHub…", ToastSeverity::Info);
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&["sync", "--quiet"]) {
+            SpawnQueuedOutcome::Started => {
+                self.issue_sync_last = Some(Instant::now());
+                self.push_toast("Sync", "Fetching open issues from GitHub…", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("Sync", "Sync queued — will run after current command.", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {
+                // A sync is already running or already queued — nothing to do.
+            }
         }
     }
 
@@ -8299,24 +8302,36 @@ impl CoordApp {
             );
             return false;
         };
-        let spawned = self.command_runner.spawn(&["bounce", &review_id]);
-        if spawned {
-            self.push_toast(
-                "Bounce",
-                &format!(
-                    "Dispatching fix worker for review {}\u{2026} Work will go Active in 1-3s once the subprocess completes.",
-                    &review_id[..review_id.len().min(8)],
-                ),
-                ToastSeverity::Info,
-            );
-        } else {
-            self.push_toast(
-                "Bounce",
-                "Another command is running — try again in a moment.",
-                ToastSeverity::Warning,
-            );
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["bounce", &review_id]);
+        match outcome {
+            SpawnQueuedOutcome::Deduped => {
+                // Same bounce already running or queued — nothing to add.
+                false
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Bounce",
+                    &format!(
+                        "Dispatching fix worker for review {}\u{2026} Work will go Active in 1-3s once the subprocess completes.",
+                        &review_id[..review_id.len().min(8)],
+                    ),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "Bounce",
+                    &format!(
+                        "Bounce queued for review {}\u{2026} Will dispatch once the current command completes.",
+                        &review_id[..review_id.len().min(8)],
+                    ),
+                    ToastSeverity::Info,
+                );
+                true
+            }
         }
-        spawned
     }
 
     /// Look up the CI summary for the currently-selected pipeline issue's
@@ -10860,8 +10875,14 @@ impl CoordApp {
             });
         }
         if let Some((label, elapsed)) = self.command_runner.running_info() {
+            let depth = self.command_runner.queue_depth();
+            let text = if depth > 0 {
+                format!(" {} ({:.0}s) · {} queued ", label, elapsed.as_secs_f64(), depth)
+            } else {
+                format!(" {} ({:.0}s) ", label, elapsed.as_secs_f64())
+            };
             left.push(StatusBarSegment {
-                text: format!(" {} ({:.0}s) ", label, elapsed.as_secs_f64()),
+                text,
                 fg: Color::rgb(255, 220, 100),
                 bg: Color::rgb(60, 50, 20),
                 bold: true,
@@ -12056,12 +12077,10 @@ impl CoordApp {
     /// #316 Phase C: shell `coord refine-board <repo>` and arm
     /// `pending_board_chat` so the next tick can bind the chat overlay.
     fn dispatch_board_chat_refine(&mut self, repo: &str) -> bool {
-        if !self.command_runner.spawn(&["refine-board", repo]) {
-            self.push_toast(
-                "Another command is running",
-                "Wait for the current command to finish, then try again.",
-                ToastSeverity::Info,
-            );
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["refine-board", repo]);
+        if outcome == SpawnQueuedOutcome::Deduped {
+            // Already running or queued — don't overwrite pending state or re-toast.
             return false;
         }
         self.pending_board_chat = Some(PendingBoardChat {
@@ -12069,23 +12088,22 @@ impl CoordApp {
             assignment_type: "refinement".to_string(),
             dispatched_at: Instant::now(),
         });
-        self.push_toast(
-            "Board refinement chat",
-            &format!("Starting board-level refinement chat for {}…", repo),
-            ToastSeverity::Info,
-        );
+        let msg = if outcome == SpawnQueuedOutcome::Queued {
+            format!("Board refinement chat queued for {}…", repo)
+        } else {
+            format!("Starting board-level refinement chat for {}…", repo)
+        };
+        self.push_toast("Board refinement chat", &msg, ToastSeverity::Info);
         true
     }
 
     /// #316 Phase A: shell `coord new-issue-chat <repo>` and arm
     /// `pending_board_chat` so the next tick can bind the chat overlay.
     fn dispatch_board_chat_new_issue(&mut self, repo: &str) -> bool {
-        if !self.command_runner.spawn(&["new-issue-chat", repo]) {
-            self.push_toast(
-                "Another command is running",
-                "Wait for the current command to finish, then try again.",
-                ToastSeverity::Info,
-            );
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["new-issue-chat", repo]);
+        if outcome == SpawnQueuedOutcome::Deduped {
+            // Already running or queued — don't overwrite pending state or re-toast.
             return false;
         }
         self.pending_board_chat = Some(PendingBoardChat {
@@ -12093,11 +12111,12 @@ impl CoordApp {
             assignment_type: "new-issue-chat".to_string(),
             dispatched_at: Instant::now(),
         });
-        self.push_toast(
-            "New issue chat",
-            &format!("Starting new-issue chat for {}…", repo),
-            ToastSeverity::Info,
-        );
+        let msg = if outcome == SpawnQueuedOutcome::Queued {
+            format!("New-issue chat queued for {}…", repo)
+        } else {
+            format!("Starting new-issue chat for {}…", repo)
+        };
+        self.push_toast("New issue chat", &msg, ToastSeverity::Info);
         true
     }
 
@@ -16344,20 +16363,22 @@ impl ShellApp for CoordApp {
                         if self.active_view == SidebarView::Pipeline
                             && self.artifact_badge_visible() =>
                     {
-                        if self.command_runner.is_running() {
-                            self.push_toast(
-                                "Pull artifacts",
-                                "Another command is running — try again in a moment.",
-                                ToastSeverity::Warning,
-                            );
-                        } else if let Some((_, repo, sanitized, work_id)) =
+                        use crate::commands::SpawnQueuedOutcome;
+                        if let Some((_, repo, sanitized, work_id)) =
                             self.artifact_fetch_target()
                         {
-                            self.pending_artifact_pull =
-                                Some((work_id.clone(), repo, sanitized));
-                            self.command_runner.spawn(&["pull-artifact", &work_id]);
-                            self.pipeline_status =
-                                Some(("Pulling artifacts…".into(), Instant::now()));
+                            let outcome = self.command_runner.spawn_queued(&["pull-artifact", &work_id]);
+                            if outcome != SpawnQueuedOutcome::Deduped {
+                                self.pending_artifact_pull =
+                                    Some((work_id.clone(), repo, sanitized));
+                                let status_msg = if outcome == SpawnQueuedOutcome::Queued {
+                                    "Pull artifacts queued…"
+                                } else {
+                                    "Pulling artifacts…"
+                                };
+                                self.pipeline_status =
+                                    Some((status_msg.into(), Instant::now()));
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -16749,7 +16770,6 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
                 ctx.state.issue_number
             )),
             timestamp_unix: None,
-            line_scales: Vec::new(),
         });
     }
     let mut user_idx = 0usize;
@@ -16771,11 +16791,9 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
         }
         // Render the whole assistant body through quadraui's markdown adapter
         // so headings, bold, italic, inline code, lists, blockquotes, and
-        // fenced code blocks are styled.  One ChatTurn per SSE message carries
-        // line_scales; build_transcript_rows splits it by the \n separators.
+        // fenced code blocks are styled.
         let md_theme = quadraui::Theme::default();
         let rendered = quadraui::render_markdown_to_styled(body, &md_theme);
-        let line_scales = rendered.line_scales.clone();
         let mut md_spans: Vec<StyledSpan> = Vec::new();
         for (i, md_line) in rendered.lines.into_iter().enumerate() {
             if i > 0 {
@@ -16787,7 +16805,6 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
             role: ChatRole::Assistant,
             text: StyledText { spans: md_spans },
             timestamp_unix: None,
-            line_scales,
         });
     }
     // Tail: any user turns submitted *after* the last SSE line we've seen

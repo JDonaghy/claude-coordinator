@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -18,10 +19,26 @@ pub struct CommandResult {
     pub stderr: String,
 }
 
+/// Outcome returned by [`CommandRunner::spawn_queued`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpawnQueuedOutcome {
+    /// The runner was idle; the command started immediately.
+    Started,
+    /// A different command was already running; this command was added to the
+    /// FIFO queue and will run automatically after the current command completes.
+    Queued,
+    /// An identical command (same argv) is already running or already pending
+    /// in the queue; the duplicate was silently dropped.
+    Deduped,
+}
+
 enum CommandState {
     Idle,
     Running {
         label: String,
+        /// Raw args (before `--config` injection), stored for dedup checks in
+        /// [`CommandRunner::spawn_queued`].
+        argv: Vec<String>,
         started_at: Instant,
         rx: mpsc::Receiver<CommandResult>,
     },
@@ -29,6 +46,11 @@ enum CommandState {
 
 pub struct CommandRunner {
     state: CommandState,
+    /// FIFO queue for user-initiated commands enqueued while another is running.
+    /// Each entry is the raw argv (before `--config` injection).  The front of
+    /// the queue is popped and started automatically each time [`poll`] detects
+    /// command completion.
+    queue: VecDeque<Vec<String>>,
     /// Ephemeral status-bar message set on command completion; cleared after MESSAGE_TTL.
     pub(crate) message: Option<(String, Instant)>,
     /// Absolute path to `coordinator.yml` found at startup.
@@ -99,33 +121,32 @@ impl CommandRunner {
     pub fn new() -> Self {
         Self {
             state: CommandState::Idle,
+            queue: VecDeque::new(),
             message: None,
             config_path: find_config(),
         }
     }
 
-    /// Spawn `coord <args>` in a background thread.
+    /// Internal: unconditionally start `coord <argv>` in a background thread
+    /// and transition to `Running` state.  Caller **must** verify the runner
+    /// is [`CommandState::Idle`] before calling.
     ///
-    /// For real subcommands (i.e. `args[0]` does not start with `-`), this
-    /// injects `--config <absolute_path>` immediately after the subcommand
-    /// name so that `coord` can locate `coordinator.yml` even when the TUI
-    /// was launched from a different working directory than the project root.
-    ///
-    /// Returns `false` if a command is already running.
-    pub fn spawn(&mut self, args: &[&str]) -> bool {
-        if self.is_running() {
-            return false;
-        }
-        let label = format!("coord {}", args.join(" "));
+    /// For real subcommands (i.e. `argv[0]` does not start with `-`) this
+    /// injects `--config <absolute_path>` into the child's argument list so
+    /// `coord` locates `coordinator.yml` even when the TUI was launched from
+    /// a different working directory.  The injected flag is NOT reflected in
+    /// `label` or the stored `argv` (kept clean for status display and dedup).
+    fn do_spawn(&mut self, argv: Vec<String>) {
+        let label = format!("coord {}", argv.join(" "));
         let (tx, rx) = mpsc::channel();
 
         // Build the full argument list, injecting --config after the subcommand
         // name (but not for flag-style args like --version which start with '-').
         let full_args: Vec<String> = {
-            let mut v: Vec<String> = Vec::with_capacity(args.len() + 2);
-            let mut iter = args.iter();
+            let mut v: Vec<String> = Vec::with_capacity(argv.len() + 2);
+            let mut iter = argv.iter();
             if let Some(first) = iter.next() {
-                v.push(first.to_string());
+                v.push(first.clone());
                 if !first.starts_with('-') {
                     if let Some(cfg) = &self.config_path {
                         v.push("--config".to_string());
@@ -133,7 +154,7 @@ impl CommandRunner {
                     }
                 }
                 for a in iter {
-                    v.push(a.to_string());
+                    v.push(a.clone());
                 }
             }
             v
@@ -203,10 +224,72 @@ impl CommandRunner {
         });
         self.state = CommandState::Running {
             label,
+            argv,
             started_at: Instant::now(),
             rx,
         };
+    }
+
+    /// Spawn `coord <args>` in a background thread.
+    ///
+    /// For real subcommands (i.e. `args[0]` does not start with `-`), this
+    /// injects `--config <absolute_path>` immediately after the subcommand
+    /// name so that `coord` can locate `coordinator.yml` even when the TUI
+    /// was launched from a different working directory than the project root.
+    ///
+    /// Returns `false` if a command is already running.  For user-initiated
+    /// actions that should queue instead of refuse, use [`spawn_queued`].
+    pub fn spawn(&mut self, args: &[&str]) -> bool {
+        if self.is_running() {
+            return false;
+        }
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        self.do_spawn(argv);
         true
+    }
+
+    /// Spawn `coord <args>`, queuing the command if another is already running.
+    ///
+    /// Behaviour:
+    /// - **Idle**: starts the command immediately, returns [`SpawnQueuedOutcome::Started`].
+    /// - **Busy, different command**: adds to the FIFO queue; the command runs
+    ///   automatically after the current one completes.  Returns
+    ///   [`SpawnQueuedOutcome::Queued`].
+    /// - **Busy, identical argv**: the same command is already running *or*
+    ///   already waiting in the queue; the duplicate is silently dropped.
+    ///   Returns [`SpawnQueuedOutcome::Deduped`].
+    ///
+    /// Use this for **user-initiated** actions.  Periodic background callers
+    /// (e.g. `coord sync --quiet` tick) must continue to call [`spawn`] so
+    /// they skip when busy rather than pile up in the queue.
+    pub fn spawn_queued(&mut self, args: &[&str]) -> SpawnQueuedOutcome {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+
+        // Dedup: identical argv already running?
+        if let CommandState::Running { argv: running_argv, .. } = &self.state {
+            if *running_argv == argv {
+                return SpawnQueuedOutcome::Deduped;
+            }
+        }
+
+        // Dedup: identical argv already queued?
+        if self.queue.iter().any(|q| q == &argv) {
+            return SpawnQueuedOutcome::Deduped;
+        }
+
+        if !self.is_running() {
+            self.do_spawn(argv);
+            SpawnQueuedOutcome::Started
+        } else {
+            self.queue.push_back(argv);
+            SpawnQueuedOutcome::Queued
+        }
+    }
+
+    /// Number of commands waiting in the queue (not counting the one
+    /// currently running).  Used by the status bar to show `· N queued`.
+    pub fn queue_depth(&self) -> usize {
+        self.queue.len()
     }
 
     /// Non-blocking check for command completion.
@@ -214,6 +297,9 @@ impl CommandRunner {
     /// Returns `Some(result)` when a command just finished (caller can inspect
     /// `exit_code` and `stderr` to surface failure toasts); returns `None`
     /// while the command is still running or no command is queued.
+    ///
+    /// When a command completes, any command waiting at the front of the queue
+    /// is popped and started automatically before this method returns.
     pub fn poll(&mut self) -> Option<CommandResult> {
         let rx = match &self.state {
             CommandState::Running { rx, .. } => rx,
@@ -228,12 +314,20 @@ impl CommandRunner {
                 };
                 self.message = Some((msg, Instant::now()));
                 self.state = CommandState::Idle;
+                // Pop and start the next queued command, if any.
+                if let Some(next_argv) = self.queue.pop_front() {
+                    self.do_spawn(next_argv);
+                }
                 Some(result)
             }
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.message = Some(("command thread lost".into(), Instant::now()));
                 self.state = CommandState::Idle;
+                // Pop and start the next queued command even on disconnect.
+                if let Some(next_argv) = self.queue.pop_front() {
+                    self.do_spawn(next_argv);
+                }
                 None
             }
         }
@@ -243,7 +337,7 @@ impl CommandRunner {
         matches!(self.state, CommandState::Running { .. })
     }
 
-    /// Returns (label, elapsed) if a command is currently running.
+    /// Returns `(label, elapsed)` if a command is currently running.
     pub fn running_info(&self) -> Option<(&str, Duration)> {
         match &self.state {
             CommandState::Running {
@@ -416,5 +510,123 @@ mod tests {
         let found = find_config_with(None, Some(cwd), Some(home));
         assert_eq!(found, None);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Queue tests ───────────────────────────────────────────────────────────
+
+    /// A command enqueued while another is running starts automatically once
+    /// the first command completes (via `poll()`).
+    #[test]
+    fn queue_runs_after_first_completes() {
+        let mut runner = CommandRunner::new();
+        // Start first command.
+        assert!(runner.spawn(&["--version"]));
+        assert!(runner.is_running());
+        // Enqueue a second command while the first is still running.
+        let outcome = runner.spawn_queued(&["notify"]);
+        assert_eq!(outcome, SpawnQueuedOutcome::Queued);
+        assert_eq!(runner.queue_depth(), 1);
+        // Wait for the first command to complete; poll() should auto-start the second.
+        let result_a = wait_for_result(&mut runner)
+            .expect("first command did not finish within 10s");
+        assert!(result_a.label.contains("--version"), "unexpected label: {}", result_a.label);
+        // Second command should now be running automatically.
+        assert!(runner.is_running(), "second command should have started after first completed");
+        assert_eq!(runner.queue_depth(), 0);
+        // Wait for the second command to finish.
+        let result_b = wait_for_result(&mut runner)
+            .expect("second (queued) command did not finish within 10s");
+        assert!(result_b.label.contains("notify"), "unexpected label: {}", result_b.label);
+        assert!(!runner.is_running());
+    }
+
+    /// Commands in the queue run in FIFO order.
+    #[test]
+    fn queue_maintains_fifo_order() {
+        let mut runner = CommandRunner::new();
+        // Start first command.
+        assert!(runner.spawn(&["--version"]));
+        // Enqueue two more.
+        assert_eq!(runner.spawn_queued(&["notify"]), SpawnQueuedOutcome::Queued);
+        assert_eq!(runner.spawn_queued(&["sync", "--quiet"]), SpawnQueuedOutcome::Queued);
+        assert_eq!(runner.queue_depth(), 2);
+        // First completes → second (notify) starts.
+        wait_for_result(&mut runner).expect("first");
+        assert!(runner.is_running(), "second command should have started");
+        let (label_b, _) = runner.running_info().expect("running_info");
+        assert!(
+            label_b.contains("notify"),
+            "expected 'notify' to run second (FIFO), got: {label_b}",
+        );
+        assert_eq!(runner.queue_depth(), 1);
+        // Second completes → third (sync --quiet) starts.
+        wait_for_result(&mut runner).expect("second");
+        assert!(runner.is_running(), "third command should have started");
+        let (label_c, _) = runner.running_info().expect("running_info");
+        assert!(
+            label_c.contains("sync"),
+            "expected 'sync' to run third (FIFO), got: {label_c}",
+        );
+        assert_eq!(runner.queue_depth(), 0);
+        // Third completes.
+        wait_for_result(&mut runner).expect("third");
+        assert!(!runner.is_running());
+    }
+
+    /// `spawn_queued` drops a command whose argv is identical to the one
+    /// currently running, and also drops a command that is already pending.
+    #[test]
+    fn spawn_queued_deduplicates_identical_commands() {
+        let mut runner = CommandRunner::new();
+        // Start a command.
+        assert!(runner.spawn(&["--version"]));
+        // Same argv as running command → deduped.
+        assert_eq!(
+            runner.spawn_queued(&["--version"]),
+            SpawnQueuedOutcome::Deduped,
+            "should dedup against the running command",
+        );
+        assert_eq!(runner.queue_depth(), 0);
+        // Different argv → queued.
+        assert_eq!(runner.spawn_queued(&["notify"]), SpawnQueuedOutcome::Queued);
+        assert_eq!(runner.queue_depth(), 1);
+        // Same argv as the queued command → deduped.
+        assert_eq!(
+            runner.spawn_queued(&["notify"]),
+            SpawnQueuedOutcome::Deduped,
+            "should dedup against already-queued command",
+        );
+        assert_eq!(runner.queue_depth(), 1, "dedup must not inflate the queue");
+        // Let everything finish.
+        wait_for_result(&mut runner).unwrap(); // --version done, notify starts
+        wait_for_result(&mut runner).unwrap(); // notify done
+        assert!(!runner.is_running());
+        assert_eq!(runner.queue_depth(), 0);
+    }
+
+    /// `queue_depth()` accurately reflects the number of pending commands
+    /// as items drain through the queue.
+    #[test]
+    fn queue_depth_reflects_pending_count() {
+        let mut runner = CommandRunner::new();
+        assert_eq!(runner.queue_depth(), 0, "starts empty");
+        // Start first command; queue should still be empty (it's running, not queued).
+        assert!(runner.spawn(&["--version"]));
+        assert_eq!(runner.queue_depth(), 0);
+        // Enqueue two more.
+        runner.spawn_queued(&["notify"]);
+        assert_eq!(runner.queue_depth(), 1);
+        runner.spawn_queued(&["sync", "--quiet"]);
+        assert_eq!(runner.queue_depth(), 2);
+        // First completes → second starts; only the third remains queued.
+        wait_for_result(&mut runner).expect("first");
+        assert_eq!(runner.queue_depth(), 1, "sync should still be queued");
+        // Second completes → third starts; queue is now empty.
+        wait_for_result(&mut runner).expect("second");
+        assert_eq!(runner.queue_depth(), 0, "queue should be drained after second pop");
+        // Third completes; all done.
+        wait_for_result(&mut runner).expect("third");
+        assert_eq!(runner.queue_depth(), 0);
+        assert!(!runner.is_running());
     }
 }
