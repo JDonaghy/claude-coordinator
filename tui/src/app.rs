@@ -12187,7 +12187,7 @@ impl CoordApp {
         let is_new_issue = pending.assignment_type == "new-issue-chat";
         let status_hint = if is_new_issue {
             format!(
-                "  New issue chat → {}  (Ctrl+S/Alt+Enter = send · f = file issue · Esc = close)",
+                "  New issue chat → {}  (Ctrl+S/Alt+Enter = send · Ctrl+F = file issue · Esc = close)",
                 pending.repo
             )
         } else {
@@ -14901,13 +14901,17 @@ impl ShellApp for CoordApp {
                 } else {
                     ctx.main_bounds()
                 };
-                // #316 Phase B: `f` key in a board new-issue-chat opens the
+                // #316 Phase B: `Ctrl+F` in a board new-issue-chat opens the
                 // file-issue modal.  Intercept before ChatController so the
-                // chat input doesn't see `f` as a literal character.
+                // chat input doesn't see Ctrl+F as a literal character.
+                // Previously matched bare `f`/`F` (#366: fixed to require Ctrl
+                // so literal 'f' can be typed in the chat input).
                 if chat_is_board {
                     if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                         if matches!(key, Key::Char('f') | Key::Char('F'))
-                            && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd
+                            && modifiers.ctrl
+                            && !modifiers.alt
+                            && !modifiers.cmd
                         {
                             self.open_file_issue_modal();
                             return Reaction::Redraw;
@@ -16459,9 +16463,9 @@ impl ShellApp for CoordApp {
                                 (Some("refinement"), _, false) => {
                                     "  (Ctrl+S/Alt+Enter = send · Ctrl+N = post notes · Esc = finish)"
                                 }
-                                // #316: board chats — no notes, but f = file issue for new-issue-chat.
+                                // #316: board chats — no notes, but Ctrl+F = file issue for new-issue-chat.
                                 (Some("new-issue-chat"), _, true) => {
-                                    "  (Ctrl+S/Alt+Enter = send · f = file issue · Esc = close)"
+                                    "  (Ctrl+S/Alt+Enter = send · Ctrl+F = file issue · Esc = close)"
                                 }
                                 (_, _, true) => {
                                     "  (Ctrl+S/Alt+Enter = send · Esc = close)"
