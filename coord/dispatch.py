@@ -88,8 +88,12 @@ def dispatch(
         "model": wire_model,
         "type": proposal.type,
         "branch": default_branch,
-        "artifact_paths": artifact_paths,
     }
+    # #351: only send artifact_paths when non-empty — older agents reject
+    # unknown payload keys with a 400.  When absent the agent falls back to
+    # self.artifact_paths (startup config).
+    if artifact_paths:
+        payload["artifact_paths"] = artifact_paths
     # Only send fresh_branch when True — older agents don't have this field
     # and will reject the payload with a 400.
     if fresh_branch:
