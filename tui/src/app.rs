@@ -13359,7 +13359,6 @@ impl CoordApp {
             || self.pending_test_fail.is_some()
             || self.pending_report_fix.is_some()
             || self.pending_refinement_close_prompt.is_some()
-            || self.pending_repo_picker.is_some()
         {
             return None;
         }
@@ -13501,7 +13500,7 @@ impl CoordApp {
                 }
                 if self.board_repo_names.len() == 1 {
                     let repo = self.board_repo_names[0].clone();
-                    self.dispatch_board_chat_refine(&repo)
+                    self.dispatch_board_chat_new_issue(&repo)
                 } else {
                     // Multiple repos — open the picker dialog.
                     self.pending_repo_picker = Some(PendingRepoPicker {
@@ -14987,7 +14986,7 @@ impl ShellApp for CoordApp {
                             if digit < picker.repos.len() {
                                 let repo = picker.repos[digit].clone();
                                 self.pending_repo_picker = None;
-                                self.dispatch_board_chat_refine(&repo);
+                                self.dispatch_board_chat_new_issue(&repo);
                                 return Reaction::Redraw;
                             }
                         }
@@ -15797,6 +15796,17 @@ impl ShellApp for CoordApp {
                                 ToastSeverity::Info,
                             );
                         }
+                        needs_redraw = true;
+                    }
+
+                    // ── #353: 'A' keybind mirrors the [A]dd toolbar button. ──
+                    Key::Char('A')
+                        if self.active_view == SidebarView::Board
+                            && self.inject_chat.is_none()
+                            && self.pending_board_chat.is_none()
+                            && self.pending_repo_picker.is_none() =>
+                    {
+                        self.dispatch_toolbar_action("toolbar:add");
                         needs_redraw = true;
                     }
 
