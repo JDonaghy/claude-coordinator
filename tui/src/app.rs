@@ -818,7 +818,11 @@ struct TestPlanOverlayState {
     step_states: Vec<TestStepState>,
     /// `test_plan_branch_head` from DB when the overlay opened — used for
     /// stale-plan detection.  `None` when the column was NULL.
-    #[allow(dead_code)]
+    ///
+    /// Read by the async `stale_check_rx` poll handler to compare against the
+    /// freshly-resolved local branch HEAD — on mismatch, `coord test-plan
+    /// --refresh` is dispatched.  See `open_test_chat_overlay_for` and the
+    /// poll site near `step_cmd_rx` in `tick()`.
     branch_head_from_db: Option<String>,
     /// Set while `coord test-plan` is running via CommandRunner so we don't
     /// double-spawn the plan fetch.
@@ -830,6 +834,18 @@ struct StepCmdResult {
     step_index: usize,
     exit_code: i32,
     output: String,
+}
+
+/// #349 Phase B: result returned by `spawn_branch_head_check`.
+///
+/// `work_assignment_id` lets the polling site verify the result still applies
+/// to the currently-open overlay — the user may have closed it and opened a
+/// different one between the spawn and the receive.
+struct StaleCheckResult {
+    work_assignment_id: String,
+    /// `git rev-parse <branch>` stdout, trimmed.  `None` if git failed
+    /// (missing repo, unknown branch, non-zero exit, decode error, etc.).
+    current_head: Option<String>,
 }
 
 /// #349 Phase B: parse the `test_plan` JSON column value into a `TestPlan`.
@@ -928,6 +944,33 @@ fn spawn_step_cmd(step_index: usize, cmd: &str) -> std::sync::mpsc::Receiver<Ste
             },
         };
         let _ = tx.send(result);
+    });
+    rx
+}
+
+/// #349 Phase B: spawn a background thread that runs `git -C <repo_path>
+/// rev-parse <branch>` and delivers the trimmed SHA (or `None` on any error)
+/// to the returned receiver.
+///
+/// This is the async version of the stale-plan branch-head check.  Running
+/// `Command::output()` on the UI/event thread blocks the terminal for as long
+/// as the subprocess takes (10–200 ms on a healthy repo, longer on a busy
+/// disk).  Spawning a thread keeps the next frame from stalling.
+fn spawn_branch_head_check(
+    work_assignment_id: String,
+    repo_path: std::path::PathBuf,
+    branch: String,
+) -> std::sync::mpsc::Receiver<StaleCheckResult> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let current_head = std::process::Command::new("git")
+            .args(["-C", &repo_path.to_string_lossy(), "rev-parse", &branch])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+        let _ = tx.send(StaleCheckResult { work_assignment_id, current_head });
     });
     rx
 }
@@ -3846,6 +3889,14 @@ pub struct CoordApp {
     /// running via CommandRunner — prevents double-spawning the plan fetch
     /// on subsequent render ticks.
     test_plan_cmd_pending: bool,
+    /// #349 Phase B: in-flight async branch-head check for stale-plan
+    /// detection.  Set on overlay open when the DB has a `branch_head` to
+    /// compare against; cleared once the background `git rev-parse` result
+    /// is consumed in `tick()` (or when the overlay closes).
+    ///
+    /// Running the rev-parse off the UI thread keeps the overlay-open path
+    /// non-blocking — see `spawn_branch_head_check`.
+    stale_check_rx: Option<std::sync::mpsc::Receiver<StaleCheckResult>>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4026,6 +4077,7 @@ impl CoordApp {
             test_plan_state: None,
             step_cmd_rx: None,
             test_plan_cmd_pending: false,
+            stale_check_rx: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -4267,8 +4319,15 @@ impl CoordApp {
         self.watch_focused = None;
         self.inject_chat = None;
         // #349 Phase B: clear test-plan overlay state when any chat closes.
+        // Also reset `test_plan_cmd_pending` and drop the async stale-check
+        // receiver — otherwise a fetch that hasn't completed yet leaves the
+        // guard stuck `true`, and the next overlay open won't re-spawn the
+        // fetch (so the plan-absent placeholder gets stuck on "unavailable"
+        // and the user has to close + reopen a second time).
         self.test_plan_state = None;
         self.step_cmd_rx = None;
+        self.test_plan_cmd_pending = false;
+        self.stale_check_rx = None;
     }
 
     /// True when the Pipeline view's Log tab is the active scroller.  On this
@@ -12775,31 +12834,30 @@ impl CoordApp {
             }
 
             // Stale-plan detection: if we have a plan AND a branch_head from DB,
-            // try to resolve the current branch HEAD using the ~/src/<repo> heuristic.
-            // On mismatch, spawn `coord test-plan --refresh`.
+            // spawn a background `git rev-parse` to resolve the current branch
+            // HEAD using the ~/src/<repo> heuristic.  The poll site in `tick()`
+            // compares the result against `overlay.branch_head_from_db` and, on
+            // mismatch, spawns `coord test-plan --refresh`.
+            //
+            // Running rev-parse on the UI thread here would block the next frame
+            // for the lifetime of the subprocess (10–200 ms locally, longer if
+            // git's index lock is contended) — visibly stutters overlay open.
             if overlay.plan.is_some()
                 && !self.test_plan_cmd_pending
+                && self.stale_check_rx.is_none()
                 && branch_head_from_db.is_some()
             {
-                if let (Some(head_db), Some(br)) = (branch_head_from_db.as_deref(), branch.as_deref()) {
+                if let Some(br) = branch.as_deref() {
                     let repo_name = pending.repo.clone();
-                    let stale = std::env::var("HOME").ok()
+                    if let Some(repo_path) = std::env::var("HOME").ok()
                         .map(|h| std::path::PathBuf::from(h).join("src").join(&repo_name))
                         .filter(|p| p.exists())
-                        .and_then(|repo_path| {
-                            std::process::Command::new("git")
-                                .args(["-C", &repo_path.to_string_lossy().into_owned(), "rev-parse", br])
-                                .output()
-                                .ok()
-                        })
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .map(|current_head| current_head != head_db)
-                        .unwrap_or(false);
-
-                    if stale && self.command_runner.spawn(&["test-plan", "--refresh", &work_id]) {
-                        self.test_plan_cmd_pending = true;
-                        overlay.plan_fetch_pending = true;
+                    {
+                        self.stale_check_rx = Some(spawn_branch_head_check(
+                            work_id.clone(),
+                            repo_path,
+                            br.to_string(),
+                        ));
                     }
                 }
             }
@@ -14458,6 +14516,50 @@ impl CoordApp {
             }
         }
 
+        // #349 Phase B: poll the async branch-head check for stale-plan detection.
+        // When it returns, compare against the overlay's `branch_head_from_db`;
+        // on mismatch (current HEAD differs from the SHA the plan was generated
+        // against), dispatch `coord test-plan --refresh` so the next overlay open
+        // gets a fresh plan.
+        if self.stale_check_rx.is_some() {
+            let stale_result = if let Some(ref rx) = self.stale_check_rx {
+                match rx.try_recv() {
+                    Ok(r) => Some(r),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Background thread panicked without sending — give up
+                        // on this check; the overlay still works with the
+                        // possibly-stale plan.
+                        Some(StaleCheckResult { work_assignment_id: String::new(), current_head: None })
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(result) = stale_result {
+                self.stale_check_rx = None;
+                // Only act when the overlay is still open for the same assignment
+                // (user may have closed/reopened a different one during the
+                // background check) and the DB had a head to compare against.
+                let should_refresh = self.test_plan_state.as_ref()
+                    .filter(|s| s.work_assignment_id == result.work_assignment_id)
+                    .and_then(|s| s.branch_head_from_db.as_deref())
+                    .zip(result.current_head.as_deref())
+                    .map(|(db_head, current_head)| db_head != current_head)
+                    .unwrap_or(false);
+                if should_refresh
+                    && !self.test_plan_cmd_pending
+                    && self.command_runner.spawn(&["test-plan", "--refresh", &result.work_assignment_id])
+                {
+                    self.test_plan_cmd_pending = true;
+                    if let Some(ref mut overlay) = self.test_plan_state {
+                        overlay.plan_fetch_pending = true;
+                    }
+                    needs_redraw = true;
+                }
+            }
+        }
+
         // #336: Poll the in-flight artifact manifest fetch and populate cache.
         if let Some((key, rx)) = &self.artifact_fetch_rx {
             match rx.try_recv() {
@@ -15501,8 +15603,13 @@ impl ShellApp for CoordApp {
                         }
                         self.inject_chat = None;
                         // #349 Phase B: clear test-plan state on any chat close.
+                        // Also reset `test_plan_cmd_pending` and drop the async
+                        // stale-check receiver so a reopen retries the fetch —
+                        // see `close_watch` for the full failure scenario.
                         self.test_plan_state = None;
                         self.step_cmd_rx = None;
+                        self.test_plan_cmd_pending = false;
+                        self.stale_check_rx = None;
                     }
                     _ => {}
                 }
@@ -17859,6 +17966,7 @@ mod tests {
             test_plan_state: None,
             step_cmd_rx: None,
             test_plan_cmd_pending: false,
+            stale_check_rx: None,
         }
     }
 
