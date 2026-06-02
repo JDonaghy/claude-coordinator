@@ -12187,7 +12187,7 @@ impl CoordApp {
         let is_new_issue = pending.assignment_type == "new-issue-chat";
         let status_hint = if is_new_issue {
             format!(
-                "  New issue chat → {}  (Ctrl+S/Alt+Enter = send · f = file issue · Esc = close)",
+                "  New issue chat → {}  (Ctrl+S/Alt+Enter = send · Ctrl+F = file issue · Esc = close)",
                 pending.repo
             )
         } else {
@@ -14901,13 +14901,17 @@ impl ShellApp for CoordApp {
                 } else {
                     ctx.main_bounds()
                 };
-                // #316 Phase B: `f` key in a board new-issue-chat opens the
+                // #316 Phase B: `Ctrl+F` in a board new-issue-chat opens the
                 // file-issue modal.  Intercept before ChatController so the
-                // chat input doesn't see `f` as a literal character.
+                // chat input doesn't see Ctrl+F as a literal character.
+                // Previously matched bare `f`/`F` (#366: fixed to require Ctrl
+                // so literal 'f' can be typed in the chat input).
                 if chat_is_board {
                     if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                         if matches!(key, Key::Char('f') | Key::Char('F'))
-                            && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd
+                            && modifiers.ctrl
+                            && !modifiers.alt
+                            && !modifiers.cmd
                         {
                             self.open_file_issue_modal();
                             return Reaction::Redraw;
@@ -16459,9 +16463,9 @@ impl ShellApp for CoordApp {
                                 (Some("refinement"), _, false) => {
                                     "  (Ctrl+S/Alt+Enter = send · Ctrl+N = post notes · Esc = finish)"
                                 }
-                                // #316: board chats — no notes, but f = file issue for new-issue-chat.
+                                // #316: board chats — no notes, but Ctrl+F = file issue for new-issue-chat.
                                 (Some("new-issue-chat"), _, true) => {
-                                    "  (Ctrl+S/Alt+Enter = send · f = file issue · Esc = close)"
+                                    "  (Ctrl+S/Alt+Enter = send · Ctrl+F = file issue · Esc = close)"
                                 }
                                 (_, _, true) => {
                                     "  (Ctrl+S/Alt+Enter = send · Esc = close)"
@@ -22865,9 +22869,10 @@ mod tests {
     }
 
     #[test]
-    fn panel_toolbar_suppressed_while_repo_picker_open() {
-        // #353: when the repo picker is open, the toolbar is suppressed
-        // so the picker's keyboard shortcuts aren't conflicted with.
+    fn panel_toolbar_stays_visible_while_repo_picker_open() {
+        // #364: the repo picker is a status-bar hint, not a modal, so the
+        // toolbar stays visible while it's open — hiding it made pressing
+        // [Add] look like a no-op.
         let mut app = make_app_default();
         app.board_repo_names.push("repo-a".to_string());
         app.board_repo_names.push("repo-b".to_string());
@@ -22877,13 +22882,13 @@ mod tests {
             selected: None,
             opened_at: Instant::now(),
         });
-        assert!(app.panel_toolbar().is_none());
+        assert!(app.panel_toolbar().is_some());
     }
 
     #[test]
-    fn dispatch_toolbar_add_single_repo_calls_refine_directly() {
-        // #353: when there's only one repo, [Add] directly calls
-        // dispatch_board_chat_refine without showing a picker.
+    fn dispatch_toolbar_add_single_repo_calls_new_issue_directly() {
+        // #364: when there's only one repo, [Add] directly calls
+        // dispatch_board_chat_new_issue without showing a picker.
         let mut app = make_app_default();
         app.board_repo_names.push("repo-a".to_string());
         assert!(app.pending_board_chat.is_none());
@@ -22891,12 +22896,12 @@ mod tests {
 
         app.dispatch_toolbar_action("toolbar:add");
 
-        // Should have opened a refine-board chat, not a picker.
+        // Should have opened a new-issue chat, not a picker.
         assert!(app.pending_board_chat.is_some());
         assert!(app.pending_repo_picker.is_none());
         let chat = app.pending_board_chat.as_ref().unwrap();
         assert_eq!(chat.repo, "repo-a");
-        assert_eq!(chat.assignment_type, "refinement");
+        assert_eq!(chat.assignment_type, "new-issue-chat");
     }
 
     #[test]
@@ -22911,7 +22916,7 @@ mod tests {
 
         app.dispatch_toolbar_action("toolbar:add");
 
-        // Should have opened a picker, not dispatched refine directly.
+        // Should have opened a picker, not dispatched a chat directly.
         assert!(app.pending_board_chat.is_none());
         let picker = app.pending_repo_picker.as_ref().expect("picker opened");
         assert_eq!(picker.repos.len(), 2);
