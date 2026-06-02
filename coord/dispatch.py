@@ -75,8 +75,14 @@ def dispatch(
         artifact_paths = list(repo.artifact_paths)
 
     # #352: resolve new-issue guidance for new-issue-chat assignments.
+    # Only resolve when the repo *explicitly configured* new_issue_guidance —
+    # the resolver always returns a non-empty _DEFAULT, so checking
+    # `if new_issue_guidance:` below would always send the field, causing
+    # agents that predate #352 to reject the payload with a 400.  Gating on
+    # the raw config field lets repos without guidance dispatch to any agent
+    # (the agent's built-in NEW_ISSUE_CHAT_SYSTEM_PROMPT is fine without it).
     new_issue_guidance: str = ""
-    if proposal.type == "new-issue-chat" and repo is not None:
+    if proposal.type == "new-issue-chat" and repo is not None and repo.new_issue_guidance:
         from pathlib import Path
         new_issue_guidance = repo.resolve_new_issue_guidance(Path(repo_path).expanduser())
 

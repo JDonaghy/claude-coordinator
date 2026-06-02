@@ -393,11 +393,13 @@ class TestNewIssueGuidance:
         assert payload["new_issue_guidance"] == guidance
 
     @patch("coord.dispatch.httpx.post")
-    def test_payload_includes_default_guidance_when_not_configured(
+    def test_payload_omits_new_issue_guidance_when_not_configured(
         self, mock_post: MagicMock,
     ) -> None:
-        """When the repo has no custom new_issue_guidance, the payload includes
-        the default guidance string provided by resolve_new_issue_guidance."""
+        """When the repo has no custom new_issue_guidance, the payload must
+        OMIT the field entirely so agents that predate #352 can accept the
+        dispatch.  The agent's built-in NEW_ISSUE_CHAT_SYSTEM_PROMPT is fine
+        without the guidance augmentation."""
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"ok": True}
         mock_post.return_value = mock_resp
@@ -422,14 +424,7 @@ class TestNewIssueGuidance:
         )
         dispatch(p, cfg)
         payload = mock_post.call_args.kwargs["json"]
-        # resolve_new_issue_guidance returns a default when not configured
-        assert payload["new_issue_guidance"] == (
-            "Required sections: "
-            "Title (active voice, ≤80 chars), "
-            "What (1-3 sentences), "
-            "Acceptance (bulleted, observable), "
-            "Out of scope"
-        )
+        assert "new_issue_guidance" not in payload
 
     @patch("coord.dispatch.httpx.post")
     def test_payload_excludes_new_issue_guidance_for_work_assignment(
