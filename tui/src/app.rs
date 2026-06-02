@@ -4523,6 +4523,7 @@ impl CoordApp {
                     role: ChatRole::User,
                     text: StyledText::plain(text.clone()),
                     timestamp_unix: now,
+                    line_scales: Vec::new(),
                 };
                 if let Some(ctx) = self.watch_pool.get_mut(&aid) {
                     ctx.inject_transcript.push(turn);
@@ -4589,6 +4590,7 @@ impl CoordApp {
                 role: ChatRole::User,
                 text: StyledText::plain(text.clone()),
                 timestamp_unix: now,
+                line_scales: Vec::new(),
             };
             if let Some(ctx) = self.watch_pool.get_mut(&aid) {
                 ctx.inject_transcript.push(turn);
@@ -16747,6 +16749,7 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
                 ctx.state.issue_number
             )),
             timestamp_unix: None,
+            line_scales: Vec::new(),
         });
     }
     let mut user_idx = 0usize;
@@ -16766,21 +16769,26 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
         if body.is_empty() {
             continue;
         }
-        // Split on newlines so each line is its own row — MessageList
-        // wraps single rows but doesn't honour embedded `\n`, so a
-        // numbered list rendered as one big row jams everything onto a
-        // single wrapped paragraph.
-        for chunk in body.split('\n') {
-            let line = chunk.trim_end();
-            if line.is_empty() {
-                continue;
+        // Render the whole assistant body through quadraui's markdown adapter
+        // so headings, bold, italic, inline code, lists, blockquotes, and
+        // fenced code blocks are styled.  One ChatTurn per SSE message carries
+        // line_scales; build_transcript_rows splits it by the \n separators.
+        let md_theme = quadraui::Theme::default();
+        let rendered = quadraui::render_markdown_to_styled(body, &md_theme);
+        let line_scales = rendered.line_scales.clone();
+        let mut md_spans: Vec<StyledSpan> = Vec::new();
+        for (i, md_line) in rendered.lines.into_iter().enumerate() {
+            if i > 0 {
+                md_spans.push(StyledSpan::plain("\n"));
             }
-            turns.push(ChatTurn {
-                role: ChatRole::Assistant,
-                text: StyledText::plain(line.to_string()),
-                timestamp_unix: None,
-            });
+            md_spans.extend(md_line.spans);
         }
+        turns.push(ChatTurn {
+            role: ChatRole::Assistant,
+            text: StyledText { spans: md_spans },
+            timestamp_unix: None,
+            line_scales,
+        });
     }
     // Tail: any user turns submitted *after* the last SSE line we've seen
     // (assistant hasn't replied yet) still belong in the transcript.
