@@ -16764,7 +16764,11 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
         if json_str(line, "type").as_deref() != Some("assistant") {
             continue;
         }
-        let text = extract_text_block(line);
+        // #372 follow-up: keep newlines so the markdown adapter can see block
+        // structure (lists, headings, fenced code, blockquotes). The plain
+        // extract_text_block flattens \n→space, which left only inline markdown
+        // (bold/italic) rendering.
+        let text = extract_text_block_keep_newlines(line);
         let body = text.trim();
         if body.is_empty() {
             continue;
