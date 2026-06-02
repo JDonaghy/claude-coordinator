@@ -366,6 +366,12 @@ struct PendingChatResume {
     /// to the original (initial) refinement assignment because the new
     /// resume row hadn't been written to the DB yet.
     arm_unix_secs: f64,
+    /// The `assignment_type` of the OLD (completed) assignment — used to
+    /// match the continuation to the same chat type (e.g. "refinement",
+    /// "test-chat", "new-issue-chat").  Without this the bind was
+    /// hardcoded to "refinement" and test-chat / new-issue-chat
+    /// continuations never rebound (#361).
+    old_type: Option<String>,
 }
 
 /// #264: after the refinement chat closes we issue `coord stop` first,
@@ -4462,8 +4468,8 @@ impl CoordApp {
     /// Appends the text to the inject transcript and clears the chat
     /// input on success.
     fn submit_inject(&mut self, text: String) -> bool {
-        let (aid, issue_number, machine_name) = match self.focused_watch_state() {
-            Some(w) => (w.assignment_id.clone(), w.issue_number, w.machine.clone()),
+        let (aid, issue_number, machine_name, old_type) = match self.focused_watch_state() {
+            Some(w) => (w.assignment_id.clone(), w.issue_number, w.machine.clone(), w.assignment_type.clone()),
             None => return false,
         };
         let text = text.trim().to_string();
@@ -4541,6 +4547,7 @@ impl CoordApp {
                 issue_number,
                 dispatched_at: Instant::now(),
                 arm_unix_secs,
+                old_type: Some(old_type),
             });
             self.pipeline_status = Some((
                 format!("⏳ Resuming chat #{issue_number}…"),
@@ -12656,9 +12663,9 @@ impl CoordApp {
     }
 
     /// #315: called each tick while `pending_chat_resume` is armed.  Looks for
-    /// a NEW running refinement assignment for the same issue (dispatched AFTER
-    /// the prior worker exited) and, when found, rebinds the open `inject_chat`
-    /// overlay to it so the conversation continues seamlessly.
+    /// a NEW running assignment of the same chat type for the same issue
+    /// (dispatched AFTER the prior worker exited) and, when found, rebinds the
+    /// open `inject_chat` overlay to it so the conversation continues seamlessly.
     ///
     /// Returns true when the overlay was rebound (caller should redraw).
     fn maybe_bind_pending_resume(&mut self) -> bool {
@@ -12681,22 +12688,26 @@ impl CoordApp {
             );
             return true;
         }
-        // Find the newest refinement assignment for this issue that is NOT
-        // the prior assignment (which just exited).  Accept either "running"
-        // (typical case — the resume worker is still mid-reply) or "done"
-        // (fast workers may complete before our bind poll fires, leaving the
-        // status already terminal — e.g. trivial replies in <2s).  We still
-        // bind so the overlay can render the worker's reply from its SSE log.
+        // Find the newest assignment of the same chat type for this issue that
+        // is NOT the prior assignment (which just exited).  Accept either
+        // "running" (typical case — the resume worker is still mid-reply) or
+        // "done" (fast workers may complete before our bind poll fires, leaving
+        // the status already terminal — e.g. trivial replies in <2s).  We
+        // still bind so the overlay can render the worker's reply from its SSE
+        // log.
         // 5-second grace on the dispatch floor — accounts for clock skew
         // between this machine and whichever machine wrote the row, and for
         // the time between `coord chat-continue` starting and the DB write
         // landing.  Without this floor, the bind picks the OLDEST matching
-        // refinement that passes the `id != old` filter, which on a 2nd
-        // submit is the FIRST refinement (original `coord refine-chat`).
+        // assignment that passes the `id != old` filter, which on a 2nd submit
+        // is the FIRST assignment (original `coord refine-chat`).
+        // #361: match by `old_type` (the originating assignment's type) rather
+        // than hardcoding "refinement" so that test-chat and new-issue-chat
+        // continuations also rebind correctly.
         let dispatch_floor = pending.arm_unix_secs - 5.0;
         let matching: Vec<_> = self.data.assignments.iter()
             .filter(|a| a.issue_number == pending.issue_number)
-            .filter(|a| a.assignment_type.as_deref() == Some("refinement"))
+            .filter(|a| a.assignment_type == pending.old_type)
             .filter(|a| a.id != pending.old_assignment_id)
             .filter(|a| a.dispatched_at.map(|d| d >= dispatch_floor).unwrap_or(false))
             .collect();
@@ -13895,12 +13906,19 @@ impl CoordApp {
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
             let config_path = self.command_runner.config_path.clone();
+            // Look up the old assignment's type so the resume bind matches
+            // the same chat type (fixes #361: test-chat / new-issue-chat
+            // continuations never rebound when filter was "refinement"-only).
+            let old_type = self.data.assignments.iter()
+                .find(|a| a.id == fb.aid)
+                .and_then(|a| a.assignment_type.clone());
             spawn_chat_continue(config_path, fb.aid.clone(), fb.text.clone());
             self.pending_chat_resume = Some(PendingChatResume {
                 old_assignment_id: fb.aid.clone(),
                 issue_number: fb.issue_number,
                 dispatched_at: Instant::now(),
                 arm_unix_secs,
+                old_type,
             });
             self.pipeline_status = Some((
                 format!("⏳ Resuming chat #{}…", fb.issue_number),
@@ -24357,5 +24375,127 @@ mod tests {
         assert_eq!(repo, "my-repo");
         assert_eq!(sanitized, "issue-42-test");
         assert_eq!(work_id, "work-abc123");
+    }
+
+    // ── #361: maybe_bind_pending_resume type-aware matching ───────────────────
+
+    /// Helper: build a new assignment whose id differs from the old one so the
+    /// `id != old_assignment_id` filter passes.
+    fn make_resume_candidate(
+        status: &str,
+        issue: u64,
+        atype: Option<&str>,
+        new_id: &str,
+    ) -> Assignment {
+        let mut a = make_assignment_typed(status, issue, "repo-a", atype);
+        a.id = new_id.to_string();
+        // Use a large dispatched_at so the dispatch-floor filter (arm_unix_secs=0 → floor=-5)
+        // always passes.
+        a.dispatched_at = Some(2_000_000.0);
+        a
+    }
+
+    /// Build a `PendingChatResume` with arm_unix_secs=0 (floor=-5, all rows
+    /// pass the floor filter) so tests focus on the type-match logic only.
+    fn make_pending_resume(
+        old_id: &str,
+        issue: u64,
+        old_type: Option<&str>,
+    ) -> PendingChatResume {
+        PendingChatResume {
+            old_assignment_id: old_id.to_string(),
+            issue_number: issue,
+            dispatched_at: Instant::now(),
+            arm_unix_secs: 0.0,
+            old_type: old_type.map(|s| s.to_string()),
+        }
+    }
+
+    /// #361 regression: test-chat continuation must rebind when the new
+    /// assignment is also "test-chat".
+    #[test]
+    fn maybe_bind_pending_resume_rebinds_test_chat() {
+        let new_asg = make_resume_candidate("running", 42, Some("test-chat"), "new-42");
+        let mut app = make_test_app(BoardData {
+            assignments: vec![new_asg],
+            ..BoardData::default()
+        });
+        app.pending_chat_resume = Some(make_pending_resume("old-42", 42, Some("test-chat")));
+        let rebound = app.maybe_bind_pending_resume();
+        assert!(
+            rebound,
+            "#361: test-chat continuation must rebind when a new test-chat assignment appears",
+        );
+        assert!(
+            app.pending_chat_resume.is_none(),
+            "pending_chat_resume must be cleared after a successful rebind",
+        );
+        assert_eq!(
+            app.watch_focused,
+            Some("new-42".to_string()),
+            "watch_focused must point to the new assignment after rebind",
+        );
+    }
+
+    /// #361 regression: new-issue-chat continuation must rebind when the new
+    /// assignment is also "new-issue-chat".
+    #[test]
+    fn maybe_bind_pending_resume_rebinds_new_issue_chat() {
+        let new_asg = make_resume_candidate("running", 7, Some("new-issue-chat"), "new-7");
+        let mut app = make_test_app(BoardData {
+            assignments: vec![new_asg],
+            ..BoardData::default()
+        });
+        app.pending_chat_resume = Some(make_pending_resume("old-7", 7, Some("new-issue-chat")));
+        let rebound = app.maybe_bind_pending_resume();
+        assert!(
+            rebound,
+            "#361: new-issue-chat continuation must rebind when a new new-issue-chat assignment appears",
+        );
+        assert!(app.pending_chat_resume.is_none());
+        assert_eq!(app.watch_focused, Some("new-7".to_string()));
+    }
+
+    /// Regression: refinement-type continuation still rebinds (pre-existing
+    /// behaviour must not break after the #361 type-aware change).
+    #[test]
+    fn maybe_bind_pending_resume_still_rebinds_refinement() {
+        let new_asg = make_resume_candidate("running", 5, Some("refinement"), "new-5");
+        let mut app = make_test_app(BoardData {
+            assignments: vec![new_asg],
+            ..BoardData::default()
+        });
+        app.pending_chat_resume = Some(make_pending_resume("old-5", 5, Some("refinement")));
+        let rebound = app.maybe_bind_pending_resume();
+        assert!(
+            rebound,
+            "refinement continuation must still rebind after #361 type-aware change",
+        );
+        assert!(app.pending_chat_resume.is_none());
+        assert_eq!(app.watch_focused, Some("new-5".to_string()));
+    }
+
+    /// Cross-type mismatch: old_type="refinement" but new assignment is
+    /// "test-chat" → must NOT rebind (different chat sessions on the same
+    /// issue should not cross-contaminate each other).
+    #[test]
+    fn maybe_bind_pending_resume_does_not_bind_across_types() {
+        // New assignment is test-chat, but the pending resume expects refinement.
+        let new_asg = make_resume_candidate("running", 10, Some("test-chat"), "new-10");
+        let mut app = make_test_app(BoardData {
+            assignments: vec![new_asg],
+            ..BoardData::default()
+        });
+        app.pending_chat_resume = Some(make_pending_resume("old-10", 10, Some("refinement")));
+        let rebound = app.maybe_bind_pending_resume();
+        assert!(
+            !rebound,
+            "cross-type mismatch (old=refinement, new=test-chat) must NOT rebind",
+        );
+        // pending_chat_resume must still be armed — not consumed.
+        assert!(
+            app.pending_chat_resume.is_some(),
+            "pending_chat_resume must remain armed when no matching assignment is found",
+        );
     }
 }
