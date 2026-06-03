@@ -7051,7 +7051,30 @@ impl CoordApp {
     /// Skipped stages (closed-issue stages that never ran through coord) are
     /// treated the same as Done for badge purposes: they don't represent a
     /// meaningful "current" action and should not halt the badge at "work".
+    ///
+    /// The lifecycle section is used as the source of truth for the "done"
+    /// state: if `pipeline_lifecycle_section` returns `"done"`, the badge
+    /// always reads "done" regardless of individual stage statuses.  This
+    /// prevents two categories of inconsistency:
+    ///
+    /// 1. **Open-but-merged issues** (`merge_stage_status_for == Done`, GitHub
+    ///    issue still open): `stage_status_for` returns `Pending` (not
+    ///    `Skipped`) for stages with no assignment because `is_closed` is
+    ///    `false`.  Without the short-circuit, `derive_current_stage` would
+    ///    halt at "review" or "work" and the sidebar badge would read "review"
+    ///    or "work" for an issue that the coordinator has already merged.
+    ///
+    /// 2. **Stale downstream stages on closed issues**: if a work assignment
+    ///    was re-dispatched after a review completed, the review stage becomes
+    ///    `Stale` (not `Done` or `Skipped`), which would again halt the badge
+    ///    at "review" even though the issue is closed.
     fn derive_current_stage(&self, issue: &PipelineIssue) -> String {
+        // Lifecycle section is the authoritative summary.  If the issue is
+        // already in "done", the badge must read "done" — never a bare stage
+        // name that would be visually indistinguishable from a lifecycle label.
+        if self.pipeline_lifecycle_section(issue) == "done" {
+            return "done".to_string();
+        }
         let stages = self.pipeline_stage_names();
         for s in &stages {
             let st = self.stage_status_for(issue, s);
@@ -21378,6 +21401,77 @@ mod tests {
             review_findings: None,
         });
         let issue = &app.pipeline_issues[0];
+        assert_eq!(app.derive_current_stage(issue), "done");
+    }
+
+    #[test]
+    fn derive_current_stage_done_for_open_merged_no_review_assignment() {
+        // Regression: an open issue whose merge_queue entry says "merged" must
+        // show "done" in the sidebar badge.  Before the fix, stage_status_for
+        // returned Pending (not Skipped) for the review stage because
+        // is_closed==false, so derive_current_stage halted at "review".
+        let mut app = make_pipeline_app();
+        // Issue #42 is deliberately NOT closed — the GitHub close hasn't
+        // synced yet, but the merge_queue entry already says "merged".
+        assert!(!app.pipeline_issues[0].is_closed);
+        // Work assignment: done.
+        app.data.assignments.push(_stage_assignment("w1", "work", 1.0, "done"));
+        // No review assignment — review ran implicitly as part of the merge PR.
+        // Merge queue: merged (the actual coordinator merge completed).
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        let issue = &app.pipeline_issues[0];
+        // Lifecycle section must say "done" (open-but-merged path).
+        assert_eq!(app.pipeline_lifecycle_section(issue), "done");
+        // Badge must read "done", not "review".
+        assert_eq!(app.derive_current_stage(issue), "done");
+    }
+
+    #[test]
+    fn derive_current_stage_done_for_open_merged_no_assignments() {
+        // Edge case: an open issue with a "merged" merge_queue entry but zero
+        // assignment rows (e.g. coord took over an already-merged PR).  The
+        // badge must still read "done" — the lifecycle section is authoritative.
+        let mut app = make_pipeline_app();
+        assert!(!app.pipeline_issues[0].is_closed);
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "ext".to_string(),
+            issue_number: Some(42),
+            state: "merged".to_string(),
+            pr_number: Some(8),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+        });
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.pipeline_lifecycle_section(issue), "done");
+        assert_eq!(app.derive_current_stage(issue), "done");
+    }
+
+    #[test]
+    fn derive_current_stage_done_for_closed_with_stale_review() {
+        // Regression: a closed issue where work was re-dispatched (second work
+        // assignment is newer) causes the review stage to be Stale (not Done
+        // or Skipped).  Before the fix, derive_current_stage halted at "review"
+        // because Stale != Done && Stale != Skipped.
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].is_closed = true;
+        // Review done at t=200, based on first work (dispatched at t=100).
+        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        // Work re-dispatched later (t=300) — makes review Stale because
+        // upstream_max_dispatched_at("review") = 300 > review.dispatched_at = 200.
+        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        let issue = &app.pipeline_issues[0];
+        // Confirm the stale condition is live (review stage is Stale).
+        assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Stale);
+        // Lifecycle section is "done" (issue is closed) — badge must say "done".
+        assert_eq!(app.pipeline_lifecycle_section(issue), "done");
         assert_eq!(app.derive_current_stage(issue), "done");
     }
 
