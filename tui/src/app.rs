@@ -63,7 +63,7 @@ use quadraui::{
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
-    StatusBarSegment, StyledSpan, StyledText, TabBar, TabItem, Toolbar, ToolbarButton,
+    StatusBarSegment, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar, ToolbarButton,
     ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
 };
 
@@ -14963,7 +14963,31 @@ impl ShellApp for CoordApp {
                             backend.draw_list(content_rect, &self.pipeline_stages_list());
                         }
                         PipelineDetailTab::Log => {
-                            backend.draw_list(content_rect, &self.pipeline_log_list());
+                            let log_list = self.pipeline_log_list();
+                            // Collect the visible text for pixel-based backends
+                            // (GTK/macOS).  The TUI backend ignores `lines` and
+                            // reads selection directly from its ratatui cell
+                            // buffer, so this is a no-cost no-op for TUI users.
+                            let lines: Vec<String> = log_list
+                                .items
+                                .iter()
+                                .map(|it| {
+                                    it.text
+                                        .spans
+                                        .iter()
+                                        .map(|s| s.text.as_str())
+                                        .collect()
+                                })
+                                .collect();
+                            backend.draw_list(content_rect, &log_list);
+                            // #312: register as a selectable TextRegion so the
+                            // quadraui runtime handles click-drag line selection
+                            // and Ctrl-C copy (OSC52 + arboard) automatically.
+                            backend.register_text_region(TextRegion {
+                                id: WidgetId::new("pipeline-log"),
+                                bounds: content_rect,
+                                lines,
+                            });
                         }
                         PipelineDetailTab::Refinement => {
                             // #264: refinement chat lives in its own tab so
