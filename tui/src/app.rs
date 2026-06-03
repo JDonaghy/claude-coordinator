@@ -3116,6 +3116,32 @@ fn fetch_pipeline_issues(
     PipelineLoaderResult::Ok(issues)
 }
 
+/// Compute the cache TTL (seconds) for a CI-check entry, based on the
+/// current CI state and whether the PR is merge-eligible.
+///
+/// Returns `Some(secs)` when a cached entry older than `secs` should trigger
+/// a fresh `gh pr checks` call.  Returns `None` when the entry should **not**
+/// be polled at all (ineligible PR with no cached data — CI state is
+/// irrelevant until the review gate clears).
+///
+/// Tiering:
+/// * `Some(s)` where `s.running > 0` → `Some(30)` — CI still in flight;
+///   needs timely updates.
+/// * `Some(s)` where all checks settled (terminal) → `Some(600)` — CI result
+///   won't change; a 10-minute re-check is conservative enough.
+/// * `None` and `merge_eligible` → `Some(0)` — no prior fetch; eligible PR
+///   needs a result immediately.
+/// * `None` and `!merge_eligible` → `None` — blocked on review; skip until
+///   eligibility changes.
+fn ci_stale_secs(cached: Option<&CiCheckSummary>, merge_eligible: bool) -> Option<u64> {
+    match cached {
+        Some(s) if s.running > 0 => Some(30),
+        Some(_) => Some(600),
+        None if merge_eligible => Some(0),
+        None => None,
+    }
+}
+
 /// Fetch CI check summary for one PR by shelling out to `gh pr checks`.
 ///
 /// Mirrors what `coord/ci_github.py::GitHubCi.list_checks_for_pr` does on the
@@ -8240,10 +8266,10 @@ impl CoordApp {
     ///    once; excess targets wait for a free slot in a later tick.
     /// 2. **Per-tick stagger** — at most `CI_MAX_NEW_PER_TICK` new loaders
     ///    are started per call, spreading bursts across many ticks.
-    /// 3. **TTL tiering** — PRs that are blocked on review-approval (the
-    ///    majority) use a much longer stale window (`CI_STALE_INELIGIBLE_SECS`)
-    ///    because their CI state doesn't affect merge readiness.  Only PRs
-    ///    with an approved review use the tight `CI_STALE_ELIGIBLE_SECS` TTL.
+    /// 3. **TTL tiering** — cache TTL is based on observed CI state (see
+    ///    [`ci_stale_secs`]): running CI → 30s, terminal (pass/fail) → 600s,
+    ///    no cache + eligible → fetch immediately, no cache + ineligible →
+    ///    skip entirely (CI result irrelevant until review clears).
     fn maybe_kick_ci_check_loaders(&mut self) {
         if self.active_view != SidebarView::Pipeline {
             return;
@@ -8253,10 +8279,6 @@ impl CoordApp {
         const CI_MAX_IN_FLIGHT: usize = 4;
         /// Maximum new loaders started in a single tick (stagger guard).
         const CI_MAX_NEW_PER_TICK: usize = 2;
-        /// Cache TTL for PRs that are merge-eligible (approved review).
-        const CI_STALE_ELIGIBLE_SECS: u64 = 30;
-        /// Cache TTL for PRs still waiting on review — CI doesn't matter yet.
-        const CI_STALE_INELIGIBLE_SECS: u64 = 300;
 
         // Global cap: don't wake any new threads when already at the limit.
         if self.pipeline_ci_loader.len() >= CI_MAX_IN_FLIGHT {
@@ -8309,16 +8331,20 @@ impl CoordApp {
             if self.pipeline_ci_loader.contains_key(&key) {
                 continue;
             }
-            // TTL tiering: ineligible PRs are polled far less often.
-            let stale_secs = if merge_eligible {
-                CI_STALE_ELIGIBLE_SECS
-            } else {
-                CI_STALE_INELIGIBLE_SECS
+            // CI-state-based TTL tiering (see `ci_stale_secs`):
+            // - running CI      → 30s  (needs timely updates)
+            // - terminal CI     → 600s (won't change; check rarely)
+            // - no cache + eligible  → fetch now
+            // - no cache + ineligible → skip entirely (blocked on review)
+            let needs_refresh = match ci_stale_secs(self.pipeline_ci_checks.get(&key), merge_eligible) {
+                None => false,
+                Some(threshold_secs) => match self.pipeline_ci_checks.get(&key) {
+                    Some(cached) => cached.fetched_at.elapsed() >= Duration::from_secs(threshold_secs),
+                    None => true, // threshold_secs == 0 for eligible+no-cache → fetch now
+                },
             };
-            if let Some(existing) = self.pipeline_ci_checks.get(&key) {
-                if existing.fetched_at.elapsed() < Duration::from_secs(stale_secs) {
-                    continue;
-                }
+            if !needs_refresh {
+                continue;
             }
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -22327,6 +22353,160 @@ mod tests {
             !app.pipeline_ci_loader.contains_key(&key),
             "eligible PR with a just-fetched summary must also be skipped",
         );
+    }
+
+    /// `ci_stale_secs` returns the correct TTL tier for each combination of
+    /// cached CI state and merge-eligibility.
+    #[test]
+    fn ci_stale_secs_tiering() {
+        fn make_ci(running: usize, passed: usize, failed: usize) -> CiCheckSummary {
+            CiCheckSummary {
+                running,
+                passed,
+                failed,
+                failed_names: vec![],
+                first_failed_url: None,
+                fetched_at: Instant::now(),
+            }
+        }
+
+        let running_ci = make_ci(1, 0, 0);
+        let terminal_ok = make_ci(0, 3, 0);
+        let terminal_fail = make_ci(0, 0, 1);
+
+        // Running CI → tight 30s TTL regardless of eligibility.
+        assert_eq!(ci_stale_secs(Some(&running_ci), true),  Some(30));
+        assert_eq!(ci_stale_secs(Some(&running_ci), false), Some(30));
+
+        // Terminal (all passed) → long 600s TTL.
+        assert_eq!(ci_stale_secs(Some(&terminal_ok),   true),  Some(600));
+        assert_eq!(ci_stale_secs(Some(&terminal_ok),   false), Some(600));
+
+        // Terminal (some failed) → long 600s TTL (CI won't un-fail).
+        assert_eq!(ci_stale_secs(Some(&terminal_fail), true),  Some(600));
+        assert_eq!(ci_stale_secs(Some(&terminal_fail), false), Some(600));
+
+        // No cache, merge-eligible → fetch immediately (Some(0)).
+        assert_eq!(ci_stale_secs(None, true), Some(0));
+
+        // No cache, ineligible (blocked on review) → skip entirely (None).
+        assert_eq!(ci_stale_secs(None, false), None);
+    }
+
+    /// Mixed queue: 45 ineligible PRs + 5 eligible PRs, all with no cached
+    /// CI summary.  Only the eligible PRs should be kicked, and only up to
+    /// the per-tick stagger limit (CI_MAX_NEW_PER_TICK = 2).
+    #[test]
+    fn maybe_kick_ci_check_loaders_mixed_queue_only_eligible_kicked() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        // Pipeline has a "review" stage (default in make_pipeline_app) →
+        // eligibility is determined by approved-review presence.
+
+        // 45 ineligible PRs: issue numbers 200..244, PR numbers 200..244.
+        for i in 0..45i64 {
+            app.data.merge_queue.push(make_mq_entry("acme/api", i + 200, i as u64 + 200));
+            // No approved review for these → ineligible.
+        }
+
+        // 5 eligible PRs: issue numbers 100..104, PR numbers 100..104.
+        for i in 0..5i64 {
+            let issue_num = i as u64 + 100;
+            app.data.merge_queue.push(make_mq_entry("acme/api", i + 100, issue_num));
+            app.data.assignments.push(make_approved_review(issue_num));
+        }
+
+        app.maybe_kick_ci_check_loaders();
+
+        // Only 2 loaders should start (the per-tick stagger cap).
+        assert_eq!(
+            app.pipeline_ci_loader.len(),
+            2,
+            "first tick must start exactly CI_MAX_NEW_PER_TICK=2 loaders",
+        );
+
+        // All started loaders must be from the eligible set (PRs 100-104).
+        for (repo, pr) in app.pipeline_ci_loader.keys() {
+            assert_eq!(repo, "acme/api");
+            assert!(
+                (100..105).contains(pr),
+                "kicked PR {pr} is not from the eligible set (100-104)",
+            );
+        }
+
+        // None of the ineligible PRs (200-244) may have a loader.
+        for i in 0..45i64 {
+            let key = ("acme/api".to_string(), i + 200);
+            assert!(
+                !app.pipeline_ci_loader.contains_key(&key),
+                "ineligible PR {} must not be kicked",
+                i + 200,
+            );
+        }
+    }
+
+    /// CI-state-based TTL: a just-fetched running-state summary must not
+    /// trigger a new loader (30s not elapsed); a just-fetched terminal-state
+    /// summary also must not (600s not elapsed).  Confirms the two TTL
+    /// branches in `maybe_kick_ci_check_loaders` are active.
+    #[test]
+    fn maybe_kick_ci_check_loaders_terminal_state_long_ttl() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+
+        // Both PRs are eligible (have approved reviews).
+        let key_running  = ("acme/api".to_string(), 10i64);
+        let key_terminal = ("acme/api".to_string(), 11i64);
+
+        app.data.merge_queue.push(make_mq_entry("acme/api", 10, 50));
+        app.data.merge_queue.push(make_mq_entry("acme/api", 11, 51));
+        app.data.assignments.push(make_approved_review(50));
+        app.data.assignments.push(make_approved_review(51));
+
+        // PR 10: CI still running — just fetched → fresh within 30s.
+        app.pipeline_ci_checks.insert(key_running.clone(), CiCheckSummary {
+            passed: 0, failed: 0, running: 1,
+            failed_names: vec![],
+            first_failed_url: None,
+            fetched_at: Instant::now(),
+        });
+
+        // PR 11: terminal state (all passed) — just fetched → fresh within 600s.
+        app.pipeline_ci_checks.insert(key_terminal.clone(), CiCheckSummary {
+            passed: 3, failed: 0, running: 0,
+            failed_names: vec![],
+            first_failed_url: None,
+            fetched_at: Instant::now(),
+        });
+
+        app.maybe_kick_ci_check_loaders();
+
+        assert!(
+            !app.pipeline_ci_loader.contains_key(&key_running),
+            "running-state summary fetched just now must not kick (30s TTL not elapsed)",
+        );
+        assert!(
+            !app.pipeline_ci_loader.contains_key(&key_terminal),
+            "terminal-state summary fetched just now must not kick (600s TTL not elapsed)",
+        );
+
+        // Verify the two TTL values are distinct: ci_stale_secs distinguishes
+        // running (30s) from terminal (600s).
+        let running_s = CiCheckSummary {
+            running: 1, passed: 0, failed: 0,
+            failed_names: vec![], first_failed_url: None, fetched_at: Instant::now(),
+        };
+        let terminal_s = CiCheckSummary {
+            running: 0, passed: 3, failed: 0,
+            failed_names: vec![], first_failed_url: None, fetched_at: Instant::now(),
+        };
+        assert_ne!(
+            ci_stale_secs(Some(&running_s), true),
+            ci_stale_secs(Some(&terminal_s), true),
+            "running and terminal states must use different TTL values",
+        );
+        assert_eq!(ci_stale_secs(Some(&running_s), true), Some(30));
+        assert_eq!(ci_stale_secs(Some(&terminal_s), true), Some(600));
     }
 
     /// Merge stage already merged → no [Go] anywhere; full pipeline Done.
