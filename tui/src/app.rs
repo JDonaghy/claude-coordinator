@@ -3491,6 +3491,13 @@ pub struct CoordApp {
     /// hard-coded `items.len() - 40` cut off latest lines when the terminal
     /// viewport was under 40 rows).
     last_main_visible_rows: std::cell::Cell<usize>,
+    /// Panel width in "backend units" (character columns for TUI, pixels for
+    /// GTK) of the Pipeline Log tab's content rect, updated just before
+    /// `pipeline_log_list` is called on each render.  Defaults to 120.  Used
+    /// by `parse_log_content_readable` / `parse_sse_log_readable` to word-wrap
+    /// long assistant text blocks so the Log tab is readable without horizontal
+    /// scrolling (#385).
+    last_log_panel_cols: std::cell::Cell<usize>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -3788,6 +3795,7 @@ impl CoordApp {
             machine_last_contact: std::collections::HashMap::new(),
             local_coord_version: fetch_local_coord_version(),
             last_main_visible_rows: std::cell::Cell::new(40),
+            last_log_panel_cols: std::cell::Cell::new(120),
             purge_days: 7,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
@@ -9872,6 +9880,13 @@ impl CoordApp {
                 items.push(kv_item("", &elapsed_header, Some(Color::rgb(120, 120, 140))));
                 items.push(kv_item("", "", None));
 
+                // #385: readable wrapped rendering.  Panel width is set by
+                // the render path via `last_log_panel_cols` just before calling
+                // this method — TUI backends store columns directly; GTK stores
+                // pixels (large values mean wrapping won't fire, which is fine
+                // since GTK handles layout internally).
+                let wrap_width = self.last_log_panel_cols.get().max(40);
+
                 // Use SSE from the watch pool if a stream exists for this
                 // assignment (focused or background) — avoids the
                 // HTTP-cache-TTL "Loading log…" flicker.
@@ -9880,13 +9895,22 @@ impl CoordApp {
                     if sse.lines.is_empty() && !sse.done {
                         items.push(kv_item("", "  Connecting to log stream…", Some(Color::rgb(140, 140, 140))));
                     } else {
-                        items.extend(parse_sse_log_with_timing(&sse.lines, &sse.line_times));
+                        items.extend(parse_sse_log_readable(&sse.lines, &sse.line_times, wrap_width));
                     }
                     if sse.done {
                         items.push(kv_item("", "  ── stream ended ──", Some(Color::rgb(90, 90, 90))));
                     }
                 } else {
-                    items.extend(self.get_activity_log(&a.id, &a.machine));
+                    // For local logs, apply readable formatting directly.
+                    // For remote/cached logs, fall back to get_activity_log.
+                    let log_path = coord_dir()
+                        .join("logs")
+                        .join(format!("{}.log", a.id));
+                    if let Ok(content) = std::fs::read_to_string(&log_path) {
+                        items.extend(parse_log_content_readable(&content, wrap_width));
+                    } else {
+                        items.extend(self.get_activity_log(&a.id, &a.machine));
+                    }
                 }
             } else {
                 items.push(kv_item("", "  (no assignment log available)", Some(Color::rgb(100, 100, 100))));
@@ -14963,6 +14987,12 @@ impl ShellApp for CoordApp {
                             backend.draw_list(content_rect, &self.pipeline_stages_list());
                         }
                         PipelineDetailTab::Log => {
+                            // #385: stash panel width so pipeline_log_list can
+                            // word-wrap assistant prose to the viewport.  For
+                            // the TUI backend lh=1 so content_rect.width is
+                            // already in character columns; for GTK it's in
+                            // pixels (large → wrapping won't trigger, fine).
+                            self.last_log_panel_cols.set(content_rect.width as usize);
                             let log_list = self.pipeline_log_list();
                             // Collect the visible text for pixel-based backends
                             // (GTK/macOS).  The TUI backend ignores `lines` and
@@ -17002,6 +17032,290 @@ fn extract_text_block_keep_newlines(json: &str) -> String {
     out
 }
 
+// ─── Readable log rendering (#385) ───────────────────────────────────────────
+
+/// Word-wrap `text` to `width` character columns, respecting existing `\n`
+/// line breaks.  Empty lines are preserved.  If `width == 0` or a line is
+/// already within budget, it is emitted as-is.  Very long single "words"
+/// (e.g. long URLs) are hard-broken at the column limit.
+fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            result.push(String::new());
+            continue;
+        }
+        if width == 0 || line.chars().count() <= width {
+            result.push(line.to_string());
+            continue;
+        }
+        // Word-wrap this line.
+        let mut current = String::new();
+        for word in line.split(' ') {
+            if word.is_empty() {
+                // Preserve a single space gap when we still have room.
+                if !current.is_empty() && current.chars().count() < width {
+                    current.push(' ');
+                }
+                continue;
+            }
+            let word_len = word.chars().count();
+            if current.is_empty() {
+                if word_len > width {
+                    // Hard-break a very long word at the column limit.
+                    let mut rest = word;
+                    while rest.chars().count() > width {
+                        let cut = rest
+                            .char_indices()
+                            .nth(width)
+                            .map(|(i, _)| i)
+                            .unwrap_or(rest.len());
+                        result.push(rest[..cut].to_string());
+                        rest = &rest[cut..];
+                    }
+                    current = rest.to_string();
+                } else {
+                    current.push_str(word);
+                }
+            } else if current.chars().count() + 1 + word_len <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                result.push(current);
+                current = word.to_string();
+            }
+        }
+        if !current.is_empty() {
+            result.push(current);
+        }
+    }
+    result
+}
+
+/// Parse one stream-json event line into zero or more displayable `ListItem`s
+/// using a readable, human-friendly format (#385):
+///
+/// * `assistant` turns: compact `Turn N  +Xs` header on its own line, then
+///   the assistant's prose wrapped to `wrap_width` columns (2-space indent),
+///   STATUS:/STUCK: lines remain as single coloured rows.
+/// * `tool_use` events: `  → Name: detail` (arrow prefix, no `[tool]` noise).
+/// * `system(init)`, `result`, `rate_limit_event`: unchanged compact lines.
+///
+/// `turn_n` is incremented for each `assistant` event (same counter as the
+/// old renderer — the two renderers are not mixed, so the counters stay in
+/// sync independently).  `wrap_width == 0` disables wrapping (lines are
+/// emitted as-is up to the text block length).
+fn parse_json_events_readable(
+    line: &str,
+    turn_n: &mut usize,
+    elapsed: Option<std::time::Duration>,
+    wrap_width: usize,
+) -> Vec<ListItem> {
+    let type_val = match json_str(line, "type") {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    match type_val.as_str() {
+        "system" => {
+            let subtype = json_str(line, "subtype").unwrap_or_default();
+            if subtype == "init" {
+                let model = json_str(line, "model").unwrap_or_else(|| "?".to_string());
+                return vec![activity_item(
+                    &format!("[init] {}", model),
+                    Color::rgb(100, 100, 180),
+                )];
+            }
+            Vec::new()
+        }
+
+        "assistant" => {
+            *turn_n += 1;
+            let n = *turn_n;
+
+            // STATUS: / STUCK: — single special line, same colours as before.
+            let text_flat = extract_text_block(line);
+            if let Some(idx) = text_flat.find("STATUS:") {
+                let rest = &text_flat[idx..];
+                let end = rest.find('\n').unwrap_or(rest.len());
+                let trimmed = rest[..end].trim();
+                return vec![activity_item(trimmed, Color::rgb(80, 210, 80))];
+            }
+            if let Some(idx) = text_flat.find("STUCK:") {
+                let rest = &text_flat[idx..];
+                let end = rest.find('\n').unwrap_or(rest.len());
+                let trimmed = rest[..end].trim();
+                return vec![activity_item(trimmed, Color::rgb(220, 120, 50))];
+            }
+
+            let elapsed_str = match elapsed {
+                Some(d) if d.as_secs() >= 1 => format!("  +{}s", d.as_secs()),
+                _ => String::new(),
+            };
+
+            // Readable text — preserve newlines so paragraph structure survives.
+            let text_nl = extract_text_block_keep_newlines(line);
+
+            // Thinking-only turn (no text, no tool_use).
+            if text_nl.trim().is_empty() {
+                let tools = extract_tool_names(line);
+                if tools.is_empty() {
+                    let thinking = collapse_ws(&extract_thinking_block(line));
+                    let header = if thinking.is_empty() {
+                        format!("  Turn {}{}", n, elapsed_str)
+                    } else {
+                        format!("  Turn {}{}  💭 {}", n, elapsed_str, thinking)
+                    };
+                    return vec![activity_item(&header, Color::rgb(80, 80, 100))];
+                }
+                // Tool-only turn: header, no prose lines.
+                let header = format!("  Turn {}{}", n, elapsed_str);
+                return vec![activity_item(&header, Color::rgb(80, 80, 100))];
+            }
+
+            // Normal turn: dim header + wrapped prose.
+            let indent = "  ";
+            let prose_wrap = if wrap_width > indent.len() {
+                wrap_width - indent.len()
+            } else {
+                0
+            };
+            let mut items = Vec::new();
+            let header = format!("  Turn {}{}", n, elapsed_str);
+            items.push(activity_item(&header, Color::rgb(80, 80, 100)));
+            for wrapped_line in word_wrap(text_nl.trim_end(), prose_wrap) {
+                let display = format!("{}{}", indent, wrapped_line);
+                items.push(activity_item(&display, Color::rgb(200, 210, 230)));
+            }
+            items
+        }
+
+        "tool_use" => {
+            let name = json_str(line, "name").unwrap_or_else(|| "?".to_string());
+            let detail = match name.as_str() {
+                "Bash" => json_str(line, "command").unwrap_or_default(),
+                "Edit" | "Write" | "Read" | "Glob" | "NotebookEdit" => {
+                    json_str(line, "file_path").unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+            // Compact single line: "  → Bash: <cmd>" or "  → Read: <path>"
+            // Wrap the detail if it's very long, but keep the arrow prefix.
+            let prefix = if detail.is_empty() {
+                format!("  \u{2192} {}", name) // →
+            } else {
+                format!("  \u{2192} {}: {}", name, detail)
+            };
+            // For very long bash commands, truncate at wrap_width with ellipsis
+            // so the arrow line stays on screen without horizontal scrolling.
+            let display = if wrap_width > 0 && prefix.chars().count() > wrap_width {
+                let cut = prefix
+                    .char_indices()
+                    .nth(wrap_width.saturating_sub(1))
+                    .map(|(i, _)| i)
+                    .unwrap_or(prefix.len());
+                format!("{}…", &prefix[..cut])
+            } else {
+                prefix
+            };
+            vec![activity_item(&display, Color::rgb(160, 130, 200))]
+        }
+
+        "result" => {
+            let turns = json_num(line, "num_turns").unwrap_or(0.0) as u64;
+            let cost = json_num(line, "total_cost_usd").unwrap_or(0.0);
+            let stop = json_str(line, "stop_reason").unwrap_or_else(|| "?".to_string());
+            let dur_ms = json_num(line, "duration_ms").unwrap_or(0.0) as u64;
+            let dur = fmt_dur(dur_ms / 1000);
+            let text = format!(
+                "[result] {} turns  ${:.2}  {}  stop={}",
+                turns, cost, dur, stop
+            );
+            vec![activity_item(&text, Color::rgb(200, 200, 100))]
+        }
+
+        "rate_limit_event" => vec![activity_item("[rate_limit]", Color::rgb(220, 150, 50))],
+
+        _ => Vec::new(),
+    }
+}
+
+/// Like `parse_sse_log_with_timing` but renders using the readable (#385)
+/// format: wrapped prose, arrow-prefixed tool calls, compact turn headers.
+/// `wrap_width == 0` disables wrapping.
+fn parse_sse_log_readable(
+    lines: &[String],
+    times: &[std::time::Instant],
+    wrap_width: usize,
+) -> Vec<ListItem> {
+    let mut items = Vec::new();
+    let mut turn_n: usize = 0;
+    let mut last_assistant_time: Option<std::time::Instant> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = times.get(i).copied();
+        let elapsed = if json_str(line, "type").as_deref() == Some("assistant") {
+            let e = t.and_then(|now| last_assistant_time.map(|prev| now.duration_since(prev)));
+            last_assistant_time = t;
+            e
+        } else {
+            None
+        };
+        items.extend(parse_json_events_readable(line, &mut turn_n, elapsed, wrap_width));
+        // Surface structured review verdict after result events.
+        if line.contains("\"type\":\"result\"") {
+            items.extend(extract_review_items(line));
+        }
+    }
+    items
+}
+
+/// Like `parse_log_content` but renders using the readable (#385) format.
+/// Used for file-based logs shown in the Pipeline Log tab.
+fn parse_log_content_readable(content: &str, wrap_width: usize) -> Vec<ListItem> {
+    let is_json = content
+        .lines()
+        .find(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| l.trim_start().starts_with('{'))
+        .unwrap_or(false);
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut turn_n: usize = 0;
+
+    for line in content.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        if is_json {
+            items.extend(parse_json_events_readable(line, &mut turn_n, None, wrap_width));
+            if line.contains("\"type\":\"result\"") {
+                items.extend(extract_review_items(line));
+            }
+        } else {
+            // Plain-text log: surface STATUS: / STUCK: lines.
+            if line.contains("STATUS:") {
+                if let Some(idx) = line.find("STATUS:") {
+                    let rest = line[idx..].trim();
+                    items.push(activity_item(rest, Color::rgb(80, 210, 80)));
+                }
+            } else if line.contains("STUCK:") {
+                if let Some(idx) = line.find("STUCK:") {
+                    let rest = line[idx..].trim();
+                    items.push(activity_item(rest, Color::rgb(220, 120, 50)));
+                }
+            }
+        }
+    }
+
+    if items.is_empty() {
+        items.push(kv_item(
+            "",
+            "  No activity yet",
+            Some(Color::rgb(100, 100, 100)),
+        ));
+    }
+    items
+}
+
 /// #319 Phase A: walk the focused chat's SSE log from `floor` forward,
 /// concatenating assistant `text` blocks into the proposed comment body.
 /// Uses [`extract_text_block_keep_newlines`] so the markdown structure
@@ -17671,6 +17985,7 @@ mod tests {
             machine_last_contact: std::collections::HashMap::new(),
             local_coord_version: None,
             last_main_visible_rows: std::cell::Cell::new(40),
+            last_log_panel_cols: std::cell::Cell::new(120),
             purge_days: 7,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
@@ -24942,6 +25257,194 @@ mod tests {
     /// Cross-type mismatch: old_type="refinement" but new assignment is
     /// "test-chat" → must NOT rebind (different chat sessions on the same
     /// issue should not cross-contaminate each other).
+    // ── word_wrap (#385) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn word_wrap_empty_string_returns_empty() {
+        assert!(word_wrap("", 80).is_empty());
+    }
+
+    #[test]
+    fn word_wrap_short_line_unchanged() {
+        let r = word_wrap("hello world", 80);
+        assert_eq!(r, vec!["hello world"]);
+    }
+
+    #[test]
+    fn word_wrap_respects_width() {
+        // "foo bar baz" at width 7: "foo bar" + "baz"
+        let r = word_wrap("foo bar baz", 7);
+        assert_eq!(r, vec!["foo bar", "baz"]);
+    }
+
+    #[test]
+    fn word_wrap_preserves_newlines() {
+        let r = word_wrap("line one\nline two", 80);
+        assert_eq!(r, vec!["line one", "line two"]);
+    }
+
+    #[test]
+    fn word_wrap_preserves_empty_lines() {
+        let r = word_wrap("a\n\nb", 80);
+        assert_eq!(r, vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn word_wrap_zero_width_no_wrapping() {
+        let long = "x ".repeat(100);
+        let r = word_wrap(long.trim(), 0);
+        assert_eq!(r.len(), 1, "width=0 should disable wrapping");
+    }
+
+    // ── parse_json_events_readable (#385) ─────────────────────────────────────
+
+    #[test]
+    fn readable_assistant_long_text_wraps_to_width() {
+        // Build a text that is 50 chars long (10 words × 5 chars each).
+        let words = "hello world hello world hello world hello world hello world";
+        // 11 words, each 5 chars → raw line = 59 chars.  Wrap at 20.
+        let line = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}",
+            words
+        );
+        let mut turn = 0;
+        let items = parse_json_events_readable(&line, &mut turn, None, 20);
+        // Should have: header + multiple prose lines, each ≤ 20 chars (including
+        // the 2-space indent prefix, so raw text ≤ 18).
+        assert!(items.len() > 2, "expected header + multiple wrapped lines, got: {:?}",
+            items.iter().map(|i| i.text.spans[0].text.as_str()).collect::<Vec<_>>());
+        for item in items.iter().skip(1) {
+            let text = item.text.spans.iter().map(|s| s.text.as_str()).collect::<String>();
+            // Each prose line starts with 2-space indent.
+            assert!(text.starts_with("  "), "prose line should be indented: {text:?}");
+            assert!(text.chars().count() <= 20,
+                "prose line exceeds wrap_width: {text:?}");
+        }
+    }
+
+    #[test]
+    fn readable_assistant_status_stays_single_line() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"STATUS: did thing → doing next → confidence: high"}]}}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1, "STATUS should produce exactly one item");
+        let text = &items[0].text.spans[0].text;
+        assert!(text.starts_with("STATUS:"), "got: {text:?}");
+    }
+
+    #[test]
+    fn readable_assistant_stuck_stays_single_line() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"STUCK: tried X [why] [blocker]"}]}}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1, "STUCK should produce exactly one item");
+        let text = &items[0].text.spans[0].text;
+        assert!(text.starts_with("STUCK:"), "got: {text:?}");
+    }
+
+    #[test]
+    fn readable_tool_use_arrow_format() {
+        let line = r#"{"type":"tool_use","name":"Bash","command":"ls -la"}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(text.contains("→"), "should use arrow: {text:?}");
+        assert!(text.contains("Bash"), "should name tool: {text:?}");
+        assert!(text.contains("ls -la"), "should show command: {text:?}");
+        assert!(!text.contains("[tool]"), "should not use old [tool] prefix: {text:?}");
+    }
+
+    #[test]
+    fn readable_tool_use_edit_shows_path() {
+        let line = r#"{"type":"tool_use","name":"Edit","file_path":"src/foo.rs"}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(text.contains("Edit"), "got: {text:?}");
+        assert!(text.contains("src/foo.rs"), "got: {text:?}");
+    }
+
+    #[test]
+    fn readable_init_stays_compact() {
+        let line = r#"{"type":"system","subtype":"init","model":"claude-sonnet-4-6"}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(text.contains("[init]"), "got: {text:?}");
+        assert!(text.contains("claude-sonnet-4-6"), "got: {text:?}");
+    }
+
+    #[test]
+    fn readable_result_stays_compact() {
+        let line = r#"{"type":"result","num_turns":5,"total_cost_usd":0.12,"stop_reason":"end_turn","duration_ms":10000}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(text.contains("[result]"), "got: {text:?}");
+        assert!(text.contains("5 turns"), "got: {text:?}");
+    }
+
+    #[test]
+    fn readable_turn_header_shows_turn_number() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"doing the work now"}]}}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert!(items.len() >= 2, "should have header + prose");
+        let header = &items[0].text.spans[0].text;
+        assert!(header.contains("Turn 1"), "header should show turn number: {header:?}");
+        // Header should NOT contain the long prose.
+        assert!(!header.contains("doing the work now"), "prose in header: {header:?}");
+    }
+
+    #[test]
+    fn readable_turn_increments_counter() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}"#;
+        let mut turn = 0;
+        parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(turn, 1);
+        parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(turn, 2);
+    }
+
+    #[test]
+    fn readable_thinking_only_turn_shows_header() {
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[\
+            {\"type\":\"thinking\",\"thinking\":\"considering options\"}]}}";
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        // Should be 1 item: a header (possibly with thinking emoji).
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(text.contains("Turn 1"), "should mention turn: {text:?}");
+    }
+
+    #[test]
+    fn readable_tool_use_long_command_truncated_to_width() {
+        let cmd = "a".repeat(200);
+        let line = format!(r#"{{"type":"tool_use","name":"Bash","command":"{cmd}"}}"#);
+        let mut turn = 0;
+        let items = parse_json_events_readable(&line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(
+            text.chars().count() <= 80,
+            "tool_use line should be truncated to wrap_width: {} chars",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn readable_unknown_event_type_returns_empty() {
+        let line = r#"{"type":"tool_result","content":"ok"}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert!(items.is_empty(), "tool_result should be filtered: {:?}", items);
+    }
+
     #[test]
     fn maybe_bind_pending_resume_does_not_bind_across_types() {
         // New assignment is test-chat, but the pending resume expects refinement.
