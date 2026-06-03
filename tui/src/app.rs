@@ -17614,8 +17614,20 @@ fn issue_body_list(
             if body.is_empty() {
                 items.push(kv_item("", " (no description)", Some(Color::rgb(100, 100, 100))));
             } else {
-                for line in body.lines() {
-                    items.push(kv_item("", &format!(" {}", line), Some(Color::rgb(200, 200, 210))));
+                // #372-pattern: render the whole body through the markdown adapter
+                // so headings, bold, italic, inline code, lists, blockquotes, and
+                // fenced code blocks are styled rather than shown as raw markup.
+                // Each rendered line becomes its own ListView row; the existing
+                // vertical scroll + selection behaviour is unchanged.
+                let md_theme = quadraui::Theme::default();
+                let rendered = quadraui::render_markdown_to_styled(body, &md_theme);
+                for md_line in rendered.lines {
+                    items.push(ListItem {
+                        text: md_line,
+                        icon: None,
+                        detail: None,
+                        decoration: Decoration::Normal,
+                    });
                 }
             }
         }
