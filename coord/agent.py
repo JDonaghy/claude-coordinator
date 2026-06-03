@@ -1385,6 +1385,14 @@ class AgentServer:
 
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Prune administrative entries for worktrees whose directories were
+        # removed out-of-band (e.g. a crash before clean_worktrees ran) so a
+        # stale entry can't block `worktree add` below (#389 hygiene).
+        try:
+            _git(repo_path, "worktree", "prune")
+        except _GitError:
+            pass
+
         # Determine if `origin` is configured.  In production it always is;
         # only test fixtures + local-only repos lack a remote.  When origin
         # is present we MUST branch from a concrete `origin/<default>` SHA
@@ -1467,28 +1475,67 @@ class AgentServer:
                 f"{_slugify(assignment.spec.issue_title)}"
             )
 
-        # Check if branch already exists (locally or on remote — retry scenario)
-        branch_exists = False
+        # Decide the base for the worker's branch.  Trusted sources, in order
+        # (#389 — a leftover LOCAL branch from a prior failed assignment on
+        # this machine must never be reused: branching a new worker off it
+        # silently reverts merged work, as happened to #357/#319 when
+        # precision was parked on a stale `issue-194` branch):
+        #   1. origin/<branch> — a real remote branch (retry/continuation).
+        #      Check it out and hard-reset to the remote tip so a divergent
+        #      local copy of the branch can't ride in.
+        #   2. local <branch>, but ONLY when this repo has no remote (test
+        #      fixtures / local-only repos) — nothing more authoritative exists.
+        #   3. otherwise branch fresh from `start_point` (origin/<default>),
+        #      deleting any untrusted local leftover with the same name first.
+        origin_has_branch = False
+        local_has_branch = False
         if not assignment.spec.fresh_branch:
-            for ref in (f"origin/{branch_name}", branch_name):
+            if has_origin:
                 try:
-                    _git(repo_path, "rev-parse", "--verify", ref)
-                    branch_exists = True
-                    break
-                except _GitError:
-                    continue
-
-        if branch_exists:
-            # Branch exists — check it out in the worktree
-            _git(repo_path, "worktree", "add", str(worktree_path), branch_name)
-        else:
-            if assignment.spec.fresh_branch:
-                # Delete stale local branch if it exists so -b doesn't fail
-                try:
-                    _git(repo_path, "branch", "-D", branch_name)
+                    _git(
+                        repo_path, "rev-parse", "--verify",
+                        f"refs/remotes/origin/{branch_name}",
+                    )
+                    origin_has_branch = True
                 except _GitError:
                     pass
-            # Branch doesn't exist — create new worktree with new branch
+            try:
+                _git(
+                    repo_path, "rev-parse", "--verify",
+                    f"refs/heads/{branch_name}",
+                )
+                local_has_branch = True
+            except _GitError:
+                pass
+
+        if origin_has_branch:
+            # Continuation/retry — force the worktree's branch to the remote
+            # tip (#389), discarding any divergent local copy of the branch.
+            _git(
+                repo_path, "worktree", "add", "-B", branch_name,
+                str(worktree_path), f"origin/{branch_name}",
+            )
+        elif local_has_branch and not has_origin:
+            # Local-only repo (no remote) — reuse the local branch as before.
+            _git(repo_path, "worktree", "add", str(worktree_path), branch_name)
+        else:
+            # Fresh branch, OR an untrusted local-only leftover in a repo that
+            # has a remote (#389).  Delete any colliding local branch so `-b`
+            # won't fail and so the worker starts from origin/<default>.
+            if local_has_branch and assignment.log_path:
+                try:
+                    with open(assignment.log_path, "a") as fh:
+                        fh.write(
+                            f"# warning: discarding leftover local branch "
+                            f"{branch_name!r} (not on origin) and branching "
+                            f"fresh from {start_point[:12]} (#389)\n"
+                        )
+                except OSError:
+                    pass
+            try:
+                _git(repo_path, "branch", "-D", branch_name)
+            except _GitError:
+                pass
             _git(
                 repo_path, "worktree", "add", "-b", branch_name,
                 str(worktree_path), start_point,
