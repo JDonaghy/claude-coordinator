@@ -3346,6 +3346,12 @@ pub struct CoordApp {
     /// The `assignment_id` of the currently-focused watch context, or `None`
     /// when the watch overlay is closed.
     watch_focused: Option<String>,
+    /// #386: True when `inject_chat` was opened from the Pipeline Log tab via
+    /// the `i` keybind (which temporarily sets `watch_focused`).  On Esc /
+    /// Cancelled the Cancelled arm uses this flag to clear `watch_focused`
+    /// again, restoring the invariant that `watch_focused.is_none()` on the
+    /// Log tab so j/k scroll falls through to the Log-tab arms (#308).
+    inject_opened_from_log_tab: bool,
     /// Chat overlay for mid-flight worker guidance. `None` when closed.
     inject_chat: Option<ChatController>,
     /// Animation frame counter for the inject chat spinner.
@@ -3763,6 +3769,7 @@ impl CoordApp {
             next_toast_id: 0,
             watch_pool: std::collections::HashMap::new(),
             watch_focused: None,
+            inject_opened_from_log_tab: false,
             inject_chat: None,
             inject_spinner_frame: 0,
             pipeline_detail_tab: PipelineDetailTab::default(),
@@ -4066,6 +4073,8 @@ impl CoordApp {
     fn close_watch(&mut self) {
         self.watch_focused = None;
         self.inject_chat = None;
+        // #386: if the Log-tab steer overlay was open, clear its flag too.
+        self.inject_opened_from_log_tab = false;
     }
 
     /// True when the Pipeline view's Log tab is the active scroller.  On this
@@ -4591,9 +4600,10 @@ impl CoordApp {
         spawn_inject_post(&host, &aid, &text, issue_number, self.inject_fallback_tx.clone());
         // Optimistic toast: fire-and-forget; 409/410 will fall back via
         // inject_fallback_rx, so we surface the confirmation immediately
-        // rather than waiting for the HTTP round-trip.
+        // rather than waiting for the HTTP round-trip.  Use "Steer sent"
+        // (not "delivered") since network errors are silently dropped.
         self.push_toast(
-            "Steer delivered",
+            "Steer sent",
             &format!("Message sent to worker #{}", issue_number),
             ToastSeverity::Info,
         );
@@ -11304,7 +11314,12 @@ impl CoordApp {
             " Merge blocked: review not yet approved  R=dispatch review  M=merge anyway  q=quit ".to_string()
         } else if self.active_view == SidebarView::Pipeline {
             // #194: Pipeline-specific hints: refresh, navigate, go, dismiss done.
-            " j/k=nav  Enter=go  R=refresh  D=dismiss-done  h/l=tabs  q=quit ".to_string()
+            // #386: include i=steer on the Log tab so the feature is discoverable.
+            if self.pipeline_detail_tab == PipelineDetailTab::Log {
+                " j/k=nav  Enter=go  i=steer  R=refresh  D=dismiss-done  h/l=tabs  q=quit ".to_string()
+            } else {
+                " j/k=nav  Enter=go  R=refresh  D=dismiss-done  h/l=tabs  q=quit ".to_string()
+            }
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS
             // section.  Right-click → Send to Pipeline (#261) is the
@@ -15337,6 +15352,15 @@ impl ShellApp for CoordApp {
                             }
                             self.watch_focused = None;
                         }
+                        // #386: Log-tab steer overlay: the `i` handler temporarily
+                        // set `watch_focused` so submit_inject could reach the
+                        // assignment.  Restore the invariant (`watch_focused` is
+                        // None on the Log tab) so j/k scroll falls through to the
+                        // Log-tab arms (#308) and `i` is not blocked by its guard.
+                        if self.inject_opened_from_log_tab {
+                            self.watch_focused = None;
+                            self.inject_opened_from_log_tab = false;
+                        }
                         self.inject_chat = None;
                     }
                     _ => {}
@@ -16033,7 +16057,10 @@ impl ShellApp for CoordApp {
                                 self.open_sse_in_pool_for_selected_issue();
                             }
                             // Focus the assignment so submit_inject can reach it.
+                            // Set the flag so the Cancelled arm knows to restore
+                            // watch_focused=None on Esc (Log-tab invariant, #308).
                             self.watch_focused = Some(aid);
+                            self.inject_opened_from_log_tab = true;
                             // Open the guidance chat overlay — same shape as
                             // the 'b' handler in the watch overlay above.
                             let mut chat = ChatController::new("inject");
@@ -18036,6 +18063,7 @@ mod tests {
             next_toast_id: 0,
             watch_pool: std::collections::HashMap::new(),
             watch_focused: None,
+            inject_opened_from_log_tab: false,
             inject_chat: None,
             inject_spinner_frame: 0,
             pipeline_detail_tab: PipelineDetailTab::default(),
