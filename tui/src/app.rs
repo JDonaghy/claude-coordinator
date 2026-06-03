@@ -944,6 +944,9 @@ fn json_num(json: &str, field: &str) -> Option<f64> {
 /// Searches for each `"type":"tool_use"` marker and extracts the `"name"`
 /// field from the same JSON object. Works for both top-level `tool_use`
 /// events and tool-use blocks nested inside `assistant` message content.
+/// Only compiled in test builds; production code uses top-level `tool_use`
+/// events directly via `parse_json_event`.
+#[cfg(test)]
 fn extract_tool_names(json: &str) -> Vec<String> {
     let marker = "\"type\":\"tool_use\"";
     let mut names: Vec<String> = Vec::new();
@@ -1054,91 +1057,205 @@ fn extract_review_items(line: &str) -> Vec<ListItem> {
     items
 }
 
-/// Extract the first non-empty text block from an assistant message.
+/// Variant of `json_str` that preserves `\n` escape sequences as real newlines
+/// instead of converting them to spaces.  Used by `extract_text_block_keep_newlines`
+/// so assistant prose retains its original paragraph structure.
+fn json_str_keep_newlines(json: &str, field: &str) -> Option<String> {
+    let key = format!("\"{}\":\"", field);
+    let start = json.find(&key)? + key.len();
+    let rest = &json[start..];
+    let mut result = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '"' => break,
+            '\\' => {
+                match chars.next()? {
+                    'n' => result.push('\n'), // preserve real newlines
+                    't' => result.push(' '),
+                    'r' => {}
+                    c => result.push(c),
+                }
+            }
+            c => result.push(c),
+        }
+    }
+    Some(result)
+}
+
+/// Extract the first non-empty text block from an assistant message,
+/// **preserving newlines** so the worker's real line structure survives.
 ///
-/// Looks for `"type":"text"` content blocks and returns the `"text"` field.
-/// Returns an empty string if no text block is found.
-fn extract_text_block(json: &str) -> String {
+/// Use this when you need readable prose output.
+fn extract_text_block_keep_newlines(json: &str) -> String {
     let marker = "\"type\":\"text\"";
     if let Some(pos) = json.find(marker) {
         let after = &json[pos + marker.len()..];
-        if let Some(text) = json_str(after, "text") {
+        if let Some(text) = json_str_keep_newlines(after, "text") {
             return text;
         }
     }
     String::new()
 }
 
-/// Parse one stream-json event line into a displayable `ListItem`.
+/// Word-wrap `text` to at most `width` columns.
 ///
-/// Returns `None` for event types that are too noisy to surface (e.g.
-/// `tool_result`, `system/task_*`, `rate_limit_event`).
+/// Splits on existing newlines first, then word-wraps each line that is
+/// longer than `width`.  Empty lines are preserved as empty entries so
+/// paragraph spacing is retained.  Returns at least one entry even for
+/// empty input.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return text.lines().map(|l| l.to_string()).collect();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for raw_line in text.lines() {
+        if raw_line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        if raw_line.chars().count() <= width {
+            out.push(raw_line.to_string());
+            continue;
+        }
+        // Word-wrap the long line.
+        let mut current = String::new();
+        for word in raw_line.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.chars().count() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(current.clone());
+                current = word.to_string();
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Default wrap width when the panel width is not known.  Wide enough to
+/// fit a typical 120-column terminal minus borders and a selection gutter.
+const DEFAULT_LOG_WRAP_WIDTH: usize = 110;
+
+/// Parse one stream-json event line into zero or more displayable `ListItem`s.
+///
+/// Returns an empty Vec for event types that are too noisy to surface (e.g.
+/// `tool_result`, `system/task_*`).  Returns multiple items when an assistant
+/// text block spans several wrapped lines.
 /// `turn_n` is a mutable counter incremented for each `assistant` event.
-fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
-    let type_val = json_str(line, "type")?;
+/// `wrap_width` controls how long a prose line may be before wrapping.
+fn parse_json_event(line: &str, turn_n: &mut usize, wrap_width: usize) -> Vec<ListItem> {
+    let Some(type_val) = json_str(line, "type") else {
+        return Vec::new();
+    };
     match type_val.as_str() {
         "system" => {
             let subtype = json_str(line, "subtype").unwrap_or_default();
             if subtype == "init" {
                 let model = json_str(line, "model").unwrap_or_else(|| "?".to_string());
-                return Some(activity_item(
+                return vec![activity_item(
                     &format!("[init] {}", model),
                     Color::rgb(100, 100, 180),
-                ));
+                )];
             }
             // Skip task_started / task_completed / other system subtypes.
-            None
+            Vec::new()
         }
 
         "assistant" => {
             *turn_n += 1;
             let n = *turn_n;
 
-            // Check for STATUS: / STUCK: inside the text block first.
-            let text = extract_text_block(line);
+            // Use the newline-preserving extractor so STATUS/STUCK detection
+            // and prose rendering both see real line breaks.
+            let text = extract_text_block_keep_newlines(line);
+
+            // STATUS: / STUCK: — surface prominently as a single highlighted line.
             if let Some(idx) = text.find("STATUS:") {
                 let rest = &text[idx..];
                 let end = rest.find('\n').unwrap_or(rest.len());
                 let trimmed = rest[..end].trim();
-                return Some(activity_item(trimmed, Color::rgb(80, 210, 80)));
+                return vec![activity_item(trimmed, Color::rgb(80, 210, 80))];
             }
             if let Some(idx) = text.find("STUCK:") {
                 let rest = &text[idx..];
                 let end = rest.find('\n').unwrap_or(rest.len());
                 let trimmed = rest[..end].trim();
-                return Some(activity_item(trimmed, Color::rgb(220, 120, 50)));
+                return vec![activity_item(trimmed, Color::rgb(220, 120, 50))];
             }
 
-            // Summarise tool calls in this turn.
-            let tools = extract_tool_names(line);
-            let summary = if !tools.is_empty() {
-                format!("[assistant] Turn {}: tool_use={}", n, tools.join(","))
-            } else if !text.is_empty() {
-                let display = trunc(&text, 80);
-                format!("[assistant] Turn {}: {:?}", n, display)
-            } else {
-                format!("[assistant] Turn {}", n)
-            };
-            Some(activity_item(&summary, Color::rgb(150, 180, 240)))
+            let mut items: Vec<ListItem> = Vec::new();
+
+            if !text.trim().is_empty() {
+                // Dim turn-number separator so the reader can orient but it
+                // doesn't compete with the prose.
+                items.push(activity_item(
+                    &format!(" ── Turn {} ──", n),
+                    Color::rgb(80, 85, 100),
+                ));
+                // Wrap each paragraph line to the panel width.
+                let body_color = Color::rgb(205, 205, 215);
+                for wrapped_line in wrap_to_width(text.trim_end(), wrap_width) {
+                    if wrapped_line.is_empty() {
+                        items.push(activity_item("", body_color));
+                    } else {
+                        items.push(activity_item(
+                            &format!("  {}", wrapped_line),
+                            body_color,
+                        ));
+                    }
+                }
+            }
+            // Tool calls embedded in the assistant content are shown by the
+            // top-level `tool_use` events that follow; skip them here to
+            // avoid duplication.
+            items
         }
 
         "tool_use" => {
             let name = json_str(line, "name").unwrap_or_else(|| "?".to_string());
+            // Extract the most useful one-line summary for each tool type.
             let detail = match name.as_str() {
                 "Bash" => json_str(line, "command")
-                    .map(|c| trunc(&c, 60).to_string())
+                    .map(|c| {
+                        // Show first non-empty, non-comment line of the command.
+                        let first = c
+                            .lines()
+                            .find(|l| {
+                                let t = l.trim();
+                                !t.is_empty() && !t.starts_with('#')
+                            })
+                            .unwrap_or(c.lines().next().unwrap_or(""))
+                            .to_string();
+                        let budget = wrap_width.saturating_sub(10); // "  → Bash: ".len()
+                        trunc(&first, budget.max(20)).to_string()
+                    })
                     .unwrap_or_default(),
                 "Edit" | "Write" | "Read" | "Glob" | "NotebookEdit" => {
                     json_str(line, "file_path").unwrap_or_default()
                 }
+                "Grep" => json_str(line, "pattern")
+                    .map(|p| trunc(&p, 60).to_string())
+                    .unwrap_or_default(),
+                "Agent" => json_str(line, "description")
+                    .map(|d| trunc(&d, 60).to_string())
+                    .unwrap_or_default(),
                 _ => String::new(),
             };
             let text = if detail.is_empty() {
-                format!("[tool] {}", name)
+                format!("  → {}", name)
             } else {
-                format!("[tool] {}: {}", name, detail)
+                format!("  → {}: {}", name, detail)
             };
-            Some(activity_item(&text, Color::rgb(180, 150, 220)))
+            vec![activity_item(&text, Color::rgb(130, 170, 230))]
         }
 
         "result" => {
@@ -1153,15 +1270,15 @@ fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
             );
             // Review-verdict body extraction happens in parse_log_content so
             // it can emit multiple list items below the metrics line.
-            Some(activity_item(&text, Color::rgb(200, 200, 100)))
+            vec![activity_item(&text, Color::rgb(200, 200, 100))]
         }
 
-        "rate_limit_event" => Some(activity_item(
+        "rate_limit_event" => vec![activity_item(
             "[rate_limit]",
             Color::rgb(220, 150, 50),
-        )),
+        )],
 
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -1169,7 +1286,10 @@ fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
 ///
 /// Handles both stream-json logs (NDJSON from `claude -p --output-format
 /// stream-json`) and plain-text logs (stdout of older workers).
-fn parse_log_content(content: &str) -> Vec<ListItem> {
+///
+/// `wrap_width` sets the column budget for word-wrapping assistant prose lines.
+/// Pass `DEFAULT_LOG_WRAP_WIDTH` when the panel width is unknown.
+fn parse_log_content(content: &str, wrap_width: usize) -> Vec<ListItem> {
     // Detect format: stream-json if the first non-comment non-blank line
     // starts with `{`.
     let is_json = content
@@ -1187,9 +1307,7 @@ fn parse_log_content(content: &str) -> Vec<ListItem> {
         }
 
         if is_json {
-            if let Some(item) = parse_json_event(line, &mut turn_n) {
-                items.push(item);
-            }
+            items.extend(parse_json_event(line, &mut turn_n, wrap_width));
             // After the metrics line, surface the structured review verdict
             // (REVIEW_VERDICT / REVIEW_BODY) embedded in the `result` field
             // of result events so reviewers don't have to leave the TUI to
@@ -1250,7 +1368,7 @@ fn load_activity_log(id: &str) -> Vec<ListItem> {
         }
     };
 
-    parse_log_content(&content)
+    parse_log_content(&content, DEFAULT_LOG_WRAP_WIDTH)
 }
 
 // ─── Pipeline stage rendering ─────────────────────────────────────────────────
@@ -2442,6 +2560,11 @@ pub struct CoordApp {
     /// hard-coded `items.len() - 40` cut off latest lines when the terminal
     /// viewport was under 40 rows).
     last_main_visible_rows: std::cell::Cell<usize>,
+    /// Cached column width of the main content panel, updated alongside
+    /// `last_main_visible_rows`.  Used by `parse_log_content` so assistant
+    /// prose wraps to the actual panel width instead of a hard-coded constant.
+    /// Defaults to `DEFAULT_LOG_WRAP_WIDTH` until the first render.
+    last_main_visible_cols: std::cell::Cell<usize>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -2612,6 +2735,7 @@ impl CoordApp {
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
             last_main_visible_rows: std::cell::Cell::new(40),
+            last_main_visible_cols: std::cell::Cell::new(DEFAULT_LOG_WRAP_WIDTH),
             purge_days: 7,
             watch_sse: None,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
@@ -3016,7 +3140,8 @@ impl CoordApp {
                         ));
                     } else {
                         let content = sse.lines.join("\n");
-                        items.extend(parse_log_content(&content));
+                        let wrap_w = self.last_main_visible_cols.get();
+                        items.extend(parse_log_content(&content, wrap_w));
                     }
                     if sse.done {
                         items.push(kv_item(
@@ -3095,6 +3220,8 @@ impl CoordApp {
             scroll_offset: scroll,
             has_focus: false,
             bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -3979,6 +4106,8 @@ impl CoordApp {
             scroll_offset: self.machine_scroll,
             has_focus,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -4027,6 +4156,8 @@ impl CoordApp {
                 scroll_offset: self.detail_scroll,
                 has_focus: false,
                 bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
             };
         }
 
@@ -4179,6 +4310,8 @@ impl CoordApp {
             scroll_offset: self.detail_scroll,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -4213,7 +4346,7 @@ impl CoordApp {
                 Ok(fetch_result) => {
                     self.pending_log_fetches.borrow_mut().remove(id);
                     let items = match fetch_result {
-                        Ok(content) => parse_log_content(&content),
+                        Ok(content) => parse_log_content(&content, self.last_main_visible_cols.get()),
                         Err(e) => vec![kv_item(
                             "",
                             &format!("  Log unavailable: {}", e),
@@ -4386,6 +4519,8 @@ impl CoordApp {
             scroll_offset: self.machine_detail_scroll,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -6330,6 +6465,8 @@ impl CoordApp {
             scroll_offset: 0,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -6342,12 +6479,14 @@ impl CoordApp {
                     is_active: self.board_detail_tab == BoardDetailTab::Board,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     label: " Issue ".to_string(),
                     is_active: self.board_detail_tab == BoardDetailTab::Issue,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
             ],
             scroll_offset: 0,
@@ -6473,18 +6612,21 @@ impl CoordApp {
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Pipeline,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     label: " Issue ".to_string(),
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Issue,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
                 TabItem {
                     label: " Stages ".to_string(),
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Stages,
                     is_dirty: false,
                     is_preview: false,
+                    is_closable: false,
                 },
             ],
             scroll_offset: 0,
@@ -6551,6 +6693,8 @@ impl CoordApp {
             scroll_offset: 0,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -7121,25 +7265,25 @@ impl CoordApp {
                 Some(Color::rgb(160, 160, 180)),
             )];
         }
-        // Tail of the log — last 200 lines.
-        let lines: Vec<&str> = content.lines().collect();
-        let tail_start = lines.len().saturating_sub(200);
+        // Limit to the last 200 NDJSON lines to avoid sluggishness on very
+        // long logs; annotate when the log is truncated.
+        let all_lines: Vec<&str> = content.lines().collect();
+        let tail_start = all_lines.len().saturating_sub(200);
         let mut rows: Vec<ListItem> = Vec::new();
         if tail_start > 0 {
             rows.push(kv_item(
                 "",
                 &format!(
                     "   (showing last 200 of {} lines from {}.log)",
-                    lines.len(), a.id,
+                    all_lines.len(), a.id,
                 ),
                 Some(Color::rgb(140, 140, 160)),
             ));
             rows.push(kv_item("", "", None));
         }
-        for line in &lines[tail_start..] {
-            let trimmed: String = line.chars().take(180).collect();
-            rows.push(kv_item("", &format!("   {trimmed}"), None));
-        }
+        let tail_content = all_lines[tail_start..].join("\n");
+        let wrap_w = self.last_main_visible_cols.get();
+        rows.extend(parse_log_content(&tail_content, wrap_w));
         rows
     }
 
@@ -7159,6 +7303,8 @@ impl CoordApp {
                 scroll_offset: 0,
                 has_focus: false,
                 bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
             };
         };
 
@@ -7177,6 +7323,8 @@ impl CoordApp {
                 scroll_offset: 0,
                 has_focus: false,
                 bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
             };
         }
 
@@ -7258,6 +7406,8 @@ impl CoordApp {
             scroll_offset: 0,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -7943,6 +8093,9 @@ impl CoordApp {
         // Stash the live viewport size — `watch_log_list` uses this to compute
         // a stick-to-bottom offset that keeps the last line on screen.
         self.last_main_visible_rows.set(visible.max(1));
+        self.last_main_visible_cols.set(
+            (main_b.width as usize).saturating_sub(4).max(40),
+        );
         // Watch overlay takes over the main panel; route scrollwheel to it
         // regardless of which view is active underneath.
         if self.watch.is_some() {
@@ -9666,6 +9819,8 @@ impl CoordApp {
             scroll_offset: 0,
             has_focus: false,
             bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
         }
     }
 
@@ -9980,6 +10135,9 @@ impl ShellApp for CoordApp {
         // viewport on every frame (not just when the user scrolls).
         self.last_main_visible_rows
             .set(content_visible_rows(m, lh).max(1));
+        self.last_main_visible_cols.set(
+            (m.width as usize).saturating_sub(4).max(40),
+        );
         match self.active_view {
             SidebarView::Board => {
                 // Tab bar (Board / Issue), then the active tab's content.
@@ -11102,6 +11260,8 @@ fn issue_body_list(
         scroll_offset,
         has_focus: false,
         bordered: false,
+        h_scroll: 0,
+        max_content_width: None,
     }
 }
 
@@ -11370,6 +11530,7 @@ mod tests {
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
             last_main_visible_rows: std::cell::Cell::new(40),
+            last_main_visible_cols: std::cell::Cell::new(DEFAULT_LOG_WRAP_WIDTH),
             purge_days: 7,
             watch_sse: None,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
@@ -11756,9 +11917,9 @@ mod tests {
     fn parse_json_event_init_returns_item() {
         let json = r#"{"type":"system","subtype":"init","model":"claude-sonnet-4-6","session_id":"abc"}"#;
         let mut n = 0;
-        let item = parse_json_event(json, &mut n);
-        assert!(item.is_some());
-        let text = &item.unwrap().text.spans[0].text;
+        let items = parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
+        assert!(!items.is_empty());
+        let text = &items[0].text.spans[0].text;
         assert!(text.contains("[init]"));
         assert!(text.contains("claude-sonnet-4-6"));
     }
@@ -11767,27 +11928,57 @@ mod tests {
     fn parse_json_event_assistant_increments_turn_counter() {
         let json = r#"{"type":"assistant","message":{"content":[]}}"#;
         let mut n = 0usize;
-        parse_json_event(json, &mut n);
+        parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
         assert_eq!(n, 1);
-        parse_json_event(json, &mut n);
+        parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
         assert_eq!(n, 2);
     }
 
     #[test]
-    fn parse_json_event_assistant_with_tool_shows_tool_name() {
+    fn parse_json_event_assistant_tool_only_returns_empty() {
+        // An assistant event containing only tool_use blocks (no text) should
+        // produce no items — the tool calls will surface as separate top-level
+        // `tool_use` events, so we skip them here to avoid duplication.
         let json = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"x"}]}}"#;
         let mut n = 0;
-        let item = parse_json_event(json, &mut n).unwrap();
-        let text = &item.text.spans[0].text;
-        assert!(text.contains("tool_use=Bash"), "got: {}", text);
+        let items = parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
+        assert!(items.is_empty(), "expected empty but got: {:?}", items);
+    }
+
+    #[test]
+    fn parse_json_event_tool_use_event_shows_arrow_prefix() {
+        // A top-level `tool_use` event renders as `→ ToolName: detail`.
+        let json = r#"{"type":"tool_use","name":"Bash","id":"x","input":{"command":"cargo build"}}"#;
+        let mut n = 0;
+        let items = parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
+        assert!(!items.is_empty(), "expected item");
+        let text = &items[0].text.spans[0].text;
+        assert!(text.contains("→"), "expected arrow prefix, got: {}", text);
+        assert!(text.contains("Bash"), "expected tool name, got: {}", text);
+    }
+
+    #[test]
+    fn parse_json_event_assistant_with_text_shows_wrapped_prose() {
+        // An assistant event with text emits: a turn separator + body lines.
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#;
+        let mut n = 0;
+        let items = parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
+        assert!(items.len() >= 2, "expected separator + body, got {} items", items.len());
+        // First item is the turn separator.
+        let sep = &items[0].text.spans[0].text;
+        assert!(sep.contains("Turn 1"), "separator should contain turn number, got: {}", sep);
+        // Body item contains the text.
+        let body_texts: Vec<&str> = items[1..].iter().map(|i| i.text.spans[0].text.as_str()).collect();
+        assert!(body_texts.iter().any(|t| t.contains("Hello world")), "body should contain text, got: {:?}", body_texts);
     }
 
     #[test]
     fn parse_json_event_status_in_text_block() {
         let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"STATUS: did thing → doing next → confidence: high"}]}}"#;
         let mut n = 0;
-        let item = parse_json_event(json, &mut n).unwrap();
-        let text = &item.text.spans[0].text;
+        let items = parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
+        assert!(!items.is_empty());
+        let text = &items[0].text.spans[0].text;
         assert!(text.starts_with("STATUS:"), "got: {}", text);
     }
 
@@ -11795,8 +11986,9 @@ mod tests {
     fn parse_json_event_stuck_in_text_block() {
         let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"STUCK: tried X [why] [blocker]"}]}}"#;
         let mut n = 0;
-        let item = parse_json_event(json, &mut n).unwrap();
-        let text = &item.text.spans[0].text;
+        let items = parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
+        assert!(!items.is_empty());
+        let text = &items[0].text.spans[0].text;
         assert!(text.starts_with("STUCK:"), "got: {}", text);
     }
 
@@ -11804,18 +11996,49 @@ mod tests {
     fn parse_json_event_result_shows_summary() {
         let json = r#"{"type":"result","num_turns":10,"total_cost_usd":0.42,"stop_reason":"end_turn","duration_ms":30000}"#;
         let mut n = 0;
-        let item = parse_json_event(json, &mut n).unwrap();
-        let text = &item.text.spans[0].text;
+        let items = parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
+        assert!(!items.is_empty());
+        let text = &items[0].text.spans[0].text;
         assert!(text.contains("[result]"), "got: {}", text);
         assert!(text.contains("10 turns"), "got: {}", text);
     }
 
     #[test]
-    fn parse_json_event_tool_result_returns_none() {
+    fn parse_json_event_tool_result_returns_empty() {
         // tool_result events are filtered out (too noisy).
         let json = r#"{"type":"tool_result","tool_use_id":"x","content":"ok"}"#;
         let mut n = 0;
-        assert!(parse_json_event(json, &mut n).is_none());
+        assert!(parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH).is_empty());
+    }
+
+    #[test]
+    fn parse_json_event_text_with_newlines_wraps_to_multiple_items() {
+        // Text with embedded newlines should produce multiple body items
+        // (one per wrapped line) rather than a single long line.
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Line one\nLine two\nLine three"}]}}"#;
+        let mut n = 0;
+        let items = parse_json_event(json, &mut n, DEFAULT_LOG_WRAP_WIDTH);
+        // separator + "Line one" + "Line two" + "Line three" = at least 4 items
+        assert!(items.len() >= 4, "expected at least 4 items, got {}: {:?}", items.len(),
+            items.iter().map(|i| &i.text.spans[0].text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn wrap_to_width_short_line_unchanged() {
+        let out = wrap_to_width("hello world", 80);
+        assert_eq!(out, vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_to_width_long_line_splits_at_word_boundary() {
+        let out = wrap_to_width("aa bb cc dd", 5);
+        assert_eq!(out, vec!["aa bb", "cc dd"]);
+    }
+
+    #[test]
+    fn wrap_to_width_preserves_empty_lines() {
+        let out = wrap_to_width("a\n\nb", 80);
+        assert_eq!(out, vec!["a", "", "b"]);
     }
 
     // ── load_activity_log — plain text ────────────────────────────────────────
