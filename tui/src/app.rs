@@ -4498,7 +4498,20 @@ impl CoordApp {
     /// running" lockout every cycle for a long-lived refinement chat).
     /// Appends the text to the inject transcript and clears the chat
     /// input on success.
+    ///
+    /// Convenience wrapper that defaults to showing the "Steer sent"
+    /// confirmation toast — appropriate for user-typed submits.  Internal
+    /// callers like [`Self::trigger_refinement_notes_synth`] that want a
+    /// silent send (they emit their own tailored toasts) should call
+    /// [`Self::submit_inject_with_toast`] with `show_toast = false`
+    /// instead.
     fn submit_inject(&mut self, text: String) -> bool {
+        self.submit_inject_with_toast(text, true)
+    }
+
+    /// Implementation of [`Self::submit_inject`] with explicit control
+    /// over the "Steer sent" confirmation toast.
+    fn submit_inject_with_toast(&mut self, text: String, show_toast: bool) -> bool {
         let (aid, issue_number, machine_name, old_type) = match self.focused_watch_state() {
             Some(w) => (w.assignment_id.clone(), w.issue_number, w.machine.clone(), w.assignment_type.clone()),
             None => return false,
@@ -4602,11 +4615,17 @@ impl CoordApp {
         // inject_fallback_rx, so we surface the confirmation immediately
         // rather than waiting for the HTTP round-trip.  Use "Steer sent"
         // (not "delivered") since network errors are silently dropped.
-        self.push_toast(
-            "Steer sent",
-            &format!("Message sent to worker #{}", issue_number),
-            ToastSeverity::Info,
-        );
+        //
+        // Suppressed for internal callers (e.g. refinement-notes synth)
+        // that emit their own tailored toasts — the user pressed Ctrl+N,
+        // not the steer keybind, so "Steer sent" would be misleading.
+        if show_toast {
+            self.push_toast(
+                "Steer sent",
+                &format!("Message sent to worker #{}", issue_number),
+                ToastSeverity::Info,
+            );
+        }
         // Stamp activity NOW so the busy spinner appears the instant the
         // user sends — without this we'd wait for the first SSE byte to
         // come back (which can be several seconds for the model's
@@ -11905,7 +11924,11 @@ impl CoordApp {
             .unwrap_or(0);
         let today = today_yyyy_mm_dd();
         let prompt = REFINEMENT_NOTES_SYNTH_PROMPT.replace("{DATE}", &today);
-        if !self.submit_inject(prompt) {
+        // Suppress the generic "Steer sent" toast — the user hit Ctrl+N
+        // for refinement-notes synth, not the steer keybind, so they
+        // shouldn't see a "Steer sent" confirmation.  This path emits its
+        // own tailored "asking the chat to draft notes…" toast below.
+        if !self.submit_inject_with_toast(prompt, false) {
             self.push_toast(
                 "Refinement notes",
                 "Couldn't send the synth prompt — chat busy or unavailable.",
@@ -22930,6 +22953,102 @@ mod tests {
 
         assert!(app.watch_focused.is_none(), "watch_focused should be cleared");
         assert!(app.watch_pool.contains_key(TEST_AID), "pool entry should survive close_watch");
+    }
+
+    #[test]
+    fn close_watch_clears_inject_opened_from_log_tab_flag() {
+        // #386: close_watch() must clear the inject_opened_from_log_tab
+        // flag.  If it didn't, a stale `true` could survive into a later
+        // chat session and trigger the Cancelled arm's `watch_focused = None`
+        // restore on a context where the user did want watch_focused to
+        // persist, breaking the Log-tab invariant (#308) in the other
+        // direction.  The flag's lifetime is bounded by close_watch and by
+        // the Cancelled arm itself.
+        let mut app = make_app_default();
+        app.inject_opened_from_log_tab = true;
+
+        app.close_watch();
+
+        assert!(
+            !app.inject_opened_from_log_tab,
+            "close_watch must clear inject_opened_from_log_tab (#386 invariant)",
+        );
+    }
+
+    #[test]
+    fn submit_inject_with_toast_false_suppresses_steer_toast() {
+        // #386: refinement-notes synth (Ctrl+N) calls submit_inject_with_toast
+        // with show_toast=false because it emits its own tailored toast.
+        // Verify the "Steer sent" toast is NOT pushed on that path so the
+        // user doesn't see a "Steer sent" confirmation for a button they
+        // never pressed.
+        let mut app = make_test_app(BoardData {
+            machines: vec![Machine {
+                name: "remote".to_string(),
+                host: "tests-localhost".to_string(),
+                reachable: true,
+                active_count: 0,
+                repos: vec![],
+                version: None,
+                worktree_bytes: 0,
+            }],
+            ..BoardData::default()
+        });
+        let (state, _tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, state);
+
+        let toasts_before = app.toasts.len();
+        let ok = app.submit_inject_with_toast("hello worker".to_string(), false);
+        assert!(ok, "submit_inject should succeed on the live-worker path");
+
+        let new_toasts: Vec<_> = app
+            .toasts
+            .iter()
+            .skip(toasts_before)
+            .map(|(item, _, _)| item.title.clone())
+            .collect();
+        assert!(
+            !new_toasts.iter().any(|t| t == "Steer sent"),
+            "show_toast=false must suppress 'Steer sent'; got toasts: {:?}",
+            new_toasts,
+        );
+    }
+
+    #[test]
+    fn submit_inject_default_shows_steer_toast() {
+        // Counterpart to the suppression test: the user-typed steer path
+        // calls submit_inject() (default show_toast=true) and SHOULD see
+        // the optimistic confirmation toast.
+        let mut app = make_test_app(BoardData {
+            machines: vec![Machine {
+                name: "remote".to_string(),
+                host: "tests-localhost".to_string(),
+                reachable: true,
+                active_count: 0,
+                repos: vec![],
+                version: None,
+                worktree_bytes: 0,
+            }],
+            ..BoardData::default()
+        });
+        let (state, _tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, state);
+
+        let toasts_before = app.toasts.len();
+        let ok = app.submit_inject("hello worker".to_string());
+        assert!(ok, "submit_inject should succeed on the live-worker path");
+
+        let new_toast_titles: Vec<_> = app
+            .toasts
+            .iter()
+            .skip(toasts_before)
+            .map(|(item, _, _)| item.title.clone())
+            .collect();
+        assert!(
+            new_toast_titles.iter().any(|t| t == "Steer sent"),
+            "user-typed steer must surface 'Steer sent'; got toasts: {:?}",
+            new_toast_titles,
+        );
     }
 
     #[test]
