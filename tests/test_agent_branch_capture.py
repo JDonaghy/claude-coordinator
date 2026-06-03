@@ -180,6 +180,119 @@ def test_fresh_branch_false_reuses_existing_branch(
     server.shutdown()
 
 
+# ── #389: leftover-branch hygiene (repos WITH a remote) ─────────────────────
+
+
+@pytest.fixture
+def repo_with_origin(tmp_path: Path) -> tuple[Path, Path]:
+    """A working clone on `main` whose `origin` is a bare repo.
+
+    Returns (clone, origin).  This mirrors production, where every repo has a
+    remote — unlike :func:`repo_clone`, which is local-only.
+    """
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "-b", "main")
+
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    _git(clone, "init", "-b", "main")
+    _git(clone, "config", "user.email", "t@t.com")
+    _git(clone, "config", "user.name", "Test")
+    _git(clone, "remote", "add", "origin", str(origin))
+    (clone / "README").write_text("hi\n")
+    _git(clone, "add", "README")
+    _git(clone, "commit", "-m", "initial")
+    _git(clone, "push", "-u", "origin", "main")
+    return clone, origin
+
+
+def test_local_only_leftover_branch_not_reused_when_origin_exists(
+    tmp_path: Path, repo_with_origin: tuple[Path, Path]
+) -> None:
+    """#389: a local `issue-N` branch that is NOT on origin is an untrusted
+    leftover — the worker must branch off origin/main, not the leftover."""
+    clone, _origin = repo_with_origin
+    main_sha = _git(clone, "rev-parse", "main")
+
+    # A leftover local branch from a prior failed assignment — never pushed.
+    _git(clone, "checkout", "-b", "issue-42-add-feature-x")
+    (clone / "stale.txt").write_text("reverted merged work\n")
+    _git(clone, "add", "stale.txt")
+    _git(clone, "commit", "-m", "stale leftover")
+    stale_sha = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "checkout", "main")
+
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/true"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api", repo_path=str(clone),
+        issue_number=42, issue_title="add feature X", briefing="b",
+        fresh_branch=False,
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == DONE
+    assert final.branch == "issue-42-add-feature-x"
+
+    # The worker's branch must start from origin/main — NOT the stale leftover.
+    branch_sha = _git(clone, "rev-parse", "issue-42-add-feature-x")
+    assert branch_sha == main_sha
+    assert branch_sha != stale_sha
+    server.shutdown()
+
+
+def test_origin_branch_reset_to_remote_tip_on_continuation(
+    tmp_path: Path, repo_with_origin: tuple[Path, Path]
+) -> None:
+    """#389: when origin HAS the branch, the worktree is hard-reset to the
+    remote tip so a divergent local copy of the branch can't ride in."""
+    clone, _origin = repo_with_origin
+
+    # Real remote work on the branch (origin/issue-42 ahead of main).
+    _git(clone, "checkout", "-b", "issue-42-add-feature-x")
+    (clone / "feature.txt").write_text("real remote work\n")
+    _git(clone, "add", "feature.txt")
+    _git(clone, "commit", "-m", "remote work")
+    origin_sha = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "push", "-u", "origin", "issue-42-add-feature-x")
+
+    # Corrupt the LOCAL copy of the branch so it diverges from origin (the
+    # #389 failure mode: a stale local branch shadowing the real remote one).
+    # Leave the branch before force-updating it — git refuses to -f a
+    # currently checked-out branch.
+    _git(clone, "checkout", "main")
+    _git(clone, "branch", "-f", "issue-42-add-feature-x", "main")
+    stale_local_sha = _git(clone, "rev-parse", "issue-42-add-feature-x")
+    assert stale_local_sha != origin_sha
+
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/true"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api", repo_path=str(clone),
+        issue_number=42, issue_title="add feature X", briefing="b",
+        fresh_branch=False,
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == DONE
+
+    # The branch must be reset to the remote tip, not the stale local copy.
+    branch_sha = _git(clone, "rev-parse", "issue-42-add-feature-x")
+    assert branch_sha == origin_sha
+    server.shutdown()
+
+
 def test_worktree_setup_failure_marks_assignment_failed(tmp_path: Path) -> None:
     """If worktree setup fails (e.g. not a git repo), the assignment goes to FAILED."""
     not_a_repo = tmp_path / "not-git"
