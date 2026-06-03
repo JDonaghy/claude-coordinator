@@ -217,9 +217,11 @@ class TestUpdateEndpoint:
         ):
             client, server = _make_client(tmp_path)
             client.post("/update")
-            # Wait inside the patch context so the background thread's
-            # subprocess.run call is still intercepted by fake_run.
-            _wait_until(lambda: any("git" in " ".join(c) for c in calls))
+            # Wait for the specific call the assertions need (git pull),
+            # not just any git call.  Staying inside the patch context
+            # ensures fake_run intercepts every subprocess.run the
+            # background thread makes.
+            _wait_until(lambda: any("pull" in c for c in calls))
 
         git_cmds = [c for c in calls if "git" in c]
         assert git_cmds, "expected a git call"
@@ -240,9 +242,13 @@ class TestUpdateEndpoint:
         ):
             client, server = _make_client(tmp_path)
             client.post("/update")
-            # Wait inside the patch context so the background thread's
-            # subprocess.run call is still intercepted by fake_run.
-            _wait_until(lambda: bool(calls))
+            # Wait for the specific call the assertions need (pip install
+            # --upgrade), not just any call.  Staying inside the patch
+            # context ensures fake_run intercepts every subprocess.run the
+            # background thread makes.
+            _wait_until(
+                lambda: any("install" in c and "--upgrade" in c for c in calls)
+            )
 
         pip_cmds = [c for c in calls if "pip" in " ".join(c)]
         assert pip_cmds, "expected a pip call"
