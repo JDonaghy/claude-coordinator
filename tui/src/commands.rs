@@ -523,7 +523,7 @@ mod tests {
         assert!(runner.spawn(&["--version"]));
         assert!(runner.is_running());
         // Enqueue a second command while the first is still running.
-        let outcome = runner.spawn_queued(&["notify"]);
+        let outcome = runner.spawn_queued(&["--help"]);
         assert_eq!(outcome, SpawnQueuedOutcome::Queued);
         assert_eq!(runner.queue_depth(), 1);
         // Wait for the first command to complete; poll() should auto-start the second.
@@ -536,7 +536,7 @@ mod tests {
         // Wait for the second command to finish.
         let result_b = wait_for_result(&mut runner)
             .expect("second (queued) command did not finish within 10s");
-        assert!(result_b.label.contains("notify"), "unexpected label: {}", result_b.label);
+        assert!(result_b.label.contains("--help"), "unexpected label: {}", result_b.label);
         assert!(!runner.is_running());
     }
 
@@ -547,15 +547,15 @@ mod tests {
         // Start first command.
         assert!(runner.spawn(&["--version"]));
         // Enqueue two more.
-        assert_eq!(runner.spawn_queued(&["notify"]), SpawnQueuedOutcome::Queued);
-        assert_eq!(runner.spawn_queued(&["sync", "--quiet"]), SpawnQueuedOutcome::Queued);
+        assert_eq!(runner.spawn_queued(&["--help"]), SpawnQueuedOutcome::Queued);
+        assert_eq!(runner.spawn_queued(&["version"]), SpawnQueuedOutcome::Queued);
         assert_eq!(runner.queue_depth(), 2);
         // First completes → second (notify) starts.
         wait_for_result(&mut runner).expect("first");
         assert!(runner.is_running(), "second command should have started");
         let (label_b, _) = runner.running_info().expect("running_info");
         assert!(
-            label_b.contains("notify"),
+            label_b.contains("--help"),
             "expected 'notify' to run second (FIFO), got: {label_b}",
         );
         assert_eq!(runner.queue_depth(), 1);
@@ -564,7 +564,7 @@ mod tests {
         assert!(runner.is_running(), "third command should have started");
         let (label_c, _) = runner.running_info().expect("running_info");
         assert!(
-            label_c.contains("sync"),
+            label_c.contains("version"),
             "expected 'sync' to run third (FIFO), got: {label_c}",
         );
         assert_eq!(runner.queue_depth(), 0);
@@ -588,11 +588,11 @@ mod tests {
         );
         assert_eq!(runner.queue_depth(), 0);
         // Different argv → queued.
-        assert_eq!(runner.spawn_queued(&["notify"]), SpawnQueuedOutcome::Queued);
+        assert_eq!(runner.spawn_queued(&["--help"]), SpawnQueuedOutcome::Queued);
         assert_eq!(runner.queue_depth(), 1);
         // Same argv as the queued command → deduped.
         assert_eq!(
-            runner.spawn_queued(&["notify"]),
+            runner.spawn_queued(&["--help"]),
             SpawnQueuedOutcome::Deduped,
             "should dedup against already-queued command",
         );
@@ -614,9 +614,9 @@ mod tests {
         assert!(runner.spawn(&["--version"]));
         assert_eq!(runner.queue_depth(), 0);
         // Enqueue two more.
-        runner.spawn_queued(&["notify"]);
+        runner.spawn_queued(&["--help"]);
         assert_eq!(runner.queue_depth(), 1);
-        runner.spawn_queued(&["sync", "--quiet"]);
+        runner.spawn_queued(&["version"]);
         assert_eq!(runner.queue_depth(), 2);
         // First completes → second starts; only the third remains queued.
         wait_for_result(&mut runner).expect("first");
