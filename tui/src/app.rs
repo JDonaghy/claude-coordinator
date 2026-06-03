@@ -1941,9 +1941,7 @@ fn parse_json_event_inner(line: &str, turn_n: &mut usize, elapsed: Option<std::t
         "tool_use" => {
             let name = json_str(line, "name").unwrap_or_else(|| "?".to_string());
             let detail = match name.as_str() {
-                "Bash" => json_str(line, "command")
-                    .map(|c| trunc(&c, 60).to_string())
-                    .unwrap_or_default(),
+                "Bash" => json_str(line, "command").unwrap_or_default(),
                 "Edit" | "Write" | "Read" | "Glob" | "NotebookEdit" => {
                     json_str(line, "file_path").unwrap_or_default()
                 }
