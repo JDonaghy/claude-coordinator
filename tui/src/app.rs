@@ -6134,15 +6134,24 @@ impl CoordApp {
         if self.merge_stage_status_for(issue) == StageStatus::Done {
             return "done";
         }
-        let has_assignments = self.data.assignments.iter().any(|a| {
+        // Only *work* assignments make an issue in-progress. Refinement /
+        // new-issue-chat / test-chat are scoping conversations, not pipeline
+        // execution — a refined-but-unstarted issue (status:ready + N done
+        // refinements, zero work) belongs in New, not Active. Counting any
+        // assignment pinned such issues to "in-progress" with grey stage boxes.
+        let has_work_assignment = self.data.assignments.iter().any(|a| {
             a.issue_number == issue.number
                 && issue
                     .coord_repo
                     .as_deref()
                     .map(|r| r == a.repo)
                     .unwrap_or(true)
+                && !matches!(
+                    a.assignment_type.as_deref(),
+                    Some("refinement") | Some("new-issue-chat") | Some("test-chat")
+                )
         });
-        if has_assignments {
+        if has_work_assignment {
             return "in-progress";
         }
         if issue.all_labels.iter().any(|l| l == "status:ready") {
@@ -19329,6 +19338,36 @@ mod tests {
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "in-progress");
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_lifecycle_refinement_only_is_pending_not_in_progress() {
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].all_labels.push("status:ready".to_string());
+        // A done refinement chat is scoping, not work — it must NOT pin a
+        // status:ready issue to in-progress; it belongs in New (pending).
+        app.data.assignments.push(Assignment {
+            id: "r1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: Some("refinement".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+        });
+        let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
+        assert_eq!(section, "pending");
     }
 
     #[test]
