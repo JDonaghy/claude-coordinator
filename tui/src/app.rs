@@ -4589,6 +4589,14 @@ impl CoordApp {
             }
         };
         spawn_inject_post(&host, &aid, &text, issue_number, self.inject_fallback_tx.clone());
+        // Optimistic toast: fire-and-forget; 409/410 will fall back via
+        // inject_fallback_rx, so we surface the confirmation immediately
+        // rather than waiting for the HTTP round-trip.
+        self.push_toast(
+            "Steer delivered",
+            &format!("Message sent to worker #{}", issue_number),
+            ToastSeverity::Info,
+        );
         // Stamp activity NOW so the busy spinner appears the instant the
         // user sends — without this we'd wait for the first SSE byte to
         // come back (which can be several seconds for the model's
@@ -15976,6 +15984,72 @@ impl ShellApp for CoordApp {
                             self.pipeline_detail_scroll
                         };
                         self.pipeline_detail_scroll = current.saturating_sub(visible);
+                        needs_redraw = true;
+                    }
+
+                    // ── i — inject/steer a running worker from the Log tab (#386)
+                    // Opens the guidance-chat overlay bound to the running
+                    // assignment for the selected pipeline row so the user can
+                    // send a mid-run message without leaving the Log view.
+                    // Uses the same submit_inject / spawn_inject_post path
+                    // as the 'b' keybind on the watch overlay — no new HTTP
+                    // machinery, just wiring.
+                    Key::Char('i')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log
+                            && self.watch_focused.is_none()
+                            && self.inject_chat.is_none() =>
+                    {
+                        // Find the running assignment for the selected row.
+                        let running = self.pipeline_sel
+                            .and_then(|i| self.pipeline_issues.get(i).cloned())
+                            .and_then(|issue| {
+                                let local_repo =
+                                    issue.coord_repo.as_deref().map(|s| s.to_string());
+                                self.data
+                                    .assignments
+                                    .iter()
+                                    .filter(|a| a.issue_number == issue.number)
+                                    .filter(|a| match local_repo.as_deref() {
+                                        Some(r) => a.repo == r,
+                                        None => true,
+                                    })
+                                    .find(|a| a.status == "running")
+                                    .map(|a| {
+                                        (
+                                            a.id.clone(),
+                                            a.issue_number,
+                                            a.machine.clone(),
+                                            a.assignment_type
+                                                .clone()
+                                                .unwrap_or_else(|| "work".to_string()),
+                                        )
+                                    })
+                            });
+                        if let Some((aid, issue_n, machine, atype)) = running {
+                            // Ensure the SSE pool has an entry (Log tab may
+                            // already have seeded one via ensure_log_tab_sse).
+                            if !self.watch_pool.contains_key(&aid) {
+                                self.open_sse_in_pool_for_selected_issue();
+                            }
+                            // Focus the assignment so submit_inject can reach it.
+                            self.watch_focused = Some(aid);
+                            // Open the guidance chat overlay — same shape as
+                            // the 'b' handler in the watch overlay above.
+                            let mut chat = ChatController::new("inject");
+                            chat.set_status(StyledText::plain(format!(
+                                "  Steer → {} #{} on {}  (Ctrl+S or Alt+Enter = send · Esc = close)",
+                                atype, issue_n, machine
+                            )));
+                            chat.set_transcript(self.focused_transcript().to_vec());
+                            self.inject_chat = Some(chat);
+                        } else {
+                            self.push_toast(
+                                "Steer",
+                                "No running assignment to steer for this issue.",
+                                ToastSeverity::Warning,
+                            );
+                        }
                         needs_redraw = true;
                     }
 
