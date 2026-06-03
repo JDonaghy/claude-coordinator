@@ -3297,15 +3297,30 @@ pub struct CoordApp {
     /// Expanded state for each (repo, status_group) pair. Default: true.
     board_status_expanded: std::collections::HashMap<(String, String), bool>,
     // ── Pipeline panel state ────────────────────────────────────────────
-    /// SidebarSystem listing tracked issues grouped by repo → lifecycle section.
+    /// SidebarSystem listing tracked issues grouped by state → (optionally) repo.
     pipeline_sidebar: SidebarSystem,
-    /// Ordered list of repo keys (coord_repo or repo_slug) used as section IDs
-    /// in the pipeline sidebar.  Rebuilt on each `rebuild_pipeline_sidebar()`.
+    /// Ordered list of repo keys (coord_repo or repo_slug) present in the
+    /// current pipeline.  Used by `pipeline_groups_for_repo` and helpers;
+    /// no longer maps 1-to-1 to sidebar section indices (that is
+    /// `pipeline_state_section_names`).  Rebuilt on each
+    /// `rebuild_pipeline_sidebar()`.
     pipeline_repo_names: Vec<String>,
+    /// Ordered list of lifecycle state keys for the current pipeline sidebar
+    /// sections.  Section index N in the sidebar maps to
+    /// `pipeline_state_section_names[N - 1]` (section 0 is always FILTER).
+    /// Only non-empty state sections appear.  Values are one of:
+    /// `"in-progress"` / `"pending"` / `"done"`.
+    /// Rebuilt on each `rebuild_pipeline_sidebar()`.
+    pipeline_state_section_names: Vec<&'static str>,
     /// Filter state (query / cursor / focus) for the Pipeline sidebar's FILTER box.
     pipeline_search: SidebarFilter,
-    /// Expanded state for each (repo_key, lifecycle_key) pair in the Pipeline sidebar.
-    /// Default: true (expanded). Persists across rebuilds so collapse survives refresh.
+    /// Expanded state for each (lifecycle_key, repo_key) sub-group in the
+    /// Pipeline sidebar's New/Done sections.  Default: true (expanded).
+    /// Persists across rebuilds so collapse survives refresh.
+    ///
+    /// Key semantics: `(lifecycle_key, repo_key)` — note the order is
+    /// lifecycle-first now that lifecycle is the top-level grouping and repo
+    /// is the sub-group.
     pipeline_lifecycle_expanded: std::collections::HashMap<(String, String), bool>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
@@ -3731,6 +3746,7 @@ impl CoordApp {
             board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
+            pipeline_state_section_names: Vec::new(),
             pipeline_search: SidebarFilter::default(),
             pipeline_lifecycle_expanded: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
@@ -6170,6 +6186,11 @@ impl CoordApp {
     /// Returns `(lifecycle_key, Vec<pipeline_issues index>)` in display
     /// order (New → In-progress → Done), skipping empty sections.
     /// Issues that the user has dismissed via 'D' are excluded.
+    ///
+    /// Note: used in tests to verify per-repo lifecycle grouping; the
+    /// production sidebar uses `pipeline_active_issues` and
+    /// `pipeline_repos_for_state` directly.
+    #[cfg(test)]
     fn pipeline_groups_for_repo(&self, repo_key: &str) -> Vec<(&'static str, Vec<usize>)> {
         const VISIBLE_LIFECYCLE: [&str; 3] = ["pending", "in-progress", "done"];
 
@@ -6229,6 +6250,141 @@ impl CoordApp {
             .map(|i| (i.repo_slug.clone(), i.number))
     }
 
+    /// Compute a short uppercase repo tag for display in the Active section.
+    ///
+    /// If `repo_name`'s first character is unique (case-insensitive) among
+    /// `all_repos`, returns that single character uppercased.  On collision,
+    /// extends to the shortest prefix of `repo_name` that is not shared by
+    /// any other entry in `all_repos`; the first character of the prefix is
+    /// uppercased and the rest are kept lowercase.
+    ///
+    /// Examples:
+    /// - `["quadraui"]` → `"Q"`
+    /// - `["claude-coordinator", "coord-something"]` → `"Cl"` / `"Co"`
+    fn repo_tag(repo_name: &str, all_repos: &[String]) -> String {
+        let Some(first_char) = repo_name.chars().next() else {
+            return "?".to_string();
+        };
+        let first_lower = first_char.to_ascii_lowercase();
+
+        // Check if any OTHER repo starts with the same letter.
+        let has_conflict = all_repos.iter().any(|r| {
+            r.as_str() != repo_name
+                && r.chars().next().map(|c| c.to_ascii_lowercase()) == Some(first_lower)
+        });
+
+        if !has_conflict {
+            // No collision — single uppercase char.
+            return first_char.to_uppercase().collect();
+        }
+
+        // Find the shortest prefix of repo_name that is unique across all_repos.
+        for len in 2..=repo_name.len() {
+            if !repo_name.is_char_boundary(len) {
+                continue;
+            }
+            let prefix_lower = repo_name[..len].to_lowercase();
+            let collision = all_repos.iter().any(|r| {
+                r.as_str() != repo_name && r.to_lowercase().starts_with(&prefix_lower)
+            });
+            if !collision {
+                let mut chars = repo_name[..len].chars();
+                let tag: String = chars
+                    .next()
+                    .map(|c| {
+                        let upper: String = c.to_uppercase().collect();
+                        upper
+                    })
+                    .unwrap_or_default()
+                    + chars.as_str();
+                return tag;
+            }
+        }
+
+        // Fallback: full name with first char uppercased.
+        let mut chars = repo_name.chars();
+        chars
+            .next()
+            .map(|c| {
+                let upper: String = c.to_uppercase().collect();
+                upper + chars.as_str()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Return a sorted list of `pipeline_issues` indices for all in-progress
+    /// issues across all repos.  Applies dedup (last-write-wins by
+    /// `(repo_slug, issue_number)`), search filter, and dismissal filter.
+    fn pipeline_active_issues(&self) -> Vec<usize> {
+        let mut dedup: std::collections::HashMap<(String, u64), usize> =
+            std::collections::HashMap::new();
+        for (i, issue) in self.pipeline_issues.iter().enumerate() {
+            if !self
+                .pipeline_dismissed
+                .contains(&(issue.repo_slug.clone(), issue.number))
+            {
+                dedup.insert((issue.repo_slug.clone(), issue.number), i);
+            }
+        }
+        let mut idxs: Vec<usize> = dedup
+            .values()
+            .copied()
+            .filter(|&i| {
+                let issue = &self.pipeline_issues[i];
+                self.pipeline_lifecycle_section(issue) == "in-progress"
+                    && self.pipeline_search.matches(issue.number, &issue.title)
+            })
+            .collect();
+        idxs.sort_unstable();
+        idxs
+    }
+
+    /// Return issues for a lifecycle state, grouped by repo, in stable repo
+    /// order (same order as `pipeline_repo_names`).  Only intended for
+    /// `"pending"` and `"done"` — Active issues are handled by
+    /// `pipeline_active_issues` instead.
+    ///
+    /// Applies dedup, search filter, and dismissal filter.  Empty repos are
+    /// omitted.
+    fn pipeline_repos_for_state(&self, lc_key: &'static str) -> Vec<(String, Vec<usize>)> {
+        let mut dedup: std::collections::HashMap<(String, u64), usize> =
+            std::collections::HashMap::new();
+        for (i, issue) in self.pipeline_issues.iter().enumerate() {
+            if !self
+                .pipeline_dismissed
+                .contains(&(issue.repo_slug.clone(), issue.number))
+                && self.pipeline_search.matches(issue.number, &issue.title)
+            {
+                dedup.insert((issue.repo_slug.clone(), issue.number), i);
+            }
+        }
+        // Build repo order from pipeline_issues (stable insertion order).
+        let mut repos: Vec<String> = Vec::new();
+        for issue in &self.pipeline_issues {
+            let key = Self::pipeline_repo_key(issue).to_string();
+            if !repos.contains(&key) {
+                repos.push(key);
+            }
+        }
+        let mut result: Vec<(String, Vec<usize>)> = Vec::new();
+        for repo_key in repos {
+            let mut idxs: Vec<usize> = dedup
+                .values()
+                .copied()
+                .filter(|&i| {
+                    let issue = &self.pipeline_issues[i];
+                    Self::pipeline_repo_key(issue) == repo_key.as_str()
+                        && self.pipeline_lifecycle_section(issue) == lc_key
+                })
+                .collect();
+            idxs.sort_unstable();
+            if !idxs.is_empty() {
+                result.push((repo_key, idxs));
+            }
+        }
+        result
+    }
+
     /// Build the SidebarSystem entries for the Pipeline panel.
     ///
     /// One section per repo; within each repo, issues are bucketed into
@@ -6254,28 +6410,24 @@ impl CoordApp {
         // Preserve panel scroll across rebuilds — without this, every 15 s
         // refresh resets the sidebar's scroll to 0 and yanks the visible
         // area back to the top, even when the selection itself is restored
-        // correctly. The user wants "the view should not change on refresh".
+        // correctly.
         let prev_panel_scroll = self.pipeline_sidebar.panel_scroll();
-        // Section 0 is always the FILTER form; repo sections start at
-        // `search_offset`.  Mirrors `rebuild_board_sidebar`'s offset.
+        // Section 0 is always the FILTER form; state sections start at
+        // `search_offset`.
         let search_offset = 1usize;
-        // Preserve per-section collapse state by repo name (section indices
-        // may shift if repos are added/removed between rebuilds, so we key
-        // by the repo identifier rather than the section index).  Mirrors
-        // the pattern already used by rebuild_board_sidebar.  The previous
-        // sidebar already carries the search section at index 0, so repo
-        // sections sit at `i + search_offset`.
-        let prev_collapsed: std::collections::HashMap<String, bool> = self
-            .pipeline_repo_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                (name.clone(), self.pipeline_sidebar.is_collapsed(i + search_offset))
-            })
-            .collect();
+        // Preserve per-section collapse state by state key (section indices
+        // may shift if sections appear/disappear between rebuilds, so we key
+        // by the state identifier rather than the section index).
+        let prev_state_collapsed: std::collections::HashMap<&'static str, bool> =
+            self.pipeline_state_section_names
+                .iter()
+                .enumerate()
+                .map(|(i, &name)| {
+                    (name, self.pipeline_sidebar.is_collapsed(i + search_offset))
+                })
+                .collect();
 
-        // Collect unique repo keys in stable order (issues are already sorted
-        // by repo_slug within fetch_pipeline_issues).
+        // Collect unique repo keys in stable order.
         let mut repos: Vec<String> = Vec::new();
         for issue in &self.pipeline_issues {
             let key = Self::pipeline_repo_key(issue).to_string();
@@ -6284,12 +6436,35 @@ impl CoordApp {
             }
         }
 
-        // Section 0: search/filter form; then one section per repo.
+        // ── Compute the three state buckets ──────────────────────────────
+        //
+        // Display order: Active (in-progress) → New (pending) → Done.
+        // Each bucket is computed once here and reused for rows + restore.
+        let active_flat: Vec<usize> = self.pipeline_active_issues();
+        let new_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("pending");
+        let done_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("done");
+
+        // Build the list of non-empty state sections in display order.
+        // Each entry: (classifier_key, display_label).
+        let mut state_sections: Vec<(&'static str, &'static str)> = Vec::new();
+        if !active_flat.is_empty() {
+            state_sections.push(("in-progress", "Active"));
+        }
+        if !new_by_repo.is_empty() {
+            state_sections.push(("pending", "New"));
+        }
+        if !done_by_repo.is_empty() {
+            state_sections.push(("done", "Done"));
+        }
+
+        // ── Build sidebar section definitions ────────────────────────────
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
         defs.push(SidebarSectionDef::form("pipeline-search", "FILTER"));
-        for repo in &repos {
-            let mut def =
-                SidebarSectionDef::new(format!("section:repo:{}", repo), repo.clone());
+        for &(lc_key, lc_label) in &state_sections {
+            let mut def = SidebarSectionDef::new(
+                format!("section:state:{}", lc_key),
+                lc_label.to_string(),
+            );
             def.show_chevron = true;
             def.size = SectionSize::Content;
             defs.push(def);
@@ -6303,154 +6478,209 @@ impl CoordApp {
         // Populate search form (section 0).
         sidebar.set_form(0, self.pipeline_search.form("pipeline-search", "Filter issues…"));
 
-        // Lifecycle display labels.  #225 + #256: Pipeline only renders
-        // three sections (New / In-progress / Done).  The classifier
-        // key `"pending"` corresponds to the umbrella's "New" — keeping
-        // the key avoids churning every consumer for a cosmetic rename;
-        // the display label here is what the user actually sees.
-        const LIFECYCLE_META: [(&str, &str); 3] = [
-            ("pending",     "New"),
-            ("in-progress", "In-progress"),
-            ("done",        "Done"),
-        ];
+        // Colour palette per lifecycle state — mirrors the Board's
+        // In-flight / Completed / Refined palette for visual consistency.
+        let state_color = |lc: &str| match lc {
+            "in-progress" => Color::rgb(80, 220, 80),
+            "done"        => Color::rgb(120, 180, 120),
+            "pending"     => Color::rgb(140, 180, 240), // "New"
+            _             => Color::rgb(140, 140, 160),
+        };
 
-        // Populate rows for each repo section.  Repo `sec_idx` lives at the
-        // sidebar section index `sec_idx + search_offset` (section 0 is the
-        // FILTER form).
-        for (sec_idx, repo_key) in repos.iter().enumerate() {
-            let section_idx = sec_idx + search_offset;
-            let groups = self.pipeline_groups_for_repo(repo_key);
-            let total: usize = groups.iter().map(|(_, v)| v.len()).sum();
-            if total > 0 {
-                sidebar.set_section_badge(
-                    section_idx,
-                    Some(StyledText::plain(format!("({})", total))),
-                );
-            }
-
+        // ── Populate rows for each state section ─────────────────────────
+        for (state_idx, &(lc_key, _lc_label)) in state_sections.iter().enumerate() {
+            let section_idx = state_idx + search_offset;
             let mut rows: Vec<TreeRow> = Vec::new();
-            for (li, (lc_key, issue_idxs)) in groups.iter().enumerate() {
-                // Find the display label for this lifecycle key.
-                let lc_label = LIFECYCLE_META
-                    .iter()
-                    .find(|(k, _)| k == lc_key)
-                    .map(|(_, v)| *v)
-                    .unwrap_or(lc_key);
 
-                // #225 / #256: only three sections visible.  Palette
-                // matches the Board's In-flight / Completed / Refined
-                // colours so the same lifecycle stage looks consistent
-                // across the two panels.
-                let header_color = match *lc_key {
-                    "in-progress" => Color::rgb(80, 220, 80),
-                    "done"        => Color::rgb(120, 180, 120),
-                    "pending"     => Color::rgb(140, 180, 240), // "New"
-                    _             => Color::rgb(140, 140, 160),
-                };
-
-                let is_expanded = self.pipeline_lifecycle_expanded
-                    .get(&(repo_key.clone(), lc_key.to_string()))
-                    .copied()
-                    .unwrap_or(true);
-
-                rows.push(TreeRow {
-                    path: vec![li as u16],
-                    indent: 1,
-                    icon: None,
-                    text: StyledText {
-                        spans: vec![StyledSpan::with_fg(
-                            format!("{} ({})", lc_label, issue_idxs.len()),
-                            header_color,
-                        )],
-                    },
-                    badge: None,
-                    is_expanded: Some(is_expanded),
-                    decoration: Decoration::Header,
-                    edit: None,
-                });
-
-                if !is_expanded {
-                    continue;
-                }
-
-                for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
-                    let issue = &self.pipeline_issues[issue_idx];
-                    let stage_name = self.derive_current_stage(issue);
-                    let (badge_text, badge_color) = stage_badge(&stage_name);
-                    let title_color = if issue.coord_repo.is_some() {
-                        Color::rgb(210, 210, 210)
-                    } else {
-                        Color::rgb(140, 140, 140)
-                    };
-                    // Show a live-stream indicator (▶) if a non-done SSE
-                    // stream exists for this issue in the watch pool — covers
-                    // both the focused stream and background streams.
-                    let has_live_stream = self.watch_pool.values().any(|ctx| {
-                        ctx.state.issue_number == issue.number && !ctx.sse.done
-                    });
-                    let mut spans = vec![
-                        StyledSpan::with_fg(
-                            format!("#{:<5}", issue.number),
-                            Color::rgb(150, 150, 240),
-                        ),
-                        StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
-                    ];
-                    if has_live_stream {
-                        spans.push(StyledSpan::with_fg(" ▶".to_string(), Color::rgb(60, 200, 80)));
+            match lc_key {
+                "in-progress" => {
+                    // Active: flat list across all repos — no repo sub-headers.
+                    // Each row shows a right-aligned single-letter repo tag as
+                    // the badge; the stage badge is implicit (detail pane).
+                    sidebar.set_section_badge(
+                        section_idx,
+                        Some(StyledText::plain(format!("({})", active_flat.len()))),
+                    );
+                    for (ii, &issue_idx) in active_flat.iter().enumerate() {
+                        let issue = &self.pipeline_issues[issue_idx];
+                        let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
+                        let tag_color = Color::rgb(180, 140, 240);
+                        let title_color = if issue.coord_repo.is_some() {
+                            Color::rgb(210, 210, 210)
+                        } else {
+                            Color::rgb(140, 140, 140)
+                        };
+                        let has_live_stream = self.watch_pool.values().any(|ctx| {
+                            ctx.state.issue_number == issue.number && !ctx.sse.done
+                        });
+                        let mut spans = vec![
+                            StyledSpan::with_fg(
+                                format!("#{:<5}", issue.number),
+                                Color::rgb(150, 150, 240),
+                            ),
+                            StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
+                        ];
+                        if has_live_stream {
+                            spans.push(StyledSpan::with_fg(
+                                " ▶".to_string(),
+                                Color::rgb(60, 200, 80),
+                            ));
+                        }
+                        rows.push(TreeRow {
+                            path: vec![ii as u16],
+                            indent: 1,
+                            icon: None,
+                            text: StyledText { spans },
+                            badge: Some(Badge::colored(tag, tag_color)),
+                            is_expanded: None,
+                            decoration: Decoration::Normal,
+                            edit: None,
+                        });
                     }
-                    let text = StyledText { spans };
-                    rows.push(TreeRow {
-                        path: vec![li as u16, ii as u16],
-                        indent: 2,
-                        icon: None,
-                        text,
-                        badge: Some(Badge::colored(&badge_text, badge_color)),
-                        is_expanded: None,
-                        decoration: Decoration::Normal,
-                        edit: None,
-                    });
+                }
+                _ => {
+                    // New / Done: grouped by repo with expandable repo sub-headers.
+                    let repo_groups: &Vec<(String, Vec<usize>)> = if lc_key == "pending" {
+                        &new_by_repo
+                    } else {
+                        &done_by_repo
+                    };
+                    let total: usize = repo_groups.iter().map(|(_, v)| v.len()).sum();
+                    sidebar.set_section_badge(
+                        section_idx,
+                        Some(StyledText::plain(format!("({})", total))),
+                    );
+                    for (ri, (repo_key, issue_idxs)) in repo_groups.iter().enumerate() {
+                        // Repo sub-header: expand/collapse keyed by
+                        // (lifecycle_key, repo_key) — lifecycle first, repo
+                        // second, matching the new field comment semantics.
+                        let is_expanded = self
+                            .pipeline_lifecycle_expanded
+                            .get(&(lc_key.to_string(), repo_key.clone()))
+                            .copied()
+                            .unwrap_or(true);
+                        rows.push(TreeRow {
+                            path: vec![ri as u16],
+                            indent: 1,
+                            icon: None,
+                            text: StyledText {
+                                spans: vec![StyledSpan::with_fg(
+                                    format!("{} ({})", repo_key, issue_idxs.len()),
+                                    state_color(lc_key),
+                                )],
+                            },
+                            badge: None,
+                            is_expanded: Some(is_expanded),
+                            decoration: Decoration::Header,
+                            edit: None,
+                        });
+                        if !is_expanded {
+                            continue;
+                        }
+                        for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
+                            let issue = &self.pipeline_issues[issue_idx];
+                            let stage_name = self.derive_current_stage(issue);
+                            let (badge_text, badge_color) = stage_badge(&stage_name);
+                            let title_color = if issue.coord_repo.is_some() {
+                                Color::rgb(210, 210, 210)
+                            } else {
+                                Color::rgb(140, 140, 140)
+                            };
+                            let has_live_stream = self.watch_pool.values().any(|ctx| {
+                                ctx.state.issue_number == issue.number && !ctx.sse.done
+                            });
+                            let mut spans = vec![
+                                StyledSpan::with_fg(
+                                    format!("#{:<5}", issue.number),
+                                    Color::rgb(150, 150, 240),
+                                ),
+                                StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
+                            ];
+                            if has_live_stream {
+                                spans.push(StyledSpan::with_fg(
+                                    " ▶".to_string(),
+                                    Color::rgb(60, 200, 80),
+                                ));
+                            }
+                            rows.push(TreeRow {
+                                path: vec![ri as u16, ii as u16],
+                                indent: 2,
+                                icon: None,
+                                text: StyledText { spans },
+                                badge: Some(Badge::colored(&badge_text, badge_color)),
+                                is_expanded: None,
+                                decoration: Decoration::Normal,
+                                edit: None,
+                            });
+                        }
+                    }
                 }
             }
             sidebar.set_rows(section_idx, rows);
         }
 
-        // Default-select the first issue in the first non-empty repo section.
-        if sidebar.active_section().is_none() {
-            'find_default: for sec_idx in 0..repos.len() {
-                let groups = self.pipeline_groups_for_repo(&repos[sec_idx]);
-                if !groups.is_empty() {
-                    let section_idx = sec_idx + search_offset;
-                    sidebar.set_active_section(Some(section_idx));
-                    // Select the first issue row (path [0, 0] = first lifecycle
-                    // group header expanded → first issue).
-                    sidebar.set_selected_path(section_idx, Some(vec![0u16, 0u16]));
-                    break 'find_default;
-                }
-            }
+        // Default-select the first issue in the first non-empty state section.
+        if sidebar.active_section().is_none() && !state_sections.is_empty() {
+            let section_idx = search_offset; // first state section
+            sidebar.set_active_section(Some(section_idx));
+            // Active: path [0] = first issue (flat list, no sub-headers).
+            // New/Done: path [0, 0] = first repo sub-header → first issue.
+            let first_path = if state_sections[0].0 == "in-progress" {
+                vec![0u16]
+            } else {
+                vec![0u16, 0u16]
+            };
+            sidebar.set_selected_path(section_idx, Some(first_path));
         }
 
         self.pipeline_repo_names = repos;
+        let new_state_section_names: Vec<&'static str> =
+            state_sections.iter().map(|&(k, _)| k).collect();
+        self.pipeline_state_section_names = new_state_section_names;
         self.pipeline_sidebar = sidebar;
 
-        // Capture the previous issue number before the partial move below.
-        // Used later to decide whether the focused-stage index needs to be
-        // recomputed (we only reset on issue change, not on every refresh).
+        // Capture the previous issue number.  Used to decide whether the
+        // focused-stage index needs to be recomputed (we only reset on issue
+        // change, not on every refresh).
         let prev_issue_num: Option<u64> = prev_sel.as_ref().map(|(_, num)| *num);
 
-        // Restore previous selection if the issue still exists.
+        // Restore previous selection if the issue still exists in the new
+        // layout.  Search both the flat Active list and the repo-grouped
+        // New/Done lists using the pre-computed buckets.
         if let Some((repo, num)) = prev_sel {
-            'outer: for (sec_idx, repo_key) in self.pipeline_repo_names.iter().enumerate() {
-                let groups = self.pipeline_groups_for_repo(repo_key);
-                for (li, (_, issue_idxs)) in groups.iter().enumerate() {
-                    for (ii, &idx) in issue_idxs.iter().enumerate() {
+            'outer: for (state_idx, &state_key) in
+                self.pipeline_state_section_names.iter().enumerate()
+            {
+                let section_idx = state_idx + search_offset;
+                if state_key == "in-progress" {
+                    for (ii, &idx) in active_flat.iter().enumerate() {
                         let issue = &self.pipeline_issues[idx];
                         if issue.repo_slug == repo && issue.number == num {
-                            let section_idx = sec_idx + search_offset;
                             self.pipeline_sel = Some(idx);
                             self.pipeline_sidebar.set_active_section(Some(section_idx));
                             self.pipeline_sidebar
-                                .set_selected_path(section_idx, Some(vec![li as u16, ii as u16]));
+                                .set_selected_path(section_idx, Some(vec![ii as u16]));
                             break 'outer;
+                        }
+                    }
+                } else {
+                    let repo_groups: &Vec<(String, Vec<usize>)> = if state_key == "pending" {
+                        &new_by_repo
+                    } else {
+                        &done_by_repo
+                    };
+                    for (ri, (_, issue_idxs)) in repo_groups.iter().enumerate() {
+                        for (ii, &idx) in issue_idxs.iter().enumerate() {
+                            let issue = &self.pipeline_issues[idx];
+                            if issue.repo_slug == repo && issue.number == num {
+                                self.pipeline_sel = Some(idx);
+                                self.pipeline_sidebar.set_active_section(Some(section_idx));
+                                self.pipeline_sidebar.set_selected_path(
+                                    section_idx,
+                                    Some(vec![ri as u16, ii as u16]),
+                                );
+                                break 'outer;
+                            }
                         }
                     }
                 }
@@ -6458,19 +6688,17 @@ impl CoordApp {
         }
         // Sync `pipeline_sel` to the sidebar's actual selection.
         self.pipeline_sel = self.selected_pipeline_index();
-        // Restore per-section collapse state by repo name.  Sections that
-        // didn't exist before stay expanded by default (a new repo
-        // appearing shouldn't be hidden from the user).
-        for (i, name) in self.pipeline_repo_names.iter().enumerate() {
-            if let Some(&was_collapsed) = prev_collapsed.get(name) {
+        // Restore per-section collapse state by state key.  New sections
+        // that weren't present before stay expanded by default.
+        for (i, &state_key) in self.pipeline_state_section_names.iter().enumerate() {
+            if let Some(&was_collapsed) = prev_state_collapsed.get(state_key) {
                 self.pipeline_sidebar.set_collapsed(i + search_offset, was_collapsed);
             }
         }
         // Restore panel scroll so the visible area doesn't jump back to the
         // top on every refresh.  Done after selection restore so the active-
         // section's keyboard nav state is set up correctly before scroll is
-        // applied (scroll_to_active_section calls in handle_key_selection
-        // assume an active section).
+        // applied.
         self.pipeline_sidebar.set_panel_scroll(prev_panel_scroll);
         // Auto-focus: when the selected issue changes (or on first render
         // with no previous selection), default to the smart stage rather
@@ -6491,25 +6719,44 @@ impl CoordApp {
     }
 
     /// Resolve the SidebarSystem's current selection to a `pipeline_issues`
-    /// index.  Paths are two-level: `[lifecycle_group_idx, issue_idx_in_group]`.
-    /// A one-level path (group header selected) returns `None`.
+    /// index.
+    ///
+    /// The path interpretation depends on the section type:
+    /// - **Active** (`"in-progress"`): path = `[ii]` — flat issue index.
+    /// - **New/Done**: path = `[ri, ii]` — repo sub-header index + issue
+    ///   index within that repo.
+    /// A one-level path in a New/Done section (repo header selected) returns
+    /// `None`.
     fn selected_pipeline_index(&self) -> Option<usize> {
-        // Section 0 is the FILTER form; repo sections start at search_offset.
+        // Section 0 is the FILTER form; state sections start at search_offset.
         let search_offset = 1usize;
         let section = self.pipeline_sidebar.active_section()?;
         if section < search_offset {
-            return None; // search section selected, not a repo
+            return None; // search section selected, not a state section
         }
+        let state_idx = section - search_offset;
+        let &state_key = self.pipeline_state_section_names.get(state_idx)?;
         let path = self.pipeline_sidebar.selected_path(section)?;
-        if path.len() < 2 {
-            return None; // group header selected, not an issue
+
+        if state_key == "in-progress" {
+            // Active: flat list — path = [ii]
+            if path.is_empty() {
+                return None;
+            }
+            let ii = path[0] as usize;
+            let flat = self.pipeline_active_issues();
+            flat.get(ii).copied()
+        } else {
+            // New / Done: repo-grouped — path = [ri, ii]
+            if path.len() < 2 {
+                return None; // repo sub-header selected
+            }
+            let ri = path[0] as usize;
+            let ii = path[1] as usize;
+            let repo_groups = self.pipeline_repos_for_state(state_key);
+            let (_, issue_idxs) = repo_groups.get(ri)?;
+            issue_idxs.get(ii).copied()
         }
-        let li = path[0] as usize;
-        let ii = path[1] as usize;
-        let repo_key = self.pipeline_repo_names.get(section - search_offset)?;
-        let groups = self.pipeline_groups_for_repo(repo_key);
-        let (_, issue_idxs) = groups.get(li)?;
-        issue_idxs.get(ii).copied()
     }
 
     /// Resolve the per-stage status of an issue from existing assignments.
@@ -10384,19 +10631,27 @@ impl CoordApp {
                         true
                     }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
+                        // A one-level path in a New/Done state section means
+                        // a repo sub-header was toggled.  Active has no
+                        // sub-headers, so we only act on New/Done.
                         let search_offset = 1usize;
                         if section >= search_offset {
-                            let repo_idx = section - search_offset;
-                            if let Some(repo_key) = self.pipeline_repo_names.get(repo_idx).cloned() {
-                                let li = path[0] as usize;
-                                let groups = self.pipeline_groups_for_repo(&repo_key);
-                                if let Some((lc_key, _)) = groups.get(li) {
-                                    let lc_key = lc_key.to_string();
-                                    let entry = self.pipeline_lifecycle_expanded
-                                        .entry((repo_key, lc_key))
-                                        .or_insert(true);
-                                    *entry = !*entry;
-                                    self.rebuild_pipeline_sidebar(None);
+                            let state_idx = section - search_offset;
+                            if let Some(&lc_key) =
+                                self.pipeline_state_section_names.get(state_idx)
+                            {
+                                if lc_key != "in-progress" {
+                                    let ri = path[0] as usize;
+                                    let repo_groups = self.pipeline_repos_for_state(lc_key);
+                                    if let Some((repo_key, _)) = repo_groups.get(ri) {
+                                        let repo_key = repo_key.clone();
+                                        let entry = self
+                                            .pipeline_lifecycle_expanded
+                                            .entry((lc_key.to_string(), repo_key))
+                                            .or_insert(true);
+                                        *entry = !*entry;
+                                        self.rebuild_pipeline_sidebar(None);
+                                    }
                                 }
                             }
                         }
@@ -17350,6 +17605,7 @@ mod tests {
             board_status_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
+            pipeline_state_section_names: Vec::new(),
             pipeline_search: SidebarFilter::default(),
             pipeline_lifecycle_expanded: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
@@ -19120,70 +19376,89 @@ mod tests {
         );
     }
 
-    /// Section collapse state must survive a rebuild — without this, the
-    /// user collapses the large claude-coordinator section and watches it
-    /// re-expand on every 15 s refresh.
+    /// State-section collapse state must survive a rebuild — without this, the
+    /// user collapses the large "Done" section and watches it re-expand on
+    /// every 15 s refresh.
     #[test]
     fn rebuild_pipeline_sidebar_preserves_section_collapsed_state() {
         let mut app = make_pipeline_app();
-        // Section 0 is the FILTER form; repo sections start at index 1.
-        // make_pipeline_app has two repos: "api" (index 1) and "other/repo"
-        // (index 2). Collapse the first repo.
+        // Add a closed (Done) issue so we have both "New" (section 1) and
+        // "Done" (section 2) state sections.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 55,
+            title: "Finished task".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: true,
+        });
+        // Need an assignment so the closed issue is visible in Done
+        // (pipeline_lifecycle_section returns "done" for is_closed=true).
+        app.rebuild_pipeline_sidebar(None);
+        // Section 0 = FILTER, 1 = "New", 2 = "Done".
         app.pipeline_sidebar.set_collapsed(1, true);
         assert!(app.pipeline_sidebar.is_collapsed(1));
         assert!(!app.pipeline_sidebar.is_collapsed(2));
 
-        // Rebuild — without the fix this resets collapse state to default
-        // (expanded) for every section.
+        // Rebuild — without the fix this resets collapse state to expanded.
         app.rebuild_pipeline_sidebar(None);
 
         assert!(
             app.pipeline_sidebar.is_collapsed(1),
-            "api collapse state must survive rebuild",
+            "New section collapse state must survive rebuild",
         );
         assert!(
             !app.pipeline_sidebar.is_collapsed(2),
-            "other/repo stays expanded as it was",
+            "Done section stays expanded as it was",
         );
     }
 
-    /// Collapse state is keyed by repo name, not section index — when the
-    /// section order changes (e.g. a new repo appears at index 0), the
-    /// existing repos' collapse state must follow them to their new
-    /// indices.
+    /// Collapse state is keyed by state name, not section index — when the
+    /// section order changes (e.g. the "Active" section appears), existing
+    /// sections' collapse state must follow them to their new indices.
     #[test]
-    fn rebuild_pipeline_sidebar_collapse_state_follows_repo_through_reorder() {
+    fn rebuild_pipeline_sidebar_collapse_state_follows_state_through_reorder() {
         let mut app = make_pipeline_app();
-        // Section 0 is the FILTER form; "api" is repo index 0 → section 1.
+        // Initially only pending issues → "New" is state section 0 → sidebar
+        // section 1.
+        assert_eq!(app.pipeline_state_section_names, vec!["pending"]);
         app.pipeline_sidebar.set_collapsed(1, true);
+        assert!(app.pipeline_sidebar.is_collapsed(1));
 
-        // Inject a new repo's issue at the front so its section becomes the
-        // first repo (section 1, after the FILTER form at section 0).
-        app.pipeline_issues.insert(0, PipelineIssue {
-            number: 1,
-            title: "New repo issue".to_string(),
+        // Add an in-progress issue — "Active" will appear at section 1,
+        // pushing "New" to section 2.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 77,
+            title: "Active work".to_string(),
             body: String::new(),
-            repo_slug: "new/repo".to_string(),
-            coord_repo: None,
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
             matched_labels: vec!["coord".to_string()],
-            all_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
         });
+        app.data.assignments.push(make_assignment_typed(
+            "running", 77, "api", Some("work"),
+        ));
 
         app.rebuild_pipeline_sidebar(None);
 
-        // After rebuild: pipeline_repo_names should be [new/repo, api, other/repo],
-        // mapping to sidebar sections [1, 2, 3].  The new repo (section 1) stays
-        // expanded; "api" (now repo index 1 → section 2) keeps its collapsed=true.
-        let names = &app.pipeline_repo_names;
-        assert_eq!(names.iter().position(|n| n == "api"), Some(1));
-        assert!(
-            app.pipeline_sidebar.is_collapsed(2),
-            "api's collapsed state followed it from section 1 to section 2",
+        // After rebuild: state sections = ["in-progress", "pending"].
+        // sidebar section 1 = "Active" (new, should be expanded by default),
+        // sidebar section 2 = "New" (was section 1, still collapsed).
+        assert_eq!(
+            app.pipeline_state_section_names,
+            vec!["in-progress", "pending"],
         );
         assert!(
             !app.pipeline_sidebar.is_collapsed(1),
-            "new section is not retroactively collapsed",
+            "Active section (new) must not be retroactively collapsed",
+        );
+        assert!(
+            app.pipeline_sidebar.is_collapsed(2),
+            "New section collapse state followed from section 1 to section 2",
         );
     }
 
@@ -19336,21 +19611,22 @@ mod tests {
 
     #[test]
     fn pipeline_search_section_offset_keeps_selection_and_collapse_correct() {
-        // With the FILTER section at index 0, repo "api" sits at sidebar
-        // section 1.  Selection must resolve to the right issue and collapse
-        // state must be keyed against the offset index.
+        // With the FILTER section at index 0, the first state section ("New"
+        // in the fixture) sits at sidebar section 1.  Selection must resolve
+        // to the right issue and collapse state must be keyed against the
+        // offset index.
         let app = make_pipeline_app();
-        // Default selection lands on the first issue (#42) of the first repo.
+        // Default selection lands on the first issue (#42) of the first
+        // repo inside the "New" section.
         assert_eq!(
             app.pipeline_sel.and_then(|i| app.pipeline_issues.get(i)).map(|i| i.number),
             Some(42),
         );
-        // The active section is a repo section, i.e. >= search_offset (1),
+        // The active section is a state section, i.e. >= search_offset (1),
         // never the FILTER form at section 0.
         let active = app.pipeline_sidebar.active_section().unwrap();
-        assert!(active >= 1, "active section is a repo, not the FILTER form");
-        // "api" is repo index 0 → section 1; selecting through the offset
-        // resolves back to issue #42.
+        assert!(active >= 1, "active section is a state section, not the FILTER form");
+        // Resolving the sidebar selection returns the same index as pipeline_sel.
         assert_eq!(app.selected_pipeline_index(), app.pipeline_sel);
     }
 
@@ -19361,6 +19637,113 @@ mod tests {
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Pending);
         assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Pending);
+    }
+
+    // ── repo_tag: collision-safe single-letter tags ────────────────────────
+
+    /// Helper to make a small Vec<String> for repo_tag calls.
+    fn repos(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn repo_tag_single_repo_returns_first_char_uppercased() {
+        assert_eq!(CoordApp::repo_tag("quadraui", &repos(&["quadraui"])), "Q");
+        assert_eq!(CoordApp::repo_tag("vimcode", &repos(&["vimcode"])), "V");
+    }
+
+    #[test]
+    fn repo_tag_no_collision_returns_first_char() {
+        // Three repos with unique first letters — each gets a single char.
+        let all = repos(&["claude-coordinator", "quadraui", "vimcode"]);
+        assert_eq!(CoordApp::repo_tag("claude-coordinator", &all), "C");
+        assert_eq!(CoordApp::repo_tag("quadraui", &all), "Q");
+        assert_eq!(CoordApp::repo_tag("vimcode", &all), "V");
+    }
+
+    #[test]
+    fn repo_tag_collision_extends_to_shortest_unique_prefix() {
+        // "claude-coordinator" and "coord-something" both start with 'c'.
+        // Shortest unique prefixes are "cl" and "co".
+        let all = repos(&["claude-coordinator", "coord-something"]);
+        assert_eq!(CoordApp::repo_tag("claude-coordinator", &all), "Cl");
+        assert_eq!(CoordApp::repo_tag("coord-something", &all), "Co");
+    }
+
+    #[test]
+    fn repo_tag_three_way_collision_extends_appropriately() {
+        // Three repos sharing first letter 'a'.
+        let all = repos(&["alpha", "apricot", "azure"]);
+        // "al" uniquely identifies "alpha", "ap" → "apricot", "az" → "azure".
+        assert_eq!(CoordApp::repo_tag("alpha",   &all), "Al");
+        assert_eq!(CoordApp::repo_tag("apricot", &all), "Ap");
+        assert_eq!(CoordApp::repo_tag("azure",   &all), "Az");
+    }
+
+    #[test]
+    fn repo_tag_case_insensitive_collision_detection() {
+        // Collision detection ignores case.
+        let all = repos(&["Foo", "fuzz"]);
+        assert_eq!(CoordApp::repo_tag("Foo",  &all), "Fo");
+        assert_eq!(CoordApp::repo_tag("fuzz", &all), "Fu");
+    }
+
+    #[test]
+    fn pipeline_active_section_rows_have_repo_tag_badge_and_flat_path() {
+        // Active (in-progress) issues must appear as flat rows with a
+        // single-letter repo tag badge.  New/Done rows use path [ri, ii].
+        let mut app = make_pipeline_app();
+        // Make issue #42 active (add an assignment).
+        app.data.assignments.push(make_assignment_typed(
+            "running", 42, "api", Some("work"),
+        ));
+        app.rebuild_pipeline_sidebar(None);
+
+        // "Active" section must now be section 1.
+        assert_eq!(
+            app.pipeline_state_section_names.first(),
+            Some(&"in-progress"),
+            "Active must be the first state section",
+        );
+        // The selected issue resolves correctly via the flat path.
+        let idx = app.pipeline_active_issues();
+        assert!(!idx.is_empty(), "active_flat must be non-empty");
+    }
+
+    #[test]
+    fn pipeline_new_done_sections_grouped_by_repo() {
+        // New and Done sections must sub-group by repo, not be flat.
+        let mut app = make_pipeline_app();
+        // Add a closed issue in the second repo.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 100,
+            title: "Closed other".to_string(),
+            body: String::new(),
+            repo_slug: "other/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: true,
+        });
+        app.rebuild_pipeline_sidebar(None);
+
+        // State sections: New (pending) + Done.
+        assert!(
+            app.pipeline_state_section_names.contains(&"pending"),
+            "New section must exist",
+        );
+        assert!(
+            app.pipeline_state_section_names.contains(&"done"),
+            "Done section must exist",
+        );
+
+        // New section has 2 repos with 1 issue each.
+        let new_groups = app.pipeline_repos_for_state("pending");
+        assert_eq!(new_groups.len(), 2, "New section has two repos");
+
+        // Done section has 1 repo.
+        let done_groups = app.pipeline_repos_for_state("done");
+        assert_eq!(done_groups.len(), 1, "Done section has one repo");
     }
 
     // ── #193: stale downstream stages ─────────────────────────────────────────
