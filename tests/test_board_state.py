@@ -756,6 +756,66 @@ def test_upsert_open_issues_updates_title_on_resync(coord_db) -> None:
     assert row["title"] == "New title"
 
 
+def test_upsert_open_issues_persists_milestone(coord_db) -> None:
+    """#406 Phase A: milestone_number + milestone_title survive a coord sync."""
+    from coord.state import upsert_open_issues
+    from coord.db import get_connection
+
+    issues = [
+        {
+            "number": 10,
+            "title": "Milestone issue",
+            "body": "",
+            "labels": [],
+            "milestone": {"number": 5, "title": "v0.5"},
+        },
+        {
+            "number": 11,
+            "title": "No-milestone issue",
+            "body": "",
+            "labels": [],
+            "milestone": None,
+        },
+    ]
+    upsert_open_issues("repo", issues)
+
+    rows = get_connection().execute(
+        "SELECT number, milestone_number, milestone_title FROM issues "
+        "WHERE repo_name='repo' ORDER BY number"
+    ).fetchall()
+    assert rows[0]["number"] == 10
+    assert rows[0]["milestone_number"] == 5
+    assert rows[0]["milestone_title"] == "v0.5"
+    assert rows[1]["number"] == 11
+    assert rows[1]["milestone_number"] is None
+    assert rows[1]["milestone_title"] is None
+
+
+def test_upsert_open_issues_clears_milestone_on_resync(coord_db) -> None:
+    """#406 Phase A: milestone is cleared when re-synced without one."""
+    from coord.state import upsert_open_issues
+    from coord.db import get_connection
+
+    # First sync: issue has milestone.
+    upsert_open_issues(
+        "repo",
+        [{"number": 20, "title": "T", "body": "", "labels": [],
+          "milestone": {"number": 3, "title": "v0.3"}}],
+    )
+    # Second sync: milestone removed.
+    upsert_open_issues(
+        "repo",
+        [{"number": 20, "title": "T", "body": "", "labels": [], "milestone": None}],
+    )
+
+    row = get_connection().execute(
+        "SELECT milestone_number, milestone_title FROM issues "
+        "WHERE repo_name='repo' AND number=20"
+    ).fetchone()
+    assert row["milestone_number"] is None
+    assert row["milestone_title"] is None
+
+
 # ── update_issue_labels (#266 follow-up) ────────────────────────────────────
 
 def test_update_issue_labels_writes_to_existing_row(coord_db) -> None:
