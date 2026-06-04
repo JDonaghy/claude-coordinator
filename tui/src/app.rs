@@ -63,8 +63,8 @@ use quadraui::{
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
-    StatusBarSegment, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar, ToolbarButton,
-    ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
+    StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
+    ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
@@ -3289,6 +3289,21 @@ fn load_pipeline_meta(
     (default_gates, tracked_labels, repos, require_plan, repo_run_cmds)
 }
 
+// ─── Log items cache ──────────────────────────────────────────────────────────
+
+/// Cached result of parsing a log's SSE (or file) content into [`ListItem`]s.
+///
+/// Invalidated when the assignment ID, line count, or wrap width changes.
+/// Prevents the full O(n) re-parse of every log line on every render tick
+/// (~60 fps); rebuilds only when the log actually grows or the panel is resized.
+struct LogItemsCache {
+    assignment_id: String,
+    /// Number of SSE lines (or file bytes for local logs) at the time of caching.
+    line_count: usize,
+    wrap_width: usize,
+    items: Vec<ListItem>,
+}
+
 // ─── CoordApp ─────────────────────────────────────────────────────────────────
 
 /// Backend-neutral coordinator dashboard.
@@ -3688,6 +3703,12 @@ pub struct CoordApp {
     /// Contains `(work_id, repo, sanitized_branch)` so we can show the
     /// destination path in a completion toast.
     pending_artifact_pull: Option<(String, String, String)>,
+    /// #399: Cache for parsed/wrapped log content items.
+    ///
+    /// Avoids the full O(n) re-parse of every log line on every render tick
+    /// (~60 fps).  Rebuilt only when the assignment, line count, or wrap
+    /// width changes.  `RefCell` so `pipeline_log_list` can update from `&self`.
+    log_items_cache: std::cell::RefCell<Option<LogItemsCache>>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -3869,6 +3890,7 @@ impl CoordApp {
             artifact_cache: std::collections::HashMap::new(),
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
+            log_items_cache: std::cell::RefCell::new(None),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -10003,6 +10025,10 @@ impl CoordApp {
     /// (avoids the polling "Loading log…" flicker every cache-TTL seconds).
     /// Falls back to `get_activity_log` (local file or remote HTTP cache)
     /// when no SSE is active.
+    ///
+    /// Content items (the expensive parse) are cached in `log_items_cache`
+    /// and rebuilt only when the assignment, line count, or wrap width
+    /// changes (#399 scroll-perf).
     fn pipeline_log_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
         let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
@@ -10021,9 +10047,8 @@ impl CoordApp {
                             .unwrap_or(std::cmp::Ordering::Equal))
                 });
             if let Some(a) = assignment {
-                // Session elapsed header — shows wall-clock time, which is
-                // meaningful even when per-turn +Ns isn't available (historical
-                // replay lines all arrive in a burst with the same Instant).
+                // Session elapsed header — always recomputed (time advances every
+                // second even when no new log lines arrive).
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs_f64())
@@ -10063,7 +10088,31 @@ impl CoordApp {
                     if sse.lines.is_empty() && !sse.done {
                         items.push(kv_item("", "  Connecting to log stream…", Some(Color::rgb(140, 140, 140))));
                     } else {
-                        items.extend(parse_sse_log_readable(&sse.lines, &sse.line_times, wrap_width));
+                        // #399 scroll-perf: check cache before re-parsing all lines.
+                        let line_count = sse.lines.len();
+                        let cache_valid = {
+                            let cache = self.log_items_cache.borrow();
+                            cache.as_ref().map_or(false, |c|
+                                c.assignment_id == a.id
+                                && c.line_count == line_count
+                                && c.wrap_width == wrap_width
+                            )
+                        };
+                        if cache_valid {
+                            let cache = self.log_items_cache.borrow();
+                            items.extend(cache.as_ref().unwrap().items.iter().cloned());
+                        } else {
+                            let content_items = parse_sse_log_readable(
+                                &sse.lines, &sse.line_times, wrap_width,
+                            );
+                            *self.log_items_cache.borrow_mut() = Some(LogItemsCache {
+                                assignment_id: a.id.clone(),
+                                line_count,
+                                wrap_width,
+                                items: content_items.clone(),
+                            });
+                            items.extend(content_items);
+                        }
                     }
                     if sse.done {
                         items.push(kv_item("", "  ── stream ended ──", Some(Color::rgb(90, 90, 90))));
@@ -10075,7 +10124,29 @@ impl CoordApp {
                         .join("logs")
                         .join(format!("{}.log", a.id));
                     if let Ok(content) = std::fs::read_to_string(&log_path) {
-                        items.extend(parse_log_content_readable(&content, wrap_width));
+                        // #399 scroll-perf: cache local-file parse by byte length.
+                        let line_count = content.len();
+                        let cache_valid = {
+                            let cache = self.log_items_cache.borrow();
+                            cache.as_ref().map_or(false, |c|
+                                c.assignment_id == a.id
+                                && c.line_count == line_count
+                                && c.wrap_width == wrap_width
+                            )
+                        };
+                        if cache_valid {
+                            let cache = self.log_items_cache.borrow();
+                            items.extend(cache.as_ref().unwrap().items.iter().cloned());
+                        } else {
+                            let content_items = parse_log_content_readable(&content, wrap_width);
+                            *self.log_items_cache.borrow_mut() = Some(LogItemsCache {
+                                assignment_id: a.id.clone(),
+                                line_count,
+                                wrap_width,
+                                items: content_items.clone(),
+                            });
+                            items.extend(content_items);
+                        }
                     } else {
                         items.extend(self.get_activity_log(&a.id, &a.machine));
                     }
@@ -15164,13 +15235,47 @@ impl ShellApp for CoordApp {
                             backend.draw_list(content_rect, &self.pipeline_stages_list());
                         }
                         PipelineDetailTab::Log => {
+                            // #399: reserve 1 column on the right for the
+                            // vertical scrollbar.  This keeps the list content
+                            // out from under the thumb glyph.  For GTK/macOS
+                            // backends, `width` is in pixels and 1 px is below
+                            // the thumb minimum so the scrollbar is a no-op —
+                            // those backends use native scrolling.
+                            let sb_col_w = if content_rect.width >= 2.0 { 1.0_f32 } else { 0.0_f32 };
+                            let list_rect = Rect::new(
+                                content_rect.x,
+                                content_rect.y,
+                                (content_rect.width - sb_col_w).max(1.0),
+                                content_rect.height,
+                            );
                             // #385: stash panel width so pipeline_log_list can
-                            // word-wrap assistant prose to the viewport.  For
-                            // the TUI backend lh=1 so content_rect.width is
-                            // already in character columns; for GTK it's in
-                            // pixels (large → wrapping won't trigger, fine).
-                            self.last_log_panel_cols.set(content_rect.width as usize);
+                            // word-wrap assistant prose to the viewport.
+                            self.last_log_panel_cols.set(list_rect.width as usize);
                             let log_list = self.pipeline_log_list();
+
+                            // #399: draw the vertical scrollbar at the right edge.
+                            if sb_col_w > 0.0 {
+                                let total = log_list.items.len();
+                                let visible = (content_rect.height as usize).max(1);
+                                if total > visible {
+                                    let sb_track = Rect::new(
+                                        content_rect.x + list_rect.width,
+                                        content_rect.y,
+                                        sb_col_w,
+                                        content_rect.height,
+                                    );
+                                    let vsb = Scrollbar::vertical(
+                                        "pipeline-log-vsb",
+                                        sb_track,
+                                        log_list.scroll_offset as f32,
+                                        total as f32,
+                                        visible as f32,
+                                        1.0,
+                                    );
+                                    backend.draw_scrollbar(sb_track, &vsb);
+                                }
+                            }
+
                             // Collect the visible text for pixel-based backends
                             // (GTK/macOS).  The TUI backend ignores `lines` and
                             // reads selection directly from its ratatui cell
@@ -15186,13 +15291,13 @@ impl ShellApp for CoordApp {
                                         .collect()
                                 })
                                 .collect();
-                            backend.draw_list(content_rect, &log_list);
+                            backend.draw_list(list_rect, &log_list);
                             // #312: register as a selectable TextRegion so the
                             // quadraui runtime handles click-drag line selection
                             // and Ctrl-C copy (OSC52 + arboard) automatically.
                             backend.register_text_region(TextRegion {
                                 id: WidgetId::new("pipeline-log"),
-                                bounds: content_rect,
+                                bounds: list_rect,
                                 lines,
                             });
                         }
@@ -17458,7 +17563,7 @@ fn parse_json_events_readable(
                 return items;
             }
 
-            // Normal turn: dim header + wrapped prose.
+            // Normal turn: dim header + wrapped prose + any tool calls.
             let indent = "  ";
             let prose_wrap = if wrap_width > indent.len() {
                 wrap_width - indent.len()
@@ -17471,6 +17576,26 @@ fn parse_json_events_readable(
             for wrapped_line in word_wrap(text_nl.trim_end(), prose_wrap) {
                 let display = format!("{}{}", indent, wrapped_line);
                 items.push(activity_item(&display, Color::rgb(200, 210, 230)));
+            }
+            // Mixed-content turn: also emit one arrow line per tool call in
+            // the same turn (e.g. "I'll read that file" + Read in one turn).
+            for (call_name, call_detail) in extract_tool_calls(line) {
+                let prefix = if call_detail.is_empty() {
+                    format!("  \u{2192} {}", call_name) // →
+                } else {
+                    format!("  \u{2192} {}: {}", call_name, call_detail)
+                };
+                let display = if wrap_width > 0 && prefix.chars().count() > wrap_width {
+                    let cut = prefix
+                        .char_indices()
+                        .nth(wrap_width.saturating_sub(1))
+                        .map(|(i, _)| i)
+                        .unwrap_or(prefix.len());
+                    format!("{}…", &prefix[..cut])
+                } else {
+                    prefix
+                };
+                items.push(activity_item(&display, Color::rgb(160, 130, 200)));
             }
             items
         }
@@ -18309,6 +18434,7 @@ mod tests {
             artifact_cache: std::collections::HashMap::new(),
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
+            log_items_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -26335,6 +26461,76 @@ mod tests {
             text.chars().count() <= 80,
             "tool-only arrow line should be truncated to wrap_width: {} chars",
             text.chars().count()
+        );
+    }
+
+    #[test]
+    fn readable_mixed_content_turn_shows_prose_and_tool_lines() {
+        // #399: mixed-content assistant turn (text + tool_use in same message).
+        // "I'll read that file" prose + a Read tool call should produce:
+        //   - a Turn N header
+        //   - the prose line(s)
+        //   - an arrow line for the Read tool call
+        let line = r#"{"type":"assistant","message":{"content":[
+            {"type":"text","text":"I'll read that file"},
+            {"type":"tool_use","id":"a","name":"Read","input":{"file_path":"src/main.rs"}}
+        ]}}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        let all_text: String = items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Must have the prose.
+        assert!(
+            all_text.contains("read that file"),
+            "mixed-content turn must show prose: {all_text:?}"
+        );
+        // Must also have the tool arrow line.
+        assert!(
+            all_text.contains('→'),
+            "mixed-content turn must show arrow for tool call: {all_text:?}"
+        );
+        assert!(
+            all_text.contains("Read"),
+            "mixed-content turn must name the tool: {all_text:?}"
+        );
+        assert!(
+            all_text.contains("src/main.rs"),
+            "mixed-content turn must show tool detail: {all_text:?}"
+        );
+    }
+
+    #[test]
+    fn readable_mixed_content_multi_tool_shows_all_arrow_lines() {
+        // #399: mixed-content turn with two tool calls — both arrow lines must appear.
+        let line = r#"{"type":"assistant","message":{"content":[
+            {"type":"text","text":"Checking the code"},
+            {"type":"tool_use","id":"a","name":"Read","input":{"file_path":"a.rs"}},
+            {"type":"tool_use","id":"b","name":"Grep","input":{"pattern":"fn foo"}}
+        ]}}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        let all_text: String = items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all_text.contains("Checking the code"), "prose: {all_text:?}");
+        assert!(all_text.contains("Read"), "Read tool: {all_text:?}");
+        assert!(all_text.contains("a.rs"), "Read path: {all_text:?}");
+        assert!(all_text.contains("Grep"), "Grep tool: {all_text:?}");
+        assert!(all_text.contains("fn foo"), "Grep pattern: {all_text:?}");
+        // Count arrow lines: should be at least 2.
+        let arrow_count = items
+            .iter()
+            .filter(|i| i.text.spans.iter().any(|s| s.text.contains('→')))
+            .count();
+        assert!(
+            arrow_count >= 2,
+            "mixed-content turn with 2 tools should have ≥2 arrow lines, got {}: {all_text:?}",
+            arrow_count
         );
     }
 
