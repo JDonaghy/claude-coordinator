@@ -15768,7 +15768,9 @@ impl CoordApp {
                 {
                     self.pending_refine_ready = None;
                     let issue_str = p.issue_number.to_string();
-                    if !self.command_runner.spawn(&["ready", &p.repo, &issue_str]) {
+                    let ready_started =
+                        self.command_runner.spawn(&["ready", &p.repo, &issue_str]);
+                    if !ready_started {
                         self.push_toast(
                             "Refine with chat",
                             "Couldn't mark ready — coord runner busy.",
@@ -15776,7 +15778,9 @@ impl CoordApp {
                         );
                     }
                     // #410: Send path — queue coord assign to run after coord ready.
-                    if p.then_dispatch {
+                    // Gate on `ready_started`: if coord ready never launched we must
+                    // not dispatch the issue (it would skip the status:ready flip).
+                    if p.then_dispatch && ready_started {
                         if let Some(machine) = self.best_machine_for(&p.repo).cloned() {
                             let machine_name = machine.name.clone();
                             let model_str = self
@@ -28445,5 +28449,91 @@ mod tests {
         assert_eq!(result.as_deref(), Some(sha));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── #410: board_row_status_badge ─────────────────────────────────────
+
+    /// `board_row_status_badge` maps lifecycle strings to the correct
+    /// per-row letter badges.  This is a pure function — test it directly
+    /// so the mapping table can't silently regress.
+    #[test]
+    fn board_row_status_badge_mapping() {
+        // Backlog: blank
+        assert!(board_row_status_badge("").is_none(), "unknown/empty → None");
+        assert!(board_row_status_badge("backlog").is_none(), "backlog → None");
+
+        // Refining / refined → "R"
+        let r_badge = board_row_status_badge("refining");
+        assert!(r_badge.is_some(), "refining → Some");
+        assert_eq!(r_badge.unwrap().text, "R");
+
+        let refined_badge = board_row_status_badge("refined");
+        assert!(refined_badge.is_some(), "refined → Some");
+        assert_eq!(refined_badge.unwrap().text, "R",
+            "refined should fold into R just like refining");
+
+        // In-flight → "A"
+        let a_badge = board_row_status_badge("in-flight");
+        assert!(a_badge.is_some(), "in-flight → Some");
+        assert_eq!(a_badge.unwrap().text, "A");
+
+        // Completed → "D"
+        let d_badge = board_row_status_badge("completed");
+        assert!(d_badge.is_some(), "completed → Some");
+        assert_eq!(d_badge.unwrap().text, "D");
+    }
+
+    // ── #410: dispatch_board_row_direct success path ─────────────────────
+
+    /// `dispatch_board_row_direct` should spawn `coord assign <machine>
+    /// <repo> <issue>` when a reachable machine exists.  The existing test
+    /// (context_menu_activate_fires_action_and_dismisses) only covers the
+    /// "no reachable machine" failure path.  This test covers the happy path.
+    #[test]
+    fn dispatch_board_row_direct_success_path_spawns_coord_assign() {
+        // Build an app that has one reachable machine configured for "repo-a".
+        let mut app = CoordApp {
+            data: BoardData {
+                machines: vec![Machine {
+                    name: "test-machine".to_string(),
+                    host: String::new(),
+                    reachable: true,
+                    active_count: 0,
+                    repos: vec!["repo-a".to_string()],
+                    version: None,
+                    worktree_bytes: 0,
+                }],
+                ..BoardData::default()
+            },
+            ..make_test_app(BoardData::default())
+        };
+
+        // Before: command runner must be idle.
+        assert!(!app.command_runner.is_running(), "runner should start idle");
+
+        let before_toasts = app.toasts.len();
+        let target = board_target(Some(42), BoardRowLifecycle::Backlog);
+        let dispatched = app.dispatch_board_row_direct(&target);
+
+        // dispatch_board_row_direct returns true on success.
+        assert!(dispatched, "dispatch_board_row_direct must return true on success");
+
+        // A command was actually spawned (coord assign …).
+        assert!(
+            app.command_runner.is_running(),
+            "coord assign must be running after successful dispatch",
+        );
+
+        // Exactly one toast (the "dispatched → test-machine" confirmation).
+        assert_eq!(
+            app.toasts.len(),
+            before_toasts + 1,
+            "exactly one success toast expected",
+        );
+        let toast_body = app.toasts.last().unwrap().0.body.to_string();
+        assert!(
+            toast_body.contains("42") && toast_body.contains("test-machine"),
+            "toast should mention issue #42 and machine, got: {toast_body:?}",
+        );
     }
 }
