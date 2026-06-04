@@ -549,7 +549,7 @@ class TestPipelineConfigParsing:
         cfg = load(p)
         assert cfg.pipeline.auto_loop is True
 
-    def test_max_review_iterations_defaults_to_3(self, tmp_path) -> None:
+    def test_max_review_iterations_defaults_to_5(self, tmp_path) -> None:
         from coord.config import load
 
         p = tmp_path / "coordinator.yml"
@@ -558,7 +558,7 @@ class TestPipelineConfigParsing:
             "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
         )
         cfg = load(p)
-        assert cfg.pipeline.max_review_iterations == 3
+        assert cfg.pipeline.max_review_iterations == 5
 
     def test_can_disable_auto_loop(self, tmp_path) -> None:
         from coord.config import load
@@ -1254,13 +1254,53 @@ class TestRunForFixTransition:
         board = Board(completed=[fix])
         save_board(board)
 
-        with patch("coord.auto_loop.dispatch_review") as mock_dispatch:
+        with (
+            patch("coord.auto_loop.dispatch_review") as mock_dispatch,
+            patch("coord.auto_loop._post_max_iterations_notice") as mock_notice,
+        ):
             actions = run_for_fix_transition("fix-3", config)
 
         assert len(actions) == 1
         assert actions[0].kind == "iteration_cap_hit"
         # dispatch_review must NOT be called when the cap is hit.
         mock_dispatch.assert_not_called()
+        # GitHub notice must be posted when the cap is hit.
+        mock_notice.assert_called_once()
+
+    def test_run_for_fix_transition_cap_hit_posts_comment_and_marks_board(
+        self, config: Config, coord_db
+    ) -> None:
+        """Cap-hit path posts a GitHub comment and persists review_state='cap_hit'."""
+        from coord.state import load_board, save_board
+
+        fix = _fix_assignment(assignment_id="fix-cap", review_iteration=3)
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with (
+            patch("coord.auto_loop.dispatch_review"),
+            patch("coord.auto_loop._post_max_iterations_notice") as mock_notice,
+        ):
+            actions = run_for_fix_transition("fix-cap", config)
+
+        # GitHub comment was posted exactly once, with the fix assignment and config.
+        # We check individual args rather than the whole object because `fix` is
+        # mutated in-place (review_state set to "cap_hit") after the mock call.
+        mock_notice.assert_called_once()
+        called_with_fix, called_with_config = mock_notice.call_args[0]
+        assert called_with_fix.assignment_id == "fix-cap"
+        assert called_with_config is config
+
+        # Board was saved with the fix marked as cap_hit.
+        loaded = load_board()
+        assert loaded is not None
+        entry = loaded.find_by_id("fix-cap")
+        assert entry is not None
+        assert entry.review_state == "cap_hit"
+
+        # Action kind confirms cap was hit.
+        assert len(actions) == 1
+        assert actions[0].kind == "iteration_cap_hit"
 
     def test_run_for_fix_transition_no_machine_available(
         self, config: Config, coord_db

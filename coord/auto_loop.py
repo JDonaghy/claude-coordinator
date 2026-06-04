@@ -581,6 +581,13 @@ def run_for_fix_transition(
             "— not dispatching another review",
             assignment_id, fix.review_iteration, max_iter,
         )
+        # Surface the cap-hit as a persisted blocker: post a GitHub comment so
+        # the operator sees it outside the TUI, mark the board entry with a
+        # distinct review_state so `coord status` shows an explicit blocker line,
+        # and save the board so the state survives a coordinator restart.
+        _post_max_iterations_notice(fix, config)
+        fix.review_state = "cap_hit"
+        save_board(board)
         return [LoopAction(
             kind="iteration_cap_hit",
             assignment_id=assignment_id,

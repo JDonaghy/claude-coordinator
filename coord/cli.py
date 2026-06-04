@@ -1316,11 +1316,35 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 if e.error:
                     click.echo(f"      error: {e.error}")
 
+    # Auto-loop iteration-cap blockers: assignments where the review→fix loop
+    # exhausted all allowed iterations without receiving an approval.  These
+    # require manual intervention (bump pipeline.max_review_iterations or
+    # dispatch a fix with `coord assign`) and are shown prominently so the
+    # operator notices them on the first `coord status` after the cap fires.
+    cap_hit_blocked = [
+        a for a in board.completed
+        if a.type == "work" and a.review_state == "cap_hit"
+    ]
+    if cap_hit_blocked:
+        click.echo("")
+        click.echo("⚠ Auto-loop blockers (manual action required):")
+        for a in cap_hit_blocked:
+            click.echo(
+                f"  #{a.issue_number}: {a.issue_title} ({a.repo_name})"
+                f"  [iteration cap hit]"
+            )
+            click.echo(
+                f"    Options: bump pipeline.max_review_iterations in coordinator.yml"
+                f" or 'coord assign' to dispatch a fix manually,"
+                f" or 'coord merge --force-merge' to merge as-is."
+            )
+
     # Show completed work assignments with review lifecycle state.
     _REVIEW_STATE_TAGS = {
         "pending": "[awaiting review]",
         "dispatched": "[review dispatched]",
         "done": "[review done]",
+        "cap_hit": "[⚠ iteration cap hit — manual action required]",
     }
     work_completed = [a for a in board.completed if a.type == "work"]
     if work_completed:
