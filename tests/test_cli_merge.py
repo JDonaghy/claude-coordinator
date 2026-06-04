@@ -224,6 +224,61 @@ class TestMergeCommand:
         # The smoking gun: merge_pr must not have been called.
         merge_fn.assert_not_called()
 
+    def test_deleted_branch_work_not_re_enqueued(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """Clog fix: a done-work assignment whose branch no longer exists on
+        origin (already merged + deleted) must NOT be auto-enqueued — that
+        re-enqueue from board.completed is the dominant merge-queue clog
+        source (closed issues miss the open-only issues cache)."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=240,
+            issue_title="#240", assignment_id="w240", type="work",
+            status="done", branch="issue-240-merged-and-deleted",
+        )
+        save_board(Board(active=[], completed=[work]))  # queue starts empty
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "some-other-branch"},  # the work branch is gone
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--dry-run", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "#240" not in result.output
+        assert not any(e.issue_number == 240 for e in mq.load_queue())
+
+    def test_existing_branch_work_is_enqueued(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """Counterpart: when the branch still exists on origin, done-work IS
+        auto-enqueued — the clog fix must not over-skip live work."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=241,
+            issue_title="#241", assignment_id="w241", type="work",
+            status="done", branch="issue-241-still-open",
+        )
+        save_board(Board(active=[], completed=[work]))
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "issue-241-still-open"},  # branch present
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--dry-run", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert any(e.issue_number == 241 for e in mq.load_queue())
+
     def test_skip_review_flag_bypasses_gate(
         self, config_file: Path, coord_dir: Path, coord_db
     ) -> None:

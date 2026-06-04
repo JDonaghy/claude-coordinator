@@ -3675,6 +3675,14 @@ def merge(
             already_merged.add((existing.repo_name, existing.issue_number))
 
     auto_enqueued: list[str] = []
+    # Per-repo cache of branches that still exist on origin.  Lets us skip
+    # re-enqueuing done-work whose branch was already merged-and-deleted — the
+    # dominant merge-queue clog source.  A done assignment for a closed issue
+    # often isn't in the open-only issues cache, so the issue-state filter
+    # above misses it; branch-existence catches every merge path (coord merge,
+    # gh pr merge, manual) uniformly.  Fail OPEN on lookup failure.
+    from coord import github_ops as _gho
+    branch_cache: dict[str, set[str]] = {}
     if board is not None:
         for a in board.completed:
             if a.type != "work" or a.status != "done":
@@ -3700,6 +3708,15 @@ def merge(
             # Skip issues whose latest work was already merged (via any
             # prior assignment_id).
             if (a.repo_name, a.issue_number) in already_merged:
+                continue
+            # Skip work whose branch no longer exists on origin (already
+            # merged + deleted).  Fail OPEN: only skip when we got a real
+            # (non-empty) branch list back and the branch isn't in it.
+            origin_branches = branch_cache.get(a.repo_name)
+            if origin_branches is None:
+                origin_branches = _gho.list_remote_branch_names(repo_cfg.github)
+                branch_cache[a.repo_name] = origin_branches
+            if origin_branches and a.branch not in origin_branches:
                 continue
             entry = mq.enqueue(
                 a,
