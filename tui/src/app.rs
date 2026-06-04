@@ -12248,17 +12248,40 @@ impl CoordApp {
     /// Stores the computed layout in `self.dialog_layout` for click
     /// hit-testing on the next mouse event.
     fn render_prompt_dialog(&self, backend: &mut dyn Backend, viewport: Rect) {
-        let Some(dialog) = self.build_prompt_dialog() else {
+        let Some(mut dialog) = self.build_prompt_dialog() else {
             *self.dialog_layout.borrow_mut() = None;
             return;
         };
         let lh = backend.line_height();
-        // Estimate body height (lines of text) and input slot height.
+        let padding = lh;
+        // Dialog width — clamp so it never exceeds a small viewport.
+        let dialog_w = (viewport.width * 0.5)
+            .clamp(30.0 * lh, 60.0 * lh)
+            .min((viewport.width - 2.0 * lh).max(10.0 * lh));
+        // Wrap the body to the inner width so a long question is never
+        // truncated on a narrow screen — one StyledText per rendered row.
+        let content_cells = ((dialog_w - 2.0 * padding) / lh).floor().max(1.0) as usize;
+        dialog.body = dialog
+            .body
+            .iter()
+            .flat_map(|line| {
+                let flat: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+                let wrapped = word_wrap(&flat, content_cells);
+                if wrapped.is_empty() {
+                    vec![StyledText::plain("")]
+                } else {
+                    wrapped.into_iter().map(StyledText::plain).collect::<Vec<_>>()
+                }
+            })
+            .collect();
         let body_h = dialog.body.len() as f32 * lh;
         let input_h = if dialog.input.is_some() { lh } else { 0.0 };
         let btn_h = lh;
+        // Per-button row height. quadraui's dialog layout stacks N vertical
+        // buttons of this height itself, so we pass the height of ONE option
+        // (label row + a blank spacer row) — not the whole block.
         let btn_row_h = if dialog.vertical_buttons {
-            dialog.buttons.len() as f32 * btn_h
+            btn_h * 2.0
         } else {
             btn_h
         };
@@ -12267,7 +12290,6 @@ impl CoordApp {
         } else {
             0.0
         };
-        let padding = lh;
         let max_label_len = dialog
             .buttons
             .iter()
@@ -12275,7 +12297,6 @@ impl CoordApp {
             .max()
             .unwrap_or(6);
         let btn_w = (max_label_len as f32 * 0.7 * lh + padding * 2.0).max(8.0 * lh);
-        let dialog_w = (viewport.width * 0.5).clamp(30.0 * lh, 60.0 * lh);
         let measure = DialogMeasure {
             width: dialog_w,
             title_height: title_h,
