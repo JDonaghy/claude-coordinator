@@ -542,8 +542,10 @@ struct TestStepJob {
     work_id: String,
     #[allow(dead_code)]
     step_idx: usize,
-    /// Channel for receiving the exit code once the subprocess finishes.
-    rx: std::sync::mpsc::Receiver<i32>,
+    /// Channel for receiving `(exit_code, captured_output)` once the subprocess
+    /// finishes.  `captured_output` is the combined stdout + stderr of the
+    /// command (newline-separated, bounded to 64 KiB to avoid unbounded growth).
+    rx: std::sync::mpsc::Receiver<(i32, String)>,
 }
 
 /// The tabs shown in the Pipeline view detail panel.
@@ -3894,12 +3896,17 @@ pub struct CoordApp {
     /// focused; reset when the pipeline selection or focused stage changes.
     test_plan_staleness_checked_for: Option<String>,
     /// In-flight plan-step jobs keyed by (work_id, step_index).  Spawned
-    /// when the user presses 1–8 in the test stage.  Polled each tick.
+    /// when the user presses 1–9 (or `a` for pull steps) in the test stage.
+    /// Polled each tick.
     test_step_jobs: std::collections::HashMap<(String, usize), TestStepJob>,
     /// Completed step exit codes keyed by (work_id, step_index).  Persists
     /// for the lifetime of the session so the rendered panel always shows the
     /// last outcome even after the job is drained.
     test_step_results: std::collections::HashMap<(String, usize), i32>,
+    /// Captured stdout+stderr for completed test-plan steps, keyed by
+    /// (work_id, step_index).  Displayed inline below each step row so the
+    /// user can see *why* a step passed or failed without leaving the panel.
+    test_step_output: std::collections::HashMap<(String, usize), String>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4088,6 +4095,7 @@ impl CoordApp {
             test_plan_staleness_checked_for: None,
             test_step_jobs: std::collections::HashMap::new(),
             test_step_results: std::collections::HashMap::new(),
+            test_step_output: std::collections::HashMap::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -7877,7 +7885,7 @@ impl CoordApp {
     }
 
     /// #349: True when the Pipeline view is active, an issue is selected, and
-    /// the currently focused stage is "test".  Used to gate the 1–8 step-run
+    /// the currently focused stage is "test".  Used to gate the 1–9 step-run
     /// keybindings so they don't fire on unrelated digit presses elsewhere.
     fn is_test_stage_focused(&self) -> bool {
         let Some(sel_idx) = self.pipeline_sel else { return false; };
@@ -7886,6 +7894,76 @@ impl CoordApp {
         self.pipeline_focused_stage
             .and_then(|fi| stage_names.get(fi).map(|n| n.as_str() == "test"))
             .unwrap_or(false)
+    }
+
+    /// #349: Return the original step index of the first `kind: "pull"` step
+    /// in the test plan for the currently-selected pipeline issue.  Returns
+    /// `None` when no issue is selected, no plan is loaded, or the plan has
+    /// no pull step.  Used by the `[a]` keybind handler to route pull steps
+    /// through `run_test_plan_step` rather than the artifact-badge path.
+    fn test_plan_pull_step_idx(&self) -> Option<usize> {
+        let sel_idx = self.pipeline_sel?;
+        let issue = self.pipeline_issues.get(sel_idx)?;
+        let local_repo = issue.coord_repo.as_deref();
+        let work = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        work.test_plan
+            .as_ref()?
+            .iter()
+            .position(|s| s.kind == "pull")
+    }
+
+    /// #349: Return the original step index of the `key_num`-th non-pull step
+    /// (1-indexed) in the test plan for the currently-selected pipeline issue.
+    ///
+    /// Pull steps are assigned the `[a]` keybind and excluded from the
+    /// 1–9 numbering.  Pressing `3` maps to the 3rd step whose kind is NOT
+    /// `"pull"`, regardless of how many pull steps precede it.
+    ///
+    /// Returns `None` when no plan is loaded or `key_num` exceeds the count
+    /// of non-pull steps.
+    fn test_plan_runnable_step_idx(&self, key_num: usize) -> Option<usize> {
+        let sel_idx = self.pipeline_sel?;
+        let issue = self.pipeline_issues.get(sel_idx)?;
+        let local_repo = issue.coord_repo.as_deref();
+        let work = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        let mut count = 0usize;
+        for (i, step) in work.test_plan.as_ref()?.iter().enumerate() {
+            if step.kind != "pull" {
+                count += 1;
+                if count == key_num {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     // ── #336 artifact helpers ────────────────────────────────────────────────
@@ -8361,19 +8439,51 @@ impl CoordApp {
         };
 
         let cmd_owned = cmd_str.clone();
-        let (tx, rx) = std::sync::mpsc::channel::<i32>();
+        let (tx, rx) = std::sync::mpsc::channel::<(i32, String)>();
         std::thread::spawn(move || {
             use std::process::{Command, Stdio};
-            let exit_code = Command::new("sh")
+            // Capture both stdout and stderr so the output can be displayed
+            // inline in the test stage panel.  Bounded to 64 KiB combined to
+            // prevent unbounded memory growth from verbose commands.
+            const MAX_OUTPUT: usize = 64 * 1024;
+            let result = Command::new("sh")
                 .arg("-c")
                 .arg(&cmd_owned)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.code().unwrap_or(-1))
-                .unwrap_or(-1);
-            let _ = tx.send(exit_code);
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            let (exit_code, output_str) = match result {
+                Ok(out) => {
+                    let code = out.status.code().unwrap_or(-1);
+                    let mut combined = String::new();
+                    // Stdout first, then stderr, with a separator when both are non-empty.
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stdout.is_empty() {
+                        combined.push_str(&stdout);
+                    }
+                    if !stderr.is_empty() {
+                        if !combined.is_empty() {
+                            combined.push_str("\n── stderr ──\n");
+                        }
+                        combined.push_str(&stderr);
+                    }
+                    // Truncate to MAX_OUTPUT bytes (safe: truncate at char boundary).
+                    if combined.len() > MAX_OUTPUT {
+                        let truncated: String = combined.chars()
+                            .take(combined.char_indices()
+                                .take_while(|(b, _)| *b < MAX_OUTPUT)
+                                .count())
+                            .collect();
+                        combined = truncated;
+                        combined.push_str("\n… (output truncated)");
+                    }
+                    (code, combined)
+                }
+                Err(e) => (-1, format!("failed to spawn: {e}")),
+            };
+            let _ = tx.send((exit_code, output_str));
         });
 
         self.test_step_jobs.insert(
@@ -8394,20 +8504,25 @@ impl CoordApp {
             return false;
         }
         use std::sync::mpsc::TryRecvError;
-        let mut done: Vec<(String, usize, i32)> = Vec::new();
+        let mut done: Vec<(String, usize, i32, String)> = Vec::new();
         for (key, job) in self.test_step_jobs.iter() {
             match job.rx.try_recv() {
-                Ok(exit_code) => done.push((key.0.clone(), key.1, exit_code)),
-                Err(TryRecvError::Disconnected) => done.push((key.0.clone(), key.1, -1)),
+                Ok((exit_code, output)) => done.push((key.0.clone(), key.1, exit_code, output)),
+                Err(TryRecvError::Disconnected) => {
+                    done.push((key.0.clone(), key.1, -1, String::new()))
+                }
                 Err(TryRecvError::Empty) => {}
             }
         }
         if done.is_empty() {
             return false;
         }
-        for (work_id, step_idx, exit_code) in done {
+        for (work_id, step_idx, exit_code, output) in done {
             self.test_step_jobs.remove(&(work_id.clone(), step_idx));
-            self.test_step_results.insert((work_id, step_idx), exit_code);
+            self.test_step_results.insert((work_id.clone(), step_idx), exit_code);
+            if !output.is_empty() {
+                self.test_step_output.insert((work_id, step_idx), output);
+            }
         }
         true
     }
@@ -10406,17 +10521,30 @@ impl CoordApp {
                 rows.push(kv_item("", "── SMOKE TEST PLAN ──", Some(header_color)));
                 rows.push(kv_item(
                     "",
-                    "   Press 1–8 to run a step.  Pull steps: use [a].  \
+                    "   Press 1–9 to run a step.  [a] to pull artifacts.  \
                      Verify steps: press key to mark ✓.",
                     Some(dim_color),
                 ));
                 rows.push(kv_item("", "", None));
 
+                // Assign number keys only to non-pull steps (1–9).
+                // Pull steps use the [a] keybind and display [a] as their hint.
+                let mut run_key: u8 = 0;
                 for (i, step) in steps.iter().enumerate() {
-                    let num = i + 1;
-                    if num > 8 {
-                        break;
-                    }
+                    // Determine the display key for this step.
+                    let is_pull = step.kind == "pull";
+                    let key_hint: String = if is_pull {
+                        "[a]".to_string()
+                    } else {
+                        run_key += 1;
+                        if run_key > 9 {
+                            // More than 9 runnable steps — stop rendering to
+                            // avoid implying a key binding that doesn't exist.
+                            break;
+                        }
+                        format!("[{}]", run_key)
+                    };
+
                     // Determine status indicator for this step.
                     let key = (work_id.clone(), i);
                     let status_str = if self.test_step_jobs.contains_key(&key) {
@@ -10444,19 +10572,19 @@ impl CoordApp {
                             let label = step.label.as_deref().unwrap_or("");
                             let cmd = step.cmd.as_deref().unwrap_or("(no cmd)");
                             if label.is_empty() {
-                                format!("[{}] pull: {}", num, cmd)
+                                format!("{} pull: {}", key_hint, cmd)
                             } else {
-                                format!("[{}] pull {}: {}", num, label, cmd)
+                                format!("{} pull {}: {}", key_hint, label, cmd)
                             }
                         }
                         "verify" => {
                             let check = step.check.as_deref().unwrap_or("(no check)");
-                            format!("[{}] (verify) {}", num, check)
+                            format!("{} (verify) {}", key_hint, check)
                         }
                         _ => {
                             // "run" and unknown kinds.
                             let cmd = step.cmd.as_deref().unwrap_or("(no cmd)");
-                            format!("[{}] {}", num, cmd)
+                            format!("{} {}", key_hint, cmd)
                         }
                     };
                     let desc_capped: String = desc.chars().take(160).collect();
@@ -10466,6 +10594,14 @@ impl CoordApp {
                         format!("{desc_capped}  {status_str}")
                     };
                     rows.push(kv_item("", &format!("   {display}"), Some(status_color)));
+
+                    // Display captured output lines below the step row.
+                    if let Some(output) = self.test_step_output.get(&key) {
+                        for line in output.lines().take(50) {
+                            let trimmed: String = line.chars().take(160).collect();
+                            rows.push(kv_item("", &format!("     {trimmed}"), Some(dim_color)));
+                        }
+                    }
                 }
                 rows.push(kv_item("", "", None));
             }
@@ -18048,21 +18184,42 @@ impl ShellApp for CoordApp {
                         self.command_runner.spawn(&["merge", "--skip-review"]);
                         needs_redraw = true;
                     }
-                    // ── 1–8 — Test stage: run smoke-test plan step ────────
+                    // ── 1–9 — Test stage: run smoke-test plan step ────────
                     // #349: When the Pipeline view is active, the test gate is
                     // actionable, and the test stage is focused, pressing a
-                    // digit key runs the corresponding step from the generated
-                    // smoke test plan via a background shell thread.
-                    // "verify" steps are marked checked immediately without
-                    // spawning a subprocess.
+                    // digit key runs the corresponding non-pull step from the
+                    // generated smoke test plan via a background shell thread.
+                    // Pull steps use [a] (handled below); "verify" steps are
+                    // marked checked immediately without spawning a subprocess.
+                    // key_num (1-indexed) maps to the key_num-th non-pull step.
                     Key::Char(ch)
                         if self.active_view == SidebarView::Pipeline
                             && self.test_gate_actionable()
                             && self.is_test_stage_focused()
-                            && matches!(ch, '1'..='8') =>
+                            && matches!(ch, '1'..='9') =>
                     {
-                        let step_idx = (*ch as u32 - '1' as u32) as usize;
-                        self.run_test_plan_step(step_idx);
+                        let key_num = (*ch as u32 - '0' as u32) as usize; // 1..=9
+                        if let Some(step_idx) = self.test_plan_runnable_step_idx(key_num) {
+                            self.run_test_plan_step(step_idx);
+                        }
+                        needs_redraw = true;
+                    }
+
+                    // ── a (test stage) — pull step via [a] keybind ────────
+                    // #349: When the test stage is focused and the plan contains
+                    // a pull step, [a] triggers that step via `run_test_plan_step`
+                    // (which now captures stdout/stderr).  This arm fires BEFORE
+                    // the #336 artifact-badge arm so only one action is taken —
+                    // preventing two concurrent pulls.
+                    Key::Char('a')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.test_gate_actionable()
+                            && self.is_test_stage_focused()
+                            && self.test_plan_pull_step_idx().is_some() =>
+                    {
+                        if let Some(pull_idx) = self.test_plan_pull_step_idx() {
+                            self.run_test_plan_step(pull_idx);
+                        }
                         needs_redraw = true;
                     }
 
@@ -19676,6 +19833,7 @@ mod tests {
             test_plan_staleness_checked_for: None,
             test_step_jobs: std::collections::HashMap::new(),
             test_step_results: std::collections::HashMap::new(),
+            test_step_output: std::collections::HashMap::new(),
         }
     }
 
@@ -28122,8 +28280,12 @@ mod tests {
     /// `read_git_branch_head` reads a loose ref file.
     #[test]
     fn read_git_branch_head_reads_loose_ref() {
-        // Create a temporary directory mimicking a git repo.
-        let tmp = std::env::temp_dir().join("coord-tui-test-git");
+        // Use the thread ID to make the directory name unique so parallel test
+        // runs cannot collide on a shared /tmp path.
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace(['(', ')'], "");
+        let tmp = std::env::temp_dir()
+            .join(format!("coord-tui-test-git-loose-{}", tid));
         let refs_dir = tmp.join(".git").join("refs").join("heads");
         std::fs::create_dir_all(&refs_dir).unwrap();
         let sha = "abcdef1234567890abcdef1234567890abcdef12";
@@ -28139,11 +28301,17 @@ mod tests {
     /// `read_git_branch_head` falls back to packed-refs when loose file missing.
     #[test]
     fn read_git_branch_head_reads_packed_refs() {
-        let tmp = std::env::temp_dir().join("coord-tui-test-git-packed");
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace(['(', ')'], "");
+        let tmp = std::env::temp_dir()
+            .join(format!("coord-tui-test-git-packed-{}", tid));
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
         let sha = "1111222233334444555566667777888899990000";
-        let packed = format!("# pack-refs with: peeled fully-peeled\n{} refs/heads/packed-branch\n", sha);
+        let packed = format!(
+            "# pack-refs with: peeled fully-peeled\n{} refs/heads/packed-branch\n",
+            sha
+        );
         std::fs::write(git_dir.join("packed-refs"), packed).unwrap();
 
         let result = read_git_branch_head(&tmp, "packed-branch");
