@@ -89,6 +89,32 @@ def _save_config_snapshot(config: Config) -> None:
             "('pipeline_require_plan', ?)",
             ("1" if config.dispatch.require_plan else "0",),
         )
+        # #349: repo_name → local-checkout path for the machine running this
+        # coordinator.  Used by the TUI to read git branch HEADs when
+        # detecting test-plan staleness.  Only includes repos that have a
+        # repo_paths entry on the matching machine (hostname-matched first;
+        # any machine as fallback).
+        local_hostname = socket.gethostname().split(".")[0]
+        repo_paths_map: dict[str, str] = {}
+        # Try hostname-matched machine first, then fall back to all machines.
+        for pass_no in range(2):
+            for m in config.machines:
+                on_this_machine = (
+                    m.name == local_hostname
+                    or m.host.split(".")[0] == local_hostname
+                )
+                if pass_no == 0 and not on_this_machine:
+                    continue
+                for rn in m.repos:
+                    if rn not in repo_paths_map:
+                        p = m.repo_path(rn)
+                        if p:
+                            repo_paths_map[rn] = str(Path(p).expanduser())
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_repo_paths', ?)",
+            (json.dumps(repo_paths_map),),
+        )
         conn.commit()
     except Exception:  # noqa: BLE001 — non-critical, don't abort CLI
         if conn is not None:
@@ -106,6 +132,54 @@ def _load_config(path: Path) -> Config:
         sys.exit(2)
     _save_config_snapshot(cfg)
     return cfg
+
+
+def _get_assignment_branch_head(
+    assignment_id: str,
+    config: "Config",
+    repo_path_fn: "Callable[[str, Config], Path | None]",
+) -> str | None:
+    """#349: Resolve the current HEAD SHA for an assignment's branch.
+
+    Looks up the assignment's repo_name + branch from the DB, finds the local
+    repo path via *repo_path_fn* (typically
+    ``coord.test_orchestrator.find_local_repo_path``), then runs
+    ``git rev-parse <branch>`` to get the SHA.
+
+    Returns ``None`` when the assignment is not found, has no branch set, the
+    local repo path can't be resolved, or git fails.  The caller treats ``None``
+    as "HEAD unknown — skip staleness tracking".
+    """
+    import subprocess  # noqa: PLC0415 — lazy import keeps startup fast
+    from coord.db import get_connection  # noqa: PLC0415
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT repo_name, branch FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if not row:
+        return None
+    repo_name: str = row["repo_name"] if hasattr(row, "keys") else row[0]
+    branch: str = (row["branch"] if hasattr(row, "keys") else row[1]) or ""
+    if not branch:
+        return None
+    local_path = repo_path_fn(repo_name, config)
+    if not local_path or not local_path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", branch],
+            cwd=str(local_path),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
 
 
 def _warn_if_source_install_drift() -> None:
@@ -4103,7 +4177,7 @@ def test_plan_cmd(
 ) -> None:
     """Generate or display the smoke test plan for ASSIGNMENT_ID."""
     from coord.state import get_test_plan, set_test_plan
-    from coord.test_orchestrator import generate_plan
+    from coord.test_orchestrator import find_local_repo_path, generate_plan
 
     cfg = _load_config(config_path)
 
@@ -4122,9 +4196,17 @@ def test_plan_cmd(
     )
     plan = generate_plan(assignment_id, cfg, model=model)
 
+    # ── Capture branch HEAD SHA for staleness detection ────────────────────
+    # Read the assignment's branch from the DB, then resolve the HEAD SHA on
+    # the local machine so the TUI can detect when the branch has advanced
+    # since this plan was generated and trigger a refresh automatically.
+    branch_head = _get_assignment_branch_head(assignment_id, cfg, find_local_repo_path)
+
     # Persist (always, even the fallback — so a subsequent call without
     # --refresh shows the cached result rather than hitting Claude again).
-    set_test_plan(assignment_id, plan)
+    # Always write branch_head (even when None) so stale SHAs from a prior
+    # run are cleared.
+    set_test_plan(assignment_id, plan, branch_head=branch_head)
 
     click.echo(json.dumps(plan, indent=2))
 

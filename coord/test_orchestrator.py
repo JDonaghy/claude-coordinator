@@ -228,12 +228,15 @@ def _get_issue_body(repo_github: str, issue_number: int) -> str:
     return ""
 
 
-def _find_local_repo_path(repo_name: str, config: Config) -> Path | None:
+def find_local_repo_path(repo_name: str, config: Config) -> Path | None:
     """Locate the repo on the local machine by matching against coordinator.yml.
 
     Tries the machine whose name or host prefix matches this machine's hostname
     first, then falls back to scanning all machines.  Returns ``None`` when no
     ``repo_paths`` entry exists for *repo_name*.
+
+    Public so that callers outside this module (e.g. ``coord/cli.py``) can
+    reuse it without duplicating the hostname-matching logic.
     """
     local_hostname = socket.gethostname().split(".")[0]
     # Prefer a machine entry that looks like this machine.
@@ -248,6 +251,11 @@ def _find_local_repo_path(repo_name: str, config: Config) -> Path | None:
         if p:
             return Path(p).expanduser()
     return None
+
+
+# Keep old private name as an alias for backward compatibility with any
+# internal callers that haven't been updated yet.
+_find_local_repo_path = find_local_repo_path
 
 
 def _build_user_prompt(

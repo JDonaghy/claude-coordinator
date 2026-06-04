@@ -240,6 +240,13 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # NULL = not yet generated.  Set by `coord test-plan` and read back
         # by the CLI (cache hit) and eventually by the TUI (Phase B).
         "ALTER TABLE assignments ADD COLUMN test_plan TEXT",
+        # #349 Phase B: branch HEAD SHA at the time `coord test-plan` last ran.
+        # Used by the TUI to detect staleness: if the branch has advanced
+        # since the plan was generated, it re-runs `coord test-plan --refresh`
+        # automatically.  NULL = plan not yet generated, or generated without
+        # branch tracking (legacy).  Always reset to NULL when set_test_plan
+        # is called with branch_head=None so no stale SHA persists.
+        "ALTER TABLE assignments ADD COLUMN test_plan_branch_head TEXT",
         # #406 Phase A: milestone columns on the issues table.
         # milestone_number is the GitHub milestone number (integer id); NULL for
         # unassigned.  milestone_title is the human-readable name (e.g. "v0.5");
