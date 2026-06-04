@@ -985,16 +985,23 @@ def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
         labels = json.dumps(
             [lbl["name"] for lbl in issue.get("labels", []) if isinstance(lbl, dict)]
         )
+        # #406: milestone is either {number, title} or None.
+        milestone = issue.get("milestone") or {}
+        milestone_number = milestone.get("number") if milestone else None
+        milestone_title = milestone.get("title") if milestone else None
         conn.execute(
             """
-            INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at)
-            VALUES (?, ?, ?, ?, 'open', ?, ?)
+            INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at,
+                                milestone_number, milestone_title)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)
             ON CONFLICT (repo_name, number) DO UPDATE SET
-                title     = excluded.title,
-                body      = excluded.body,
-                state     = 'open',
-                labels    = excluded.labels,
-                synced_at = excluded.synced_at
+                title            = excluded.title,
+                body             = excluded.body,
+                state            = 'open',
+                labels           = excluded.labels,
+                synced_at        = excluded.synced_at,
+                milestone_number = excluded.milestone_number,
+                milestone_title  = excluded.milestone_title
             """,
             (
                 repo_name,
@@ -1003,6 +1010,8 @@ def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
                 issue.get("body", "") or "",
                 labels,
                 now,
+                milestone_number,
+                milestone_title,
             ),
         )
     conn.commit()

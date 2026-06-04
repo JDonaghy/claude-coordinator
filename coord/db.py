@@ -240,6 +240,14 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # NULL = not yet generated.  Set by `coord test-plan` and read back
         # by the CLI (cache hit) and eventually by the TUI (Phase B).
         "ALTER TABLE assignments ADD COLUMN test_plan TEXT",
+        # #406 Phase A: milestone columns on the issues table.
+        # milestone_number is the GitHub milestone number (integer id); NULL for
+        # unassigned.  milestone_title is the human-readable name (e.g. "v0.5");
+        # NULL when no milestone is assigned.  Idempotent — SQLite raises
+        # OperationalError when the column already exists, which is swallowed
+        # below.
+        "ALTER TABLE issues ADD COLUMN milestone_number INTEGER",
+        "ALTER TABLE issues ADD COLUMN milestone_title TEXT",
     ]
     for sql in migrations:
         try:

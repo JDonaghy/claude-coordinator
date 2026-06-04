@@ -1027,6 +1027,12 @@ struct IssueGroup {
     /// that aren't in the cache.  Drives the Backlog / Refining /
     /// Refined split inside the Pending bucket.
     labels: Vec<String>,
+    /// #406: GitHub milestone number.  `None` for unassigned issues.
+    /// Used by the Board sidebar to group issues under milestone headers.
+    milestone_number: Option<i64>,
+    /// #406: GitHub milestone title (e.g. "v0.5").  `None` when no milestone
+    /// is assigned.  Displayed in the milestone group header.
+    milestone_title: Option<String>,
 }
 
 /// #337: returns `true` for assignment types that represent real work
@@ -1043,6 +1049,7 @@ fn is_workable_type(ty: &str) -> bool {
 }
 
 impl IssueGroup {
+    #[allow(dead_code)]
     fn status_color(&self) -> Color {
         match self.status_summary.as_str() {
             "running" => Color::rgb(80, 220, 80),
@@ -1369,6 +1376,10 @@ struct FetchedIssue {
     /// "open" | "closed".  Carried so the DB upsert mirrors what `coord sync`
     /// would have written.
     state: String,
+    /// #406: GitHub milestone number, if any.
+    milestone_number: Option<i64>,
+    /// #406: GitHub milestone title, if any.
+    milestone_title: Option<String>,
 }
 
 /// #271 part 2 follow-up: cached `gh pr view` snapshot for a Pipeline
@@ -1475,6 +1486,10 @@ struct OpenIssue {
     /// Issue tab can display bodies for closed issues (e.g. in the Completed
     /// group), but only "open" entries get injected as Pending rows.
     state: String,
+    /// #406: GitHub milestone number.  `None` for issues without a milestone.
+    milestone_number: Option<i64>,
+    /// #406: GitHub milestone title (e.g. "v0.5").  `None` when no milestone.
+    milestone_title: Option<String>,
 }
 
 #[derive(Default)]
@@ -2465,7 +2480,8 @@ fn load_data() -> BoardData {
     // "open" entries are injected as Pending rows downstream.
     let open_issues: Vec<OpenIssue> = {
         let mut stmt = match conn.prepare(
-            "SELECT repo_name, number, title, body, labels, state FROM issues \
+            "SELECT repo_name, number, title, body, labels, state, \
+             milestone_number, milestone_title FROM issues \
              ORDER BY repo_name, number",
         ) {
             Ok(s) => s,
@@ -2481,6 +2497,8 @@ fn load_data() -> BoardData {
                 body: row.get::<_, String>(3).unwrap_or_default(),
                 labels,
                 state: row.get::<_, String>(5).unwrap_or_else(|_| "open".to_string()),
+                milestone_number: row.get::<_, Option<i64>>(6).unwrap_or(None),
+                milestone_title: row.get::<_, Option<String>>(7).unwrap_or(None),
             })
         }) {
             Ok(r) => r,
@@ -2650,7 +2668,7 @@ fn spawn_issue_fetch(
                 "--repo",
                 &repo_slug,
                 "--json",
-                "number,title,body,labels,state",
+                "number,title,body,labels,state,milestone",
             ])
             .output();
         let result = match output {
@@ -2668,6 +2686,15 @@ fn spawn_issue_fetch(
                                     .collect()
                             })
                             .unwrap_or_default();
+                        // #406: parse milestone {number, title} or null.
+                        let milestone_obj = v.get("milestone");
+                        let milestone_number = milestone_obj
+                            .and_then(|m| m.get("number"))
+                            .and_then(|n| n.as_i64());
+                        let milestone_title = milestone_obj
+                            .and_then(|m| m.get("title"))
+                            .and_then(|t| t.as_str())
+                            .map(String::from);
                         let issue = FetchedIssue {
                             number,
                             title: v.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
@@ -2678,6 +2705,8 @@ fn spawn_issue_fetch(
                                 .and_then(|s| s.as_str())
                                 .unwrap_or("open")
                                 .to_ascii_lowercase(),
+                            milestone_number,
+                            milestone_title,
                         };
                         // Best-effort upsert into the local DB. Failures (DB
                         // locked, schema missing, etc.) are non-fatal — the
@@ -2783,14 +2812,17 @@ fn upsert_issue_db(repo_name: &str, issue: &FetchedIssue) -> rusqlite::Result<()
         .unwrap_or_default()
         .as_secs_f64();
     conn.execute(
-        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at, \
+         milestone_number, milestone_title) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
          ON CONFLICT(repo_name, number) DO UPDATE SET \
             title = excluded.title, \
             body = excluded.body, \
             state = excluded.state, \
             labels = excluded.labels, \
-            synced_at = excluded.synced_at",
+            synced_at = excluded.synced_at, \
+            milestone_number = excluded.milestone_number, \
+            milestone_title = excluded.milestone_title",
         rusqlite::params![
             repo_name,
             issue.number as i64,
@@ -2798,7 +2830,9 @@ fn upsert_issue_db(repo_name: &str, issue: &FetchedIssue) -> rusqlite::Result<()
             issue.body,
             issue.state,
             labels_json,
-            now
+            now,
+            issue.milestone_number,
+            issue.milestone_title
         ],
     )?;
     Ok(())
@@ -3346,7 +3380,14 @@ pub struct CoordApp {
     /// Filter state (query / cursor / focus) for the Board sidebar's FILTER box.
     board_search: SidebarFilter,
     /// Expanded state for each (repo, status_group) pair. Default: true.
+    /// With milestone grouping the status key is prefixed by milestone:
+    /// `"<milestone_key>:<status_key>"` (e.g. `"5:in-flight"` or
+    /// `"no-milestone:backlog"`).
     board_status_expanded: std::collections::HashMap<(String, String), bool>,
+    /// #406: Expanded state for each (repo, milestone_key) pair.  Default:
+    /// expanded when the milestone has in-flight items, collapsed otherwise.
+    /// milestone_key is the milestone number as a string, or `"no-milestone"`.
+    board_milestone_expanded: std::collections::HashMap<(String, String), bool>,
     // ── Pipeline panel state ────────────────────────────────────────────
     /// SidebarSystem listing tracked issues grouped by state → (optionally) repo.
     pipeline_sidebar: SidebarSystem,
@@ -3818,6 +3859,7 @@ impl CoordApp {
             issue_sync_last: None,
             board_search: SidebarFilter::default(),
             board_status_expanded: std::collections::HashMap::new(),
+            board_milestone_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
             pipeline_state_section_names: Vec::new(),
@@ -4905,6 +4947,8 @@ impl CoordApp {
                     is_closed: false,
                     has_open_record: false,
                     labels: Vec::new(),
+                    milestone_number: None,
+                    milestone_title: None,
                 });
             group.assignments.push(a.clone());
         }
@@ -4966,6 +5010,11 @@ impl CoordApp {
                     if group.labels.is_empty() {
                         group.labels = oi.labels.clone();
                     }
+                    // #406: copy milestone from the issues cache onto the group.
+                    // The open_issues row is always the authority — overwrite even
+                    // if a previous assignment had already stamped a value.
+                    group.milestone_number = oi.milestone_number;
+                    group.milestone_title = oi.milestone_title.clone();
                 }
             }
         }
@@ -4988,6 +5037,8 @@ impl CoordApp {
                 is_closed: false,
                 has_open_record: true,
                 labels: oi.labels.clone(),
+                milestone_number: oi.milestone_number,
+                milestone_title: oi.milestone_title.clone(),
             });
         }
 
@@ -5037,6 +5088,98 @@ impl CoordApp {
         result
     }
 
+    /// #406: Group a repo's issues by milestone, then by lifecycle status within
+    /// each milestone group.
+    ///
+    /// Returns `Vec<(milestone_key, display_title, status_groups)>` where:
+    /// - `milestone_key` — `"<n>"` for numbered milestones (e.g. `"5"`), or
+    ///   `"no-milestone"` for unassigned issues.
+    /// - `display_title` — the milestone title (e.g. `"v0.5"`) or
+    ///   `"No milestone"`.
+    /// - `status_groups` — `Vec<(display_name, key, issues)>` in display order
+    ///   (Backlog → Refining → Refined → In-flight → Completed), with empty
+    ///   groups omitted and the `board_search` filter applied.
+    ///
+    /// Sorted: named milestones by number ASC, `"No milestone"` last.
+    fn board_milestones_with_status_for_repo<'a>(
+        &'a self,
+        issues: &'a [(String, Vec<IssueGroup>)],
+        repo: &str,
+    ) -> Vec<(String, String, Vec<(&'static str, &'static str, Vec<(usize, &'a IssueGroup)>)>)> {
+        let flat: &[IssueGroup] = match issues.iter().find(|(r, _)| r == repo) {
+            Some((_, v)) => v,
+            None => return Vec::new(),
+        };
+
+        // Bucket flat indices into milestones.
+        let mut milestone_map: std::collections::BTreeMap<
+            (i64, String),          // (number, title) for sorting; number=i64::MAX for "no-milestone"
+            (String, String, Vec<usize>),  // (key, display_title, flat_indices)
+        > = std::collections::BTreeMap::new();
+
+        for (flat_idx, g) in flat.iter().enumerate() {
+            if !self.board_search.matches(g.issue_number, &g.issue_title) {
+                continue;
+            }
+            match g.milestone_number {
+                Some(n) => {
+                    let title = g.milestone_title.clone().unwrap_or_default();
+                    let key = n.to_string();
+                    let sort_key = (n, title.clone());
+                    milestone_map
+                        .entry(sort_key)
+                        .or_insert_with(|| (key, title, Vec::new()))
+                        .2
+                        .push(flat_idx);
+                }
+                None => {
+                    let sort_key = (i64::MAX, String::new());
+                    milestone_map
+                        .entry(sort_key)
+                        .or_insert_with(|| ("no-milestone".to_string(), "No milestone".to_string(), Vec::new()))
+                        .2
+                        .push(flat_idx);
+                }
+            }
+        }
+
+        // For each milestone, build the status sub-groups.
+        let mut result = Vec::new();
+        for (_, (key, display_title, flat_indices)) in milestone_map {
+            let mut backlog: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut refining: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut refined: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut in_flight: Vec<(usize, &IssueGroup)> = Vec::new();
+            let mut completed: Vec<(usize, &IssueGroup)> = Vec::new();
+            for fi in &flat_indices {
+                let g = &flat[*fi];
+                match g.lifecycle_section() {
+                    "backlog"    => backlog.push((*fi, g)),
+                    "refining"   => refining.push((*fi, g)),
+                    "refined"    => refined.push((*fi, g)),
+                    "in-flight"  => in_flight.push((*fi, g)),
+                    "completed"  => completed.push((*fi, g)),
+                    _            => backlog.push((*fi, g)),
+                }
+            }
+            let status_groups: Vec<(&'static str, &'static str, Vec<(usize, &IssueGroup)>)> = [
+                ("Backlog",   "backlog",   backlog),
+                ("Refining",  "refining",  refining),
+                ("Refined",   "refined",   refined),
+                ("In-flight", "in-flight", in_flight),
+                ("Completed", "completed", completed),
+            ]
+            .into_iter()
+            .filter(|(_, _, v)| !v.is_empty())
+            .collect();
+
+            if !status_groups.is_empty() {
+                result.push((key, display_title, status_groups));
+            }
+        }
+        result
+    }
+
     /// Rebuild the SidebarSystem from current data.
     ///
     /// Layout:
@@ -5044,8 +5187,8 @@ impl CoordApp {
     /// - Section 1: PROPOSALS (only when proposals exist)
     /// - Section 1/2+: one section per repo
     ///
-    /// Within each repo section, issues are grouped by status into sub-trees:
-    /// Running → Failed → Completed → Pending. Empty groups are omitted.
+    /// Within each repo section, issues are grouped by milestone then status:
+    /// Repo > Milestone > Status > Issue. Empty groups are omitted.
     /// Rows are filtered by `board_search` (case-insensitive substring).
     fn rebuild_board_sidebar(&mut self) {
         self.board_issues_cache = self.issues_by_repo();
@@ -5148,160 +5291,159 @@ impl CoordApp {
             );
         }
 
-        // Helper: fuzzy filter — true if the issue matches the search query.
-        let filter = self.board_search.clone();
-        let issue_matches = |num: u64, title: &str| -> bool { filter.matches(num, title) };
-
-        // Build per-repo status groups.
-        for (cache_idx, (repo, issues)) in grouped.iter().enumerate() {
+        // #406: Build per-repo milestone > status > issue rows.
+        //
+        // Two-phase loop to satisfy the borrow checker:
+        // Phase 1 — inside the block, compute `(total, rows)` using
+        //   `board_milestones_with_status_for_repo` (borrows &self).
+        //   `milestones` is dropped at the end of the block.
+        // Phase 2 — outside the block, apply mutations to `self.board_sidebar`
+        //   (requires &mut self, which is safe once milestones is dropped).
+        for (cache_idx, (repo, _issues)) in grouped.iter().enumerate() {
             let section_idx = cache_idx + offset;
 
-            // #256 / #226 lifecycle model: bucket issues into the
-            // five sections.  Classifier must stay in sync with
-            // `board_grouped_for_repo` / `select_issue` so click
-            // hit-testing and visual rendering agree.
-            let mut backlog: Vec<(usize, &IssueGroup)> = Vec::new();
-            let mut refining: Vec<(usize, &IssueGroup)> = Vec::new();
-            let mut refined: Vec<(usize, &IssueGroup)> = Vec::new();
-            let mut in_flight: Vec<(usize, &IssueGroup)> = Vec::new();
-            let mut completed: Vec<(usize, &IssueGroup)> = Vec::new();
-            for (flat_idx, g) in issues.iter().enumerate() {
-                if !issue_matches(g.issue_number, &g.issue_title) {
-                    continue;
-                }
-                match g.lifecycle_section() {
-                    "backlog" => backlog.push((flat_idx, g)),
-                    "refining" => refining.push((flat_idx, g)),
-                    "refined" => refined.push((flat_idx, g)),
-                    "in-flight" => in_flight.push((flat_idx, g)),
-                    "completed" => completed.push((flat_idx, g)),
-                    _ => backlog.push((flat_idx, g)),
-                }
-            }
+            let (total, rows): (usize, Vec<TreeRow>) = {
+                // Compute milestone-grouped data for this repo.
+                // milestones holds &IssueGroup refs; it must be dropped before
+                // any &mut self borrow (sidebar mutations) below.
+                let milestones = self.board_milestones_with_status_for_repo(grouped, repo);
 
-            let groups: Vec<(&str, &str, &Vec<(usize, &IssueGroup)>)> = [
-                ("Backlog",   "backlog",   &backlog),
-                ("Refining",  "refining",  &refining),
-                ("Refined",   "refined",   &refined),
-                ("In-flight", "in-flight", &in_flight),
-                ("Completed", "completed", &completed),
-            ]
-            .into_iter()
-            .filter(|(_, _, v)| !v.is_empty())
-            .collect();
+                let total: usize = milestones
+                    .iter()
+                    .flat_map(|(_, _, sgs)| sgs.iter().map(|(_, _, issues)| issues.len()))
+                    .sum();
 
-            let total: usize = backlog.len()
-                + refining.len()
-                + refined.len()
-                + in_flight.len()
-                + completed.len();
+                let mut rows: Vec<TreeRow> = Vec::new();
+
+                for (milestone_idx, (m_key, m_display, status_groups)) in milestones.iter().enumerate() {
+                    let mi = milestone_idx as u16;
+
+                    let m_total: usize = status_groups.iter().map(|(_, _, v)| v.len()).sum();
+                    let m_has_inflight = status_groups.iter().any(|(_, key, _)| *key == "in-flight");
+
+                    // Expand state: default to expanded when in-flight, else collapsed.
+                    let m_is_exp = *self
+                        .board_milestone_expanded
+                        .get(&(repo.clone(), m_key.clone()))
+                        .unwrap_or(&m_has_inflight);
+
+                    // Milestone header color.
+                    let m_header_color = if m_has_inflight {
+                        Color::rgb(200, 200, 100)
+                    } else if m_key == "no-milestone" {
+                        Color::rgb(100, 100, 120)
+                    } else {
+                        Color::rgb(160, 160, 200)
+                    };
+
+                    rows.push(TreeRow {
+                        path: vec![mi],
+                        indent: 1,
+                        icon: None,
+                        text: StyledText {
+                            spans: vec![StyledSpan::with_fg(
+                                format!("{} ({})", m_display, m_total),
+                                m_header_color,
+                            )],
+                        },
+                        badge: None,
+                        is_expanded: Some(m_is_exp),
+                        decoration: Decoration::Header,
+                        edit: None,
+                    });
+
+                    if m_is_exp {
+                        for (status_idx, (display_name, key, group_issues)) in status_groups.iter().enumerate() {
+                            let si = status_idx as u16;
+                            let combined_key = format!("{}:{}", m_key, key);
+                            let is_exp = *self
+                                .board_status_expanded
+                                .get(&(repo.clone(), combined_key))
+                                .unwrap_or(&true);
+
+                            // #256 / #226 lifecycle palette.
+                            let header_color = match *key {
+                                "backlog"   => Color::rgb(140, 140, 160),
+                                "refining"  => Color::rgb(220, 180, 100),
+                                "refined"   => Color::rgb(140, 180, 220),
+                                "in-flight" => Color::rgb(80, 220, 80),
+                                "completed" => Color::rgb(120, 180, 120),
+                                _           => Color::rgb(140, 140, 160),
+                            };
+                            rows.push(TreeRow {
+                                path: vec![mi, si],
+                                indent: 2,
+                                icon: None,
+                                text: StyledText {
+                                    spans: vec![StyledSpan::with_fg(
+                                        format!("{} ({})", display_name, group_issues.len()),
+                                        header_color,
+                                    )],
+                                },
+                                badge: None,
+                                is_expanded: Some(is_exp),
+                                decoration: Decoration::Header,
+                                edit: None,
+                            });
+
+                            if is_exp {
+                                for (issue_idx, (_flat_idx, g)) in group_issues.iter().enumerate() {
+                                    let text = StyledText {
+                                        spans: vec![
+                                            StyledSpan::with_fg(
+                                                format!("#{:<5}", g.issue_number),
+                                                Color::rgb(150, 150, 240),
+                                            ),
+                                            StyledSpan::plain(trunc(&g.issue_title, 20)),
+                                        ],
+                                    };
+                                    // #336: machine badge on Completed rows.
+                                    let badge = if *key == "completed" {
+                                        g.assignments
+                                            .iter()
+                                            .filter(|a| a.assignment_type.as_deref() != Some("refinement"))
+                                            .max_by(|a, b| {
+                                                a.dispatched_at
+                                                    .partial_cmp(&b.dispatched_at)
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            })
+                                            .map(|a| Badge::colored(&a.machine, Color::rgb(100, 150, 120)))
+                                    } else {
+                                        None
+                                    };
+                                    rows.push(TreeRow {
+                                        path: vec![mi, si, issue_idx as u16],
+                                        indent: 3,
+                                        icon: None,
+                                        text,
+                                        badge,
+                                        is_expanded: None,
+                                        decoration: if g.status_summary == "failed" {
+                                            Decoration::Error
+                                        } else {
+                                            Decoration::Normal
+                                        },
+                                        edit: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // milestones dropped here — &self borrow released.
+                (total, rows)
+            };
+
+            // Phase 2: apply mutations now that milestones is dropped.
             if total > 0 {
                 self.board_sidebar.set_section_badge(
                     section_idx,
                     Some(StyledText::plain(format!("({})", total))),
                 );
             }
-
-            // Auto-collapse repos with no In-flight work and an empty
-            // search.  A user dropping in mid-session cares about
-            // running / failed work first; the Pending and Completed
-            // backlogs stay one click away behind the chevron.
-            let has_active = !in_flight.is_empty();
-            if !has_active && total == 0 {
+            if total == 0 {
                 self.board_sidebar.set_collapsed(section_idx, true);
             }
-
-            let mut rows: Vec<TreeRow> = Vec::new();
-            for (group_idx, (display_name, key, group_issues)) in groups.iter().enumerate() {
-                let gi = group_idx as u16;
-                let is_exp = *self
-                    .board_status_expanded
-                    .get(&(repo.clone(), key.to_string()))
-                    .unwrap_or(&true);
-
-                // #256 / #226 lifecycle palette.  In-flight is the
-                // attention-worthy green (running / failed / done-but-
-                // open all fold here); Completed is the muted "done"
-                // green.  Backlog / Refining / Refined ramp from
-                // unscoped grey → warm yellow (active scoping) → cool
-                // blue (scope-locked, ready to dispatch).
-                let header_color = match *key {
-                    "backlog" => Color::rgb(140, 140, 160),
-                    "refining" => Color::rgb(220, 180, 100),
-                    "refined" => Color::rgb(140, 180, 220),
-                    "in-flight" => Color::rgb(80, 220, 80),
-                    "completed" => Color::rgb(120, 180, 120),
-                    _ => Color::rgb(140, 140, 160),
-                };
-                rows.push(TreeRow {
-                    path: vec![gi],
-                    indent: 1,
-                    icon: None,
-                    text: StyledText {
-                        spans: vec![StyledSpan::with_fg(
-                            format!("{} ({})", display_name, group_issues.len()),
-                            header_color,
-                        )],
-                    },
-                    badge: None,
-                    is_expanded: Some(is_exp),
-                    decoration: Decoration::Header,
-                    edit: None,
-                });
-
-                if is_exp {
-                    for (issue_idx, (_flat_idx, g)) in group_issues.iter().enumerate() {
-                        let _sc = g.status_color();
-                        let text = StyledText {
-                            spans: vec![
-                                StyledSpan::with_fg(
-                                    format!("#{:<5}", g.issue_number),
-                                    Color::rgb(150, 150, 240),
-                                ),
-                                StyledSpan::plain(trunc(&g.issue_title, 20)),
-                            ],
-                        };
-                        // #336: Show the machine name as a muted badge on Completed
-                        // rows so the user can see at a glance which agent did the
-                        // work without opening the detail panel.
-                        let badge = if *key == "completed" {
-                            g.assignments
-                                .iter()
-                                .filter(|a| {
-                                    a.assignment_type.as_deref() != Some("refinement")
-                                })
-                                .max_by(|a, b| {
-                                    a.dispatched_at
-                                        .partial_cmp(&b.dispatched_at)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                })
-                                .map(|a| {
-                                    Badge::colored(
-                                        &a.machine,
-                                        Color::rgb(100, 150, 120),
-                                    )
-                                })
-                        } else {
-                            None
-                        };
-                        rows.push(TreeRow {
-                            path: vec![gi, issue_idx as u16],
-                            indent: 2,
-                            icon: None,
-                            text,
-                            badge,
-                            is_expanded: None,
-                            decoration: if g.status_summary == "failed" {
-                                Decoration::Error
-                            } else {
-                                Decoration::Normal
-                            },
-                            edit: None,
-                        });
-                    }
-                }
-            }
-
             self.board_sidebar.set_rows(section_idx, rows);
         }
 
@@ -5376,6 +5518,10 @@ impl CoordApp {
     /// - **Completed** — closed AND has at least one assignment
     ///
     /// Empty groups are omitted so the sidebar doesn't show stub headers.
+    ///
+    /// Used by tests.  Production rendering goes through
+    /// `board_milestones_with_status_for_repo` instead.
+    #[allow(dead_code)]
     fn board_grouped_for_repo<'a>(
         &'a self,
         issues: &'a [(String, Vec<IssueGroup>)],
@@ -5417,8 +5563,8 @@ impl CoordApp {
 
     /// Return the IssueGroup currently selected in the board sidebar.
     ///
-    /// Paths are now two-level: `[group_idx, issue_idx_within_group]`. A
-    /// one-level path (group header selected) returns `None`.
+    /// Paths are now three-level: `[milestone_idx, status_idx, issue_idx]`.
+    /// Shorter paths (milestone or status header selected) return `None`.
     fn board_selected_issue_group(&self) -> Option<&IssueGroup> {
         let section = self.board_sidebar.active_section()?;
         let offset = self.board_repo_offset();
@@ -5426,14 +5572,16 @@ impl CoordApp {
             return None;
         }
         let path = self.board_sidebar.selected_path(section)?;
-        if path.len() < 2 {
+        if path.len() < 3 {
             return None;
         }
-        let group_idx = path[0] as usize;
-        let issue_idx = path[1] as usize;
+        let milestone_idx = path[0] as usize;
+        let status_idx = path[1] as usize;
+        let issue_idx = path[2] as usize;
         let repo = self.board_repo_names.get(section - offset)?;
-        let groups = self.board_grouped_for_repo(&self.board_issues_cache, repo);
-        let (_, issues_in_group) = groups.get(group_idx)?;
+        let milestones = self.board_milestones_with_status_for_repo(&self.board_issues_cache, repo);
+        let (_, _, status_groups) = milestones.get(milestone_idx)?;
+        let (_, _, issues_in_group) = status_groups.get(status_idx)?;
         let (flat_idx, _) = issues_in_group.get(issue_idx)?;
         let (_, all_issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
         all_issues.get(*flat_idx)
@@ -5492,69 +5640,56 @@ impl CoordApp {
             Some(p) => p,
             None => return false,
         };
-        if path.is_empty() {
+        // Need at least [milestone_idx, status_idx] to identify the group;
+        // an issue row has 3 elements.
+        if path.len() < 2 {
             return false;
         }
-        let group_idx = path[0] as usize;
+        let milestone_idx = path[0] as usize;
+        let status_idx = path[1] as usize;
         let repo = match self.board_repo_names.get(section - offset) {
             Some(r) => r,
             None => return false,
         };
-        let groups = self.board_grouped_for_repo(&self.board_issues_cache, repo);
-        matches!(groups.get(group_idx), Some(("completed", _)))
+        let milestones = self.board_milestones_with_status_for_repo(&self.board_issues_cache, repo);
+        matches!(
+            milestones
+                .get(milestone_idx)
+                .and_then(|(_, _, sgs)| sgs.get(status_idx)),
+            Some((_, "completed", _))
+        )
     }
 
     /// Try to select a specific issue in the sidebar by repo and issue number.
     fn select_issue(&mut self, repo: &str, issue_number: u64) {
         let offset = self.board_repo_offset();
-        // Find the repo's cache entry and its groups.
+        // Find the repo's section index.
         let cache_idx = match self.board_repo_names.iter().position(|r| r == repo) {
             Some(i) => i,
             None => return,
         };
         let section_idx = cache_idx + offset;
-        // Reconstruct groups to find the 2-level path for this issue.
-        // Clone the flat list to avoid borrow conflicts.
-        let flat: Vec<IssueGroup> = match self.board_issues_cache.iter().find(|(r, _)| r == repo) {
-            Some((_, v)) => v.clone(),
-            None => return,
-        };
-        // #256 / #226 lifecycle bucketing — keep in sync with
-        // `board_grouped_for_repo` and `rebuild_board_sidebar` so a
-        // `select_issue` lookup lands on the same `[group, issue]`
-        // path the click handler resolves to.
-        let mut backlog: Vec<(usize, u64)> = Vec::new();
-        let mut refining: Vec<(usize, u64)> = Vec::new();
-        let mut refined: Vec<(usize, u64)> = Vec::new();
-        let mut in_flight: Vec<(usize, u64)> = Vec::new();
-        let mut completed: Vec<(usize, u64)> = Vec::new();
-        for (i, g) in flat.iter().enumerate() {
-            if !self.board_search.matches(g.issue_number, &g.issue_title) {
-                continue;
-            }
-            match g.lifecycle_section() {
-                "backlog" => backlog.push((i, g.issue_number)),
-                "refining" => refining.push((i, g.issue_number)),
-                "refined" => refined.push((i, g.issue_number)),
-                "in-flight" => in_flight.push((i, g.issue_number)),
-                "completed" => completed.push((i, g.issue_number)),
-                _ => backlog.push((i, g.issue_number)),
-            }
-        }
-        let groups_ordered: Vec<Vec<(usize, u64)>> =
-            [backlog, refining, refined, in_flight, completed]
-                .into_iter()
-                .filter(|v| !v.is_empty())
-                .collect();
-        for (group_idx, group_issues) in groups_ordered.iter().enumerate() {
-            for (issue_idx, (_flat_idx, num)) in group_issues.iter().enumerate() {
-                if *num == issue_number {
-                    self.board_sidebar.set_active_section(Some(section_idx));
-                    self.board_sidebar.set_selected_path(
-                        section_idx,
-                        Some(vec![group_idx as u16, issue_idx as u16]),
-                    );
-                    return;
+        // Clone to avoid borrow conflicts.
+        let cache = self.board_issues_cache.clone();
+        // #406: milestone > status > issue bucketing — must stay in sync with
+        // `board_milestones_with_status_for_repo` and `rebuild_board_sidebar`
+        // so the path this function produces matches what the click handler resolves to.
+        let milestones = self.board_milestones_with_status_for_repo(&cache, repo);
+        for (milestone_idx, (_, _, status_groups)) in milestones.iter().enumerate() {
+            for (status_idx, (_, _, group_issues)) in status_groups.iter().enumerate() {
+                for (issue_idx, (_, g)) in group_issues.iter().enumerate() {
+                    if g.issue_number == issue_number {
+                        self.board_sidebar.set_active_section(Some(section_idx));
+                        self.board_sidebar.set_selected_path(
+                            section_idx,
+                            Some(vec![
+                                milestone_idx as u16,
+                                status_idx as u16,
+                                issue_idx as u16,
+                            ]),
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -10780,21 +10915,43 @@ impl CoordApp {
                 match result {
                     SidebarEvent::RowSelected { section, ref path } => {
                         if path.len() == 1 {
-                            // Single-click on a status-group header toggles expansion.
+                            // #406: click on a milestone header — toggle milestone expansion.
                             let offset = self.board_repo_offset();
                             if section >= offset {
                                 let repo_idx = section - offset;
                                 if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
-                                    let group_idx = path[0] as usize;
+                                    let milestone_idx = path[0] as usize;
                                     let cache = self.board_issues_cache.clone();
-                                    let groups = self.board_grouped_for_repo(&cache, &repo);
-                                    if let Some((key, _)) = groups.get(group_idx) {
-                                        let key = key.to_string();
-                                        let entry = self.board_status_expanded
-                                            .entry((repo, key))
+                                    let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
+                                    if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
+                                        let m_key = m_key.clone();
+                                        let entry = self.board_milestone_expanded
+                                            .entry((repo, m_key))
                                             .or_insert(true);
                                         *entry = !*entry;
                                         self.rebuild_board_sidebar();
+                                    }
+                                }
+                            }
+                        } else if path.len() == 2 {
+                            // #406: click on a status-group header inside a milestone.
+                            let offset = self.board_repo_offset();
+                            if section >= offset {
+                                let repo_idx = section - offset;
+                                if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
+                                    let milestone_idx = path[0] as usize;
+                                    let status_idx = path[1] as usize;
+                                    let cache = self.board_issues_cache.clone();
+                                    let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
+                                    if let Some((m_key, _, status_groups)) = milestones.get(milestone_idx) {
+                                        if let Some((_, s_key, _)) = status_groups.get(status_idx) {
+                                            let combined = format!("{}:{}", m_key, s_key);
+                                            let entry = self.board_status_expanded
+                                                .entry((repo, combined))
+                                                .or_insert(true);
+                                            *entry = !*entry;
+                                            self.rebuild_board_sidebar();
+                                        }
                                     }
                                 }
                             }
@@ -10809,16 +10966,37 @@ impl CoordApp {
                             if section >= offset {
                                 let repo_idx = section - offset;
                                 if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
-                                    let group_idx = path[0] as usize;
+                                    let milestone_idx = path[0] as usize;
                                     let cache = self.board_issues_cache.clone();
-                                    let groups = self.board_grouped_for_repo(&cache, &repo);
-                                    if let Some((key, _)) = groups.get(group_idx) {
-                                        let key = key.to_string();
-                                        let entry = self.board_status_expanded
-                                            .entry((repo, key))
+                                    let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
+                                    if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
+                                        let m_key = m_key.clone();
+                                        let entry = self.board_milestone_expanded
+                                            .entry((repo, m_key))
                                             .or_insert(true);
                                         *entry = !*entry;
                                         self.rebuild_board_sidebar();
+                                    }
+                                }
+                            }
+                        } else if path.len() == 2 {
+                            let offset = self.board_repo_offset();
+                            if section >= offset {
+                                let repo_idx = section - offset;
+                                if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
+                                    let milestone_idx = path[0] as usize;
+                                    let status_idx = path[1] as usize;
+                                    let cache = self.board_issues_cache.clone();
+                                    let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
+                                    if let Some((m_key, _, status_groups)) = milestones.get(milestone_idx) {
+                                        if let Some((_, s_key, _)) = status_groups.get(status_idx) {
+                                            let combined = format!("{}:{}", m_key, s_key);
+                                            let entry = self.board_status_expanded
+                                                .entry((repo, combined))
+                                                .or_insert(true);
+                                            *entry = !*entry;
+                                            self.rebuild_board_sidebar();
+                                        }
                                     }
                                 }
                             }
@@ -10839,23 +11017,37 @@ impl CoordApp {
                         self.board_sidebar.focus_form(0, true);
                         true
                     }
-                    // Chevron click on a status-group header row — same
-                    // toggle logic as RowSelected/RowActivated with path.len()==1.
-                    SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
+                    // #406: Chevron click on a milestone or status-group header row.
+                    SidebarEvent::RowToggleExpand { section, ref path } if path.len() <= 2 => {
                         let offset = self.board_repo_offset();
                         if section >= offset {
                             let repo_idx = section - offset;
                             if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
-                                let group_idx = path[0] as usize;
                                 let cache = self.board_issues_cache.clone();
-                                let groups = self.board_grouped_for_repo(&cache, &repo);
-                                if let Some((key, _)) = groups.get(group_idx) {
-                                    let key = key.to_string();
-                                    let entry = self.board_status_expanded
-                                        .entry((repo, key))
-                                        .or_insert(true);
-                                    *entry = !*entry;
-                                    self.rebuild_board_sidebar();
+                                let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
+                                if path.len() == 1 {
+                                    let milestone_idx = path[0] as usize;
+                                    if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
+                                        let m_key = m_key.clone();
+                                        let entry = self.board_milestone_expanded
+                                            .entry((repo, m_key))
+                                            .or_insert(true);
+                                        *entry = !*entry;
+                                        self.rebuild_board_sidebar();
+                                    }
+                                } else if path.len() == 2 {
+                                    let milestone_idx = path[0] as usize;
+                                    let status_idx = path[1] as usize;
+                                    if let Some((m_key, _, status_groups)) = milestones.get(milestone_idx) {
+                                        if let Some((_, s_key, _)) = status_groups.get(status_idx) {
+                                            let combined = format!("{}:{}", m_key, s_key);
+                                            let entry = self.board_status_expanded
+                                                .entry((repo, combined))
+                                                .or_insert(true);
+                                            *entry = !*entry;
+                                            self.rebuild_board_sidebar();
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -18901,6 +19093,7 @@ mod tests {
             issue_sync_last: None,
             board_search: SidebarFilter::default(),
             board_status_expanded: std::collections::HashMap::new(),
+            board_milestone_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
             pipeline_state_section_names: Vec::new(),
@@ -19055,9 +19248,9 @@ mod tests {
         ];
         let mut app = make_app_with_assignments(assignments);
         // Section 0 = search form; section 1 = repo-a (running first).
-        // Path is 2-level: [group_idx=0 (Running), issue_idx=0].
+        // #406: Path is now 3-level: [milestone_idx=0, status_idx=0 (In-flight), issue_idx=0].
         app.board_sidebar.set_active_section(Some(1));
-        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0, 0]));
         let sel = app.board_selected_issue();
         assert!(sel.is_some(), "expected Some, got None");
         let (repo, issue_num) = sel.unwrap();
@@ -19765,6 +19958,8 @@ mod tests {
                 body: String::new(),
                 state: "open".to_string(),
                 labels: Vec::new(),
+                milestone_number: None,
+                milestone_title: None,
             });
         }
         app.rebuild_board_sidebar();
@@ -19864,6 +20059,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         // status:refining → Refining
         app.data.open_issues.push(OpenIssue {
@@ -19873,6 +20070,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:refining".to_string()],
+            milestone_number: None,
+            milestone_title: None,
         });
         // status:ready → Refined
         app.data.open_issues.push(OpenIssue {
@@ -19882,6 +20081,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:ready".to_string()],
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -19906,18 +20107,21 @@ mod tests {
             repo_name: "repo-a".to_string(), number: 1,
             title: "b".to_string(), body: String::new(),
             state: "open".to_string(), labels: Vec::new(),
+            milestone_number: None, milestone_title: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(), number: 2,
             title: "r".to_string(), body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:refining".to_string()],
+            milestone_number: None, milestone_title: None,
         });
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(), number: 3,
             title: "rd".to_string(), body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:ready".to_string()],
+            milestone_number: None, milestone_title: None,
         });
         // Issue 4: in-flight (open issue with running assignment).
         app.data.assignments.push(make_assignment_typed(
@@ -19927,6 +20131,7 @@ mod tests {
             repo_name: "repo-a".to_string(), number: 4,
             title: "if".to_string(), body: String::new(),
             state: "open".to_string(), labels: Vec::new(),
+            milestone_number: None, milestone_title: None,
         });
         // Issue 5: completed (closed issue with done assignment).
         app.data.assignments.push(make_assignment_typed(
@@ -19936,6 +20141,7 @@ mod tests {
             repo_name: "repo-a".to_string(), number: 5,
             title: "c".to_string(), body: String::new(),
             state: "closed".to_string(), labels: Vec::new(),
+            milestone_number: None, milestone_title: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -19963,6 +20169,8 @@ mod tests {
             body: String::new(),
             state: "closed".to_string(),
             labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -19987,7 +20195,7 @@ mod tests {
     #[test]
     fn board_select_issue_uses_two_level_path() {
         // Two open issues with assignments → both in the single
-        // In-flight group.  Path [0, 1] selects the second issue.
+        // In-flight group.  #406: path is now 3-level: [milestone=0, status=0, issue_idx].
         let assignments = vec![
             make_assignment_typed("running", 10, "repo-a", Some("work")),
             make_assignment_typed("done", 20, "repo-a", Some("work")),
@@ -19998,10 +20206,11 @@ mod tests {
         seed_open_issue_records(&mut app, "repo-a", &[10, 20]);
         app.select_issue("repo-a", 20);
         let path = app.board_sidebar.selected_path(1).cloned();
-        // The flat order inside In-flight is the sorted-by-issue-number
-        // order from `issues_by_repo`; #20 sits at index 1.
+        // The flat order inside In-flight (within the No-milestone group) is
+        // sorted-by-issue-number; #20 sits at index 1.
+        // Accept both orderings in case the status group index shifts.
         assert!(
-            path == Some(vec![0u16, 1u16]) || path == Some(vec![0u16, 0u16]),
+            path == Some(vec![0u16, 0u16, 1u16]) || path == Some(vec![0u16, 0u16, 0u16]),
             "selected issue must land inside the single In-flight group, got {:?}",
             path,
         );
@@ -23898,6 +24107,8 @@ mod tests {
             body: String::new(),
             state: "closed".to_string(),
             labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         app
@@ -23905,22 +24116,26 @@ mod tests {
 
     #[test]
     fn purge_guard_true_when_completed_group_header_selected() {
-        // #265: a "done" assignment on a *closed* GitHub issue lands
-        // in the Completed group at group_idx 0.
+        // #265 / #406: a "done" assignment on a *closed* GitHub issue lands
+        // in the Completed group.
+        // With the 3-level tree, the Completed status header is at path
+        // [milestone_idx=0, status_idx=0] (the only non-empty group within
+        // the "No milestone" milestone).
         let mut app = make_app_with_one_completed_issue();
         // Section 1 = repo-a (section 0 is the search form).
-        // Path [0] selects the Completed group header.
         app.board_sidebar.set_active_section(Some(1));
-        app.board_sidebar.set_selected_path(1, Some(vec![0]));
+        // Path [0, 0]: milestone 0 ("No milestone"), status 0 ("Completed").
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
         assert!(app.board_selection_in_completed_group());
     }
 
     #[test]
     fn purge_guard_true_when_issue_row_in_completed_group_selected() {
-        // Issue row within Completed group (path [group_idx, issue_idx]).
+        // Issue row within Completed group.
+        // #406: path is now 3-level: [milestone_idx, status_idx, issue_idx].
         let mut app = make_app_with_one_completed_issue();
         app.board_sidebar.set_active_section(Some(1));
-        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0, 0]));
         assert!(app.board_selection_in_completed_group());
     }
 
@@ -24937,6 +25152,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         app.select_issue("repo-a", 88);
@@ -24964,6 +25181,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:refining".to_string()],
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         app.select_issue("repo-a", 89);
@@ -24987,6 +25206,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         app.select_issue("repo-a", 90);
@@ -25393,6 +25614,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 10),
@@ -25410,6 +25633,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:refining".to_string()],
+            milestone_number: None,
+            milestone_title: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 11),
@@ -25427,6 +25652,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:ready".to_string()],
+            milestone_number: None,
+            milestone_title: None,
         });
         assert_eq!(
             app.board_row_lifecycle("repo-a", 12),
@@ -26403,6 +26630,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:ready".to_string()],
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -26440,6 +26669,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:ready".to_string()],
+            milestone_number: None,
+            milestone_title: None,
         });
         // Issue 2: new-issue-chat only, no label → Backlog.
         app.data.open_issues.push(OpenIssue {
@@ -26449,6 +26680,8 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -27114,5 +27347,131 @@ mod tests {
             app.pending_chat_resume.is_some(),
             "pending_chat_resume must remain armed when no matching assignment is found",
         );
+    }
+
+    // ── #406: milestone grouping ──────────────────────────────────────────────
+
+    #[test]
+    fn milestone_grouping_separates_issues_by_milestone() {
+        // Two issues in different milestones and one without a milestone.
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 1,
+            title: "v0.5 feature".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: Some(5),
+            milestone_title: Some("v0.5".to_string()),
+        });
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 2,
+            title: "v0.6 task".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: Some(6),
+            milestone_title: Some("v0.6".to_string()),
+        });
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 3,
+            title: "unplanned".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        app.rebuild_board_sidebar();
+        let cache = app.board_issues_cache.clone();
+        let milestones = app.board_milestones_with_status_for_repo(&cache, "repo-a");
+
+        // Should have 3 milestone groups: v0.5 (5), v0.6 (6), No milestone.
+        assert_eq!(milestones.len(), 3, "should have 3 milestone groups: {:?}",
+            milestones.iter().map(|(k, d, _)| format!("{k}={d}")).collect::<Vec<_>>());
+
+        // Named milestones come first in number order, "No milestone" last.
+        assert_eq!(milestones[0].0, "5");
+        assert_eq!(milestones[0].1, "v0.5");
+        assert_eq!(milestones[1].0, "6");
+        assert_eq!(milestones[1].1, "v0.6");
+        assert_eq!(milestones[2].0, "no-milestone");
+        assert_eq!(milestones[2].1, "No milestone");
+
+        // Each milestone has exactly one issue in the Backlog status group.
+        for (key, _, status_groups) in &milestones {
+            assert_eq!(status_groups.len(), 1, "milestone {key} should have 1 status group");
+            assert_eq!(status_groups[0].1, "backlog", "milestone {key}: status should be backlog");
+            assert_eq!(status_groups[0].2.len(), 1, "milestone {key} should have 1 issue");
+        }
+    }
+
+    #[test]
+    fn milestone_grouping_select_issue_round_trips_three_level_path() {
+        // An issue with a milestone: select_issue builds a 3-level path and
+        // board_selected_issue resolves it back to the same (repo, number).
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 42,
+            title: "issue with milestone".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: Some(7),
+            milestone_title: Some("v0.7".to_string()),
+        });
+        app.rebuild_board_sidebar();
+        app.select_issue("repo-a", 42);
+        let sel = app.board_selected_issue();
+        assert_eq!(
+            sel,
+            Some(("repo-a".to_string(), 42)),
+            "select_issue + board_selected_issue should round-trip",
+        );
+        // Path must be exactly 3-level: [milestone_idx, status_idx, issue_idx].
+        let path = app.board_sidebar.selected_path(1).cloned();
+        assert!(
+            path.as_ref().map(|p| p.len()) == Some(3),
+            "path should be 3-level, got {:?}",
+            path,
+        );
+    }
+
+    #[test]
+    fn milestone_grouping_no_milestone_sorted_last() {
+        // Verify "No milestone" always sorts after any named milestones.
+        let mut app = make_app_default();
+        // Add "No milestone" issue first.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 1,
+            title: "unplanned".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        // Then a named milestone.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 2,
+            title: "planned".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: Some(1),
+            milestone_title: Some("v0.1".to_string()),
+        });
+        app.rebuild_board_sidebar();
+        let cache = app.board_issues_cache.clone();
+        let milestones = app.board_milestones_with_status_for_repo(&cache, "repo-a");
+        assert_eq!(milestones.len(), 2);
+        assert_eq!(milestones[0].0, "1", "named milestone comes first");
+        assert_eq!(milestones[1].0, "no-milestone", "No milestone sorted last");
     }
 }
