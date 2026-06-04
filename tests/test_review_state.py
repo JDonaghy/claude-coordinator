@@ -786,6 +786,35 @@ class TestStatusReviewStateDisplay:
         assert "[review dispatched]" not in output
         assert "[review done]" not in output
 
+    def test_status_shows_cap_hit_blocker(
+        self, config_file: Path, cli_coord_dir: Path
+    ) -> None:
+        """review_state='cap_hit' shows the ⚠ Auto-loop blockers section and
+        the [⚠ iteration cap hit tag in the completed work listing."""
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop",
+                    repo_name="api",
+                    issue_number=42,
+                    issue_title="Cap hit task",
+                    assignment_id="w-cap",
+                    status="done",
+                    type="work",
+                    review_state="cap_hit",
+                    finished_at=5.0,
+                )
+            ]
+        )
+        save_board(board)
+
+        with patch("coord.network.check_all", return_value=[]):
+            output = self._run_status(config_file)
+
+        assert "⚠ Auto-loop blockers" in output
+        assert "[⚠ iteration cap hit" in output
+        assert "Cap hit task" in output
+
     def test_status_only_shows_work_type_assignments(
         self, config_file: Path, cli_coord_dir: Path
     ) -> None:
