@@ -1711,6 +1711,50 @@ fn extract_tool_names(json: &str) -> Vec<String> {
     names
 }
 
+/// Return the display-detail string for a named tool given the JSON fragment
+/// of the tool's object (or enclosing event). Maps tool name → relevant field.
+/// Used by both the top-level `tool_use` event handler and `extract_tool_calls`
+/// so the two code paths stay in sync.
+fn tool_detail(name: &str, json: &str) -> String {
+    match name {
+        "Bash" => json_str(json, "command").unwrap_or_default(),
+        "Edit" | "Write" | "Read" | "Glob" | "NotebookEdit" => {
+            json_str(json, "file_path").unwrap_or_default()
+        }
+        "Grep" => json_str(json, "pattern").unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Extract (name, detail) pairs from every `tool_use` block found in `json`.
+///
+/// Unlike `extract_tool_names`, this returns one entry *per occurrence* (not
+/// deduplicated) and includes the per-tool detail string produced by
+/// `tool_detail`.  Used to render one `→ Name: detail` line per tool call in
+/// assistant events that contain only tool-use content blocks.
+fn extract_tool_calls(json: &str) -> Vec<(String, String)> {
+    let marker = "\"type\":\"tool_use\"";
+    let mut calls: Vec<(String, String)> = Vec::new();
+    let mut pos = 0;
+    while let Some(found) = json[pos..].find(marker) {
+        let after = pos + found + marker.len();
+        // Search in the next ~400 bytes for name + detail fields.
+        // Round up to the next UTF-8 char boundary (same safety measure as
+        // extract_tool_names — box-drawing chars are 3 bytes each and can land
+        // exactly on a fixed-size boundary).
+        let mut window_end = (after + 400).min(json.len());
+        while window_end < json.len() && !json.is_char_boundary(window_end) {
+            window_end += 1;
+        }
+        let window = &json[after..window_end];
+        let name = json_str(window, "name").unwrap_or_else(|| "?".to_string());
+        let detail = tool_detail(&name, window);
+        calls.push((name, detail));
+        pos = after;
+    }
+    calls
+}
+
 /// Parse the `REVIEW_VERDICT` / `REVIEW_BODY` block embedded in a result event's
 /// `result` string and return it as renderable list items. Returns an empty
 /// Vec when the result isn't a structured review (e.g. a normal work or plan
@@ -1824,40 +1868,6 @@ fn extract_thinking_block(json: &str) -> String {
         }
     }
     String::new()
-}
-
-/// Parse SSE log lines with per-turn timing.  For each `[assistant]` event
-/// the elapsed time since the *previous* assistant event is appended to the
-/// label so slow turns stand out at a glance.
-fn parse_sse_log_with_timing(lines: &[String], times: &[Instant]) -> Vec<ListItem> {
-    let mut items = Vec::new();
-    let mut turn_n: usize = 0;
-    let mut last_assistant_time: Option<Instant> = None;
-    for (i, line) in lines.iter().enumerate() {
-        let t = times.get(i).copied();
-        // Compute elapsed since last assistant turn for assistant events.
-        let elapsed = if json_str(line, "type").as_deref() == Some("assistant") {
-            let e = t.and_then(|now| last_assistant_time.map(|prev| now.duration_since(prev)));
-            last_assistant_time = t;
-            e
-        } else {
-            None
-        };
-        if let Some(item) = parse_json_event_timed(line, &mut turn_n, elapsed) {
-            items.push(item);
-        }
-    }
-    items
-}
-
-/// Parse one stream-json event line into a displayable `ListItem`.
-///
-/// Returns `None` for event types that are too noisy to surface (e.g.
-/// `tool_result`, `system/task_*`, `rate_limit_event`).
-/// `turn_n` is a mutable counter incremented for each `assistant` event.
-/// `elapsed` is the time since the previous assistant turn, shown on the label.
-fn parse_json_event_timed(line: &str, turn_n: &mut usize, elapsed: Option<std::time::Duration>) -> Option<ListItem> {
-    parse_json_event_inner(line, turn_n, elapsed)
 }
 
 fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
@@ -4461,7 +4471,11 @@ impl CoordApp {
                             Some(Color::rgb(140, 140, 140)),
                         ));
                     } else {
-                        items.extend(parse_sse_log_with_timing(&sse.lines, &sse.line_times));
+                        // Use the readable renderer (#385) so the live watch view
+                        // word-wraps prose and shows arrow-prefixed tool calls —
+                        // same format as the Log tab and `coord log` output.
+                        let wrap_width = self.last_log_panel_cols.get().max(40);
+                        items.extend(parse_sse_log_readable(&sse.lines, &sse.line_times, wrap_width));
                     }
                     if sse.done {
                         items.push(kv_item(
@@ -17397,21 +17411,51 @@ fn parse_json_events_readable(
             // Readable text — preserve newlines so paragraph structure survives.
             let text_nl = extract_text_block_keep_newlines(line);
 
-            // Thinking-only turn (no text, no tool_use).
+            // No prose text block — could be thinking-only, tool-only, or both.
             if text_nl.trim().is_empty() {
-                let tools = extract_tool_names(line);
-                if tools.is_empty() {
+                let calls = extract_tool_calls(line);
+                if calls.is_empty() {
+                    // Thinking-only (or completely empty) turn: header on its own
+                    // line, then thinking text wrapped on separate line(s) so it
+                    // isn't glued inline to "Turn N".
                     let thinking = collapse_ws(&extract_thinking_block(line));
-                    let header = if thinking.is_empty() {
-                        format!("  Turn {}{}", n, elapsed_str)
-                    } else {
-                        format!("  Turn {}{}  💭 {}", n, elapsed_str, thinking)
-                    };
-                    return vec![activity_item(&header, Color::rgb(80, 80, 100))];
+                    let header = format!("  Turn {}{}", n, elapsed_str);
+                    if thinking.is_empty() {
+                        return vec![activity_item(&header, Color::rgb(80, 80, 100))];
+                    }
+                    let mut items = vec![activity_item(&header, Color::rgb(80, 80, 100))];
+                    let think_inner_wrap = if wrap_width > 2 { wrap_width - 2 } else { 0 };
+                    for wl in word_wrap(&format!("💭 {}", thinking), think_inner_wrap) {
+                        items.push(activity_item(
+                            &format!("  {}", wl),
+                            Color::rgb(130, 110, 150),
+                        ));
+                    }
+                    return items;
                 }
-                // Tool-only turn: header, no prose lines.
-                let header = format!("  Turn {}{}", n, elapsed_str);
-                return vec![activity_item(&header, Color::rgb(80, 80, 100))];
+                // Tool-only turn: one arrow line per tool call.
+                // Drop the bare "Turn N" header — each tool line carries its own
+                // content so the header is pure noise (#issue items 1-2).
+                let mut items = Vec::new();
+                for (call_name, call_detail) in &calls {
+                    let prefix = if call_detail.is_empty() {
+                        format!("  \u{2192} {}", call_name) // →
+                    } else {
+                        format!("  \u{2192} {}: {}", call_name, call_detail)
+                    };
+                    let display = if wrap_width > 0 && prefix.chars().count() > wrap_width {
+                        let cut = prefix
+                            .char_indices()
+                            .nth(wrap_width.saturating_sub(1))
+                            .map(|(i, _)| i)
+                            .unwrap_or(prefix.len());
+                        format!("{}…", &prefix[..cut])
+                    } else {
+                        prefix
+                    };
+                    items.push(activity_item(&display, Color::rgb(160, 130, 200)));
+                }
+                return items;
             }
 
             // Normal turn: dim header + wrapped prose.
@@ -17433,13 +17477,7 @@ fn parse_json_events_readable(
 
         "tool_use" => {
             let name = json_str(line, "name").unwrap_or_else(|| "?".to_string());
-            let detail = match name.as_str() {
-                "Bash" => json_str(line, "command").unwrap_or_default(),
-                "Edit" | "Write" | "Read" | "Glob" | "NotebookEdit" => {
-                    json_str(line, "file_path").unwrap_or_default()
-                }
-                _ => String::new(),
-            };
+            let detail = tool_detail(&name, line);
             // Compact single line: "  → Bash: <cmd>" or "  → Read: <path>"
             // Wrap the detail if it's very long, but keep the arrow prefix.
             let prefix = if detail.is_empty() {
@@ -17481,8 +17519,9 @@ fn parse_json_events_readable(
     }
 }
 
-/// Like `parse_sse_log_with_timing` but renders using the readable (#385)
-/// format: wrapped prose, arrow-prefixed tool calls, compact turn headers.
+/// Render SSE log lines using the readable (#385) format: wrapped prose,
+/// arrow-prefixed tool calls, one line per tool call, thinking on separate
+/// wrapped lines.  Used by both the Log tab and the live watch overlay.
 /// `wrap_width == 0` disables wrapping.
 fn parse_sse_log_readable(
     lines: &[String],
@@ -26171,15 +26210,33 @@ mod tests {
     }
 
     #[test]
-    fn readable_thinking_only_turn_shows_header() {
+    fn readable_thinking_only_turn_has_thinking_on_separate_line() {
         let line = "{\"type\":\"assistant\",\"message\":{\"content\":[\
-            {\"type\":\"thinking\",\"thinking\":\"considering options\"}]}}";
+            {\"type\":\"thinking\",\"thinking\":\"considering options carefully\"}]}}";
         let mut turn = 0;
         let items = parse_json_events_readable(line, &mut turn, None, 80);
-        // Should be 1 item: a header (possibly with thinking emoji).
-        assert_eq!(items.len(), 1);
-        let text = &items[0].text.spans[0].text;
-        assert!(text.contains("Turn 1"), "should mention turn: {text:?}");
+        // Should be >= 2 items: a Turn N header + at least one thinking line.
+        assert!(
+            items.len() >= 2,
+            "thinking-only turn should have header + thinking lines, got: {:?}",
+            items.iter().map(|i| i.text.spans[0].text.as_str()).collect::<Vec<_>>()
+        );
+        let header = &items[0].text.spans[0].text;
+        assert!(header.contains("Turn 1"), "first item should be turn header: {header:?}");
+        // Thinking must NOT be glued inline to the header.
+        assert!(
+            !header.contains("considering options"),
+            "thinking must not be inline in header: {header:?}"
+        );
+        // Thinking content should appear on a subsequent line.
+        let thinking_text: String = items[1..]
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(
+            thinking_text.contains("considering options"),
+            "thinking should be on separate line(s): {thinking_text:?}"
+        );
     }
 
     #[test]
@@ -26203,6 +26260,82 @@ mod tests {
         let mut turn = 0;
         let items = parse_json_events_readable(line, &mut turn, None, 80);
         assert!(items.is_empty(), "tool_result should be filtered: {:?}", items);
+    }
+
+    #[test]
+    fn readable_grep_tool_use_shows_pattern() {
+        // Top-level tool_use event for Grep should surface the pattern field.
+        let line = r#"{"type":"tool_use","name":"Grep","pattern":"fn foo"}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(text.contains("Grep"), "should name tool: {text:?}");
+        assert!(text.contains("fn foo"), "should show pattern: {text:?}");
+        assert!(text.contains('→'), "should use arrow format: {text:?}");
+    }
+
+    #[test]
+    fn readable_tool_only_assistant_turn_renders_arrow_lines() {
+        // Assistant event with only a tool_use content block (no text block).
+        // The parser should emit one arrow line for the tool, NOT a bare "Turn N".
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"x","name":"Bash","input":{"command":"ls -la"}}]}}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert!(!items.is_empty(), "tool-only turn should produce output");
+        let all_text: String = items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(all_text.contains('→'), "should use arrow format: {all_text:?}");
+        assert!(all_text.contains("Bash"), "should name tool: {all_text:?}");
+        assert!(all_text.contains("ls -la"), "should show command: {all_text:?}");
+        // No bare "Turn 1" without content — the header is dropped for tool-only turns.
+        assert!(
+            !all_text.contains("Turn 1"),
+            "should not have bare Turn N header for tool-only turn: {all_text:?}"
+        );
+    }
+
+    #[test]
+    fn readable_multi_tool_assistant_turn_renders_one_line_per_tool() {
+        // Assistant event with two tool_use content blocks should produce two
+        // arrow lines — one per tool call.
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Read","input":{"file_path":"src/main.rs"}},{"type":"tool_use","id":"b","name":"Grep","input":{"pattern":"fn main"}}]}}"#;
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert!(
+            items.len() >= 2,
+            "multi-tool turn should produce one line per tool, got: {:?}",
+            items.iter().map(|i| i.text.spans[0].text.as_str()).collect::<Vec<_>>()
+        );
+        let all_text: String = items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(all_text.contains("Read"), "should show Read tool: {all_text:?}");
+        assert!(all_text.contains("src/main.rs"), "should show Read path: {all_text:?}");
+        assert!(all_text.contains("Grep"), "should show Grep tool: {all_text:?}");
+        assert!(all_text.contains("fn main"), "should show Grep pattern: {all_text:?}");
+    }
+
+    #[test]
+    fn readable_tool_only_assistant_turn_long_detail_truncated() {
+        // Tool-only turn with a long Bash command — each arrow line must respect
+        // wrap_width via the same truncation logic as the top-level tool_use handler.
+        let cmd = "b".repeat(200);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"x","name":"Bash","input":{{"command":"{cmd}"}}}}]}}}}"#
+        );
+        let mut turn = 0;
+        let items = parse_json_events_readable(&line, &mut turn, None, 80);
+        assert_eq!(items.len(), 1);
+        let text = &items[0].text.spans[0].text;
+        assert!(
+            text.chars().count() <= 80,
+            "tool-only arrow line should be truncated to wrap_width: {} chars",
+            text.chars().count()
+        );
     }
 
     #[test]
