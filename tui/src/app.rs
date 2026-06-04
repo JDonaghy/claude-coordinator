@@ -387,6 +387,9 @@ struct PendingRefineReady {
     /// The assignment id of the refinement worker — only used to recognise
     /// "this is the stop we were waiting on" when CommandResult lands.
     assignment_id: String,
+    /// #410: when true, queue a `coord assign` dispatch immediately after
+    /// `coord ready` succeeds (Send = Save + dispatch to pipeline).
+    then_dispatch: bool,
 }
 
 /// #319 Phase A: synth prompt injected into the refinement chat when the
@@ -3501,15 +3504,10 @@ pub struct CoordApp {
     // ── Issue sync state ─────────────────────────────────────────────────
     /// Last time `coord sync --quiet` was spawned (to rate-limit kicks).
     issue_sync_last: Option<Instant>,
-    // ── Board search / status-group state ───────────────────────────────
+    // ── Board search / milestone state ──────────────────────────────────
     /// Filter state (query / cursor / focus) for the Board sidebar's FILTER box.
     board_search: SidebarFilter,
-    /// Expanded state for each (repo, status_group) pair. Default: true.
-    /// With milestone grouping the status key is prefixed by milestone:
-    /// `"<milestone_key>:<status_key>"` (e.g. `"5:in-flight"` or
-    /// `"no-milestone:backlog"`).
-    board_status_expanded: std::collections::HashMap<(String, String), bool>,
-    /// #406: Expanded state for each (repo, milestone_key) pair.  Default:
+    /// #406/#410: Expanded state for each (repo, milestone_key) pair.  Default:
     /// expanded when the milestone has in-flight items, collapsed otherwise.
     /// milestone_key is the milestone number as a string, or `"no-milestone"`.
     board_milestone_expanded: std::collections::HashMap<(String, String), bool>,
@@ -3656,6 +3654,9 @@ pub struct CoordApp {
     /// sequential dispatch; the poll handler fires this once stop's
     /// CommandResult arrives.
     pending_refine_ready: Option<PendingRefineReady>,
+    /// #410: when true, the next `finalise_refinement_chat()` call should
+    /// also queue a pipeline dispatch after `coord ready` completes.
+    refine_then_dispatch: bool,
     /// #264: cache key for the last chat-transcript rebuild so tick()
     /// can skip the JSON-parsing pass when nothing changed.  Tuple is
     /// `(focused_assignment_id, sse.lines.len(), inject_transcript.len())`.
@@ -4009,7 +4010,6 @@ impl CoordApp {
             last_notify: Instant::now(),
             issue_sync_last: None,
             board_search: SidebarFilter::default(),
-            board_status_expanded: std::collections::HashMap::new(),
             board_milestone_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
@@ -4047,6 +4047,7 @@ impl CoordApp {
             inject_fallback_tx,
             inject_fallback_rx,
             pending_refine_ready: None,
+            refine_then_dispatch: false,
             chat_transcript_cache_key: None,
             chat_last_activity: None,
             chat_spinner_throttle: 0,
@@ -5280,6 +5281,11 @@ impl CoordApp {
     ///   groups omitted and the `board_search` filter applied.
     ///
     /// Sorted: named milestones by number ASC, `"No milestone"` last.
+    ///
+    /// Production rendering uses `board_milestones_for_repo` (flat, no status
+    /// sub-groups).  This function is retained for tests that verify the
+    /// status-bucketing logic.
+    #[allow(dead_code)]
     fn board_milestones_with_status_for_repo<'a>(
         &'a self,
         issues: &'a [(String, Vec<IssueGroup>)],
@@ -5359,6 +5365,70 @@ impl CoordApp {
         result
     }
 
+    /// #410: Group a repo's issues by milestone only (no status sub-grouping).
+    ///
+    /// Returns `Vec<(milestone_key, display_title, issues)>` where:
+    /// - `milestone_key` — `"<n>"` for numbered milestones (e.g. `"5"`), or
+    ///   `"no-milestone"` for unassigned issues.
+    /// - `display_title` — milestone title or `"No milestone"`.
+    /// - `issues` — `Vec<(flat_idx, &IssueGroup)>` in board order with the
+    ///   `board_search` filter applied.
+    ///
+    /// Sorted: named milestones by number ASC, `"No milestone"` last.
+    fn board_milestones_for_repo<'a>(
+        &'a self,
+        issues: &'a [(String, Vec<IssueGroup>)],
+        repo: &str,
+    ) -> Vec<(String, String, Vec<(usize, &'a IssueGroup)>)> {
+        let flat: &[IssueGroup] = match issues.iter().find(|(r, _)| r == repo) {
+            Some((_, v)) => v,
+            None => return Vec::new(),
+        };
+
+        let mut milestone_map: std::collections::BTreeMap<
+            (i64, String),
+            (String, String, Vec<usize>),
+        > = std::collections::BTreeMap::new();
+
+        for (flat_idx, g) in flat.iter().enumerate() {
+            if !self.board_search.matches(g.issue_number, &g.issue_title) {
+                continue;
+            }
+            match g.milestone_number {
+                Some(n) => {
+                    let title = g.milestone_title.clone().unwrap_or_default();
+                    let key = n.to_string();
+                    let sort_key = (n, title.clone());
+                    milestone_map
+                        .entry(sort_key)
+                        .or_insert_with(|| (key, title, Vec::new()))
+                        .2
+                        .push(flat_idx);
+                }
+                None => {
+                    let sort_key = (i64::MAX, String::new());
+                    milestone_map
+                        .entry(sort_key)
+                        .or_insert_with(|| {
+                            ("no-milestone".to_string(), "No milestone".to_string(), Vec::new())
+                        })
+                        .2
+                        .push(flat_idx);
+                }
+            }
+        }
+
+        milestone_map
+            .into_values()
+            .filter(|(_, _, idxs)| !idxs.is_empty())
+            .map(|(key, display_title, idxs)| {
+                let group_issues: Vec<(usize, &IssueGroup)> =
+                    idxs.into_iter().map(|fi| (fi, &flat[fi])).collect();
+                (key, display_title, group_issues)
+            })
+            .collect()
+    }
+
     /// Rebuild the SidebarSystem from current data.
     ///
     /// Layout:
@@ -5366,9 +5436,11 @@ impl CoordApp {
     /// - Section 1: PROPOSALS (only when proposals exist)
     /// - Section 1/2+: one section per repo
     ///
-    /// Within each repo section, issues are grouped by milestone then status:
-    /// Repo > Milestone > Status > Issue. Empty groups are omitted.
-    /// Rows are filtered by `board_search` (case-insensitive substring).
+    /// Within each repo section, issues are grouped by milestone then issue
+    /// (Repo > Milestone > Issue).  Each issue row carries a trailing
+    /// status letter (R/A/D) as a right-aligned badge.  Empty groups are
+    /// omitted.  Rows are filtered by `board_search` (case-insensitive
+    /// substring).
     fn rebuild_board_sidebar(&mut self) {
         self.board_issues_cache = self.issues_by_repo();
         let grouped = &self.board_issues_cache;
@@ -5470,11 +5542,11 @@ impl CoordApp {
             );
         }
 
-        // #406: Build per-repo milestone > status > issue rows.
+        // #410: Build per-repo milestone > issue rows (status sub-group removed).
         //
         // Two-phase loop to satisfy the borrow checker:
         // Phase 1 — inside the block, compute `(total, rows)` using
-        //   `board_milestones_with_status_for_repo` (borrows &self).
+        //   `board_milestones_for_repo` (borrows &self).
         //   `milestones` is dropped at the end of the block.
         // Phase 2 — outside the block, apply mutations to `self.board_sidebar`
         //   (requires &mut self, which is safe once milestones is dropped).
@@ -5485,20 +5557,16 @@ impl CoordApp {
                 // Compute milestone-grouped data for this repo.
                 // milestones holds &IssueGroup refs; it must be dropped before
                 // any &mut self borrow (sidebar mutations) below.
-                let milestones = self.board_milestones_with_status_for_repo(grouped, repo);
+                let milestones = self.board_milestones_for_repo(grouped, repo);
 
-                let total: usize = milestones
-                    .iter()
-                    .flat_map(|(_, _, sgs)| sgs.iter().map(|(_, _, issues)| issues.len()))
-                    .sum();
+                let total: usize = milestones.iter().map(|(_, _, v)| v.len()).sum();
 
                 let mut rows: Vec<TreeRow> = Vec::new();
 
-                for (milestone_idx, (m_key, m_display, status_groups)) in milestones.iter().enumerate() {
+                for (milestone_idx, (m_key, m_display, group_issues)) in milestones.iter().enumerate() {
                     let mi = milestone_idx as u16;
 
-                    let m_total: usize = status_groups.iter().map(|(_, _, v)| v.len()).sum();
-                    let m_has_inflight = status_groups.iter().any(|(_, key, _)| *key == "in-flight");
+                    let m_has_inflight = group_issues.iter().any(|(_, g)| g.lifecycle_section() == "in-flight");
 
                     // Expand state: default to expanded when in-flight, else collapsed.
                     let m_is_exp = *self
@@ -5521,7 +5589,7 @@ impl CoordApp {
                         icon: None,
                         text: StyledText {
                             spans: vec![StyledSpan::with_fg(
-                                format!("{} ({})", m_display, m_total),
+                                format!("{} ({})", m_display, group_issues.len()),
                                 m_header_color,
                             )],
                         },
@@ -5532,80 +5600,32 @@ impl CoordApp {
                     });
 
                     if m_is_exp {
-                        for (status_idx, (display_name, key, group_issues)) in status_groups.iter().enumerate() {
-                            let si = status_idx as u16;
-                            let combined_key = format!("{}:{}", m_key, key);
-                            let is_exp = *self
-                                .board_status_expanded
-                                .get(&(repo.clone(), combined_key))
-                                .unwrap_or(&true);
-
-                            // #256 / #226 lifecycle palette.
-                            let header_color = match *key {
-                                "backlog"   => Color::rgb(140, 140, 160),
-                                "refining"  => Color::rgb(220, 180, 100),
-                                "refined"   => Color::rgb(140, 180, 220),
-                                "in-flight" => Color::rgb(80, 220, 80),
-                                "completed" => Color::rgb(120, 180, 120),
-                                _           => Color::rgb(140, 140, 160),
+                        for (issue_idx, (_flat_idx, g)) in group_issues.iter().enumerate() {
+                            let text = StyledText {
+                                spans: vec![
+                                    StyledSpan::with_fg(
+                                        format!("#{:<5}", g.issue_number),
+                                        Color::rgb(150, 150, 240),
+                                    ),
+                                    StyledSpan::plain(trunc(&g.issue_title, 20)),
+                                ],
                             };
+                            // #410: per-row status letter badge (R/A/D).
+                            let badge = board_row_status_badge(g.lifecycle_section());
                             rows.push(TreeRow {
-                                path: vec![mi, si],
+                                path: vec![mi, issue_idx as u16],
                                 indent: 2,
                                 icon: None,
-                                text: StyledText {
-                                    spans: vec![StyledSpan::with_fg(
-                                        format!("{} ({})", display_name, group_issues.len()),
-                                        header_color,
-                                    )],
+                                text,
+                                badge,
+                                is_expanded: None,
+                                decoration: if g.status_summary == "failed" {
+                                    Decoration::Error
+                                } else {
+                                    Decoration::Normal
                                 },
-                                badge: None,
-                                is_expanded: Some(is_exp),
-                                decoration: Decoration::Header,
                                 edit: None,
                             });
-
-                            if is_exp {
-                                for (issue_idx, (_flat_idx, g)) in group_issues.iter().enumerate() {
-                                    let text = StyledText {
-                                        spans: vec![
-                                            StyledSpan::with_fg(
-                                                format!("#{:<5}", g.issue_number),
-                                                Color::rgb(150, 150, 240),
-                                            ),
-                                            StyledSpan::plain(trunc(&g.issue_title, 20)),
-                                        ],
-                                    };
-                                    // #336: machine badge on Completed rows.
-                                    let badge = if *key == "completed" {
-                                        g.assignments
-                                            .iter()
-                                            .filter(|a| a.assignment_type.as_deref() != Some("refinement"))
-                                            .max_by(|a, b| {
-                                                a.dispatched_at
-                                                    .partial_cmp(&b.dispatched_at)
-                                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                            })
-                                            .map(|a| Badge::colored(&a.machine, Color::rgb(100, 150, 120)))
-                                    } else {
-                                        None
-                                    };
-                                    rows.push(TreeRow {
-                                        path: vec![mi, si, issue_idx as u16],
-                                        indent: 3,
-                                        icon: None,
-                                        text,
-                                        badge,
-                                        is_expanded: None,
-                                        decoration: if g.status_summary == "failed" {
-                                            Decoration::Error
-                                        } else {
-                                            Decoration::Normal
-                                        },
-                                        edit: None,
-                                    });
-                                }
-                            }
                         }
                     }
                 }
@@ -5699,7 +5719,7 @@ impl CoordApp {
     /// Empty groups are omitted so the sidebar doesn't show stub headers.
     ///
     /// Used by tests.  Production rendering goes through
-    /// `board_milestones_with_status_for_repo` instead.
+    /// `board_milestones_for_repo` instead.
     #[allow(dead_code)]
     fn board_grouped_for_repo<'a>(
         &'a self,
@@ -5751,17 +5771,16 @@ impl CoordApp {
             return None;
         }
         let path = self.board_sidebar.selected_path(section)?;
-        if path.len() < 3 {
+        // #410: issue rows are at path depth 2 — [milestone_idx, issue_idx].
+        if path.len() < 2 {
             return None;
         }
         let milestone_idx = path[0] as usize;
-        let status_idx = path[1] as usize;
-        let issue_idx = path[2] as usize;
+        let issue_idx = path[1] as usize;
         let repo = self.board_repo_names.get(section - offset)?;
-        let milestones = self.board_milestones_with_status_for_repo(&self.board_issues_cache, repo);
-        let (_, _, status_groups) = milestones.get(milestone_idx)?;
-        let (_, _, issues_in_group) = status_groups.get(status_idx)?;
-        let (flat_idx, _) = issues_in_group.get(issue_idx)?;
+        let milestones = self.board_milestones_for_repo(&self.board_issues_cache, repo);
+        let (_, _, group_issues) = milestones.get(milestone_idx)?;
+        let (flat_idx, _) = group_issues.get(issue_idx)?;
         let (_, all_issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
         all_issues.get(*flat_idx)
     }
@@ -5819,24 +5838,15 @@ impl CoordApp {
             Some(p) => p,
             None => return false,
         };
-        // Need at least [milestone_idx, status_idx] to identify the group;
-        // an issue row has 3 elements.
+        // #410: issue rows are at path depth 2 — [milestone_idx, issue_idx].
         if path.len() < 2 {
             return false;
         }
-        let milestone_idx = path[0] as usize;
-        let status_idx = path[1] as usize;
-        let repo = match self.board_repo_names.get(section - offset) {
-            Some(r) => r,
-            None => return false,
-        };
-        let milestones = self.board_milestones_with_status_for_repo(&self.board_issues_cache, repo);
-        matches!(
-            milestones
-                .get(milestone_idx)
-                .and_then(|(_, _, sgs)| sgs.get(status_idx)),
-            Some((_, "completed", _))
-        )
+        // Check lifecycle of the actually-selected issue.
+        match self.board_selected_issue_group() {
+            Some(g) => g.lifecycle_section() == "completed",
+            None => false,
+        }
     }
 
     /// Try to select a specific issue in the sidebar by repo and issue number.
@@ -5850,25 +5860,19 @@ impl CoordApp {
         let section_idx = cache_idx + offset;
         // Clone to avoid borrow conflicts.
         let cache = self.board_issues_cache.clone();
-        // #406: milestone > status > issue bucketing — must stay in sync with
-        // `board_milestones_with_status_for_repo` and `rebuild_board_sidebar`
+        // #410: milestone > issue bucketing — must stay in sync with
+        // `board_milestones_for_repo` and `rebuild_board_sidebar`
         // so the path this function produces matches what the click handler resolves to.
-        let milestones = self.board_milestones_with_status_for_repo(&cache, repo);
-        for (milestone_idx, (_, _, status_groups)) in milestones.iter().enumerate() {
-            for (status_idx, (_, _, group_issues)) in status_groups.iter().enumerate() {
-                for (issue_idx, (_, g)) in group_issues.iter().enumerate() {
-                    if g.issue_number == issue_number {
-                        self.board_sidebar.set_active_section(Some(section_idx));
-                        self.board_sidebar.set_selected_path(
-                            section_idx,
-                            Some(vec![
-                                milestone_idx as u16,
-                                status_idx as u16,
-                                issue_idx as u16,
-                            ]),
-                        );
-                        return;
-                    }
+        let milestones = self.board_milestones_for_repo(&cache, repo);
+        for (milestone_idx, (_, _, group_issues)) in milestones.iter().enumerate() {
+            for (issue_idx, (_, g)) in group_issues.iter().enumerate() {
+                if g.issue_number == issue_number {
+                    self.board_sidebar.set_active_section(Some(section_idx));
+                    self.board_sidebar.set_selected_path(
+                        section_idx,
+                        Some(vec![milestone_idx as u16, issue_idx as u16]),
+                    );
+                    return;
                 }
             }
         }
@@ -11523,14 +11527,14 @@ impl CoordApp {
                 match result {
                     SidebarEvent::RowSelected { section, ref path } => {
                         if path.len() == 1 {
-                            // #406: click on a milestone header — toggle milestone expansion.
+                            // #410: click on a milestone header — toggle milestone expansion.
                             let offset = self.board_repo_offset();
                             if section >= offset {
                                 let repo_idx = section - offset;
                                 if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
                                     let milestone_idx = path[0] as usize;
                                     let cache = self.board_issues_cache.clone();
-                                    let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
+                                    let milestones = self.board_milestones_for_repo(&cache, &repo);
                                     if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
                                         let m_key = m_key.clone();
                                         let entry = self.board_milestone_expanded
@@ -11541,42 +11545,22 @@ impl CoordApp {
                                     }
                                 }
                             }
-                        } else if path.len() == 2 {
-                            // #406: click on a status-group header inside a milestone.
-                            let offset = self.board_repo_offset();
-                            if section >= offset {
-                                let repo_idx = section - offset;
-                                if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
-                                    let milestone_idx = path[0] as usize;
-                                    let status_idx = path[1] as usize;
-                                    let cache = self.board_issues_cache.clone();
-                                    let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
-                                    if let Some((m_key, _, status_groups)) = milestones.get(milestone_idx) {
-                                        if let Some((_, s_key, _)) = status_groups.get(status_idx) {
-                                            let combined = format!("{}:{}", m_key, s_key);
-                                            let entry = self.board_status_expanded
-                                                .entry((repo, combined))
-                                                .or_insert(true);
-                                            *entry = !*entry;
-                                            self.rebuild_board_sidebar();
-                                        }
-                                    }
-                                }
-                            }
                         } else {
+                            // path.len() == 2: issue row — reset detail scroll.
                             self.detail_scroll = 0;
                         }
                         true
                     }
                     SidebarEvent::RowActivated { section, ref path } => {
                         if path.len() == 1 {
+                            // Activate on a milestone header — toggle expansion.
                             let offset = self.board_repo_offset();
                             if section >= offset {
                                 let repo_idx = section - offset;
                                 if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
                                     let milestone_idx = path[0] as usize;
                                     let cache = self.board_issues_cache.clone();
-                                    let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
+                                    let milestones = self.board_milestones_for_repo(&cache, &repo);
                                     if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
                                         let m_key = m_key.clone();
                                         let entry = self.board_milestone_expanded
@@ -11587,28 +11571,8 @@ impl CoordApp {
                                     }
                                 }
                             }
-                        } else if path.len() == 2 {
-                            let offset = self.board_repo_offset();
-                            if section >= offset {
-                                let repo_idx = section - offset;
-                                if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
-                                    let milestone_idx = path[0] as usize;
-                                    let status_idx = path[1] as usize;
-                                    let cache = self.board_issues_cache.clone();
-                                    let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
-                                    if let Some((m_key, _, status_groups)) = milestones.get(milestone_idx) {
-                                        if let Some((_, s_key, _)) = status_groups.get(status_idx) {
-                                            let combined = format!("{}:{}", m_key, s_key);
-                                            let entry = self.board_status_expanded
-                                                .entry((repo, combined))
-                                                .or_insert(true);
-                                            *entry = !*entry;
-                                            self.rebuild_board_sidebar();
-                                        }
-                                    }
-                                }
-                            }
                         } else {
+                            // path.len() == 2: issue row activate — reset detail scroll.
                             self.detail_scroll = 0;
                         }
                         true
@@ -11625,37 +11589,22 @@ impl CoordApp {
                         self.board_sidebar.focus_form(0, true);
                         true
                     }
-                    // #406: Chevron click on a milestone or status-group header row.
-                    SidebarEvent::RowToggleExpand { section, ref path } if path.len() <= 2 => {
+                    // #410: Chevron click on a milestone header row (only depth-1 rows are headers).
+                    SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
                         let offset = self.board_repo_offset();
                         if section >= offset {
                             let repo_idx = section - offset;
                             if let Some(repo) = self.board_repo_names.get(repo_idx).cloned() {
                                 let cache = self.board_issues_cache.clone();
-                                let milestones = self.board_milestones_with_status_for_repo(&cache, &repo);
-                                if path.len() == 1 {
-                                    let milestone_idx = path[0] as usize;
-                                    if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
-                                        let m_key = m_key.clone();
-                                        let entry = self.board_milestone_expanded
-                                            .entry((repo, m_key))
-                                            .or_insert(true);
-                                        *entry = !*entry;
-                                        self.rebuild_board_sidebar();
-                                    }
-                                } else if path.len() == 2 {
-                                    let milestone_idx = path[0] as usize;
-                                    let status_idx = path[1] as usize;
-                                    if let Some((m_key, _, status_groups)) = milestones.get(milestone_idx) {
-                                        if let Some((_, s_key, _)) = status_groups.get(status_idx) {
-                                            let combined = format!("{}:{}", m_key, s_key);
-                                            let entry = self.board_status_expanded
-                                                .entry((repo, combined))
-                                                .or_insert(true);
-                                            *entry = !*entry;
-                                            self.rebuild_board_sidebar();
-                                        }
-                                    }
+                                let milestones = self.board_milestones_for_repo(&cache, &repo);
+                                let milestone_idx = path[0] as usize;
+                                if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
+                                    let m_key = m_key.clone();
+                                    let entry = self.board_milestone_expanded
+                                        .entry((repo, m_key))
+                                        .or_insert(true);
+                                    *entry = !*entry;
+                                    self.rebuild_board_sidebar();
                                 }
                             }
                         }
@@ -12426,6 +12375,19 @@ impl CoordApp {
             items.push(ContextMenuItem::action("drop-to-refining", "Drop to Refining"));
             items.push(ContextMenuItem::separator());
         }
+        // #410: "Send" dispatches the issue as a work assignment directly
+        // (coord assign), regardless of status.  Skipped for Completed
+        // (already done) and Unknown (no issue context).
+        if matches!(
+            lifecycle,
+            BoardRowLifecycle::Backlog
+                | BoardRowLifecycle::Refining
+                | BoardRowLifecycle::Refined
+                | BoardRowLifecycle::InFlight
+        ) {
+            items.push(ContextMenuItem::action("board-send", "Send"));
+            items.push(ContextMenuItem::separator());
+        }
         if let Some(num) = issue_number {
             items.push(ContextMenuItem::action(
                 "copy-issue-number",
@@ -12826,36 +12788,36 @@ impl CoordApp {
             });
         }
 
-        // ── Refinement-chat close ────────────────────────────────────────
+        // ── Refinement-chat close (#410: Cancel / Save / Send) ──────────
         if let Some(ref p) = self.pending_refinement_close_prompt {
             return Some(Dialog {
                 id: WidgetId::new("dialog:refinement-close"),
-                title: StyledText::plain("Save Refinement Notes?"),
+                title: StyledText::plain("Close Refinement Chat"),
                 body: vec![StyledText::plain(format!(
-                    "Save notes for issue #{} before closing?",
+                    "What do you want to do with issue #{}?",
                     p.issue_number
                 ))],
                 buttons: vec![
                     DialogButton {
-                        id: WidgetId::new("yes"),
-                        label: "Y  Draft + post, then mark ready".into(),
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Cancel — discard, issue unchanged".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("save"),
+                        label: "S  Save — draft notes + mark ready".into(),
                         is_default: true,
                         is_cancel: false,
                         tint: None,
                     },
                     DialogButton {
-                        id: WidgetId::new("no"),
-                        label: "N  Mark ready without notes".into(),
+                        id: WidgetId::new("send"),
+                        label: "D  Send — save + dispatch to pipeline".into(),
                         is_default: false,
                         is_cancel: false,
-                        tint: None,
-                    },
-                    DialogButton {
-                        id: WidgetId::new("cancel"),
-                        label: "Esc  Keep chatting".into(),
-                        is_default: false,
-                        is_cancel: true,
-                        tint: None,
+                        tint: Some(Color::rgb(60, 180, 220)),
                     },
                 ],
                 severity: Some(DialogSeverity::Question),
@@ -13182,10 +13144,11 @@ impl CoordApp {
             return;
         }
 
-        // ── Refinement-close ─────────────────────────────────────────────
+        // ── Refinement-close (#410: Cancel/Save/Send) ────────────────────
         if self.pending_refinement_close_prompt.is_some() {
             match id {
-                "yes" => {
+                "save" => {
+                    // Save: draft notes + mark ready, stay on Board.
                     self.pending_refinement_close_prompt = None;
                     self.finalise_after_notes_post = true;
                     self.trigger_refinement_notes_synth();
@@ -13193,13 +13156,21 @@ impl CoordApp {
                         self.finalise_after_notes_post = false;
                     }
                 }
-                "no" => {
+                "send" => {
+                    // Send: draft notes + mark ready + dispatch to pipeline.
                     self.pending_refinement_close_prompt = None;
-                    self.finalise_refinement_chat();
-                    self.inject_chat = None;
+                    self.finalise_after_notes_post = true;
+                    self.refine_then_dispatch = true;
+                    self.trigger_refinement_notes_synth();
+                    if self.pending_refinement_notes_synth.is_none() {
+                        self.finalise_after_notes_post = false;
+                        self.refine_then_dispatch = false;
+                    }
                 }
                 _ => {
+                    // Cancel (Esc / outside click): discard, issue unchanged.
                     self.pending_refinement_close_prompt = None;
+                    self.cancel_refinement_chat();
                 }
             }
             *self.dialog_layout.borrow_mut() = None;
@@ -13384,17 +13355,41 @@ impl CoordApp {
         // — leaves a clean sequence (stop → ready), and a failed stop
         // keeps the issue in status:refining rather than racing the label
         // flip.
+        let then_dispatch = std::mem::take(&mut self.refine_then_dispatch);
         self.command_runner.spawn(&["stop", &aid]);
         self.pending_refine_ready = Some(PendingRefineReady {
             repo,
             issue_number: issue_n,
             assignment_id: aid,
+            then_dispatch,
         });
+        let action = if then_dispatch { "stopping worker, then marking ready + dispatching…" }
+                     else { "stopping worker, then marking ready…" };
         self.push_toast(
             "Refine with chat",
-            &format!("#{}: stopping worker, then marking ready…", issue_n),
+            &format!("#{}: {}", issue_n, action),
             ToastSeverity::Info,
         );
+    }
+
+    /// #410: Stop the refinement worker without flipping any status labels.
+    /// Used when the user picks Cancel in the close dialog — the issue stays
+    /// in its current state (Refining / Backlog / whatever).
+    fn cancel_refinement_chat(&mut self) {
+        self.refine_then_dispatch = false;
+        if let Some(id) = self.watch_focused.clone() {
+            self.command_runner.spawn(&["stop", &id]);
+            let issue_n = self.watch_pool.get(&id).map(|c| c.state.issue_number).unwrap_or(0);
+            if issue_n != 0 {
+                self.push_toast(
+                    "Refine cancelled",
+                    &format!("#{}: stopping worker, no label change.", issue_n),
+                    ToastSeverity::Info,
+                );
+            }
+        }
+        self.inject_chat = None;
+        self.watch_focused = None;
     }
 
     /// #319 Phase A: trigger the "Add refinement notes" finaliser.  Called
@@ -14725,6 +14720,72 @@ impl CoordApp {
         true
     }
 
+    /// #410: Dispatch a Board row's issue directly as a work assignment
+    /// (`coord assign <machine> <repo> <issue>`), bypassing any label changes
+    /// or refinement steps.  Works regardless of the issue's current status.
+    fn dispatch_board_row_direct(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo, num) = match target {
+            ContextMenuTarget::BoardRow {
+                issue_number: Some(num),
+                repo_name: Some(repo),
+                ..
+            } => (repo.clone(), *num),
+            _ => {
+                self.push_toast(
+                    "Send unavailable",
+                    "No issue + repo target — focus a row first.",
+                    ToastSeverity::Info,
+                );
+                return false;
+            }
+        };
+        let Some(machine) = self.best_machine_for(&repo).cloned() else {
+            self.push_toast(
+                "Send",
+                &format!("#{}: no reachable machine for {} — check coordinator.yml.", num, repo),
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let machine_name = machine.name.clone();
+        let issue_str = num.to_string();
+        let model_str = self
+            .settings
+            .machine_model
+            .get(&machine_name)
+            .map(|p| p.as_str().to_string());
+        let mut cmd: Vec<String> = vec![
+            "assign".into(),
+            machine_name.clone(),
+            repo.clone(),
+            issue_str,
+        ];
+        if let Some(ref m) = model_str {
+            cmd.push("--model".into());
+            cmd.push(m.clone());
+        }
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let spawned = self.command_runner.spawn(&cmd_refs);
+        if spawned {
+            self.push_toast(
+                "Send",
+                &format!("#{} dispatched → {}", num, machine_name),
+                ToastSeverity::Info,
+            );
+            // Kick the pipeline loader so the issue appears in Pipeline:New
+            // (and then In-progress) without waiting for the 60 s refresh.
+            self.pipeline_last_load = None;
+            self.maybe_kick_pipeline_loader();
+        } else {
+            self.push_toast(
+                "Send",
+                "Another command is running — try again in a moment.",
+                ToastSeverity::Warning,
+            );
+        }
+        spawned
+    }
+
     /// Route a context-menu `action_id` to the right behaviour.
     /// Stub actions for the MVP (#259); subsequent issues replace with
     /// row-state-specific dispatch.
@@ -14831,6 +14892,9 @@ impl CoordApp {
                 "Mark Refined",
                 "#{} → Refined (tagging status:ready…)",
             ),
+            // #410: Send — dispatch the issue as a work assignment directly
+            // (coord assign <machine> <repo> <issue>), regardless of status.
+            "board-send" => self.dispatch_board_row_direct(target),
             // #266: Refining → Backlog (strips status:refining).
             // Refined → Refining is handled by `coord refine` which
             // also removes status:ready, so `drop-to-refining` reuses
@@ -14977,6 +15041,22 @@ fn union_rects(a: Option<Rect>, b: Rect) -> Rect {
     let right = (a.x + a.width).max(b.x + b.width);
     let bottom = (a.y + a.height).max(b.y + b.height);
     Rect::new(x, y, right - x, bottom - y)
+}
+
+/// #410: Per-issue status badge for the Board tree.
+///
+/// Returns the color-coded single-letter badge shown trailing each issue row:
+/// - `"R"` (yellow)  — `status:refining` OR `status:ready` (refined-but-not-dispatched)
+/// - `"A"` (cyan)    — in-flight / dispatched
+/// - `"D"` (dim)     — completed
+/// - `None`          — backlog (unrefined, no badge shown)
+fn board_row_status_badge(lifecycle: &str) -> Option<Badge> {
+    match lifecycle {
+        "refining" | "refined" => Some(Badge::colored("R", Color::rgb(220, 180, 50))),
+        "in-flight" => Some(Badge::colored("A", Color::rgb(60, 180, 220))),
+        "completed" => Some(Badge::colored("D", Color::rgb(100, 100, 110))),
+        _ => None, // backlog — blank
+    }
 }
 
 /// Convert an engine-side `ContextMenuState` into the `quadraui::ContextMenu`
@@ -15694,6 +15774,55 @@ impl CoordApp {
                             "Couldn't mark ready — coord runner busy.",
                             ToastSeverity::Warning,
                         );
+                    }
+                    // #410: Send path — queue coord assign to run after coord ready.
+                    if p.then_dispatch {
+                        if let Some(machine) = self.best_machine_for(&p.repo).cloned() {
+                            let machine_name = machine.name.clone();
+                            let model_str = self
+                                .settings
+                                .machine_model
+                                .get(&machine_name)
+                                .map(|mp| mp.as_str().to_string());
+                            let issue_str2 = p.issue_number.to_string();
+                            let mut cmd: Vec<String> = vec![
+                                "assign".into(),
+                                machine_name.clone(),
+                                p.repo.clone(),
+                                issue_str2,
+                            ];
+                            if let Some(ref m) = model_str {
+                                cmd.push("--model".into());
+                                cmd.push(m.clone());
+                            }
+                            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+                            use crate::commands::SpawnQueuedOutcome;
+                            match self.command_runner.spawn_queued(&cmd_refs) {
+                                SpawnQueuedOutcome::Started => {
+                                    self.push_toast(
+                                        "Send",
+                                        &format!("#{} dispatched → {}", p.issue_number, machine_name),
+                                        ToastSeverity::Info,
+                                    );
+                                }
+                                SpawnQueuedOutcome::Queued => {
+                                    self.push_toast(
+                                        "Send",
+                                        &format!("#{}: dispatch queued → {}", p.issue_number, machine_name),
+                                        ToastSeverity::Info,
+                                    );
+                                }
+                                SpawnQueuedOutcome::Deduped => {}
+                            }
+                            self.pipeline_last_load = None;
+                            self.maybe_kick_pipeline_loader();
+                        } else {
+                            self.push_toast(
+                                "Send",
+                                &format!("#{}: ready — but no reachable machine for {}.", p.issue_number, p.repo),
+                                ToastSeverity::Warning,
+                            );
+                        }
                     }
                 }
             }
@@ -16789,34 +16918,36 @@ impl ShellApp for CoordApp {
             return Reaction::Redraw;
         }
 
-        // ── #328: refinement-chat close prompt — Y/N/Esc on the status bar
-        // owns all input while the user decides whether to draft notes.
-        // The chat overlay stays rendered behind the hint so the user can
-        // read the transcript before answering.  Y triggers the notes
-        // synth and chains finalise on successful post; N finalises
-        // immediately; Esc cancels and returns the user to the chat.
+        // ── #410: refinement-chat close dialog — Cancel/Save/Send.
+        // Esc=Cancel (discard), S=Save (notes+ready), D=Send (notes+ready+dispatch).
+        // The chat overlay stays rendered behind the dialog.
         if self.pending_refinement_close_prompt.is_some() {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 match key {
-                    Key::Char('y') | Key::Char('Y') => {
+                    Key::Named(NamedKey::Escape) => {
+                        // Cancel — discard, issue unchanged, just stop the worker.
+                        self.pending_refinement_close_prompt = None;
+                        self.cancel_refinement_chat();
+                    }
+                    Key::Char('s') | Key::Char('S') => {
+                        // Save — draft notes + mark ready, stay on Board.
                         self.pending_refinement_close_prompt = None;
                         self.finalise_after_notes_post = true;
                         self.trigger_refinement_notes_synth();
-                        // If synth bailed out (no slug, dispatch busy,
-                        // etc.) it toasted and didn't arm — clear the
-                        // commitment so it can't quietly finalise on a
-                        // later Phase-A Ctrl+N flow.
                         if self.pending_refinement_notes_synth.is_none() {
                             self.finalise_after_notes_post = false;
                         }
                     }
-                    Key::Char('n') | Key::Char('N') => {
+                    Key::Char('d') | Key::Char('D') => {
+                        // Send — draft notes + mark ready + dispatch to pipeline.
                         self.pending_refinement_close_prompt = None;
-                        self.finalise_refinement_chat();
-                        self.inject_chat = None;
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        self.pending_refinement_close_prompt = None;
+                        self.finalise_after_notes_post = true;
+                        self.refine_then_dispatch = true;
+                        self.trigger_refinement_notes_synth();
+                        if self.pending_refinement_notes_synth.is_none() {
+                            self.finalise_after_notes_post = false;
+                            self.refine_then_dispatch = false;
+                        }
                     }
                     _ => {}
                 }
@@ -16918,35 +17049,29 @@ impl ShellApp for CoordApp {
                     ChatControllerEvent::Cancelled => {
                         // Worker-guidance chat: Esc just closes the modal
                         // (worker keeps running because the user is
-                        // mid-task).  Refinement chat: Esc finalises —
-                        // stop the worker + flip status:refining →
-                        // status:ready.
+                        // mid-task).
                         //
-                        // #328: when the refinement chat has any user
-                        // turns, defer the finalise and offer the notes
-                        // finaliser via a Y/N/Esc status-bar prompt.  The
-                        // chat overlay stays visible so the user can read
-                        // the transcript while deciding.  Empty chats
-                        // (user hit Esc without engaging) still fast-exit.
+                        // #410: Refinement chat: Esc always shows the
+                        // Cancel/Save/Send dialog so the user can choose
+                        // to discard, save notes+mark-ready, or save+dispatch.
                         //
                         // #316 Board chat: Esc just closes the overlay;
                         // no status label to flip since there's no issue.
                         if chat_is_refinement {
-                            let has_user_turns = self.watch_focused.as_ref()
-                                .and_then(|id| self.watch_pool.get(id))
-                                .map(|ctx| !ctx.inject_transcript.is_empty())
-                                .unwrap_or(false);
                             let issue_n = self.focused_watch_state()
                                 .map(|w| w.issue_number)
                                 .unwrap_or(0);
-                            if has_user_turns && issue_n != 0 {
+                            if issue_n != 0 {
                                 self.pending_refinement_close_prompt =
                                     Some(PendingRefinementClosePrompt { issue_number: issue_n });
-                                // Leave inject_chat open — the prompt is a
-                                // status-bar overlay above it.
+                                // Leave inject_chat open — the dialog renders
+                                // on top of it so the user can read the
+                                // transcript while deciding.
                                 return Reaction::Redraw;
                             }
-                            self.finalise_refinement_chat();
+                            // No issue context (shouldn't happen in practice) —
+                            // fall back to immediate cancel.
+                            self.cancel_refinement_chat();
                         }
                         // Board chats: stop the worker, clear chat.
                         if chat_is_board {
@@ -18565,8 +18690,9 @@ impl ShellApp for CoordApp {
                                 // the chat continues seamlessly.  Never show
                                 // a "read-only" warning here; the prompt
                                 // suffix stays send-enabled.
+                                // #410: Esc now shows Cancel/Save/Send dialog.
                                 (Some("refinement"), _, false) => {
-                                    "  (Ctrl+S/Alt+Enter = send · Ctrl+N = post notes · Esc = finish)"
+                                    "  (Ctrl+S/Alt+Enter = send · Ctrl+N = notes · Esc = Cancel/Save/Send)"
                                 }
                                 // #316: board chats — no notes, but Ctrl+F = file issue for new-issue-chat.
                                 (Some("new-issue-chat"), _, true) => {
@@ -19747,7 +19873,6 @@ mod tests {
             last_notify: Instant::now(),
             issue_sync_last: None,
             board_search: SidebarFilter::default(),
-            board_status_expanded: std::collections::HashMap::new(),
             board_milestone_expanded: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
@@ -19785,6 +19910,7 @@ mod tests {
             inject_fallback_tx,
             inject_fallback_rx,
             pending_refine_ready: None,
+            refine_then_dispatch: false,
             chat_transcript_cache_key: None,
             chat_last_activity: None,
             chat_spinner_throttle: 0,
@@ -20858,8 +20984,8 @@ mod tests {
 
     #[test]
     fn board_select_issue_uses_two_level_path() {
-        // Two open issues with assignments → both in the single
-        // In-flight group.  #406: path is now 3-level: [milestone=0, status=0, issue_idx].
+        // Two open issues with assignments → both under the No-milestone group.
+        // #410: path is now 2-level: [milestone_idx=0, issue_idx].
         let assignments = vec![
             make_assignment_typed("running", 10, "repo-a", Some("work")),
             make_assignment_typed("done", 20, "repo-a", Some("work")),
@@ -20870,12 +20996,12 @@ mod tests {
         seed_open_issue_records(&mut app, "repo-a", &[10, 20]);
         app.select_issue("repo-a", 20);
         let path = app.board_sidebar.selected_path(1).cloned();
-        // The flat order inside In-flight (within the No-milestone group) is
-        // sorted-by-issue-number; #20 sits at index 1.
-        // Accept both orderings in case the status group index shifts.
+        // The flat order inside the No-milestone group is sorted by issue
+        // number; #20 sits at index 1 (after #10).
+        // Accept both orderings in case sort order differs.
         assert!(
-            path == Some(vec![0u16, 0u16, 1u16]) || path == Some(vec![0u16, 0u16, 0u16]),
-            "selected issue must land inside the single In-flight group, got {:?}",
+            path == Some(vec![0u16, 1u16]) || path == Some(vec![0u16, 0u16]),
+            "selected issue must be a 2-level path [milestone, issue], got {:?}",
             path,
         );
         let sel = app.board_selected_issue();
@@ -26207,11 +26333,10 @@ mod tests {
         assert!(opened, "context menu should open for a Board row");
         let state = app.pending_context_menu.expect("state set");
         assert!(!state.items.is_empty());
-        // First action item is the keyboard focus.  In-flight rows
-        // don't get a Refine, so Copy is first.
+        // #410: In-flight rows now get a "Send" action first (direct dispatch).
         assert_eq!(
             state.items[state.selected_idx].action_id.as_deref(),
-            Some("copy-issue-number"),
+            Some("board-send"),
         );
         assert!(state.items.iter().any(|it| it.label.contains("#42")));
     }
@@ -26232,15 +26357,16 @@ mod tests {
             Point::new(0.0, 0.0),
             board_target(Some(1), BoardRowLifecycle::InFlight),
         );
-        // Layout (Copy / separator / Refresh) — move forward should land
-        // on Refresh, not the separator.
+        // #410: InFlight layout — Send / separator / Copy / separator / Refresh.
+        // First item (selected) is "board-send"; moving forward should skip
+        // the separator and land on "copy-issue-number".
         let state_before = app.pending_context_menu.clone().unwrap();
         app.context_menu_move_selection(1);
         let state_after = app.pending_context_menu.clone().unwrap();
         assert_ne!(state_before.selected_idx, state_after.selected_idx);
         assert_eq!(
             state_after.items[state_after.selected_idx].action_id.as_deref(),
-            Some("refresh"),
+            Some("copy-issue-number"),
         );
     }
 
@@ -26256,7 +26382,8 @@ mod tests {
         assert!(fired);
         // Menu dismissed.
         assert!(app.pending_context_menu.is_none());
-        // Copy is a stub that pushes a toast.
+        // #410: First item is "board-send"; in a test app with no machines it
+        // toasts "no reachable machine" — still exactly one toast emitted.
         assert_eq!(app.toasts.len(), before + 1);
     }
 
@@ -28137,9 +28264,9 @@ mod tests {
     }
 
     #[test]
-    fn milestone_grouping_select_issue_round_trips_three_level_path() {
-        // An issue with a milestone: select_issue builds a 3-level path and
-        // board_selected_issue resolves it back to the same (repo, number).
+    fn milestone_grouping_select_issue_round_trips_two_level_path() {
+        // #410: An issue with a milestone: select_issue builds a 2-level path
+        // [milestone_idx, issue_idx] and board_selected_issue resolves it back.
         let mut app = make_app_default();
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -28159,11 +28286,11 @@ mod tests {
             Some(("repo-a".to_string(), 42)),
             "select_issue + board_selected_issue should round-trip",
         );
-        // Path must be exactly 3-level: [milestone_idx, status_idx, issue_idx].
+        // #410: Path must be exactly 2-level: [milestone_idx, issue_idx].
         let path = app.board_sidebar.selected_path(1).cloned();
         assert!(
-            path.as_ref().map(|p| p.len()) == Some(3),
-            "path should be 3-level, got {:?}",
+            path.as_ref().map(|p| p.len()) == Some(2),
+            "path should be 2-level, got {:?}",
             path,
         );
     }
