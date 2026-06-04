@@ -1459,9 +1459,14 @@ class AgentServer:
         # test path silent.
         if has_origin:
             try:
-                _git(repo_path, "fetch", "origin")
+                # --prune (#412): drop stale refs/remotes/origin/<branch> for
+                # branches deleted on origin. Without it, a deleted branch's
+                # remote-tracking ref lingers at its old SHA and the
+                # origin_has_branch check below branches a "fresh" worker off
+                # that dead ref — silently reimplementing on stale code.
+                _git(repo_path, "fetch", "origin", "--prune")
             except _GitError:
-                pass  # transient — falls through to the rev-parse check below
+                pass  # transient — origin_has_branch is cross-checked via ls-remote
 
         default_branch = assignment.spec.branch or "main"
         if has_origin:
@@ -1550,6 +1555,19 @@ class AgentServer:
                     origin_has_branch = True
                 except _GitError:
                     pass
+                # #412 guard: a local refs/remotes/origin/<branch> can be stale
+                # (deleted on origin but not pruned). Confirm against the actual
+                # remote so a "fresh" worker can't branch off a dead ref's SHA.
+                if origin_has_branch:
+                    try:
+                        remote_heads = _git(
+                            repo_path, "ls-remote", "--heads",
+                            "origin", branch_name,
+                        )
+                        if not remote_heads.strip():
+                            origin_has_branch = False
+                    except _GitError:
+                        pass  # network hiccup — trust the (pruned) local ref
             try:
                 _git(
                     repo_path, "rev-parse", "--verify",
