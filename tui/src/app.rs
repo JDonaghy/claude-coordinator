@@ -883,6 +883,35 @@ fn parse_test_plan_steps(raw: &str) -> Option<Vec<TestPlanStep>> {
     Some(result)
 }
 
+/// #349: Return the original index of the first `kind: "pull"` step in
+/// *steps*, or `None` when no pull step exists.  Pulled into a free
+/// function so the keybind-mapping rule ("pull steps own the `[a]` key")
+/// can be unit-tested without constructing an `App`.
+fn pull_step_index(steps: &[TestPlanStep]) -> Option<usize> {
+    steps.iter().position(|s| s.kind == "pull")
+}
+
+/// #349: Return the original index of the `key_num`-th non-pull step
+/// (1-indexed) in *steps*, or `None` when `key_num` exceeds the count of
+/// non-pull steps.  Pull steps are excluded from the 1–9 numbering — they
+/// own the `[a]` keybind instead.  Pulled into a free function so the
+/// number-key → step-index mapping can be unit-tested without an `App`.
+fn runnable_step_index(steps: &[TestPlanStep], key_num: usize) -> Option<usize> {
+    if key_num == 0 {
+        return None;
+    }
+    let mut count = 0usize;
+    for (i, step) in steps.iter().enumerate() {
+        if step.kind != "pull" {
+            count += 1;
+            if count == key_num {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 /// #349: Read the current HEAD SHA for a git branch by examining the local
 /// `.git` directory directly — fast (just file I/O) and safe to call from
 /// the render thread.  Returns `None` when the file doesn't exist, is
@@ -7920,10 +7949,7 @@ impl CoordApp {
                     .partial_cmp(&b.dispatched_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })?;
-        work.test_plan
-            .as_ref()?
-            .iter()
-            .position(|s| s.kind == "pull")
+        pull_step_index(work.test_plan.as_ref()?)
     }
 
     /// #349: Return the original step index of the `key_num`-th non-pull step
@@ -7954,16 +7980,7 @@ impl CoordApp {
                     .partial_cmp(&b.dispatched_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })?;
-        let mut count = 0usize;
-        for (i, step) in work.test_plan.as_ref()?.iter().enumerate() {
-            if step.kind != "pull" {
-                count += 1;
-                if count == key_num {
-                    return Some(i);
-                }
-            }
-        }
-        None
+        runnable_step_index(work.test_plan.as_ref()?, key_num)
     }
 
     // ── #336 artifact helpers ────────────────────────────────────────────────
@@ -10484,7 +10501,7 @@ impl CoordApp {
     ///
     /// Shows the AI-generated smoke test plan as a "SMOKE TEST PLAN" system
     /// block at the top, with numbered steps that the user can run via keys
-    /// 1–8.  Below that, the cached `coord test` build log is rendered as
+    /// 1–9.  Below that, the cached `coord test` build log is rendered as
     /// before.
     fn stage_content_test(&self, issue: &PipelineIssue) -> Vec<ListItem> {
         // Find the latest work assignment.
@@ -12245,9 +12262,9 @@ impl CoordApp {
             // #235: include B (Phase 1 build) when no build is already in
             // flight for this work id.  #314: always include T=test-chat.
             if self.can_trigger_test_build() {
-                " Test gate: B=build  T=chat  1–8=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
+                " Test gate: B=build  T=chat  1–9=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             } else {
-                " Test gate: T=chat  1–8=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
+                " Test gate: T=chat  1–9=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             }
         } else if self.can_bounce_work_after_test_fail() {
             // #236: Test just failed — the user's next step is to fix the
@@ -18210,16 +18227,17 @@ impl ShellApp for CoordApp {
                     // a pull step, [a] triggers that step via `run_test_plan_step`
                     // (which now captures stdout/stderr).  This arm fires BEFORE
                     // the #336 artifact-badge arm so only one action is taken —
-                    // preventing two concurrent pulls.
+                    // preventing two concurrent pulls.  Uses `if let` in the
+                    // match guard (stable since Rust 1.88) so the pull-step
+                    // index is resolved exactly once per keypress and reused in
+                    // the arm body.
                     Key::Char('a')
                         if self.active_view == SidebarView::Pipeline
                             && self.test_gate_actionable()
                             && self.is_test_stage_focused()
-                            && self.test_plan_pull_step_idx().is_some() =>
+                            && let Some(pull_idx) = self.test_plan_pull_step_idx() =>
                     {
-                        if let Some(pull_idx) = self.test_plan_pull_step_idx() {
-                            self.run_test_plan_step(pull_idx);
-                        }
+                        self.run_test_plan_step(pull_idx);
                         needs_redraw = true;
                     }
 
@@ -28265,6 +28283,87 @@ mod tests {
         let wide = "A̐éö̲\u{20000}"; // combining chars + surrogate-range codepoint
         let safe: String = wide.chars().take(2).collect();
         assert_eq!(safe.chars().count(), 2);
+    }
+
+    // Build a TestPlanStep with just the kind set — the keybind-mapping
+    // helpers only inspect `kind`, so empty cmd/label/check is fine.
+    fn step(kind: &str) -> TestPlanStep {
+        TestPlanStep {
+            kind: kind.to_string(),
+            cmd: None,
+            label: None,
+            check: None,
+        }
+    }
+
+    /// #349 keybind-mapping: pull steps own `[a]`; non-pull steps get keys 1–9
+    /// in source order.  `runnable_step_index(N)` returns the original index
+    /// of the Nth non-pull step (skipping any pull steps in between);
+    /// `pull_step_index()` returns the index of the first pull step.
+    #[test]
+    fn pull_and_runnable_indexes_skip_pull_steps() {
+        // Plan layout (original index → kind):
+        //   0 → run     ← runnable_step_index(1)
+        //   1 → pull    ← pull_step_index()
+        //   2 → run     ← runnable_step_index(2)
+        //   3 → verify  ← runnable_step_index(3)
+        //   4 → run     ← runnable_step_index(4)
+        let steps = vec![
+            step("run"),
+            step("pull"),
+            step("run"),
+            step("verify"),
+            step("run"),
+        ];
+
+        // Pull step keybind ([a]) → first pull step's original index.
+        assert_eq!(pull_step_index(&steps), Some(1));
+
+        // Number keys 1..=4 → consecutive non-pull steps in source order.
+        assert_eq!(runnable_step_index(&steps, 1), Some(0), "key 1 → step 0 (run)");
+        assert_eq!(runnable_step_index(&steps, 2), Some(2), "key 2 skips pull");
+        assert_eq!(runnable_step_index(&steps, 3), Some(3), "key 3 → verify");
+        assert_eq!(runnable_step_index(&steps, 4), Some(4), "key 4 → step 4 (run)");
+
+        // Out-of-range key returns None — no spurious step fires.
+        assert_eq!(runnable_step_index(&steps, 5), None);
+        assert_eq!(runnable_step_index(&steps, 9), None);
+        // key_num=0 is also None — the keybind handler passes 1..=9 only,
+        // but be explicit about the lower bound.
+        assert_eq!(runnable_step_index(&steps, 0), None);
+    }
+
+    /// When the plan contains no pull step, `pull_step_index` is `None` and
+    /// numbering covers every step.  Guards `[a]` from firing on a plan that
+    /// doesn't define a pull action.
+    #[test]
+    fn pull_index_none_when_plan_has_no_pull() {
+        let steps = vec![step("run"), step("verify"), step("run")];
+        assert_eq!(pull_step_index(&steps), None);
+        assert_eq!(runnable_step_index(&steps, 1), Some(0));
+        assert_eq!(runnable_step_index(&steps, 2), Some(1));
+        assert_eq!(runnable_step_index(&steps, 3), Some(2));
+        assert_eq!(runnable_step_index(&steps, 4), None);
+    }
+
+    /// When the plan begins with a pull step, the first numbered key (`1`)
+    /// must still map to the *second* original index — not skip past it
+    /// inconsistently.
+    #[test]
+    fn pull_index_resolves_when_pull_is_first_step() {
+        let steps = vec![step("pull"), step("run"), step("run")];
+        assert_eq!(pull_step_index(&steps), Some(0));
+        assert_eq!(runnable_step_index(&steps, 1), Some(1));
+        assert_eq!(runnable_step_index(&steps, 2), Some(2));
+        assert_eq!(runnable_step_index(&steps, 3), None);
+    }
+
+    /// An empty plan yields `None` for both helpers — no key fires.
+    #[test]
+    fn empty_plan_yields_no_indexes() {
+        let steps: Vec<TestPlanStep> = Vec::new();
+        assert_eq!(pull_step_index(&steps), None);
+        assert_eq!(runnable_step_index(&steps, 1), None);
     }
 
     /// `read_git_branch_head` returns None for non-existent repo dirs.

@@ -704,6 +704,102 @@ class TestSaveConfigSnapshot:
         assert row is not None
         assert row["value"] == "0"
 
+    def test_writes_pipeline_repo_paths(self, coord_db) -> None:
+        """#349: pipeline_repo_paths in board_meta maps repo → local path.
+
+        Prefers a machine whose name matches the local hostname, then falls
+        back to any other machine that defines a `repo_paths` entry for that
+        repo.  The TUI reads this map to resolve local checkouts when
+        detecting test-plan staleness.
+        """
+        import json as _json
+        import socket as _socket
+
+        from coord.cli import _save_config_snapshot
+        from coord.config import Config
+        from coord.models import Machine, Repo
+
+        local_host = _socket.gethostname().split(".")[0]
+
+        cfg = Config(
+            repos=[
+                Repo(name="api", github="acme/api"),
+                Repo(name="web", github="acme/web"),
+                Repo(name="docs", github="acme/docs"),
+            ],
+            machines=[
+                # Local machine — owns "api" via its repo_paths.
+                Machine(
+                    name=local_host,
+                    host=f"{local_host}.tailnet",
+                    repos=["api"],
+                    repo_paths={"api": "/home/dev/src/api"},
+                ),
+                # Remote machine — provides "web" via fallback after the
+                # local machine pass yields no entry for it.
+                Machine(
+                    name="other",
+                    host="other.tailnet",
+                    repos=["web"],
+                    repo_paths={"web": "/srv/web"},
+                ),
+                # No repo_paths anywhere for "docs" → omitted from the map.
+            ],
+        )
+        _save_config_snapshot(cfg)
+
+        row = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key = 'pipeline_repo_paths'"
+        ).fetchone()
+        assert row is not None
+        paths = _json.loads(row["value"])
+        assert paths.get("api") == "/home/dev/src/api"
+        assert paths.get("web") == "/srv/web"
+        # Repos without a repo_paths entry on any machine are not written.
+        assert "docs" not in paths
+
+    def test_pipeline_repo_paths_prefers_local_hostname(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#349: when two machines define a path for the same repo, the
+        hostname-matched machine wins.  The fallback only applies to repos
+        the local machine doesn't cover."""
+        import json as _json
+        import socket as _socket
+
+        from coord.cli import _save_config_snapshot
+        from coord.config import Config
+        from coord.models import Machine, Repo
+
+        monkeypatch.setattr(_socket, "gethostname", lambda: "laptop")
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(
+                    name="laptop",
+                    host="laptop.tailnet",
+                    repos=["api"],
+                    repo_paths={"api": "/home/me/api-local"},
+                ),
+                Machine(
+                    name="server",
+                    host="server.tailnet",
+                    repos=["api"],
+                    repo_paths={"api": "/srv/api-remote"},
+                ),
+            ],
+        )
+        _save_config_snapshot(cfg)
+
+        row = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key = 'pipeline_repo_paths'"
+        ).fetchone()
+        assert row is not None
+        paths = _json.loads(row["value"])
+        # Hostname-matched machine's path wins.
+        assert paths["api"] == "/home/me/api-local"
+
 
 # ── upsert_open_issues ──────────────────────────────────────────────────────
 

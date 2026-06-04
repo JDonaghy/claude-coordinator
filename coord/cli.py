@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import click
@@ -136,8 +137,8 @@ def _load_config(path: Path) -> Config:
 
 def _get_assignment_branch_head(
     assignment_id: str,
-    config: "Config",
-    repo_path_fn: "Callable[[str, Config], Path | None]",
+    config: Config,
+    repo_path_fn: Callable[[str, Config], Path | None],
 ) -> str | None:
     """#349: Resolve the current HEAD SHA for an assignment's branch.
 
