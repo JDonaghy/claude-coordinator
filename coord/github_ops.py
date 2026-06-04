@@ -66,6 +66,30 @@ def check_branch_exists(repo: str, branch: str) -> bool:
         return False
 
 
+def list_remote_branch_names(repo: str) -> set[str]:
+    """Return the set of branch names that currently exist on `repo` (owner/name).
+
+    One paginated ``gh api`` call.  Used by ``coord merge`` to skip re-enqueuing
+    done-work whose branch was already merged-and-deleted (the dominant
+    merge-queue clog source).  Returns an empty set on error so callers can
+    fail OPEN (treat "couldn't determine" as "don't skip").
+    """
+    try:
+        raw = _gh(
+            "api", "--paginate",
+            f"repos/{repo}/git/refs/heads",
+            "--jq", ".[].ref",
+        )
+    except RuntimeError:
+        return set()
+    prefix = "refs/heads/"
+    return {
+        line.strip()[len(prefix):]
+        for line in raw.splitlines()
+        if line.strip().startswith(prefix)
+    }
+
+
 def delete_remote_branch(repo: str, branch: str) -> bool:
     """Delete a remote branch. Returns True on success, False on failure."""
     try:
