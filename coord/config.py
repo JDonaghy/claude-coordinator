@@ -200,7 +200,7 @@ class PipelineConfig:
 
     ``max_review_iterations`` is the maximum number of fix rounds before
     the auto-loop stops and posts a notice asking for manual intervention.
-    Default is 3.
+    Default is 5.
 
     ``escalate_fix_model`` controls whether auto-dispatched fix workers
     escalate the model on each bounce iteration.  When ``True`` (default),
@@ -213,7 +213,7 @@ class PipelineConfig:
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
     labels: dict[str, list[str]] = field(default_factory=dict)
     auto_loop: bool = True
-    max_review_iterations: int = 3
+    max_review_iterations: int = 5
     escalate_fix_model: bool = True
 
     def tracked_labels(self) -> list[str]:

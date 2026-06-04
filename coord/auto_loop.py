@@ -508,6 +508,10 @@ def _post_max_iterations_notice(work: Assignment, config: Config) -> None:
         f"**Manual intervention required.** Options:\n"
         f"- Review the diff and the reviewer's latest findings, then dispatch "
         f"a fix manually with `coord assign`.\n"
+        f"- Run `coord merge --force-merge` to merge the branch as-is "
+        f"(if the review findings are acceptable).\n"
+        f"- Bump `pipeline.max_review_iterations` in `coordinator.yml` "
+        f"(currently `{max_iter}`) to allow more automated fix rounds.\n"
         f"- Adjust the issue scope and open a fresh issue.\n\n"
         f"Details:\n"
         f"- Assignment: `{work.assignment_id}`\n"
@@ -581,6 +585,13 @@ def run_for_fix_transition(
             "— not dispatching another review",
             assignment_id, fix.review_iteration, max_iter,
         )
+        # Surface the cap-hit as a persisted blocker: post a GitHub comment so
+        # the operator sees it outside the TUI, mark the board entry with a
+        # distinct review_state so `coord status` shows an explicit blocker line,
+        # and save the board so the state survives a coordinator restart.
+        _post_max_iterations_notice(fix, config)
+        fix.review_state = "cap_hit"
+        save_board(board)
         return [LoopAction(
             kind="iteration_cap_hit",
             assignment_id=assignment_id,
