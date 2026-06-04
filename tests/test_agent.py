@@ -19,6 +19,7 @@ from coord.agent import (
     RUNNING,
     AgentServer,
     AssignmentSpec,
+    _worker_subprocess_env,
     default_worker_command,
 )
 
@@ -64,6 +65,50 @@ def _server(tmp_path: Path, *, argv: list[str] | None = None, repo_path: Path | 
         repo_paths={"api": str(rp)},
         **kwargs,
     )
+
+
+def test_worker_env_strips_agent_venv_from_path() -> None:
+    # #402: when the agent runs inside a venv, the venv's bin must not be on
+    # the worker's PATH (else a worker `pip install -e .` clobbers the agent).
+    env = _worker_subprocess_env(
+        {"PATH": "/venv/bin:/home/u/.local/bin:/usr/bin:/bin"},
+        prefix="/venv",
+        base_prefix="/usr",
+    )
+    parts = env["PATH"].split(os.pathsep)
+    assert "/venv/bin" not in parts
+    assert parts == ["/home/u/.local/bin", "/usr/bin", "/bin"]
+
+
+def test_worker_env_clears_virtualenv_markers() -> None:
+    env = _worker_subprocess_env(
+        {"PATH": "/usr/bin", "VIRTUAL_ENV": "/venv", "PYTHONHOME": "/venv"},
+        prefix="/venv",
+        base_prefix="/usr",
+    )
+    assert "VIRTUAL_ENV" not in env
+    assert "PYTHONHOME" not in env
+
+
+def test_worker_env_preserves_path_when_not_in_venv() -> None:
+    # System-Python agent (prefix == base_prefix): never strip /usr/bin & co.
+    original = "/usr/local/bin:/usr/bin:/bin"
+    env = _worker_subprocess_env(
+        {"PATH": original},
+        prefix="/usr",
+        base_prefix="/usr",
+    )
+    assert env["PATH"] == original
+
+
+def test_worker_env_keeps_unrelated_entries() -> None:
+    env = _worker_subprocess_env(
+        {"PATH": "/venv/bin:/opt/cargo/bin:/usr/bin", "EDITOR": "vim"},
+        prefix="/venv",
+        base_prefix="/usr",
+    )
+    assert env["PATH"] == "/opt/cargo/bin:/usr/bin"
+    assert env["EDITOR"] == "vim"
 
 
 def test_health_reports_machine(tmp_path: Path) -> None:

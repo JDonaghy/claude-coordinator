@@ -99,7 +99,13 @@ coord init                       # Interactive setup: detects repos + capabiliti
 
 ## Development
 
+Always work in a virtualenv. Agent workers are spawned with the agent's own
+venv stripped from `PATH` (#402), so a bare `pip install` resolves to system
+Python (PEP 668) — and must **never** target the agent's runtime venv. Create
+your own venv in the checkout (`.venv/` is gitignored):
+
 ```bash
+python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 pytest
 coord plan --dry-run
