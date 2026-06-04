@@ -59,6 +59,8 @@ use crate::settings::{
 use quadraui::accelerator::{parse_key_binding, ParsedBinding};
 use quadraui::{
     Backend, Badge, ChatController, ChatControllerEvent, ChatRole, ChatTurn, Color, Decoration,
+    Dialog, DialogButton, DialogHit, DialogInput, DialogLayout, DialogMeasure,
+    DialogSeverity, DialogTextInput,
     Key, ListItem, ListView, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
@@ -3531,6 +3533,10 @@ pub struct CoordApp {
     /// render path (same pattern as `settings_form`), populated on every
     /// frame while a menu is open and cleared when it dismisses.
     context_menu_layout: std::cell::RefCell<Option<ContextMenuLayout>>,
+    /// Cached `DialogLayout` from the last prompt-dialog render — used for
+    /// click hit-testing on dialog buttons.  Populated while any
+    /// `pending_*` prompt dialog is visible; cleared when it dismisses.
+    dialog_layout: std::cell::RefCell<Option<DialogLayout>>,
     /// Machines panel: name of machine awaiting restart confirmation.
     /// While `Some`, 'y'/'Y' fires `coord agent restart --machine <name>`;
     /// any other key cancels.
@@ -3855,6 +3861,7 @@ impl CoordApp {
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
+            dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
             local_coord_version: fetch_local_coord_version(),
@@ -10539,7 +10546,13 @@ impl CoordApp {
             } => {
                 let pos = *position;
                 let lh = backend.line_height();
-                // #259: an open context menu intercepts all clicks first
+                // #369/#329: an open prompt dialog intercepts all clicks
+                // first (highest z-order) — outside → dismiss; on a
+                // button → fire action; inside body → swallow.
+                if let Some(handled) = self.handle_dialog_click(pos) {
+                    return handled;
+                }
+                // #259: an open context menu intercepts all clicks next
                 // — outside the menu → dismiss; on an item → activate;
                 // anywhere else inside the menu → swallow (keep open).
                 if let Some(handled) = self.handle_context_menu_click(pos) {
@@ -11418,69 +11431,12 @@ impl CoordApp {
             }
         }
         let proposals = self.data.proposals.len();
-        let hints = if let Some(ref picker) = self.pending_repo_picker {
-            // #353: repo picker for the [Add] button — show numeric shortcuts.
-            let mut hint = " Select repo: ".to_string();
-            for (i, repo) in picker.repos.iter().enumerate() {
-                if i > 0 {
-                    hint.push_str("  ");
-                }
-                hint.push_str(&format!("{}={}", i + 1, repo));
-            }
-            hint.push_str("  Esc=cancel ");
-            hint
-        } else if let Some(ref p) = self.pending_refinement_close_prompt {
-            // #328: refinement-chat close prompt — Y/N/Esc takes precedence
-            // over every other hint while the user decides.
-            format!(
-                " Save refinement notes to #{} before closing?  Y=draft+post then mark ready  N=mark ready without notes  Esc=keep chatting ",
-                p.issue_number,
-            )
-        } else if let Some(ref buf) = self.pending_report_fix {
-            // #296: inline description input for report+fix takes precedence.
-            format!(" Report failure — description: {}_  Enter=submit+dispatch  Esc=cancel ", buf)
-        } else if let Some((_, ref buf)) = self.pending_test_fail {
-            // #200: inline reason input takes precedence over the purge prompt
-            // and normal hints.
-            format!(" Test failure reason: {}_  Enter=submit  Esc=cancel ", buf)
-        } else if let Some(ref repo) = self.pending_force_merge {
-            // #245: force-merge confirm prompt — overrides every other hint
-            // until the user picks y/Y (confirm) or any other key (cancel).
-            // Scope is shown so the user knows whether this hits one repo or
-            // the whole queue.
-            let scope = if repo.is_empty() {
-                " (whole queue)".to_string()
-            } else {
-                format!(" --repo {}", repo)
-            };
-            format!(
-                " Force-merge{} despite failed CI checks? y=confirm  Esc=cancel ",
-                scope
-            )
-        } else if let Some(ref name) = self.pending_restart {
-            // Restart confirmation — show active worker count in the prompt.
-            let active = self
-                .data
-                .machines
-                .iter()
-                .find(|m| &m.name == name)
-                .map(|m| m.active_count)
-                .unwrap_or(0);
-            format!(
-                " Restart {} ({} active worker{})? y=confirm  Esc=cancel ",
-                name,
-                active,
-                if active == 1 { "" } else { "s" },
-            )
-        } else if let Some((a, i)) = self.pending_purge {
-            // Confirm prompt overrides the normal hints while purge is pending.
-            format!(
-                " Purge {} assignment{} + {} closed issue{} older than {}d? y=confirm  Esc=cancel ",
-                a, if a == 1 { "" } else { "s" },
-                i, if i == 1 { "" } else { "s" },
-                self.purge_days
-            )
-        } else if self.active_view == SidebarView::Machines {
+        // #369/#329: Prompt questions are now shown as quadraui Dialog
+        // popups rather than status-bar hint strings — the dialog is the
+        // affordance.  The hints chain below falls through to the normal
+        // view-specific hints whenever a prompt dialog is showing, so the
+        // status bar remains informative instead of going blank.
+        let hints = if self.active_view == SidebarView::Machines {
             // Machines panel action hints.
             " r=restart  u=update  c=clean worktrees  q=quit ".to_string()
         } else if self.active_view == SidebarView::Pipeline && self.test_gate_actionable() {
@@ -12023,6 +11979,584 @@ impl CoordApp {
     fn dismiss_context_menu(&mut self) {
         self.pending_context_menu = None;
         *self.context_menu_layout.borrow_mut() = None;
+    }
+
+    // ── #369 / #329: Prompt dialogs ─────────────────────────────────────────
+    //
+    // Replaces the seven status-bar hint prompts with quadraui `Dialog`
+    // popups — centered modal overlays with labelled, clickable buttons.
+    // Keyboard bindings are preserved unchanged; clicking a button fires
+    // the same action as the corresponding key.
+
+    /// Build the `quadraui::Dialog` for whichever prompt is currently
+    /// active, following the same priority order as `status_bar()`.
+    /// Returns `None` when no prompt is pending.
+    fn build_prompt_dialog(&self) -> Option<Dialog> {
+        // ── Repo picker ──────────────────────────────────────────────────
+        if let Some(ref picker) = self.pending_repo_picker {
+            let mut buttons: Vec<DialogButton> = picker
+                .repos
+                .iter()
+                .enumerate()
+                .map(|(i, repo)| DialogButton {
+                    id: WidgetId::new(format!("repo:{i}")),
+                    label: format!("{}  {}", i + 1, repo),
+                    is_default: i == 0,
+                    is_cancel: false,
+                    tint: None,
+                })
+                .collect();
+            buttons.push(DialogButton {
+                id: WidgetId::new("cancel"),
+                label: "Cancel".into(),
+                is_default: false,
+                is_cancel: true,
+                tint: None,
+            });
+            return Some(Dialog {
+                id: WidgetId::new("dialog:repo-picker"),
+                title: StyledText::plain("Select Target Repo"),
+                body: vec![StyledText::plain(
+                    "Choose the repo to file the new issue in:",
+                )],
+                buttons,
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: true,
+                input: None,
+            });
+        }
+
+        // ── Refinement-chat close ────────────────────────────────────────
+        if let Some(ref p) = self.pending_refinement_close_prompt {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:refinement-close"),
+                title: StyledText::plain("Save Refinement Notes?"),
+                body: vec![StyledText::plain(format!(
+                    "Save notes for issue #{} before closing?",
+                    p.issue_number
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "Y  Draft + post, then mark ready".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("no"),
+                        label: "N  Mark ready without notes".into(),
+                        is_default: false,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Keep chatting".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: true,
+                input: None,
+            });
+        }
+
+        // ── Report-fix description input ─────────────────────────────────
+        if let Some(ref buf) = self.pending_report_fix {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:report-fix"),
+                title: StyledText::plain("Report & Dispatch Fix"),
+                body: vec![StyledText::plain(
+                    "Enter a description for the fix (optional):",
+                )],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: buf.clone(),
+                    placeholder: "description…".into(),
+                    cursor: Some(buf.len()),
+                })),
+            });
+        }
+
+        // ── Test-failure reason input ────────────────────────────────────
+        if let Some((_, ref buf)) = self.pending_test_fail {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:test-fail"),
+                title: StyledText::plain("Record Test Failure"),
+                body: vec![StyledText::plain("Enter a reason (optional):")],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: buf.clone(),
+                    placeholder: "reason…".into(),
+                    cursor: Some(buf.len()),
+                })),
+            });
+        }
+
+        // ── Force-merge confirm ──────────────────────────────────────────
+        if let Some(ref repo) = self.pending_force_merge {
+            let scope_line = if repo.is_empty() {
+                "Scope: whole merge queue".to_string()
+            } else {
+                format!("Scope: --repo {}", repo)
+            };
+            return Some(Dialog {
+                id: WidgetId::new("dialog:force-merge"),
+                title: StyledText::plain("Force Merge"),
+                body: vec![
+                    StyledText::plain("Force-merge despite failed CI checks?"),
+                    StyledText::plain(scope_line),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "y  Force merge".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: Some(Color::rgb(200, 80, 80)),
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
+        // ── Restart confirm ──────────────────────────────────────────────
+        if let Some(ref name) = self.pending_restart {
+            let active = self
+                .data
+                .machines
+                .iter()
+                .find(|m| &m.name == name)
+                .map(|m| m.active_count)
+                .unwrap_or(0);
+            return Some(Dialog {
+                id: WidgetId::new("dialog:restart"),
+                title: StyledText::plain("Restart Machine"),
+                body: vec![StyledText::plain(format!(
+                    "Restart {} ({} active worker{})?",
+                    name,
+                    active,
+                    if active == 1 { "" } else { "s" },
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "y  Confirm restart".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
+        // ── Purge confirm ────────────────────────────────────────────────
+        if let Some((a, i)) = self.pending_purge {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:purge"),
+                title: StyledText::plain("Purge Old Data"),
+                body: vec![StyledText::plain(format!(
+                    "Purge {} assignment{} + {} closed issue{} older than {}d?",
+                    a,
+                    if a == 1 { "" } else { "s" },
+                    i,
+                    if i == 1 { "" } else { "s" },
+                    self.purge_days,
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "y  Confirm purge".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: Some(Color::rgb(200, 80, 80)),
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
+        None
+    }
+
+    /// Render the active prompt dialog (if any) centered in `viewport`.
+    /// Stores the computed layout in `self.dialog_layout` for click
+    /// hit-testing on the next mouse event.
+    fn render_prompt_dialog(&self, backend: &mut dyn Backend, viewport: Rect) {
+        let Some(mut dialog) = self.build_prompt_dialog() else {
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        };
+        let lh = backend.line_height();
+        let padding = lh;
+        // Dialog width — clamp so it never exceeds a small viewport.
+        let dialog_w = (viewport.width * 0.5)
+            .clamp(30.0 * lh, 60.0 * lh)
+            .min((viewport.width - 2.0 * lh).max(10.0 * lh));
+        // Wrap the body to the inner width so a long question is never
+        // truncated on a narrow screen — one StyledText per rendered row.
+        let content_cells = ((dialog_w - 2.0 * padding) / lh).floor().max(1.0) as usize;
+        dialog.body = dialog
+            .body
+            .iter()
+            .flat_map(|line| {
+                let flat: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+                let wrapped = word_wrap(&flat, content_cells);
+                if wrapped.is_empty() {
+                    vec![StyledText::plain("")]
+                } else {
+                    wrapped.into_iter().map(StyledText::plain).collect::<Vec<_>>()
+                }
+            })
+            .collect();
+        let body_h = dialog.body.len() as f32 * lh;
+        let input_h = if dialog.input.is_some() { lh } else { 0.0 };
+        let btn_h = lh;
+        // Per-button row height. quadraui's dialog layout stacks N vertical
+        // buttons of this height itself, so we pass the height of ONE option
+        // (label row + a blank spacer row) — not the whole block.
+        let btn_row_h = if dialog.vertical_buttons {
+            btn_h * 2.0
+        } else {
+            btn_h
+        };
+        let title_h = if dialog.title.spans.iter().any(|s| !s.text.is_empty()) {
+            lh
+        } else {
+            0.0
+        };
+        let max_label_len = dialog
+            .buttons
+            .iter()
+            .map(|b| b.label.chars().count())
+            .max()
+            .unwrap_or(6);
+        let btn_w = (max_label_len as f32 * 0.7 * lh + padding * 2.0).max(8.0 * lh);
+        let measure = DialogMeasure {
+            width: dialog_w,
+            title_height: title_h,
+            body_height: body_h,
+            input_height: input_h,
+            button_row_height: btn_row_h,
+            button_width: btn_w,
+            button_gap: lh,
+            padding,
+        };
+        let layout = dialog.layout(viewport, measure, |_| {
+            quadraui::ToolbarItemMeasure::new(0.0)
+        });
+        backend.draw_dialog(&dialog, &layout);
+        *self.dialog_layout.borrow_mut() = Some(layout);
+    }
+
+    /// Hit-test a click against the active prompt dialog.
+    ///
+    /// Returns `Some(true)` when the click fired an action (or was
+    /// swallowed inside the dialog body), `Some(false)` when no dialog
+    /// layout is cached (no dialog showing), and the outside-click case
+    /// dismisses the dialog and returns `Some(true)`.
+    fn handle_dialog_click(&mut self, pos: Point) -> Option<bool> {
+        let layout = self.dialog_layout.borrow().clone()?;
+        match layout.hit_test(pos.x, pos.y) {
+            DialogHit::Outside => {
+                // Click outside the dialog — dismiss (same as Esc).
+                self.dismiss_prompt_dialog();
+                Some(true)
+            }
+            DialogHit::Body | DialogHit::BodyToolbarButton(_) => {
+                // Click inside dialog but not on a button — swallow.
+                Some(true)
+            }
+            DialogHit::Button(id) => {
+                let id_str = id.as_str().to_string();
+                self.fire_dialog_button(&id_str);
+                Some(true)
+            }
+        }
+    }
+
+    /// Dismiss whatever prompt dialog is currently showing (Esc / outside click).
+    fn dismiss_prompt_dialog(&mut self) {
+        if self.pending_repo_picker.is_some() {
+            self.pending_repo_picker = None;
+        } else if self.pending_refinement_close_prompt.is_some() {
+            self.pending_refinement_close_prompt = None;
+        } else if self.pending_report_fix.is_some() {
+            self.pending_report_fix = None;
+        } else if self.pending_test_fail.is_some() {
+            self.pending_test_fail = None;
+        } else if self.pending_force_merge.is_some() {
+            self.pending_force_merge = None;
+            self.push_toast("Force-merge cancelled", "CI gate stays in place", ToastSeverity::Info);
+        } else if self.pending_restart.is_some() {
+            self.pending_restart = None;
+        } else if self.pending_purge.is_some() {
+            self.pending_purge = None;
+        }
+        *self.dialog_layout.borrow_mut() = None;
+    }
+
+    /// Fire the action associated with a dialog button id.
+    /// Button ids mirror those set in `build_prompt_dialog`.
+    fn fire_dialog_button(&mut self, id: &str) {
+        // ── Repo picker ──────────────────────────────────────────────────
+        if self.pending_repo_picker.is_some() {
+            if id == "cancel" {
+                self.pending_repo_picker = None;
+            } else if let Some(idx_str) = id.strip_prefix("repo:") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if let Some(picker) = self.pending_repo_picker.take() {
+                        if let Some(repo) = picker.repos.get(idx) {
+                            let repo = repo.clone();
+                            self.dispatch_board_chat_new_issue(&repo);
+                        }
+                    }
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Refinement-close ─────────────────────────────────────────────
+        if self.pending_refinement_close_prompt.is_some() {
+            match id {
+                "yes" => {
+                    self.pending_refinement_close_prompt = None;
+                    self.finalise_after_notes_post = true;
+                    self.trigger_refinement_notes_synth();
+                    if self.pending_refinement_notes_synth.is_none() {
+                        self.finalise_after_notes_post = false;
+                    }
+                }
+                "no" => {
+                    self.pending_refinement_close_prompt = None;
+                    self.finalise_refinement_chat();
+                    self.inject_chat = None;
+                }
+                _ => {
+                    self.pending_refinement_close_prompt = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Report-fix ───────────────────────────────────────────────────
+        if self.pending_report_fix.is_some() {
+            match id {
+                "submit" => {
+                    let description = self.pending_report_fix.take().unwrap_or_default();
+                    let description = description.trim().to_string();
+                    let reason_opt = if description.is_empty() { None } else { Some(description.as_str()) };
+                    if self.record_test_verdict("failed", reason_opt) {
+                        if let Some(work_id) = self.pipeline_selected_work_id() {
+                            let args: Vec<String> = if description.is_empty() {
+                                vec!["fix".to_string(), work_id.clone()]
+                            } else {
+                                vec![
+                                    "fix".to_string(),
+                                    work_id.clone(),
+                                    "--guidance".to_string(),
+                                    description.clone(),
+                                ]
+                            };
+                            let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                            let issue_num = self
+                                .pipeline_sel
+                                .and_then(|i| self.pipeline_issues.get(i))
+                                .map(|iss| iss.number)
+                                .unwrap_or(0);
+                            use crate::commands::SpawnQueuedOutcome;
+                            match self.command_runner.spawn_queued(&args_ref) {
+                                SpawnQueuedOutcome::Deduped => {}
+                                SpawnQueuedOutcome::Queued => {
+                                    self.push_toast(
+                                        "Fix worker queued",
+                                        &format!("Fix worker queued for #{} — will dispatch after current command.", issue_num),
+                                        ToastSeverity::Info,
+                                    );
+                                }
+                                SpawnQueuedOutcome::Started => {
+                                    self.push_toast(
+                                        "Fix worker dispatched",
+                                        &format!("Fix worker dispatched for #{}", issue_num),
+                                        ToastSeverity::Info,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    self.pending_report_fix = None;
+                }
+                _ => {
+                    self.pending_report_fix = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Test-fail ────────────────────────────────────────────────────
+        if self.pending_test_fail.is_some() {
+            match id {
+                "submit" => {
+                    let reason = self
+                        .pending_test_fail
+                        .as_ref()
+                        .map(|(_, b)| b.trim().to_string())
+                        .unwrap_or_default();
+                    let reason_opt = if reason.is_empty() { None } else { Some(reason.as_str()) };
+                    self.record_test_verdict("failed", reason_opt);
+                    self.pending_test_fail = None;
+                }
+                _ => {
+                    self.pending_test_fail = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Force-merge ──────────────────────────────────────────────────
+        if let Some(ref repo) = self.pending_force_merge.clone() {
+            match id {
+                "yes" => {
+                    let scoped = !repo.is_empty();
+                    let mut args: Vec<&str> = vec!["merge", "--force-merge"];
+                    if scoped {
+                        args.push("--repo");
+                        args.push(repo);
+                    }
+                    self.command_runner.spawn(&args);
+                    let scope_str = if scoped {
+                        format!(" --repo {}", repo)
+                    } else {
+                        String::new()
+                    };
+                    self.push_toast(
+                        "Force-merge dispatched",
+                        &format!("coord merge --force-merge{} — CI gate bypassed", scope_str),
+                        ToastSeverity::Warning,
+                    );
+                    self.pending_force_merge = None;
+                }
+                _ => {
+                    self.pending_force_merge = None;
+                    self.push_toast("Force-merge cancelled", "CI gate stays in place", ToastSeverity::Info);
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Restart ──────────────────────────────────────────────────────
+        if let Some(name) = self.pending_restart.clone() {
+            match id {
+                "yes" => {
+                    self.command_runner.spawn(&["agent", "restart", "--machine", &name]);
+                    self.pending_restart = None;
+                }
+                _ => {
+                    self.pending_restart = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Purge ────────────────────────────────────────────────────────
+        if self.pending_purge.is_some() {
+            match id {
+                "yes" => {
+                    let secs = self.purge_days as f64 * 86_400.0;
+                    match purge_done_assignments_db(secs) {
+                        Ok((a, i)) => self.push_toast(
+                            "Purge complete",
+                            &format!("Removed {} assignment{} + {} closed issue{}",
+                                a, if a == 1 { "" } else { "s" },
+                                i, if i == 1 { "" } else { "s" }),
+                            ToastSeverity::Info,
+                        ),
+                        Err(e) => self.push_toast(
+                            "Purge failed",
+                            &format!("{}", e),
+                            ToastSeverity::Error,
+                        ),
+                    }
+                    self.pending_purge = None;
+                    self.refresh();
+                }
+                _ => {
+                    self.pending_purge = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+        }
     }
 
     /// #266: shared helper for board-row context-menu actions that
@@ -15375,11 +15909,11 @@ impl ShellApp for CoordApp {
             backend.draw_toast_stack(layout.main_content_bounds, &stack);
         }
 
-        // ── #259: open context menu (above everything) ──────────────────
-        // Drawn last so it sits on top of toasts, the panel content, and
-        // the toolbar.  The viewport unions the sidebar + main panel so a
-        // menu anchored in the sidebar can flow rightward into the main
-        // area without being clipped to the (narrow) sidebar width.
+        // ── #259: open context menu (above everything except dialogs) ───
+        // Drawn before dialogs so a prompt dialog still sits on top.
+        // The viewport unions the sidebar + main panel so a menu anchored
+        // in the sidebar can flow rightward into the main area without
+        // being clipped to the (narrow) sidebar width.
         if self.pending_context_menu.is_some() {
             let viewport = union_rects(
                 layout.sidebar_content_bounds,
@@ -15392,6 +15926,17 @@ impl ShellApp for CoordApp {
             // hit-test on the next click.
             *self.context_menu_layout.borrow_mut() = None;
         }
+
+        // ── #369/#329: Prompt dialogs (highest z-order) ──────────────────
+        // Rendered after everything else so the modal sits on top of the
+        // context menu, toasts, and panel content.  The viewport unions
+        // sidebar + main so the dialog centers across the whole content
+        // area (not just the narrow sidebar).
+        let dialog_viewport = union_rects(
+            layout.sidebar_content_bounds,
+            layout.main_content_bounds,
+        );
+        self.render_prompt_dialog(backend, dialog_viewport);
     }
 
     fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend, ctx: &ShellContext) -> Reaction {
@@ -18399,6 +18944,7 @@ mod tests {
             pending_force_merge: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(None),
+            dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
             local_coord_version: None,
@@ -20916,48 +21462,61 @@ mod tests {
         assert!(!app.can_bounce_work_after_test_fail());
     }
 
-    // ── #245: force-merge confirm prompt ────────────────────────────────
+    // ── #245 / #329: force-merge confirm dialog ─────────────────────────────
+    // The prompt is now a quadraui Dialog popup rather than a status-bar hint.
 
     #[test]
-    fn pending_force_merge_hint_shows_repo_scope() {
-        // When pending_force_merge is Some(repo), the status bar hint
-        // should announce the scoped force-merge and offer y/Esc.
+    fn pending_force_merge_dialog_shows_repo_scope() {
+        // When pending_force_merge is Some(repo), build_prompt_dialog should
+        // return a Dialog whose body mentions the --repo scope.
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
         app.pending_force_merge = Some("api".to_string());
 
+        let dialog = app.build_prompt_dialog()
+            .expect("expected a force-merge dialog");
+        let body_text: String = dialog.body.iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            body_text.contains("--repo api"),
+            "expected scoped scope in dialog body, got: {body_text}",
+        );
+        // Status bar still shows the normal Pipeline hint (dialog is the
+        // affordance; status bar reverts to prior content).
         let bar = app.status_bar();
         let hint = bar.right_segments.iter().map(|s| s.text.clone())
             .collect::<Vec<_>>().join(" ");
-        assert!(
-            hint.contains("Force-merge --repo api"),
-            "expected scoped force-merge hint, got: {hint}",
-        );
-        assert!(hint.contains("y=confirm"));
-        assert!(hint.contains("Esc=cancel"));
+        assert!(!hint.contains("Force-merge"), "force-merge hint should not be in status bar: {hint}");
     }
 
     #[test]
-    fn pending_force_merge_hint_shows_whole_queue_when_no_repo() {
-        // Empty repo string ⇒ no --repo flag, so the prompt warns the user
-        // the override hits the whole queue.
+    fn pending_force_merge_dialog_shows_whole_queue_when_no_repo() {
+        // Empty repo string ⇒ scope line says "whole merge queue".
         let mut app = make_pipeline_app();
         app.pending_force_merge = Some(String::new());
-        let bar = app.status_bar();
-        let hint = bar.right_segments.iter().map(|s| s.text.clone())
-            .collect::<Vec<_>>().join(" ");
+
+        let dialog = app.build_prompt_dialog()
+            .expect("expected a force-merge dialog");
+        let body_text: String = dialog.body.iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            hint.contains("whole queue"),
-            "expected whole-queue warning, got: {hint}",
+            body_text.contains("whole merge queue"),
+            "expected whole-queue scope in dialog body, got: {body_text}",
         );
     }
 
     #[test]
-    fn pending_force_merge_hint_overrides_other_hints() {
-        // The confirm prompt must beat the normal Pipeline/Board hints so
-        // the user isn't shown a stale "m=merge" affordance while we're
-        // already waiting for a y/N.
+    fn pending_force_merge_dialog_not_in_status_bar() {
+        // The force-merge confirm prompt must no longer bleed into the
+        // status bar; the dialog is the sole affordance.  The status bar
+        // should show the normal pipeline or board hint instead.
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
@@ -20965,8 +21524,10 @@ mod tests {
         let bar = app.status_bar();
         let hint = bar.right_segments.iter().map(|s| s.text.clone())
             .collect::<Vec<_>>().join(" ");
-        assert!(!hint.contains("p=plan"), "default hint leaked through: {hint}");
-        assert!(!hint.contains("m=merge anyway"), "stale checks-failed hint: {hint}");
+        assert!(!hint.contains("Force-merge"), "force-merge prompt leaked into status bar: {hint}");
+        assert!(!hint.contains("y=confirm"), "confirm key hint leaked into status bar: {hint}");
+        // A dialog should be buildable.
+        assert!(app.build_prompt_dialog().is_some(), "expected dialog to be Some");
     }
 
     // ── #253: merge-blocked-on-review predicate ────────────────────────────
