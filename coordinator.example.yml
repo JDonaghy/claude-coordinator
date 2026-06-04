@@ -27,12 +27,14 @@ repos:
     github: JDonaghy/claude-coordinator
     depends_on: []
     default_branch: main
-    # Pin to ~/.coord-venv so the build works regardless of PATH —
-    # without this, modern Debian/Ubuntu hits PEP 668 "externally-
-    # managed-environment" when pip resolves to /usr/bin/pip. The agent
-    # install script (install-agent.sh) creates this venv on every
-    # machine that runs `coord agent`.
-    build_command: "~/.coord-venv/bin/pip install -e ."
+    # #402: build a wheel into a throwaway dir — do NOT `pip install -e .`
+    # into ~/.coord-venv. `coord test` runs build_command in the canonical
+    # checkout, so an editable install pinned the AGENT's runtime venv to
+    # whatever branch was checked out, silently reverting its PyPI install.
+    # `pip wheel` exercises the full build backend without mutating any venv,
+    # and still uses ~/.coord-venv/bin/pip so PEP 668 ("externally-managed-
+    # environment" when pip resolves to /usr/bin/pip) doesn't bite.
+    build_command: "~/.coord-venv/bin/pip wheel --no-deps --wheel-dir /tmp/coord-test-build ."
     # test_command omitted: pytest isn't installed in ~/.coord-venv
     # (runtime-only) and the human Test gate (#200) handles verification.
     # artifact_paths: []  # no compiled binaries to stash for a Python package

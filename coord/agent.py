@@ -14,6 +14,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -315,6 +316,56 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     if result.returncode != 0:
         raise _GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def _safe_realpath(path: str) -> str:
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return path
+
+
+def _worker_subprocess_env(
+    base_env: dict[str, str] | None = None,
+    *,
+    prefix: str | None = None,
+    base_prefix: str | None = None,
+) -> dict[str, str]:
+    """Environment for worker `claude -p` subprocesses, with the agent's own
+    venv removed (#402).
+
+    The agent runs from a venv whose ``bin`` is first on PATH (systemd unit),
+    and workers are spawned with ``cwd`` inside an ephemeral
+    ``~/.coord/worktrees/<id>`` checkout. Without sanitizing the environment, a
+    worker that runs ``pip install -e .`` (e.g. following the repo's CLAUDE.md
+    dev step) resolves ``pip`` to the *agent's* venv and pins its editable
+    finder to the worktree. When the worktree is reaped the agent crash-loops
+    with ``ModuleNotFoundError: No module named 'coord'``.
+
+    Dropping the agent's venv ``bin`` from PATH (and clearing ``VIRTUAL_ENV`` /
+    ``PYTHONHOME``) forces a worker's ``pip``/``python`` to its own venv instead
+    of the agent's. Only strips when the agent is actually running inside a venv
+    (``prefix != base_prefix``) so a system-Python agent never loses
+    ``/usr/bin`` & co.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    pfx = sys.prefix if prefix is None else prefix
+    base_pfx = sys.base_prefix if base_prefix is None else base_prefix
+
+    if pfx and base_pfx and _safe_realpath(pfx) != _safe_realpath(base_pfx):
+        venv_bin = _safe_realpath(os.path.join(pfx, "bin"))
+        path = env.get("PATH", "")
+        if path:
+            kept = [
+                part
+                for part in path.split(os.pathsep)
+                if part and _safe_realpath(part) != venv_bin
+            ]
+            env["PATH"] = os.pathsep.join(kept)
+
+    env.pop("VIRTUAL_ENV", None)
+    env.pop("PYTHONHOME", None)
+    return env
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
@@ -1623,6 +1674,10 @@ class AgentServer:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE,
                 start_new_session=True,
+                # #402: strip the agent's own venv from the worker's PATH so a
+                # worker's `pip install -e .` can't clobber the agent's runtime
+                # venv from a soon-to-be-reaped worktree.
+                env=_worker_subprocess_env(),
             )
         except (FileNotFoundError, OSError) as e:
             log_fh.write(f"\n# spawn failed: {e}\n")
