@@ -210,3 +210,61 @@ def test_unpushed_commits_warning_in_log(
         f"expected unpushed-commits warning in log, got:\n{log_text}"
     )
     server.shutdown()
+
+
+def test_stale_remote_tracking_ref_does_not_hijack_fresh_branch(
+    tmp_path: Path, repo_with_remote: tuple[Path, Path]
+) -> None:
+    """#412: a stale ``refs/remotes/origin/<branch>`` (branch deleted on origin
+    but not pruned) must NOT become the base for a 'fresh' worker.  Pre-fix, a
+    prune-less fetch left the dead ref behind, the origin_has_branch check
+    matched it, and the worker silently branched off the old deleted-branch SHA.
+    """
+    clone, _remote = repo_with_remote
+    origin_sha = _git(clone, "rev-parse", "origin/develop")
+
+    # Fabricate an old feature commit and plant a STALE remote-tracking ref for
+    # a branch that does NOT exist on origin — exactly the state a prune-less
+    # fetch leaves after the upstream branch is deleted.
+    _git(clone, "checkout", "-b", "tmp-old")
+    (clone / "OLD.txt").write_text("stale feature work\n")
+    _git(clone, "add", "OLD.txt")
+    _git(clone, "commit", "-m", "old #42 work (deleted on origin)")
+    stale_sha = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "checkout", "develop")
+    _git(clone, "branch", "-D", "tmp-old")
+    # Agent derives branch name issue-42-add-x from (number, title).
+    _git(clone, "update-ref", "refs/remotes/origin/issue-42-add-x", stale_sha)
+    assert stale_sha != origin_sha
+
+    out_file = tmp_path / "worker_state.txt"
+    server = AgentServer(
+        machine_name="t", repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "sh", "-c",
+            f"echo BASE_SHA=$(git rev-parse HEAD) >> {out_file}; "
+            f"[ -f OLD.txt ] && echo STALE_LEAKED=yes >> {out_file} "
+            f"|| echo STALE_LEAKED=no >> {out_file}",
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api", repo_path=str(clone),
+        issue_number=42, issue_title="add x", briefing="b",
+        branch="develop",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == DONE, f"assignment failed: {final.error}"
+
+    recorded = out_file.read_text()
+    assert f"BASE_SHA={origin_sha}" in recorded, (
+        f"worker branched off the STALE ref instead of origin/develop (#412).\n"
+        f"{recorded}\norigin_sha={origin_sha} stale_sha={stale_sha}"
+    )
+    assert "STALE_LEAKED=no" in recorded, (
+        f"stale deleted-branch work (OLD.txt) leaked into the worker's branch "
+        f"— #412 regression\n{recorded}"
+    )
+    server.shutdown()
