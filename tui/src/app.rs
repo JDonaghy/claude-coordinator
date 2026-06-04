@@ -519,6 +519,35 @@ struct TestBuildResult {
     finished_at: Instant,
 }
 
+/// #349: One step in a generated smoke-test plan.  Parsed from the JSON stored
+/// in `assignments.test_plan` when the DB row is loaded.
+#[derive(Clone, Debug)]
+struct TestPlanStep {
+    /// Step type: "pull", "run", or "verify".
+    kind: String,
+    /// Shell command for "pull" and "run" steps; absent for "verify".
+    cmd: Option<String>,
+    /// Human-readable label (mainly for "pull" steps).
+    label: Option<String>,
+    /// Observable assertion for "verify" steps.
+    check: Option<String>,
+}
+
+/// #349: In-flight execution of a single test-plan step.  Background thread
+/// runs the shell command and signals completion via the mpsc channel.
+struct TestStepJob {
+    /// (work_id, step_index) key — stored here for future diagnostics /
+    /// logging; not read in the current implementation.
+    #[allow(dead_code)]
+    work_id: String,
+    #[allow(dead_code)]
+    step_idx: usize,
+    /// Channel for receiving `(exit_code, captured_output)` once the subprocess
+    /// finishes.  `captured_output` is the combined stdout + stderr of the
+    /// command (newline-separated, bounded to 64 KiB to avoid unbounded growth).
+    rx: std::sync::mpsc::Receiver<(i32, String)>,
+}
+
 /// The tabs shown in the Pipeline view detail panel.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum PipelineDetailTab {
@@ -676,6 +705,15 @@ struct Assignment {
     /// in the DB column.  `None` for non-review assignments and for
     /// reviews completed before the cache landed.
     review_findings: Option<String>,
+    /// #349 Phase B: AI-generated smoke-test plan for type="work" assignments.
+    /// Parsed from the JSON blob in `assignments.test_plan`.  `None` = not
+    /// yet generated (TUI will spawn `coord test-plan` to fill it in).
+    test_plan: Option<Vec<TestPlanStep>>,
+    /// #349 Phase B: git branch HEAD SHA at the time the cached test_plan was
+    /// generated.  `None` when no plan exists or when it was generated without
+    /// branch tracking.  Used to detect staleness (branch advanced →
+    /// auto-refresh via `coord test-plan --refresh`).
+    test_plan_branch_head: Option<String>,
 }
 
 impl Assignment {
@@ -816,6 +854,70 @@ fn sanitize_branch(branch: &str) -> String {
         }
     }
     result.trim_matches('-').to_string()
+}
+
+/// #349: Parse the JSON blob from `assignments.test_plan` into a Vec of
+/// [`TestPlanStep`]s.  Returns `None` on any parse failure so callers
+/// degrade gracefully to the "Preparing plan…" placeholder.
+///
+/// The expected JSON shape is:
+/// ```json
+/// {"steps": [{"kind": "run"|"pull"|"verify", "cmd": "…", "label": "…", "check": "…"}],
+///  "blockers": ["…"]}
+/// ```
+fn parse_test_plan_steps(raw: &str) -> Option<Vec<TestPlanStep>> {
+    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let steps = val.get("steps")?.as_array()?;
+    let result: Vec<TestPlanStep> = steps
+        .iter()
+        .filter_map(|s| {
+            let kind = s.get("kind")?.as_str()?.to_string();
+            Some(TestPlanStep {
+                kind,
+                cmd: s.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                label: s.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                check: s.get("check").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            })
+        })
+        .collect();
+    Some(result)
+}
+
+/// #349: Read the current HEAD SHA for a git branch by examining the local
+/// `.git` directory directly — fast (just file I/O) and safe to call from
+/// the render thread.  Returns `None` when the file doesn't exist, is
+/// unreadable, or the branch is not yet known locally.
+///
+/// Handles both loose refs (`refs/heads/<branch>`) and packed refs
+/// (`packed-refs` file).
+fn read_git_branch_head(repo_dir: &std::path::Path, branch: &str) -> Option<String> {
+    use std::fs;
+    // First try the loose ref file: .git/refs/heads/<branch>.
+    // Branch names may contain slashes (feature/foo), which map to subdirs.
+    let loose = repo_dir.join(".git").join("refs").join("heads").join(branch);
+    if let Ok(content) = fs::read_to_string(&loose) {
+        let sha = content.trim().to_string();
+        if !sha.is_empty() {
+            return Some(sha);
+        }
+    }
+    // Fall back to .git/packed-refs.  Format: "<sha> refs/heads/<branch>"
+    let packed = repo_dir.join(".git").join("packed-refs");
+    if let Ok(content) = fs::read_to_string(&packed) {
+        let needle = format!("refs/heads/{}", branch);
+        for line in content.lines() {
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let mut parts = line.splitn(2, ' ');
+            let sha = parts.next()?;
+            let refname = parts.next()?;
+            if refname.trim() == needle {
+                return Some(sha.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// #336: Spawn a background thread that queries `GET /artifact/<repo>/<branch>`
@@ -1514,6 +1616,12 @@ struct BoardData {
     /// `coordinator.yml`.  Only repos that define `run_cmd` are present.
     /// Surfaced in the Test stage detail panel as the "Run" row.
     pipeline_repo_run_cmds: std::collections::HashMap<String, String>,
+    /// #349: coord-local repo name → absolute local checkout path on this
+    /// machine.  Populated by `_save_config_snapshot` from the hostname-
+    /// matched `repo_paths` in `coordinator.yml` and stored in
+    /// `board_meta['pipeline_repo_paths']`.  Used by the TUI to read git
+    /// branch HEAD SHAs for test-plan staleness detection.
+    pipeline_repo_paths: std::collections::HashMap<String, String>,
     /// Mirror of `dispatch.require_plan` from coordinator.yml.  When true,
     /// the pipeline prepends a Plan stage before Work, and Work [Go]
     /// becomes "approve the plan and dispatch work" rather than fresh
@@ -2248,7 +2356,7 @@ fn load_data() -> BoardData {
             "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
              status, branch, model, type, dispatched_at, finished_at, exit_code, \
              test_state, review_verdict, review_of_assignment_id, cost_usd, \
-             smoke_tests, review_findings \
+             smoke_tests, review_findings, test_plan, test_plan_branch_head \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -2276,6 +2384,14 @@ fn load_data() -> BoardData {
                     .get::<_, Option<String>>(16)?
                     .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok()),
                 review_findings: row.get::<_, Option<String>>(17)?,
+                // #349: parse test_plan JSON blob into Vec<TestPlanStep>.
+                // Silently returns None on parse failure so older rows (no
+                // column or malformed JSON) degrade to the "Preparing plan…"
+                // placeholder rather than crashing.
+                test_plan: row
+                    .get::<_, Option<String>>(18)?
+                    .and_then(|raw| parse_test_plan_steps(&raw)),
+                test_plan_branch_head: row.get::<_, Option<String>>(19)?,
             })
         }) {
             Ok(r) => r,
@@ -2514,6 +2630,7 @@ fn load_data() -> BoardData {
         pipeline_repos,
         pipeline_require_plan,
         pipeline_repo_run_cmds,
+        pipeline_repo_paths,
     ) = load_pipeline_meta(&conn);
 
     // ── Query cached structured plans ──────────────────────────────────────
@@ -2552,6 +2669,7 @@ fn load_data() -> BoardData {
         pipeline_repos,
         pipeline_require_plan,
         pipeline_repo_run_cmds,
+        pipeline_repo_paths,
         plans,
     }
 }
@@ -3260,11 +3378,12 @@ fn fetch_ci_check_summary(repo_slug: &str, pr_number: i64) -> Result<CiCheckSumm
 /// Read pipeline-related entries from the `board_meta` table.
 ///
 /// Returns ``(default_gates, tracked_labels, repos, require_plan,
-/// repo_run_cmds)`` with the documented fallbacks when the keys are missing
-/// or unparseable: gates default to ``["review", "merge"]``, tracked labels
-/// to ``["coord"]``, repos to an empty list, require_plan to ``false``, and
-/// repo_run_cmds to an empty map.  Repos are returned as
-/// ``(coord_name, github_slug)`` pairs preserving insertion order.
+/// repo_run_cmds, repo_paths)`` with the documented fallbacks when the keys
+/// are missing or unparseable: gates default to ``["review", "merge"]``,
+/// tracked labels to ``["coord"]``, repos to an empty list, require_plan to
+/// ``false``, repo_run_cmds to an empty map, and repo_paths to an empty map.
+/// Repos are returned as ``(coord_name, github_slug)`` pairs preserving
+/// insertion order.
 fn load_pipeline_meta(
     conn: &Connection,
 ) -> (
@@ -3272,6 +3391,7 @@ fn load_pipeline_meta(
     Vec<String>,
     Vec<(String, String)>,
     bool,
+    std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
 ) {
     fn read_key(conn: &Connection, key: &str) -> Option<String> {
@@ -3281,6 +3401,20 @@ fn load_pipeline_meta(
             |row| row.get::<_, String>(0),
         )
         .ok()
+    }
+
+    fn read_map(conn: &Connection, key: &str) -> std::collections::HashMap<String, String> {
+        read_key(conn, key)
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|val| match val {
+                serde_json::Value::Object(map) => Some(
+                    map.into_iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     let default_gates: Vec<String> = read_key(conn, "pipeline_default_gates")
@@ -3307,22 +3441,13 @@ fn load_pipeline_meta(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    // #296: repo_name → run_cmd map from coordinator.yml.  Only present
-    // for repos that set `run_cmd`; others are absent from the map.
-    let repo_run_cmds: std::collections::HashMap<String, String> =
-        read_key(conn, "pipeline_repo_run_cmds")
-            .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-            .and_then(|val| match val {
-                serde_json::Value::Object(map) => Some(
-                    map.into_iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-                        .collect(),
-                ),
-                _ => None,
-            })
-            .unwrap_or_default();
+    // #296: repo_name → run_cmd map from coordinator.yml.
+    let repo_run_cmds = read_map(conn, "pipeline_repo_run_cmds");
 
-    (default_gates, tracked_labels, repos, require_plan, repo_run_cmds)
+    // #349: repo_name → local checkout path on this machine.
+    let repo_paths = read_map(conn, "pipeline_repo_paths");
+
+    (default_gates, tracked_labels, repos, require_plan, repo_run_cmds, repo_paths)
 }
 
 // ─── Log items cache ──────────────────────────────────────────────────────────
@@ -3756,6 +3881,32 @@ pub struct CoordApp {
     /// (~60 fps).  Rebuilt only when the assignment, line count, or wrap
     /// width changes.  `RefCell` so `pipeline_log_list` can update from `&self`.
     log_items_cache: std::cell::RefCell<Option<LogItemsCache>>,
+
+    // ── #349: Test-plan state ─────────────────────────────────────────────────
+    /// Work-assignment IDs for which we have already queued a
+    /// `coord test-plan` spawn (or are waiting for it to complete).
+    /// Prevents duplicate spawns — once an ID is in this set the
+    /// "Preparing plan…" placeholder is shown and no further spawns are issued
+    /// until the plan lands (after which `assignment.test_plan` becomes `Some`
+    /// and the set entry is irrelevant).  Cleared when the test stage focus
+    /// moves to a different assignment so a re-focus always re-checks.
+    test_plan_pending: std::collections::HashSet<String>,
+    /// Assignment ID for which we last ran the staleness check.  Avoids
+    /// re-running the git HEAD read on every tick while the same stage is
+    /// focused; reset when the pipeline selection or focused stage changes.
+    test_plan_staleness_checked_for: Option<String>,
+    /// In-flight plan-step jobs keyed by (work_id, step_index).  Spawned
+    /// when the user presses 1–9 (or `a` for pull steps) in the test stage.
+    /// Polled each tick.
+    test_step_jobs: std::collections::HashMap<(String, usize), TestStepJob>,
+    /// Completed step exit codes keyed by (work_id, step_index).  Persists
+    /// for the lifetime of the session so the rendered panel always shows the
+    /// last outcome even after the job is drained.
+    test_step_results: std::collections::HashMap<(String, usize), i32>,
+    /// Captured stdout+stderr for completed test-plan steps, keyed by
+    /// (work_id, step_index).  Displayed inline below each step row so the
+    /// user can see *why* a step passed or failed without leaving the panel.
+    test_step_output: std::collections::HashMap<(String, usize), String>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -3940,6 +4091,11 @@ impl CoordApp {
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
             log_items_cache: std::cell::RefCell::new(None),
+            test_plan_pending: std::collections::HashSet::new(),
+            test_plan_staleness_checked_for: None,
+            test_step_jobs: std::collections::HashMap::new(),
+            test_step_results: std::collections::HashMap::new(),
+            test_step_output: std::collections::HashMap::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -4900,6 +5056,29 @@ impl CoordApp {
                     .filter(|a| a.status == "running")
                     .map(|a| a.id.clone())
                     .collect();
+
+                // #349: Reset staleness-check tracking so the next tick re-runs
+                // the git HEAD comparison.  New data may reflect new commits so
+                // we want to re-check even for the same work assignment.
+                self.test_plan_staleness_checked_for = None;
+
+                // #349: Clear pending-spawn entries for work assignments whose
+                // plan has now landed (test_plan is Some after the refresh).
+                // Without this, the pending set would grow forever and the
+                // "Preparing plan…" label might linger after the plan is ready.
+                let newly_planned: Vec<String> = self
+                    .test_plan_pending
+                    .iter()
+                    .filter(|id| {
+                        self.data.assignments.iter().any(|a| {
+                            &a.id == *id && a.test_plan.is_some()
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                for id in newly_planned {
+                    self.test_plan_pending.remove(&id);
+                }
 
                 true
             }
@@ -7673,7 +7852,7 @@ impl CoordApp {
                     &format!(
                         "Marked {} (work {}){}",
                         verb,
-                        &work_id[..8.min(work_id.len())],
+                        work_id.chars().take(8).collect::<String>(),
                         suffix,
                     ),
                     ToastSeverity::Info,
@@ -7703,6 +7882,88 @@ impl CoordApp {
         }
         self.test_stage_status_for(issue) == StageStatus::Pending
             && self.stage_status_for_internal_work(issue) == StageStatus::Done
+    }
+
+    /// #349: True when the Pipeline view is active, an issue is selected, and
+    /// the currently focused stage is "test".  Used to gate the 1–9 step-run
+    /// keybindings so they don't fire on unrelated digit presses elsewhere.
+    fn is_test_stage_focused(&self) -> bool {
+        let Some(sel_idx) = self.pipeline_sel else { return false; };
+        let Some(issue) = self.pipeline_issues.get(sel_idx) else { return false; };
+        let stage_names = self.pipeline_stage_names_for_issue(issue);
+        self.pipeline_focused_stage
+            .and_then(|fi| stage_names.get(fi).map(|n| n.as_str() == "test"))
+            .unwrap_or(false)
+    }
+
+    /// #349: Return the original step index of the first `kind: "pull"` step
+    /// in the test plan for the currently-selected pipeline issue.  Returns
+    /// `None` when no issue is selected, no plan is loaded, or the plan has
+    /// no pull step.  Used by the `[a]` keybind handler to route pull steps
+    /// through `run_test_plan_step` rather than the artifact-badge path.
+    fn test_plan_pull_step_idx(&self) -> Option<usize> {
+        let sel_idx = self.pipeline_sel?;
+        let issue = self.pipeline_issues.get(sel_idx)?;
+        let local_repo = issue.coord_repo.as_deref();
+        let work = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        work.test_plan
+            .as_ref()?
+            .iter()
+            .position(|s| s.kind == "pull")
+    }
+
+    /// #349: Return the original step index of the `key_num`-th non-pull step
+    /// (1-indexed) in the test plan for the currently-selected pipeline issue.
+    ///
+    /// Pull steps are assigned the `[a]` keybind and excluded from the
+    /// 1–9 numbering.  Pressing `3` maps to the 3rd step whose kind is NOT
+    /// `"pull"`, regardless of how many pull steps precede it.
+    ///
+    /// Returns `None` when no plan is loaded or `key_num` exceeds the count
+    /// of non-pull steps.
+    fn test_plan_runnable_step_idx(&self, key_num: usize) -> Option<usize> {
+        let sel_idx = self.pipeline_sel?;
+        let issue = self.pipeline_issues.get(sel_idx)?;
+        let local_repo = issue.coord_repo.as_deref();
+        let work = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        let mut count = 0usize;
+        for (i, step) in work.test_plan.as_ref()?.iter().enumerate() {
+            if step.kind != "pull" {
+                count += 1;
+                if count == key_num {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     // ── #336 artifact helpers ────────────────────────────────────────────────
@@ -8041,6 +8302,226 @@ impl CoordApp {
                         ToastSeverity::Error,
                     );
                 }
+            }
+        }
+        true
+    }
+
+    // ── #349: Test-plan lifecycle ─────────────────────────────────────────────
+
+    /// #349: Spawn `coord test-plan [--refresh] <work_id>` via CommandRunner
+    /// when the test stage is focused and no plan is cached (or it is stale).
+    ///
+    /// Called from `run_periodic_work` each tick.  Idempotent: will not spawn
+    /// a second time while the first is still in-flight (CommandRunner is
+    /// single-slot and the work_id will be in `test_plan_pending`).
+    fn maybe_spawn_test_plan(&mut self) {
+        // Only act when the Pipeline view is active and a test stage is focused.
+        if self.active_view != SidebarView::Pipeline {
+            return;
+        }
+        let Some(sel_idx) = self.pipeline_sel else { return; };
+        let Some(issue) = self.pipeline_issues.get(sel_idx).cloned() else { return; };
+
+        // Determine which stage is focused and whether it's the "test" stage.
+        let stage_names = self.pipeline_stage_names_for_issue(&issue);
+        let focused_is_test = self
+            .pipeline_focused_stage
+            .and_then(|fi| stage_names.get(fi).map(|n| n.as_str() == "test"))
+            .unwrap_or(false);
+        if !focused_is_test {
+            return;
+        }
+
+        // Find the latest work assignment for this issue.
+        let local_repo = issue.coord_repo.as_deref();
+        let work = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        let Some(work) = work else { return; };
+        let work_id = work.id.clone();
+
+        // ── Staleness check ────────────────────────────────────────────────
+        // Run once per work_id (tracked by test_plan_staleness_checked_for).
+        if self.test_plan_staleness_checked_for.as_deref() != Some(&work_id) {
+            self.test_plan_staleness_checked_for = Some(work_id.clone());
+            // Only check staleness when a plan AND a branch_head exist.
+            if let (Some(branch), Some(cached_head)) = (
+                &work.branch,
+                &work.test_plan_branch_head,
+            ) {
+                if let Some(local_path) =
+                    issue.coord_repo.as_ref().and_then(|r| {
+                        self.data.pipeline_repo_paths.get(r.as_str())
+                    })
+                {
+                    let repo_dir = std::path::Path::new(local_path.as_str());
+                    if let Some(live_head) = read_git_branch_head(repo_dir, branch) {
+                        if &live_head != cached_head {
+                            // Branch advanced — refresh the plan.
+                            self.test_plan_pending.insert(work_id.clone());
+                            self.command_runner.spawn_queued(&[
+                                "test-plan",
+                                &work_id,
+                                "--refresh",
+                            ]);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Spawn when plan is missing ─────────────────────────────────────
+        if work.test_plan.is_none() && !self.test_plan_pending.contains(&work_id) {
+            self.test_plan_pending.insert(work_id.clone());
+            self.command_runner.spawn_queued(&["test-plan", &work_id]);
+        }
+    }
+
+    /// #349: Run the test-plan step at *step_idx* for the selected pipeline
+    /// issue's latest work assignment.  Spawns a background thread that
+    /// executes the step's shell command and sends the exit code back via an
+    /// mpsc channel, which is polled by `poll_test_step_jobs`.
+    ///
+    /// No-ops when:
+    /// - No work assignment or test plan is available.
+    /// - `step_idx` is out of range for the plan.
+    /// - A job for `(work_id, step_idx)` is already in flight.
+    fn run_test_plan_step(&mut self, step_idx: usize) {
+        let Some(sel_idx) = self.pipeline_sel else { return; };
+        let Some(issue) = self.pipeline_issues.get(sel_idx).cloned() else { return; };
+        let local_repo = issue.coord_repo.as_deref();
+        let work = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        let Some(work) = work else { return; };
+        let Some(ref steps) = work.test_plan else { return; };
+        let Some(step) = steps.get(step_idx) else { return; };
+        let work_id = work.id.clone();
+        let key = (work_id.clone(), step_idx);
+
+        // Don't re-run an already in-flight step.
+        if self.test_step_jobs.contains_key(&key) {
+            return;
+        }
+
+        // "verify" steps have no command — just mark checked (exit 0).
+        if step.kind == "verify" {
+            self.test_step_results.insert(key, 0);
+            return;
+        }
+
+        let Some(ref cmd_str) = step.cmd else {
+            // No command to run — mark as checked.
+            self.test_step_results.insert(key, 0);
+            return;
+        };
+
+        let cmd_owned = cmd_str.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<(i32, String)>();
+        std::thread::spawn(move || {
+            use std::process::{Command, Stdio};
+            // Capture both stdout and stderr so the output can be displayed
+            // inline in the test stage panel.  Bounded to 64 KiB combined to
+            // prevent unbounded memory growth from verbose commands.
+            const MAX_OUTPUT: usize = 64 * 1024;
+            let result = Command::new("sh")
+                .arg("-c")
+                .arg(&cmd_owned)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            let (exit_code, output_str) = match result {
+                Ok(out) => {
+                    let code = out.status.code().unwrap_or(-1);
+                    let mut combined = String::new();
+                    // Stdout first, then stderr, with a separator when both are non-empty.
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stdout.is_empty() {
+                        combined.push_str(&stdout);
+                    }
+                    if !stderr.is_empty() {
+                        if !combined.is_empty() {
+                            combined.push_str("\n── stderr ──\n");
+                        }
+                        combined.push_str(&stderr);
+                    }
+                    // Truncate to MAX_OUTPUT bytes (safe: truncate at char boundary).
+                    if combined.len() > MAX_OUTPUT {
+                        let truncated: String = combined.chars()
+                            .take(combined.char_indices()
+                                .take_while(|(b, _)| *b < MAX_OUTPUT)
+                                .count())
+                            .collect();
+                        combined = truncated;
+                        combined.push_str("\n… (output truncated)");
+                    }
+                    (code, combined)
+                }
+                Err(e) => (-1, format!("failed to spawn: {e}")),
+            };
+            let _ = tx.send((exit_code, output_str));
+        });
+
+        self.test_step_jobs.insert(
+            key,
+            TestStepJob { work_id, step_idx, rx },
+        );
+        self.push_toast(
+            &format!("Step {}", step_idx + 1),
+            &format!("Running: {}", cmd_str.chars().take(80).collect::<String>()),
+            ToastSeverity::Info,
+        );
+    }
+
+    /// #349: Drain completed test-plan step jobs.  Returns `true` when at
+    /// least one job finished (the panel needs to be redrawn).
+    fn poll_test_step_jobs(&mut self) -> bool {
+        if self.test_step_jobs.is_empty() {
+            return false;
+        }
+        use std::sync::mpsc::TryRecvError;
+        let mut done: Vec<(String, usize, i32, String)> = Vec::new();
+        for (key, job) in self.test_step_jobs.iter() {
+            match job.rx.try_recv() {
+                Ok((exit_code, output)) => done.push((key.0.clone(), key.1, exit_code, output)),
+                Err(TryRecvError::Disconnected) => {
+                    done.push((key.0.clone(), key.1, -1, String::new()))
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if done.is_empty() {
+            return false;
+        }
+        for (work_id, step_idx, exit_code, output) in done {
+            self.test_step_jobs.remove(&(work_id.clone(), step_idx));
+            self.test_step_results.insert((work_id.clone(), step_idx), exit_code);
+            if !output.is_empty() {
+                self.test_step_output.insert((work_id, step_idx), output);
             }
         }
         true
@@ -9735,7 +10216,8 @@ impl CoordApp {
                     let built_by_note =
                         if manifest.built_by_assignment_id.as_deref() != Some(latest.id.as_str()) {
                             if let Some(id) = &manifest.built_by_assignment_id {
-                                format!(" [built by {}]", &id[..8.min(id.len())])
+                                let id_short: String = id.chars().take(8).collect();
+                                format!(" [built by {}]", id_short)
                             } else {
                                 String::new()
                             }
@@ -9998,12 +10480,16 @@ impl CoordApp {
         rows
     }
 
-    /// Test stage content — the cached build log from the most recent
-    /// `coord test` run for the issue's work assignment.
+    /// Test stage content — #349 plan (if available) + the cached build log.
+    ///
+    /// Shows the AI-generated smoke test plan as a "SMOKE TEST PLAN" system
+    /// block at the top, with numbered steps that the user can run via keys
+    /// 1–8.  Below that, the cached `coord test` build log is rendered as
+    /// before.
     fn stage_content_test(&self, issue: &PipelineIssue) -> Vec<ListItem> {
         // Find the latest work assignment.
         let local_repo = issue.coord_repo.as_deref();
-        let work_id = self
+        let work_assignment = self
             .data
             .assignments
             .iter()
@@ -10017,21 +10503,143 @@ impl CoordApp {
                 a.dispatched_at
                     .partial_cmp(&b.dispatched_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|a| a.id.clone());
-        let Some(work_id) = work_id else { return Vec::new() };
+            });
+        let Some(work) = work_assignment else { return Vec::new() };
+        let work_id = work.id.clone();
+        let mut rows: Vec<ListItem> = Vec::new();
+
+        // ── #349: Smoke test plan section ────────────────────────────────────
+        let header_color = Color::rgb(200, 200, 240);
+        let step_color = Color::rgb(220, 220, 220);
+        let pending_color = Color::rgb(220, 180, 100);
+        let ok_color = Color::rgb(120, 200, 120);
+        let fail_color = Color::rgb(220, 100, 100);
+        let dim_color = Color::rgb(140, 140, 160);
+
+        match &work.test_plan {
+            Some(steps) => {
+                rows.push(kv_item("", "── SMOKE TEST PLAN ──", Some(header_color)));
+                rows.push(kv_item(
+                    "",
+                    "   Press 1–9 to run a step.  [a] to pull artifacts.  \
+                     Verify steps: press key to mark ✓.",
+                    Some(dim_color),
+                ));
+                rows.push(kv_item("", "", None));
+
+                // Assign number keys only to non-pull steps (1–9).
+                // Pull steps use the [a] keybind and display [a] as their hint.
+                let mut run_key: u8 = 0;
+                for (i, step) in steps.iter().enumerate() {
+                    // Determine the display key for this step.
+                    let is_pull = step.kind == "pull";
+                    let key_hint: String = if is_pull {
+                        "[a]".to_string()
+                    } else {
+                        run_key += 1;
+                        if run_key > 9 {
+                            // More than 9 runnable steps — stop rendering to
+                            // avoid implying a key binding that doesn't exist.
+                            break;
+                        }
+                        format!("[{}]", run_key)
+                    };
+
+                    // Determine status indicator for this step.
+                    let key = (work_id.clone(), i);
+                    let status_str = if self.test_step_jobs.contains_key(&key) {
+                        "⏳ running…".to_string()
+                    } else if let Some(&exit) = self.test_step_results.get(&key) {
+                        if exit == 0 {
+                            "✓".to_string()
+                        } else {
+                            format!("✗ (exit {})", exit)
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let status_color = if self.test_step_jobs.contains_key(&key) {
+                        pending_color
+                    } else if let Some(&exit) = self.test_step_results.get(&key) {
+                        if exit == 0 { ok_color } else { fail_color }
+                    } else {
+                        step_color
+                    };
+
+                    // Build the step description line.
+                    let desc = match step.kind.as_str() {
+                        "pull" => {
+                            let label = step.label.as_deref().unwrap_or("");
+                            let cmd = step.cmd.as_deref().unwrap_or("(no cmd)");
+                            if label.is_empty() {
+                                format!("{} pull: {}", key_hint, cmd)
+                            } else {
+                                format!("{} pull {}: {}", key_hint, label, cmd)
+                            }
+                        }
+                        "verify" => {
+                            let check = step.check.as_deref().unwrap_or("(no check)");
+                            format!("{} (verify) {}", key_hint, check)
+                        }
+                        _ => {
+                            // "run" and unknown kinds.
+                            let cmd = step.cmd.as_deref().unwrap_or("(no cmd)");
+                            format!("{} {}", key_hint, cmd)
+                        }
+                    };
+                    let desc_capped: String = desc.chars().take(160).collect();
+                    let display = if status_str.is_empty() {
+                        desc_capped
+                    } else {
+                        format!("{desc_capped}  {status_str}")
+                    };
+                    rows.push(kv_item("", &format!("   {display}"), Some(status_color)));
+
+                    // Display captured output lines below the step row.
+                    if let Some(output) = self.test_step_output.get(&key) {
+                        for line in output.lines().take(50) {
+                            let trimmed: String = line.chars().take(160).collect();
+                            rows.push(kv_item("", &format!("     {trimmed}"), Some(dim_color)));
+                        }
+                    }
+                }
+                rows.push(kv_item("", "", None));
+            }
+            None => {
+                // Plan not yet generated — "Preparing plan…" placeholder.
+                // `maybe_spawn_test_plan` (called each tick) will spawn
+                // `coord test-plan` the next time it runs.
+                rows.push(kv_item("", "── SMOKE TEST PLAN ──", Some(header_color)));
+                if self.test_plan_pending.contains(&work_id) {
+                    rows.push(kv_item(
+                        "",
+                        "   Preparing plan… (running `coord test-plan`)",
+                        Some(pending_color),
+                    ));
+                } else {
+                    rows.push(kv_item(
+                        "",
+                        "   Preparing plan…",
+                        Some(pending_color),
+                    ));
+                }
+                rows.push(kv_item("", "", None));
+            }
+        }
+
+        // ── Build log section (unchanged from prior implementation) ─────────
         let Some(build) = self.last_test_builds.get(&work_id) else {
-            return vec![kv_item(
+            rows.push(kv_item(
                 "",
                 "   (no build recorded — press B to run `coord test`)",
-                Some(Color::rgb(160, 160, 180)),
-            )];
+                Some(dim_color),
+            ));
+            return rows;
         };
-        let mut rows: Vec<ListItem> = Vec::new();
         let (status_label, status_color) = if build.exit_code == 0 {
-            ("✓ succeeded", Color::rgb(120, 200, 120))
+            ("✓ succeeded", ok_color)
         } else {
-            ("✗ failed", Color::rgb(220, 100, 100))
+            ("✗ failed", fail_color)
         };
         rows.push(kv_item("Build", status_label, Some(status_color)));
         rows.push(kv_item(
@@ -10506,8 +11114,8 @@ impl CoordApp {
             return;
         }
         for a in matching.iter() {
-            let id_short = if a.id.len() > 8 { &a.id[..8] } else { &a.id };
-            items.push(kv_item("Assignment", id_short, Some(Color::rgb(160, 200, 220))));
+            let id_short: String = a.id.chars().take(8).collect();
+            items.push(kv_item("Assignment", &id_short, Some(Color::rgb(160, 200, 220))));
             items.push(kv_item("Machine", &a.machine, Some(Color::rgb(210, 210, 210))));
             let status_color = match a.status.as_str() {
                 "running" => Color::rgb(220, 180, 100),
@@ -10586,8 +11194,8 @@ impl CoordApp {
             return;
         }
         for e in entries {
-            let id_short = if e.assignment_id.len() > 8 { &e.assignment_id[..8] } else { &e.assignment_id };
-            items.push(kv_item("Assignment", id_short, Some(Color::rgb(160, 200, 220))));
+            let id_short: String = e.assignment_id.chars().take(8).collect();
+            items.push(kv_item("Assignment", &id_short, Some(Color::rgb(160, 200, 220))));
             let state_color = match e.state.as_str() {
                 "merged" => Color::rgb(120, 200, 120),
                 "failed" | "human_required" => Color::rgb(220, 70, 70),
@@ -11637,9 +12245,9 @@ impl CoordApp {
             // #235: include B (Phase 1 build) when no build is already in
             // flight for this work id.  #314: always include T=test-chat.
             if self.can_trigger_test_build() {
-                " Test gate: B=build  T=chat  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
+                " Test gate: B=build  T=chat  1–8=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             } else {
-                " Test gate: T=chat  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
+                " Test gate: T=chat  1–8=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             }
         } else if self.can_bounce_work_after_test_fail() {
             // #236: Test just failed — the user's next step is to fix the
@@ -15257,6 +15865,14 @@ impl CoordApp {
         // Cheap no-op when no jobs are in flight.
         needs_redraw |= self.poll_test_build_jobs();
 
+        // #349: Drain completed test-plan step jobs.
+        if self.poll_test_step_jobs() {
+            needs_redraw = true;
+        }
+        // #349: Maybe spawn `coord test-plan` if the test stage is focused
+        // and no plan is cached yet (or the plan is stale).
+        self.maybe_spawn_test_plan();
+
         // #271 part 2 follow-up: drain completed `gh pr view` fetches
         // into the cache so the Test guidance block picks them up.
         if self.poll_pending_pr_fetches() {
@@ -17568,6 +18184,45 @@ impl ShellApp for CoordApp {
                         self.command_runner.spawn(&["merge", "--skip-review"]);
                         needs_redraw = true;
                     }
+                    // ── 1–9 — Test stage: run smoke-test plan step ────────
+                    // #349: When the Pipeline view is active, the test gate is
+                    // actionable, and the test stage is focused, pressing a
+                    // digit key runs the corresponding non-pull step from the
+                    // generated smoke test plan via a background shell thread.
+                    // Pull steps use [a] (handled below); "verify" steps are
+                    // marked checked immediately without spawning a subprocess.
+                    // key_num (1-indexed) maps to the key_num-th non-pull step.
+                    Key::Char(ch)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.test_gate_actionable()
+                            && self.is_test_stage_focused()
+                            && matches!(ch, '1'..='9') =>
+                    {
+                        let key_num = (*ch as u32 - '0' as u32) as usize; // 1..=9
+                        if let Some(step_idx) = self.test_plan_runnable_step_idx(key_num) {
+                            self.run_test_plan_step(step_idx);
+                        }
+                        needs_redraw = true;
+                    }
+
+                    // ── a (test stage) — pull step via [a] keybind ────────
+                    // #349: When the test stage is focused and the plan contains
+                    // a pull step, [a] triggers that step via `run_test_plan_step`
+                    // (which now captures stdout/stderr).  This arm fires BEFORE
+                    // the #336 artifact-badge arm so only one action is taken —
+                    // preventing two concurrent pulls.
+                    Key::Char('a')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.test_gate_actionable()
+                            && self.is_test_stage_focused()
+                            && self.test_plan_pull_step_idx().is_some() =>
+                    {
+                        if let Some(pull_idx) = self.test_plan_pull_step_idx() {
+                            self.run_test_plan_step(pull_idx);
+                        }
+                        needs_redraw = true;
+                    }
+
                     // ── r — Machines: restart selected agent ─────────────
                     Key::Char('r') if self.active_view == SidebarView::Machines => {
                         if let Some(m) = self.data.machines.get(self.machine_sel) {
@@ -19174,6 +19829,11 @@ mod tests {
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
             log_items_cache: std::cell::RefCell::new(None),
+            test_plan_pending: std::collections::HashSet::new(),
+            test_plan_staleness_checked_for: None,
+            test_step_jobs: std::collections::HashMap::new(),
+            test_step_results: std::collections::HashMap::new(),
+            test_step_output: std::collections::HashMap::new(),
         }
     }
 
@@ -19324,6 +19984,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         }
     }
 
@@ -19385,6 +20047,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         }
     }
 
@@ -20499,6 +21163,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -20530,6 +21196,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "pending");
@@ -20589,6 +21257,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -21316,6 +21986,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         }
     }
 
@@ -22476,6 +23148,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -22516,6 +23190,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -22556,6 +23232,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -22664,6 +23342,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -22741,6 +23421,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -22781,6 +23463,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -22808,6 +23492,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -22840,6 +23526,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -22861,6 +23549,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -22890,6 +23580,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -22944,6 +23636,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -22980,6 +23674,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -23000,6 +23696,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -23170,6 +23868,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         }
     }
 
@@ -23468,6 +24168,8 @@ mod tests {
                 cost_usd: None,
                 smoke_tests: None,
                 review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -23508,6 +24210,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -23543,6 +24247,8 @@ mod tests {
                 cost_usd: None,
                 smoke_tests: None,
                 review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -23583,6 +24289,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -23658,6 +24366,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -23693,6 +24403,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -23722,6 +24434,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -23751,6 +24465,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -23875,12 +24591,14 @@ mod tests {
             "CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);",
         )
         .unwrap();
-        let (gates, labels, repos, require_plan, run_cmds) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds, repo_paths) =
+            load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["review".to_string(), "merge".to_string()]);
         assert_eq!(labels, vec!["coord".to_string()]);
         assert!(repos.is_empty());
         assert!(!require_plan);
         assert!(run_cmds.is_empty(), "no run_cmds configured → empty map");
+        assert!(repo_paths.is_empty(), "no repo_paths configured → empty map");
     }
 
     #[test]
@@ -23893,10 +24611,12 @@ mod tests {
               ('pipeline_tracked_labels', '[\"hotfix\",\"feature\"]'), \
               ('pipeline_repos', '{\"api\":\"acme/api\"}'), \
               ('pipeline_repo_run_cmds', '{\"api\":\"cargo run --example gtk_panel\"}'), \
+              ('pipeline_repo_paths', '{\"api\":\"/home/user/src/api\"}'), \
               ('pipeline_require_plan', '1');",
         )
         .unwrap();
-        let (gates, labels, repos, require_plan, run_cmds) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds, repo_paths) =
+            load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["plan", "work", "smoke"]);
         assert_eq!(labels, vec!["hotfix", "feature"]);
         assert_eq!(repos, vec![("api".to_string(), "acme/api".to_string())]);
@@ -23905,6 +24625,11 @@ mod tests {
             run_cmds.get("api").map(|s| s.as_str()),
             Some("cargo run --example gtk_panel"),
             "run_cmds parsed from board_meta",
+        );
+        assert_eq!(
+            repo_paths.get("api").map(|s| s.as_str()),
+            Some("/home/user/src/api"),
+            "repo_paths parsed from board_meta",
         );
     }
 
@@ -26783,6 +27508,8 @@ mod tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -27473,5 +28200,123 @@ mod tests {
         assert_eq!(milestones.len(), 2);
         assert_eq!(milestones[0].0, "1", "named milestone comes first");
         assert_eq!(milestones[1].0, "no-milestone", "No milestone sorted last");
+    }
+
+    // ── #349: Test-plan helpers ───────────────────────────────────────────────
+
+    /// Parsing a well-formed test_plan JSON blob returns the expected steps.
+    #[test]
+    fn parse_test_plan_steps_happy_path() {
+        let raw = r#"{"steps":[
+            {"kind":"run","cmd":"cargo test"},
+            {"kind":"pull","cmd":"coord pull-artifact abc","label":"binary"},
+            {"kind":"verify","check":"no panic in stderr"}
+        ],"blockers":[]}"#;
+        let steps = parse_test_plan_steps(raw).expect("should parse");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].kind, "run");
+        assert_eq!(steps[0].cmd.as_deref(), Some("cargo test"));
+        assert_eq!(steps[1].kind, "pull");
+        assert_eq!(steps[1].label.as_deref(), Some("binary"));
+        assert_eq!(steps[2].kind, "verify");
+        assert_eq!(steps[2].check.as_deref(), Some("no panic in stderr"));
+        assert!(steps[2].cmd.is_none());
+    }
+
+    /// Malformed JSON returns None gracefully (no panic).
+    #[test]
+    fn parse_test_plan_steps_malformed_returns_none() {
+        assert!(parse_test_plan_steps("not json at all").is_none());
+        assert!(parse_test_plan_steps("{}").is_none()); // missing "steps"
+        assert!(parse_test_plan_steps("null").is_none());
+    }
+
+    /// Empty steps array returns Some(vec![]).
+    #[test]
+    fn parse_test_plan_steps_empty_array() {
+        let raw = r#"{"steps":[],"blockers":["need hardware"]}"#;
+        let steps = parse_test_plan_steps(raw).expect("should parse");
+        assert!(steps.is_empty());
+    }
+
+    /// Extra keys in step objects are silently ignored (forward-compat).
+    #[test]
+    fn parse_test_plan_steps_extra_keys_ignored() {
+        let raw = r#"{"steps":[{"kind":"run","cmd":"pytest","future_key":"x"}],"blockers":[]}"#;
+        let steps = parse_test_plan_steps(raw).expect("should parse");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, "run");
+    }
+
+    /// #349 bug-guard: `chars().take(N)` must not panic when truncating at a
+    /// multi-byte UTF-8 boundary.  Previously the code used `&s[..N]` which
+    /// panics when N falls inside a multi-byte sequence.
+    #[test]
+    fn truncate_unicode_at_boundary_does_not_panic() {
+        // "こんにちは" — each character is 3 bytes in UTF-8.
+        // Byte length is 15; character count is 5.
+        // A naïve &s[..8] would split "に" (starts at byte 6, ends at byte 9).
+        let s = "こんにちは世界";
+        // char-safe truncation at 4 chars.
+        let truncated: String = s.chars().take(4).collect();
+        assert_eq!(truncated, "こんにち", "should take 4 full characters");
+        assert_eq!(truncated.chars().count(), 4);
+        // Same logic as used in stage_content_test and other render paths.
+        let wide = "A̐éö̲\u{20000}"; // combining chars + surrogate-range codepoint
+        let safe: String = wide.chars().take(2).collect();
+        assert_eq!(safe.chars().count(), 2);
+    }
+
+    /// `read_git_branch_head` returns None for non-existent repo dirs.
+    #[test]
+    fn read_git_branch_head_missing_dir_returns_none() {
+        let result = read_git_branch_head(
+            std::path::Path::new("/nonexistent/repo"),
+            "main",
+        );
+        assert!(result.is_none());
+    }
+
+    /// `read_git_branch_head` reads a loose ref file.
+    #[test]
+    fn read_git_branch_head_reads_loose_ref() {
+        // Use the thread ID to make the directory name unique so parallel test
+        // runs cannot collide on a shared /tmp path.
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace(['(', ')'], "");
+        let tmp = std::env::temp_dir()
+            .join(format!("coord-tui-test-git-loose-{}", tid));
+        let refs_dir = tmp.join(".git").join("refs").join("heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        let sha = "abcdef1234567890abcdef1234567890abcdef12";
+        std::fs::write(refs_dir.join("my-branch"), format!("{}\n", sha)).unwrap();
+
+        let result = read_git_branch_head(&tmp, "my-branch");
+        assert_eq!(result.as_deref(), Some(sha));
+
+        // Clean up (best-effort).
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `read_git_branch_head` falls back to packed-refs when loose file missing.
+    #[test]
+    fn read_git_branch_head_reads_packed_refs() {
+        let tid = format!("{:?}", std::thread::current().id())
+            .replace(['(', ')'], "");
+        let tmp = std::env::temp_dir()
+            .join(format!("coord-tui-test-git-packed-{}", tid));
+        let git_dir = tmp.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let sha = "1111222233334444555566667777888899990000";
+        let packed = format!(
+            "# pack-refs with: peeled fully-peeled\n{} refs/heads/packed-branch\n",
+            sha
+        );
+        std::fs::write(git_dir.join("packed-refs"), packed).unwrap();
+
+        let result = read_git_branch_head(&tmp, "packed-branch");
+        assert_eq!(result.as_deref(), Some(sha));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -685,13 +685,24 @@ def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     conn.commit()
 
 
-def set_test_plan(assignment_id: str, plan: dict) -> None:
-    """#342 Phase A: persist a generated smoke-test plan on the assignment row.
+def set_test_plan(
+    assignment_id: str,
+    plan: dict,
+    *,
+    branch_head: str | None = None,
+) -> None:
+    """#342/#349: persist a generated smoke-test plan on the assignment row.
 
     ``plan`` must be a valid plan dict (keys ``steps`` and ``blockers``).
     Stored as JSON-encoded TEXT in the ``test_plan`` column.  Silently
     no-ops when the row doesn't exist — matches the pattern used by the
     other ``update_assignment_*`` helpers.
+
+    ``branch_head`` is the git HEAD SHA of the worker's branch at the time
+    the plan was generated.  The TUI compares this against the current local
+    branch HEAD to detect staleness and re-generate when needed.  When
+    ``branch_head`` is ``None`` the column is explicitly reset to NULL so no
+    stale SHA from a previous generation persists.
 
     Idempotent: calling again with a new plan overwrites the previous value.
     """
@@ -699,8 +710,9 @@ def set_test_plan(assignment_id: str, plan: dict) -> None:
         return
     conn = get_connection()
     conn.execute(
-        "UPDATE assignments SET test_plan=? WHERE assignment_id=?",
-        (json.dumps(plan), assignment_id),
+        "UPDATE assignments SET test_plan=?, test_plan_branch_head=? "
+        "WHERE assignment_id=?",
+        (json.dumps(plan), branch_head, assignment_id),
     )
     conn.commit()
 

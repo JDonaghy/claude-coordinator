@@ -1,4 +1,4 @@
-"""Tests for the `coord test-plan` CLI command — Phase A of #342.
+"""Tests for the `coord test-plan` CLI command — Phase A of #342 + #349.
 
 Covers:
 - Cache hit: if test_plan is already in DB, no Claude call is made.
@@ -6,6 +6,8 @@ Covers:
 - Unknown assignment_id: exits with error message.
 - Happy path: plan generated, printed as JSON, persisted to DB.
 - Fallback plan: persisted and printed when generation fails.
+- #349: branch_head persisted on set_test_plan, reset to NULL when None.
+- #349: _get_assignment_branch_head resolves git HEAD via subprocess.
 """
 
 from __future__ import annotations
@@ -364,3 +366,164 @@ class TestStateHelpers:
         from coord.state import get_test_plan
 
         assert get_test_plan("") is None
+
+    def test_set_with_branch_head_persists_sha(
+        self, coord_db: sqlite3.Connection
+    ) -> None:
+        """#349: branch_head kwarg is stored in test_plan_branch_head column."""
+        _insert_assignment(coord_db)
+        from coord.state import set_test_plan
+
+        plan = {"steps": [], "blockers": []}
+        set_test_plan("abc123", plan, branch_head="deadbeef1234567890")
+
+        row = coord_db.execute(
+            "SELECT test_plan_branch_head FROM assignments WHERE assignment_id='abc123'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "deadbeef1234567890"
+
+    def test_set_with_none_branch_head_resets_column(
+        self, coord_db: sqlite3.Connection
+    ) -> None:
+        """#349: calling set_test_plan with branch_head=None resets the column to NULL."""
+        _insert_assignment(coord_db)
+        from coord.state import set_test_plan
+
+        plan = {"steps": [], "blockers": []}
+        # First write with a SHA.
+        set_test_plan("abc123", plan, branch_head="aabbccdd")
+        # Then overwrite with no SHA — should reset to NULL.
+        set_test_plan("abc123", plan, branch_head=None)
+
+        row = coord_db.execute(
+            "SELECT test_plan_branch_head FROM assignments WHERE assignment_id='abc123'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None
+
+
+# ── #349: _get_assignment_branch_head helper ──────────────────────────────────
+
+class TestGetAssignmentBranchHead:
+    """Unit tests for the branch-HEAD resolver helper in cli.py."""
+
+    def _insert_assignment_with_branch(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        assignment_id: str = "abc123",
+        repo_name: str = "api",
+        branch: str | None = "issue-42-my-fix",
+    ) -> None:
+        conn.execute(
+            """INSERT INTO assignments
+               (assignment_id, machine_name, repo_name, repo_github,
+                issue_number, issue_title, status, branch)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (assignment_id, "laptop", repo_name, "acme/api", 42,
+             "Fix bug", "done", branch),
+        )
+        conn.commit()
+
+    def test_returns_sha_when_git_succeeds(
+        self, coord_db: sqlite3.Connection, tmp_path
+    ) -> None:
+        self._insert_assignment_with_branch(coord_db)
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+
+        from pathlib import Path as _Path
+        mock_path_fn = lambda _repo, _cfg: repo_dir  # noqa: E731
+
+        from coord.cli import _get_assignment_branch_head
+        from unittest.mock import patch
+
+        with patch(
+            "subprocess.run",
+            return_value=type("R", (), {"returncode": 0, "stdout": "abcdef123\n"})(),
+        ):
+            result = _get_assignment_branch_head("abc123", object(), mock_path_fn)
+
+        assert result == "abcdef123"
+
+    def test_returns_none_when_branch_is_null(
+        self, coord_db: sqlite3.Connection, tmp_path
+    ) -> None:
+        self._insert_assignment_with_branch(coord_db, branch=None)
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+
+        from coord.cli import _get_assignment_branch_head
+
+        result = _get_assignment_branch_head(
+            "abc123", object(), lambda _r, _c: repo_dir
+        )
+        assert result is None
+
+    def test_returns_none_when_assignment_not_found(
+        self, coord_db: sqlite3.Connection
+    ) -> None:
+        from coord.cli import _get_assignment_branch_head
+
+        result = _get_assignment_branch_head(
+            "no-such", object(), lambda _r, _c: None
+        )
+        assert result is None
+
+    def test_returns_none_when_repo_path_missing(
+        self, coord_db: sqlite3.Connection, tmp_path
+    ) -> None:
+        self._insert_assignment_with_branch(coord_db)
+        from coord.cli import _get_assignment_branch_head
+
+        result = _get_assignment_branch_head(
+            "abc123", object(), lambda _r, _c: None
+        )
+        assert result is None
+
+    def test_returns_none_when_git_fails(
+        self, coord_db: sqlite3.Connection, tmp_path
+    ) -> None:
+        self._insert_assignment_with_branch(coord_db)
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+
+        from coord.cli import _get_assignment_branch_head
+        from unittest.mock import patch
+
+        with patch(
+            "subprocess.run",
+            return_value=type("R", (), {"returncode": 128, "stdout": ""})(),
+        ):
+            result = _get_assignment_branch_head(
+                "abc123", object(), lambda _r, _c: repo_dir
+            )
+
+        assert result is None
+
+    def test_branch_head_stored_in_db_on_generation(
+        self, coord_db: sqlite3.Connection, tmp_path
+    ) -> None:
+        """Integration: after `coord test-plan` runs, test_plan_branch_head is set."""
+        _insert_assignment(coord_db, assignment_id="abc123", branch="issue-42-fix-bug")
+        cfg = _write_config(tmp_path)
+
+        runner = CliRunner()
+        with patch(
+            "coord.test_orchestrator.generate_plan", return_value=SAMPLE_PLAN
+        ):
+            with patch(
+                "coord.cli._get_assignment_branch_head",
+                return_value="abc123456789",
+            ):
+                result = runner.invoke(
+                    main, ["test-plan", "abc123", "--config", str(cfg)]
+                )
+
+        assert result.exit_code == 0, result.output
+        row = coord_db.execute(
+            "SELECT test_plan_branch_head FROM assignments WHERE assignment_id='abc123'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "abc123456789"
