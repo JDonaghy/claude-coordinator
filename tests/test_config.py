@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
-from coord.config import ConfigError, _parse_concurrency, load
+from coord.config import (
+    ConfigError,
+    ProviderDef,
+    ProvidersConfig,
+    _parse_concurrency,
+    load,
+)
 
 
 def test_load_valid_config(valid_config_path: Path) -> None:
@@ -548,3 +555,268 @@ def test_new_issue_guidance_non_string_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="new_issue_guidance must be a string"):
         load(p)
+
+
+# ── providers block (#323) ────────────────────────────────────────────────────
+
+
+_MIN_CONFIG = (
+    "repos:\n"
+    "  - name: api\n    github: a/a\n"
+    "machines:\n"
+    "  - name: m\n    host: h\n    repos: [api]\n"
+)
+
+
+def test_providers_absent_block_defaults() -> None:
+    """When 'providers' is absent, default='claude' and implicit 'claude' entry present."""
+    cfg = ProvidersConfig()
+    assert cfg.default == "claude"
+    assert "claude" in cfg.definitions
+    assert cfg.definitions["claude"].type == "claude"
+
+
+def test_providers_absent_in_config_file(tmp_path: Path) -> None:
+    """Loading a config without a 'providers' block produces the same defaults."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(_MIN_CONFIG)
+    cfg = load(p)
+    assert cfg.providers.default == "claude"
+    assert "claude" in cfg.providers.definitions
+    assert cfg.providers.definitions["claude"].type == "claude"
+
+
+def test_providers_explicit_default_overrides_claude(tmp_path: Path) -> None:
+    """providers.default can override the default provider name."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  default: fast-claude\n"
+        "  definitions:\n"
+        "    fast-claude:\n"
+        "      type: claude\n"
+        "      binary: fast-claude-cli\n"
+    )
+    cfg = load(p)
+    assert cfg.providers.default == "fast-claude"
+    defn = cfg.providers.definitions["fast-claude"]
+    assert defn.type == "claude"
+    assert defn.binary == "fast-claude-cli"
+
+
+def test_providers_all_fields_parsed(tmp_path: Path) -> None:
+    """All ProviderDef fields are parsed and stored correctly."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    my-provider:\n"
+        "      type: claude\n"
+        "      binary: /usr/local/bin/claude\n"
+        "      model: sonnet\n"
+        "      attach_url: http://localhost:9999\n"
+        "      env:\n"
+        "        FOO: bar\n"
+        "        BAZ: qux\n"
+        "      extra_args:\n"
+        "        - --dangerously-skip-permissions\n"
+        "        - --max-turns\n"
+        "        - '100'\n"
+    )
+    cfg = load(p)
+    defn = cfg.providers.definitions["my-provider"]
+    assert defn.type == "claude"
+    assert defn.binary == "/usr/local/bin/claude"
+    assert defn.model == "sonnet"
+    assert defn.attach_url == "http://localhost:9999"
+    assert defn.env == {"FOO": "bar", "BAZ": "qux"}
+    assert defn.extra_args == ["--dangerously-skip-permissions", "--max-turns", "100"]
+
+
+def test_providers_env_var_expansion(tmp_path: Path, monkeypatch) -> None:
+    """${VAR} placeholders in env values are expanded from os.environ."""
+    monkeypatch.setenv("COORD_TEST_TOKEN", "secret-token-xyz")
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    remote:\n"
+        "      type: claude\n"
+        "      env:\n"
+        "        API_TOKEN: '${COORD_TEST_TOKEN}'\n"
+        "        STATIC_VAL: plain-value\n"
+    )
+    cfg = load(p)
+    env = cfg.providers.definitions["remote"].env
+    assert env["API_TOKEN"] == "secret-token-xyz"
+    assert env["STATIC_VAL"] == "plain-value"
+
+
+def test_providers_env_var_expansion_unset_var_left_as_is(tmp_path: Path, monkeypatch) -> None:
+    """When ${VAR} is not set in os.environ, the literal placeholder is kept."""
+    monkeypatch.delenv("COORD_DEFINITELY_UNSET_VAR", raising=False)
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    p:\n"
+        "      type: claude\n"
+        "      env:\n"
+        "        KEY: '${COORD_DEFINITELY_UNSET_VAR}'\n"
+    )
+    cfg = load(p)
+    # Unset var → placeholder stays as-is
+    assert cfg.providers.definitions["p"].env["KEY"] == "${COORD_DEFINITELY_UNSET_VAR}"
+
+
+def test_providers_implicit_claude_always_present(tmp_path: Path) -> None:
+    """Even when definitions is supplied without 'claude', the implicit entry is added."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    other:\n"
+        "      type: claude\n"
+    )
+    cfg = load(p)
+    assert "claude" in cfg.providers.definitions
+    assert cfg.providers.definitions["claude"].type == "claude"
+
+
+def test_providers_not_a_mapping_raises(tmp_path: Path) -> None:
+    """'providers' must be a mapping; a list raises ConfigError."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(_MIN_CONFIG + "providers: [a, b]\n")
+    with pytest.raises(ConfigError, match="providers.*mapping"):
+        load(p)
+
+
+def test_providers_default_non_string_raises(tmp_path: Path) -> None:
+    """providers.default must be a non-empty string."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  default: 42\n"
+    )
+    with pytest.raises(ConfigError, match="providers.default must be a non-empty string"):
+        load(p)
+
+
+def test_providers_definition_missing_type_raises(tmp_path: Path) -> None:
+    """Each definition must have a 'type' field."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    notype:\n"
+        "      binary: claude-bin\n"
+    )
+    with pytest.raises(ConfigError, match="type is required"):
+        load(p)
+
+
+def test_providers_definition_env_non_string_value_raises(tmp_path: Path) -> None:
+    """Env values must be strings."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    p:\n"
+        "      type: claude\n"
+        "      env:\n"
+        "        KEY: 42\n"
+    )
+    with pytest.raises(ConfigError, match="env must map strings to strings"):
+        load(p)
+
+
+def test_providers_extra_args_non_string_element_raises(tmp_path: Path) -> None:
+    """extra_args elements must be strings."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    p:\n"
+        "      type: claude\n"
+        "      extra_args:\n"
+        "        - 99\n"
+    )
+    with pytest.raises(ConfigError, match="extra_args must be a list of strings"):
+        load(p)
+
+
+# ── Repo.provider (#323) ──────────────────────────────────────────────────────
+
+
+def test_repo_provider_absent_defaults_to_none(tmp_path: Path) -> None:
+    """When 'provider' is absent from a repo entry, Repo.provider is None."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(_MIN_CONFIG)
+    cfg = load(p)
+    assert cfg.repo("api").provider is None
+
+
+def test_repo_provider_parsed(tmp_path: Path) -> None:
+    """Repo.provider is parsed and stored when present."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: a/a\n"
+        "    provider: fast-claude\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.repo("api").provider == "fast-claude"
+
+
+def test_repo_provider_non_string_raises(tmp_path: Path) -> None:
+    """repos[i].provider must be a string when present."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n    provider: 42\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    with pytest.raises(ConfigError, match="provider must be a string"):
+        load(p)
+
+
+# ── ProvidersConfig standalone tests ─────────────────────────────────────────
+
+
+def test_providers_config_default_constructor() -> None:
+    """ProvidersConfig() produces default='claude' with implicit claude entry."""
+    cfg = ProvidersConfig()
+    assert cfg.default == "claude"
+    assert "claude" in cfg.definitions
+    assert isinstance(cfg.definitions["claude"], ProviderDef)
+    assert cfg.definitions["claude"].type == "claude"
+
+
+def test_providers_config_explicit_claude_entry_not_duplicated() -> None:
+    """When 'claude' is supplied explicitly, __post_init__ does not add a second one."""
+    custom_def = ProviderDef(type="claude", binary="my-claude")
+    cfg = ProvidersConfig(definitions={"claude": custom_def})
+    assert cfg.definitions["claude"] is custom_def
+
+
+def test_provider_def_defaults() -> None:
+    """ProviderDef optional fields default to None / empty."""
+    defn = ProviderDef(type="claude")
+    assert defn.binary is None
+    assert defn.model is None
+    assert defn.attach_url is None
+    assert defn.env == {}
+    assert defn.extra_args == []

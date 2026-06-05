@@ -71,6 +71,11 @@ class Repo:
     # semantics per (repo, branch) pair.  Files under 100 bytes or ending
     # in `.d` are excluded (dependency files, not binaries).
     artifact_paths: list[str] = field(default_factory=list)
+    # #323: optional provider override for workers dispatched to this repo.
+    # When set, overrides providers.default from coordinator.yml.  The value
+    # must match a key in providers.definitions (or be "claude" which is
+    # always implicit).  None means "use the global default".
+    provider: str | None = None
 
     def resolve_new_issue_guidance(self, repo_path: Path) -> str:
         """Return the new-issue guidance string for this repo.
