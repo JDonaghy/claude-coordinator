@@ -21,7 +21,11 @@ required-features = ["gtk"]
 gtk = ["quadraui/gtk"]
 
 [dependencies]
-quadraui = { path = "../../quadraui/quadraui", features = ["tui"] }
+# `terminal` enables quadraui's PTY + vt100 + scrollback engine
+# (`quadraui::terminal_engine::TerminalSession`) so the Terminal panel
+# (#424) can host a live shell inside the TUI. Always-on — the feature
+# pulls in `portable-pty` + `vt100`, which are small native deps.
+quadraui = { path = "../../quadraui/quadraui", features = ["tui", "terminal"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

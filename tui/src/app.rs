@@ -669,6 +669,12 @@ enum SidebarView {
     Pipeline,
     /// Settings panel: category nav on the left, form controls on the right.
     Settings,
+    /// #424: embedded terminal pane hosting a live PTY-backed shell session
+    /// via `quadraui::terminal_engine::TerminalSession`.  Focus routing is
+    /// controlled by `CoordApp::terminal_focused`: when true, keystrokes
+    /// pass through to the PTY; when false, normal TUI chrome handles
+    /// them. F12 toggles focus.
+    Terminal,
 }
 
 impl SidebarView {
@@ -678,6 +684,7 @@ impl SidebarView {
             SidebarView::Machines => "Machines",
             SidebarView::Pipeline => "Pipeline",
             SidebarView::Settings => "Settings",
+            SidebarView::Terminal => "Terminal",
         }
     }
 }
@@ -3928,6 +3935,35 @@ pub struct CoordApp {
     /// (work_id, step_index).  Displayed inline below each step row so the
     /// user can see *why* a step passed or failed without leaving the panel.
     test_step_output: std::collections::HashMap<(String, usize), String>,
+    // ── #424: embedded terminal pane state ──────────────────────────────
+    /// Live PTY-backed shell session shown when `active_view ==
+    /// SidebarView::Terminal`.  Lazily spawned by [`tick`] the first
+    /// time the user opens the Terminal view; persisted across view
+    /// switches (switching to Board then back to Terminal does NOT
+    /// respawn the shell).  Becomes `None` only on initial construction
+    /// or if the initial spawn failed (error captured in
+    /// `terminal_spawn_error`).
+    terminal_session: Option<quadraui::terminal_engine::TerminalSession>,
+    /// FOCUS PROTOCOL (#424):
+    ///   - `true`  → keystrokes on the Terminal view encode to xterm
+    ///     escape sequences and write to the PTY (`write_input`).  TUI
+    ///     chrome view-switching (1/2/3/4/5) is INACTIVE in this mode;
+    ///     press F12 to release focus.
+    ///   - `false` → keystrokes drive normal TUI chrome (view switching,
+    ///     hotkeys); the PTY output is still visible but read-only.
+    /// Default on entering the Terminal view: `true`.
+    /// Toggle key: F12 (chosen because it is rarely produced by the
+    /// PTY and is a single key — no chord needed).
+    terminal_focused: bool,
+    /// Pending PTY resize target written by [`render_content`] (which
+    /// only has `&self`) and applied by [`tick`] (`&mut self`).  Stores
+    /// `(cols, rows)` derived from the live viewport rect divided by
+    /// the backend's cell metrics.  `Cell` because render is `&self`.
+    terminal_pending_dims: std::cell::Cell<Option<(u16, u16)>>,
+    /// Error captured if `TerminalSession::spawn` failed (missing
+    /// `$SHELL`, fork failure, etc.).  Displayed in the Terminal pane
+    /// as a one-line placeholder so the user knows why nothing rendered.
+    terminal_spawn_error: Option<String>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4118,6 +4154,13 @@ impl CoordApp {
             test_step_jobs: std::collections::HashMap::new(),
             test_step_results: std::collections::HashMap::new(),
             test_step_output: std::collections::HashMap::new(),
+            // #424: terminal pane is lazily spawned the first time the
+            // user opens the Terminal view (see `tick`).  Start with no
+            // session, focus enabled-by-default once the view is opened.
+            terminal_session: None,
+            terminal_focused: false,
+            terminal_pending_dims: std::cell::Cell::new(None),
+            terminal_spawn_error: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -4160,6 +4203,15 @@ impl CoordApp {
                     icon: "⚙".into(),
                     tooltip: "Settings".into(),
                     title: "SETTINGS".into(),
+                },
+                // #424: embedded terminal pane (PTY-backed shell via
+                // quadraui::terminal_engine::TerminalSession).
+                PanelDefinition {
+                    id: WidgetId::new("panel:terminal"),
+                    // >_ for a shell prompt glyph.
+                    icon: ">_".into(),
+                    tooltip: "Terminal".into(),
+                    title: "TERMINAL".into(),
                 },
             ],
         )
@@ -11794,6 +11846,8 @@ impl CoordApp {
                 let _ = (pos, sidebar_b, backend);
                 false
             }
+            // #424: Terminal sidebar is a hint placeholder; clicks are inert.
+            SidebarView::Terminal => false,
         }
     }
 
@@ -12032,6 +12086,9 @@ impl CoordApp {
                 let _ = (delta, sidebar_b, backend);
                 false
             }
+            // #424: Terminal view's sidebar is just a hint placeholder —
+            // no scrollable content, swallow the wheel.
+            SidebarView::Terminal => false,
         }
     }
 
@@ -12182,6 +12239,11 @@ impl CoordApp {
                 self.settings_form.borrow_mut().handle_cached(&scroll_event, main_b);
                 true
             }
+            // #424: Terminal pane handles scroll via the PTY scrollback
+            // (history/scroll_offset).  Mouse-wheel scrollback is OUT
+            // OF SCOPE for this PR — copy-out + scrollbar drag come in
+            // quadraui #283 / coord #326.  Swallow the wheel for now.
+            SidebarView::Terminal => true,
         }
     }
 
@@ -12212,7 +12274,10 @@ impl CoordApp {
             // (now wired to mouse clicks) are unreachable for users who don't
             // know about the activity-bar key shortcuts.
             StatusBarSegment {
-                text: format!(" {}  [1=Board 2=Machines 3=Pipeline 4=Settings] ", view_label),
+                text: format!(
+                    " {}  [1=Board 2=Machines 3=Pipeline 4=Settings 5=Terminal] ",
+                    view_label
+                ),
                 fg: Color::rgb(200, 220, 255),
                 bg: Color::rgb(40, 60, 90),
                 bold: false,
@@ -12281,7 +12346,14 @@ impl CoordApp {
         // affordance.  The hints chain below falls through to the normal
         // view-specific hints whenever a prompt dialog is showing, so the
         // status bar remains informative instead of going blank.
-        let hints = if self.active_view == SidebarView::Machines {
+        let hints = if self.active_view == SidebarView::Terminal {
+            // #424: Terminal pane — F12 toggles PTY focus / chrome focus.
+            if self.terminal_focused {
+                " PTY focused — F12 = release  (typed keys go to the shell) ".to_string()
+            } else {
+                " PTY released — F12 = focus  ·  1–5 switch view  ·  q=quit ".to_string()
+            }
+        } else if self.active_view == SidebarView::Machines {
             // Machines panel action hints.
             " r=restart  u=update  c=clean worktrees  q=quit ".to_string()
         } else if self.active_view == SidebarView::Pipeline && self.test_gate_actionable() {
@@ -15521,8 +15593,13 @@ impl CoordApp {
                     toolbar_button("retry", "[R]etry", retry_enabled),
                 ]
             }
-            // Machines and Settings have no panel-level verbs.
-            SidebarView::Machines | SidebarView::Settings => return None,
+            // Machines, Settings, Terminal: no panel-level verbs.
+            // (#424: Terminal is a pure pass-through pane — keys go to
+            // the PTY or to view-switching; there's no coord-level verb
+            // that makes sense at the panel-bar level.)
+            SidebarView::Machines | SidebarView::Settings | SidebarView::Terminal => {
+                return None
+            }
         };
 
         Some(Toolbar {
@@ -16419,6 +16496,28 @@ impl CoordApp {
         }
     }
 
+    /// #424: empty list shown in the sidebar slot while the Terminal
+    /// view is active — keeps the sidebar header at a stable height so
+    /// the layout doesn't shift when switching to/from this view.
+    fn terminal_sidebar_placeholder(&self) -> ListView {
+        let hint = if self.terminal_focused {
+            "  PTY focused — F12 to release"
+        } else {
+            "  PTY released — F12 to focus"
+        };
+        ListView {
+            id: WidgetId::new("terminal-sidebar-placeholder"),
+            title: Some(StyledText::plain(" TERMINAL ")),
+            items: vec![activity_item(hint, Color::rgb(160, 160, 160))],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+        }
+    }
+
     /// Build the unified settings `Form`.
     ///
     /// #237: All categories render as one full-width scrollable form with
@@ -16676,6 +16775,265 @@ impl CoordApp {
     }
 }
 
+// ─── #424: embedded terminal pane plumbing ────────────────────────────────────
+
+impl CoordApp {
+    /// Per-tick maintenance for the embedded terminal pane (#424).
+    ///
+    /// Performs three things in order, each idempotent:
+    ///
+    /// 1. **Lazy spawn** — the first time the user opens the Terminal
+    ///    view (so `terminal_pending_dims` has been written by
+    ///    `render_content`), spawn a fresh [`TerminalSession`] running
+    ///    the user's `$SHELL`.  Any failure is captured in
+    ///    `terminal_spawn_error` so the pane shows a readable diagnostic
+    ///    instead of silently being blank.
+    ///
+    /// 2. **Resize** — if the pending dims differ from the session's
+    ///    current `(cols, rows)`, propagate via
+    ///    [`TerminalSession::resize`] (which sends SIGWINCH so `vim`,
+    ///    `htop`, etc. re-layout).
+    ///
+    /// 3. **Poll** — drain pending PTY output and the child-exit
+    ///    status.  Returns `true` when a repaint is needed.
+    ///
+    /// Runs on every tick (not just when the Terminal view is active)
+    /// so output continues to accumulate while the user is on Board /
+    /// Pipeline / Settings, matching the watch-pool's behaviour.  This
+    /// is cheap: `poll()` short-circuits when there's nothing on the
+    /// channel and `try_wait()` is non-blocking.
+    fn drive_terminal_pane(&mut self) -> bool {
+        let mut changed = false;
+
+        // 1. Lazy spawn — only triggered the first time the user opens
+        //    the Terminal view (so the renderer has stashed real dims).
+        if self.terminal_session.is_none() && self.terminal_spawn_error.is_none() {
+            if let Some((cols, rows)) = self.terminal_pending_dims.get() {
+                let cwd = std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+                let shell = quadraui::terminal_engine::default_shell();
+                match quadraui::terminal_engine::TerminalSession::spawn(
+                    cols.max(20),
+                    rows.max(5),
+                    &shell,
+                    &cwd,
+                    10_000, // 10 000-line scrollback
+                ) {
+                    Ok(sess) => {
+                        self.terminal_session = Some(sess);
+                        changed = true;
+                    }
+                    Err(e) => {
+                        self.terminal_spawn_error = Some(e.to_string());
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Resize on dimension change.
+        if let Some(ref mut sess) = self.terminal_session {
+            if let Some((cols, rows)) = self.terminal_pending_dims.get() {
+                if cols != sess.cols() || rows != sess.rows() {
+                    sess.resize(cols, rows);
+                    changed = true;
+                }
+            }
+        }
+
+        // 3. Drain PTY output + observe child exit.
+        if let Some(ref mut sess) = self.terminal_session {
+            if sess.poll() {
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    /// Forward a key press to the embedded terminal PTY (#424).
+    ///
+    /// Encodes the key + modifiers into the appropriate xterm-256color
+    /// escape sequence via [`key_to_pty_bytes`] and writes them to the
+    /// PTY via [`TerminalSession::write_input`].  Returns `true` when
+    /// the event was consumed (caller should suppress further routing
+    /// and request a redraw); `false` when there is no live session or
+    /// the key produced no PTY bytes (e.g. CapsLock).
+    fn forward_key_to_pty(&mut self, key: &Key, mods: &quadraui::Modifiers) -> bool {
+        let Some(sess) = self.terminal_session.as_mut() else {
+            return false;
+        };
+        if sess.is_exited() {
+            // Don't write to a dead PTY — but DO swallow the keypress
+            // (the user is on the Terminal view; we don't want stray
+            // keys to drive nav while the dead-process pane is up).
+            return true;
+        }
+        // Any input pops the user back to the live view (matches the
+        // quadraui terminal example's behaviour).
+        sess.scroll_reset();
+        if let Some(bytes) = key_to_pty_bytes(key.clone(), *mods) {
+            sess.write_input(&bytes);
+        }
+        true
+    }
+}
+
+/// Convert a `Key` + `Modifiers` pair to the byte sequence sent to a
+/// PTY (#424).  Mirrors the helper that ships in
+/// `quadraui/examples/common/terminal_app.rs` — re-implemented here
+/// because the example file is not part of the published API.
+///
+/// Covers the common VT100 / xterm-256color sequences (cursor keys,
+/// function keys, Home/End/PgUp/PgDn, Ctrl+letter -> control codes,
+/// printable chars).  Keys with no PTY mapping (CapsLock, etc.) return
+/// `None`.
+fn key_to_pty_bytes(key: Key, mods: quadraui::Modifiers) -> Option<Vec<u8>> {
+    match key {
+        Key::Char(ch) => {
+            if mods.ctrl {
+                // Ctrl+A..Ctrl+Z → bytes 0x01..0x1A.
+                let c = ch.to_ascii_uppercase();
+                if c.is_ascii_alphabetic() {
+                    return Some(vec![c as u8 - b'@']);
+                }
+                // Ctrl+[ → ESC, Ctrl+\ → FS, Ctrl+] → GS, Ctrl+^ → RS, Ctrl+_ → US.
+                match ch {
+                    '[' => return Some(vec![0x1b]),
+                    '\\' => return Some(vec![0x1c]),
+                    ']' => return Some(vec![0x1d]),
+                    '^' => return Some(vec![0x1e]),
+                    '_' => return Some(vec![0x1f]),
+                    _ => {}
+                }
+            }
+            // Regular printable character — encode as UTF-8.
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            Some(s.as_bytes().to_vec())
+        }
+        Key::Named(named) => named_key_to_pty_bytes(named, mods),
+    }
+}
+
+/// Helper for [`key_to_pty_bytes`] — maps named keys to escape sequences.
+fn named_key_to_pty_bytes(key: quadraui::NamedKey, mods: quadraui::Modifiers) -> Option<Vec<u8>> {
+    use quadraui::NamedKey;
+    let mod_param = pty_modifier_param(mods);
+    match key {
+        NamedKey::Enter => Some(b"\r".to_vec()),
+        NamedKey::Tab => {
+            if mods.shift {
+                Some(b"\x1b[Z".to_vec()) // back-tab
+            } else {
+                Some(b"\t".to_vec())
+            }
+        }
+        NamedKey::BackTab => Some(b"\x1b[Z".to_vec()),
+        NamedKey::Backspace => Some(b"\x7f".to_vec()),
+        NamedKey::Delete => Some(pty_xterm_seq(b"3", mod_param)),
+        NamedKey::Escape => Some(b"\x1b".to_vec()),
+        NamedKey::Up => Some(pty_xterm_cursor_seq(b"A", mod_param)),
+        NamedKey::Down => Some(pty_xterm_cursor_seq(b"B", mod_param)),
+        NamedKey::Right => Some(pty_xterm_cursor_seq(b"C", mod_param)),
+        NamedKey::Left => Some(pty_xterm_cursor_seq(b"D", mod_param)),
+        NamedKey::Home => Some(pty_xterm_seq(b"1", mod_param)),
+        NamedKey::End => Some(pty_xterm_seq(b"4", mod_param)),
+        NamedKey::Insert => Some(pty_xterm_seq(b"2", mod_param)),
+        NamedKey::PageUp => Some(pty_xterm_seq(b"5", mod_param)),
+        NamedKey::PageDown => Some(pty_xterm_seq(b"6", mod_param)),
+        NamedKey::F(n) => pty_f_key_bytes(n, mod_param),
+        // Keys with no PTY mapping.
+        NamedKey::CapsLock | NamedKey::NumLock | NamedKey::ScrollLock | NamedKey::Menu => None,
+    }
+}
+
+/// Build an xterm modifier parameter (1-based; plain = `None`).
+fn pty_modifier_param(mods: quadraui::Modifiers) -> Option<u8> {
+    let n: u8 = 1
+        + if mods.shift { 1 } else { 0 }
+        + if mods.alt { 2 } else { 0 }
+        + if mods.ctrl { 4 } else { 0 };
+    if n == 1 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// Build `\x1b[<code>~` or `\x1b[<code>;<mod>~` for tilde-terminated sequences.
+fn pty_xterm_seq(code: &[u8], mod_param: Option<u8>) -> Vec<u8> {
+    let mut v = b"\x1b[".to_vec();
+    v.extend_from_slice(code);
+    if let Some(m) = mod_param {
+        v.push(b';');
+        v.push(b'0' + m);
+    }
+    v.push(b'~');
+    v
+}
+
+/// Build cursor-movement sequences: `\x1b[<letter>` or `\x1b[1;<mod><letter>`.
+fn pty_xterm_cursor_seq(letter: &[u8], mod_param: Option<u8>) -> Vec<u8> {
+    match mod_param {
+        None => {
+            let mut v = b"\x1b[".to_vec();
+            v.extend_from_slice(letter);
+            v
+        }
+        Some(m) => {
+            let mut v = b"\x1b[1;".to_vec();
+            v.push(b'0' + m);
+            v.extend_from_slice(letter);
+            v
+        }
+    }
+}
+
+/// Function-key byte sequences (xterm encoding).
+fn pty_f_key_bytes(n: u8, mod_param: Option<u8>) -> Option<Vec<u8>> {
+    let bytes = match n {
+        1 => {
+            if mod_param.is_none() {
+                b"\x1bOP".to_vec()
+            } else {
+                pty_xterm_cursor_seq(b"P", mod_param)
+            }
+        }
+        2 => {
+            if mod_param.is_none() {
+                b"\x1bOQ".to_vec()
+            } else {
+                pty_xterm_cursor_seq(b"Q", mod_param)
+            }
+        }
+        3 => {
+            if mod_param.is_none() {
+                b"\x1bOR".to_vec()
+            } else {
+                pty_xterm_cursor_seq(b"R", mod_param)
+            }
+        }
+        4 => {
+            if mod_param.is_none() {
+                b"\x1bOS".to_vec()
+            } else {
+                pty_xterm_cursor_seq(b"S", mod_param)
+            }
+        }
+        5 => pty_xterm_seq(b"15", mod_param),
+        6 => pty_xterm_seq(b"17", mod_param),
+        7 => pty_xterm_seq(b"18", mod_param),
+        8 => pty_xterm_seq(b"19", mod_param),
+        9 => pty_xterm_seq(b"20", mod_param),
+        10 => pty_xterm_seq(b"21", mod_param),
+        11 => pty_xterm_seq(b"23", mod_param),
+        12 => pty_xterm_seq(b"24", mod_param),
+        _ => return None,
+    };
+    Some(bytes)
+}
+
 // ─── ShellApp implementation ──────────────────────────────────────────────────
 
 impl ShellApp for CoordApp {
@@ -16728,6 +17086,13 @@ impl ShellApp for CoordApp {
                     // slot keeps a header (consistent with other views)
                     // without offering a misleading affordance.
                     backend.draw_list(sidebar_rect, &self.settings_sidebar_placeholder());
+                }
+                SidebarView::Terminal => {
+                    // #424: no sidebar list for the Terminal view — the
+                    // pane is one big PTY surface in the main area.  Draw
+                    // an empty placeholder so the sidebar header
+                    // (TERMINAL / chrome) keeps a stable height.
+                    backend.draw_list(sidebar_rect, &self.terminal_sidebar_placeholder());
                 }
             }
         }
@@ -16970,6 +17335,66 @@ impl ShellApp for CoordApp {
                     }
                 }
             }
+            SidebarView::Terminal => {
+                // #424: draw the live PTY surface into the full main rect.
+                // Render path is `&self`, so we cannot spawn / resize /
+                // poll here.  Instead:
+                //   - stash the desired (cols, rows) for `tick` to apply
+                //     via `TerminalSession::resize`,
+                //   - read the session and build a paint snapshot, or
+                //   - render a one-line placeholder when no session yet
+                //     exists (spawn happens on the next `tick`).
+                let cell_w = backend.char_width().max(1.0);
+                let cell_h = lh.max(1.0);
+                let cols = (m.width / cell_w).floor().max(1.0) as u16;
+                let rows = (m.height / cell_h).floor().max(1.0) as u16;
+                self.terminal_pending_dims.set(Some((cols, rows)));
+
+                if let Some(ref sess) = self.terminal_session {
+                    let total = sess.history_len() + sess.rows() as usize;
+                    let sb = if total > sess.rows() as usize {
+                        Some(sess.scrollbar_state(None))
+                    } else {
+                        None
+                    };
+                    let snapshot = sess.to_terminal(
+                        WidgetId::new("coord-terminal:0"),
+                        sb,
+                    );
+                    backend.draw_terminal(m, &snapshot);
+                } else {
+                    // No session yet — show a one-line placeholder.  The
+                    // first `tick` after this render will spawn it.
+                    let msg = match &self.terminal_spawn_error {
+                        Some(err) => format!(
+                            "  Terminal failed to start: {}  (press 1/2/3/4 to switch views)",
+                            err
+                        ),
+                        None => "  Starting shell session…".to_string(),
+                    };
+                    let item = activity_item(
+                        &msg,
+                        match self.terminal_spawn_error {
+                            Some(_) => Color::rgb(220, 80, 80),
+                            None => Color::rgb(180, 180, 180),
+                        },
+                    );
+                    backend.draw_list(
+                        m,
+                        &ListView {
+                            id: WidgetId::new("terminal-placeholder"),
+                            title: None,
+                            items: vec![item],
+                            selected_idx: 0,
+                            scroll_offset: 0,
+                            has_focus: false,
+                            bordered: false,
+                            h_scroll: 0,
+                            max_content_width: None,
+                        },
+                    );
+                }
+            }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
@@ -17049,6 +17474,46 @@ impl ShellApp for CoordApp {
 
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
+
+        // ── #424: embedded terminal pane focus arbitration ──────────────
+        // PROTOCOL:
+        //   - When `active_view == SidebarView::Terminal`:
+        //     * F12 toggles `terminal_focused` (handled here always,
+        //       regardless of current focus state).
+        //     * When `terminal_focused == true`, every other KeyPressed
+        //       is encoded via `key_to_pty_bytes` and forwarded to the
+        //       PTY — TUI chrome (view-switch hotkeys 1/2/3/4/5, etc.)
+        //       is INACTIVE in this mode.
+        //     * When `terminal_focused == false`, keys flow through to
+        //       the normal TUI dispatch (1/2/3/4/5 work).
+        //   - When the Terminal view is NOT active, this block is a no-op.
+        //
+        // Mouse/window events fall through to normal handlers — the
+        // Terminal view doesn't need special mouse handling for the MVP
+        // (no selection / scrollbar drag wired up yet; copy-out is
+        // tracked in quadraui #283).
+        if self.active_view == SidebarView::Terminal {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                // F12 = focus-toggle — always handled, independent of
+                // current focus state, so the user can escape from the
+                // PTY-passthrough mode.
+                if matches!(key, Key::Named(NamedKey::F(12)))
+                    && !modifiers.ctrl
+                    && !modifiers.alt
+                    && !modifiers.shift
+                {
+                    self.terminal_focused = !self.terminal_focused;
+                    return Reaction::Redraw;
+                }
+                if self.terminal_focused {
+                    // Forward every other key to the PTY; ignore the
+                    // return value (a missing PTY just swallows the key
+                    // — the placeholder pane shows why).
+                    let _ = self.forward_key_to_pty(key, modifiers);
+                    return Reaction::Redraw;
+                }
+            }
+        }
 
         // ── #316 Phase B: file-issue modal owns ALL input while open ───
         // Esc cancels; Ctrl+Y submits via `gh issue create`.
@@ -17722,6 +18187,14 @@ impl ShellApp for CoordApp {
                         self.active_view = SidebarView::Settings;
                         needs_redraw = true;
                     }
+                    // #424: 5 → Terminal pane; entering defaults to
+                    // PTY-focused so the user can type immediately
+                    // (F12 releases focus back to the TUI chrome).
+                    Key::Char('5') => {
+                        self.active_view = SidebarView::Terminal;
+                        self.terminal_focused = true;
+                        needs_redraw = true;
+                    }
 
                     // ── Settings panel keyboard nav ──────────────────────
                     // #237: j/k now step through the unified form's
@@ -18016,6 +18489,10 @@ impl ShellApp for CoordApp {
                             }
                             // Settings: handled by the earlier guarded arm.
                             SidebarView::Settings => {}
+                            // #424: Terminal view nav happens via F12 +
+                            // PTY passthrough — bare j/k when unfocused
+                            // are inert (no list to navigate).
+                            SidebarView::Terminal => {}
                         }
                         needs_redraw = true;
                     }
@@ -18053,6 +18530,8 @@ impl ShellApp for CoordApp {
                             }
                             // Settings: handled by the earlier guarded arm.
                             SidebarView::Settings => {}
+                            // #424: see Down/j arm above.
+                            SidebarView::Terminal => {}
                         }
                         needs_redraw = true;
                     }
@@ -18223,6 +18702,8 @@ impl ShellApp for CoordApp {
                                 self.settings_field_sel = 0;
                                 self.settings_form.borrow_mut().set_scroll_offset(0);
                             }
+                            // #424: Terminal — no nav target for Home.
+                            SidebarView::Terminal => {}
                         }
                         needs_redraw = true;
                     }
@@ -18262,6 +18743,8 @@ impl ShellApp for CoordApp {
                                 let count = self.settings_interactive_field_ids().len();
                                 self.settings_field_sel = count.saturating_sub(1);
                             }
+                            // #424: Terminal — no nav target for End.
+                            SidebarView::Terminal => {}
                         }
                         needs_redraw = true;
                     }
@@ -18814,6 +19297,14 @@ impl ShellApp for CoordApp {
                     SidebarView::Pipeline
                 }
                 "panel:settings" => SidebarView::Settings,
+                "panel:terminal" => {
+                    // #424: entering the Terminal view defaults to
+                    // PTY-focused so the user can start typing
+                    // immediately.  F12 releases focus back to the TUI
+                    // chrome (1/2/3/4/5 view switching).
+                    self.terminal_focused = true;
+                    SidebarView::Terminal
+                }
                 _ => return,
             };
         }
@@ -18831,6 +19322,13 @@ impl ShellApp for CoordApp {
         // doesn't reflect until the user moves the mouse or presses a key.
         let mut needs_redraw = self.apply_pending_data();
         needs_redraw |= self.run_periodic_work();
+        // ── #424: drive the embedded terminal PTY ──────────────────────
+        // (Lazy spawn, resize-on-demand, poll-for-output.)  Performed on
+        // every tick regardless of which view is active so output keeps
+        // arriving even when the user has switched away — the same
+        // pattern the watch-pool already follows.  Spawn, however, only
+        // fires the first time the Terminal view becomes active.
+        needs_redraw |= self.drive_terminal_pane();
         // After data has been applied, the Log tab's preferred assignment may
         // have changed (e.g. auto_loop dispatched a new review/fix). Re-attach
         // SSE so we don't fall back to the polling 'Loading log…' flicker.
@@ -20158,6 +20656,11 @@ mod tests {
             test_step_jobs: std::collections::HashMap::new(),
             test_step_results: std::collections::HashMap::new(),
             test_step_output: std::collections::HashMap::new(),
+            // #424
+            terminal_session: None,
+            terminal_focused: false,
+            terminal_pending_dims: std::cell::Cell::new(None),
+            terminal_spawn_error: None,
         }
     }
 
@@ -28788,5 +29291,215 @@ mod tests {
             toast_body.contains("42") && toast_body.contains("test-machine"),
             "toast should mention issue #42 and machine, got: {toast_body:?}",
         );
+    }
+
+    // ── #424: embedded terminal pane ─────────────────────────────────────
+
+    #[test]
+    fn sidebar_view_terminal_has_label() {
+        // The status-bar chip line and the activity-bar tooltip both
+        // call `.label()`; if the Terminal variant ever drops out of
+        // the match the panel becomes nameless instead of failing
+        // loudly.
+        assert_eq!(SidebarView::Terminal.label(), "Terminal");
+    }
+
+    #[test]
+    fn key_to_pty_bytes_printable_ascii() {
+        let bytes = key_to_pty_bytes(Key::Char('a'), quadraui::Modifiers::default());
+        assert_eq!(bytes.as_deref(), Some(&b"a"[..]));
+    }
+
+    #[test]
+    fn key_to_pty_bytes_ctrl_c_is_etx() {
+        // Ctrl+C is the most common interactive signal — confirm it
+        // maps to ETX (0x03) so a shell receives SIGINT.
+        let mods = quadraui::Modifiers {
+            ctrl: true,
+            ..quadraui::Modifiers::default()
+        };
+        let bytes = key_to_pty_bytes(Key::Char('c'), mods);
+        assert_eq!(bytes.as_deref(), Some(&[0x03u8][..]));
+    }
+
+    #[test]
+    fn key_to_pty_bytes_ctrl_d_is_eot() {
+        let mods = quadraui::Modifiers {
+            ctrl: true,
+            ..quadraui::Modifiers::default()
+        };
+        let bytes = key_to_pty_bytes(Key::Char('d'), mods);
+        assert_eq!(bytes.as_deref(), Some(&[0x04u8][..]));
+    }
+
+    #[test]
+    fn key_to_pty_bytes_enter_is_cr() {
+        // The shell expects CR (\r), NOT LF (\n) — sending LF leaves
+        // half-typed lines hanging.  This is the exact gotcha that
+        // bit the PTY scrape work (#424 references it).
+        let bytes = key_to_pty_bytes(
+            Key::Named(NamedKey::Enter),
+            quadraui::Modifiers::default(),
+        );
+        assert_eq!(bytes.as_deref(), Some(&b"\r"[..]));
+    }
+
+    #[test]
+    fn key_to_pty_bytes_arrow_up_unmodified() {
+        // Plain Up arrow → \x1b[A (cursor sequence, no modifier param).
+        let bytes = key_to_pty_bytes(
+            Key::Named(NamedKey::Up),
+            quadraui::Modifiers::default(),
+        );
+        assert_eq!(bytes.as_deref(), Some(&b"\x1b[A"[..]));
+    }
+
+    #[test]
+    fn key_to_pty_bytes_backspace_is_del() {
+        // Most modern shells treat 0x7f (DEL) as backspace.
+        let bytes = key_to_pty_bytes(
+            Key::Named(NamedKey::Backspace),
+            quadraui::Modifiers::default(),
+        );
+        assert_eq!(bytes.as_deref(), Some(&[0x7fu8][..]));
+    }
+
+    #[test]
+    fn key_to_pty_bytes_capslock_is_none() {
+        // CapsLock has no PTY mapping — caller should NOT try to send
+        // anything to the shell.
+        let bytes = key_to_pty_bytes(
+            Key::Named(NamedKey::CapsLock),
+            quadraui::Modifiers::default(),
+        );
+        assert_eq!(bytes, None);
+    }
+
+    #[test]
+    fn forward_key_to_pty_without_session_is_noop() {
+        // No session spawned → forward returns false, no panic.
+        let mut app = make_app_default();
+        assert!(app.terminal_session.is_none());
+        let consumed = app.forward_key_to_pty(
+            &Key::Char('a'),
+            &quadraui::Modifiers::default(),
+        );
+        assert!(!consumed);
+    }
+
+    /// Integration test: actually spawn /bin/sh via the same code path
+    /// `drive_terminal_pane` uses, write a command + Enter via the PTY
+    /// helper, and confirm the screen text shows the expected output.
+    /// Mirrors the quadraui crate's own session_send_str_screen_text
+    /// test so we catch regressions in the wire-up even if quadraui's
+    /// own test passes.
+    #[test]
+    #[cfg(unix)]
+    fn terminal_pane_round_trip_via_helpers() {
+        use std::time::{Duration, Instant};
+
+        let cwd = std::env::temp_dir();
+        let mut sess = quadraui::terminal_engine::TerminalSession::spawn(
+            80, 24, "/bin/sh", &cwd, 1000,
+        )
+        .expect("spawn /bin/sh");
+
+        // Type 'echo __coord_marker__' + Enter, then 'exit 0' + Enter.
+        // Each char comes through key_to_pty_bytes so we exercise the
+        // exact wire format the live pane sends.
+        let line = "echo __coord_marker__";
+        for ch in line.chars() {
+            let bytes = key_to_pty_bytes(
+                Key::Char(ch),
+                quadraui::Modifiers::default(),
+            )
+            .expect("char must encode");
+            sess.write_input(&bytes);
+        }
+        let enter = key_to_pty_bytes(
+            Key::Named(NamedKey::Enter),
+            quadraui::Modifiers::default(),
+        )
+        .expect("enter must encode");
+        sess.write_input(&enter);
+        for ch in "exit 0".chars() {
+            let bytes = key_to_pty_bytes(
+                Key::Char(ch),
+                quadraui::Modifiers::default(),
+            )
+            .expect("char must encode");
+            sess.write_input(&bytes);
+        }
+        sess.write_input(&enter);
+
+        // Poll until the marker shows up or 5 s elapse.
+        let start = Instant::now();
+        let mut found = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            sess.poll();
+            if sess.full_text().contains("__coord_marker__") {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            found,
+            "echo output not visible in PTY within 5s; full_text={:?}",
+            sess.full_text(),
+        );
+
+        // The shell should also exit cleanly — covers the child-exit
+        // path drive_terminal_pane.poll() observes via try_wait.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) && !sess.is_exited() {
+            sess.poll();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(sess.is_exited(), "/bin/sh did not exit after `exit 0`");
+        assert_eq!(sess.exit_code(), Some(0));
+    }
+
+    /// Resizing must propagate to the session so vt100 + the PTY both
+    /// re-layout.  Without this, programs like `less` keep using the
+    /// old column count after a TUI window resize.
+    #[test]
+    #[cfg(unix)]
+    fn terminal_pane_resize_propagates_to_session() {
+        let cwd = std::env::temp_dir();
+        let mut sess = quadraui::terminal_engine::TerminalSession::spawn(
+            80, 24, "/bin/sh", &cwd, 100,
+        )
+        .expect("spawn /bin/sh");
+        assert_eq!(sess.cols(), 80);
+        assert_eq!(sess.rows(), 24);
+        sess.resize(120, 40);
+        assert_eq!(sess.cols(), 120);
+        assert_eq!(sess.rows(), 40);
+        // Tidy up.
+        sess.write_input(b"exit\r");
+    }
+
+    #[test]
+    fn shell_config_advertises_terminal_panel() {
+        // The activity bar's "5th slot" must be the Terminal panel — if
+        // the panel definition ever gets dropped, the activity-bar
+        // click → on_shell_event("panel:terminal") wire breaks
+        // silently.
+        let cfg = CoordApp::shell_config();
+        assert!(
+            cfg.panels.iter().any(|p| p.id.as_str() == "panel:terminal"),
+            "shell_config must include the Terminal panel for #424",
+        );
+    }
+
+    #[test]
+    fn panel_toolbar_terminal_has_no_toolbar() {
+        // The Terminal pane is pure pass-through — no coord verbs apply,
+        // so it should not show a per-panel toolbar (which would steal
+        // a row from the PTY surface).
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Terminal;
+        assert!(app.panel_toolbar().is_none());
     }
 }
