@@ -1896,18 +1896,36 @@ class AgentServer:
         # ``slave_fd`` is dup'd into the child's stdin/stdout/stderr and
         # closed in the parent immediately after Popen returns.  The child
         # sees a real TTY so interactive ``claude`` enables its TUI path.
+        # We deliberately use the Python stdlib ``pty`` module rather than
+        # the ``portable-pty`` Rust crate referenced in the #425 issue
+        # description (the crate powers quadraui #279 / vimcode's engine,
+        # which served only as a conceptual reference).  Rationale: no new
+        # runtime dependency, fewer moving parts, and the coordinator
+        # already targets Linux/macOS agent machines.  The stdlib module
+        # is Unix-only — Windows agents are not in scope for #425; if
+        # they ever are, the import will fail loudly at this site rather
+        # than at module load (the import is deferred to keep
+        # ``import coord.agent`` working on non-Unix during static
+        # analysis / docs builds).
         import pty  # stdlib, Unix-only — deferred for platform safety  # noqa: PLC0415
         master_fd, slave_fd = pty.openpty()
 
-        # Build the worker environment.  ``TERM`` may be missing in
-        # systemd-managed agent processes — default to ``xterm-256color``
-        # so the TUI renders.  Provider env() entries (none in this PR)
-        # take precedence over both.
-        env = _worker_subprocess_env()
-        env.setdefault("TERM", "xterm-256color")
-        env.update(provider.env())
-
+        # Build the worker environment and spawn the child.  The fd pair
+        # is allocated above, so any failure between ``openpty()`` and a
+        # successful ``Popen()`` would leak both descriptors unless we
+        # guard the entire setup with ``try``.  ``_worker_subprocess_env``
+        # and ``provider.env()`` should not raise in practice (the former
+        # just copies ``os.environ``; the latter returns ``{}`` for the
+        # PTY provider in this PR), but a defensive wrap costs nothing
+        # and survives future provider implementations.
         try:
+            # ``TERM`` may be missing in systemd-managed agent processes
+            # — default to ``xterm-256color`` so the TUI renders.
+            # Provider env() entries take precedence.
+            env = _worker_subprocess_env()
+            env.setdefault("TERM", "xterm-256color")
+            env.update(provider.env())
+
             proc = subprocess.Popen(
                 argv,
                 cwd=str(repo_path),
