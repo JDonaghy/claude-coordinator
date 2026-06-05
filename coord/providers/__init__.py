@@ -56,6 +56,12 @@ def build_provider(
     """
     ptype = definition.type
     if ptype == "claude":
+        # TODO(#322 wiring issue): also thread definition.model,
+        # definition.env, and definition.extra_args through to the spawn
+        # path.  Today only `binary` is consumed because ClaudeProvider
+        # is not yet wired into AgentServer.spawn() — see the next child
+        # issue of #322.  Until then these fields are parsed and
+        # validated but ignored when build_provider() is called.
         return ClaudeProvider(binary=definition.binary)
     raise ValueError(
         f"Unknown provider type {ptype!r} (provider name: {name!r}). "

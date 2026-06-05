@@ -976,7 +976,15 @@ def _parse_providers(raw: Any) -> ProvidersConfig:
             extra_args=extra_args,
         )
 
-    # Always ensure the implicit "claude" definition is present.
+    # Belt-and-suspenders: ProvidersConfig.__post_init__ already
+    # materialises the implicit "claude" entry when ProvidersConfig() is
+    # constructed above (line ~904), so this branch is unreachable under
+    # current code.  Kept as a guard against future refactors that might
+    # construct ProvidersConfig differently (e.g. via dict-update or
+    # bypassing __post_init__ with object.__new__) — the invariant
+    # "definitions always contains 'claude'" is load-bearing for
+    # resolve_provider_name() callers that look up the definition
+    # without checking presence first.
     if "claude" not in cfg.definitions:
         cfg.definitions["claude"] = ProviderDef(type="claude")
 

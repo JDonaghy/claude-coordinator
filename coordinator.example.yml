@@ -108,3 +108,34 @@ models:
   #   sonnet: claude-sonnet-4-6
   #   opus:   claude-opus-4-7
 
+# providers: worker-command backend registry (#322 / #323).
+#
+# When this block is absent, the coordinator behaves exactly as before:
+# `default: claude` and an implicit `claude` definition spawn the usual
+# `claude -p` worker.  Define additional providers here to route some
+# repos or some assignments through a different backend.
+#
+# Precedence chain (highest → lowest):
+#   AssignmentSpec.provider  →  Repo.provider  →  providers.default
+#
+# providers:
+#   default: claude                 # name in `definitions` to use by default
+#   definitions:
+#     claude:                       # built-in; redefining is optional
+#       type: claude                # only "claude" is supported today
+#       binary: claude              # path/name of the worker binary
+#       # model / extra_args / env are parsed but not yet wired into the
+#       # spawn path — they will be honoured by the next #322 child issue.
+#       model: sonnet               # optional: pin this provider to a model
+#       extra_args: []              # optional: extra args appended to argv
+#       env: {}                     # optional: extra env vars (${VAR} expanded)
+#
+#     # Example: a hypothetical alternative backend.  Pass per-repo with
+#     # `provider: fast-claude` in the repo entry, or per-assignment with
+#     # `--provider fast-claude` on `coord assign` (once wired).
+#     fast-claude:
+#       type: claude
+#       binary: /opt/claude-fast/bin/claude
+#       env:
+#         ANTHROPIC_API_KEY: "${FAST_CLAUDE_KEY}"
+

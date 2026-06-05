@@ -233,7 +233,7 @@ def test_env_empty() -> None:
 
 
 def test_capabilities_all_true() -> None:
-    """ClaudeProvider reports all capabilities as True."""
+    """ClaudeProvider reports all capabilities as True and billing_mode='metered'."""
     caps = ClaudeProvider().capabilities()
     assert isinstance(caps, Capabilities)
     assert caps.resume is True
@@ -241,6 +241,16 @@ def test_capabilities_all_true() -> None:
     assert caps.cost_reporting is True
     assert caps.true_system_prompt is True
     assert caps.enforces_deny_list is True
+    # billing_mode is the Track-3 routing signal for the June-15 metering
+    # mitigation (#322) — claude -p is billed at API rates.
+    assert caps.billing_mode == "metered"
+
+
+def test_capabilities_billing_mode_is_string() -> None:
+    """billing_mode is always a string from the documented vocabulary."""
+    caps = ClaudeProvider().capabilities()
+    assert isinstance(caps.billing_mode, str)
+    assert caps.billing_mode in {"subscription", "metered", "byo_key", "unknown"}
 
 
 def test_supports_inject_agrees_with_capabilities() -> None:
