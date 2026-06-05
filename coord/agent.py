@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import pty
 import re
 import shlex
 import shutil
@@ -71,6 +70,11 @@ _REAP_POLL_INTERVAL = 5.0        # seconds between proc.wait timeout attempts
 _REAP_GRACE_AFTER_RESULT = 30.0  # grace period after result line before SIGTERM
 _REAP_MAX_WAIT = 2 * 60 * 60.0   # absolute max wait (2 hours) — last-resort safety net
 _RESULT_LINE_MARKER = b'"type":"result"'
+# PTY workers (ClaudePtyProvider) never emit stream-json, so the pump thread
+# stamps this sentinel after the subprocess exits.  Must match
+# ``coord.providers.claude_pty.PTY_RESULT_MARKER`` (kept as bytes here to
+# avoid a module-level import cycle with coord.providers.claude_pty).
+_PTY_RESULT_LINE_MARKER = b"# pty: worker exited"
 
 # First-output (TTFT) watchdog default and the distinct exit code used when it
 # fires, so `_reap` records the assignment as FAILED (any non-zero exit) and the
@@ -98,10 +102,18 @@ def _killpg_safe(pid: int, sig: int) -> None:
 
 
 def _log_has_result(log_path: str) -> bool:
-    """Return True if the worker's stream-json log contains a final result event."""
+    """Return True if the log contains a final result event.
+
+    Checks for both the stream-json ``"type":"result"`` marker (written by
+    ``claude -p`` / :class:`ClaudeProvider`) and the PTY sentinel
+    ``# pty: worker exited`` (stamped by the PTY pump thread after the
+    interactive ``claude`` subprocess exits — see
+    :data:`coord.providers.claude_pty.PTY_RESULT_MARKER`).
+    """
     try:
         with open(log_path, "rb") as f:
-            return _RESULT_LINE_MARKER in f.read()
+            content = f.read()
+            return _RESULT_LINE_MARKER in content or _PTY_RESULT_LINE_MARKER in content
     except OSError:
         return False
 
@@ -1861,6 +1873,7 @@ class AgentServer:
         # ``slave_fd`` is dup'd into the child's stdin/stdout/stderr and
         # closed in the parent immediately after Popen returns.  The child
         # sees a real TTY so interactive ``claude`` enables its TUI path.
+        import pty  # stdlib, Unix-only — deferred for platform safety  # noqa: PLC0415
         master_fd, slave_fd = pty.openpty()
 
         # Build the worker environment.  ``TERM`` may be missing in
