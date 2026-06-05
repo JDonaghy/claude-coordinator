@@ -1,0 +1,334 @@
+7[r8[?25h[?25l[?2004h[?1004h[?2031h[>0q[c]0;✳ Claude Code[38;5;174m╭───[6GClaude[13GCode[18G[38;5;246mv2.1.165[27G[38;5;174m─────────────────────────────────────────────────────╮[39m
+[38;5;174m│[54G[2m│[56G[22m[1mWhat's[63Gnew[80G[22m│[39m
+[38;5;174m│[19G[39m[1mWelcome[27Gback[32GJohn![54G[22m[2m[38;5;174m│[56G[39m[22mBug[60Gfixes[66Gand[70Greliabil…[80G[38;5;174m│[39m
+[38;5;174m│[54G[2m│[56G[39m[22mAdded[62G`requiredMinimum…[80G[38;5;174m│[39m
+[38;5;174m│[25G▐[48;5;16m▛███▜[49m▌[54G[2m│[56G[39m[22mAdded[62G`/plugin[71Glist`[77Gc…[80G[38;5;174m│[39m
+[38;5;174m│[24G▝▜[48;5;16m█████[49m▛▘[54G[2m│[56G[22m[38;5;246m[3m/release-notes[71Gfor[75Gmore[80G[23m[38;5;174m│[39m
+[38;5;174m│[26G▘▘[29G▝▝[54G[2m│[80G[22m│[39m
+[38;5;174m│[10G[38;5;246mOpus[15G4.8[19G(1M[23Gcontext)[32G·[34GClaude[41GMax[45G·[54G[2m[38;5;174m│[80G[22m│[39m
+[38;5;174m│[10G[38;5;246mjohnfdonaghy@gmail.com's[35GOrganization[54G[2m[38;5;174m│[80G[22m│[39m
+[38;5;174m│[13G[38;5;246m~/.coord/worktrees/bf5b9a1ce074[54G[2m[38;5;174m│[80G[22m│[39m
+[38;5;174m╰──────────────────────────────────────────────────────────────────────────────╯[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+❯ [7mT[27m[2mry[7G"refactor[17Gapp.rs"[22m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;147m⏵⏵[6Gaccept[13Gedits[19Gon[38;5;246m (shift+tab[33Gto[36Gcycle)[43G·[45G←[47Gfor[51Gagents[63G●[65Ghigh[70G·[72G/effort[39m
+[2C[3A[2D[3B[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[1A[2K[G[1A[8A[38;5;174m ▐[48;5;16m▛███▜[49m▌[39m   [1mClaude Code[22m [38;5;246mv2.1.165[39m[K[1B[38;5;174m▝▜[48;5;16m█████[49m▛▘[12G[38;5;246mOpus 4.8 (1M context) · Claude Max[54G[39m[K[1B[38;5;174m  ▘▘ ▝▝  [12G[38;5;246m~/.coord/worktrees/bf5b9a1ce074[54G[39m[K[1B[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────[1B[39m❯ [7mT[27m[2mry "refactor app.rs"[22m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────[1B[39m [3G[38;5;147m⏵⏵ accept edits on[38;5;246m (shift+[30Gab to cycle) ·[45G←[47Gfor agents[63G● high · /effort[80G[39m[K[1B[K[1B[K[1B[K[1B[K[1B[K[1B[K[1B[K[1B[K[7A[2C[3A[2D[3B[2C[1A[38;5;246mOpus 4.8 (1M context) | Contex[34G:[36GN/A | Branch: issue-426-agent-completion-v…[39m
+[3G[38;5;147m⏵⏵[6Gaccept[13Gedits[19Gon[38;5;246m (shift+tab[33Gto[36Gcycle)[43G·[45G←[47Gfor[51Gagents[39m
+[63G[38;5;246m●[65Ghigh[70G·[72G/effort[39m
+[2C[5A[2D[5B[6A [38;5;174m▎[39m [38;5;174m[1mOpus 4.8 is here![22m[38;5;246m Now defaults to high effort · /effort xhigh for your [39m[K[1B [38;5;174m▎[39m [38;5;246mhardest tasks[39m[K[1B[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────[1B[39m❯ [7mT[27m[2mry "refactor app.rs"[22m[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;246mOpus[8G4.8[12G(1M[16Gcontext)[25G|[27GContext:[36GN/A[40G|[42GBranch:[50Gissue-426-agent-completion-v…[39m
+[3G[38;5;147m⏵⏵[6Gaccept[13Gedits[19Gon[38;5;246m (shift+tab[33Gto[36Gcycle)[43G·[45G←[47Gfor[51Gagents[39m
+[63G[38;5;246m●[65Ghigh[70G·[72G/effort[39m
+[2C[5A[2D[5B[2C[5AReply OK and end turn.[7m [41C[3B[27m[K
+
+[24C[5A]0;⠂ Claude Code[24D[5B[6A[48;5;237m[38;5;239m❯ [38;5;231mReply OK and end turn.[39m                                                        [1B[49m[K[1B[38;5;174m·[39m [38;5;174mB[38;5;216mlov[38;5;174miating… [39m[K[2C[1B[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────[1B[38;5;246m❯ [39m[7m [63G[27m[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;246mOpus[8G4.8[12G(1M[16Gcontext)[25G|[27GContext:[36GN/A[40G|[42GBranch:[50Gissue-426-agent-completion-v…[39m
+[3G[38;5;147m⏵⏵[6Gaccept[13Gedits[19Gon[38;5;246m (shift+tab[33Gto[36Gcycle)[39m
+[63G[38;5;246m●[65Ghigh[70G·[72G/effort[39m
+[2C[5A[2D[5B[8A[38;5;174m✢[4Gl[7G[38;5;216mi[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[4C[8A[38;5;174mov[8G[38;5;216mat[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[6C[8A[38;5;174mi[10G[38;5;216mi[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m*[8Ga[11G[38;5;216mn[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8C[8A[38;5;174mt[12G[38;5;216mg[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✶[10Gin[13G[38;5;216m…[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[11C[8A[38;5;174mg[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✻[13G…[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✽[39m
+
+
+
+
+
+
+
+[2C[5A]0;⠂ End turn acknowledgment]0;⠐ End turn acknowledgment[2D[5B[8A[38;5;174m✻[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✶[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m*[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[2C[8A[38;5;216mB[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✢[4G[38;5;216ml[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[2C[8A[38;5;174mB[5G[38;5;216mov[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[3C[8A[38;5;174ml[7G[38;5;216mi[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m·[5Go[8G[38;5;216ma[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[5C[8A[38;5;174mvi[9G[38;5;216mti[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[7C[8A[38;5;174ma[11G[38;5;216mn[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8C[8A[38;5;174mt[12G[38;5;216mg[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[9C[8A[38;5;174mi[13G[38;5;216m…[39m
+
+
+
+
+
+
+
+[2C[5A]0;⠂ End turn acknowledgment[2D[5B[10C[8A[38;5;174mng[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✢[13G…[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m*[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[2C[8A[38;5;216mB[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✶[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[2C[8A[38;5;174mB[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✻[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;174m✽[39m
+
+
+
+
+
+
+
+[2C[5A[2D[5B[8A[38;5;231m●[3G[39mOK[K
+
+
+
+
+
+
+
+[2C[5A[2D[5B[6A  COORD_PTY_DONE[K[1B[K[1B[38;5;174m✽[39m [38;5;216mR[38;5;174meticulating… [38;5;246m(2s · ↓[39m [38;5;246m5 tokens)[39m[K[2C[1B[K[1B[38;5;244m────────────────────────────────────────────────────────────────────────────────[1B[38;5;246m❯ [39m[7m [63G[27m[K
+[38;5;244m────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;5;246mOpus[8G4.8[12G(1M[16Gcontext)[25G|[27GContext:[36GN/A[40G|[42GBranch:[50Gissue-426-agent-completion-v…[39m
+[3G[38;5;147m⏵⏵[6Gaccept[13Gedits[19Gon[38;5;246m (shift+tab[33Gto[36Gcycle)[39m
+[63G[38;5;246m●[65Ghigh[70G·[72G/effort[39m
+[2C[5A[2D[5B[2C[8A[38;5;180mReticulating…[39m
+
+
+
+
+
+
+
+[2C[5A]0;✳ End turn acknowledgment[2D[5B[8A[38;5;246m✻[3GSautéed for 2s[39m[K[3B❯ [41C[3B[38;5;246m · ← for agents[39m
+
+[2C[5A[2D[5B[35C[3A[38;5;246m2.0% | Branch: i[53Gsue-426-agent-completion-[39m
+
+
+[2C[5A(B[2D[5B[6A[48;5;237m[38;5;239m❯ [38;5;231m/cost[39m                                                                         [1B[49m[K[1B[38;5;153m────────────────────────────────────────────────────────────────────────────────[2C[1B[1mSettings[22m[39m  Status   Config  [48;5;153m[38;5;16m[1m Usage [22m[39m[49m  Stats[K[2C[1B[K[2C[1B[1mSession[63G[22m[K
+
+[3G[38;5;246mTotal[9Gcost:[26G$0.1516[39m
+[3G[38;5;246mTotal[9Gduration[18G(API):[26G3s[39m
+[3G[38;5;246mTotal[9Gduration[18G(wall):[26G7s[39m
+[3G[38;5;246mTotal[9Gcode[14Gchanges:[26G0[28Glines[34Gadded,[41G0[43Glines[49Gremoved[39m
+[3G[38;5;246mUsage[9Gby[12Gmodel:[39m
+[3G[38;5;246m [7Gclaude-haiku-4-5:[26G440[30Ginput,[37G12[40Goutput,[48G0[50Gcache[56Gread,[62G0[64Gcache[70Gwrite[39m
+[3G[38;5;246m($0.0005)[39m
+[3G[38;5;246m [8Gclaude-opus-4-8:[26G2.3k[31Ginput,[38G16[41Goutput,[49G0[51Gcache[57Gread,[63G22.3k[69Gcache[39m
+[3G[38;5;246mwrite[9G($0.1511)[39m
+
+[3G[1mCurrent[11Gsession[22m
+[3G[48;5;102m[38;5;153m█████████████████████████████▌                    [54G[39m[49m59%[58Gused
+[3G[38;5;246mResets[10G12:10am[18G(UTC)[39m
+
+[3G[1mCurrent[11Gweek[16G(all[21Gmodels)[22m
+[3G[48;5;102m[38;5;153m████████████████████████████▉                     [54G[39m[49m57%[58Gused
+[3G[38;5;246mResets[10GJun[14G6,[17G5pm[21G(UTC)[39m
+
+[3G[1mWhat's[10Gcontributing[23Gto[26Gyour[31Glimits[38Gusage?[22m
+[3G[38;5;246mApproximate,[16Gbased[22Gon[25Glocal[31Gsessions[40Gon[43Gthis[48Gmachine[56G—[58Gdoes[63Gnot[67Ginclude[39m
+[3G[38;5;246mother[9Gdevices[17Gor[20Gclaude.ai[39m
+
+[3G[38;5;246mScanning[12Glocal[18Gsessions…[39m
+
+[3G[38;5;246mRefreshing…[39m
+
+[3G[38;5;246mEsc[7Gto[10Gcancel[39m
+[30C[31A[30D[31B[2C[5A[38;5;246mLast 24h[12G· these are independent characteristics of your usage, not a [2C[1Bbreakdown[2C[1B[39m[K[2C[1B[38;5;246mNothing over 10% in this period — try the other window.[2C[1B[39m[K
+[3G[38;5;246md[5Gto[8Gday[12G·[14Gw[16Gto[19Gweek[39m
+
+[3G[38;5;246mRefreshing…[39m
+
+[3G[38;5;246mEsc[7Gto[10Gcancel[39m
+[30C[36A[30D[36B[31C[21A[48;5;102m[38;5;153m█[54G[39m[49m60[54C[4B8[2C[3B[1mCurrent week (Son[21Get [25Gnly)[22m[K[2C[1B[48;5;102m[38;5;153m███████████████████████▌                          [39m[49m 47% used[K[2C[1B[38;5;246mRes[7Gts Jun 6,[17G5pm (UTC)[39m[K[2C[2B[1mWhat's contributing to your limits usage?[22m[K[2C[1B[38;5;246mApproximate, based on local sessions on this machine — does not include [2C[1Bother devices or claude.ai[2C[1B[39m[K[2C[1B[38;5;246mLast 24h · these are independent characteristics of your usage, not a [2C[1Bbreak[9Gown[39m[K[2C[2B[38;5;246mNothing over 10% in this period — try the other window.[2C[2Bd to day · w to week[39m
+
+[3G[1mUsage[9Gcredits[22m
+[3G[48;5;102m[38;5;153m▏                                                 [54G[39m[49m0%[57Gused
+[3G[38;5;246m$0.46[9G/[11G$100.00[19Gspent[25G·[27GResets[34GJul[38G1[40G(UTC)[39m
+
+[3G[38;5;246mEsc[7Gto[10Gcancel[39m
+[30C[42A[?1006l[?1003l[?1002l[?1000l[30D[42B(B[>4m[<u[?1004l[?2031l[?2004l[?25h7[r8]0;[2m[22m
+[2mResume this session with:[22m
+[2mclaude --resume 1f85daf0-0a54-4bf1-bd92-0c2a0fa8e385[22m
+[2m[22m
