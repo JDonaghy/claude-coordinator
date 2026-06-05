@@ -158,6 +158,15 @@ def test_pull_artifact_success_rsync(tmp_path: Path, coord_db) -> None:
     rsync_cmd = mock_run.call_args[0][0]
     assert rsync_cmd[0] == "rsync"
     assert "-az" in rsync_cmd
+    # ssh must be non-interactive: BatchMode=yes so an auth/host-key prompt
+    # can never open /dev/tty and hijack the TUI's terminal (screen
+    # corruption, unresponsive to 'q').
+    ssh_opt = rsync_cmd[rsync_cmd.index("-e") + 1]
+    assert "BatchMode=yes" in ssh_opt, ssh_opt
+    # Belt-and-braces: detach from the controlling terminal and null stdin so
+    # no descendant (ssh) can claim the TUI's tty even if BatchMode is bypassed.
+    assert mock_run.call_args.kwargs.get("stdin") is subprocess.DEVNULL
+    assert mock_run.call_args.kwargs.get("start_new_session") is True
     # Path should be printed
     assert str(dest) in result.output
 

@@ -2885,16 +2885,24 @@ def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path)
     remote = f"{machine.host}:~/.coord/artifacts/{repo_name}/{sanitized}/"
     cmd = [
         "rsync", "-az", "--info=progress2",
-        # accept-new: auto-accept the host key on first contact so the pull
-        # is non-interactive on a fresh agent machine.  This is safe on
-        # Tailscale where the network is already authenticated.
-        "-e", "ssh -o StrictHostKeyChecking=accept-new",
+        # BatchMode=yes: ssh must NEVER prompt.  When this runs under the TUI,
+        # an ssh passphrase/password/changed-host-key prompt opens /dev/tty
+        # directly — bypassing the nulled stdin — and hijacks the TUI's
+        # terminal (screen corruption, unresponsive to 'q').  BatchMode makes
+        # ssh fail fast instead; the TUI captures stderr and toasts it.
+        # accept-new: auto-accept a *new* host key on first contact so the
+        # pull stays non-interactive on a fresh agent machine (safe on
+        # Tailscale, where the network is already authenticated).
+        "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new",
         "--exclude=.assignment_id",
         remote,
         str(dest_path) + "/",
     ]
     click.echo(f"\nRsyncing {remote} → {dest_path}/")
-    result = subprocess.run(cmd)
+    # start_new_session + stdin=DEVNULL: belt-and-braces so no descendant
+    # (ssh) can claim the controlling terminal even if BatchMode is somehow
+    # bypassed — see the TTY-hijack note on the rsync command above.
+    result = subprocess.run(cmd, stdin=subprocess.DEVNULL, start_new_session=True)
 
     if result.returncode != 0:
         click.echo(
