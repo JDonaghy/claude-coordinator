@@ -75,6 +75,23 @@ def test_log_has_result_pty_marker_absent_returns_false(tmp_path: Path) -> None:
     assert not _log_has_result(str(log))
 
 
+def test_pty_marker_bytes_sync_with_provider_string() -> None:
+    """The byte sentinel in coord.agent must stay in sync with the provider.
+
+    There are two independent copies of the PTY result sentinel — one as a
+    bytes literal in ``coord.agent`` (so ``_log_has_result`` can do a binary
+    scan) and one as a string in ``coord.providers.claude_pty`` (the source
+    of truth that the PTY pump thread reads via
+    ``ClaudePtyProvider.result_marker()``).  If they ever drift, the pump
+    thread will stamp a marker the reap thread no longer recognises, and
+    PTY workers will silently wait the full ``_REAP_MAX_WAIT`` (~2h)
+    before being reaped.  This test guards against that silent regression.
+    """
+    from coord.providers.claude_pty import PTY_RESULT_MARKER
+
+    assert PTY_RESULT_MARKER.encode("utf-8") == _PTY_RESULT_LINE_MARKER
+
+
 # ── _wait_for_proc_or_result ─────────────────────────────────────────────────
 
 class _FakeProc:

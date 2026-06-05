@@ -49,6 +49,11 @@ if TYPE_CHECKING:
 # worker exits.  Used as :meth:`ClaudePtyProvider.result_marker` because the
 # interactive ``claude`` CLI does NOT emit a stream-json ``result`` event,
 # so the standard ``"type":"result"`` marker never appears.
+#
+# MUST stay byte-equal to ``coord.agent._PTY_RESULT_LINE_MARKER`` (which is
+# the bytes form of this constant — kept separate there to dodge a
+# module-level import cycle).  The sync is asserted in
+# ``tests/test_agent_reap.py::test_pty_marker_bytes_sync_with_provider_string``.
 PTY_RESULT_MARKER = "# pty: worker exited"
 
 
