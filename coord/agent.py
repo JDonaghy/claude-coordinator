@@ -86,6 +86,23 @@ _RESULT_LINE_MARKER = b'"type":"result"'
 # test_pty_marker_bytes_sync_with_provider_string``.
 _PTY_RESULT_LINE_MARKER = b"# pty: worker exited"
 
+# #425 PTY briefing-submit: after the briefing is pasted into the interactive
+# TUI (bracketed paste), wait this long before sending the submit carriage
+# return — a CR sent too soon after ESC[201~ is swallowed by paste-end
+# processing.  Measured floor was ~0.6s against interactive `claude`; 0.8s
+# keeps margin.
+_PTY_SUBMIT_SETTLE_S = 0.8
+
+# #425 PTY readiness: ESC[?2004h (bracketed-paste enable) is emitted EARLY,
+# while the TUI is still drawing its first frame — a briefing pasted at that
+# instant is silently dropped.  After seeing the enable marker we additionally
+# wait for the init render to go quiet (log size stable for _PTY_READY_QUIESCE_S,
+# overall cap _PTY_READY_QUIESCE_CAP_S) before pasting.  Verified reliable
+# against interactive `claude` (#425 smoke: pasting on the enable marker alone
+# fails; quiescence-gated pasting succeeds).
+_PTY_READY_QUIESCE_S = 0.8
+_PTY_READY_QUIESCE_CAP_S = 8.0
+
 # First-output (TTFT) watchdog default and the distinct exit code used when it
 # fires, so `_reap` records the assignment as FAILED (any non-zero exit) and the
 # `concurrency.auto_reassign` path re-dispatches it. See #299 and the upstream
@@ -2041,36 +2058,77 @@ class AgentServer:
         )
         pump_thread.start()
 
-        # Readiness: wait briefly for the first bytes from the worker
-        # (banner / prompt) before writing the briefing.  We poll the log
-        # rather than the master fd directly to avoid stealing bytes from
-        # the pump thread.  A 5-second cap means we never block the spawn
-        # indefinitely; if no bytes arrive the briefing is still written
-        # — the worker will pick it up once its prompt is live.
+        # Readiness + briefing submission for the interactive TUI.  Unlike the
+        # stream-json path we cannot just write the briefing to stdin:
+        # interactive ``claude`` only accepts a (multi-line) briefing as a
+        # bracketed paste, and only AFTER it has both enabled bracketed-paste
+        # input AND finished drawing its first frame.  So:
+        #   (1) wait (≤5s) for the bracketed-paste-enable DECSET (ESC[?2004h)
+        #       to appear in the log;
+        #   (2) wait for the init render to go quiet (log size stable) — the
+        #       enable marker fires while the TUI is still drawing, and a
+        #       paste sent at that instant is silently dropped;
+        #   (3) paste the briefing (``initial_input`` returns the
+        #       bracketed-paste block — no submit key);
+        #   (4) settle, then submit with a SEPARATE carriage return (``\n``
+        #       does NOT submit under the enhanced keyboard protocol, and a CR
+        #       glued onto ESC[201~ in the same write is swallowed).
+        # All four steps were verified live against interactive ``claude``
+        # (#425 smoke); see ClaudePtyProvider for the byte-level rationale.
+        #
+        # We poll the log rather than the master fd directly to avoid stealing
+        # bytes from the pump thread.  If a marker never appears we paste
+        # anyway after the cap — degraded, but no worse than blind pasting.
         #
         # KNOWN LIMITATION (deferred to #426): if the interactive `claude`
-        # process exits before the 5-second readiness window (auth failure,
-        # crash, immediate misconfig), the pump thread sees EIO on
-        # ``master_fd``, stamps the result marker, and closes ``master_fd``;
-        # the ``os.write(master_fd, …)`` here then raises ``OSError`` and
-        # the briefing is silently lost.  The assignment itself is reaped
-        # quickly — ``_reap`` calls ``proc.wait()`` and the child has
-        # already exited, so the status flips to FAILED in seconds rather
-        # than waiting for the ``_REAP_MAX_WAIT`` timer.  But the operator
-        # sees no clear "your briefing was discarded" signal; #426 will
-        # surface that as a distinct failure mode.  The safety gate in
-        # :meth:`assign` limits PTY workers to non-mutating spec types,
-        # so a silently-lost briefing is a nuisance rather than a
-        # correctness problem.
+        # process exits before the readiness window (auth failure, crash,
+        # immediate misconfig), the pump thread sees EIO on ``master_fd``,
+        # stamps the result marker, and closes ``master_fd``; the
+        # ``os.write(master_fd, …)`` here then raises ``OSError`` and the
+        # briefing is silently lost.  The assignment itself is reaped quickly
+        # — ``_reap`` calls ``proc.wait()`` and the child has already exited,
+        # so the status flips to FAILED in seconds rather than waiting for the
+        # ``_REAP_MAX_WAIT`` timer.  But the operator sees no clear "your
+        # briefing was discarded" signal; #426 will surface that as a distinct
+        # failure mode.  The safety gate in :meth:`assign` limits PTY workers
+        # to non-mutating spec types, so a silently-lost briefing is a
+        # nuisance rather than a correctness problem.
+        from coord.providers.claude_pty import (  # noqa: PLC0415
+            BRACKETED_PASTE_ENABLE,
+        )
+
         initial_input = provider.initial_input(spec)
         if initial_input:
+            # (1) wait for bracketed-paste input to be enabled.
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
-                if _log_has_output(log_path):
+                try:
+                    with open(log_path, "rb") as _rf:
+                        if BRACKETED_PASTE_ENABLE in _rf.read():
+                            break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+            # (2) wait for the init render to go quiet before pasting.
+            quiet_cap = time.monotonic() + _PTY_READY_QUIESCE_CAP_S
+            last_size = -1
+            last_change = time.monotonic()
+            while time.monotonic() < quiet_cap:
+                try:
+                    size = os.path.getsize(log_path)
+                except OSError:
+                    size = last_size
+                if size != last_size:
+                    last_size = size
+                    last_change = time.monotonic()
+                elif time.monotonic() - last_change >= _PTY_READY_QUIESCE_S:
                     break
                 time.sleep(0.05)
             try:
+                # (3) paste, (4) settle then submit with a carriage return.
                 os.write(master_fd, initial_input)
+                time.sleep(_PTY_SUBMIT_SETTLE_S)
+                os.write(master_fd, b"\r")
             except OSError as e:
                 try:
                     log_fh.write(f"\n# pty: failed to send initial briefing: {e}\n")

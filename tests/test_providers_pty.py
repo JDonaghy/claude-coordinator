@@ -206,18 +206,47 @@ def test_pty_supports_inject_agrees_with_capabilities() -> None:
 # ── ClaudePtyProvider: initial_input / result_marker / env / parse_log ────────
 
 
-def test_pty_initial_input_is_plain_text_with_newline() -> None:
-    """initial_input returns the briefing as bytes + a single trailing newline."""
+def test_pty_initial_input_is_bracketed_paste() -> None:
+    """initial_input wraps the briefing in a bracketed-paste block.
+
+    A multi-line briefing must arrive as one bracketed paste or the TUI
+    swallows the embedded newlines; the submitting carriage return is sent
+    SEPARATELY by ``_spawn_pty`` so it is NOT part of this payload.
+    """
+    from coord.providers.claude_pty import (
+        BRACKETED_PASTE_END,
+        BRACKETED_PASTE_START,
+    )
+
     spec = _make_spec(briefing="Hello, worker!")
     data = ClaudePtyProvider().initial_input(spec)
     assert isinstance(data, bytes)
-    assert data == b"Hello, worker!\n"
+    assert data == BRACKETED_PASTE_START + b"Hello, worker!" + BRACKETED_PASTE_END
+    # No trailing newline and no carriage return — submit is separate.
+    assert not data.endswith(b"\n")
+    assert b"\r" not in data
 
 
-def test_pty_initial_input_preserves_existing_newline() -> None:
-    """A briefing that already ends with \\n is not double-newlined."""
-    spec = _make_spec(briefing="Hello\n")
-    assert ClaudePtyProvider().initial_input(spec) == b"Hello\n"
+def test_pty_initial_input_strips_trailing_newlines() -> None:
+    """A briefing with trailing newlines is normalised before wrapping."""
+    from coord.providers.claude_pty import (
+        BRACKETED_PASTE_END,
+        BRACKETED_PASTE_START,
+    )
+
+    spec = _make_spec(briefing="Hello\n\n")
+    assert (
+        ClaudePtyProvider().initial_input(spec)
+        == BRACKETED_PASTE_START + b"Hello" + BRACKETED_PASTE_END
+    )
+
+
+def test_pty_initial_input_preserves_multiline_body() -> None:
+    """Embedded newlines inside the briefing are kept (only the paste markers
+    frame them) so the whole multi-line briefing submits as one message."""
+    spec = _make_spec(briefing="line one\nline two\nline three")
+    data = ClaudePtyProvider().initial_input(spec)
+    assert b"line one\nline two\nline three" in data
 
 
 def test_pty_initial_input_is_not_stream_json() -> None:
@@ -495,8 +524,14 @@ def test_pty_spawn_routes_through_pty_path(tmp_path: Path) -> None:
     # The PTY worker emitted its ready banner (proves the pump runs).
     assert "READY_BANNER" in log, f"worker banner missing from log: {log!r}"
     # The pump captured the worker's echo of our briefing — proves the
-    # initial_input was written to the PTY master after readiness.
-    assert "got=ECHO_ME" in log, f"briefing not echoed back: {log!r}"
+    # bracketed-paste initial_input was written to the PTY master after
+    # readiness and the carriage return submitted the line.  The scripted
+    # worker is a plain shell `read` (not a TUI paste handler), so the line
+    # it echoes still carries the paste markers around the body — assert the
+    # briefing body survived the round-trip.
+    assert any("got=" in ln and "ECHO_ME" in ln for ln in log.splitlines()), (
+        f"briefing not echoed back: {log!r}"
+    )
     # The pump stamped the result marker after the worker exited.
     assert PTY_RESULT_MARKER in log
     # And the spawn header named the provider.
@@ -507,12 +542,13 @@ def test_pty_spawn_routes_through_pty_path(tmp_path: Path) -> None:
 class _ScriptedPtyProvider(ClaudePtyProvider):
     """Test-only provider that mocks ``claude`` with a tiny shell script.
 
-    The script prints ``READY_BANNER`` (so the readiness loop in
-    ``_spawn_pty`` sees output and proceeds to write the briefing), reads
-    one line from the PTY, echoes it as ``got=<line>``, then exits.  This
-    proves the round-trip from initial_input → PTY master → child stdin →
-    child stdout → PTY master → log without depending on a real claude
-    install.
+    The script emits the bracketed-paste-enable DECSET (``ESC[?2004h``) so the
+    readiness loop in ``_spawn_pty`` — which waits for that marker, then for
+    render quiescence — proceeds to write the briefing.  It then prints
+    ``READY_BANNER``, reads one line from the PTY, echoes it as ``got=<line>``,
+    and exits.  This proves the round-trip from initial_input → PTY master →
+    child stdin → child stdout → PTY master → log without depending on a real
+    claude install.
 
     Everything else (capabilities, initial_input, result_marker,
     parse_log) is inherited unchanged from :class:`ClaudePtyProvider`.
@@ -530,7 +566,7 @@ class _ScriptedPtyProvider(ClaudePtyProvider):
         return [
             "/bin/sh",
             "-c",
-            'echo READY_BANNER; read line; echo "got=$line"',
+            "printf '\\033[?2004h'; echo READY_BANNER; read line; echo \"got=$line\"",
         ]
 
 

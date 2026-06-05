@@ -56,6 +56,29 @@ if TYPE_CHECKING:
 # ``tests/test_agent_reap.py::test_pty_marker_bytes_sync_with_provider_string``.
 PTY_RESULT_MARKER = "# pty: worker exited"
 
+# Briefing-submission control bytes for the interactive TUI (#425).
+#
+# A multi-line briefing MUST be delivered inside a bracketed-paste block
+# (``ESC[200~`` ... ``ESC[201~``) — otherwise the TUI treats each embedded
+# newline as a soft line break and the message is never submitted.  The
+# submitting Enter is a CARRIAGE RETURN (``\r``); ``\n`` does NOT submit under
+# the TUI's enhanced (kitty) keyboard protocol.  The CR must be written
+# *separately*, after a short settle delay, by
+# :meth:`coord.agent.AgentServer._spawn_pty` — a CR glued onto ``ESC[201~`` in
+# the same write is swallowed by paste-end processing.  ``initial_input``
+# returns only the bracketed-paste block; the spawn path appends the CR.
+# Verified live against interactive ``claude`` v2.1.165 (#425 smoke: raw
+# multi-line never submits; bracketed-paste + separate CR reliably does).
+BRACKETED_PASTE_START = b"\x1b[200~"
+BRACKETED_PASTE_END = b"\x1b[201~"
+
+# DECSET emitted by the TUI once it has ENABLED bracketed-paste input — the
+# spawn path waits for this (then for render quiescence) before pasting, so the
+# briefing is never sent before the TUI can accept it (the enable arrives
+# ~0.85s after first output, while the TUI is still drawing; pasting then is
+# silently dropped).
+BRACKETED_PASTE_ENABLE = b"\x1b[?2004h"
+
 
 class ClaudePtyProvider(Provider):
     """Interactive ``claude`` (no ``-p``) attached to a PTY.
@@ -207,15 +230,22 @@ class ClaudePtyProvider(Provider):
         return argv
 
     def initial_input(self, spec: "AssignmentSpec") -> bytes:
-        """Return the briefing as plain text + newline for the PTY master.
+        """Return the briefing wrapped in a bracketed-paste block.
 
         Interactive ``claude`` reads typed input from the TTY, NOT stream-json
-        envelopes — so this returns the raw briefing followed by a single
-        ``\\n`` to submit the line.  The agent writes these bytes to the
-        PTY master fd once the worker is ready.
+        envelopes.  A real briefing is multi-line, and the TUI swallows
+        embedded newlines unless the whole block arrives as a bracketed paste
+        (:data:`BRACKETED_PASTE_START` ... :data:`BRACKETED_PASTE_END`).  This
+        returns only that paste block — **no trailing newline and no submit
+        key**.  The submitting carriage return (``\\r``; ``\\n`` does NOT
+        submit under the TUI's enhanced keyboard protocol) is written
+        *separately* by :meth:`coord.agent.AgentServer._spawn_pty` after a
+        short settle delay, because a CR glued onto ``ESC[201~`` in the same
+        write is consumed by paste-end processing.  Verified live against
+        interactive ``claude`` (#425 smoke).
         """
-        text = spec.briefing if spec.briefing.endswith("\n") else spec.briefing + "\n"
-        return text.encode("utf-8")
+        body = spec.briefing.rstrip("\n")
+        return BRACKETED_PASTE_START + body.encode("utf-8") + BRACKETED_PASTE_END
 
     def result_marker(self) -> str:
         """Sentinel written by the PTY spawn path after the worker exits.
