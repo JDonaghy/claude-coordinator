@@ -1764,7 +1764,24 @@ class AgentServer:
 
             provider_obj = self._providers[spec.provider]
             if isinstance(provider_obj, ClaudePtyProvider):
-                self._spawn_pty(assignment, repo_path, provider_obj)
+                # ``_spawn_pty`` polls for worker readiness for up to 5
+                # seconds before writing the briefing.  ``_spawn`` is called
+                # synchronously from the async HTTP ``assign`` handler in
+                # ``agent_app.py`` (no run_in_executor), so a blocking call
+                # here freezes the uvicorn event loop — status polls, cancel
+                # calls, health checks all time out.  Mirror the
+                # ``_pull_then_spawn`` pattern: run the PTY spawn on a
+                # background daemon thread and return immediately.  The
+                # assignment is already in ``self._assignments`` (PENDING)
+                # by the time the HTTP handler responds; the thread flips
+                # it to RUNNING once the child is up.
+                thread = threading.Thread(
+                    target=self._spawn_pty,
+                    args=(assignment, repo_path, provider_obj),
+                    daemon=True,
+                    name=f"agent-pty-spawn-{assignment.id}",
+                )
+                thread.start()
                 return
 
         argv = self.worker_command(assignment.spec)
@@ -1917,7 +1934,10 @@ class AgentServer:
         # and ``provider.env()`` should not raise in practice (the former
         # just copies ``os.environ``; the latter returns ``{}`` for the
         # PTY provider in this PR), but a defensive wrap costs nothing
-        # and survives future provider implementations.
+        # and survives future provider implementations.  We track ``proc``
+        # explicitly so the ``BaseException`` guard below can tell whether
+        # the child has taken ownership of the fds yet.
+        proc: subprocess.Popen | None = None
         try:
             # ``TERM`` may be missing in systemd-managed agent processes
             # — default to ``xterm-256color`` so the TUI renders.
@@ -1947,6 +1967,26 @@ class AgentServer:
                 assignment.finished_at = time.time()
             self._persist()
             return
+        except BaseException:
+            # Defensive catch-all for non-OSError failures from
+            # ``provider.env()`` or future setup steps (e.g. a misbehaving
+            # provider raising ``ValueError`` / ``RuntimeError``).  Without
+            # this clause the fds leak and the process accumulates orphan
+            # PTY pairs.  We only close the fds if the child has not yet
+            # been launched — once ``Popen`` returns successfully the child
+            # owns the slave fd and the parent's master fd will be cleaned
+            # up by the pump thread.
+            if proc is None:
+                for fd in (master_fd, slave_fd):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
+            raise
 
         # The child owns ``slave_fd`` now — close the parent's copy or the
         # pump thread will block forever on EOF.
@@ -2010,15 +2050,18 @@ class AgentServer:
         #
         # KNOWN LIMITATION (deferred to #426): if the interactive `claude`
         # process exits before the 5-second readiness window (auth failure,
-        # crash, immediate misconfig), ``os.write(master_fd, …)`` here
-        # raises ``OSError`` because the pump thread has already closed
-        # the master fd on EOF.  The failure is logged but the assignment
-        # stays in RUNNING until the reap thread's max-wait timer
-        # (``_REAP_MAX_WAIT`` == 2h) expires.  Until #426 wires a faster
-        # spawn-failure signal, operators may see a PTY assignment hang
-        # for up to two hours on fast-failing workers.  The safety gate
-        # in :meth:`assign` limits PTY workers to non-mutating spec types,
-        # so this is a nuisance rather than a correctness problem.
+        # crash, immediate misconfig), the pump thread sees EIO on
+        # ``master_fd``, stamps the result marker, and closes ``master_fd``;
+        # the ``os.write(master_fd, …)`` here then raises ``OSError`` and
+        # the briefing is silently lost.  The assignment itself is reaped
+        # quickly — ``_reap`` calls ``proc.wait()`` and the child has
+        # already exited, so the status flips to FAILED in seconds rather
+        # than waiting for the ``_REAP_MAX_WAIT`` timer.  But the operator
+        # sees no clear "your briefing was discarded" signal; #426 will
+        # surface that as a distinct failure mode.  The safety gate in
+        # :meth:`assign` limits PTY workers to non-mutating spec types,
+        # so a silently-lost briefing is a nuisance rather than a
+        # correctness problem.
         initial_input = provider.initial_input(spec)
         if initial_input:
             deadline = time.monotonic() + 5.0

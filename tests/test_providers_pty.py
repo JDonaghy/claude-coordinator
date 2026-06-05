@@ -532,3 +532,76 @@ class _ScriptedPtyProvider(ClaudePtyProvider):
             "-c",
             'echo READY_BANNER; read line; echo "got=$line"',
         ]
+
+
+class _SlowReadinessPtyProvider(ClaudePtyProvider):
+    """Mock provider whose ``claude`` mock blocks for the full 5-second
+    readiness window before emitting any output.
+
+    Used to prove the fix for the iter-4 review: the PTY spawn (including
+    the readiness poll) must run on a background thread so the HTTP
+    handler in ``agent_app.py`` does not block the uvicorn event loop.
+    With the fix in place, ``server.assign(spec)`` returns in milliseconds
+    even though the worker won't be ready for ~5 s.
+    """
+
+    def build_command(
+        self,
+        spec: AssignmentSpec,
+        *,
+        resolved_model=None,
+        system_prompt=None,
+        allowed_tools=None,
+        permission_mode="acceptEdits",
+    ) -> list[str]:
+        # Sleep past the readiness window, then exit.  No output until
+        # the sleep elapses — so the readiness loop in ``_spawn_pty``
+        # spins its full 5-second deadline before giving up.
+        return ["/bin/sh", "-c", "sleep 6"]
+
+
+def test_pty_assign_returns_immediately_without_blocking_on_readiness(
+    tmp_path: Path,
+) -> None:
+    """Regression test for the iter-4 review: PTY ``assign()`` must not
+    block the HTTP event loop while the readiness loop polls for output.
+
+    Setup: a mock provider whose argv sleeps for 6 seconds before exiting
+    (no output, so ``_spawn_pty`` would spin its full 5 s readiness budget
+    on the synchronous path).  With the fix in place, ``server.assign()``
+    must return in well under that budget — we assert under 1 s, leaving
+    ample headroom for slow CI runners.
+    """
+    import time
+
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["myrepo"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo unused"],
+        repo_paths={"myrepo": str(repo)},
+        providers={"claude-pty": _SlowReadinessPtyProvider()},
+    )
+    spec = _make_spec(
+        repo_name="myrepo",
+        repo_path=str(repo),
+        type="plan",
+        provider="claude-pty",
+        briefing="briefing",
+    )
+    start = time.monotonic()
+    record = server.assign(spec)
+    elapsed = time.monotonic() - start
+    # The fix: assign() must return in milliseconds, not seconds.  Without
+    # the fix, the 5-second readiness wait blocks here.  We assert < 1 s
+    # to stay well clear of CI jitter while still proving the call did
+    # not synchronously block on the readiness loop.
+    assert elapsed < 1.0, (
+        f"server.assign() blocked the caller for {elapsed:.3f}s — "
+        "PTY readiness wait should run on a background thread"
+    )
+    # Wait for the worker to actually finish before tearing down.
+    server.wait_for(record.id, timeout=15.0)
+    server.shutdown()
