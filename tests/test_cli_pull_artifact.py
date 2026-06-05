@@ -171,6 +171,49 @@ def test_pull_artifact_success_rsync(tmp_path: Path, coord_db) -> None:
     assert str(dest) in result.output
 
 
+def test_pull_artifact_local_machine_skips_ssh(tmp_path: Path, coord_db) -> None:
+    """Artifact built on the local host: copy locally, never rsync/ssh.
+
+    rsync-over-ssh to our own hostname fails ("Permission denied" — no
+    self-ssh key), which surfaced as a meaningless pull error in the TUI.
+    """
+    from coord.agent import _sanitize_branch
+
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    manifest_payload = {
+        "files": [{"name": "mybinary", "size": 10, "mtime": 1.0}],
+        "total_bytes": 10,
+        "built_by_assignment_id": "asgn-abc123",
+    }
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = manifest_payload
+
+    # Simulate the agent's local stash under a patched HOME.
+    home = tmp_path / "home"
+    src = home / ".coord" / "artifacts" / "myrepo" / _sanitize_branch("issue-42-my-feature")
+    src.mkdir(parents=True)
+    (src / "mybinary").write_bytes(b"BINARYDATA")
+
+    dest = tmp_path / "out"
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp), \
+         patch("socket.gethostname", return_value="builder"), \
+         patch("pathlib.Path.home", return_value=home), \
+         patch("subprocess.run") as mock_run:
+        result = runner.invoke(
+            main,
+            ["pull-artifact", "asgn-abc123", "--into", str(dest), "--config", str(cfg)],
+        )
+
+    assert result.exit_code == 0, result.output
+    # The whole point: a local pull must NOT shell out to rsync/ssh.
+    mock_run.assert_not_called()
+    assert (dest / "mybinary").read_bytes() == b"BINARYDATA"
+
+
 def test_pull_artifact_rsync_failure(tmp_path: Path, coord_db) -> None:
     """When rsync fails, exit non-zero with clear message."""
     cfg = _write_config(tmp_path)

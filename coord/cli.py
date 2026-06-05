@@ -2881,6 +2881,35 @@ def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path)
         dest_path = Path.home() / ".coord" / "artifacts" / repo_name / sanitized
     dest_path.mkdir(parents=True, exist_ok=True)
 
+    # ── Local-machine short-circuit ───────────────────────────────────────
+    # When the artifact was built on the machine running this command (e.g.
+    # the coordinator/TUI host), the agent already stashed the files locally
+    # at ~/.coord/artifacts/<repo>/<branch>/ — there is nothing to fetch, and
+    # rsync-over-ssh to our own hostname FAILS ("Permission denied" — no
+    # self-ssh key), which surfaced as a meaningless pull error in the TUI.
+    # Copy locally if the destination differs; otherwise it is a no-op.
+    local_hostname = socket.gethostname().split(".")[0].lower()
+    is_local = (
+        machine.name.lower() == local_hostname
+        or machine.host.split(".")[0].lower() == local_hostname
+    )
+    if is_local:
+        src_dir = Path.home() / ".coord" / "artifacts" / repo_name / sanitized
+        if src_dir.resolve() == dest_path.resolve():
+            click.echo(f"\nArtifacts already local at: {dest_path}")
+            return
+        click.echo(f"\nCopying local artifacts {src_dir}/ → {dest_path}/")
+        for item in src_dir.iterdir():
+            if item.name == ".assignment_id":
+                continue
+            target = dest_path / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+        click.echo(f"\nArtifacts saved to: {dest_path}")
+        return
+
     # ── rsync ─────────────────────────────────────────────────────────────
     remote = f"{machine.host}:~/.coord/artifacts/{repo_name}/{sanitized}/"
     cmd = [
