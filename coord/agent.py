@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import pty
 import re
 import shlex
 import shutil
@@ -299,6 +300,15 @@ class AssignmentSpec:
     # then sees this as the next user turn.  Only set for chat-continue
     # re-dispatches; regular work/plan/review dispatches leave this None.
     resume_session_id: str | None = None
+    # #425: optional provider override naming a provider in the agent's
+    # configured providers registry.  When None the agent uses its default
+    # ``claude -p`` spawn path (byte-identical to pre-#425 behaviour) — no
+    # provider lookup is performed and no safety gate runs.  When set, the
+    # named provider's :meth:`~coord.providers.base.Provider.capabilities`
+    # are inspected by :meth:`AgentServer.assign` and the spawn is routed
+    # through :meth:`AgentServer._spawn_pty` if the provider is a
+    # :class:`~coord.providers.claude_pty.ClaudePtyProvider`.
+    provider: str | None = None
 
 
 class _GitError(RuntimeError):
@@ -747,6 +757,21 @@ def _user_message_line(text: str) -> bytes:
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
+# #425: assignment types that **mutate** the repo or external state.  The
+# safety gate in :meth:`AgentServer.assign` refuses to start these on any
+# provider whose ``capabilities().enforces_deny_list`` is False — i.e. a
+# provider that has NOT been verified to honour the worker deny-list.
+# Non-mutating types (``plan``, ``refinement``, ``test-chat``,
+# ``new-issue-chat``) are read-only chats and may run on unverified
+# providers without risk.
+WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
+    "work",
+    "review",
+    "smoke",
+    "conflict-fix",
+})
+
+
 class AgentServer:
     """Owns assignment state and subprocesses. Thread-safe."""
 
@@ -764,6 +789,15 @@ class AgentServer:
         # #305: per-repo artifact glob patterns; repo_name → list of globs.
         # Populated from coordinator.yml Repo.artifact_paths at startup.
         artifact_paths: dict[str, list[str]] | None = None,
+        # #425: opt-in provider registry.  Maps provider name → concrete
+        # :class:`~coord.providers.base.Provider` instance.  Looked up by
+        # :class:`AssignmentSpec.provider`.  When None (or empty), the
+        # agent's behaviour is byte-identical to pre-#425: every spawn
+        # uses ``self.worker_command`` and routes through the existing
+        # ``_spawn`` path.  Only specs with an explicit
+        # ``spec.provider`` matching a key in this dict take a different
+        # path.
+        providers: "dict[str, object] | None" = None,
     ) -> None:
         self.machine_name = machine_name
         self.capabilities = list(capabilities)
@@ -779,6 +813,12 @@ class AgentServer:
         # watchdog kills workers that emit zero output within the timeout.
         self.bash_wrap_spawn = bash_wrap_spawn
         self.first_output_timeout = first_output_timeout
+        # #425: optional provider registry (see constructor docstring).
+        # Typed as ``dict[str, object]`` to avoid an import cycle with
+        # :mod:`coord.providers` at module load time — concrete instances
+        # are duck-typed (``build_command``, ``initial_input``,
+        # ``capabilities``, ``env``) at call sites.
+        self._providers: dict[str, object] = dict(providers or {})
 
         self._lock = threading.Lock()
         self._assignments: dict[str, AgentAssignment] = {}
@@ -1259,6 +1299,30 @@ class AgentServer:
                     f"pull_repos references repos with no repo_path on this agent: {unknown}"
                 )
 
+        # #425 safety gate: refuse write-capable assignment types on any
+        # provider that does NOT enforce the deny-list.  Non-mutating
+        # types (plan / refinement / test-chat / new-issue-chat) may still
+        # use unverified providers because they can't push code or open
+        # PRs.  When ``spec.provider`` is None or unknown, this gate is a
+        # no-op and the default ``claude -p`` path runs unchanged.
+        if spec.provider is not None and spec.provider in self._providers:
+            provider_obj = self._providers[spec.provider]
+            caps = provider_obj.capabilities()  # type: ignore[attr-defined]
+            if (
+                not caps.enforces_deny_list
+                and spec.type in WRITE_CAPABLE_SPEC_TYPES
+            ):
+                raise ValueError(
+                    f"refusing to spawn spec.type={spec.type!r} on provider "
+                    f"{spec.provider!r}: this provider reports "
+                    "capabilities().enforces_deny_list=False — its deny-list "
+                    "enforcement has not been verified, so the agent will not "
+                    "run write-capable assignment types on it.  Use a "
+                    "non-mutating type (plan, refinement, test-chat, "
+                    "new-issue-chat) or switch to a provider that enforces "
+                    "the deny-list (e.g. 'claude')."
+                )
+
         assignment = AgentAssignment(
             id=uuid.uuid4().hex[:12],
             spec=spec,
@@ -1666,6 +1730,21 @@ class AgentServer:
         self._persist()
 
     def _spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
+        # #425: ADDITIVE PTY branch — when the assignment names a provider
+        # in the agent's registry AND that provider is the PTY type, route
+        # to :meth:`_spawn_pty`.  In every other case the legacy code path
+        # below runs unchanged (byte-for-byte) so no-config behaviour is
+        # identical to pre-#425.
+        spec = assignment.spec
+        if spec.provider is not None and spec.provider in self._providers:
+            # Deferred import keeps the cycle latent at module load time.
+            from coord.providers.claude_pty import ClaudePtyProvider  # noqa: PLC0415
+
+            provider_obj = self._providers[spec.provider]
+            if isinstance(provider_obj, ClaudePtyProvider):
+                self._spawn_pty(assignment, repo_path, provider_obj)
+                return
+
         argv = self.worker_command(assignment.spec)
         log_fh = open(assignment.log_path, "a")  # noqa: SIM115 — handle closed in _reap
 
@@ -1721,6 +1800,174 @@ class AgentServer:
             proc.stdin.flush()
         except (BrokenPipeError, OSError) as e:
             log_fh.write(f"\n# failed to send initial briefing: {e}\n")
+
+        with self._lock:
+            assignment.status = RUNNING
+            assignment.pid = proc.pid
+            assignment.started_at = time.time()
+            self._processes[assignment.id] = proc
+
+        thread = threading.Thread(
+            target=self._reap,
+            args=(assignment.id, proc, log_fh, assignment.log_path),
+            daemon=True,
+            name=f"agent-reap-{assignment.id}",
+        )
+        with self._lock:
+            self._threads[assignment.id] = thread
+        thread.start()
+        self._persist()
+
+    def _spawn_pty(
+        self,
+        assignment: AgentAssignment,
+        repo_path: Path,
+        provider: object,
+    ) -> None:
+        """ADDITIVE PTY spawn path for :class:`ClaudePtyProvider` (#425).
+
+        Spawns the interactive ``claude`` CLI attached to a pseudo-terminal
+        (via :mod:`pty` from the Python standard library), streams the PTY
+        master fd's byte output to the same log file the legacy
+        ``claude -p`` path writes, waits briefly for the worker to emit its
+        first bytes (a sign the TUI has finished initialising), then writes
+        :meth:`Provider.initial_input` to the PTY master — exactly the bytes
+        a human would type at the prompt followed by ``\\n``.
+
+        The reap logic (:meth:`_reap`) is reused unchanged: it watches the
+        process group, captures branch state, and pushes the worker's
+        commits.  Logical completion is left to follow-up issue #426; this
+        PR only wires the spawn side.
+        """
+        spec = assignment.spec
+        # Build the worker argv through the provider seam.  The PTY argv
+        # has no -p / stream-json flags — interactive claude reads from
+        # the TTY and renders TUI output.
+        argv = provider.build_command(  # type: ignore[attr-defined]
+            spec, resolved_model=spec.model
+        )
+
+        log_fh = open(assignment.log_path, "a")  # noqa: SIM115 — closed in _reap
+        argv_oneline = shlex.join(argv).replace("\n", "\\n")
+        header = (
+            f"# agent={self.machine_name} repo={spec.repo_name} "
+            f"issue=#{spec.issue_number} provider={spec.provider} "
+            f"argv={argv_oneline}\n"
+        )
+        log_fh.write(header)
+        log_fh.flush()
+
+        # Open the PTY.  ``master_fd`` stays in this (parent) process; the
+        # ``slave_fd`` is dup'd into the child's stdin/stdout/stderr and
+        # closed in the parent immediately after Popen returns.  The child
+        # sees a real TTY so interactive ``claude`` enables its TUI path.
+        master_fd, slave_fd = pty.openpty()
+
+        # Build the worker environment.  ``TERM`` may be missing in
+        # systemd-managed agent processes — default to ``xterm-256color``
+        # so the TUI renders.  Provider env() entries (none in this PR)
+        # take precedence over both.
+        env = _worker_subprocess_env()
+        env.setdefault("TERM", "xterm-256color")
+        env.update(provider.env())  # type: ignore[attr-defined]
+
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(repo_path),
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+                env=env,
+            )
+        except (FileNotFoundError, OSError) as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            log_fh.write(f"\n# pty spawn failed: {e}\n")
+            log_fh.close()
+            with self._lock:
+                assignment.status = FAILED
+                assignment.error = str(e)
+                assignment.finished_at = time.time()
+            self._persist()
+            return
+
+        # The child owns ``slave_fd`` now — close the parent's copy or the
+        # pump thread will block forever on EOF.
+        try:
+            os.close(slave_fd)
+        except OSError:
+            pass
+
+        # PTY pump: read bytes from the master fd and append them to the
+        # log file.  Opens its own append handle so it does not race with
+        # the ``log_fh`` writes from this method or from ``_reap``.  On
+        # EOF (child closed all copies of slave) the thread exits, closes
+        # the master fd, and stamps the provider's result marker so
+        # ``_log_has_result`` in the reap thread sees logical completion.
+        log_path = assignment.log_path
+        result_marker = provider.result_marker()  # type: ignore[attr-defined]
+
+        def _pump() -> None:
+            try:
+                with open(log_path, "ab") as pump_fh:
+                    while True:
+                        try:
+                            data = os.read(master_fd, 4096)
+                        except OSError:
+                            break
+                        if not data:
+                            break
+                        try:
+                            pump_fh.write(data)
+                            pump_fh.flush()
+                        except OSError:
+                            break
+                    # Stamp the result marker AFTER the PTY closes so the
+                    # reap thread's _log_has_result poll observes logical
+                    # completion.  Best-effort: an OSError here just means
+                    # the reap thread will fall back to its max-wait timer.
+                    try:
+                        pump_fh.write(b"\n" + result_marker.encode("utf-8") + b"\n")
+                        pump_fh.flush()
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+
+        pump_thread = threading.Thread(
+            target=_pump,
+            daemon=True,
+            name=f"agent-pty-pump-{assignment.id}",
+        )
+        pump_thread.start()
+
+        # Readiness: wait briefly for the first bytes from the worker
+        # (banner / prompt) before writing the briefing.  We poll the log
+        # rather than the master fd directly to avoid stealing bytes from
+        # the pump thread.  A 5-second cap means we never block the spawn
+        # indefinitely; if no bytes arrive the briefing is still written
+        # — the worker will pick it up once its prompt is live.
+        initial_input = provider.initial_input(spec)  # type: ignore[attr-defined]
+        if initial_input:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if _log_has_output(log_path):
+                    break
+                time.sleep(0.05)
+            try:
+                os.write(master_fd, initial_input)
+            except OSError as e:
+                try:
+                    log_fh.write(f"\n# pty: failed to send initial briefing: {e}\n")
+                    log_fh.flush()
+                except OSError:
+                    pass
 
         with self._lock:
             assignment.status = RUNNING

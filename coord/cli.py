@@ -745,8 +745,14 @@ def _start_agent_server(
     # exist (typical on a dedicated worker node), run with empty capabilities
     # and repos. The coordinator sends repo details at dispatch time.
     from coord.config import ConcurrencyConfig as _ConcurrencyConfig
+    from coord.providers import build_provider as _build_provider
     concurrency = _ConcurrencyConfig()
     artifact_paths_by_repo: dict[str, list[str]] = {}
+    # #425: providers registry from cfg.providers.definitions.  Empty when
+    # there's no config file (config-free mode) — the agent then runs with
+    # no providers and the legacy claude -p spawn path, byte-identical to
+    # pre-#425 behaviour.
+    providers_registry: dict[str, object] = {}
     if not config_path.exists() and machine_name:
         from coord.models import Machine as _Machine
         machine = _Machine(
@@ -766,6 +772,15 @@ def _start_agent_server(
             for r in cfg.repos
             if r.artifact_paths
         }
+        # #425: instantiate each named provider so the agent can dispatch
+        # to it when an assignment names it (spec.provider).  An unknown
+        # provider type raises ValueError from build_provider — surface
+        # it as a startup failure rather than silently dropping the
+        # definition, so operators notice misconfiguration early.
+        for prov_name, defn in cfg.providers.definitions.items():
+            providers_registry[prov_name] = _build_provider(
+                prov_name, defn, cfg.models
+            )
 
     server = AgentServer(
         machine_name=machine.name,
@@ -775,6 +790,7 @@ def _start_agent_server(
         bash_wrap_spawn=concurrency.bash_wrap_spawn,
         first_output_timeout=concurrency.first_output_timeout,
         artifact_paths=artifact_paths_by_repo,
+        providers=providers_registry,
     )
     app = build_app(server)
     click.echo(

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from coord.providers.base import Capabilities, Provider, WorkerSummary
 from coord.providers.claude import ClaudeProvider
+from coord.providers.claude_pty import ClaudePtyProvider
 
 if TYPE_CHECKING:
     from coord.config import ModelsConfig, ProviderDef, ProvidersConfig
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Capabilities",
     "ClaudeProvider",
+    "ClaudePtyProvider",
     "Provider",
     "WorkerSummary",
     "build_provider",
@@ -63,9 +65,16 @@ def build_provider(
         # issue of #322.  Until then these fields are parsed and
         # validated but ignored when build_provider() is called.
         return ClaudeProvider(binary=definition.binary)
+    if ptype == "claude-pty":
+        # #425: interactive `claude` driven through a PTY — the
+        # subscription-billed escape hatch from the 2026-06-15 metering
+        # change.  Like the "claude" branch above, only `binary` is
+        # consumed in this PR; threading `model` / `env` / `extra_args`
+        # is left to a follow-up wiring issue.
+        return ClaudePtyProvider(binary=definition.binary)
     raise ValueError(
         f"Unknown provider type {ptype!r} (provider name: {name!r}). "
-        f"Supported types: ['claude']"
+        f"Supported types: ['claude', 'claude-pty']"
     )
 
 

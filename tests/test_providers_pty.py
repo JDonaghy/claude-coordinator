@@ -1,0 +1,534 @@
+"""Tests for ClaudePtyProvider and the agent-side PTY spawn path (#425).
+
+Covers:
+* :class:`ClaudePtyProvider` unit tests: argv shape (interactive — no ``-p``),
+  capabilities (``billing_mode='subscription'``, ``enforces_deny_list=False``),
+  initial_input (plain text + newline), parse_log delegation, env, registry
+  registration.
+* Safety gate: :meth:`AgentServer.assign` refuses write-capable assignment
+  types on providers whose ``capabilities().enforces_deny_list`` is False
+  but accepts non-mutating types.
+* Default-path-unchanged: with no providers configured, the agent still
+  uses :func:`default_worker_command` and the legacy ``claude -p`` spawn.
+
+All tests **mock** the PTY/claude binary — no real ``claude`` session is
+launched and no network or subscription call is made.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from coord.agent import (
+    AgentServer,
+    AssignmentSpec,
+    WRITE_CAPABLE_SPEC_TYPES,
+    default_worker_command,
+)
+from coord.config import ProviderDef
+from coord.providers import (
+    ClaudeProvider,
+    ClaudePtyProvider,
+    build_provider,
+    resolve_provider_name,
+)
+from coord.providers.base import Capabilities
+from coord.providers.claude_pty import PTY_RESULT_MARKER
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _make_spec(**kwargs) -> AssignmentSpec:
+    defaults: dict = {
+        "repo_name": "myrepo",
+        "repo_path": "/some/path",
+        "issue_number": 42,
+        "issue_title": "Add something",
+        "briefing": "Please do the thing.",
+    }
+    defaults.update(kwargs)
+    return AssignmentSpec(**defaults)
+
+
+def _init_repo(path: Path) -> Path:
+    """Create a minimal git repo with one commit so worktrees can be created."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=str(path), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "t@t.com"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
+    )
+    (path / "README").write_text("init\n")
+    subprocess.run(
+        ["git", "add", "README"], cwd=str(path), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=str(path),
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+# ── ClaudePtyProvider: argv shape ─────────────────────────────────────────────
+
+
+def test_pty_build_command_is_interactive_no_dash_p() -> None:
+    """Interactive argv: no ``-p``, no stream-json flags."""
+    spec = _make_spec(type="work")
+    argv = ClaudePtyProvider().build_command(spec)
+    assert argv[0] == "claude"
+    assert "-p" not in argv
+    assert "--input-format" not in argv
+    assert "--output-format" not in argv
+    assert "--verbose" not in argv
+
+
+def test_pty_build_command_passes_safety_flags() -> None:
+    """``--allowedTools`` / ``--permission-mode`` are still passed (safety hedge)."""
+    spec = _make_spec(type="work")
+    argv = ClaudePtyProvider().build_command(spec)
+    assert "--allowedTools" in argv
+    assert "--permission-mode" in argv
+    assert "--system-prompt" in argv
+    pm_idx = argv.index("--permission-mode")
+    assert argv[pm_idx + 1] == "acceptEdits"
+
+
+def test_pty_build_command_honours_resolved_model() -> None:
+    """resolved_model is reflected as ``--model <value>`` in the argv."""
+    spec = _make_spec(type="work", model="sonnet")
+    argv = ClaudePtyProvider().build_command(spec, resolved_model="opus")
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "opus"
+
+
+def test_pty_build_command_resolved_model_none_uses_spec_model() -> None:
+    """When resolved_model is None, spec.model is used."""
+    argv = ClaudePtyProvider().build_command(_make_spec(model="haiku"))
+    assert argv[argv.index("--model") + 1] == "haiku"
+
+
+def test_pty_build_command_no_model_suppresses_flag() -> None:
+    """When neither resolved_model nor spec.model is set, no ``--model`` flag."""
+    argv = ClaudePtyProvider().build_command(_make_spec(model=None))
+    assert "--model" not in argv
+
+
+def test_pty_build_command_system_prompt_override() -> None:
+    """Explicit system_prompt kwarg wins over computed one."""
+    argv = ClaudePtyProvider().build_command(
+        _make_spec(type="work"), system_prompt="custom"
+    )
+    assert argv[argv.index("--system-prompt") + 1] == "custom"
+
+
+def test_pty_build_command_allowed_tools_override() -> None:
+    """Explicit allowed_tools kwarg wins over computed one."""
+    argv = ClaudePtyProvider().build_command(
+        _make_spec(type="work"), allowed_tools="Read"
+    )
+    assert argv[argv.index("--allowedTools") + 1] == "Read"
+
+
+def test_pty_build_command_permission_mode_override() -> None:
+    """Explicit permission_mode kwarg is reflected in the argv."""
+    argv = ClaudePtyProvider().build_command(
+        _make_spec(type="work"), permission_mode="bypassPermissions"
+    )
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_pty_build_command_custom_binary() -> None:
+    """ClaudePtyProvider(binary='x') uses the custom binary."""
+    argv = ClaudePtyProvider(binary="my-claude").build_command(_make_spec())
+    assert argv[0] == "my-claude"
+
+
+def test_pty_build_command_branches_match_claude_for_plan_type() -> None:
+    """spec.type=plan still gets the plan system prompt + Read,Bash tools."""
+    spec = _make_spec(type="plan")
+    argv = ClaudePtyProvider().build_command(spec)
+    # Same spec-type branch logic as ClaudeProvider — easiest cross-check
+    # is via the legacy default_worker_command's computed values.
+    legacy = default_worker_command(spec)
+    legacy_sp = legacy[legacy.index("--system-prompt") + 1]
+    legacy_at = legacy[legacy.index("--allowedTools") + 1]
+    assert argv[argv.index("--system-prompt") + 1] == legacy_sp
+    assert argv[argv.index("--allowedTools") + 1] == legacy_at
+
+
+# ── ClaudePtyProvider: capabilities ──────────────────────────────────────────
+
+
+def test_pty_capabilities_billing_mode_subscription() -> None:
+    """billing_mode must be 'subscription' — the whole point of the provider."""
+    caps = ClaudePtyProvider().capabilities()
+    assert isinstance(caps, Capabilities)
+    assert caps.billing_mode == "subscription"
+
+
+def test_pty_capabilities_enforces_deny_list_false() -> None:
+    """enforces_deny_list is False until verified — gates the safety guard."""
+    caps = ClaudePtyProvider().capabilities()
+    assert caps.enforces_deny_list is False
+
+
+def test_pty_capabilities_other_flags_documented() -> None:
+    """resume/inject/cost_reporting are False; true_system_prompt is True."""
+    caps = ClaudePtyProvider().capabilities()
+    assert caps.resume is False
+    assert caps.inject is False
+    assert caps.cost_reporting is False
+    assert caps.true_system_prompt is True
+
+
+def test_pty_supports_inject_agrees_with_capabilities() -> None:
+    p = ClaudePtyProvider()
+    assert p.supports_inject() == p.capabilities().inject == False  # noqa: E712
+
+
+# ── ClaudePtyProvider: initial_input / result_marker / env / parse_log ────────
+
+
+def test_pty_initial_input_is_plain_text_with_newline() -> None:
+    """initial_input returns the briefing as bytes + a single trailing newline."""
+    spec = _make_spec(briefing="Hello, worker!")
+    data = ClaudePtyProvider().initial_input(spec)
+    assert isinstance(data, bytes)
+    assert data == b"Hello, worker!\n"
+
+
+def test_pty_initial_input_preserves_existing_newline() -> None:
+    """A briefing that already ends with \\n is not double-newlined."""
+    spec = _make_spec(briefing="Hello\n")
+    assert ClaudePtyProvider().initial_input(spec) == b"Hello\n"
+
+
+def test_pty_initial_input_is_not_stream_json() -> None:
+    """initial_input must not be a stream-json envelope (no JSON object)."""
+    spec = _make_spec(briefing="some text")
+    data = ClaudePtyProvider().initial_input(spec)
+    assert not data.startswith(b"{"), "PTY initial_input must be raw bytes, not JSON"
+
+
+def test_pty_result_marker_is_documented_sentinel() -> None:
+    """result_marker returns the PTY-specific sentinel."""
+    assert ClaudePtyProvider().result_marker() == PTY_RESULT_MARKER
+    assert PTY_RESULT_MARKER.startswith("#")
+
+
+def test_pty_env_is_empty() -> None:
+    """env() returns an empty dict for ClaudePtyProvider."""
+    assert ClaudePtyProvider().env() == {}
+
+
+def test_pty_parse_log_handles_non_json_bytes(tmp_path: Path) -> None:
+    """parse_log degrades gracefully on raw TTY bytes (no stream-json)."""
+    log = tmp_path / "worker.log"
+    # Raw TTY-style content: ANSI escapes and plain text — not JSON.
+    log.write_text("\x1b[1mclaude>\x1b[0m hello world\n")
+    summary = ClaudePtyProvider().parse_log(log)
+    # Should not crash; returns a blank-ish summary.
+    assert summary.num_turns == 0
+    assert summary.total_cost_usd == 0.0
+
+
+# ── Registry registration ────────────────────────────────────────────────────
+
+
+def test_build_provider_claude_pty_type() -> None:
+    """build_provider with type='claude-pty' returns a ClaudePtyProvider."""
+    defn = ProviderDef(type="claude-pty")
+    provider = build_provider("claude-pty", defn, None)
+    assert isinstance(provider, ClaudePtyProvider)
+
+
+def test_build_provider_claude_pty_with_binary() -> None:
+    """build_provider passes the binary override to ClaudePtyProvider."""
+    defn = ProviderDef(type="claude-pty", binary="my-claude")
+    provider = build_provider("claude-pty", defn, None)
+    argv = provider.build_command(_make_spec(type="work"))
+    assert argv[0] == "my-claude"
+
+
+def test_resolve_provider_name_picks_claude_pty_when_set() -> None:
+    """The precedence chain returns 'claude-pty' when the spec sets it."""
+    from coord.config import ProvidersConfig
+
+    name = resolve_provider_name("claude-pty", None, ProvidersConfig())
+    assert name == "claude-pty"
+
+
+# ── Safety gate ──────────────────────────────────────────────────────────────
+
+
+def _server_with_pty(tmp_path: Path, repo: Path) -> AgentServer:
+    """Build an AgentServer with a ClaudePtyProvider in its providers dict."""
+    return AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["myrepo"],
+        state_dir=tmp_path / "state",
+        # Default worker_command isn't used when the PTY path triggers, but
+        # we still need a callable for the back-compat path.
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo unused"],
+        repo_paths={"myrepo": str(repo)},
+        providers={"claude-pty": ClaudePtyProvider(binary="/bin/false")},
+    )
+
+
+@pytest.mark.parametrize("spec_type", sorted(WRITE_CAPABLE_SPEC_TYPES))
+def test_safety_gate_refuses_write_capable_types_on_unverified_provider(
+    tmp_path: Path, spec_type: str
+) -> None:
+    """Write-capable types must NOT spawn when enforces_deny_list is False."""
+    repo = _init_repo(tmp_path / "repo")
+    server = _server_with_pty(tmp_path, repo)
+    spec = _make_spec(
+        repo_name="myrepo",
+        repo_path=str(repo),
+        type=spec_type,
+        provider="claude-pty",
+        # type="review" / "smoke" assignments in production carry a
+        # review_target / branch — supply harmless values so AssignmentSpec
+        # construction is consistent.
+        review_target="123" if spec_type == "review" else None,
+    )
+    with pytest.raises(ValueError, match="enforces_deny_list=False"):
+        server.assign(spec)
+    server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "spec_type", ["plan", "refinement", "test-chat", "new-issue-chat"]
+)
+def test_safety_gate_allows_non_mutating_types_on_unverified_provider(
+    tmp_path: Path, spec_type: str
+) -> None:
+    """Read-only types may use an unverified-deny-list provider.
+
+    We let the assign call proceed past the gate and then immediately shut
+    the server down — the PTY spawn itself will fail/exit cleanly because
+    we configured binary=/bin/false, but the gate must NOT have raised.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = _server_with_pty(tmp_path, repo)
+    spec = _make_spec(
+        repo_name="myrepo",
+        repo_path=str(repo),
+        type=spec_type,
+        provider="claude-pty",
+    )
+    # The gate is what we're testing; spawn may fail since /bin/false exits
+    # immediately, but that failure is reported on the assignment record
+    # (status=FAILED) — assign() itself returns a record without raising.
+    record = server.assign(spec)
+    assert record is not None
+    assert record.spec.type == spec_type
+    # Wait briefly for the spawn/reap to complete so shutdown is clean.
+    server.wait_for(record.id, timeout=10.0)
+    server.shutdown()
+
+
+def test_safety_gate_no_provider_is_a_no_op(tmp_path: Path) -> None:
+    """spec.provider=None never raises the gate even with no registry."""
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["myrepo"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"myrepo": str(repo)},
+        # No providers dict — back-compat mode.
+    )
+    spec = _make_spec(
+        repo_name="myrepo", repo_path=str(repo), type="work", provider=None
+    )
+    record = server.assign(spec)
+    final = server.wait_for(record.id, timeout=10.0)
+    assert final.status in ("done", "failed")  # spawn succeeded, no gate raised
+    server.shutdown()
+
+
+def test_safety_gate_unknown_provider_falls_back_to_default(tmp_path: Path) -> None:
+    """spec.provider naming a key not in the registry never raises the gate.
+
+    The agent's no-config behaviour is byte-identical to today, and an
+    unknown provider name simply falls through to ``self.worker_command``
+    — which is the legacy ``claude -p`` path in production.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["myrepo"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"myrepo": str(repo)},
+        providers={},  # empty registry; nothing to look up.
+    )
+    spec = _make_spec(
+        repo_name="myrepo",
+        repo_path=str(repo),
+        type="work",
+        provider="not-registered",
+    )
+    record = server.assign(spec)
+    final = server.wait_for(record.id, timeout=10.0)
+    # Spawn used worker_command (legacy path) — the gate never fired
+    # because the named provider wasn't in the registry.
+    assert final.status in ("done", "failed")
+    server.shutdown()
+
+
+# ── Default-path-unchanged ───────────────────────────────────────────────────
+
+
+def test_default_path_uses_legacy_worker_command_when_no_providers(
+    tmp_path: Path,
+) -> None:
+    """No-config: AgentServer routes through ``self.worker_command`` and
+    NOT through the PTY branch."""
+    repo = _init_repo(tmp_path / "repo")
+    captured: list[list[str]] = []
+
+    def recording_builder(spec: AssignmentSpec) -> list[str]:
+        argv = ["/bin/sh", "-c", "echo legacy-output"]
+        captured.append(argv)
+        return argv
+
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["myrepo"],
+        state_dir=tmp_path / "state",
+        worker_command=recording_builder,
+        repo_paths={"myrepo": str(repo)},
+        # No providers dict at all — the default path must run.
+    )
+
+    # Sentinel: if the PTY branch were taken it would import and call
+    # ClaudePtyProvider.build_command, NOT recording_builder.  We verify
+    # that recording_builder was the one invoked.
+    spec = _make_spec(
+        repo_name="myrepo", repo_path=str(repo), type="work", provider=None
+    )
+    record = server.assign(spec)
+    final = server.wait_for(record.id, timeout=10.0)
+    assert final.status == "done"
+    assert captured == [["/bin/sh", "-c", "echo legacy-output"]]
+    log = Path(final.log_path).read_text()
+    assert "legacy-output" in log
+    # And the log header is the legacy header (no `provider=` field).
+    assert "provider=" not in log.splitlines()[0]
+    server.shutdown()
+
+
+def test_default_provider_selection_is_claude(tmp_path: Path) -> None:
+    """ProvidersConfig() default resolves to 'claude' (not 'claude-pty').
+
+    A redundant cross-check that the registry default is unchanged so the
+    no-config dispatch path keeps using ClaudeProvider semantics.
+    """
+    from coord.config import ProvidersConfig
+
+    cfg = ProvidersConfig()
+    assert cfg.default == "claude"
+    assert resolve_provider_name(None, None, cfg) == "claude"
+    # And build_provider on the implicit definition returns a ClaudeProvider.
+    provider = build_provider("claude", cfg.definitions["claude"], None)
+    assert isinstance(provider, ClaudeProvider)
+
+
+# ── PTY spawn smoke test (mocked claude binary) ──────────────────────────────
+
+
+def test_pty_spawn_routes_through_pty_path(tmp_path: Path) -> None:
+    """The PTY branch actually runs when spec.provider names a ClaudePtyProvider.
+
+    Uses a tiny shell script as a stand-in for the ``claude`` binary — it
+    prints a banner (so the readiness loop sees output), reads a line from
+    stdin (the briefing), echoes it back, and exits.  This exercises:
+        * the PTY-branch dispatch in ``_spawn``;
+        * the PTY pump thread (PTY master → log file);
+        * the readiness wait + initial_input write to the PTY master;
+        * the result-marker stamping after the worker exits.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["myrepo"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo unused"],
+        repo_paths={"myrepo": str(repo)},
+        providers={"claude-pty": _ScriptedPtyProvider()},
+    )
+    # Use a non-mutating type so the safety gate doesn't refuse.
+    spec = _make_spec(
+        repo_name="myrepo",
+        repo_path=str(repo),
+        type="plan",
+        provider="claude-pty",
+        briefing="ECHO_ME",
+    )
+    record = server.assign(spec)
+    final = server.wait_for(record.id, timeout=15.0)
+    log = Path(final.log_path).read_text(errors="replace")
+    # The PTY worker emitted its ready banner (proves the pump runs).
+    assert "READY_BANNER" in log, f"worker banner missing from log: {log!r}"
+    # The pump captured the worker's echo of our briefing — proves the
+    # initial_input was written to the PTY master after readiness.
+    assert "got=ECHO_ME" in log, f"briefing not echoed back: {log!r}"
+    # The pump stamped the result marker after the worker exited.
+    assert PTY_RESULT_MARKER in log
+    # And the spawn header named the provider.
+    assert "provider=claude-pty" in log.splitlines()[0]
+    server.shutdown()
+
+
+class _ScriptedPtyProvider(ClaudePtyProvider):
+    """Test-only provider that mocks ``claude`` with a tiny shell script.
+
+    The script prints ``READY_BANNER`` (so the readiness loop in
+    ``_spawn_pty`` sees output and proceeds to write the briefing), reads
+    one line from the PTY, echoes it as ``got=<line>``, then exits.  This
+    proves the round-trip from initial_input → PTY master → child stdin →
+    child stdout → PTY master → log without depending on a real claude
+    install.
+
+    Everything else (capabilities, initial_input, result_marker,
+    parse_log) is inherited unchanged from :class:`ClaudePtyProvider`.
+    """
+
+    def build_command(
+        self,
+        spec: AssignmentSpec,
+        *,
+        resolved_model=None,
+        system_prompt=None,
+        allowed_tools=None,
+        permission_mode="acceptEdits",
+    ) -> list[str]:
+        return [
+            "/bin/sh",
+            "-c",
+            'echo READY_BANNER; read line; echo "got=$line"',
+        ]
