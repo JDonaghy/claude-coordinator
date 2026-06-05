@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -257,6 +259,63 @@ class CiStoreConfig:
 
 
 @dataclass
+class ProviderDef:
+    """Definition of a single named worker-command provider.
+
+    Corresponds to one entry under ``providers.definitions`` in
+    ``coordinator.yml``.  All fields except ``type`` are optional.
+
+    Attributes:
+        type: Provider backend type (currently only ``"claude"`` is
+            supported).
+        binary: Override the worker binary path/name.  ``None`` means the
+            provider uses its own default (``"claude"`` for the claude
+            backend).
+        model: Pin this provider to a specific model id or alias.  Takes
+            precedence over ``models.default`` for assignments routed to
+            this provider.
+        attach_url: Reserved for future attach-mode providers.
+        env: Extra environment variables for the worker subprocess.
+            Values may contain ``${VAR}`` placeholders which are expanded
+            from :data:`os.environ` at parse time.
+        extra_args: Additional command-line arguments appended to the
+            worker argv.
+    """
+
+    type: str
+    binary: str | None = None
+    model: str | None = None
+    attach_url: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProvidersConfig:
+    """Global provider registry.
+
+    Parsed from the optional ``providers:`` block in ``coordinator.yml``.
+    When the block is absent, ``default == "claude"`` and an implicit
+    ``"claude"`` definition is present in ``definitions``.
+
+    Attributes:
+        default: The provider name used when no per-spec or per-repo
+            override is set.  Defaults to ``"claude"``.
+        definitions: Named provider definitions keyed by provider name.
+            An implicit ``"claude"`` entry is always materialised if absent.
+    """
+
+    default: str = "claude"
+    definitions: dict[str, ProviderDef] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Always ensure the implicit "claude" definition exists so callers
+        # can look it up by name without checking for its presence.
+        if "claude" not in self.definitions:
+            self.definitions["claude"] = ProviderDef(type="claude")
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
@@ -268,6 +327,7 @@ class Config:
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
+    providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -301,6 +361,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
     ci_store = _parse_ci_store(raw.get("ci_store"))
+    providers = _parse_providers(raw.get("providers"))
 
     return Config(
         repos=repos,
@@ -313,6 +374,7 @@ def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
         pipeline=pipeline,
         dispatch=dispatch,
         ci_store=ci_store,
+        providers=providers,
         path=p,
     )
 
@@ -397,6 +459,11 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 )
         artifact_paths: list[str] = list(artifact_paths_raw)
 
+        # #323: optional per-repo provider override.
+        repo_provider = entry.get("provider")
+        if repo_provider is not None and not isinstance(repo_provider, str):
+            raise ConfigError(f"repos[{i}].provider must be a string")
+
         repos.append(
             Repo(
                 name=name,
@@ -412,6 +479,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 reference_repos=reference_repos,
                 new_issue_guidance=new_issue_guidance,
                 artifact_paths=artifact_paths,
+                provider=repo_provider,
             )
         )
     return repos
@@ -798,6 +866,120 @@ def _parse_ci_store(raw: Any) -> CiStoreConfig:
         if not isinstance(value, str) or value not in ("github", "none"):
             raise ConfigError("ci_store.type must be one of: github, none")
         cfg.type = value
+    return cfg
+
+
+_ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _expand_env_vars(value: str) -> str:
+    """Expand ``${VAR}`` placeholders in *value* using :data:`os.environ`.
+
+    Unset variables are left as-is (e.g. ``${MISSING}`` stays
+    ``"${MISSING}"``).  Only ``${VAR}`` syntax is supported — bare ``$VAR``
+    is not expanded.
+    """
+
+    def _replace(m: re.Match) -> str:  # type: ignore[type-arg]
+        var = m.group(1)
+        return os.environ.get(var, m.group(0))
+
+    return _ENV_VAR_RE.sub(_replace, value)
+
+
+def _parse_providers(raw: Any) -> ProvidersConfig:
+    """Parse the optional ``providers:`` block from coordinator.yml.
+
+    An absent block returns ``ProvidersConfig()`` — ``default == "claude"``
+    and an implicit ``"claude"`` definition present.  An explicit block may
+    override ``default`` and/or add named definitions.  Values in
+    ``definitions[*].env`` undergo ``${VAR}`` expansion against
+    :data:`os.environ`.
+    """
+    if raw is None:
+        return ProvidersConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'providers' must be a mapping")
+
+    cfg = ProvidersConfig()
+
+    if "default" in raw:
+        value = raw["default"]
+        if not isinstance(value, str) or not value:
+            raise ConfigError("providers.default must be a non-empty string")
+        cfg.default = value
+
+    defs_raw = raw.get("definitions", {}) or {}
+    if not isinstance(defs_raw, dict):
+        raise ConfigError("providers.definitions must be a mapping")
+
+    for def_name, def_raw in defs_raw.items():
+        if not isinstance(def_name, str):
+            raise ConfigError("providers.definitions keys must be strings")
+        if not isinstance(def_raw, dict):
+            raise ConfigError(
+                f"providers.definitions[{def_name!r}] must be a mapping"
+            )
+
+        ptype = def_raw.get("type")
+        if not ptype or not isinstance(ptype, str):
+            raise ConfigError(
+                f"providers.definitions[{def_name!r}].type is required (string)"
+            )
+
+        binary = def_raw.get("binary")
+        if binary is not None and not isinstance(binary, str):
+            raise ConfigError(
+                f"providers.definitions[{def_name!r}].binary must be a string"
+            )
+
+        model = def_raw.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ConfigError(
+                f"providers.definitions[{def_name!r}].model must be a string"
+            )
+
+        attach_url = def_raw.get("attach_url")
+        if attach_url is not None and not isinstance(attach_url, str):
+            raise ConfigError(
+                f"providers.definitions[{def_name!r}].attach_url must be a string"
+            )
+
+        env_raw = def_raw.get("env", {}) or {}
+        if not isinstance(env_raw, dict):
+            raise ConfigError(
+                f"providers.definitions[{def_name!r}].env must be a mapping"
+            )
+        for k, v in env_raw.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ConfigError(
+                    f"providers.definitions[{def_name!r}].env must map strings to strings"
+                )
+        # Expand ${VAR} in env values.
+        env: dict[str, str] = {k: _expand_env_vars(v) for k, v in env_raw.items()}
+
+        extra_args_raw = def_raw.get("extra_args", []) or []
+        if not isinstance(extra_args_raw, list) or not all(
+            isinstance(a, str) for a in extra_args_raw
+        ):
+            raise ConfigError(
+                f"providers.definitions[{def_name!r}].extra_args must be a list of strings"
+            )
+        extra_args: list[str] = list(extra_args_raw)
+
+        cfg.definitions[def_name] = ProviderDef(
+            type=ptype,
+            binary=binary,
+            model=model,
+            attach_url=attach_url,
+            env=env,
+            extra_args=extra_args,
+        )
+
+    # Always ensure the implicit "claude" definition is present.
+    if "claude" not in cfg.definitions:
+        cfg.definitions["claude"] = ProviderDef(type="claude")
+
     return cfg
 
 
