@@ -239,6 +239,17 @@ impl CommandRunner {
     ///
     /// Returns `false` if a command is already running.  For user-initiated
     /// actions that should queue instead of refuse, use [`spawn_queued`].
+    ///
+    /// # Audit rule
+    ///
+    /// **User-initiated actions** (keybinds, toolbar buttons, context-menu items)
+    /// must call [`spawn_queued`] so the action queues with visible feedback
+    /// instead of being silently refused with "another command is running".
+    ///
+    /// **Background / auto-fire callers** (e.g. `kick_issue_sync`, auto-notify)
+    /// must call this method (`spawn`) so they **skip when busy** rather than
+    /// piling up in the queue.  These paths are always guarded by an explicit
+    /// `is_running()` check before calling.
     pub fn spawn(&mut self, args: &[&str]) -> bool {
         if self.is_running() {
             return false;
@@ -628,5 +639,88 @@ mod tests {
         wait_for_result(&mut runner).expect("third");
         assert_eq!(runner.queue_depth(), 0);
         assert!(!runner.is_running());
+    }
+
+    // ── Migration rule tests (#428) ───────────────────────────────────────────
+
+    /// User-initiated action: `spawn_queued` when runner is busy returns `Queued`
+    /// (not `false`/`Deduped`).  Simulates the migrate-to-queue path for actions
+    /// like stop, retry, notify, merge, agent restart.
+    #[test]
+    fn spawn_queued_returns_queued_when_busy() {
+        let mut runner = CommandRunner::new();
+        // Start a "current" command.
+        assert_eq!(runner.spawn_queued(&["--version"]), SpawnQueuedOutcome::Started);
+        assert!(runner.is_running());
+        // A different user-initiated action arrives while the first runs.
+        let outcome = runner.spawn_queued(&["--help"]);
+        assert_eq!(
+            outcome,
+            SpawnQueuedOutcome::Queued,
+            "user-initiated action should queue, not refuse",
+        );
+        assert_eq!(runner.queue_depth(), 1);
+        // Let everything drain.
+        wait_for_result(&mut runner).unwrap();
+        wait_for_result(&mut runner).unwrap();
+        assert!(!runner.is_running());
+    }
+
+    /// Background `spawn()` callers skip when busy — the skip-when-busy
+    /// invariant must not be broken by the migration.
+    #[test]
+    fn background_spawn_skips_when_busy() {
+        let mut runner = CommandRunner::new();
+        assert!(runner.spawn(&["--version"]), "first spawn should succeed");
+        assert!(runner.is_running());
+        // Background caller (e.g. kick_issue_sync) calls plain spawn() — must skip.
+        assert!(
+            !runner.spawn(&["--help"]),
+            "background spawn should return false (skip), not queue",
+        );
+        assert_eq!(runner.queue_depth(), 0, "background spawn must not add to queue");
+        wait_for_result(&mut runner).unwrap();
+        assert!(!runner.is_running());
+    }
+
+    /// Identical commands across both `spawn` (running) and `spawn_queued`
+    /// (pending) are silently deduped — no scary error, queue stays at 1.
+    #[test]
+    fn spawn_queued_dedup_prevents_pile_up() {
+        let mut runner = CommandRunner::new();
+        assert!(runner.spawn(&["--version"]));
+        // Queue one instance of --help.
+        assert_eq!(runner.spawn_queued(&["--help"]), SpawnQueuedOutcome::Queued);
+        assert_eq!(runner.queue_depth(), 1);
+        // Mash the same action three more times — all should dedup.
+        for _ in 0..3 {
+            assert_eq!(
+                runner.spawn_queued(&["--help"]),
+                SpawnQueuedOutcome::Deduped,
+                "repeated identical action should dedup silently",
+            );
+        }
+        assert_eq!(runner.queue_depth(), 1, "dedup must not inflate queue past 1");
+        // Drain.
+        wait_for_result(&mut runner).unwrap();
+        wait_for_result(&mut runner).unwrap();
+        assert!(!runner.is_running());
+    }
+
+    /// `spawn_queued` when the runner is idle returns `Started` immediately —
+    /// the `Queued` path is never taken when there is nothing to wait for.
+    #[test]
+    fn spawn_queued_starts_immediately_when_idle() {
+        let mut runner = CommandRunner::new();
+        assert!(!runner.is_running(), "runner should start idle");
+        let outcome = runner.spawn_queued(&["--version"]);
+        assert_eq!(
+            outcome,
+            SpawnQueuedOutcome::Started,
+            "should start immediately when idle",
+        );
+        assert!(runner.is_running());
+        assert_eq!(runner.queue_depth(), 0);
+        wait_for_result(&mut runner).unwrap();
     }
 }

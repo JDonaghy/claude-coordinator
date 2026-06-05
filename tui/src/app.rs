@@ -4547,24 +4547,26 @@ impl CoordApp {
             ));
             return false;
         }
-        let spawned = self
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self
             .command_runner
-            .spawn(&["approve-plan", &aid]);
-        if spawned {
-            self.pipeline_status = Some((
-                format!("approving plan #{} → dispatching work", issue_number),
-                Instant::now(),
-            ));
-            // Close the watch so the user returns to Stages and can see the
-            // new work assignment appear on the next refresh.
-            self.close_watch();
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
+            .spawn_queued(&["approve-plan", &aid]);
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                self.pipeline_status = Some((
+                    format!("approving plan #{} → dispatching work", issue_number),
+                    Instant::now(),
+                ));
+                // Close the watch so the user returns to Stages and can see the
+                // new work assignment appear on the next refresh.
+                self.close_watch();
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "approve-plan runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Find a running or non-done assignment for the currently-selected
@@ -4604,19 +4606,21 @@ impl CoordApp {
         let Some(a) = pick else { return false; };
         let aid = a.id.clone();
         let issue_n = a.issue_number;
-        let spawned = self.command_runner.spawn(&["stop", &aid]);
-        if spawned {
-            self.pipeline_status = Some((
-                format!("stop dispatched for #{}", issue_n),
-                Instant::now(),
-            ));
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["stop", &aid]);
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                self.pipeline_status = Some((
+                    format!("stop dispatched for #{}", issue_n),
+                    Instant::now(),
+                ));
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "stop runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Open the PR for the currently-selected Pipeline row in the user's
@@ -4659,19 +4663,21 @@ impl CoordApp {
             Some(w) => (w.assignment_id.clone(), w.issue_number),
             None => return false,
         };
-        let spawned = self.command_runner.spawn(&["stop", &aid]);
-        if spawned {
-            self.pipeline_status = Some((
-                format!("stop dispatched for #{}", issue_number),
-                Instant::now(),
-            ));
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["stop", &aid]);
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                self.pipeline_status = Some((
+                    format!("stop dispatched for #{}", issue_number),
+                    Instant::now(),
+                ));
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "stop runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Build the body `ListView` for the watch overlay — the raw log lines
@@ -8651,19 +8657,21 @@ impl CoordApp {
             ));
             return false;
         };
-        let spawned = self.command_runner.spawn(&["retry", &id]);
-        if spawned {
-            self.pipeline_status = Some((
-                format!("retry dispatched for {} #{}", stage, issue.number),
-                Instant::now(),
-            ));
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["retry", &id]);
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                self.pipeline_status = Some((
+                    format!("retry dispatched for {} #{}", stage, issue.number),
+                    Instant::now(),
+                ));
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "retry runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Dispatch the Work stage.
@@ -8690,23 +8698,25 @@ impl CoordApp {
         // dispatches the work assignment with the plan output baked into
         // the briefing.
         if let Some(plan_id) = self.find_done_plan_assignment_id(&issue, &coord_repo) {
-            let spawned = self.command_runner.spawn(&["approve-plan", &plan_id]);
-            if spawned {
-                self.pipeline_status = Some((
-                    format!(
-                        "approving plan {} → dispatching work for #{}",
-                        &plan_id[..plan_id.len().min(8)],
-                        issue.number
-                    ),
-                    Instant::now(),
-                ));
-            } else {
-                self.pipeline_status = Some((
-                    "another command is running — try again in a moment".to_string(),
-                    Instant::now(),
-                ));
+            use crate::commands::SpawnQueuedOutcome;
+            let outcome = self.command_runner.spawn_queued(&["approve-plan", &plan_id]);
+            match outcome {
+                SpawnQueuedOutcome::Started => {
+                    self.pipeline_status = Some((
+                        format!(
+                            "approving plan {} → dispatching work for #{}",
+                            &plan_id[..plan_id.len().min(8)],
+                            issue.number
+                        ),
+                        Instant::now(),
+                    ));
+                }
+                SpawnQueuedOutcome::Queued => {
+                    self.push_toast("⏳ Queued", "approve-plan runs after current command", ToastSeverity::Info);
+                }
+                SpawnQueuedOutcome::Deduped => {}
             }
-            return spawned;
+            return matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued);
         }
 
         let Some(machine) = self.best_machine_for(&coord_repo) else {
@@ -8739,19 +8749,21 @@ impl CoordApp {
             cmd.push(m.clone());
         }
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        let spawned = self.command_runner.spawn(&cmd_refs);
-        if spawned {
-            self.pipeline_status = Some((
-                format!("dispatched #{} → {}", issue.number, machine_name),
-                Instant::now(),
-            ));
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&cmd_refs);
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                self.pipeline_status = Some((
+                    format!("dispatched #{} → {}", issue.number, machine_name),
+                    Instant::now(),
+                ));
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "assign runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Dispatch the Plan stage: `coord assign --plan-only <machine> <repo> <issue>`.
@@ -8798,19 +8810,21 @@ impl CoordApp {
             cmd.push(m.clone());
         }
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        let spawned = self.command_runner.spawn(&cmd_refs);
-        if spawned {
-            self.pipeline_status = Some((
-                format!("plan dispatched for #{} → {}", issue.number, machine_name),
-                Instant::now(),
-            ));
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&cmd_refs);
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                self.pipeline_status = Some((
+                    format!("plan dispatched for #{} → {}", issue.number, machine_name),
+                    Instant::now(),
+                ));
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "plan assign runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Find the most recent done plan-typed assignment for this issue.
@@ -8840,19 +8854,21 @@ impl CoordApp {
     fn dispatch_pipeline_review(&mut self) -> bool {
         let Some(idx) = self.pipeline_sel else { return false; };
         let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
-        let spawned = self.command_runner.spawn(&["notify"]);
-        if spawned {
-            self.pipeline_status = Some((
-                format!("notify dispatched for #{}", issue.number),
-                Instant::now(),
-            ));
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["notify"]);
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                self.pipeline_status = Some((
+                    format!("notify dispatched for #{}", issue.number),
+                    Instant::now(),
+                ));
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "notify runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Dispatch the Merge stage: `coord merge --repo <coord_repo>`.
@@ -8869,28 +8885,32 @@ impl CoordApp {
             ));
             return false;
         };
-        let spawned = self.command_runner.spawn(&[
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&[
             "merge",
             "--repo",
             &coord_repo,
         ]);
-        if spawned {
-            // #290: mark the issue as in-flight so merge_stage_status_for returns
-            // Active immediately — the Merge box turns blue and the Go button drops
-            // at once, without waiting for the DB to reflect the new merge_queue entry.
-            self.pipeline_inflight_merges
-                .insert((issue.repo_slug.clone(), issue.number));
-            self.pipeline_status = Some((
-                format!("merge dispatched for {} (#{})", coord_repo, issue.number),
-                Instant::now(),
-            ));
-        } else {
-            self.pipeline_status = Some((
-                "another command is running — try again in a moment".to_string(),
-                Instant::now(),
-            ));
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                // #290: mark the issue as in-flight so merge_stage_status_for returns
+                // Active immediately — the Merge box turns blue and the Go button drops
+                // at once, without waiting for the DB to reflect the new merge_queue entry.
+                // Only set inflight when the command actually started — not when queued,
+                // because the merge hasn't run yet and the UI state would be wrong.
+                self.pipeline_inflight_merges
+                    .insert((issue.repo_slug.clone(), issue.number));
+                self.pipeline_status = Some((
+                    format!("merge dispatched for {} (#{})", coord_repo, issue.number),
+                    Instant::now(),
+                ));
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Kick off a background `gh search issues` poll (no-op if one is
@@ -9266,13 +9286,19 @@ impl CoordApp {
     /// happened (dispatched, opened a prompt, or surfaced a toast) so
     /// the caller can request a redraw.
     fn dispatch_pipeline_merge_for_selected_issue(&mut self) -> bool {
+        use crate::commands::SpawnQueuedOutcome;
         match self.pipeline_merge_state() {
             PipelineMergeState::NotApplicable => {
                 // Outside the Pipeline view, fall back to the unscoped
                 // "merge whatever's ready" behaviour (matches the
                 // pre-classifier `m` keybind on the Board / Machines
                 // views).
-                self.command_runner.spawn(&["merge"]);
+                match self.command_runner.spawn_queued(&["merge"]) {
+                    SpawnQueuedOutcome::Queued => {
+                        self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+                    }
+                    SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
+                }
                 true
             }
             PipelineMergeState::NoQueue { issue } => {
@@ -9320,10 +9346,19 @@ impl CoordApp {
                     // No coord_repo mapping — fall back to unscoped
                     // merge so power users with cross-repo work can
                     // still drive it from the TUI.
-                    self.command_runner.spawn(&["merge"]);
+                    match self.command_runner.spawn_queued(&["merge"]) {
+                        SpawnQueuedOutcome::Queued => {
+                            self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+                        }
+                        SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
+                    }
                 } else {
-                    self.command_runner
-                        .spawn(&["merge", "--repo", &repo]);
+                    match self.command_runner.spawn_queued(&["merge", "--repo", &repo]) {
+                        SpawnQueuedOutcome::Queued => {
+                            self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+                        }
+                        SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
+                    }
                 }
                 true
             }
@@ -13263,17 +13298,25 @@ impl CoordApp {
                         args.push("--repo");
                         args.push(repo);
                     }
-                    self.command_runner.spawn(&args);
+                    use crate::commands::SpawnQueuedOutcome;
                     let scope_str = if scoped {
                         format!(" --repo {}", repo)
                     } else {
                         String::new()
                     };
-                    self.push_toast(
-                        "Force-merge dispatched",
-                        &format!("coord merge --force-merge{} — CI gate bypassed", scope_str),
-                        ToastSeverity::Warning,
-                    );
+                    match self.command_runner.spawn_queued(&args) {
+                        SpawnQueuedOutcome::Started => {
+                            self.push_toast(
+                                "Force-merge dispatched",
+                                &format!("coord merge --force-merge{} — CI gate bypassed", scope_str),
+                                ToastSeverity::Warning,
+                            );
+                        }
+                        SpawnQueuedOutcome::Queued => {
+                            self.push_toast("⏳ Queued", "force-merge runs after current command", ToastSeverity::Info);
+                        }
+                        SpawnQueuedOutcome::Deduped => {}
+                    }
                     self.pending_force_merge = None;
                 }
                 _ => {
@@ -13289,7 +13332,13 @@ impl CoordApp {
         if let Some(name) = self.pending_restart.clone() {
             match id {
                 "yes" => {
-                    self.command_runner.spawn(&["agent", "restart", "--machine", &name]);
+                    use crate::commands::SpawnQueuedOutcome;
+                    match self.command_runner.spawn_queued(&["agent", "restart", "--machine", &name]) {
+                        SpawnQueuedOutcome::Queued => {
+                            self.push_toast("⏳ Queued", "agent restart runs after current command", ToastSeverity::Info);
+                        }
+                        SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
+                    }
                     self.pending_restart = None;
                 }
                 _ => {
@@ -13356,7 +13405,10 @@ impl CoordApp {
         // keeps the issue in status:refining rather than racing the label
         // flip.
         let then_dispatch = std::mem::take(&mut self.refine_then_dispatch);
-        self.command_runner.spawn(&["stop", &aid]);
+        // Use spawn_queued so the stop is enqueued if another command is already
+        // running — the pending_refine_ready handler fires when the stop eventually
+        // completes via poll(), so the stop → ready sequence is always preserved.
+        self.command_runner.spawn_queued(&["stop", &aid]);
         self.pending_refine_ready = Some(PendingRefineReady {
             repo,
             issue_number: issue_n,
@@ -13378,7 +13430,7 @@ impl CoordApp {
     fn cancel_refinement_chat(&mut self) {
         self.refine_then_dispatch = false;
         if let Some(id) = self.watch_focused.clone() {
-            self.command_runner.spawn(&["stop", &id]);
+            self.command_runner.spawn_queued(&["stop", &id]);
             let issue_n = self.watch_pool.get(&id).map(|c| c.state.issue_number).unwrap_or(0);
             if issue_n != 0 {
                 self.push_toast(
@@ -14765,25 +14817,26 @@ impl CoordApp {
             cmd.push(m.clone());
         }
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        let spawned = self.command_runner.spawn(&cmd_refs);
-        if spawned {
-            self.push_toast(
-                "Send",
-                &format!("#{} dispatched → {}", num, machine_name),
-                ToastSeverity::Info,
-            );
-            // Kick the pipeline loader so the issue appears in Pipeline:New
-            // (and then In-progress) without waiting for the 60 s refresh.
-            self.pipeline_last_load = None;
-            self.maybe_kick_pipeline_loader();
-        } else {
-            self.push_toast(
-                "Send",
-                "Another command is running — try again in a moment.",
-                ToastSeverity::Warning,
-            );
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&cmd_refs);
+        match outcome {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Send",
+                    &format!("#{} dispatched → {}", num, machine_name),
+                    ToastSeverity::Info,
+                );
+                // Kick the pipeline loader so the issue appears in Pipeline:New
+                // (and then In-progress) without waiting for the 60 s refresh.
+                self.pipeline_last_load = None;
+                self.maybe_kick_pipeline_loader();
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "assign runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
         }
-        spawned
+        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
     }
 
     /// Route a context-menu `action_id` to the right behaviour.
@@ -15497,8 +15550,16 @@ impl CoordApp {
                 }
             }
             "toolbar:notify" => {
-                self.command_runner.spawn(&["notify"]);
-                self.last_notify = Instant::now();
+                use crate::commands::SpawnQueuedOutcome;
+                match self.command_runner.spawn_queued(&["notify"]) {
+                    SpawnQueuedOutcome::Started => {
+                        self.last_notify = Instant::now();
+                    }
+                    SpawnQueuedOutcome::Queued => {
+                        self.push_toast("⏳ Queued", "notify runs after current command", ToastSeverity::Info);
+                    }
+                    SpawnQueuedOutcome::Deduped => {}
+                }
                 true
             }
             "toolbar:merge" => {
@@ -15523,7 +15584,10 @@ impl CoordApp {
                     }
                 } else if let Some(a) = self.board_selected_failed_assignment() {
                     let id = a.id.clone();
-                    self.command_runner.spawn(&["retry", &id]);
+                    use crate::commands::SpawnQueuedOutcome;
+                    if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&["retry", &id]) {
+                        self.push_toast("⏳ Queued", "retry runs after current command", ToastSeverity::Info);
+                    }
                 } else {
                     self.push_toast(
                         "No failed assignment selected",
@@ -15570,11 +15634,18 @@ impl CoordApp {
                     Some(issue) => {
                         let repo = issue.coord_repo.clone().unwrap();
                         let num_str = issue.number.to_string();
-                        if self.command_runner.spawn(&["ready", &repo, &num_str]) {
-                            self.pipeline_status = Some((
-                                format!("#{}: marking ready", issue.number),
-                                Instant::now(),
-                            ));
+                        use crate::commands::SpawnQueuedOutcome;
+                        match self.command_runner.spawn_queued(&["ready", &repo, &num_str]) {
+                            SpawnQueuedOutcome::Started => {
+                                self.pipeline_status = Some((
+                                    format!("#{}: marking ready", issue.number),
+                                    Instant::now(),
+                                ));
+                            }
+                            SpawnQueuedOutcome::Queued => {
+                                self.push_toast("⏳ Queued", "ready runs after current command", ToastSeverity::Info);
+                            }
+                            SpawnQueuedOutcome::Deduped => {}
                         }
                     }
                 }
@@ -15768,13 +15839,20 @@ impl CoordApp {
                 {
                     self.pending_refine_ready = None;
                     let issue_str = p.issue_number.to_string();
-                    let ready_started =
-                        self.command_runner.spawn(&["ready", &p.repo, &issue_str]);
+                    // Use spawn_queued so `ready` is enqueued if another command
+                    // was queued while this stop was running.  ready_started is
+                    // true for both Started and Queued — it will run eventually.
+                    use crate::commands::SpawnQueuedOutcome;
+                    let ready_outcome = self.command_runner.spawn_queued(&["ready", &p.repo, &issue_str]);
+                    let ready_started = matches!(
+                        ready_outcome,
+                        SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+                    );
                     if !ready_started {
                         self.push_toast(
                             "Refine with chat",
-                            "Couldn't mark ready — coord runner busy.",
-                            ToastSeverity::Warning,
+                            "ready already queued or running — skipping duplicate.",
+                            ToastSeverity::Info,
                         );
                     }
                     // #410: Send path — queue coord assign to run after coord ready.
@@ -17080,7 +17158,7 @@ impl ShellApp for CoordApp {
                         // Board chats: stop the worker, clear chat.
                         if chat_is_board {
                             if let Some(id) = self.watch_focused.clone() {
-                                self.command_runner.spawn(&["stop", &id]);
+                                self.command_runner.spawn_queued(&["stop", &id]);
                             }
                             self.watch_focused = None;
                         }
@@ -17255,7 +17333,10 @@ impl ShellApp for CoordApp {
                 match key {
                     Key::Char('y') | Key::Char('Y') => {
                         if let Some(name) = self.pending_restart.take() {
-                            self.command_runner.spawn(&["agent", "restart", "--machine", &name]);
+                            use crate::commands::SpawnQueuedOutcome;
+                            if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&["agent", "restart", "--machine", &name]) {
+                                self.push_toast("⏳ Queued", "agent restart runs after current command", ToastSeverity::Info);
+                            }
                         }
                     }
                     _ => {
@@ -17345,17 +17426,25 @@ impl ShellApp for CoordApp {
                             args.push("--repo");
                             args.push(&repo);
                         }
-                        self.command_runner.spawn(&args);
+                        use crate::commands::SpawnQueuedOutcome;
                         let scope_str = if scoped {
                             format!(" --repo {}", repo)
                         } else {
                             String::new()
                         };
-                        self.push_toast(
-                            "Force-merge dispatched",
-                            &format!("coord merge --force-merge{} — CI gate bypassed", scope_str),
-                            ToastSeverity::Warning,
-                        );
+                        match self.command_runner.spawn_queued(&args) {
+                            SpawnQueuedOutcome::Started => {
+                                self.push_toast(
+                                    "Force-merge dispatched",
+                                    &format!("coord merge --force-merge{} — CI gate bypassed", scope_str),
+                                    ToastSeverity::Warning,
+                                );
+                            }
+                            SpawnQueuedOutcome::Queued => {
+                                self.push_toast("⏳ Queued", "force-merge runs after current command", ToastSeverity::Info);
+                            }
+                            SpawnQueuedOutcome::Deduped => {}
+                        }
                         self.pending_force_merge = None;
                     }
                     _ => {
@@ -18289,8 +18378,16 @@ impl ShellApp for CoordApp {
                     // now; `coord plan` still exists as a CLI escape
                     // hatch but doesn't earn a keybind.
                     Key::Char('n') => {
-                        self.command_runner.spawn(&["notify"]);
-                        self.last_notify = Instant::now();
+                        use crate::commands::SpawnQueuedOutcome;
+                        match self.command_runner.spawn_queued(&["notify"]) {
+                            SpawnQueuedOutcome::Started => {
+                                self.last_notify = Instant::now();
+                            }
+                            SpawnQueuedOutcome::Queued => {
+                                self.push_toast("⏳ Queued", "notify runs after current command", ToastSeverity::Info);
+                            }
+                            SpawnQueuedOutcome::Deduped => {}
+                        }
                         needs_redraw = true;
                     }
                     Key::Char('m') => {
@@ -18310,7 +18407,10 @@ impl ShellApp for CoordApp {
                     Key::Char('M')
                         if self.merge_blocked_on_review_for_selected_issue() =>
                     {
-                        self.command_runner.spawn(&["merge", "--skip-review"]);
+                        use crate::commands::SpawnQueuedOutcome;
+                        if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&["merge", "--skip-review"]) {
+                            self.push_toast("⏳ Queued", "merge --skip-review runs after current command", ToastSeverity::Info);
+                        }
                         needs_redraw = true;
                     }
                     // ── 1–9 — Test stage: run smoke-test plan step ────────
@@ -18360,9 +18460,12 @@ impl ShellApp for CoordApp {
                                 self.pending_restart = Some(m.name.clone());
                             } else {
                                 let name = m.name.clone();
-                                self.command_runner.spawn(&[
+                                use crate::commands::SpawnQueuedOutcome;
+                                if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&[
                                     "agent", "restart", "--machine", &name,
-                                ]);
+                                ]) {
+                                    self.push_toast("⏳ Queued", "agent restart runs after current command", ToastSeverity::Info);
+                                }
                             }
                             needs_redraw = true;
                         }
@@ -18372,9 +18475,12 @@ impl ShellApp for CoordApp {
                     Key::Char('u') if self.active_view == SidebarView::Machines => {
                         if let Some(m) = self.data.machines.get(self.machine_sel) {
                             let name = m.name.clone();
-                            self.command_runner.spawn(&[
+                            use crate::commands::SpawnQueuedOutcome;
+                            if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&[
                                 "agent", "update", "--machine", &name,
-                            ]);
+                            ]) {
+                                self.push_toast("⏳ Queued", "agent update runs after current command", ToastSeverity::Info);
+                            }
                             needs_redraw = true;
                         }
                     }
@@ -18383,9 +18489,12 @@ impl ShellApp for CoordApp {
                     Key::Char('c') if self.active_view == SidebarView::Machines => {
                         if let Some(m) = self.data.machines.get(self.machine_sel) {
                             let name = m.name.clone();
-                            self.command_runner.spawn(&[
+                            use crate::commands::SpawnQueuedOutcome;
+                            if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&[
                                 "agent", "clean-worktrees", "--machine", &name,
-                            ]);
+                            ]) {
+                                self.push_toast("⏳ Queued", "agent clean-worktrees runs after current command", ToastSeverity::Info);
+                            }
                             needs_redraw = true;
                         }
                     }
@@ -18416,7 +18525,10 @@ impl ShellApp for CoordApp {
                             needs_redraw = true;
                         } else if let Some(a) = self.board_selected_failed_assignment() {
                             let id = a.id.clone();
-                            self.command_runner.spawn(&["retry", &id]);
+                            use crate::commands::SpawnQueuedOutcome;
+                            if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&["retry", &id]) {
+                                self.push_toast("⏳ Queued", "retry runs after current command", ToastSeverity::Info);
+                            }
                             needs_redraw = true;
                         } else {
                             // #249 Principle 2: explain the precondition
