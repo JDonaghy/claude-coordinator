@@ -45,6 +45,16 @@ class Capabilities:
         enforces_deny_list: SAFETY — honours the worker deny-list and tool
             restrictions.  Providers that ignore ``--allowedTools`` / deny
             prompts must set this to ``False`` so the coordinator can warn.
+        billing_mode: How runs of this provider are billed.  One of
+            ``"subscription"`` (covered by a fixed-price plan, e.g.
+            interactive Claude Code on Max/Pro), ``"metered"`` (billed
+            per-token at API rates, e.g. ``claude -p`` after the
+            2026-06-15 metering change), ``"byo_key"`` (uses the
+            operator's own API key — cost is theirs), or ``"unknown"``
+            for backends whose billing the coordinator can't infer.  This
+            is the Track-3 routing signal for the June-15 metering
+            mitigation (#322): the coordinator and TUI prefer a
+            non-metered backend when one is available.
     """
 
     resume: bool
@@ -52,6 +62,7 @@ class Capabilities:
     cost_reporting: bool
     true_system_prompt: bool
     enforces_deny_list: bool
+    billing_mode: str
 
 
 class Provider(ABC):

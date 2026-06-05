@@ -43,13 +43,21 @@ class ClaudeProvider(Provider):
     # ── Capabilities ──────────────────────────────────────────────────────────
 
     def capabilities(self) -> Capabilities:
-        """All capabilities enabled — claude -p is the reference backend."""
+        """All capabilities enabled — claude -p is the reference backend.
+
+        ``billing_mode="metered"`` reflects the 2026-06-15 Anthropic
+        change: ``claude -p`` (and Agent SDK) sessions are billed at full
+        API rates against a small non-rolling credit pool, not against
+        the Max/Pro subscription.  Downstream code uses this flag to
+        prefer a non-metered backend when one is available (#322).
+        """
         return Capabilities(
             resume=True,
             inject=True,
             cost_reporting=True,
             true_system_prompt=True,
             enforces_deny_list=True,
+            billing_mode="metered",
         )
 
     # ── Core methods ──────────────────────────────────────────────────────────
