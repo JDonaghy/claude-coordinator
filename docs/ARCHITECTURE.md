@@ -134,6 +134,24 @@ A story that won't merge — the TUI "Go" does nothing, `coord merge` skips it, 
 
 **Live-on-pull vs needs-release:** the merge/review/auto-loop logic (`merge_queue.py`, `auto_loop.py`, `reconcile.py`, `cli.py`) runs in fresh `coord` CLI invocations, so a `git pull` of the coordinator clone makes fixes live immediately. Only agent-side code (`agent.py` / `agent_app.py`, the long-running `coord agent` service) needs a release + `coord agent update` — see [AGENT_OPERATIONS.md](AGENT_OPERATIONS.md).
 
+## When an issue is sitting in the pipeline you never dispatched
+
+Board vs Pipeline membership is **label-driven, not assignment-driven**. An open issue with *zero* assignments can still show up in the Pipeline — because it carries a `status:ready` label. The lifecycle (defined in `coord/cli.py`'s `refine`/`ready`/`backlog` commands and mirrored in `tui/src/app.rs`) is:
+
+| State | Signal | Where it shows |
+|---|---|---|
+| **Backlog** | `coord` label, **no** `status:*` label, no assignments | Board sidebar |
+| **Refining** | `status:refining` | Board sidebar |
+| **Refined / Ready** | `status:ready`, no assignments | **Pipeline** (a "pending / ready-to-dispatch" card) |
+| **In-progress** | has a `type="work"` assignment | Pipeline |
+| **Done** | merged | Pipeline (Done group) |
+
+So the "ready-but-not-started" state — `coord` + `status:ready`, no work assignment — is a Pipeline card that looks dispatched but isn't. **The refinement chat and new-issue chat flows finalize by flipping `status:refining → status:ready` (via `coord ready`), which silently parks the issue in this limbo.** That's how issues "appear in the pipeline" without anyone dispatching them.
+
+**To drop one back to the Board:** `coord backlog <repo> <issue>` strips `status:refining`/`status:ready`, returning it to unscoped Backlog. It's symmetric with `coord refine` / `coord ready`, and writes through to the local `issues` cache so the TUI reflects it on the next refresh. (The TUI's right-click *Drop to Backlog* fires the same command — #266.)
+
+**Known gap (#359):** refinement/plan-only issues get stranded in the Pipeline this way; the desired fix is for the chat dialogs to route straight to **Plan** or **Work** instead of leaving an issue in the `status:ready` limbo stage.
+
 ## Divergence risk
 
 The CLI and the TUI are peer clients of the same state. They re-implement the same business logic in two languages. There is no compiler check keeping them in sync.
