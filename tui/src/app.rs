@@ -522,6 +522,21 @@ struct TestBuildResult {
     finished_at: Instant,
 }
 
+/// #434: Durable record of a `coord pull-artifact` run.
+///
+/// Stored on `CoordApp.last_artifact_pulls` keyed by `work_id`.  A new
+/// pull for the same work id replaces the prior entry.
+#[derive(Clone)]
+struct ArtifactPullResult {
+    /// Exit code from `coord pull-artifact`.  0 = success.
+    exit_code: i32,
+    /// On success: the local destination path (`~/.coord/artifacts/<repo>/<sanitized>/`).
+    /// On failure: the first meaningful stderr line, or a generic message.
+    message: String,
+    /// When the pull finished, used by the renderer to format an "Xs ago" hint.
+    finished_at: Instant,
+}
+
 /// #349: One step in a generated smoke-test plan.  Parsed from the JSON stored
 /// in `assignments.test_plan` when the DB row is loaded.
 #[derive(Clone, Debug)]
@@ -3876,6 +3891,11 @@ pub struct CoordApp {
     /// Contains `(work_id, repo, sanitized_branch)` so we can show the
     /// destination path in a completion toast.
     pending_artifact_pull: Option<(String, String, String)>,
+    /// #434: Durable record of the last `coord pull-artifact` per work-id.
+    /// Keyed by `work_id`.  Drives the persistent "Last pull: …" line in the
+    /// Pipeline detail panel so the user who missed the 4 s toast can still
+    /// see the result.
+    last_artifact_pulls: std::collections::HashMap<String, ArtifactPullResult>,
     /// #399: Cache for parsed/wrapped log content items.
     ///
     /// Avoids the full O(n) re-parse of every log line on every render tick
@@ -4091,6 +4111,7 @@ impl CoordApp {
             artifact_cache: std::collections::HashMap::new(),
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
+            last_artifact_pulls: std::collections::HashMap::new(),
             log_items_cache: std::cell::RefCell::new(None),
             test_plan_pending: std::collections::HashSet::new(),
             test_plan_staleness_checked_for: None,
@@ -9942,8 +9963,9 @@ impl CoordApp {
         let test_status = self.test_stage_status_for(issue);
         let actionable = self.test_gate_actionable();
         let has_build_record = self.last_test_builds.contains_key(&latest.id);
+        let has_pull_record = self.last_artifact_pulls.contains_key(&latest.id);
         let in_flight = self.test_build_in_flight(&latest.id);
-        if !actionable && !has_build_record && !in_flight {
+        if !actionable && !has_build_record && !has_pull_record && !in_flight {
             return;
         }
 
@@ -10046,6 +10068,25 @@ impl CoordApp {
                 "(not run yet — press B)",
                 Some(Color::rgb(160, 160, 180)),
             ));
+        }
+        // #434: Persistent artifact-pull result — survives the 4 s toast.
+        if let Some(pull) = self.last_artifact_pulls.get(&latest.id) {
+            let ago = pull.finished_at.elapsed().as_secs();
+            if pull.exit_code == 0 {
+                items.push(kv_item(
+                    "  Pull",
+                    &format!("✓ → {} ({}s ago)", pull.message, ago),
+                    Some(Color::rgb(120, 200, 120)),
+                ));
+            } else {
+                let snippet: String = pull.message.chars().take(80).collect();
+                let ellipsis = if pull.message.chars().count() > 80 { "…" } else { "" };
+                items.push(kv_item(
+                    "  Pull",
+                    &format!("✗ exit {} ({}s ago): {}{}", pull.exit_code, ago, snippet, ellipsis),
+                    Some(Color::rgb(220, 100, 100)),
+                ));
+            }
         }
         // #271 part 2 follow-up: surface the PR description and files
         // changed inline when a PR exists.  The worker's PR body is
@@ -10663,6 +10704,26 @@ impl CoordApp {
                     ));
                 }
                 rows.push(kv_item("", "", None));
+            }
+        }
+
+        // ── #434: Artifact-pull result ───────────────────────────────────────
+        if let Some(pull) = self.last_artifact_pulls.get(&work_id) {
+            let ago = pull.finished_at.elapsed().as_secs();
+            if pull.exit_code == 0 {
+                rows.push(kv_item(
+                    "Last pull",
+                    &format!("✓ → {} ({}s ago)", pull.message, ago),
+                    Some(ok_color),
+                ));
+            } else {
+                let snippet: String = pull.message.chars().take(80).collect();
+                let ellipsis = if pull.message.chars().count() > 80 { "…" } else { "" };
+                rows.push(kv_item(
+                    "Last pull",
+                    &format!("✗ exit {} ({}s ago): {}{}", pull.exit_code, ago, snippet, ellipsis),
+                    Some(fail_color),
+                ));
             }
         }
 
@@ -15908,21 +15969,41 @@ impl CoordApp {
                     }
                 }
             }
-            // #336: pull-artifact completion — show the local destination path.
+            // #336 / #434: pull-artifact completion — show the local
+            // destination path and persist a durable record so it survives
+            // the 4-second toast.
             if let Some((work_id, repo, sanitized)) = &self.pending_artifact_pull.clone() {
                 if result.label.contains(&format!("pull-artifact {}", work_id)) {
                     self.pending_artifact_pull = None;
+                    let pull_message: String;
                     if result.exit_code == 0 {
                         let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
                         let path = format!("{home}/.coord/artifacts/{repo}/{sanitized}/");
+                        pull_message = path.clone();
                         self.push_toast(
                             "Artifacts ready",
                             &format!("Saved to {path}"),
                             ToastSeverity::Info,
                         );
+                    } else {
+                        // Generic failure toast already fired from
+                        // command_runner.poll() above — just capture the
+                        // error text for the durable panel line.
+                        pull_message = first_meaningful_stderr_line(&result.stderr)
+                            .unwrap_or_else(|| {
+                                format!("exit {} — no stderr captured", result.exit_code)
+                            });
                     }
-                    // Non-zero exit: the generic failure toast from
-                    // command_runner.poll() above already fired.
+                    // #434: persist the result so it remains visible after
+                    // the toast dismisses.
+                    self.last_artifact_pulls.insert(
+                        work_id.clone(),
+                        ArtifactPullResult {
+                            exit_code: result.exit_code,
+                            message: pull_message,
+                            finished_at: Instant::now(),
+                        },
+                    );
                 }
             }
             // #290 recovery: a coord command just finished.  If this was a
@@ -20070,6 +20151,7 @@ mod tests {
             artifact_cache: std::collections::HashMap::new(),
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
+            last_artifact_pulls: std::collections::HashMap::new(),
             log_items_cache: std::cell::RefCell::new(None),
             test_plan_pending: std::collections::HashSet::new(),
             test_plan_staleness_checked_for: None,
@@ -27843,6 +27925,65 @@ mod tests {
         assert_eq!(repo, "my-repo");
         assert_eq!(sanitized, "issue-42-test");
         assert_eq!(work_id, "work-abc123");
+    }
+
+    // ── #434: ArtifactPullResult persistence ─────────────────────────────────
+
+    #[test]
+    fn last_artifact_pulls_records_success_path() {
+        let mut app = make_app_for_artifact_tests();
+        app.last_artifact_pulls.insert(
+            "work-abc123".to_string(),
+            ArtifactPullResult {
+                exit_code: 0,
+                message: "/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string(),
+                finished_at: Instant::now(),
+            },
+        );
+        let record = app.last_artifact_pulls.get("work-abc123").unwrap();
+        assert_eq!(record.exit_code, 0);
+        assert!(record.message.contains("artifacts/my-repo/issue-42-test/"));
+    }
+
+    #[test]
+    fn last_artifact_pulls_records_failure_message() {
+        let mut app = make_app_for_artifact_tests();
+        app.last_artifact_pulls.insert(
+            "work-abc123".to_string(),
+            ArtifactPullResult {
+                exit_code: 1,
+                message: "rsync: connection refused".to_string(),
+                finished_at: Instant::now(),
+            },
+        );
+        let record = app.last_artifact_pulls.get("work-abc123").unwrap();
+        assert_eq!(record.exit_code, 1);
+        assert_eq!(record.message, "rsync: connection refused");
+    }
+
+    #[test]
+    fn last_artifact_pulls_replaces_prior_entry() {
+        let mut app = make_app_for_artifact_tests();
+        // First pull — failure.
+        app.last_artifact_pulls.insert(
+            "work-abc123".to_string(),
+            ArtifactPullResult {
+                exit_code: 1,
+                message: "connection refused".to_string(),
+                finished_at: Instant::now(),
+            },
+        );
+        // Second pull — success: should overwrite.
+        app.last_artifact_pulls.insert(
+            "work-abc123".to_string(),
+            ArtifactPullResult {
+                exit_code: 0,
+                message: "/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string(),
+                finished_at: Instant::now(),
+            },
+        );
+        let record = app.last_artifact_pulls.get("work-abc123").unwrap();
+        assert_eq!(record.exit_code, 0, "second pull should overwrite first");
     }
 
     // ── #361: maybe_bind_pending_resume type-aware matching ───────────────────
