@@ -20,7 +20,15 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
+
+if TYPE_CHECKING:
+    # Type-only import to give `_spawn_pty` a precise annotation without
+    # eagerly triggering the import cycle (coord.providers.claude_pty imports
+    # from coord.agent at runtime via deferred imports).  Runtime callers
+    # still rely on the `isinstance(provider_obj, ClaudePtyProvider)` guard
+    # in `_spawn` so the attribute access in `_spawn_pty` is safe.
+    from coord.providers.claude_pty import ClaudePtyProvider
 
 
 DEFAULT_STATE_DIR = Path.home() / ".coord"
@@ -71,9 +79,11 @@ _REAP_GRACE_AFTER_RESULT = 30.0  # grace period after result line before SIGTERM
 _REAP_MAX_WAIT = 2 * 60 * 60.0   # absolute max wait (2 hours) — last-resort safety net
 _RESULT_LINE_MARKER = b'"type":"result"'
 # PTY workers (ClaudePtyProvider) never emit stream-json, so the pump thread
-# stamps this sentinel after the subprocess exits.  Must match
+# stamps this sentinel after the subprocess exits.  MUST stay byte-equal to
 # ``coord.providers.claude_pty.PTY_RESULT_MARKER`` (kept as bytes here to
-# avoid a module-level import cycle with coord.providers.claude_pty).
+# avoid a module-level import cycle with coord.providers.claude_pty).  The
+# sync is asserted in ``tests/test_agent_reap.py::
+# test_pty_marker_bytes_sync_with_provider_string``.
 _PTY_RESULT_LINE_MARKER = b"# pty: worker exited"
 
 # First-output (TTFT) watchdog default and the distinct exit code used when it
@@ -1834,7 +1844,7 @@ class AgentServer:
         self,
         assignment: AgentAssignment,
         repo_path: Path,
-        provider: object,
+        provider: "ClaudePtyProvider",
     ) -> None:
         """ADDITIVE PTY spawn path for :class:`ClaudePtyProvider` (#425).
 
@@ -1850,12 +1860,25 @@ class AgentServer:
         process group, captures branch state, and pushes the worker's
         commits.  Logical completion is left to follow-up issue #426; this
         PR only wires the spawn side.
+
+        Note: ``self.bash_wrap_spawn`` (the daemon-spawn stall mitigation
+        for anthropics/claude-code#56268) is **deliberately NOT applied**
+        on the PTY path.  The bash-wrap inserts a transient
+        ``bash -c 'exec <argv>'`` parent, but that only behaves correctly
+        when the child inherits regular pipes from its parent — wrapping
+        an interactive ``claude`` whose stdio is a PTY slave fd breaks the
+        TTY allocation and the worker either fails to start its TUI or
+        loses its line-discipline.  PTY workers are also currently gated
+        to non-mutating spec types (the safety gate in :meth:`assign`
+        refuses write-capable types on any provider whose capabilities
+        report ``enforces_deny_list=False``), so the daemon-spawn stall
+        risk profile is narrower than for ``claude -p`` workers.
         """
         spec = assignment.spec
         # Build the worker argv through the provider seam.  The PTY argv
         # has no -p / stream-json flags — interactive claude reads from
         # the TTY and renders TUI output.
-        argv = provider.build_command(  # type: ignore[attr-defined]
+        argv = provider.build_command(
             spec, resolved_model=spec.model
         )
 
@@ -1882,7 +1905,7 @@ class AgentServer:
         # take precedence over both.
         env = _worker_subprocess_env()
         env.setdefault("TERM", "xterm-256color")
-        env.update(provider.env())  # type: ignore[attr-defined]
+        env.update(provider.env())
 
         try:
             proc = subprocess.Popen(
@@ -1921,7 +1944,7 @@ class AgentServer:
         # the master fd, and stamps the provider's result marker so
         # ``_log_has_result`` in the reap thread sees logical completion.
         log_path = assignment.log_path
-        result_marker = provider.result_marker()  # type: ignore[attr-defined]
+        result_marker = provider.result_marker()
 
         def _pump() -> None:
             try:
@@ -1966,7 +1989,19 @@ class AgentServer:
         # the pump thread.  A 5-second cap means we never block the spawn
         # indefinitely; if no bytes arrive the briefing is still written
         # — the worker will pick it up once its prompt is live.
-        initial_input = provider.initial_input(spec)  # type: ignore[attr-defined]
+        #
+        # KNOWN LIMITATION (deferred to #426): if the interactive `claude`
+        # process exits before the 5-second readiness window (auth failure,
+        # crash, immediate misconfig), ``os.write(master_fd, …)`` here
+        # raises ``OSError`` because the pump thread has already closed
+        # the master fd on EOF.  The failure is logged but the assignment
+        # stays in RUNNING until the reap thread's max-wait timer
+        # (``_REAP_MAX_WAIT`` == 2h) expires.  Until #426 wires a faster
+        # spawn-failure signal, operators may see a PTY assignment hang
+        # for up to two hours on fast-failing workers.  The safety gate
+        # in :meth:`assign` limits PTY workers to non-mutating spec types,
+        # so this is a nuisance rather than a correctness problem.
+        initial_input = provider.initial_input(spec)
         if initial_input:
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
