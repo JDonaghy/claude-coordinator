@@ -18,6 +18,7 @@ from coord.agent import (
     _log_has_result,
     _maybe_bash_wrap,
     _wait_for_proc_or_result,
+    _PTY_RESULT_LINE_MARKER,
     _RESULT_LINE_MARKER,
 )
 
@@ -51,6 +52,27 @@ def test_log_has_result_handles_binary_safe_scan(tmp_path: Path) -> None:
     log = tmp_path / "log"
     log.write_bytes(b'\xff\xfe' + _RESULT_LINE_MARKER + b'\xff')
     assert _log_has_result(str(log))
+
+
+def test_log_has_result_finds_pty_marker(tmp_path: Path) -> None:
+    """The PTY sentinel (stamped after the PTY worker exits) is detected.
+
+    Interactive ``claude`` never emits ``"type":"result"`` stream-json, so
+    the pump thread writes ``_PTY_RESULT_LINE_MARKER`` to the log instead.
+    ``_log_has_result`` must recognise it so the reap-thread grace-period
+    optimisation (force-kill after logical completion) fires for PTY workers
+    the same as for ``claude -p`` workers.
+    """
+    log = tmp_path / "log"
+    log.write_bytes(b"\n" + _PTY_RESULT_LINE_MARKER + b"\n")
+    assert _log_has_result(str(log))
+
+
+def test_log_has_result_pty_marker_absent_returns_false(tmp_path: Path) -> None:
+    """A log with only TTY bytes but no PTY sentinel is not yet complete."""
+    log = tmp_path / "log"
+    log.write_bytes(b"\x1b[1mclaude>\x1b[0m hello\n")
+    assert not _log_has_result(str(log))
 
 
 # ── _wait_for_proc_or_result ─────────────────────────────────────────────────
