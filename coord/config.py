@@ -266,8 +266,12 @@ class ProviderDef:
     ``coordinator.yml``.  All fields except ``type`` are optional.
 
     Attributes:
-        type: Provider backend type (currently only ``"claude"`` is
-            supported).
+        type: Provider backend type.  Currently supported values are
+            ``"claude"`` (legacy ``claude -p`` stream-json worker, the
+            default) and ``"claude-pty"`` (interactive ``claude`` spawned
+            inside a PTY for subscription-billed runs — see #425).  The
+            authoritative list of registered backends is built by
+            :func:`coord.providers.build_provider`.
         binary: Override the worker binary path/name.  ``None`` means the
             provider uses its own default (``"claude"`` for the claude
             backend).
