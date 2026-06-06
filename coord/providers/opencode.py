@@ -92,10 +92,21 @@ class OpenCodeProvider(Provider):
     Args:
         binary: Override the worker binary name/path.  ``None`` falls back to
             :data:`DEFAULT_OPENCODE_BINARY` (``"opencode"``).
+        attach_url: When set, passes ``--attach <attach_url>`` so the worker
+            connects to an already-running OpenCode server instead of starting
+            a new session.  Corresponds to ``ProviderDef.attach_url`` in
+            ``coordinator.yml``.  ``None`` omits the flag (default headless
+            ``opencode run`` starts its own session).
     """
 
-    def __init__(self, binary: str | None = None) -> None:
+    def __init__(
+        self,
+        binary: str | None = None,
+        *,
+        attach_url: str | None = None,
+    ) -> None:
         self._binary = binary
+        self._attach_url = attach_url
 
     # ── Capabilities ──────────────────────────────────────────────────────────
 
@@ -233,6 +244,11 @@ class OpenCodeProvider(Provider):
 
         # ASSUMPTION: subcommand is "run" for non-interactive / headless mode.
         argv: list[str] = [binary, "run"]
+
+        # When attach_url is set, connect to a running OpenCode server instead
+        # of starting a new session.  ASSUMPTION: flag is ``--attach <URL>``.
+        if self._attach_url:
+            argv.extend(["--attach", self._attach_url])
 
         # ASSUMPTION: --model flag selects the AI model by name.
         if effective_model:

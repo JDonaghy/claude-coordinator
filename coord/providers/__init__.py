@@ -77,10 +77,11 @@ def build_provider(
         return ClaudePtyProvider(binary=definition.binary)
     if ptype == "opencode":
         # #325: OpenCode (sst/opencode) worker backend — uses the operator's
-        # own API keys, runs `opencode run BRIEFING`.  Only `binary` is
-        # consumed here; `model` / `env` / `extra_args` threading is left to
-        # the follow-up wiring issue (#324).
-        return OpenCodeProvider(binary=definition.binary)
+        # own API keys, runs `opencode run BRIEFING`.  `attach_url` is wired
+        # here because it is OpenCode-specific (not a cross-provider concern).
+        # `model` / `env` / `extra_args` threading is left to the follow-up
+        # wiring issue (#324).
+        return OpenCodeProvider(binary=definition.binary, attach_url=definition.attach_url)
     raise ValueError(
         f"Unknown provider type {ptype!r} (provider name: {name!r}). "
         f"Supported types: ['claude', 'claude-pty', 'opencode']"
