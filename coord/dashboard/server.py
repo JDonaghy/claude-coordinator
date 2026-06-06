@@ -294,7 +294,10 @@ def build_app(config: Config) -> Starlette:
                 assignment_id = response.get("id", "pending")
                 if repo:
                     record_dispatched(
-                        assignment_id=assignment_id, proposal=p, repo_github=repo.github,
+                        assignment_id=assignment_id,
+                        proposal=p,
+                        repo_github=repo.github,
+                        provider_name=response.get("_provider_name"),
                     )
                 do_not_touch = compute_do_not_touch(p, peers=selected, in_flight=in_flight)
                 try:

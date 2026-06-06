@@ -1507,9 +1507,10 @@ class AgentServer:
         """Inject a new user message into a running worker via its stdin.
 
         Raises :class:`KeyError` when the assignment doesn't exist on this
-        agent, :class:`RuntimeError` when the worker isn't running, and
-        :class:`BrokenPipeError` when the worker closed its stdin (e.g.
-        already finished or crashed).
+        agent, :class:`RuntimeError` when the worker isn't running or when the
+        assignment's provider does not support message injection
+        (``capabilities().inject=False``), and :class:`BrokenPipeError` when
+        the worker closed its stdin (e.g. already finished or crashed).
 
         The worker picks up the message at its next turn boundary — between
         tool calls, not mid-tool.  Each injection appends a `# inject:`
@@ -1523,6 +1524,18 @@ class AgentServer:
                 raise RuntimeError(
                     f"assignment {assignment_id} is {assignment.status!r}, not running"
                 )
+            # #324: capability gate — refuse injection when the provider
+            # reports capabilities().inject=False.  A provider without stdin-
+            # injection support (e.g. a PTY-only backend) must opt out here so
+            # callers get a clear error rather than silently writing bytes to an
+            # stdin pipe that the provider may not even expose.
+            spec = assignment.spec
+            if spec.provider is not None and spec.provider in self._providers:
+                if not self._providers[spec.provider].capabilities().inject:
+                    raise RuntimeError(
+                        f"provider {spec.provider!r} does not support message injection "
+                        f"(capabilities().inject=False)"
+                    )
             proc = self._processes.get(assignment_id)
         if proc is None or proc.stdin is None or proc.poll() is not None:
             raise BrokenPipeError(
@@ -1886,6 +1899,15 @@ class AgentServer:
         # spawn — only the immediate parent of claude changes.
         spawn_argv = _maybe_bash_wrap(argv, self.bash_wrap_spawn)
 
+        # #324: Merge provider.env() on top of the base worker env.  The PTY
+        # path (_spawn_pty) does the equivalent at its own Popen site; both
+        # paths must stay in sync.  For the legacy / no-provider path,
+        # env() is effectively {} so the result is identical to calling
+        # _worker_subprocess_env() directly (no-config parity preserved).
+        _spawn_env = _worker_subprocess_env()
+        if spec.provider is not None and spec.provider in self._providers:
+            _spawn_env.update(self._providers[spec.provider].env())
+
         try:
             proc = subprocess.Popen(
                 spawn_argv,
@@ -1897,7 +1919,7 @@ class AgentServer:
                 # #402: strip the agent's own venv from the worker's PATH so a
                 # worker's `pip install -e .` can't clobber the agent's runtime
                 # venv from a soon-to-be-reaped worktree.
-                env=_worker_subprocess_env(),
+                env=_spawn_env,
             )
         except (FileNotFoundError, OSError) as e:
             log_fh.write(f"\n# spawn failed: {e}\n")
@@ -2239,11 +2261,56 @@ class AgentServer:
         log_fh,
         log_path: str,
     ) -> None:
+        # #324: Resolve the provider for this assignment so _wait_for_proc_or_result
+        # uses provider.result_marker() and the session-id parse below uses
+        # provider.parse_log().  Look up BEFORE the wait so the marker check
+        # uses the right sentinel from the start.  For ClaudeProvider these
+        # calls delegate to the same functions used previously — behavior is
+        # byte-identical; the seam is now complete for future providers.
+        with self._lock:
+            _reap_start = self._assignments.get(assignment_id)
+        _reap_provider = None
+        if _reap_start is not None:
+            _rp_name = _reap_start.spec.provider
+            if _rp_name is not None and _rp_name in self._providers:
+                _reap_provider = self._providers[_rp_name]
+
+        # Build a log_has_result callable from the provider's result_marker.
+        # When the provider's marker matches the built-in default we reuse
+        # _log_has_result (which adds per-line JSON validation to avoid false
+        # positives).  A provider with a different marker gets a simple byte-
+        # substring check that also recognises the PTY sentinel so PTY-spawned
+        # assignments are reaped correctly regardless of provider.
+        if _reap_provider is not None:
+            _marker_bytes = _reap_provider.result_marker().encode()
+            if _marker_bytes == _RESULT_LINE_MARKER:
+                # Default marker — reuse the JSON-validating checker.
+                _log_has_result_fn = _log_has_result
+            else:
+                # Non-default marker — plain substring check per line.
+                def _log_has_result_fn(  # type: ignore[misc]
+                    lp: str, *, _m: bytes = _marker_bytes
+                ) -> bool:
+                    try:
+                        with open(lp, "rb") as _f:
+                            for _line in _f:
+                                if _line.lstrip().startswith(_PTY_RESULT_LINE_MARKER):
+                                    return True
+                                if _m in _line:
+                                    return True
+                        return False
+                    except OSError:
+                        return False
+        else:
+            _log_has_result_fn = _log_has_result
+
         # Use a polling wait that handles claude-cli's well-known habit of
         # not exiting after emitting its final result event (a child of the
         # process group keeps the session alive). See #228.
         exit_code = _wait_for_proc_or_result(
-            proc, log_path, first_output_timeout=self.first_output_timeout
+            proc, log_path,
+            first_output_timeout=self.first_output_timeout,
+            log_has_result=_log_has_result_fn,
         )
         log_fh.close()
 
@@ -2317,17 +2384,30 @@ class AgentServer:
                 assignment.status = DONE if exit_code == 0 else FAILED
             self._processes.pop(assignment_id, None)
 
-        # #315: parse the log for the worker's claude session_id (from the
+        # #315/#324: parse the log for the worker's claude session_id (from the
         # `system.init` event emitted by `claude -p --output-format stream-json`).
         # Done OUTSIDE the lock so the log parse (I/O + JSON) doesn't stall
         # other threads; the field write is the only mutation, and assignment
         # objects are only dropped under the lock so the reference is safe.
+        # #324: route through provider.parse_log() when a provider is registered
+        # so future providers can customise log parsing.  ClaudeProvider delegates
+        # to coord.worker_events.parse_log — byte-identical to the old path.
         if assignment is not None and assignment.claude_session_id is None:
             try:
-                from coord.worker_events import is_stream_json, parse_log  # noqa: PLC0415
+                from coord.worker_events import is_stream_json  # noqa: PLC0415
                 lp = assignment.log_path
                 if lp and is_stream_json(lp):
-                    summary = parse_log(lp, tail_bytes=0)
+                    _parse_provider_name = assignment.spec.provider
+                    if (
+                        _parse_provider_name is not None
+                        and _parse_provider_name in self._providers
+                    ):
+                        summary = self._providers[_parse_provider_name].parse_log(
+                            lp, tail_bytes=0
+                        )
+                    else:
+                        from coord.worker_events import parse_log  # noqa: PLC0415
+                        summary = parse_log(lp, tail_bytes=0)
                     if summary.session_id:
                         assignment.claude_session_id = summary.session_id
             except Exception:  # noqa: BLE001
