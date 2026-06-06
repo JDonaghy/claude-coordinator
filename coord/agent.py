@@ -1364,15 +1364,18 @@ class AgentServer:
                     f"pull_repos references repos with no repo_path on this agent: {unknown}"
                 )
 
-        # #425 safety gate: refuse write-capable assignment types on any
-        # provider that does NOT enforce the deny-list.  Non-mutating
-        # types (plan / refinement / test-chat / new-issue-chat) may still
-        # use unverified providers because they can't push code or open
-        # PRs.  When ``spec.provider`` is None or unknown, this gate is a
-        # no-op and the default ``claude -p`` path runs unchanged.
+        # #425/#324 capability gates: only run when spec.provider names a
+        # provider in this agent's registry.  When spec.provider is None or
+        # unknown, both gates are no-ops and the default ``claude -p`` path
+        # runs unchanged (no-config parity requirement, #324).
         if spec.provider is not None and spec.provider in self._providers:
             provider_obj = self._providers[spec.provider]
             caps = provider_obj.capabilities()  # type: ignore[attr-defined]
+
+            # Safety gate (#425): refuse write-capable assignment types on any
+            # provider that does NOT enforce the deny-list.  Non-mutating
+            # types (plan / refinement / test-chat / new-issue-chat) may still
+            # use unverified providers because they can't push code or open PRs.
             if (
                 not caps.enforces_deny_list
                 and spec.type in WRITE_CAPABLE_SPEC_TYPES
@@ -1386,6 +1389,21 @@ class AgentServer:
                     "non-mutating type (plan, refinement, test-chat, "
                     "new-issue-chat) or switch to a provider that enforces "
                     "the deny-list (e.g. 'claude')."
+                )
+
+            # Resume gate (#324): refuse session-resume when the provider
+            # doesn't support the --resume flag.  A provider with
+            # capabilities().resume=False has no concept of session continuity;
+            # passing resume_session_id would be silently ignored, misleading
+            # the coordinator into thinking the worker loaded the prior context.
+            if spec.resume_session_id and not caps.resume:
+                raise ValueError(
+                    f"refusing to resume session {spec.resume_session_id!r} "
+                    f"on provider {spec.provider!r}: "
+                    "capabilities().resume=False — this provider does not "
+                    "support session resume via --resume.  Use a provider "
+                    "with resume=True (e.g. 'claude') or dispatch without "
+                    "resume_session_id."
                 )
 
         assignment = AgentAssignment(
@@ -1795,11 +1813,17 @@ class AgentServer:
         self._persist()
 
     def _spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
-        # #425: ADDITIVE PTY branch — when the assignment names a provider
-        # in the agent's registry AND that provider is the PTY type, route
-        # to :meth:`_spawn_pty`.  In every other case the legacy code path
-        # below runs unchanged (byte-for-byte) so no-config behaviour is
-        # identical to pre-#425.
+        # #324/#425: provider-layer routing.
+        #
+        # When the assignment names a provider in this agent's registry, route
+        # through the provider seam:
+        #   - PTY providers → background thread via ``_spawn_pty``.
+        #   - All other providers (e.g. ClaudeProvider) → ``build_command``
+        #     and ``initial_input`` instead of the legacy helpers.
+        #
+        # When spec.provider is None OR the name is not in the registry, the
+        # legacy code path below runs **unchanged** (byte-for-byte identical to
+        # pre-#324) so no-config deployments are not affected.
         spec = assignment.spec
         if spec.provider is not None and spec.provider in self._providers:
             # Deferred import keeps the cycle latent at module load time.
@@ -1827,7 +1851,24 @@ class AgentServer:
                 thread.start()
                 return
 
-        argv = self.worker_command(assignment.spec)
+            # #324: Non-PTY provider path (e.g. ClaudeProvider).
+            # Use the provider seam for both argv and initial stdin.
+            # ``ClaudeProvider.build_command(spec)`` produces the same argv as
+            # ``default_worker_command(spec)`` (parity enforced by test_providers.py),
+            # so the agent output is byte-for-byte identical when the provider
+            # is a ClaudeProvider.
+            argv: list[str] = provider_obj.build_command(  # type: ignore[attr-defined]
+                spec, resolved_model=spec.model
+            )
+            initial_input: bytes = provider_obj.initial_input(spec)  # type: ignore[attr-defined]
+        else:
+            # Legacy / no-config path — byte-identical to pre-#324.  Used
+            # whenever spec.provider is None or not in the registry so that
+            # deployments without a providers block in coordinator.yml are
+            # completely unaffected by this change.
+            argv = self.worker_command(assignment.spec)
+            initial_input = _user_message_line(assignment.spec.briefing)
+
         log_fh = open(assignment.log_path, "a")  # noqa: SIM115 — handle closed in _reap
 
         argv_oneline = shlex.join(argv).replace("\n", "\\n")
@@ -1876,9 +1917,13 @@ class AgentServer:
         # initial briefing; for a --resume re-dispatch (`spec.resume_session_id`
         # set) it is the next user turn written into the restored conversation.
         # Either way the worker sees it as a stream-json user message.
+        #
+        # #324: ``initial_input`` is either from ``provider.initial_input(spec)``
+        # (provider path) or ``_user_message_line(spec.briefing)`` (legacy path).
+        # Both produce the same bytes for ClaudeProvider — parity maintained.
         try:
             assert proc.stdin is not None
-            proc.stdin.write(_user_message_line(assignment.spec.briefing))
+            proc.stdin.write(initial_input)
             proc.stdin.flush()
         except (BrokenPipeError, OSError) as e:
             log_fh.write(f"\n# failed to send initial briefing: {e}\n")

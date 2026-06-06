@@ -255,6 +255,11 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # below.
         "ALTER TABLE issues ADD COLUMN milestone_number INTEGER",
         "ALTER TABLE issues ADD COLUMN milestone_title TEXT",
+        # #324: resolved provider name recorded at dispatch time so the TUI
+        # can surface it in the assignment detail panel (#327).  NULL for rows
+        # dispatched before #324 landed; the TUI shows "claude" as the
+        # implicit default when the column is NULL.
+        "ALTER TABLE assignments ADD COLUMN provider_name TEXT",
     ]
     for sql in migrations:
         try:
