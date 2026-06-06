@@ -12475,12 +12475,13 @@ impl CoordApp {
         } else if self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal
         {
-            // #440: Pipeline detail Terminal tab — same F12 model as the
-            // standalone pane but scoped to the selected issue's session.
+            // #440/#446: Pipeline detail Terminal tab — same F12 model as
+            // the standalone pane but scoped to the selected issue's session.
+            // `s` (released only) launches a remote ssh+tmux claude session.
             if self.detail_terminal_focused {
                 " PTY focused — F12 = release  (typed keys go to the shell) ".to_string()
             } else {
-                " PTY released — F12 = focus  ·  j/k=nav  h/l=tabs  q=quit ".to_string()
+                " PTY released — F12 = focus  ·  s = remote session  ·  j/k=nav  h/l=tabs  q=quit ".to_string()
             }
         } else if self.active_view == SidebarView::Machines {
             // Machines panel action hints.
@@ -17104,6 +17105,125 @@ impl CoordApp {
         true
     }
 
+    /// Resolve the ssh hostname for a remote session on the given issue (#446).
+    ///
+    /// Resolution order:
+    /// 1. A **running** assignment for this issue → use that machine's host.
+    /// 2. Any assignment for this issue (done / failed / pending) → fall back
+    ///    to its machine's host (reattach to the tmux session).
+    /// 3. First machine in `data.machines` whose `repos` list contains the
+    ///    issue's coord-local repo name.
+    /// 4. No match → `None` (caller shows an error toast).
+    fn remote_session_host_for_issue(&self, issue_num: u64) -> Option<String> {
+        // Steps 1 & 2: find the most relevant assignment for this issue.
+        // Prefer running over any other status by scoring running=1, rest=0.
+        let machine_name = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num)
+            .max_by_key(|a| if a.status == "running" { 1u8 } else { 0u8 })
+            .map(|a| a.machine.clone());
+
+        if let Some(name) = machine_name {
+            if let Some(m) = self.data.machines.iter().find(|m| m.name == name) {
+                if !m.host.is_empty() {
+                    return Some(m.host.clone());
+                }
+            }
+        }
+
+        // Step 3: fall back to the first machine that lists the issue's repo.
+        let coord_repo = self
+            .pipeline_issues
+            .iter()
+            .find(|iss| iss.number == issue_num)
+            .and_then(|iss| iss.coord_repo.clone());
+
+        if let Some(repo) = coord_repo {
+            for m in &self.data.machines {
+                if !m.host.is_empty() && m.repos.iter().any(|r| r == &repo) {
+                    return Some(m.host.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Launch a remote human-attended `claude` session over ssh + tmux (#446).
+    ///
+    /// # What this does
+    ///
+    /// 1. Resolves the target host via [`remote_session_host_for_issue`].
+    /// 2. Kills any existing PTY for this issue (replaced by drop when we
+    ///    `insert` the new session).
+    /// 3. Spawns a local shell session (`TerminalSession::spawn`) using the
+    ///    same path as the lazy-spawn in `drive_detail_terminals`.
+    /// 4. Auto-runs the ssh+tmux launch line (with trailing `\r`).
+    ///    `tmux new-session -A -s coord-issue-N` reattaches to an existing
+    ///    tmux session if one is already running — closing/reopening the tab
+    ///    is safe.  `~/.local/bin/claude` is the absolute path because
+    ///    `claude` is NOT on the bash `PATH` over ssh (only zsh sources it).
+    /// 5. Pre-fills a one-liner kick-off prompt **without a trailing `\r`** —
+    ///    the human presses Enter to submit.  This is non-negotiable for ToS
+    ///    compliance (§3.7 / #437): the TUI hosts an attended session, it does
+    ///    not auto-submit instructions to the AI.
+    /// 6. Auto-focuses the PTY so the human can interact immediately.
+    fn launch_remote_session_for_selected_issue(&mut self) {
+        let Some(issue_num) = self.selected_issue_number() else {
+            return;
+        };
+
+        let Some(host) = self.remote_session_host_for_issue(issue_num) else {
+            self.pipeline_status = Some((
+                "No machine found for this issue — cannot launch remote session".to_string(),
+                Instant::now(),
+            ));
+            return;
+        };
+
+        let (cols, rows) = self
+            .detail_terminal_pending_dims
+            .get()
+            .unwrap_or((80, 24));
+        let cwd = self.detail_terminal_cwd(issue_num);
+        let shell = quadraui::terminal_engine::default_shell();
+
+        match quadraui::terminal_engine::TerminalSession::spawn(
+            cols.max(20),
+            rows.max(5),
+            &shell,
+            &cwd,
+            10_000,
+        ) {
+            Ok(mut sess) => {
+                // Auto-run the launcher line.  `tmux new-session -A` reattaches
+                // to an existing `coord-issue-N` session instead of creating a
+                // second one, so pressing `s` again is safe while a session is
+                // still running on the remote machine.
+                let launch_line = build_remote_launch_cmd(&host, issue_num);
+                sess.send_str(&launch_line);
+
+                // Pre-fill (NO trailing \r) — human reviews and presses Enter.
+                // ToS boundary: we NEVER auto-submit instructions to claude.
+                let kickoff = build_remote_kickoff_prompt(issue_num);
+                sess.send_str(&kickoff);
+
+                // Replace any existing session (the old one is dropped here).
+                self.detail_terminal_sessions.insert(issue_num, sess);
+                self.detail_terminal_spawn_errors.remove(&issue_num);
+
+                // Auto-focus so the user can type immediately.
+                self.detail_terminal_focused = true;
+            }
+            Err(e) => {
+                self.detail_terminal_spawn_errors
+                    .insert(issue_num, e.to_string());
+            }
+        }
+    }
+
     /// Render the Pipeline detail Terminal tab for the selected issue (#440).
     ///
     /// Called from `render_content` when `pipeline_detail_tab ==
@@ -17180,6 +17300,43 @@ impl CoordApp {
             );
         }
     }
+}
+
+// ── #446: Remote session command builders ─────────────────────────────────────
+
+/// Build the ssh+tmux launch line that auto-runs when the user presses `s`
+/// in the Pipeline detail Terminal tab.
+///
+/// The trailing `\r` is intentional — it auto-submits the line so the ssh
+/// connection starts immediately.  Only the *launcher* is auto-run; the
+/// claude kick-off prompt (see [`build_remote_kickoff_prompt`]) is
+/// pre-filled without `\r` so the human reviews it before pressing Enter.
+///
+/// `~/.local/bin/claude` is an absolute path because `claude` is NOT on the
+/// bash PATH over ssh (zsh login shells load `~/.zshrc` which sets it up,
+/// but `ssh -t host "cmd"` uses a non-login bash).
+///
+/// `tmux new-session -A -s coord-issue-<N>` reattaches to an existing tmux
+/// session with that name if one already exists, so re-pressing `s` (or
+/// closing/reopening the Terminal tab) reattaches cleanly instead of
+/// spawning a second `claude` process.
+fn build_remote_launch_cmd(host: &str, issue_num: u64) -> String {
+    format!(
+        "ssh -t {} \"tmux new-session -A -s coord-issue-{} '~/.local/bin/claude'\"\r",
+        host, issue_num,
+    )
+}
+
+/// Build the one-liner kick-off prompt that is pre-filled (but NOT
+/// auto-submitted) into the remote claude session (#446).
+///
+/// The human reads the pre-filled text and presses Enter to start.  This
+/// keeps the session human-attended and ToS-compliant (§3.7 / #437).
+/// The string intentionally has no trailing `\r` or `\n`.
+fn build_remote_kickoff_prompt(issue_num: u64) -> String {
+    format!(
+        "Work on issue #{issue_num}: read it with `gh issue view {issue_num}`, then get started and ask me questions as you go."
+    )
 }
 
 /// Convert a `Key` + `Modifiers` pair to the byte sequence sent to a
@@ -17828,6 +17985,10 @@ impl ShellApp for CoordApp {
         //       chrome (tab switching, view nav) is INACTIVE.
         //     * When unfocused, keys flow through to normal dispatch.
         //   - Outside this condition this block is a no-op.
+        //
+        // #446 addition (PTY released only):
+        //   * `s` launches a remote human-attended `claude` session over
+        //     ssh + tmux and auto-focuses the PTY.
         if self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal
         {
@@ -17842,6 +18003,17 @@ impl ShellApp for CoordApp {
                 }
                 if self.detail_terminal_focused {
                     let _ = self.forward_key_to_detail_terminal(key, modifiers);
+                    return Reaction::Redraw;
+                }
+                // ── #446: `s` = launch remote ssh+tmux claude session ──────
+                // Only fires when the PTY is *released* (not focused), so the
+                // letter 's' still reaches the remote shell when in PTY mode.
+                if matches!(key, Key::Char('s'))
+                    && !modifiers.ctrl
+                    && !modifiers.alt
+                    && !modifiers.shift
+                {
+                    self.launch_remote_session_for_selected_issue();
                     return Reaction::Redraw;
                 }
             }
@@ -30085,5 +30257,202 @@ mod tests {
             .get_mut(&440)
             .unwrap()
             .write_input(b"exit\r");
+    }
+
+    // ── #446: remote session command builders ─────────────────────────────────
+
+    #[test]
+    fn build_remote_launch_cmd_contains_host_and_issue() {
+        let cmd = build_remote_launch_cmd("precision.tailnet.ts.net", 446);
+        assert!(
+            cmd.contains("precision.tailnet.ts.net"),
+            "command must contain the target host"
+        );
+        assert!(
+            cmd.contains("coord-issue-446"),
+            "tmux session name must embed the issue number"
+        );
+        assert!(
+            cmd.contains("~/.local/bin/claude"),
+            "must use absolute path to claude (not bare 'claude' which isn't on bash PATH over ssh)"
+        );
+        assert!(
+            cmd.contains("tmux new-session -A"),
+            "must use -A flag so reconnecting reattaches instead of spawning a second claude"
+        );
+        assert!(
+            cmd.ends_with('\r'),
+            "launch line must end with \\r to auto-run (only the launcher, not the kickoff prompt)"
+        );
+    }
+
+    #[test]
+    fn build_remote_launch_cmd_ssh_dash_t_flag() {
+        // ssh -t allocates a PTY on the remote side, required for an
+        // interactive tmux session.
+        let cmd = build_remote_launch_cmd("myhost", 123);
+        assert!(
+            cmd.contains("ssh -t "),
+            "must pass -t to ssh so tmux gets a PTY"
+        );
+    }
+
+    #[test]
+    fn build_remote_kickoff_prompt_no_trailing_cr() {
+        let prompt = build_remote_kickoff_prompt(446);
+        assert!(
+            !prompt.ends_with('\r'),
+            "kickoff prompt must NOT end with \\r — the human presses Enter (ToS §3.7)"
+        );
+        assert!(
+            !prompt.ends_with('\n'),
+            "kickoff prompt must NOT end with \\n"
+        );
+        assert!(
+            prompt.contains("446"),
+            "kickoff prompt must reference the issue number"
+        );
+        assert!(
+            prompt.contains("gh issue view"),
+            "kickoff prompt should guide claude to read the issue"
+        );
+    }
+
+    #[test]
+    fn build_remote_kickoff_prompt_references_issue_number() {
+        // Parameterised: each issue number is embedded in the prompt.
+        for &n in &[1u64, 99, 446, 1000] {
+            let p = build_remote_kickoff_prompt(n);
+            assert!(
+                p.contains(&n.to_string()),
+                "prompt for issue #{n} must contain the number"
+            );
+        }
+    }
+
+    // ── #446: remote_session_host_for_issue ───────────────────────────────────
+
+    fn make_machine(name: &str, host: &str, repos: Vec<&str>) -> Machine {
+        Machine {
+            name: name.to_string(),
+            host: host.to_string(),
+            reachable: true,
+            active_count: 0,
+            repos: repos.into_iter().map(|s| s.to_string()).collect(),
+            version: None,
+            worktree_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn remote_session_host_from_running_assignment() {
+        // A running assignment for issue 123 on "precision" → host returned.
+        let mut a = make_assignment_typed("running", 123, "my-repo", Some("work"));
+        a.machine = "precision".to_string();
+        let mut app = make_test_app(BoardData {
+            assignments: vec![a],
+            machines: vec![make_machine("precision", "precision.tailnet.ts.net", vec!["my-repo"])],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 123,
+            title: "test".to_string(),
+            body: String::new(),
+            repo_slug: "owner/my-repo".to_string(),
+            coord_repo: Some("my-repo".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        assert_eq!(
+            app.remote_session_host_for_issue(123),
+            Some("precision.tailnet.ts.net".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_session_host_prefers_running_over_done() {
+        // Two assignments for the same issue: done on machine-a, running on
+        // machine-b.  The running assignment's host must be preferred.
+        let mut done_a = make_assignment_typed("done", 55, "repo", Some("work"));
+        done_a.machine = "machine-a".to_string();
+        let mut run_b = make_assignment_typed("running", 55, "repo", Some("review"));
+        run_b.machine = "machine-b".to_string();
+        let app = make_test_app(BoardData {
+            assignments: vec![done_a, run_b],
+            machines: vec![
+                make_machine("machine-a", "host-a.ts.net", vec!["repo"]),
+                make_machine("machine-b", "host-b.ts.net", vec!["repo"]),
+            ],
+            ..BoardData::default()
+        });
+        assert_eq!(
+            app.remote_session_host_for_issue(55),
+            Some("host-b.ts.net".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_session_host_fallback_to_machine_repos() {
+        // No assignment exists, but a machine lists the issue's coord-repo.
+        let app = make_test_app(BoardData {
+            assignments: vec![],
+            machines: vec![make_machine("worker", "worker.ts.net", vec!["target-repo"])],
+            ..BoardData::default()
+        });
+        // Simulate pipeline_issues with a coord_repo match.
+        let mut app = app;
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 77,
+            title: "fallback test".to_string(),
+            body: String::new(),
+            repo_slug: "org/target-repo".to_string(),
+            coord_repo: Some("target-repo".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        assert_eq!(
+            app.remote_session_host_for_issue(77),
+            Some("worker.ts.net".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_session_host_none_when_no_match() {
+        // No assignment, no machine with matching repo → None.
+        let mut app = make_test_app(BoardData {
+            assignments: vec![],
+            machines: vec![make_machine("other", "other.ts.net", vec!["unrelated-repo"])],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 99,
+            title: "orphan".to_string(),
+            body: String::new(),
+            repo_slug: "org/no-match".to_string(),
+            coord_repo: Some("my-repo".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        assert_eq!(app.remote_session_host_for_issue(99), None);
+    }
+
+    #[test]
+    fn remote_session_host_skips_empty_host() {
+        // Machine exists with a matching repo but has an empty host string
+        // (e.g. local machine entry) → must not be returned.
+        let mut a = make_assignment_typed("running", 10, "repo", Some("work"));
+        a.machine = "localbox".to_string();
+        let app = make_test_app(BoardData {
+            assignments: vec![a],
+            machines: vec![make_machine("localbox", "", vec!["repo"])],
+            ..BoardData::default()
+        });
+        // No other machine → None.
+        assert_eq!(app.remote_session_host_for_issue(10), None);
     }
 }
