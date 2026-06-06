@@ -61,7 +61,6 @@ __all__ = ["launch_human_attended_interactive"]
 # dropped (verified live against interactive ``claude``).
 _READY_QUIESCE_S = 0.8
 _READY_QUIESCE_CAP_S = 8.0
-_READY_DEADLINE_S = 5.0
 
 
 def launch_human_attended_interactive(
@@ -153,6 +152,11 @@ def launch_human_attended_interactive(
     prefilled = not bool(paste_block)
     started = time.monotonic()
     last_master_activity = started
+    # Capture the raw wait-status from the WNOHANG poll so that if the
+    # child is already reaped when we reach the post-loop waitpid we can
+    # still extract the correct exit code (see ChildProcessError handler
+    # below).
+    _reaped_status: int | None = None
 
     try:
         while True:
@@ -206,7 +210,7 @@ def launch_human_attended_interactive(
 
             # Poll child status without blocking.
             try:
-                done_pid, _status = os.waitpid(pid, os.WNOHANG)
+                done_pid, _reaped_status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
                 break
             if done_pid != 0:
@@ -241,6 +245,15 @@ def launch_human_attended_interactive(
     try:
         _, status = os.waitpid(pid, 0)
     except ChildProcessError:
+        # The zombie was already reaped by the WNOHANG poll inside the
+        # relay loop.  Use the status captured there so non-zero exit
+        # codes are correctly propagated (without this fix the function
+        # would always return 0 for the normal-exit path).
+        if _reaped_status is not None:
+            if os.WIFEXITED(_reaped_status):
+                return os.WEXITSTATUS(_reaped_status)
+            if os.WIFSIGNALED(_reaped_status):
+                return 128 + os.WTERMSIG(_reaped_status)
         return 0
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status)

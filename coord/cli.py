@@ -1933,10 +1933,13 @@ def assign(
         provider = ClaudePtyProvider()
         caps = provider.capabilities()
         # Structural guard: confirm we wired the right backend.
-        assert caps.human_attended_only is True, (
-            "BUG: --interactive resolved a provider whose capabilities do "
-            "NOT report human_attended_only=True; refusing to launch."
-        )
+        # Use RuntimeError (not assert) so this is never silently removed
+        # when Python runs with -O.
+        if not caps.human_attended_only:
+            raise RuntimeError(
+                "BUG: --interactive resolved a provider whose capabilities do "
+                "NOT report human_attended_only=True; refusing to launch."
+            )
 
         repo_path = machine_obj.repo_path(repo) or str(
             Path.cwd()

@@ -321,8 +321,14 @@ def test_dispatch_refuses_human_attended_repo_override() -> None:
         dispatch(proposal, cfg)
 
 
-def test_dispatch_review_refuses_human_attended(monkeypatch) -> None:
-    """coord.review.dispatch_review refuses on a human-attended repo override."""
+def test_dispatch_review_refuses_human_attended(monkeypatch, capsys) -> None:
+    """dispatch_review returns None (and prints a warning) on a human-attended repo.
+
+    The function must NOT raise ValueError — callers (notify.py, reconcile.py)
+    only check for a None return value and would crash if a ValueError escaped.
+    Returning None leaves review_state as 'pending' so the next notify call
+    retries, consistent with how _reassign handles the same guard.
+    """
     from coord.review import dispatch_review
     from coord.models import Assignment, Board
 
@@ -344,8 +350,12 @@ def test_dispatch_review_refuses_human_attended(monkeypatch) -> None:
         branch="issue-42-test",
         type="work",
     )
-    with pytest.raises(ValueError, match="human_attended_only=True"):
-        dispatch_review(completed, board, cfg)
+    result = dispatch_review(completed, board, cfg)
+    assert result is None, "dispatch_review must return None for human-attended providers"
+    captured = capsys.readouterr()
+    assert "human_attended_only=True" in captured.out, (
+        "Expected a warning mentioning human_attended_only=True in stdout"
+    )
 
 
 def test_reassign_refuses_human_attended() -> None:
