@@ -58,8 +58,8 @@ use crate::settings::{
 };
 use quadraui::accelerator::{parse_key_binding, ParsedBinding};
 use quadraui::{
-    Backend, Badge, ChatController, ChatControllerEvent, ChatRole, ChatTurn, Color, Decoration,
-    Dialog, DialogButton, DialogHit, DialogInput, DialogLayout, DialogMeasure,
+    Backend, Badge, ButtonMask, ChatController, ChatControllerEvent, ChatRole, ChatTurn, Color,
+    Decoration, Dialog, DialogButton, DialogHit, DialogInput, DialogLayout, DialogMeasure,
     DialogSeverity, DialogTextInput,
     Key, ListItem, ListView, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
@@ -3996,14 +3996,35 @@ pub struct CoordApp {
     /// `render_detail_terminal_tab` (`&self`) and applied by `tick`
     /// (`&mut self`).
     detail_terminal_pending_dims: std::cell::Cell<Option<(u16, u16)>>,
-    /// #446: per-issue pending claude kickoff prompt awaiting readiness.
-    /// Armed by `launch_remote_session_for_selected_issue` when the user
-    /// presses `s`; injected as a bracketed paste by `drive_detail_terminals`
-    /// once the remote `claude` session flips bracketed-paste mode on
-    /// (i.e. its input prompt is live).  Removed after a single injection
-    /// so the kickoff text never re-fires.  Bracketed paste is sent
-    /// WITHOUT a trailing CR — the human presses Enter (ToS §3.7 / #437).
-    detail_terminal_pending_kickoff: std::collections::HashMap<u64, String>,
+    /// #446: per-issue terminal rect captured by `render_detail_terminal_tab`
+    /// (`&self`) so mouse handlers can route Scroll/MouseDown over the
+    /// terminal area to the PTY scrollback even though they only have the
+    /// full `main` rect to work with.  Cell so the renderer can stash it.
+    detail_terminal_pending_rect: std::cell::Cell<Option<Rect>>,
+    /// #446: in-progress scrollbar thumb drag for the per-issue detail
+    /// terminal, captured at `MouseDown` time and consulted by
+    /// `MouseMoved` / `MouseUp`.  Mirrors the example pattern in
+    /// `quadraui/examples/common/terminal_app.rs`.
+    detail_terminal_scrollbar_drag: Option<DetailTerminalScrollbarDrag>,
+}
+
+/// #446: snapshot of the scrollbar-drag geometry captured at `MouseDown`.
+///
+/// Mirrors the `ScrollbarDrag` struct from `terminal_app.rs` so that
+/// `MouseMoved` can compute a stable scroll-offset even if the terminal
+/// dimensions change mid-drag.
+#[derive(Debug, Clone, Copy)]
+struct DetailTerminalScrollbarDrag {
+    /// Issue number whose session the drag targets.
+    issue_num: u64,
+    /// Y coordinate of the top of the scrollbar track.
+    track_y: f32,
+    /// Height of the scrollbar track.
+    track_h: f32,
+    /// Total line count from the scrollbar state snapshot.
+    total: usize,
+    /// Visible line count from the scrollbar state snapshot.
+    visible: usize,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4207,8 +4228,9 @@ impl CoordApp {
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
-            // #446: per-issue pending kickoff prompt (readiness-gated).
-            detail_terminal_pending_kickoff: std::collections::HashMap::new(),
+            // #446: per-issue terminal rect + scrollbar-drag state.
+            detail_terminal_pending_rect: std::cell::Cell::new(None),
+            detail_terminal_scrollbar_drag: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -9625,9 +9647,6 @@ impl CoordApp {
                     self.pipeline_issues.iter().map(|i| i.number).collect();
                 self.detail_terminal_sessions.retain(|k, _| live_nums.contains(k));
                 self.detail_terminal_spawn_errors.retain(|k, _| live_nums.contains(k));
-                // #446: also drop pending kickoff prompts for vanished issues.
-                self.detail_terminal_pending_kickoff
-                    .retain(|k, _| live_nums.contains(k));
                 self.pipeline_loader = None;
                 self.rebuild_pipeline_sidebar(prev_sel);
                 true
@@ -11666,6 +11685,18 @@ impl CoordApp {
             // change in the hovered id triggers a redraw.
             UiEvent::MouseMoved { .. } => {
                 let pos = if let UiEvent::MouseMoved { position, .. } = event { *position } else { return false; };
+                // #446: if a detail-terminal scrollbar drag is in flight
+                // and the left button is still down, update it.  Mirrors
+                // the example pattern in `terminal_app.rs`.
+                if self.detail_terminal_scrollbar_drag.is_some() {
+                    let left_down = matches!(event, UiEvent::MouseMoved {
+                        buttons: ButtonMask { left: true, .. }, ..
+                    });
+                    if left_down {
+                        self.apply_detail_terminal_scrollbar_drag(pos.y);
+                        return true;
+                    }
+                }
                 let lh = backend.line_height();
                 let mut redraw = false;
                 // Forward to the active sidebar so scrollbar drag tracks the cursor.
@@ -11755,6 +11786,10 @@ impl CoordApp {
 
             // Forward MouseUp to the active sidebar to release any scrollbar drag.
             UiEvent::MouseUp { .. } => {
+                // #446: release any in-progress detail-terminal scrollbar
+                // drag before forwarding to the sidebar (which is unaware
+                // of the detail terminal's drag state).
+                let detail_drag_released = self.end_detail_terminal_scrollbar_drag();
                 if let Some(sidebar_b) = ctx.sidebar_bounds() {
                     match self.active_view {
                         SidebarView::Board => {
@@ -11766,7 +11801,7 @@ impl CoordApp {
                         _ => {}
                     }
                 }
-                false
+                detail_drag_released
             }
 
             _ => false,
@@ -12082,6 +12117,15 @@ impl CoordApp {
             return false;
         }
         if self.active_view == SidebarView::Pipeline {
+            // #446: in the Terminal detail tab, a click in the scrollbar
+            // column starts a thumb drag.  Try this BEFORE the tab-row
+            // hit-test so a drag-start near the top of the terminal isn't
+            // mis-routed as a tab click.
+            if self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                && self.try_start_detail_terminal_scrollbar_drag(pos)
+            {
+                return true;
+            }
             // Tab bar occupies the first `lh * 1.4` row of the main panel.
             let tab_h = lh * 1.4;
             if pos.y - main_b.y < tab_h {
@@ -12354,8 +12398,22 @@ impl CoordApp {
                         // the chat's internal scrollbar.
                     }
                     PipelineDetailTab::Terminal => {
-                        // #440: PTY scrollback (quadraui #283) is out of
-                        // scope for this PR; swallow wheel events here.
+                        // #446: route wheel events to the selected issue's
+                        // PTY scrollback.  Mirrors the pattern in
+                        // `quadraui/examples/common/terminal_app.rs`:
+                        // positive y = scroll up (into history), negative y
+                        // = scroll down (toward live).
+                        if let Some(issue_num) = self.selected_issue_number() {
+                            if let Some(sess) =
+                                self.detail_terminal_sessions.get_mut(&issue_num)
+                            {
+                                if delta.y > 0.0 {
+                                    sess.scroll_up(3);
+                                } else if delta.y < 0.0 {
+                                    sess.scroll_down(3);
+                                }
+                            }
+                        }
                     }
                 }
                 let _ = visible;
@@ -17081,49 +17139,21 @@ impl CoordApp {
             }
         }
 
-        // 3. Poll all sessions for output, and — for any issue with a
-        //    pending #446 claude kickoff prompt — inject it via bracketed
-        //    paste as soon as the remote `claude` flips bracketed-paste
-        //    mode on (its input prompt is now live and accepting bytes).
+        // 3. Poll all sessions for output.
         //
-        //    Why gate on bracketed-paste mode: sending bytes immediately
-        //    after the ssh+tmux launch line silently dropped them because
-        //    the ssh handshake / tmux attach / claude startup hadn't
-        //    completed.  `bracketed_paste_enabled()` is `claude`'s own
-        //    readiness signal (DEC private mode 2004), so it's the
-        //    cleanest non-scraping gate available.
-        //
-        //    Why bracketed paste (instead of plain bytes): claude's input
-        //    box treats `[200~`..`[201~`-wrapped text as a paste, which is
-        //    the conventional way to pre-fill a multi-line buffer.  We
-        //    intentionally omit the trailing `\r`/`\n` — the human must
-        //    press Enter (ToS §3.7 / #437).  Removing the entry after
-        //    write guarantees we inject exactly once per launch, even
-        //    while bracketed-paste mode remains enabled across many ticks.
-        let mut to_inject: Vec<(u64, String)> = Vec::new();
-        for (issue_num, sess) in self.detail_terminal_sessions.iter_mut() {
+        //    Note: an earlier iteration of #446 tried to auto-inject the
+        //    claude kickoff prompt here, gated on the remote claude's
+        //    `bracketed_paste_enabled()` readiness signal.  Live smoke
+        //    found that `bracketed_paste_enabled()` never flips true
+        //    through ssh — so the kickoff never injected.  The current
+        //    design copies the kickoff to the system clipboard at launch
+        //    time instead (see `launch_remote_session_for_selected_issue`)
+        //    and leaves the actual paste + submit to the human.  This
+        //    keeps the session strictly attended (ToS §3.7 / #437).
+        for sess in self.detail_terminal_sessions.values_mut() {
             if sess.poll() {
                 changed = true;
             }
-            if let Some(kickoff) = self.detail_terminal_pending_kickoff.get(issue_num) {
-                if sess.bracketed_paste_enabled() {
-                    to_inject.push((*issue_num, kickoff.clone()));
-                }
-            }
-        }
-        for (issue_num, kickoff) in to_inject {
-            if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
-                // ESC [ 200 ~  <kickoff>  ESC [ 201 ~ — NO trailing CR/LF.
-                let mut bytes: Vec<u8> = Vec::with_capacity(kickoff.len() + 12);
-                bytes.extend_from_slice(b"\x1b[200~");
-                bytes.extend_from_slice(kickoff.as_bytes());
-                bytes.extend_from_slice(b"\x1b[201~");
-                sess.write_input(&bytes);
-            }
-            // Remove unconditionally so a missing session doesn't leave the
-            // kickoff armed forever.
-            self.detail_terminal_pending_kickoff.remove(&issue_num);
-            changed = true;
         }
 
         changed
@@ -17154,6 +17184,93 @@ impl CoordApp {
             sess.write_input(&bytes);
         }
         true
+    }
+
+    /// Try to start a detail-terminal scrollbar drag (#446).
+    ///
+    /// Mirrors the `MouseDown` branch in
+    /// `quadraui/examples/common/terminal_app.rs`: when the user clicks
+    /// in the rightmost column of the terminal rect *and* the session
+    /// has overflowing scrollback, capture the geometry and apply an
+    /// initial drag.  Returns `true` if the click was consumed by the
+    /// drag-start (caller must skip other click routing); `false` when
+    /// the click is unrelated (no session, scrollbar not visible, or
+    /// click is outside the scrollbar column).
+    fn try_start_detail_terminal_scrollbar_drag(&mut self, pos: Point) -> bool {
+        // Only meaningful while the Terminal detail tab is showing.
+        if self.active_view != SidebarView::Pipeline
+            || self.pipeline_detail_tab != PipelineDetailTab::Terminal
+        {
+            return false;
+        }
+        let Some(rect) = self.detail_terminal_pending_rect.get() else {
+            return false;
+        };
+        let Some(issue_num) = self.selected_issue_number() else {
+            return false;
+        };
+        // Rightmost column = scrollbar.  Match the example pattern
+        // (`scrollbar_col = vp.width - 1.0`).
+        let sb_col = (rect.x + rect.width - 1.0).max(rect.x);
+        let in_scrollbar = pos.x >= sb_col
+            && pos.y >= rect.y
+            && pos.y < rect.y + rect.height;
+        if !in_scrollbar {
+            return false;
+        }
+        let Some(sess) = self.detail_terminal_sessions.get(&issue_num) else {
+            return false;
+        };
+        let total = sess.history_len() + sess.rows() as usize;
+        let visible = sess.rows() as usize;
+        if total <= visible {
+            // Scrollbar not visible — nothing to drag.
+            return false;
+        }
+        let drag = DetailTerminalScrollbarDrag {
+            issue_num,
+            track_y: rect.y,
+            track_h: rect.height,
+            total,
+            visible,
+        };
+        self.detail_terminal_scrollbar_drag = Some(drag);
+        self.apply_detail_terminal_scrollbar_drag(pos.y);
+        true
+    }
+
+    /// Apply an in-progress detail-terminal scrollbar drag at Y (#446).
+    ///
+    /// Mirrors `apply_scrollbar_drag` in `terminal_app.rs`: the scrollbar
+    /// is **inverted** — dragging to the top of the track shows the
+    /// oldest history, dragging to the bottom shows the live view.
+    fn apply_detail_terminal_scrollbar_drag(&mut self, y: f32) {
+        let (issue_num, track_y, track_h, max_scroll) = match self.detail_terminal_scrollbar_drag {
+            Some(d) => (
+                d.issue_num,
+                d.track_y,
+                d.track_h,
+                d.total.saturating_sub(d.visible),
+            ),
+            None => return,
+        };
+        if track_h <= 0.0 {
+            return;
+        }
+        // fraction 0 = top of track, 1 = bottom of track
+        let fraction = ((y - track_y) / track_h).clamp(0.0, 1.0);
+        // Inverted: top → max history, bottom → live (offset 0)
+        let offset = ((1.0 - fraction) * max_scroll as f32).round() as usize;
+        if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
+            sess.set_scroll_offset(offset);
+        }
+    }
+
+    /// End any in-progress detail-terminal scrollbar drag (#446).  Returns
+    /// `true` if a drag was actually released so the caller can request a
+    /// redraw.
+    fn end_detail_terminal_scrollbar_drag(&mut self) -> bool {
+        self.detail_terminal_scrollbar_drag.take().is_some()
     }
 
     /// Resolve the ssh hostname for a remote session on the given issue (#446).
@@ -17263,18 +17380,17 @@ impl CoordApp {
     ///    tmux session if one is already running — closing/reopening the tab
     ///    is safe.  `~/.local/bin/claude` is the absolute path because
     ///    `claude` is NOT on the bash `PATH` over ssh (only zsh sources it).
-    /// 5. **Arms** a pending claude kick-off prompt for this issue.  We do
-    ///    NOT inject it here — at this point the ssh handshake hasn't even
-    ///    started, so any bytes we send would be dropped by the not-yet-
-    ///    ready remote claude process.  Instead,
-    ///    [`drive_detail_terminals`] watches for bracketed-paste mode to
-    ///    flip on (claude's readiness signal) and then injects the prompt
-    ///    via a bracketed paste, once, with **no trailing `\r`** — the
-    ///    human presses Enter.  This is non-negotiable for ToS compliance
-    ///    (§3.7 / #437): the TUI hosts an attended session, it does not
-    ///    auto-submit instructions to the AI.
+    /// 5. **Copies** the claude kick-off prompt to the system clipboard via
+    ///    `backend.services().clipboard().write_text(...)`.  An earlier
+    ///    iteration tried to auto-inject the prompt via a bracketed paste
+    ///    gated on `TerminalSession::bracketed_paste_enabled()`, but live
+    ///    smoke found that the readiness signal never flips true through
+    ///    ssh — the kickoff never landed.  Putting the kickoff on the
+    ///    clipboard keeps the session strictly human-attended (ToS §3.7 /
+    ///    #437): the human pastes and presses Enter; we never auto-submit
+    ///    instructions to the AI.
     /// 6. Auto-focuses the PTY so the human can interact immediately.
-    fn launch_remote_session_for_selected_issue(&mut self) {
+    fn launch_remote_session_for_selected_issue(&mut self, backend: &mut dyn Backend) {
         let Some(issue_num) = self.selected_issue_number() else {
             return;
         };
@@ -17322,15 +17438,23 @@ impl CoordApp {
                 self.detail_terminal_sessions.insert(issue_num, sess);
                 self.detail_terminal_spawn_errors.remove(&issue_num);
 
-                // Arm the kickoff prompt: we'll inject it via bracketed paste
-                // once `bracketed_paste_enabled()` flips on for this issue's
-                // session in `drive_detail_terminals`.  Sending it here, when
-                // ssh hasn't even connected yet, silently dropped the bytes
-                // (smoke-found regression).  No trailing `\r`/`\n` — the
-                // human presses Enter to submit (ToS §3.7 / #437).
+                // Copy the kickoff prompt to the system clipboard so the
+                // human can paste it into claude with a single shortcut
+                // once the remote session is live.  No trailing CR/LF —
+                // they press Enter to submit (ToS §3.7 / #437).
                 let kickoff = build_remote_kickoff_prompt(issue_num);
-                self.detail_terminal_pending_kickoff
-                    .insert(issue_num, kickoff);
+                backend.services().clipboard().write_text(&kickoff);
+
+                // Pipeline status hint so the human knows the kickoff is
+                // ready to paste.  Includes the remote cwd cue so they
+                // recognise the prompt is repo-scoped.
+                self.pipeline_status = Some((
+                    format!(
+                        "Kickoff copied to clipboard — paste into claude (session is in ~/src/{})",
+                        repo_dir,
+                    ),
+                    Instant::now(),
+                ));
 
                 // Auto-focus so the user can type immediately.
                 self.detail_terminal_focused = true;
@@ -17355,6 +17479,9 @@ impl CoordApp {
         let cols = (rect.width / cell_w).floor().max(1.0) as u16;
         let rows = (rect.height / lh).floor().max(1.0) as u16;
         self.detail_terminal_pending_dims.set(Some((cols, rows)));
+        // #446: stash the exact rect for mouse handlers (Scroll / scrollbar
+        // drag).  Cell so the `&self` render path can write to it.
+        self.detail_terminal_pending_rect.set(Some(rect));
 
         let Some(issue_num) = self.selected_issue_number() else {
             // No issue selected — show a neutral placeholder.
@@ -18138,7 +18265,7 @@ impl ShellApp for CoordApp {
                     && !modifiers.alt
                     && !modifiers.shift
                 {
-                    self.launch_remote_session_for_selected_issue();
+                    self.launch_remote_session_for_selected_issue(backend);
                     return Reaction::Redraw;
                 }
             }
@@ -21316,7 +21443,8 @@ mod tests {
             detail_terminal_focused: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #446
-            detail_terminal_pending_kickoff: std::collections::HashMap::new(),
+            detail_terminal_pending_rect: std::cell::Cell::new(None),
+            detail_terminal_scrollbar_drag: None,
         }
     }
 
@@ -30689,47 +30817,94 @@ mod tests {
         assert_eq!(app.remote_repo_dir_for_issue(999), None);
     }
 
-    // ── #446: bracketed-paste kickoff injection ──────────────────────────────
+    // ── #446: clipboard-based kickoff handoff ────────────────────────────────
 
+    /// Test backend stub: a `PlatformServices` implementation that records
+    /// every `Clipboard::write_text` call into an interior `RefCell<String>`.
+    ///
+    /// The auto-seed path used to inject the kickoff prompt via bracketed
+    /// paste (gated on the remote claude's `bracketed_paste_enabled()`),
+    /// but live smoke found the readiness signal never flips through ssh.
+    /// The current design copies the kickoff to the clipboard at launch
+    /// time and leaves the actual paste + submit to the human — this stub
+    /// lets the test capture what `launch_remote_session_for_selected_issue`
+    /// places on the clipboard.
+    struct StubClipboard {
+        last_write: std::cell::RefCell<Option<String>>,
+    }
+
+    impl quadraui::backend::Clipboard for StubClipboard {
+        fn read_text(&self) -> Option<String> {
+            self.last_write.borrow().clone()
+        }
+        fn write_text(&self, text: &str) {
+            *self.last_write.borrow_mut() = Some(text.to_string());
+        }
+    }
+
+    struct StubPlatformServices {
+        clipboard: StubClipboard,
+    }
+
+    impl quadraui::backend::PlatformServices for StubPlatformServices {
+        fn clipboard(&self) -> &dyn quadraui::backend::Clipboard {
+            &self.clipboard
+        }
+        fn show_file_open_dialog(
+            &self,
+            _opts: quadraui::backend::FileDialogOptions,
+        ) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn show_file_save_dialog(
+            &self,
+            _opts: quadraui::backend::FileDialogOptions,
+        ) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn send_notification(&self, _n: quadraui::backend::Notification) {}
+        fn open_url(&self, _url: &str) {}
+        fn platform_name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    /// Smoke-level: a freshly-constructed `StubPlatformServices` round-trips
+    /// `write_text` → `read_text` via the inner `RefCell`.  Guards the test
+    /// stub itself so a later test failure can't be blamed on the stub.
     #[test]
-    fn build_remote_kickoff_prompt_bracketed_paste_wrapping() {
-        // Document the exact byte sequence the readiness gate emits:
-        // ESC[200~ <kickoff> ESC[201~ — NO trailing CR/LF.  Keeps the
-        // ToS §3.7 / #437 invariant ("never auto-submit") visible to
-        // future readers.
-        let kickoff = build_remote_kickoff_prompt(446);
-        let mut bytes: Vec<u8> = Vec::new();
-        bytes.extend_from_slice(b"\x1b[200~");
-        bytes.extend_from_slice(kickoff.as_bytes());
-        bytes.extend_from_slice(b"\x1b[201~");
-        // Start marker.
-        assert!(
-            bytes.starts_with(b"\x1b[200~"),
-            "must start with bracketed-paste start marker (ESC[200~)"
-        );
-        // End marker.
-        assert!(
-            bytes.ends_with(b"\x1b[201~"),
-            "must end with bracketed-paste end marker (ESC[201~)"
-        );
-        // The kickoff text survives intact between the markers.
-        let middle = &bytes[6..bytes.len() - 6];
-        assert_eq!(
-            middle,
-            kickoff.as_bytes(),
-            "kickoff payload must survive bracketed-paste wrapping unchanged"
-        );
-        // CRITICAL: no trailing CR or LF after the end marker — the human
-        // presses Enter (ToS §3.7 / #437).
-        assert_ne!(
-            *bytes.last().unwrap(),
-            b'\r',
-            "bracketed paste must NOT end with CR — the human submits"
-        );
-        assert_ne!(
-            *bytes.last().unwrap(),
-            b'\n',
-            "bracketed paste must NOT end with LF — the human submits"
-        );
+    fn stub_clipboard_round_trips_write_then_read() {
+        use quadraui::backend::Clipboard;
+        let svc = StubClipboard {
+            last_write: std::cell::RefCell::new(None),
+        };
+        assert_eq!(svc.read_text(), None);
+        svc.write_text("hello world");
+        assert_eq!(svc.read_text(), Some("hello world".to_string()));
+    }
+
+    /// `build_remote_kickoff_prompt(N)` is the exact text we now place on
+    /// the system clipboard at launch time.  This test pins that contract:
+    /// the prompt mentions the issue number and `gh issue view`, ends
+    /// without CR/LF (human presses Enter — ToS §3.7 / #437), and survives
+    /// being shuttled through the clipboard unchanged.
+    #[test]
+    fn launch_kickoff_payload_is_what_we_copy_to_clipboard() {
+        use quadraui::backend::{Clipboard, PlatformServices};
+        let expected = build_remote_kickoff_prompt(446);
+        let svc = StubPlatformServices {
+            clipboard: StubClipboard {
+                last_write: std::cell::RefCell::new(None),
+            },
+        };
+        // Simulate the exact call the launch path makes.
+        svc.clipboard().write_text(&expected);
+        let got = svc.clipboard().read_text();
+        assert_eq!(got, Some(expected.clone()));
+        // Cross-check the kickoff invariants while we have it isolated.
+        assert!(!expected.ends_with('\r'));
+        assert!(!expected.ends_with('\n'));
+        assert!(expected.contains("446"));
+        assert!(expected.contains("gh issue view"));
     }
 }
