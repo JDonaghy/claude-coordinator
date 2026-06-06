@@ -3996,6 +3996,14 @@ pub struct CoordApp {
     /// `render_detail_terminal_tab` (`&self`) and applied by `tick`
     /// (`&mut self`).
     detail_terminal_pending_dims: std::cell::Cell<Option<(u16, u16)>>,
+    /// #446: per-issue pending claude kickoff prompt awaiting readiness.
+    /// Armed by `launch_remote_session_for_selected_issue` when the user
+    /// presses `s`; injected as a bracketed paste by `drive_detail_terminals`
+    /// once the remote `claude` session flips bracketed-paste mode on
+    /// (i.e. its input prompt is live).  Removed after a single injection
+    /// so the kickoff text never re-fires.  Bracketed paste is sent
+    /// WITHOUT a trailing CR — the human presses Enter (ToS §3.7 / #437).
+    detail_terminal_pending_kickoff: std::collections::HashMap<u64, String>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4199,6 +4207,8 @@ impl CoordApp {
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
+            // #446: per-issue pending kickoff prompt (readiness-gated).
+            detail_terminal_pending_kickoff: std::collections::HashMap::new(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -9615,6 +9625,9 @@ impl CoordApp {
                     self.pipeline_issues.iter().map(|i| i.number).collect();
                 self.detail_terminal_sessions.retain(|k, _| live_nums.contains(k));
                 self.detail_terminal_spawn_errors.retain(|k, _| live_nums.contains(k));
+                // #446: also drop pending kickoff prompts for vanished issues.
+                self.detail_terminal_pending_kickoff
+                    .retain(|k, _| live_nums.contains(k));
                 self.pipeline_loader = None;
                 self.rebuild_pipeline_sidebar(prev_sel);
                 true
@@ -17068,11 +17081,49 @@ impl CoordApp {
             }
         }
 
-        // 3. Poll all sessions for output.
-        for sess in self.detail_terminal_sessions.values_mut() {
+        // 3. Poll all sessions for output, and — for any issue with a
+        //    pending #446 claude kickoff prompt — inject it via bracketed
+        //    paste as soon as the remote `claude` flips bracketed-paste
+        //    mode on (its input prompt is now live and accepting bytes).
+        //
+        //    Why gate on bracketed-paste mode: sending bytes immediately
+        //    after the ssh+tmux launch line silently dropped them because
+        //    the ssh handshake / tmux attach / claude startup hadn't
+        //    completed.  `bracketed_paste_enabled()` is `claude`'s own
+        //    readiness signal (DEC private mode 2004), so it's the
+        //    cleanest non-scraping gate available.
+        //
+        //    Why bracketed paste (instead of plain bytes): claude's input
+        //    box treats `[200~`..`[201~`-wrapped text as a paste, which is
+        //    the conventional way to pre-fill a multi-line buffer.  We
+        //    intentionally omit the trailing `\r`/`\n` — the human must
+        //    press Enter (ToS §3.7 / #437).  Removing the entry after
+        //    write guarantees we inject exactly once per launch, even
+        //    while bracketed-paste mode remains enabled across many ticks.
+        let mut to_inject: Vec<(u64, String)> = Vec::new();
+        for (issue_num, sess) in self.detail_terminal_sessions.iter_mut() {
             if sess.poll() {
                 changed = true;
             }
+            if let Some(kickoff) = self.detail_terminal_pending_kickoff.get(issue_num) {
+                if sess.bracketed_paste_enabled() {
+                    to_inject.push((*issue_num, kickoff.clone()));
+                }
+            }
+        }
+        for (issue_num, kickoff) in to_inject {
+            if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
+                // ESC [ 200 ~  <kickoff>  ESC [ 201 ~ — NO trailing CR/LF.
+                let mut bytes: Vec<u8> = Vec::with_capacity(kickoff.len() + 12);
+                bytes.extend_from_slice(b"\x1b[200~");
+                bytes.extend_from_slice(kickoff.as_bytes());
+                bytes.extend_from_slice(b"\x1b[201~");
+                sess.write_input(&bytes);
+            }
+            // Remove unconditionally so a missing session doesn't leave the
+            // kickoff armed forever.
+            self.detail_terminal_pending_kickoff.remove(&issue_num);
+            changed = true;
         }
 
         changed
@@ -17151,24 +17202,77 @@ impl CoordApp {
         None
     }
 
+    /// Resolve the remote repo *directory name* for an issue (#446).
+    ///
+    /// Every machine in the fleet checks each repo out under `~/src/<name>`
+    /// (confirmed via per-machine `repo_paths` in `coordinator.yml`), so
+    /// the directory basename of the local checkout is the same name that
+    /// works on every other machine.
+    ///
+    /// Resolution order (mirrors [`detail_terminal_cwd`]):
+    /// 1. Basename of `pipeline_repo_paths[repo_key]` if it exists.
+    /// 2. `issue.coord_repo` (typically the bare repo name).
+    /// 3. Last segment of `issue.repo_slug` (`"owner/repo"` → `"repo"`).
+    ///
+    /// Returns `None` only when the issue itself isn't in
+    /// `pipeline_issues` (caller surfaces a toast).
+    fn remote_repo_dir_for_issue(&self, issue_num: u64) -> Option<String> {
+        let issue = self
+            .pipeline_issues
+            .iter()
+            .find(|iss| iss.number == issue_num)?;
+        let repo_key = issue.coord_repo.as_deref().unwrap_or(&issue.repo_slug);
+        if let Some(path) = self.data.pipeline_repo_paths.get(repo_key) {
+            if let Some(name) = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        if let Some(cr) = issue.coord_repo.as_deref() {
+            if !cr.is_empty() {
+                return Some(cr.to_string());
+            }
+        }
+        issue
+            .repo_slug
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
     /// Launch a remote human-attended `claude` session over ssh + tmux (#446).
     ///
     /// # What this does
     ///
-    /// 1. Resolves the target host via [`remote_session_host_for_issue`].
+    /// 1. Resolves the target host via [`remote_session_host_for_issue`] and
+    ///    the remote repo directory name via [`remote_repo_dir_for_issue`].
     /// 2. Kills any existing PTY for this issue (replaced by drop when we
     ///    `insert` the new session).
     /// 3. Spawns a local shell session (`TerminalSession::spawn`) using the
     ///    same path as the lazy-spawn in `drive_detail_terminals`.
-    /// 4. Auto-runs the ssh+tmux launch line (with trailing `\r`).
+    /// 4. Auto-runs the ssh+tmux launch line (with trailing `\r`).  The
+    ///    inner command does `cd ~/src/<repo> && exec ~/.local/bin/claude`
+    ///    so `claude` starts in the repo working tree (smoke-found
+    ///    regression: without the `cd`, claude opened in `$HOME`).
     ///    `tmux new-session -A -s coord-issue-N` reattaches to an existing
     ///    tmux session if one is already running — closing/reopening the tab
     ///    is safe.  `~/.local/bin/claude` is the absolute path because
     ///    `claude` is NOT on the bash `PATH` over ssh (only zsh sources it).
-    /// 5. Pre-fills a one-liner kick-off prompt **without a trailing `\r`** —
-    ///    the human presses Enter to submit.  This is non-negotiable for ToS
-    ///    compliance (§3.7 / #437): the TUI hosts an attended session, it does
-    ///    not auto-submit instructions to the AI.
+    /// 5. **Arms** a pending claude kick-off prompt for this issue.  We do
+    ///    NOT inject it here — at this point the ssh handshake hasn't even
+    ///    started, so any bytes we send would be dropped by the not-yet-
+    ///    ready remote claude process.  Instead,
+    ///    [`drive_detail_terminals`] watches for bracketed-paste mode to
+    ///    flip on (claude's readiness signal) and then injects the prompt
+    ///    via a bracketed paste, once, with **no trailing `\r`** — the
+    ///    human presses Enter.  This is non-negotiable for ToS compliance
+    ///    (§3.7 / #437): the TUI hosts an attended session, it does not
+    ///    auto-submit instructions to the AI.
     /// 6. Auto-focuses the PTY so the human can interact immediately.
     fn launch_remote_session_for_selected_issue(&mut self) {
         let Some(issue_num) = self.selected_issue_number() else {
@@ -17178,6 +17282,15 @@ impl CoordApp {
         let Some(host) = self.remote_session_host_for_issue(issue_num) else {
             self.pipeline_status = Some((
                 "No machine found for this issue — cannot launch remote session".to_string(),
+                Instant::now(),
+            ));
+            return;
+        };
+
+        let Some(repo_dir) = self.remote_repo_dir_for_issue(issue_num) else {
+            self.pipeline_status = Some((
+                "Cannot resolve repo directory for this issue — remote session not launched"
+                    .to_string(),
                 Instant::now(),
             ));
             return;
@@ -17202,17 +17315,22 @@ impl CoordApp {
                 // to an existing `coord-issue-N` session instead of creating a
                 // second one, so pressing `s` again is safe while a session is
                 // still running on the remote machine.
-                let launch_line = build_remote_launch_cmd(&host, issue_num);
+                let launch_line = build_remote_launch_cmd(&host, issue_num, &repo_dir);
                 sess.send_str(&launch_line);
-
-                // Pre-fill (NO trailing \r) — human reviews and presses Enter.
-                // ToS boundary: we NEVER auto-submit instructions to claude.
-                let kickoff = build_remote_kickoff_prompt(issue_num);
-                sess.send_str(&kickoff);
 
                 // Replace any existing session (the old one is dropped here).
                 self.detail_terminal_sessions.insert(issue_num, sess);
                 self.detail_terminal_spawn_errors.remove(&issue_num);
+
+                // Arm the kickoff prompt: we'll inject it via bracketed paste
+                // once `bracketed_paste_enabled()` flips on for this issue's
+                // session in `drive_detail_terminals`.  Sending it here, when
+                // ssh hasn't even connected yet, silently dropped the bytes
+                // (smoke-found regression).  No trailing `\r`/`\n` — the
+                // human presses Enter to submit (ToS §3.7 / #437).
+                let kickoff = build_remote_kickoff_prompt(issue_num);
+                self.detail_terminal_pending_kickoff
+                    .insert(issue_num, kickoff);
 
                 // Auto-focus so the user can type immediately.
                 self.detail_terminal_focused = true;
@@ -17316,14 +17434,21 @@ impl CoordApp {
 /// bash PATH over ssh (zsh login shells load `~/.zshrc` which sets it up,
 /// but `ssh -t host "cmd"` uses a non-login bash).
 ///
+/// `cd ~/src/<repo_dir>` puts `claude` in the right working tree before
+/// `exec`-ing it (smoke-found regression: without the `cd`, claude opens
+/// in `$HOME` on the remote machine).  `tmux new-session -A` only runs
+/// the command on *first create* — when reattaching to an existing
+/// `coord-issue-<N>` session, the original cwd is preserved, so the `cd`
+/// is correctly skipped on reattach.
+///
 /// `tmux new-session -A -s coord-issue-<N>` reattaches to an existing tmux
 /// session with that name if one already exists, so re-pressing `s` (or
 /// closing/reopening the Terminal tab) reattaches cleanly instead of
 /// spawning a second `claude` process.
-fn build_remote_launch_cmd(host: &str, issue_num: u64) -> String {
+fn build_remote_launch_cmd(host: &str, issue_num: u64, repo_dir: &str) -> String {
     format!(
-        "ssh -t {} \"tmux new-session -A -s coord-issue-{} '~/.local/bin/claude'\"\r",
-        host, issue_num,
+        "ssh -t {} \"tmux new-session -A -s coord-issue-{} 'cd ~/src/{} && exec ~/.local/bin/claude'\"\r",
+        host, issue_num, repo_dir,
     )
 }
 
@@ -21190,6 +21315,8 @@ mod tests {
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
+            // #446
+            detail_terminal_pending_kickoff: std::collections::HashMap::new(),
         }
     }
 
@@ -30263,7 +30390,8 @@ mod tests {
 
     #[test]
     fn build_remote_launch_cmd_contains_host_and_issue() {
-        let cmd = build_remote_launch_cmd("precision.tailnet.ts.net", 446);
+        let cmd =
+            build_remote_launch_cmd("precision.tailnet.ts.net", 446, "claude-coordinator");
         assert!(
             cmd.contains("precision.tailnet.ts.net"),
             "command must contain the target host"
@@ -30290,10 +30418,39 @@ mod tests {
     fn build_remote_launch_cmd_ssh_dash_t_flag() {
         // ssh -t allocates a PTY on the remote side, required for an
         // interactive tmux session.
-        let cmd = build_remote_launch_cmd("myhost", 123);
+        let cmd = build_remote_launch_cmd("myhost", 123, "my-repo");
         assert!(
             cmd.contains("ssh -t "),
             "must pass -t to ssh so tmux gets a PTY"
+        );
+    }
+
+    #[test]
+    fn build_remote_launch_cmd_cd_into_repo_then_exec_claude() {
+        // Smoke-found regression #446: claude must open in the repo
+        // checkout, not in `$HOME` on the remote machine.  The inner
+        // tmux command must `cd ~/src/<repo>` before launching claude.
+        let cmd = build_remote_launch_cmd("hostA", 446, "claude-coordinator");
+        assert!(
+            cmd.contains("cd ~/src/claude-coordinator && exec ~/.local/bin/claude"),
+            "launch must cd into ~/src/<repo> and exec claude; got: {}",
+            cmd,
+        );
+        // Repo dir is templated — different repo, different cd target.
+        let cmd2 = build_remote_launch_cmd("hostA", 99, "quadraui");
+        assert!(
+            cmd2.contains("cd ~/src/quadraui && exec ~/.local/bin/claude"),
+            "launch must template the repo dir; got: {}",
+            cmd2,
+        );
+        // Host + issue still propagate alongside the new cd.
+        assert!(
+            cmd2.contains("ssh -t hostA "),
+            "host must still be present alongside cd"
+        );
+        assert!(
+            cmd2.contains("coord-issue-99"),
+            "issue number must still be in the tmux session name"
         );
     }
 
@@ -30454,5 +30611,125 @@ mod tests {
         });
         // No other machine → None.
         assert_eq!(app.remote_session_host_for_issue(10), None);
+    }
+
+    // ── #446: remote_repo_dir_for_issue ───────────────────────────────────────
+
+    #[test]
+    fn remote_repo_dir_uses_basename_of_pipeline_repo_path() {
+        // pipeline_repo_paths['foo'] = '/home/john/src/foo' → dir = 'foo'.
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(
+            "claude-coordinator".to_string(),
+            "/home/john/src/claude-coordinator".to_string(),
+        );
+        let mut app = make_test_app(BoardData {
+            pipeline_repo_paths: paths,
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 446,
+            title: "t".to_string(),
+            body: String::new(),
+            repo_slug: "JDonaghy/claude-coordinator".to_string(),
+            coord_repo: Some("claude-coordinator".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        assert_eq!(
+            app.remote_repo_dir_for_issue(446),
+            Some("claude-coordinator".to_string()),
+        );
+    }
+
+    #[test]
+    fn remote_repo_dir_falls_back_to_coord_repo_when_no_path_mapped() {
+        // No pipeline_repo_paths entry → use issue.coord_repo.
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 77,
+            title: "t".to_string(),
+            body: String::new(),
+            repo_slug: "org/quadraui".to_string(),
+            coord_repo: Some("quadraui".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        assert_eq!(
+            app.remote_repo_dir_for_issue(77),
+            Some("quadraui".to_string()),
+        );
+    }
+
+    #[test]
+    fn remote_repo_dir_falls_back_to_repo_slug_last_segment() {
+        // No path, no coord_repo → use the last segment of "owner/repo".
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 1,
+            title: "t".to_string(),
+            body: String::new(),
+            repo_slug: "owner/some-repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        assert_eq!(
+            app.remote_repo_dir_for_issue(1),
+            Some("some-repo".to_string()),
+        );
+    }
+
+    #[test]
+    fn remote_repo_dir_none_when_issue_missing() {
+        let app = make_test_app(BoardData::default());
+        assert_eq!(app.remote_repo_dir_for_issue(999), None);
+    }
+
+    // ── #446: bracketed-paste kickoff injection ──────────────────────────────
+
+    #[test]
+    fn build_remote_kickoff_prompt_bracketed_paste_wrapping() {
+        // Document the exact byte sequence the readiness gate emits:
+        // ESC[200~ <kickoff> ESC[201~ — NO trailing CR/LF.  Keeps the
+        // ToS §3.7 / #437 invariant ("never auto-submit") visible to
+        // future readers.
+        let kickoff = build_remote_kickoff_prompt(446);
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(kickoff.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        // Start marker.
+        assert!(
+            bytes.starts_with(b"\x1b[200~"),
+            "must start with bracketed-paste start marker (ESC[200~)"
+        );
+        // End marker.
+        assert!(
+            bytes.ends_with(b"\x1b[201~"),
+            "must end with bracketed-paste end marker (ESC[201~)"
+        );
+        // The kickoff text survives intact between the markers.
+        let middle = &bytes[6..bytes.len() - 6];
+        assert_eq!(
+            middle,
+            kickoff.as_bytes(),
+            "kickoff payload must survive bracketed-paste wrapping unchanged"
+        );
+        // CRITICAL: no trailing CR or LF after the end marker — the human
+        // presses Enter (ToS §3.7 / #437).
+        assert_ne!(
+            *bytes.last().unwrap(),
+            b'\r',
+            "bracketed paste must NOT end with CR — the human submits"
+        );
+        assert_ne!(
+            *bytes.last().unwrap(),
+            b'\n',
+            "bracketed paste must NOT end with LF — the human submits"
+        );
     }
 }
