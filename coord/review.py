@@ -628,6 +628,21 @@ def dispatch_review(
     if repo is None:
         return None
 
+    # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-dispatched reviews are
+    # an unattended path, so refuse to route them through a provider
+    # whose capabilities mark it ``human_attended_only``.  Deferred import
+    # keeps the review module free of a module-level cycle with the
+    # provider registry.  On refusal we surface the error to the caller
+    # rather than silently dropping the review.
+    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+    guard_unattended_dispatch(
+        spec_provider=None,
+        repo_provider=repo.provider,
+        providers_cfg=config.providers,
+        models_cfg=config.models,
+        where="auto-dispatch review",
+    )
+
     pr = pr_lookup(
         repo.github,
         branch=completed.branch,

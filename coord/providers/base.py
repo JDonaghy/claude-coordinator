@@ -55,6 +55,22 @@ class Capabilities:
             is the Track-3 routing signal for the June-15 metering
             mitigation (#322): the coordinator and TUI prefer a
             non-metered backend when one is available.
+        human_attended_only: STRUCTURAL TOS-COMPLIANCE GATE (#437).  When
+            ``True``, this provider may NEVER be selected for unattended
+            dispatch — the coordinator refuses to route ``coord plan`` /
+            ``coord approve`` / auto-review / auto-reassign /
+            reconciliation through it.  Used for subscription-billed
+            interactive backends (e.g. :class:`ClaudePtyProvider`) where
+            running unsupervised would violate Anthropic ToS §3.7
+            (no headless / agentic use of subscription Claude Code).
+            The default is ``False`` — a new provider is automatable
+            unless it explicitly opts out (fail-safe: a metered backend
+            is safe to gate behind nothing; an interactive subscription
+            backend must opt out).  Workers run via this provider must
+            be launched into a human-attended terminal by ``coord assign
+            --interactive`` and HUMAN-CLOSED; no coordinator-side
+            completion-sentinel watching, no auto-termination on output,
+            no parsing of the TTY to advance pipeline state.
     """
 
     resume: bool
@@ -63,6 +79,7 @@ class Capabilities:
     true_system_prompt: bool
     enforces_deny_list: bool
     billing_mode: str
+    human_attended_only: bool = False
 
 
 class Provider(ABC):

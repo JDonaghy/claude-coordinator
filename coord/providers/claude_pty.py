@@ -133,6 +133,18 @@ class ClaudePtyProvider(Provider):
             true_system_prompt=True,
             enforces_deny_list=False,
             billing_mode="subscription",
+            # #437: STRUCTURAL TOS-COMPLIANCE GATE.  Interactive Claude
+            # Code on a Max/Pro subscription is covered ONLY for
+            # human-attended use — running it unsupervised would violate
+            # Anthropic ToS §3.7.  Flagging the provider here means the
+            # coordinator's unattended dispatch paths (``coord plan`` /
+            # ``coord approve`` / auto-review / auto-reassign /
+            # reconciliation) refuse to select this provider at all.
+            # The only path that may launch this backend is
+            # ``coord assign --interactive``, which attaches the worker
+            # to the operator's local TTY and is HUMAN-CLOSED.  See
+            # :class:`~coord.providers.base.Capabilities`.
+            human_attended_only=True,
         )
 
     # ── Core methods ──────────────────────────────────────────────────────────

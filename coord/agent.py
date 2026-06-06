@@ -86,12 +86,11 @@ _RESULT_LINE_MARKER = b'"type":"result"'
 # test_pty_marker_bytes_sync_with_provider_string``.
 _PTY_RESULT_LINE_MARKER = b"# pty: worker exited"
 
-# #425 PTY briefing-submit: after the briefing is pasted into the interactive
-# TUI (bracketed paste), wait this long before sending the submit carriage
-# return — a CR sent too soon after ESC[201~ is swallowed by paste-end
-# processing.  Measured floor was ~0.6s against interactive `claude`; 0.8s
-# keeps margin.
-_PTY_SUBMIT_SETTLE_S = 0.8
+# #425 (now retired in #437) used to define ``_PTY_SUBMIT_SETTLE_S`` here for
+# auto-submitting the briefing after the bracketed paste.  Auto-submit was
+# removed for ToS §3.7 compliance (#437): the human-attended interactive path
+# PRE-FILLS the input box and the operator presses Enter themselves.  No
+# coordinator-side submit means no settle delay is needed.
 
 # #425 PTY readiness: ESC[?2004h (bracketed-paste enable) is emitted EARLY,
 # while the TUI is still drawing its first frame — a briefing pasted at that
@@ -2058,7 +2057,7 @@ class AgentServer:
         )
         pump_thread.start()
 
-        # Readiness + briefing submission for the interactive TUI.  Unlike the
+        # Readiness + briefing PRE-FILL for the interactive TUI.  Unlike the
         # stream-json path we cannot just write the briefing to stdin:
         # interactive ``claude`` only accepts a (multi-line) briefing as a
         # bracketed paste, and only AFTER it has both enabled bracketed-paste
@@ -2069,30 +2068,34 @@ class AgentServer:
         #       enable marker fires while the TUI is still drawing, and a
         #       paste sent at that instant is silently dropped;
         #   (3) paste the briefing (``initial_input`` returns the
-        #       bracketed-paste block — no submit key);
-        #   (4) settle, then submit with a SEPARATE carriage return (``\n``
-        #       does NOT submit under the enhanced keyboard protocol, and a CR
-        #       glued onto ESC[201~ in the same write is swallowed).
-        # All four steps were verified live against interactive ``claude``
+        #       bracketed-paste block — NO submit key).
+        # The pre-fill steps were verified live against interactive ``claude``
         # (#425 smoke); see ClaudePtyProvider for the byte-level rationale.
+        #
+        # #437: ToS-COMPLIANCE — we deliberately do NOT submit the briefing
+        # on the operator's behalf.  The human launching this session via
+        # ``coord assign --interactive`` sees the briefing PRE-FILLED in the
+        # input box and presses Enter themselves.  No coordinator-side
+        # auto-submit, no content-based completion detection, no
+        # auto-termination on output, no TTY scraping to advance pipeline
+        # state.  The session is HUMAN-CLOSED.  This is the structural
+        # difference from #425's automated submit path that was retired
+        # alongside #426 for Anthropic ToS §3.7 compliance.
         #
         # We poll the log rather than the master fd directly to avoid stealing
         # bytes from the pump thread.  If a marker never appears we paste
         # anyway after the cap — degraded, but no worse than blind pasting.
         #
-        # KNOWN LIMITATION (deferred to #426): if the interactive `claude`
-        # process exits before the readiness window (auth failure, crash,
-        # immediate misconfig), the pump thread sees EIO on ``master_fd``,
-        # stamps the result marker, and closes ``master_fd``; the
-        # ``os.write(master_fd, …)`` here then raises ``OSError`` and the
-        # briefing is silently lost.  The assignment itself is reaped quickly
-        # — ``_reap`` calls ``proc.wait()`` and the child has already exited,
-        # so the status flips to FAILED in seconds rather than waiting for the
-        # ``_REAP_MAX_WAIT`` timer.  But the operator sees no clear "your
-        # briefing was discarded" signal; #426 will surface that as a distinct
-        # failure mode.  The safety gate in :meth:`assign` limits PTY workers
-        # to non-mutating spec types, so a silently-lost briefing is a
-        # nuisance rather than a correctness problem.
+        # KNOWN LIMITATION: if the interactive `claude` process exits before
+        # the readiness window (auth failure, crash, immediate misconfig), the
+        # pump thread sees EIO on ``master_fd``, stamps the result marker, and
+        # closes ``master_fd``; the ``os.write(master_fd, …)`` here then raises
+        # ``OSError`` and the pre-fill is silently lost.  The assignment is
+        # reaped quickly — ``_reap`` calls ``proc.wait()`` and the child has
+        # already exited, so status flips to FAILED in seconds rather than
+        # waiting for ``_REAP_MAX_WAIT``.  The safety gate in :meth:`assign`
+        # limits PTY workers to non-mutating spec types, so a silently-lost
+        # pre-fill is a nuisance rather than a correctness problem.
         from coord.providers.claude_pty import (  # noqa: PLC0415
             BRACKETED_PASTE_ENABLE,
         )
@@ -2125,13 +2128,17 @@ class AgentServer:
                     break
                 time.sleep(0.05)
             try:
-                # (3) paste, (4) settle then submit with a carriage return.
+                # (3) PRE-FILL ONLY.  The bracketed-paste block populates the
+                # TUI's input box; the operator presses Enter to submit.  #437
+                # explicitly does NOT write a trailing carriage return — that
+                # is the structural change that makes this path human-attended
+                # rather than agentic.  No content-based completion detection
+                # follows; no scraper inspects the TTY for sentinels; the
+                # session terminates when the human exits ``claude``.
                 os.write(master_fd, initial_input)
-                time.sleep(_PTY_SUBMIT_SETTLE_S)
-                os.write(master_fd, b"\r")
             except OSError as e:
                 try:
-                    log_fh.write(f"\n# pty: failed to send initial briefing: {e}\n")
+                    log_fh.write(f"\n# pty: failed to pre-fill briefing: {e}\n")
                     log_fh.flush()
                 except OSError:
                     pass

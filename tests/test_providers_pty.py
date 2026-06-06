@@ -18,6 +18,7 @@ launched and no network or subscription call is made.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -492,12 +493,14 @@ def test_default_provider_selection_is_claude(tmp_path: Path) -> None:
 def test_pty_spawn_routes_through_pty_path(tmp_path: Path) -> None:
     """The PTY branch actually runs when spec.provider names a ClaudePtyProvider.
 
-    Uses a tiny shell script as a stand-in for the ``claude`` binary — it
-    prints a banner (so the readiness loop sees output), reads a line from
-    stdin (the briefing), echoes it back, and exits.  This exercises:
+    Uses a tiny python script as a stand-in for the ``claude`` binary — it
+    prints a banner (so the readiness loop sees output), reads a fixed-size
+    chunk from stdin (the PRE-FILLED briefing — no CR is written by the
+    agent under #437), echoes it back, and exits.  This exercises:
         * the PTY-branch dispatch in ``_spawn``;
         * the PTY pump thread (PTY master → log file);
-        * the readiness wait + initial_input write to the PTY master;
+        * the readiness wait + initial_input PRE-FILL to the PTY master
+          (no auto-submit — see #437);
         * the result-marker stamping after the worker exits.
     """
     repo = _init_repo(tmp_path / "repo")
@@ -525,10 +528,10 @@ def test_pty_spawn_routes_through_pty_path(tmp_path: Path) -> None:
     assert "READY_BANNER" in log, f"worker banner missing from log: {log!r}"
     # The pump captured the worker's echo of our briefing — proves the
     # bracketed-paste initial_input was written to the PTY master after
-    # readiness and the carriage return submitted the line.  The scripted
-    # worker is a plain shell `read` (not a TUI paste handler), so the line
-    # it echoes still carries the paste markers around the body — assert the
-    # briefing body survived the round-trip.
+    # readiness.  Under #437 the agent does NOT write a trailing CR (no
+    # auto-submit), so the mock reads a fixed byte count rather than
+    # waiting for a newline.  Assert the briefing body survived the
+    # round-trip.
     assert any("got=" in ln and "ECHO_ME" in ln for ln in log.splitlines()), (
         f"briefing not echoed back: {log!r}"
     )
@@ -539,16 +542,42 @@ def test_pty_spawn_routes_through_pty_path(tmp_path: Path) -> None:
     server.shutdown()
 
 
-class _ScriptedPtyProvider(ClaudePtyProvider):
-    """Test-only provider that mocks ``claude`` with a tiny shell script.
+# Python script body used by :class:`_ScriptedPtyProvider`.  The mock emits the
+# bracketed-paste-enable DECSET (``\x1b[?2004h``) so the readiness loop in
+# ``_spawn_pty`` proceeds to write the briefing, prints ``READY_BANNER``, reads
+# a fixed-size byte chunk from stdin (the pre-fill — the agent no longer writes
+# a CR), echoes ``got=<bytes>``, and exits.  A 1.5 s timeout backstops the read
+# so the test fails fast if the pre-fill never arrives.
+_SCRIPTED_PTY_MOCK = (
+    "import sys, os, select; "
+    "sys.stdout.write('\\x1b[?2004h'); "
+    "sys.stdout.write('READY_BANNER\\n'); "
+    "sys.stdout.flush(); "
+    "buf = b''; "
+    "deadline = __import__('time').monotonic() + 1.5; "
+    "tlen = 6 + len('ECHO_ME') + 6; "  # ESC[200~ + body + ESC[201~
+    "import time as _t\n"
+    "while len(buf) < tlen and _t.monotonic() < deadline:\n"
+    "    r, _, _ = select.select([0], [], [], 0.05)\n"
+    "    if r:\n"
+    "        chunk = os.read(0, tlen - len(buf))\n"
+    "        if not chunk: break\n"
+    "        buf += chunk\n"
+    "sys.stdout.write('got=' + buf.decode('utf-8', errors='replace') + '\\n')\n"
+    "sys.stdout.flush()\n"
+)
 
-    The script emits the bracketed-paste-enable DECSET (``ESC[?2004h``) so the
-    readiness loop in ``_spawn_pty`` — which waits for that marker, then for
-    render quiescence — proceeds to write the briefing.  It then prints
-    ``READY_BANNER``, reads one line from the PTY, echoes it as ``got=<line>``,
-    and exits.  This proves the round-trip from initial_input → PTY master →
-    child stdin → child stdout → PTY master → log without depending on a real
-    claude install.
+
+class _ScriptedPtyProvider(ClaudePtyProvider):
+    """Test-only provider that mocks ``claude`` with a tiny python script.
+
+    Under #437 the agent's PTY path PRE-FILLS the input box but does NOT
+    submit, so the mock can't use a line-oriented ``read`` to capture the
+    briefing — instead it reads a fixed byte count off stdin and echoes
+    it.  This proves the round-trip from initial_input → PTY master →
+    child stdin → child stdout → PTY master → log without depending on
+    a real claude install AND without depending on the (now-removed)
+    auto-submit.
 
     Everything else (capabilities, initial_input, result_marker,
     parse_log) is inherited unchanged from :class:`ClaudePtyProvider`.
@@ -563,11 +592,7 @@ class _ScriptedPtyProvider(ClaudePtyProvider):
         allowed_tools=None,
         permission_mode="acceptEdits",
     ) -> list[str]:
-        return [
-            "/bin/sh",
-            "-c",
-            "printf '\\033[?2004h'; echo READY_BANNER; read line; echo \"got=$line\"",
-        ]
+        return [sys.executable, "-c", _SCRIPTED_PTY_MOCK]
 
 
 class _SlowReadinessPtyProvider(ClaudePtyProvider):
