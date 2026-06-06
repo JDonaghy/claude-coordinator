@@ -525,6 +525,25 @@ def test_opencode_build_command_custom_binary() -> None:
     assert argv[0] == "/opt/opencode"
 
 
+def test_opencode_build_command_with_attach_url() -> None:
+    """When attach_url is set, --attach <url> is inserted before the briefing."""
+    spec = _make_spec(type="work", briefing="do it")
+    p = OpenCodeProvider(attach_url="http://localhost:4242")
+    argv = p.build_command(spec)
+    assert "--attach" in argv, "--attach flag missing from argv"
+    idx = argv.index("--attach")
+    assert argv[idx + 1] == "http://localhost:4242", "attach URL value mismatch"
+    # Briefing must still be the final argument.
+    assert argv[-1] == "do it"
+
+
+def test_opencode_build_command_without_attach_url_omits_flag() -> None:
+    """When attach_url is None (default), --attach is absent from argv."""
+    spec = _make_spec(type="work", briefing="do it")
+    argv = OpenCodeProvider().build_command(spec)
+    assert "--attach" not in argv
+
+
 def test_opencode_build_command_briefing_is_last_arg() -> None:
     """Briefing is always the last element of the argv."""
     spec = _make_spec(type="work", briefing="my briefing text", model="haiku",
@@ -600,9 +619,8 @@ def test_opencode_result_marker() -> None:
     assert OpenCodeProvider().result_marker() == RESULT_MARKER
 
 
-def test_opencode_result_marker_in_fixture(tmp_path: Path) -> None:
+def test_opencode_result_marker_in_fixture() -> None:
     """result_marker() appears in the last line of the sample fixture."""
-    import importlib.resources
     fixtures_dir = Path(__file__).parent / "fixtures"
     fixture = fixtures_dir / "opencode_run_sample.jsonl"
     assert fixture.exists(), "opencode_run_sample.jsonl fixture is missing"
@@ -779,6 +797,18 @@ def test_build_provider_opencode_with_binary() -> None:
     spec = _make_spec(type="work", briefing="hi")
     argv = provider.build_command(spec)
     assert argv[0] == "/usr/local/bin/opencode"
+
+
+def test_build_provider_opencode_with_attach_url() -> None:
+    """build_provider threads attach_url from ProviderDef into OpenCodeProvider."""
+    defn = ProviderDef(type="opencode", attach_url="http://localhost:4242")
+    provider = build_provider("oc", defn, None)
+    assert isinstance(provider, OpenCodeProvider)
+    spec = _make_spec(type="work", briefing="hi")
+    argv = provider.build_command(spec)
+    assert "--attach" in argv
+    idx = argv.index("--attach")
+    assert argv[idx + 1] == "http://localhost:4242"
 
 
 def test_build_provider_unknown_type_still_raises() -> None:
