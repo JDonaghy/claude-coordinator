@@ -67,6 +67,12 @@ DONE = "done"
 FAILED = "failed"
 CANCELLED = "cancelled"
 
+# Maximum number of terminal (done/failed/cancelled) assignments retained in
+# memory and persisted to agent_state.json (#452).  Oldest entries (by
+# finished_at, falling back to started_at) are dropped once this limit is
+# exceeded.  Active (pending/running) assignments are never pruned.
+_COMPLETED_HISTORY_CAP = 50
+
 
 # ── Reap tuning ───────────────────────────────────────────────────────────────
 # claude-cli sometimes does not exit after emitting its final
@@ -2433,6 +2439,20 @@ class AgentServer:
 
     def _persist(self) -> None:
         with self._lock:
+            # Cap terminal assignments to keep both in-memory state and the
+            # persisted file bounded (#452).  Active (pending/running)
+            # assignments are never touched so in-flight work is safe.
+            terminal = [
+                a for a in self._assignments.values()
+                if a.status not in (PENDING, RUNNING)
+            ]
+            if len(terminal) > _COMPLETED_HISTORY_CAP:
+                terminal.sort(
+                    key=lambda a: a.finished_at or a.started_at or 0.0,
+                    reverse=True,
+                )
+                for old in terminal[_COMPLETED_HISTORY_CAP:]:
+                    self._assignments.pop(old.id, None)
             data = {
                 "machine": self.machine_name,
                 "capabilities": self.capabilities,
@@ -2466,6 +2486,21 @@ class AgentServer:
                 if a.finished_at is None:
                     a.finished_at = time.time()
             self._assignments[a.id] = a
+
+        # Cap terminal history immediately on load so the first /status poll
+        # after a restart with a bloated state file is already bounded (#452).
+        # No lock needed here — __init__ hasn't started any threads yet.
+        terminal = [
+            a for a in self._assignments.values()
+            if a.status not in (PENDING, RUNNING)
+        ]
+        if len(terminal) > _COMPLETED_HISTORY_CAP:
+            terminal.sort(
+                key=lambda a: a.finished_at or a.started_at or 0.0,
+                reverse=True,
+            )
+            for old in terminal[_COMPLETED_HISTORY_CAP:]:
+                self._assignments.pop(old.id, None)
 
         # Prune stale worktrees on startup
         self._prune_worktrees()
