@@ -64,6 +64,31 @@ def _reassign(
     machine = candidates[0]
     repo_path = machine.repo_path(failed.repo_name)
 
+    # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-reassign is an
+    # unattended dispatch path; refuse to retry through a provider that
+    # opts out of unattended use.  Resolve precedence with per-repo
+    # override and the global default (the failed assignment doesn't
+    # carry a spec-level provider into this path).  On refusal: skip the
+    # reassignment — the failed assignment stays failed for human
+    # attention rather than getting silently re-tried on the wrong
+    # provider.
+    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+    repo_for_provider = config.repo(failed.repo_name)
+    try:
+        guard_unattended_dispatch(
+            spec_provider=None,
+            repo_provider=(
+                repo_for_provider.provider
+                if repo_for_provider is not None
+                else None
+            ),
+            providers_cfg=config.providers,
+            models_cfg=config.models,
+            where="auto-reassign (reconcile)",
+        )
+    except ValueError:
+        return None
+
     retry_model = model if model is not None else failed.model
     # The Assignment keeps the alias for legibility; the wire payload is
     # resolved through models.versions when an exact id is pinned.

@@ -58,6 +58,12 @@ class ClaudeProvider(Provider):
             true_system_prompt=True,
             enforces_deny_list=True,
             billing_mode="metered",
+            # #437: claude -p is an unattended/headless backend — billed
+            # per-token and intended for autonomous dispatch.  This is the
+            # COMPLIANT automatable path and must NOT be flagged as
+            # human-attended.  Set explicitly (not by default) to make the
+            # intent visible in code.
+            human_attended_only=False,
         )
 
     # ── Core methods ──────────────────────────────────────────────────────────

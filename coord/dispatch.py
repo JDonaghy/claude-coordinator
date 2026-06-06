@@ -46,6 +46,23 @@ def dispatch(
 
     # Resolve deny-list from the repo's worker_permissions config.
     repo = config.repo(proposal.repo_name)
+
+    # #437: STRUCTURAL TOS-COMPLIANCE GATE — refuse to route an
+    # unattended dispatch through a provider whose capabilities mark it
+    # ``human_attended_only`` (subscription-billed interactive Claude
+    # Code).  Precedence: per-proposal override (if the brain ever sets
+    # one) → per-repo ``Repo.provider`` → ``config.providers.default``.
+    # Deferred import so the unattended dispatch surface stays free of a
+    # module-level cycle with the provider registry.
+    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+    spec_provider = getattr(proposal, "provider", None)
+    guard_unattended_dispatch(
+        spec_provider=spec_provider,
+        repo_provider=repo.provider if repo is not None else None,
+        providers_cfg=config.providers,
+        models_cfg=config.models,
+        where="coord approve / dispatch",
+    )
     deny_commands: list[str] = []
     if repo is not None and repo.worker_permissions is not None:
         deny_commands = repo.worker_permissions.deny

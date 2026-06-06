@@ -31,6 +31,7 @@ __all__ = [
     "Provider",
     "WorkerSummary",
     "build_provider",
+    "guard_unattended_dispatch",
     "resolve_provider_name",
 ]
 
@@ -103,3 +104,79 @@ def resolve_provider_name(
     if repo_provider is not None:
         return repo_provider
     return providers_cfg.default
+
+
+def guard_unattended_dispatch(
+    *,
+    spec_provider: str | None,
+    repo_provider: str | None,
+    providers_cfg: "ProvidersConfig",
+    models_cfg: "ModelsConfig | None" = None,
+    where: str = "unattended dispatch",
+) -> str:
+    """STRUCTURAL TOS-COMPLIANCE GATE for unattended dispatch (#437).
+
+    Resolves the effective provider name with :func:`resolve_provider_name`
+    (precedence: spec → repo → providers.default), then instantiates the
+    provider via :func:`build_provider` and inspects its
+    :class:`~coord.providers.base.Capabilities`.  Raises :class:`ValueError`
+    if ``capabilities().human_attended_only`` is ``True`` — that flag means
+    the backend (currently :class:`~coord.providers.claude_pty.ClaudePtyProvider`,
+    interactive subscription-billed Claude Code) is only licensed for
+    human-attended use under Anthropic ToS §3.7 and must NEVER be selected
+    for autonomous routing.
+
+    This gate is called from every unattended dispatch path
+    (``coord.dispatch.dispatch``, ``coord.review.dispatch_review``,
+    ``coord.reconcile._reassign``).  The human-attended escape hatch
+    (``coord assign --interactive``) deliberately skips this gate.
+
+    Args:
+        spec_provider: Per-spec/per-proposal provider override, or ``None``.
+        repo_provider: Per-repo provider override (``Repo.provider``), or
+            ``None``.
+        providers_cfg: The coordinator's
+            :class:`~coord.config.ProvidersConfig`.
+        models_cfg: Optional :class:`~coord.config.ModelsConfig`, forwarded
+            to :func:`build_provider`.
+        where: Short description of the calling site (e.g.
+            ``"coord approve / dispatch"``) — interpolated into the error
+            message so the human knows which path refused.
+
+    Returns:
+        The effective provider name (also returned for callers that want to
+        thread it onward to the wire payload).
+
+    Raises:
+        ValueError: When the effective provider opts out of unattended use.
+            The message names the provider, explains why, and points the
+            user at ``coord assign --interactive``.
+    """
+    name = resolve_provider_name(spec_provider, repo_provider, providers_cfg)
+    definition = providers_cfg.definitions.get(name)
+    if definition is None:
+        # Unknown name (not in registry) → fall through; the agent's own
+        # unknown-provider handling kicks in.  Don't fabricate a refusal
+        # for a typo'd provider name; let the existing error path surface
+        # it as a validation failure at the agent.
+        return name
+    try:
+        provider = build_provider(name, definition, models_cfg)
+    except ValueError:
+        # build_provider raises on unknown TYPE; the caller will hit the
+        # same error path on dispatch.  Don't shadow it here.
+        return name
+    caps = provider.capabilities()
+    if caps.human_attended_only:
+        raise ValueError(
+            f"refusing {where}: provider {name!r} reports "
+            f"capabilities().human_attended_only=True — this backend is "
+            f"licensed only for human-attended interactive use (Anthropic "
+            f"ToS §3.7) and must NEVER be selected for unattended "
+            f"automation.  To launch a human-attended session, run "
+            f"`coord assign --interactive <machine> <repo> <issue>` from "
+            f"the operator's terminal; the human drives and closes the "
+            f"session.  To dispatch unattended, configure a non-human-"
+            f"attended provider (e.g. `claude`)."
+        )
+    return name

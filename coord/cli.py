@@ -1826,6 +1826,20 @@ def approve(
         "network for GH HEADs.  Matches `coord approve --skip-freshness` (#267)."
     ),
 )
+@click.option(
+    "--interactive",
+    is_flag=True,
+    help=(
+        "HUMAN-ATTENDED launcher (#437): start interactive `claude` "
+        "locally on THIS terminal with the briefing PRE-FILLED in the "
+        "input box.  You press Enter to submit and Ctrl-C / `/exit` to "
+        "end the session.  Used for the subscription-billed path; the "
+        "coordinator does NOT watch the TTY, does NOT auto-submit, does "
+        "NOT advance the pipeline from session output.  This bypasses "
+        "the agent HTTP server and runs `claude` as a child of your "
+        "shell."
+    ),
+)
 def assign(
     machine: str,
     repo: str,
@@ -1839,6 +1853,7 @@ def assign(
     force: bool,
     no_pull: bool,
     skip_freshness: bool,
+    interactive: bool,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -1898,6 +1913,77 @@ def assign(
         issue_body = issue_data.get("body", "")
         if issue_body:
             briefing = f"Issue #{issue}: {issue_title}\n\n{issue_body}"
+
+    # #437: HUMAN-ATTENDED branch.  When --interactive is set, we run
+    # interactive `claude` as a child of THIS shell with the briefing
+    # PRE-FILLED in the input box.  No HTTP agent, no Proposal, no
+    # GitHub posting, no board update — the operator drives the session
+    # and closes it manually.  This is the subscription-billed escape
+    # hatch from Anthropic ToS §3.7 metering.  Resolving
+    # ClaudePtyProvider here AND asserting its capabilities are flagged
+    # human_attended_only is the structural guarantee that this path is
+    # the only one that can launch it; the unattended dispatch sites
+    # (dispatch/review/reconcile) refuse the same capability.
+    if interactive:
+        from coord.providers import ClaudePtyProvider  # noqa: PLC0415
+        from coord.interactive import (  # noqa: PLC0415
+            launch_human_attended_interactive,
+        )
+
+        provider = ClaudePtyProvider()
+        caps = provider.capabilities()
+        # Structural guard: confirm we wired the right backend.
+        assert caps.human_attended_only is True, (
+            "BUG: --interactive resolved a provider whose capabilities do "
+            "NOT report human_attended_only=True; refusing to launch."
+        )
+
+        repo_path = machine_obj.repo_path(repo) or str(
+            Path.cwd()
+        )
+
+        # Build an AssignmentSpec so the provider produces the same argv
+        # the agent-side spawn would build.  Note: provider="claude-pty"
+        # is set so any downstream introspection records the right value;
+        # we do NOT POST this spec anywhere.
+        from coord.agent import AssignmentSpec  # noqa: PLC0415
+
+        resolved_model = model if model else cfg.models.default
+        spec = AssignmentSpec(
+            repo_name=repo,
+            repo_path=repo_path,
+            issue_number=issue,
+            issue_title=issue_title,
+            briefing=briefing,
+            model=resolved_model,
+            type="plan" if (plan_only or (cfg.dispatch.require_plan and not no_plan)) else "work",
+            provider="claude-pty",
+        )
+        argv = provider.build_command(spec, resolved_model=resolved_model)
+
+        click.echo(
+            f"{machine} (local TTY) → {repo} #{issue}: {issue_title}"
+        )
+        click.echo("  mode: HUMAN-ATTENDED interactive launch (#437)")
+        click.echo(
+            "  the briefing will be PRE-FILLED in the input box; "
+            "press Enter to submit; Ctrl-C / `/exit` to end the session."
+        )
+        if dry_run:
+            click.echo("  (dry run — not launched)")
+            click.echo(f"  would exec: {argv}")
+            click.echo(f"  cwd: {repo_path}")
+            return
+        # The launcher relays the operator's TTY to/from the child's
+        # PTY master, injects the bracketed-paste pre-fill ONCE after
+        # readiness, then exits when the child exits.  No coordinator
+        # state is mutated; no GitHub call is made.
+        exit_code = launch_human_attended_interactive(
+            argv, briefing, cwd=repo_path
+        )
+        if exit_code != 0:
+            click.echo(f"  claude exited with status {exit_code}", err=True)
+        sys.exit(exit_code)
 
     # Build a Proposal inline
     from coord.models import Proposal
