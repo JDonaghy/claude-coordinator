@@ -12275,23 +12275,16 @@ impl CoordApp {
         lh: f32,
         char_w: f32,
     ) -> bool {
-        let cw = char_w.max(1.0);
-        let ch = lh.max(1.0);
         match self.active_view {
             SidebarView::Terminal => {
                 // Terminal surface occupies the full main content rect (the
                 // Terminal view has no panel toolbar, so main_b == the PTY area).
-                let in_rect = pos.x >= main_b.x
-                    && pos.x < main_b.x + main_b.width
-                    && pos.y >= main_b.y
-                    && pos.y < main_b.y + main_b.height;
-                if !in_rect {
-                    return false;
-                }
-                let col = ((pos.x - main_b.x) / cw) as u16;
-                let row = ((pos.y - main_b.y) / ch) as u16;
-                if let Some(ref mut sess) = self.terminal_session {
-                    return sess.forward_mouse(kind, button, col, row, modifiers);
+                if let Some((col, row)) =
+                    terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
+                {
+                    if let Some(ref mut sess) = self.terminal_session {
+                        return sess.forward_mouse(kind, button, col, row, modifiers);
+                    }
                 }
                 false
             }
@@ -12299,20 +12292,14 @@ impl CoordApp {
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
                 // Content area starts below the tab bar (lh * 1.4 rows).
-                let tab_h = lh * 1.4;
-                let content_y = main_b.y + tab_h;
-                let in_rect = pos.x >= main_b.x
-                    && pos.x < main_b.x + main_b.width
-                    && pos.y >= content_y
-                    && pos.y < main_b.y + main_b.height;
-                if !in_rect {
-                    return false;
-                }
-                let col = ((pos.x - main_b.x) / cw) as u16;
-                let row = ((pos.y - content_y) / ch) as u16;
-                if let Some(issue_num) = self.selected_issue_number() {
-                    if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
-                        return sess.forward_mouse(kind, button, col, row, modifiers);
+                let content_y = main_b.y + lh * 1.4;
+                if let Some((col, row)) =
+                    terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+                {
+                    if let Some(issue_num) = self.selected_issue_number() {
+                        if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
+                            return sess.forward_mouse(kind, button, col, row, modifiers);
+                        }
                     }
                 }
                 false
@@ -20977,6 +20964,44 @@ fn record_test_verdict_db(
 ) -> rusqlite::Result<()> {
     let conn = open_purge_conn()?;
     record_test_verdict_conn(&conn, assignment_id, verdict, reason)
+}
+
+// ─── Terminal mouse coordinate helpers ────────────────────────────────────────
+
+/// Translate a pixel position into terminal (col, row) cell coordinates.
+///
+/// `rect` is the full bounding box of the PTY surface (in pixels).
+/// `origin_y` is the Y pixel coordinate where **row 0** starts:
+///   - Standalone `SidebarView::Terminal`: pass `rect.y`
+///     (the entire main-content rect is the PTY area, no toolbar above it).
+///   - `SidebarView::Pipeline` with the Terminal tab: pass `rect.y + lh * 1.4`
+///     (a tab bar occupies the top `lh * 1.4` pixels before the PTY content begins).
+///
+/// `char_w` and `line_h` are the backend's character cell dimensions in pixels.
+/// Both are clamped to `1.0` to guard against zero/sub-pixel values.
+///
+/// Returns `None` when `pos` lies outside the active PTY area
+/// (left of `rect.x`, right of `rect.x + rect.width`, above `origin_y`, or
+/// below `rect.y + rect.height`).
+fn terminal_pixel_to_cell(
+    pos: Point,
+    rect: Rect,
+    origin_y: f32,
+    char_w: f32,
+    line_h: f32,
+) -> Option<(u16, u16)> {
+    let cw = char_w.max(1.0);
+    let ch = line_h.max(1.0);
+    if pos.x < rect.x
+        || pos.x >= rect.x + rect.width
+        || pos.y < origin_y
+        || pos.y >= rect.y + rect.height
+    {
+        return None;
+    }
+    let col = ((pos.x - rect.x) / cw) as u16;
+    let row = ((pos.y - origin_y) / ch) as u16;
+    Some((col, row))
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -30307,5 +30332,223 @@ mod tests {
             .get_mut(&440)
             .unwrap()
             .write_input(b"exit\r");
+    }
+
+    // ── terminal_pixel_to_cell ────────────────────────────────────────────────
+    //
+    // These tests exercise the coordinate-translation helper in isolation, before
+    // any session exists.  They cover:
+    //   (a) the standalone Terminal branch: origin_y == rect.y
+    //   (b) the Pipeline/Terminal branch:  origin_y == rect.y + tab_h
+    //   (c) boundary / out-of-bounds cases for all four edges
+    //   (d) char_w / line_h clamping to 1.0
+
+    #[test]
+    fn tpc_top_left_corner_maps_to_origin() {
+        // Clicking the very first pixel of the PTY area should be (col=0, row=0).
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(10.0, 20.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn tpc_mid_rect_correct_col_row() {
+        // x-offset = 24 px / 8 px-per-col = col 3
+        // y-offset = 32 px / 16 px-per-row = row 2
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(34.0, 52.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0),
+            Some((3, 2))
+        );
+    }
+
+    #[test]
+    fn tpc_outside_left_returns_none() {
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(9.9, 30.0);
+        assert_eq!(terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0), None);
+    }
+
+    #[test]
+    fn tpc_at_right_edge_exclusive_returns_none() {
+        // x == rect.x + rect.width is *outside* (exclusive upper bound)
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(90.0, 30.0); // 10 + 80 = 90 → None
+        assert_eq!(terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0), None);
+    }
+
+    #[test]
+    fn tpc_outside_top_returns_none() {
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(30.0, 19.9);
+        assert_eq!(terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0), None);
+    }
+
+    #[test]
+    fn tpc_at_bottom_edge_exclusive_returns_none() {
+        // y == rect.y + rect.height is *outside* (exclusive upper bound)
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(30.0, 60.0); // 20 + 40 = 60 → None
+        assert_eq!(terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0), None);
+    }
+
+    /// Pipeline/Terminal branch: the tab bar occupies `lh * 1.4` pixels above
+    /// the content area, so `origin_y = rect.y + lh * 1.4`.
+    #[test]
+    fn tpc_pipeline_tab_bar_area_returns_none() {
+        let rect = Rect::new(0.0, 0.0, 100.0, 80.0);
+        let lh = 16.0_f32;
+        let origin_y = rect.y + lh * 1.4; // 22.4
+        // Cursor in the tab bar (y=10 < 22.4) → None
+        let in_tab = Point::new(50.0, 10.0);
+        assert_eq!(terminal_pixel_to_cell(in_tab, rect, origin_y, 8.0, lh), None);
+    }
+
+    #[test]
+    fn tpc_pipeline_content_just_below_tab_bar_is_row_zero() {
+        let rect = Rect::new(0.0, 0.0, 100.0, 80.0);
+        let lh = 16.0_f32;
+        let origin_y = rect.y + lh * 1.4; // 22.4
+        // Cursor at y == origin_y → row 0; x=50 / cw=8 → col 6
+        let just_below = Point::new(50.0, 22.4);
+        assert_eq!(
+            terminal_pixel_to_cell(just_below, rect, origin_y, 8.0, lh),
+            Some((6, 0))
+        );
+    }
+
+    #[test]
+    fn tpc_pipeline_content_mid_area_correct_row_offset() {
+        // The row is measured from origin_y, NOT from rect.y.
+        // y=54.4, origin_y=22.4 → y_offset=32.0 / 16 = row 2
+        // x=16.0 / 8.0 = col 2
+        let rect = Rect::new(0.0, 0.0, 100.0, 80.0);
+        let lh = 16.0_f32;
+        let origin_y = rect.y + lh * 1.4; // 22.4
+        let pos = Point::new(16.0, 54.4);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 8.0, lh),
+            Some((2, 2))
+        );
+    }
+
+    #[test]
+    fn tpc_zero_char_dimensions_clamped_to_one() {
+        // char_w=0.0 / line_h=0.0 must clamp to 1.0 (no divide-by-zero).
+        let rect = Rect::new(0.0, 0.0, 50.0, 50.0);
+        let pos = Point::new(5.0, 10.0);
+        // cw=1.0 → col=5;  ch=1.0 → row=10
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, rect.y, 0.0, 0.0),
+            Some((5, 10))
+        );
+    }
+
+    // ── terminal_mouse_event routing ─────────────────────────────────────────
+    //
+    // These tests verify that `terminal_mouse_event` delegates to the correct
+    // branch for each SidebarView.  Because no real TerminalSession is wired up
+    // in `make_test_app`, every call returns `false` — the useful invariant is
+    // that neither branch panics and the code compiles against both view paths.
+
+    #[test]
+    fn terminal_mouse_event_terminal_view_no_session_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // Point inside the PTY rect — returns false because session is None.
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            MouseButton::Left,
+            Point::new(50.0, 50.0),
+            Modifiers::default(),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_mouse_event_terminal_view_outside_rect_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(100.0, 50.0, 80.0, 40.0);
+        // Point outside the rect — returns false immediately without touching session.
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            quadraui::MouseButton::Left,
+            Point::new(10.0, 10.0), // well outside
+            quadraui::Modifiers::default(),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_mouse_event_pipeline_terminal_tab_no_session_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // Point inside the content area (below the tab bar).
+        let lh = 16.0_f32;
+        let content_y = main_b.y + lh * 1.4; // 22.4
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            quadraui::MouseButton::Left,
+            Point::new(50.0, content_y + 5.0), // just inside the PTY content
+            quadraui::Modifiers::default(),
+            main_b,
+            lh,
+            8.0,
+        );
+        assert!(!result); // no session → false
+    }
+
+    #[test]
+    fn terminal_mouse_event_pipeline_terminal_tab_in_tab_bar_returns_false() {
+        // A point in the tab bar (above origin_y) must return false — it lies
+        // outside the PTY content rect and should never reach forward_mouse.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let lh = 16.0_f32;
+        // y=5.0 is inside the tab bar (tab_h=22.4), not in the PTY area.
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            quadraui::MouseButton::Left,
+            Point::new(50.0, 5.0),
+            quadraui::Modifiers::default(),
+            main_b,
+            lh,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_mouse_event_non_terminal_view_returns_false() {
+        // Board view has no PTY — the _ arm must return false immediately.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Board;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            MouseButton::Left,
+            Point::new(50.0, 50.0),
+            Modifiers::default(),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
     }
 }
