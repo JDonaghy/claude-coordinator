@@ -2437,22 +2437,34 @@ class AgentServer:
         if assignment is not None:
             self._cleanup_worktree(assignment)
 
+    def _prune_completed_history(self) -> None:
+        """Drop oldest terminal assignments over _COMPLETED_HISTORY_CAP (#452).
+
+        Caller must hold self._lock (or call from __init__ before threads
+        start).  Active (pending/running) assignments are never pruned.
+        """
+        terminal = [
+            a for a in self._assignments.values()
+            if a.status not in (PENDING, RUNNING)
+        ]
+        if len(terminal) > _COMPLETED_HISTORY_CAP:
+            terminal.sort(
+                key=lambda a: (
+                    a.finished_at if a.finished_at is not None
+                    else a.started_at if a.started_at is not None
+                    else 0.0
+                ),
+                reverse=True,
+            )
+            for old in terminal[_COMPLETED_HISTORY_CAP:]:
+                self._assignments.pop(old.id, None)
+
     def _persist(self) -> None:
         with self._lock:
             # Cap terminal assignments to keep both in-memory state and the
             # persisted file bounded (#452).  Active (pending/running)
             # assignments are never touched so in-flight work is safe.
-            terminal = [
-                a for a in self._assignments.values()
-                if a.status not in (PENDING, RUNNING)
-            ]
-            if len(terminal) > _COMPLETED_HISTORY_CAP:
-                terminal.sort(
-                    key=lambda a: a.finished_at or a.started_at or 0.0,
-                    reverse=True,
-                )
-                for old in terminal[_COMPLETED_HISTORY_CAP:]:
-                    self._assignments.pop(old.id, None)
+            self._prune_completed_history()
             data = {
                 "machine": self.machine_name,
                 "capabilities": self.capabilities,
@@ -2490,17 +2502,7 @@ class AgentServer:
         # Cap terminal history immediately on load so the first /status poll
         # after a restart with a bloated state file is already bounded (#452).
         # No lock needed here — __init__ hasn't started any threads yet.
-        terminal = [
-            a for a in self._assignments.values()
-            if a.status not in (PENDING, RUNNING)
-        ]
-        if len(terminal) > _COMPLETED_HISTORY_CAP:
-            terminal.sort(
-                key=lambda a: a.finished_at or a.started_at or 0.0,
-                reverse=True,
-            )
-            for old in terminal[_COMPLETED_HISTORY_CAP:]:
-                self._assignments.pop(old.id, None)
+        self._prune_completed_history()
 
         # Prune stale worktrees on startup
         self._prune_worktrees()
