@@ -11647,6 +11647,26 @@ impl CoordApp {
                             return true;
                         }
                     }
+                } else if ctx.in_main(pos.x, pos.y) {
+                    // #454: Forward right-click Press to the embedded PTY when
+                    // mouse reporting is enabled.  Without this the PTY would
+                    // receive an orphaned Release (from the MouseUp arm) with
+                    // no corresponding Press, breaking right-click in apps
+                    // such as vim or tmux.
+                    let main_b = ctx.main_bounds();
+                    let char_w = backend.char_width();
+                    let lh = backend.line_height();
+                    if self.terminal_mouse_event(
+                        TerminalMouseKind::Press,
+                        MouseButton::Right,
+                        pos,
+                        quadraui::Modifiers::default(),
+                        main_b,
+                        lh,
+                        char_w,
+                    ) {
+                        return true;
+                    }
                 }
                 false
             }
