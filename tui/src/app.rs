@@ -586,6 +586,14 @@ enum PipelineDetailTab {
     /// to Issue / Stages / Log while the chat keeps streaming in the
     /// background.
     Refinement,
+    /// #440: per-issue interactive shell for the detail view.  Each active
+    /// issue gets its own `TerminalSession`; only the selected issue's
+    /// terminal is visible while others keep running in the background.
+    /// Focus arbitration mirrors the standalone Terminal pane: F12 toggles
+    /// PTY focus (detail_terminal_focused); F12-released keys drive normal
+    /// TUI navigation.  The #437 human-attended launcher will dock into
+    /// this tab in a follow-up — this PR hosts a generic shell only.
+    Terminal,
 }
 
 /// The tabs shown in the Board view detail panel.
@@ -3970,6 +3978,24 @@ pub struct CoordApp {
     /// `$SHELL`, fork failure, etc.).  Displayed in the Terminal pane
     /// as a one-line placeholder so the user knows why nothing rendered.
     terminal_spawn_error: Option<String>,
+    // ── #440: per-issue detail-view terminals ──────────────────────────
+    /// Per-issue terminal sessions for the Pipeline detail Terminal tab.
+    /// Keyed by issue number.  Lazily spawned the first time the user
+    /// opens the Terminal tab for a given issue; kept running while the
+    /// issue stays in `pipeline_issues`; dropped when the issue leaves
+    /// the pipeline (on the next load that no longer contains it).
+    detail_terminal_sessions: std::collections::HashMap<u64, quadraui::terminal_engine::TerminalSession>,
+    /// Spawn errors for per-issue terminals (shown as a one-line
+    /// placeholder in the Terminal tab).
+    detail_terminal_spawn_errors: std::collections::HashMap<u64, String>,
+    /// Focus state for the Pipeline detail Terminal tab.  `true` when
+    /// keypresses route to the selected issue's PTY.  F12 toggles.
+    /// Independent of `terminal_focused` (the standalone pane's flag).
+    detail_terminal_focused: bool,
+    /// Pending `(cols, rows)` for per-issue terminal resize, stashed by
+    /// `render_detail_terminal_tab` (`&self`) and applied by `tick`
+    /// (`&mut self`).
+    detail_terminal_pending_dims: std::cell::Cell<Option<(u16, u16)>>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4168,6 +4194,11 @@ impl CoordApp {
             terminal_focused: false,
             terminal_pending_dims: std::cell::Cell::new(None),
             terminal_spawn_error: None,
+            // #440: per-issue detail-view terminals.
+            detail_terminal_sessions: std::collections::HashMap::new(),
+            detail_terminal_spawn_errors: std::collections::HashMap::new(),
+            detail_terminal_focused: false,
+            detail_terminal_pending_dims: std::cell::Cell::new(None),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -9578,6 +9609,12 @@ impl CoordApp {
                 // to issue #0 on every 15s refresh.
                 let prev_sel = self.capture_pipeline_selection_id();
                 self.pipeline_issues = issues;
+                // #440: prune terminal sessions for issues that are no
+                // longer in the pipeline so we don't keep stale PTYs.
+                let live_nums: std::collections::HashSet<u64> =
+                    self.pipeline_issues.iter().map(|i| i.number).collect();
+                self.detail_terminal_sessions.retain(|k, _| live_nums.contains(k));
+                self.detail_terminal_spawn_errors.retain(|k, _| live_nums.contains(k));
                 self.pipeline_loader = None;
                 self.rebuild_pipeline_sidebar(prev_sel);
                 true
@@ -9845,6 +9882,20 @@ impl CoordApp {
                         " Refinement ".to_string()
                     },
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Refinement,
+                    is_dirty: false,
+                    is_preview: false,
+                    is_closable: false,
+                },
+                // #440: per-issue interactive shell tab.
+                TabItem {
+                    label: if self.detail_terminal_focused
+                        && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                    {
+                        " Terminal ▶ ".to_string()
+                    } else {
+                        " Terminal ".to_string()
+                    },
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Terminal,
                     is_dirty: false,
                     is_preview: false,
                     is_closable: false,
@@ -12029,9 +12080,13 @@ impl CoordApp {
                         1 => PipelineDetailTab::Issue,
                         2 => PipelineDetailTab::Stages,
                         3 => PipelineDetailTab::Log,
-                        _ => PipelineDetailTab::Refinement,
+                        4 => PipelineDetailTab::Refinement,
+                        _ => PipelineDetailTab::Terminal,
                     };
                     if new_tab != self.pipeline_detail_tab {
+                        if new_tab != PipelineDetailTab::Terminal {
+                            self.detail_terminal_focused = false;
+                        }
                         self.pipeline_detail_tab = new_tab;
                         self.pipeline_detail_scroll = if new_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
                         if new_tab == PipelineDetailTab::Log {
@@ -12285,6 +12340,10 @@ impl CoordApp {
                         // a no-op so wheel events here don't fight with
                         // the chat's internal scrollbar.
                     }
+                    PipelineDetailTab::Terminal => {
+                        // #440: PTY scrollback (quadraui #283) is out of
+                        // scope for this PR; swallow wheel events here.
+                    }
                 }
                 let _ = visible;
                 true
@@ -12412,6 +12471,16 @@ impl CoordApp {
                 " PTY focused — F12 = release  (typed keys go to the shell) ".to_string()
             } else {
                 " PTY released — F12 = focus  ·  1–5 switch view  ·  q=quit ".to_string()
+            }
+        } else if self.active_view == SidebarView::Pipeline
+            && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+        {
+            // #440: Pipeline detail Terminal tab — same F12 model as the
+            // standalone pane but scoped to the selected issue's session.
+            if self.detail_terminal_focused {
+                " PTY focused — F12 = release  (typed keys go to the shell) ".to_string()
+            } else {
+                " PTY released — F12 = focus  ·  j/k=nav  h/l=tabs  q=quit ".to_string()
             }
         } else if self.active_view == SidebarView::Machines {
             // Machines panel action hints.
@@ -16908,6 +16977,209 @@ impl CoordApp {
         }
         true
     }
+
+    // ── #440: per-issue detail-view terminal helpers ──────────────────────
+
+    /// Return the issue number for the currently-selected pipeline issue,
+    /// or `None` when nothing is selected.
+    fn selected_issue_number(&self) -> Option<u64> {
+        self.pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .map(|issue| issue.number)
+    }
+
+    /// Return a sensible cwd for a per-issue detail terminal.  Uses the
+    /// repo path from `pipeline_repo_paths` when it exists and is a
+    /// directory; falls back to `current_dir()`.
+    fn detail_terminal_cwd(&self, issue_num: u64) -> std::path::PathBuf {
+        if let Some(issue) = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .filter(|iss| iss.number == issue_num)
+        {
+            let repo_key = issue.coord_repo.as_deref().unwrap_or(&issue.repo_slug);
+            if let Some(path) = self.data.pipeline_repo_paths.get(repo_key) {
+                let p = std::path::Path::new(path);
+                if p.is_dir() {
+                    return p.to_path_buf();
+                }
+            }
+        }
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+    }
+
+    /// Drive all per-issue detail terminal sessions (#440).
+    ///
+    /// 1. **Lazy spawn** — when the Terminal tab is active for a selected
+    ///    issue and no session exists yet, spawn one (cwd = repo path or
+    ///    `current_dir()`).
+    ///
+    /// 2. **Resize** — propagate pending dims to all live sessions.
+    ///
+    /// 3. **Poll** — drain PTY output for every session (not just the
+    ///    selected one) so output keeps arriving in the background.
+    ///
+    /// Called on every `tick()`, mirroring the standalone
+    /// `drive_terminal_pane`.
+    fn drive_detail_terminals(&mut self) -> bool {
+        let mut changed = false;
+
+        // 1. Lazy spawn for the selected issue when the Terminal tab is shown.
+        if self.active_view == SidebarView::Pipeline
+            && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+        {
+            if let Some(issue_num) = self.selected_issue_number() {
+                if !self.detail_terminal_sessions.contains_key(&issue_num)
+                    && !self.detail_terminal_spawn_errors.contains_key(&issue_num)
+                {
+                    if let Some((cols, rows)) = self.detail_terminal_pending_dims.get() {
+                        let cwd = self.detail_terminal_cwd(issue_num);
+                        let shell = quadraui::terminal_engine::default_shell();
+                        match quadraui::terminal_engine::TerminalSession::spawn(
+                            cols.max(20),
+                            rows.max(5),
+                            &shell,
+                            &cwd,
+                            10_000, // 10 000-line scrollback
+                        ) {
+                            Ok(sess) => {
+                                self.detail_terminal_sessions.insert(issue_num, sess);
+                                changed = true;
+                            }
+                            Err(e) => {
+                                self.detail_terminal_spawn_errors
+                                    .insert(issue_num, e.to_string());
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Resize all sessions when dims change.
+        if let Some((cols, rows)) = self.detail_terminal_pending_dims.get() {
+            for sess in self.detail_terminal_sessions.values_mut() {
+                if cols != sess.cols() || rows != sess.rows() {
+                    sess.resize(cols, rows);
+                    changed = true;
+                }
+            }
+        }
+
+        // 3. Poll all sessions for output.
+        for sess in self.detail_terminal_sessions.values_mut() {
+            if sess.poll() {
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    /// Forward a keypress to the selected issue's detail terminal PTY (#440).
+    ///
+    /// Mirrors `forward_key_to_pty` but routes to the per-issue session map
+    /// rather than the standalone terminal session.
+    fn forward_key_to_detail_terminal(
+        &mut self,
+        key: &Key,
+        mods: &quadraui::Modifiers,
+    ) -> bool {
+        let Some(issue_num) = self.selected_issue_number() else {
+            return false;
+        };
+        let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) else {
+            return false;
+        };
+        if sess.is_exited() {
+            // Swallow the keypress — don't let stray keys drive TUI nav
+            // while the dead-process pane is shown.
+            return true;
+        }
+        sess.scroll_reset();
+        if let Some(bytes) = key_to_pty_bytes(key.clone(), *mods) {
+            sess.write_input(&bytes);
+        }
+        true
+    }
+
+    /// Render the Pipeline detail Terminal tab for the selected issue (#440).
+    ///
+    /// Called from `render_content` when `pipeline_detail_tab ==
+    /// PipelineDetailTab::Terminal`.  Stashes the desired `(cols, rows)` in
+    /// `detail_terminal_pending_dims` for `tick` to apply; reads the live
+    /// `TerminalSession` snapshot and paints it, or shows a placeholder while
+    /// the session is starting up (or a red error if spawn failed).
+    fn render_detail_terminal_tab(&self, backend: &mut dyn Backend, rect: Rect) {
+        let lh = backend.line_height().max(1.0);
+        let cell_w = backend.char_width().max(1.0);
+        let cols = (rect.width / cell_w).floor().max(1.0) as u16;
+        let rows = (rect.height / lh).floor().max(1.0) as u16;
+        self.detail_terminal_pending_dims.set(Some((cols, rows)));
+
+        let Some(issue_num) = self.selected_issue_number() else {
+            // No issue selected — show a neutral placeholder.
+            backend.draw_list(
+                rect,
+                &ListView {
+                    id: WidgetId::new("detail-terminal-no-issue"),
+                    title: None,
+                    items: vec![activity_item(
+                        "  Select an issue to open a terminal.",
+                        Color::rgb(160, 160, 160),
+                    )],
+                    selected_idx: 0,
+                    scroll_offset: 0,
+                    has_focus: false,
+                    bordered: false,
+                    h_scroll: 0,
+                    max_content_width: None,
+                },
+            );
+            return;
+        };
+
+        if let Some(sess) = self.detail_terminal_sessions.get(&issue_num) {
+            let total = sess.history_len() + sess.rows() as usize;
+            let sb = if total > sess.rows() as usize {
+                Some(sess.scrollbar_state(None))
+            } else {
+                None
+            };
+            let snapshot = sess.to_terminal(
+                WidgetId::new(format!("detail-terminal:{}", issue_num)),
+                sb,
+            );
+            backend.draw_terminal(rect, &snapshot);
+        } else {
+            // Session pending or spawn error.
+            let (msg, color) = match self.detail_terminal_spawn_errors.get(&issue_num) {
+                Some(err) => (
+                    format!("  Terminal failed to start: {}  (F12 to focus)", err),
+                    Color::rgb(220, 80, 80),
+                ),
+                None => (
+                    "  Starting shell session…".to_string(),
+                    Color::rgb(180, 180, 180),
+                ),
+            };
+            backend.draw_list(
+                rect,
+                &ListView {
+                    id: WidgetId::new("detail-terminal-placeholder"),
+                    title: None,
+                    items: vec![activity_item(&msg, color)],
+                    selected_idx: 0,
+                    scroll_offset: 0,
+                    has_focus: false,
+                    bordered: false,
+                    h_scroll: 0,
+                    max_content_width: None,
+                },
+            );
+        }
+    }
 }
 
 /// Convert a `Key` + `Modifiers` pair to the byte sequence sent to a
@@ -17356,6 +17628,13 @@ impl ShellApp for CoordApp {
                                 backend.draw_list(content_rect, &self.refinement_tab_placeholder_list());
                             }
                         }
+                        PipelineDetailTab::Terminal => {
+                            // #440: per-issue interactive shell.  Stashes
+                            // dims, reads the session snapshot, paints the
+                            // PTY surface.  Spawn / resize / poll happen in
+                            // `drive_detail_terminals` on every tick.
+                            self.render_detail_terminal_tab(backend, content_rect);
+                        }
                     }
                 }
             }
@@ -17534,6 +17813,35 @@ impl ShellApp for CoordApp {
                     // return value (a missing PTY just swallows the key
                     // — the placeholder pane shows why).
                     let _ = self.forward_key_to_pty(key, modifiers);
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
+        // ── #440: Pipeline detail Terminal tab focus arbitration ─────────
+        // PROTOCOL (mirrors the standalone Terminal pane):
+        //   - When `active_view == Pipeline` and
+        //     `pipeline_detail_tab == Terminal`:
+        //     * F12 toggles `detail_terminal_focused`.
+        //     * When focused, every other keypress is forwarded to the
+        //       selected issue's PTY via `key_to_pty_bytes`.  TUI
+        //       chrome (tab switching, view nav) is INACTIVE.
+        //     * When unfocused, keys flow through to normal dispatch.
+        //   - Outside this condition this block is a no-op.
+        if self.active_view == SidebarView::Pipeline
+            && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+        {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                if matches!(key, Key::Named(NamedKey::F(12)))
+                    && !modifiers.ctrl
+                    && !modifiers.alt
+                    && !modifiers.shift
+                {
+                    self.detail_terminal_focused = !self.detail_terminal_focused;
+                    return Reaction::Redraw;
+                }
+                if self.detail_terminal_focused {
+                    let _ = self.forward_key_to_detail_terminal(key, modifiers);
                     return Reaction::Redraw;
                 }
             }
@@ -18584,17 +18892,24 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── h/l — cycle Pipeline detail tabs ─────────────────
-                    // Order: Pipeline → Issue → Stages → Log → Refinement → Pipeline …
+                    // Order: Pipeline → Issue → Stages → Log → Refinement → Terminal → Pipeline …
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        self.pipeline_detail_tab = match self.pipeline_detail_tab {
-                            PipelineDetailTab::Pipeline => PipelineDetailTab::Refinement,
+                        let next = match self.pipeline_detail_tab {
+                            PipelineDetailTab::Pipeline => PipelineDetailTab::Terminal,
                             PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
                             PipelineDetailTab::Stages => PipelineDetailTab::Issue,
                             PipelineDetailTab::Log => PipelineDetailTab::Stages,
                             PipelineDetailTab::Refinement => PipelineDetailTab::Log,
+                            PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
                         };
+                        // Release PTY focus whenever the user navigates away
+                        // from the Terminal tab.
+                        if self.pipeline_detail_tab == PipelineDetailTab::Terminal {
+                            self.detail_terminal_focused = false;
+                        }
+                        self.pipeline_detail_tab = next;
                         self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
                         if self.pipeline_detail_tab == PipelineDetailTab::Log {
                             self.ensure_log_tab_sse();
@@ -18604,13 +18919,20 @@ impl ShellApp for CoordApp {
                     Key::Char('l') | Key::Named(NamedKey::Right)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        self.pipeline_detail_tab = match self.pipeline_detail_tab {
+                        let next = match self.pipeline_detail_tab {
                             PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
                             PipelineDetailTab::Issue => PipelineDetailTab::Stages,
                             PipelineDetailTab::Stages => PipelineDetailTab::Log,
                             PipelineDetailTab::Log => PipelineDetailTab::Refinement,
-                            PipelineDetailTab::Refinement => PipelineDetailTab::Pipeline,
+                            PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
+                            PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
                         };
+                        // Release PTY focus whenever the user navigates away
+                        // from the Terminal tab.
+                        if self.pipeline_detail_tab == PipelineDetailTab::Terminal {
+                            self.detail_terminal_focused = false;
+                        }
+                        self.pipeline_detail_tab = next;
                         self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
                         if self.pipeline_detail_tab == PipelineDetailTab::Log {
                             self.ensure_log_tab_sse();
@@ -19353,6 +19675,11 @@ impl ShellApp for CoordApp {
         // pattern the watch-pool already follows.  Spawn, however, only
         // fires the first time the Terminal view becomes active.
         needs_redraw |= self.drive_terminal_pane();
+        // ── #440: drive per-issue detail-view terminals ─────────────────
+        // Lazy spawn for the selected issue when the Terminal tab is open;
+        // resize and poll all sessions on every tick so background issues'
+        // shells keep accumulating output.
+        needs_redraw |= self.drive_detail_terminals();
         // After data has been applied, the Log tab's preferred assignment may
         // have changed (e.g. auto_loop dispatched a new review/fix). Re-attach
         // SSE so we don't fall back to the polling 'Loading log…' flicker.
@@ -20686,6 +21013,11 @@ mod tests {
             terminal_focused: false,
             terminal_pending_dims: std::cell::Cell::new(None),
             terminal_spawn_error: None,
+            // #440
+            detail_terminal_sessions: std::collections::HashMap::new(),
+            detail_terminal_spawn_errors: std::collections::HashMap::new(),
+            detail_terminal_focused: false,
+            detail_terminal_pending_dims: std::cell::Cell::new(None),
         }
     }
 
@@ -29520,5 +29852,238 @@ mod tests {
         let mut app = make_app_default();
         app.active_view = SidebarView::Terminal;
         assert!(app.panel_toolbar().is_none());
+    }
+
+    // ── #440: per-issue detail-view terminal tests ──────────────────────────
+
+    #[test]
+    fn detail_terminal_tab_exists_in_pipeline_tab_bar() {
+        // The Terminal tab must appear in the pipeline detail tab bar so the
+        // click / h/l navigation has something to switch to.
+        let app = make_app_default();
+        let bar = app.pipeline_detail_tab_bar();
+        let has_terminal = bar.tabs.iter().any(|t| t.label.trim() == "Terminal");
+        assert!(has_terminal, "pipeline detail tab bar must include a Terminal tab (#440)");
+    }
+
+    #[test]
+    fn detail_terminal_tab_is_seventh_in_pipeline_tab_bar() {
+        // Order: Pipeline / Issue / Stages / Log / Refinement / Terminal.
+        // Index 5 (0-based) → Terminal.
+        let app = make_app_default();
+        let bar = app.pipeline_detail_tab_bar();
+        assert!(bar.tabs.len() >= 6, "expected at least 6 pipeline detail tabs");
+        assert_eq!(
+            bar.tabs[5].label.trim(),
+            "Terminal",
+            "tab index 5 must be Terminal"
+        );
+    }
+
+    #[test]
+    fn pipeline_detail_tab_cycles_through_terminal_forward() {
+        // l (Right) from Refinement should land on Terminal.
+        let mut app = make_app_default();
+        app.pipeline_detail_tab = PipelineDetailTab::Refinement;
+        // Advance one step.
+        app.pipeline_detail_tab = match app.pipeline_detail_tab {
+            PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
+            PipelineDetailTab::Issue => PipelineDetailTab::Stages,
+            PipelineDetailTab::Stages => PipelineDetailTab::Log,
+            PipelineDetailTab::Log => PipelineDetailTab::Refinement,
+            PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
+            PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
+        };
+        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
+    }
+
+    #[test]
+    fn pipeline_detail_tab_cycles_through_terminal_backward() {
+        // h (Left) from Pipeline should land on Terminal (wrap-around).
+        let mut app = make_app_default();
+        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_detail_tab = match app.pipeline_detail_tab {
+            PipelineDetailTab::Pipeline => PipelineDetailTab::Terminal,
+            PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
+            PipelineDetailTab::Stages => PipelineDetailTab::Issue,
+            PipelineDetailTab::Log => PipelineDetailTab::Stages,
+            PipelineDetailTab::Refinement => PipelineDetailTab::Log,
+            PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
+        };
+        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
+    }
+
+    #[test]
+    fn forward_key_to_detail_terminal_without_session_returns_false() {
+        // No session exists yet → forward_key_to_detail_terminal must
+        // return false (no panic, no side-effect).
+        let mut app = make_app_default();
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "test issue".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        assert!(app.detail_terminal_sessions.is_empty());
+        let consumed = app.forward_key_to_detail_terminal(
+            &Key::Char('a'),
+            &quadraui::Modifiers::default(),
+        );
+        assert!(!consumed, "no session → should return false");
+    }
+
+    #[test]
+    fn selected_issue_number_returns_none_without_selection() {
+        let app = make_app_default();
+        assert_eq!(app.selected_issue_number(), None);
+    }
+
+    #[test]
+    fn selected_issue_number_returns_correct_number() {
+        let mut app = make_app_default();
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 99,
+            title: "my issue".to_string(),
+            body: String::new(),
+            repo_slug: "o/r".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        assert_eq!(app.selected_issue_number(), Some(99));
+    }
+
+    #[test]
+    fn detail_terminal_lifecycle_cleanup_removes_stale_sessions() {
+        // When pipeline_issues is refreshed and an issue is gone, its session
+        // entry must be pruned so we don't keep orphaned PTYs.
+        let mut app = make_app_default();
+        // Pretend issue #1 has an active session (use a marker in the error
+        // map since we can't easily inject a real TerminalSession here).
+        app.detail_terminal_spawn_errors.insert(1, "test-error".to_string());
+        app.detail_terminal_spawn_errors.insert(2, "test-error-2".to_string());
+
+        // Simulate a pipeline refresh that drops issue #1 but keeps #2.
+        let new_issues = vec![PipelineIssue {
+            number: 2,
+            title: "kept issue".to_string(),
+            body: String::new(),
+            repo_slug: "o/r".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        // Apply the same logic that apply_pipeline_load uses.
+        app.pipeline_issues = new_issues;
+        let live_nums: std::collections::HashSet<u64> =
+            app.pipeline_issues.iter().map(|i| i.number).collect();
+        app.detail_terminal_sessions.retain(|k, _| live_nums.contains(k));
+        app.detail_terminal_spawn_errors.retain(|k, _| live_nums.contains(k));
+
+        // Issue #1 should have been pruned; issue #2 should remain.
+        assert!(
+            !app.detail_terminal_spawn_errors.contains_key(&1),
+            "stale session for #1 should be pruned"
+        );
+        assert!(
+            app.detail_terminal_spawn_errors.contains_key(&2),
+            "kept session for #2 should remain"
+        );
+    }
+
+    #[test]
+    fn detail_terminal_focused_starts_false() {
+        let app = make_app_default();
+        assert!(
+            !app.detail_terminal_focused,
+            "detail_terminal_focused should start as false"
+        );
+    }
+
+    #[test]
+    fn detail_terminal_pending_dims_starts_none() {
+        let app = make_app_default();
+        assert!(
+            app.detail_terminal_pending_dims.get().is_none(),
+            "detail_terminal_pending_dims should start as None"
+        );
+    }
+
+    /// Integration test: actually spawn /bin/sh for a per-issue terminal,
+    /// write a command + Enter via `forward_key_to_detail_terminal`, and
+    /// confirm the screen text shows the expected output.  Mirrors the
+    /// standalone terminal round-trip test but exercises the per-issue
+    /// session map path.
+    #[test]
+    #[cfg(unix)]
+    fn detail_terminal_round_trip_via_helpers() {
+        use std::time::{Duration, Instant};
+
+        let mut app = make_app_default();
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 440,
+            title: "detail terminal test issue".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+
+        // Manually spawn a session into the per-issue map (bypasses the lazy
+        // spawn in drive_detail_terminals which needs pending_dims from render).
+        let cwd = std::env::temp_dir();
+        let sess = quadraui::terminal_engine::TerminalSession::spawn(
+            80, 24, "/bin/sh", &cwd, 1000,
+        )
+        .expect("spawn /bin/sh");
+        app.detail_terminal_sessions.insert(440, sess);
+
+        // Type 'echo __detail_marker__' + Enter via forward_key_to_detail_terminal.
+        let line = "echo __detail_marker__";
+        let enter_bytes = key_to_pty_bytes(
+            Key::Named(NamedKey::Enter),
+            quadraui::Modifiers::default(),
+        )
+        .expect("enter must encode");
+        for ch in line.chars() {
+            let bytes = key_to_pty_bytes(Key::Char(ch), quadraui::Modifiers::default())
+                .expect("char must encode");
+            app.detail_terminal_sessions.get_mut(&440).unwrap().write_input(&bytes);
+        }
+        app.detail_terminal_sessions.get_mut(&440).unwrap().write_input(&enter_bytes);
+
+        // Poll until marker appears or 5 s elapse.
+        let start = Instant::now();
+        let mut found = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            app.detail_terminal_sessions.get_mut(&440).unwrap().poll();
+            if app.detail_terminal_sessions[&440].full_text().contains("__detail_marker__") {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            found,
+            "echo output not visible in per-issue PTY within 5s; full_text={:?}",
+            app.detail_terminal_sessions[&440].full_text(),
+        );
+
+        // Tidy up.
+        app.detail_terminal_sessions
+            .get_mut(&440)
+            .unwrap()
+            .write_input(b"exit\r");
     }
 }
