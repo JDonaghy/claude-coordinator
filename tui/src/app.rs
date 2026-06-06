@@ -3998,6 +3998,14 @@ pub struct CoordApp {
     /// `render_detail_terminal_tab` (`&self`) and applied by `tick`
     /// (`&mut self`).
     detail_terminal_pending_dims: std::cell::Cell<Option<(u16, u16)>>,
+    /// #454: bitmask of mouse buttons whose `Press` was forwarded to an
+    /// embedded PTY but whose matching `Release` has not yet been
+    /// forwarded.  Used so that a release fires even when the cursor
+    /// has been dragged outside the terminal content area — without it,
+    /// terminal apps (vim visual mode, tmux mouse drag, less) stay
+    /// stuck in "button held" state until the next click.
+    /// Bits: `1` = Left, `2` = Middle, `4` = Right.
+    pty_pressed_buttons: u8,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4201,6 +4209,8 @@ impl CoordApp {
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
+            // #454: tracks Press → Release for PTY mouse-reporting drags.
+            pty_pressed_buttons: 0,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -11561,6 +11571,10 @@ impl CoordApp {
                         lh,
                         char_w,
                     ) {
+                        // Remember the press so the matching `Release`
+                        // fires even if the user drags out of the panel
+                        // before releasing (#454 review fix).
+                        self.pty_pressed_buttons |= pty_button_bit(MouseButton::Left);
                         return true;
                     }
                     self.mouse_main_click(pos, main_b, lh)
@@ -11571,6 +11585,7 @@ impl CoordApp {
             UiEvent::MouseDown {
                 position,
                 button: MouseButton::Right,
+                modifiers,
                 ..
             } => {
                 // #259: right-click opens a context menu for the row
@@ -11579,6 +11594,7 @@ impl CoordApp {
                 // gets focused / selected, then open the menu using the
                 // newly-selected row as the target.
                 let pos = *position;
+                let modifiers = *modifiers;
                 if ctx.in_sidebar(pos.x, pos.y) {
                     if let Some(sidebar_b) = ctx.sidebar_bounds() {
                         // Pre-select the row under the cursor by routing
@@ -11660,11 +11676,15 @@ impl CoordApp {
                         TerminalMouseKind::Press,
                         MouseButton::Right,
                         pos,
-                        quadraui::Modifiers::default(),
+                        modifiers,
                         main_b,
                         lh,
                         char_w,
                     ) {
+                        // Mirror the Left-button path: remember the press
+                        // so the matching `Release` fires even if the
+                        // user releases outside the panel (#454 fix-2).
+                        self.pty_pressed_buttons |= pty_button_bit(MouseButton::Right);
                         return true;
                     }
                 }
@@ -11735,24 +11755,37 @@ impl CoordApp {
                     // mouse-reporting mode is active.  `forward_mouse`
                     // returns false when reporting is off, so there is no
                     // performance cost on the common idle path.
+                    //
+                    // Plain hover (no button held) is intentionally NOT
+                    // forwarded: under the xterm "button-event tracking"
+                    // protocol (mode 1002), a motion event always carries
+                    // a button bit, so reporting Left for hover looks
+                    // identical to a Left-drag — and would trigger vim
+                    // visual selection, tmux copy-mode drag, ranger
+                    // selection, etc. on plain cursor movement.  We
+                    // forward Move only when at least one button is
+                    // actually held (#454 review fix).
                     let char_w = backend.char_width();
                     let main_b = ctx.main_bounds();
-                    let btn = if buttons.right {
-                        MouseButton::Right
-                    } else if buttons.middle {
-                        MouseButton::Middle
-                    } else {
-                        MouseButton::Left
-                    };
-                    redraw |= self.terminal_mouse_event(
-                        TerminalMouseKind::Move,
-                        btn,
-                        pos,
-                        Modifiers::default(),
-                        main_b,
-                        lh,
-                        char_w,
-                    );
+                    if buttons.left || buttons.right || buttons.middle {
+                        let btn = if buttons.right {
+                            MouseButton::Right
+                        } else if buttons.middle {
+                            MouseButton::Middle
+                        } else {
+                            // buttons.left is true by the outer guard.
+                            MouseButton::Left
+                        };
+                        redraw |= self.terminal_mouse_event(
+                            TerminalMouseKind::Move,
+                            btn,
+                            pos,
+                            Modifiers::default(),
+                            main_b,
+                            lh,
+                            char_w,
+                        );
+                    }
                     // Note: intentional fall-through — toolbar hover tracking
                     // below still runs even when the PTY consumed the move.
                     if let Some(toolbar) = self.panel_toolbar() {
@@ -11827,11 +11860,25 @@ impl CoordApp {
                 }
                 // #454: forward button release to the embedded PTY when mouse
                 // reporting is enabled (gated inside forward_mouse itself).
-                if ctx.in_main(pos.x, pos.y) {
-                    let lh = backend.line_height();
-                    let char_w = backend.char_width();
-                    let main_b = ctx.main_bounds();
-                    if self.terminal_mouse_event(
+                //
+                // Two paths into the release:
+                //   - Cursor still in_main → normal, position-driven
+                //     forward via `terminal_mouse_event`.
+                //   - Cursor outside in_main but we have an outstanding
+                //     PTY press for this button → the user dragged out of
+                //     the panel; force-forward with the position clamped
+                //     to the PTY rect so the terminal app gets its
+                //     matching Release (vim visual mode, tmux drag, less
+                //     would otherwise stay "button held" forever).
+                let bit = pty_button_bit(btn);
+                let press_outstanding = bit != 0 && (self.pty_pressed_buttons & bit) != 0;
+                let lh = backend.line_height();
+                let char_w = backend.char_width();
+                let main_b = ctx.main_bounds();
+                let in_main = ctx.in_main(pos.x, pos.y);
+                let mut consumed = false;
+                if in_main {
+                    consumed = self.terminal_mouse_event(
                         TerminalMouseKind::Release,
                         btn,
                         pos,
@@ -11839,9 +11886,20 @@ impl CoordApp {
                         main_b,
                         lh,
                         char_w,
-                    ) {
-                        return true;
-                    }
+                    );
+                }
+                if press_outstanding && !consumed {
+                    // Out-of-bounds release: clamp position to the PTY
+                    // content rect and force-forward so the PTY sees the
+                    // matching Release.  `terminal_force_release` handles
+                    // both the standalone and Pipeline/Terminal sessions.
+                    consumed = self.terminal_force_release(btn, pos, main_b, lh, char_w);
+                }
+                if press_outstanding {
+                    self.pty_pressed_buttons &= !bit;
+                }
+                if consumed {
+                    return true;
                 }
                 false
             }
@@ -12308,6 +12366,63 @@ impl CoordApp {
         }
     }
 
+    /// #454: force-forward a `Release` to the active terminal session even
+    /// when `pos` lies outside the PTY content rect.  Mirrors
+    /// [`terminal_mouse_event`]'s routing (standalone Terminal vs
+    /// Pipeline/Terminal tab) but uses [`terminal_pixel_to_cell_clamped`]
+    /// so the cell coordinates land inside the visible grid.
+    ///
+    /// Called from the `MouseUp` arm when `pty_pressed_buttons` records an
+    /// outstanding press for `button` — without this fallback, terminal
+    /// apps that opted into mouse reporting would stay stuck in
+    /// "button held" state after the user drags out of the panel
+    /// (vim visual mode, tmux mouse drag, less, ranger, …).
+    fn terminal_force_release(
+        &mut self,
+        button: MouseButton,
+        pos: Point,
+        main_b: Rect,
+        lh: f32,
+        char_w: f32,
+    ) -> bool {
+        match self.active_view {
+            SidebarView::Terminal => {
+                let (col, row) =
+                    terminal_pixel_to_cell_clamped(pos, main_b, main_b.y, char_w, lh);
+                if let Some(ref mut sess) = self.terminal_session {
+                    return sess.forward_mouse(
+                        TerminalMouseKind::Release,
+                        button,
+                        col,
+                        row,
+                        Modifiers::default(),
+                    );
+                }
+                false
+            }
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                let content_y = main_b.y + lh * 1.4;
+                let (col, row) =
+                    terminal_pixel_to_cell_clamped(pos, main_b, content_y, char_w, lh);
+                if let Some(issue_num) = self.selected_issue_number() {
+                    if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
+                        return sess.forward_mouse(
+                            TerminalMouseKind::Release,
+                            button,
+                            col,
+                            row,
+                            Modifiers::default(),
+                        );
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Scroll wheel in the sidebar.
     fn mouse_sidebar_scroll(
         &mut self,
@@ -12490,36 +12605,40 @@ impl CoordApp {
                         // #454: Forward scroll to the PTY when the child has
                         // mouse reporting or is on the alt screen; otherwise
                         // scroll local scrollback (3 rows per notch).
-                        let tab_h = lh * 1.4;
-                        let content_y = main_b.y + tab_h;
-                        let in_term = pos.x >= main_b.x
-                            && pos.x < main_b.x + main_b.width
-                            && pos.y >= content_y
-                            && pos.y < main_b.y + main_b.height;
-                        if in_term && delta.y != 0.0 {
-                            let kind = if delta.y > 0.0 {
-                                TerminalMouseKind::WheelUp
-                            } else {
-                                TerminalMouseKind::WheelDown
-                            };
-                            let col = ((pos.x - main_b.x) / char_w.max(1.0)) as u16;
-                            let row = ((pos.y - content_y) / lh.max(1.0)) as u16;
-                            if let Some(issue_num) = self.selected_issue_number() {
-                                if let Some(sess) =
-                                    self.detail_terminal_sessions.get_mut(&issue_num)
-                                {
-                                    if !sess.forward_mouse(
-                                        kind,
-                                        MouseButton::Left,
-                                        col,
-                                        row,
-                                        Modifiers::default(),
-                                    ) {
-                                        // No PTY mouse reporting — scroll local scrollback.
-                                        if delta.y > 0.0 {
-                                            sess.scroll_up(3);
-                                        } else {
-                                            sess.scroll_down(3);
+                        //
+                        // `forward_mouse` for `WheelUp`/`WheelDown` already
+                        // gates internally on
+                        // `should_forward_wheel()` (mouse reporting OR
+                        // alt-screen), so calling it directly and falling
+                        // back on `false` is equivalent to the explicit
+                        // gate from the issue spec.
+                        let content_y = main_b.y + lh * 1.4;
+                        if delta.y != 0.0 {
+                            if let Some((col, row)) =
+                                terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+                            {
+                                let kind = if delta.y > 0.0 {
+                                    TerminalMouseKind::WheelUp
+                                } else {
+                                    TerminalMouseKind::WheelDown
+                                };
+                                if let Some(issue_num) = self.selected_issue_number() {
+                                    if let Some(sess) =
+                                        self.detail_terminal_sessions.get_mut(&issue_num)
+                                    {
+                                        if !sess.forward_mouse(
+                                            kind,
+                                            MouseButton::Left,
+                                            col,
+                                            row,
+                                            Modifiers::default(),
+                                        ) {
+                                            // No PTY mouse reporting — scroll local scrollback.
+                                            if delta.y > 0.0 {
+                                                sess.scroll_up(3);
+                                            } else {
+                                                sess.scroll_down(3);
+                                            }
                                         }
                                     }
                                 }
@@ -12544,28 +12663,34 @@ impl CoordApp {
             // the child has mouse reporting enabled or is on the alt screen
             // (e.g. tmux, vim, less).  Fall back to local scrollback when
             // forward_mouse returns false.
+            //
+            // `forward_mouse` for wheel kinds gates internally on
+            // `should_forward_wheel()` (mouse reporting OR alt-screen),
+            // matching the explicit gate from the issue spec.
             SidebarView::Terminal => {
-                if let Some(ref mut sess) = self.terminal_session {
-                    if delta.y != 0.0 {
-                        let kind = if delta.y > 0.0 {
-                            TerminalMouseKind::WheelUp
-                        } else {
-                            TerminalMouseKind::WheelDown
-                        };
-                        let col = ((pos.x - main_b.x) / char_w.max(1.0)) as u16;
-                        let row = ((pos.y - main_b.y) / lh.max(1.0)) as u16;
-                        if !sess.forward_mouse(
-                            kind,
-                            MouseButton::Left,
-                            col,
-                            row,
-                            Modifiers::default(),
-                        ) {
-                            // No PTY mouse reporting — scroll local scrollback.
-                            if delta.y > 0.0 {
-                                sess.scroll_up(3);
+                if delta.y != 0.0 {
+                    if let Some((col, row)) =
+                        terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
+                    {
+                        if let Some(ref mut sess) = self.terminal_session {
+                            let kind = if delta.y > 0.0 {
+                                TerminalMouseKind::WheelUp
                             } else {
-                                sess.scroll_down(3);
+                                TerminalMouseKind::WheelDown
+                            };
+                            if !sess.forward_mouse(
+                                kind,
+                                MouseButton::Left,
+                                col,
+                                row,
+                                Modifiers::default(),
+                            ) {
+                                // No PTY mouse reporting — scroll local scrollback.
+                                if delta.y > 0.0 {
+                                    sess.scroll_up(3);
+                                } else {
+                                    sess.scroll_down(3);
+                                }
                             }
                         }
                     }
@@ -21004,6 +21129,49 @@ fn terminal_pixel_to_cell(
     Some((col, row))
 }
 
+/// Clamping variant of [`terminal_pixel_to_cell`] used by the `Release`
+/// path (#454): when the cursor has been dragged outside the PTY content
+/// area, we still need to forward a `Release` to the embedded terminal —
+/// the canonical xterm-mouse protocol assumes every `Press` is matched by
+/// a `Release`.  Clamping `pos` to the content rect yields a valid
+/// `(col, row)` for the edge cell instead of dropping the event.
+///
+/// The right/bottom edges are exclusive, mirroring
+/// [`terminal_pixel_to_cell`]: we clamp to `width - 1` / `height - 1` so
+/// the returned cell stays inside the visible grid.
+fn terminal_pixel_to_cell_clamped(
+    pos: Point,
+    rect: Rect,
+    origin_y: f32,
+    char_w: f32,
+    line_h: f32,
+) -> (u16, u16) {
+    let cw = char_w.max(1.0);
+    let ch = line_h.max(1.0);
+    // `rect.width.max(1.0) - 1.0` keeps the right edge inclusive for
+    // clamping while keeping `terminal_pixel_to_cell`'s exclusive
+    // semantics for the bounds check above.
+    let right_inclusive = rect.x + (rect.width.max(1.0) - 1.0);
+    let bottom_inclusive = rect.y + (rect.height.max(1.0) - 1.0);
+    let cx = pos.x.clamp(rect.x, right_inclusive);
+    let cy = pos.y.clamp(origin_y, bottom_inclusive);
+    let col = ((cx - rect.x) / cw) as u16;
+    let row = ((cy - origin_y) / ch) as u16;
+    (col, row)
+}
+
+/// Map a [`MouseButton`] to the bit used in `pty_pressed_buttons` (#454).
+/// Returns `0` for buttons we do not track (X1/X2/Other) so that a Press
+/// for those buttons never sets a Release-pending flag.
+fn pty_button_bit(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Middle => 2,
+        MouseButton::Right => 4,
+        _ => 0,
+    }
+}
+
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -21265,6 +21433,8 @@ mod tests {
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
+            // #454
+            pty_pressed_buttons: 0,
         }
     }
 
@@ -30550,5 +30720,299 @@ mod tests {
             8.0,
         );
         assert!(!result);
+    }
+
+    // ── terminal_pixel_to_cell_clamped ───────────────────────────────────────
+    //
+    // The clamping variant is used by the release-outside-bounds path
+    // (#454 review fix 1).  Unlike `terminal_pixel_to_cell`, it returns
+    // a valid cell even when `pos` is outside the rect: clamps left/top
+    // to the origin and right/bottom to width-1 / height-1.
+
+    #[test]
+    fn tpc_clamped_inside_rect_matches_unclamped() {
+        // For a point already inside the rect, the clamped variant
+        // should agree with the unclamped variant.
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(34.0, 52.0);
+        let unclamped = terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0).unwrap();
+        let clamped = terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0);
+        assert_eq!(unclamped, clamped);
+    }
+
+    #[test]
+    fn tpc_clamped_outside_left_clamps_to_col_zero() {
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(-50.0, 30.0); // way left of the rect
+        assert_eq!(
+            terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0),
+            (0, 0),
+        );
+    }
+
+    #[test]
+    fn tpc_clamped_outside_right_clamps_to_last_col() {
+        // rect.width = 80 → right_inclusive = rect.x + 79.0
+        // 79.0 / 8.0 = col 9 (last visible col in an 80-wide rect at 8 px/cell)
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(1000.0, 30.0);
+        let (col, row) = terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0);
+        assert_eq!(col, 9);
+        // 30.0 - 20.0 = 10 → 10 / 16 = row 0
+        assert_eq!(row, 0);
+    }
+
+    #[test]
+    fn tpc_clamped_outside_below_clamps_to_last_row() {
+        // rect.height = 40 → bottom_inclusive = rect.y + 39.0
+        // 39.0 / 16.0 = row 2
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(34.0, 1000.0);
+        let (col, row) = terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0);
+        assert_eq!(col, 3);
+        assert_eq!(row, 2);
+    }
+
+    #[test]
+    fn tpc_clamped_zero_dimensions_dont_panic() {
+        // width=0, height=0 → max(1.0)-1.0 = 0.0, so right == rect.x; cell is (0,0).
+        let rect = Rect::new(0.0, 0.0, 0.0, 0.0);
+        let pos = Point::new(100.0, 100.0);
+        assert_eq!(
+            terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0),
+            (0, 0),
+        );
+    }
+
+    // ── pty_button_bit ────────────────────────────────────────────────────────
+
+    #[test]
+    fn pty_button_bit_mapping_is_distinct() {
+        // Left/Middle/Right must each map to a distinct non-zero bit;
+        // X1/X2/Other must map to 0 so they don't trigger the release
+        // bookkeeping (we don't forward them to the PTY anyway).
+        assert_eq!(pty_button_bit(MouseButton::Left), 1);
+        assert_eq!(pty_button_bit(MouseButton::Middle), 2);
+        assert_eq!(pty_button_bit(MouseButton::Right), 4);
+        assert_eq!(pty_button_bit(MouseButton::X1), 0);
+        assert_eq!(pty_button_bit(MouseButton::X2), 0);
+        assert_eq!(pty_button_bit(MouseButton::Other(7)), 0);
+    }
+
+    // ── pty_pressed_buttons field initial state ──────────────────────────────
+
+    #[test]
+    fn pty_pressed_buttons_starts_at_zero() {
+        // Press tracking starts empty — no outstanding releases on first frame.
+        let app = make_test_app(BoardData::default());
+        assert_eq!(app.pty_pressed_buttons, 0);
+    }
+
+    // ── terminal_force_release routing ───────────────────────────────────────
+    //
+    // The release-outside-bounds helper (#454 review fix 1).  Without a
+    // real session attached, both branches return false; the invariant
+    // is that neither panics and the routing matches `terminal_mouse_event`.
+
+    #[test]
+    fn terminal_force_release_terminal_view_no_session_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // Far-out-of-bounds position must not panic in the clamp path.
+        let result = app.terminal_force_release(
+            MouseButton::Left,
+            Point::new(-500.0, -500.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_force_release_pipeline_terminal_no_session_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.terminal_force_release(
+            MouseButton::Right,
+            Point::new(9999.0, 9999.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_force_release_non_terminal_view_returns_false() {
+        // Board view: no PTY routing → false, no panic.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Board;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.terminal_force_release(
+            MouseButton::Left,
+            Point::new(50.0, 50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    // ── mouse_main_scroll: wheel-forwarding path (#454 review issue 3) ───────
+    //
+    // The wheel arms in `mouse_main_scroll` were previously uncovered.
+    // These tests verify the SidebarView::Terminal and Pipeline/Terminal
+    // branches don't panic, return the expected redraw flag, and fall
+    // through cleanly when no session is attached.  An integration test
+    // below spawns a real /bin/sh to verify the local-scrollback fallback.
+
+    #[test]
+    fn mouse_main_scroll_terminal_view_no_session_returns_true() {
+        // Terminal view always returns `true` (consumes the wheel) even
+        // when no session is wired up — there is no other widget to fall
+        // through to in this view.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0), // wheel up
+            Point::new(50.0, 50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn mouse_main_scroll_terminal_view_wheel_outside_rect_no_panic() {
+        // Position outside the PTY rect → terminal_pixel_to_cell returns
+        // None, so no forwarding and no local scrollback work.  Must not
+        // panic and must still report `true` (Terminal view consumes wheel).
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0),
+            Point::new(-50.0, -50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn mouse_main_scroll_pipeline_terminal_no_session_returns_true() {
+        // Pipeline/Terminal tab: wheel path runs but no session is mapped
+        // for the selected issue → no forwarding, no panic.  Pipeline arm
+        // returns true unconditionally.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // Position must be inside the content area (below tab bar of
+        // `lh*1.4 = 22.4`).
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, -1.0),
+            Point::new(50.0, 50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn mouse_main_scroll_pipeline_terminal_wheel_in_tab_bar_no_op() {
+        // Click in the tab bar (y < tab_h) → terminal_pixel_to_cell
+        // returns None → no forwarding, no scrollback work, no panic.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0),
+            Point::new(50.0, 5.0), // y=5 < tab_h=22.4
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+    }
+
+    /// Integration test: spawn a real /bin/sh and verify the wheel
+    /// fallback engages local scrollback when mouse reporting is OFF.
+    /// `scroll_offset` advances by 3 rows per wheel notch (matching the
+    /// fallback in the SidebarView::Terminal arm).
+    #[test]
+    #[cfg(unix)]
+    fn mouse_main_scroll_terminal_wheel_falls_back_to_local_scrollback() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+
+        // Spawn a real session so forward_mouse can be invoked.
+        let cwd = std::env::temp_dir();
+        let mut sess = quadraui::terminal_engine::TerminalSession::spawn(
+            80, 24, "/bin/sh", &cwd, 1000,
+        )
+        .expect("spawn /bin/sh");
+
+        // Seed enough history to exceed one wheel-up worth (3 rows).
+        for _ in 0..10 {
+            sess.write_input(b"echo seed\r");
+        }
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            sess.poll();
+            if sess.history_len() >= 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(sess.history_len() >= 5, "need history to scroll into");
+        assert!(
+            !sess.mouse_reporting_enabled(),
+            "plain /bin/sh shouldn't enable mouse reporting",
+        );
+        app.terminal_session = Some(sess);
+
+        // Wheel-up from inside the PTY rect: forward_mouse returns false
+        // (no reporting, no alt-screen), so the fallback scrolls history.
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let before = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .scroll_offset();
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0),
+            Point::new(50.0, 50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+        let after = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .scroll_offset();
+        assert_eq!(
+            after.saturating_sub(before),
+            3,
+            "wheel-up notch should scroll local history by 3 rows when \
+             forward_mouse returns false (mouse reporting OFF)",
+        );
+
+        // Tidy up.
+        if let Some(ref mut sess) = app.terminal_session {
+            sess.write_input(b"exit\r");
+        }
     }
 }
