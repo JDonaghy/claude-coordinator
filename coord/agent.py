@@ -130,16 +130,43 @@ def _killpg_safe(pid: int, sig: int) -> None:
 def _log_has_result(log_path: str) -> bool:
     """Return True if the log contains a final result event.
 
-    Checks for both the stream-json ``"type":"result"`` marker (written by
-    ``claude -p`` / :class:`ClaudeProvider`) and the PTY sentinel
-    ``# pty: worker exited`` (stamped by the PTY pump thread after the
-    interactive ``claude`` subprocess exits — see
-    :data:`coord.providers.claude_pty.PTY_RESULT_MARKER`).
+    Two completion markers are recognised:
+
+    * the stream-json ``{"type":"result"}`` event written by ``claude -p`` /
+      :class:`ClaudeProvider`, and
+    * the PTY sentinel ``# pty: worker exited`` (stamped by the PTY pump
+      thread after the interactive ``claude`` subprocess exits — see
+      :data:`coord.providers.claude_pty.PTY_RESULT_MARKER`).
+
+    Both are matched **per line, structurally** rather than as a raw substring
+    over the whole file. A naive substring scan false-positives whenever a
+    worker merely *reads* a file that contains the marker text — e.g. a task
+    touching ``coord/agent.py`` or ``coord/providers/claude*.py`` echoes the
+    literal back inside a ``tool_result`` payload — which reaps the worker
+    mid-task and records it as a clean ``done`` (the #324/#325 no-op
+    completions, 2026-06-06). So:
+
+    * the stream-json marker counts only when the line parses as a JSON object
+      whose **top-level** ``type`` is ``"result"`` (a ``tool_result`` carrying
+      the string is a top-level ``"type":"user"`` line and is ignored), and
+    * the PTY sentinel counts only as a standalone log line (it is a
+      ``#``-comment the coordinator writes itself; a worker reading the source
+      sees it embedded in a ``{...}`` JSON line, never as a bare line).
     """
     try:
         with open(log_path, "rb") as f:
-            content = f.read()
-            return _RESULT_LINE_MARKER in content or _PTY_RESULT_LINE_MARKER in content
+            for raw in f:
+                if raw.lstrip().startswith(_PTY_RESULT_LINE_MARKER):
+                    return True
+                if _RESULT_LINE_MARKER not in raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(event, dict) and event.get("type") == "result":
+                    return True
+            return False
     except OSError:
         return False
 
