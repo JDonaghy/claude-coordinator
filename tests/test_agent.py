@@ -17,8 +17,10 @@ from coord.agent import (
     DONE,
     FAILED,
     RUNNING,
+    AgentAssignment,
     AgentServer,
     AssignmentSpec,
+    _COMPLETED_HISTORY_CAP,
     _worker_subprocess_env,
     default_worker_command,
 )
@@ -1437,3 +1439,195 @@ class TestCapabilityGates:
         final = server.wait_for(a.id, timeout=5)
         assert final.status == DONE
         server.shutdown()
+
+
+# ── #452: Completed-assignment history cap ─────────────────────────────────────
+
+
+class TestCompletedHistoryCap:
+    """Verify that terminal assignments are pruned to _COMPLETED_HISTORY_CAP (#452)."""
+
+    def _make_spec(self, repo_path: Path) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+        )
+
+    def test_persist_caps_terminal_assignments(self, tmp_path: Path) -> None:
+        """100 terminal assignments → _persist() keeps only the most recent 50
+        in both memory and on disk; oldest entries are evicted."""
+        N = 100
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        # Inject N synthetic terminal assignments directly (bypasses worker spawn).
+        # Use monotonically increasing finished_at so "recent" is well-defined.
+        spec = self._make_spec(repo)
+        for i in range(N):
+            a = AgentAssignment(
+                id=f"cap{i:04d}",
+                spec=spec,
+                status=DONE,
+                started_at=float(i),
+                finished_at=float(i),
+                exit_code=0,
+            )
+            server._assignments[a.id] = a
+
+        server._persist()
+
+        # ── In-memory state must be bounded ──────────────────────────────────
+        assert len(server._assignments) <= _COMPLETED_HISTORY_CAP, (
+            f"in-memory assignments not capped: {len(server._assignments)} > "
+            f"{_COMPLETED_HISTORY_CAP}"
+        )
+
+        # The most recent N/2 entries (highest finished_at) must survive.
+        kept_ids = {a.id for a in server._assignments.values()}
+        for i in range(N // 2, N):  # cap0050 … cap0099
+            assert f"cap{i:04d}" in kept_ids, (
+                f"recent assignment cap{i:04d} was incorrectly dropped"
+            )
+
+        # The oldest N/2 entries must be gone.
+        for i in range(N // 2):  # cap0000 … cap0049
+            assert f"cap{i:04d}" not in kept_ids, (
+                f"old assignment cap{i:04d} was incorrectly retained"
+            )
+
+        # ── Persisted file must be bounded ────────────────────────────────────
+        state = json.loads(server.state_path.read_text())
+        assert len(state["assignments"]) <= _COMPLETED_HISTORY_CAP, (
+            f"persisted assignments not capped: {len(state['assignments'])} > "
+            f"{_COMPLETED_HISTORY_CAP}"
+        )
+        file_ids = {a["id"] for a in state["assignments"]}
+        for i in range(N // 2, N):
+            assert f"cap{i:04d}" in file_ids, (
+                f"recent assignment cap{i:04d} missing from persisted state"
+            )
+        for i in range(N // 2):
+            assert f"cap{i:04d}" not in file_ids, (
+                f"old assignment cap{i:04d} should not be in persisted state"
+            )
+
+    def test_active_assignments_are_never_pruned(self, tmp_path: Path) -> None:
+        """Active (pending/running) assignments must not be touched by the cap,
+        even when terminal count is below the cap."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        # Inject a mix of terminal and active assignments.
+        for i in range(30):
+            a = AgentAssignment(
+                id=f"done{i:03d}",
+                spec=spec,
+                status=DONE,
+                finished_at=float(i),
+                exit_code=0,
+            )
+            server._assignments[a.id] = a
+
+        active_id = "active-sentinel"
+        server._assignments[active_id] = AgentAssignment(
+            id=active_id,
+            spec=spec,
+            status=RUNNING,
+            started_at=999.0,
+        )
+
+        server._persist()
+
+        # Active assignment must still be in memory and on disk.
+        assert active_id in server._assignments, "active assignment was pruned"
+        state = json.loads(server.state_path.read_text())
+        assert any(a["id"] == active_id for a in state["assignments"]), (
+            "active assignment missing from persisted state"
+        )
+
+    def test_load_state_prunes_bloated_file(self, tmp_path: Path) -> None:
+        """A pre-existing state file with > _COMPLETED_HISTORY_CAP terminal
+        assignments is pruned in-memory immediately on load, so the first
+        /status poll after restart is already bounded (#452)."""
+        N = 80  # above the cap
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+
+        # Write a bloated state file directly (simulates a pre-fix agent).
+        spec_dict = {
+            "repo_name": "api",
+            "repo_path": str(tmp_path),
+            "issue_number": 1,
+            "issue_title": "t",
+            "briefing": "b",
+            "files_allowed": [],
+            "files_forbidden": [],
+            "branch": "main",
+        }
+        assignments = []
+        for i in range(N):
+            assignments.append({
+                "id": f"old{i:04d}",
+                "status": DONE,
+                "pid": None,
+                "started_at": float(i),
+                "finished_at": float(i),
+                "exit_code": 0,
+                "log_path": None,
+                "error": None,
+                "branch": None,
+                "worktree_path": None,
+                "claude_session_id": None,
+                "spec": dict(spec_dict),
+            })
+        (state_dir / "agent_state.json").write_text(
+            json.dumps({"machine": "test", "capabilities": [], "repos": ["api"],
+                        "assignments": assignments})
+        )
+
+        # Instantiate the server — _load_state() should prune immediately.
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=state_dir,
+        )
+
+        assert len(server._assignments) <= _COMPLETED_HISTORY_CAP, (
+            f"_load_state() did not prune bloated file: "
+            f"{len(server._assignments)} > {_COMPLETED_HISTORY_CAP}"
+        )
+        # The most recent entries (highest finished_at) must be kept.
+        kept_ids = set(server._assignments.keys())
+        for i in range(N - _COMPLETED_HISTORY_CAP, N):  # old0030 … old0079
+            assert f"old{i:04d}" in kept_ids, (
+                f"recent assignment old{i:04d} was incorrectly dropped on load"
+            )
+
+    def test_list_assignments_completed_is_bounded(self, tmp_path: Path) -> None:
+        """list_assignments()['completed'] must not exceed the cap after _persist."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        for i in range(70):
+            a = AgentAssignment(
+                id=f"la{i:04d}",
+                spec=spec,
+                status=DONE,
+                finished_at=float(i),
+                exit_code=0,
+            )
+            server._assignments[a.id] = a
+
+        server._persist()  # triggers in-memory prune
+
+        listing = server.list_assignments()
+        assert len(listing["completed"]) <= _COMPLETED_HISTORY_CAP, (
+            f"list_assignments() returned {len(listing['completed'])} completed items, "
+            f"expected ≤ {_COMPLETED_HISTORY_CAP}"
+        )
