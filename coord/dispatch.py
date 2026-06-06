@@ -54,9 +54,13 @@ def dispatch(
     # one) → per-repo ``Repo.provider`` → ``config.providers.default``.
     # Deferred import so the unattended dispatch surface stays free of a
     # module-level cycle with the provider registry.
-    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+    from coord.providers import guard_unattended_dispatch, resolve_provider_name  # noqa: PLC0415
     spec_provider = getattr(proposal, "provider", None)
-    guard_unattended_dispatch(
+    # #324: resolve the effective provider name (spec > repo > default) so
+    # the coordinator DB always records the winning provider regardless of
+    # which level supplied it, and the wire payload carries the exact name
+    # the agent should look up in its registry.
+    effective_provider_name: str = guard_unattended_dispatch(
         spec_provider=spec_provider,
         repo_provider=repo.provider if repo is not None else None,
         providers_cfg=config.providers,
@@ -139,10 +143,25 @@ def dispatch(
     # field reject unknown payload keys with a 400.
     if getattr(proposal, "resume_session_id", None):
         payload["resume_session_id"] = proposal.resume_session_id
+    # #324: send the resolved provider name when it differs from the implicit
+    # default ("claude").  Older agents that don't know about providers ignore
+    # the field (AssignmentSpec(**body) accepts unknown kwargs since Python
+    # 3.12 dataclasses don't reject extras — actually they DO reject extras,
+    # but spec.provider was added in #425 so agents with that field already
+    # accept it).  When the effective provider IS "claude", omitting the
+    # field keeps the wire payload identical to pre-#324 for all default-
+    # configured deployments (no-config parity requirement).
+    if effective_provider_name and effective_provider_name != "claude":
+        payload["provider"] = effective_provider_name
 
     resp = httpx.post(url, json=payload, timeout=15)
     resp.raise_for_status()
-    return resp.json()
+    result = resp.json()
+    # #324: attach the resolved provider name to the response dict so callers
+    # that record the dispatched assignment (cli.py, dashboard/server.py) can
+    # persist it without re-resolving the config precedence chain.
+    result["_provider_name"] = effective_provider_name
+    return result
 
 
 def dispatch_with_retry(

@@ -80,6 +80,8 @@ def _row_to_assignment(row: object) -> Assignment:
         cost_usd=d.get("cost_usd"),
         # #252: stored as JSON; absent column → None (not parsed yet).
         smoke_tests=_decode_smoke_tests(d.get("smoke_tests")),
+        # #324: resolved provider name; None for rows predating this feature.
+        provider_name=d.get("provider_name"),
     )
 
 
@@ -139,6 +141,8 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.cost_usd,
         # #252: encode list as JSON; None → NULL.
         (json.dumps(a.smoke_tests) if a.smoke_tests is not None else None),
+        # #324: resolved provider name; None → NULL.
+        a.provider_name,
     )
 
 
@@ -150,7 +154,7 @@ _UPSERT_SQL = """
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
         review_posted_at, test_state, test_reason, review_verdict, cost_usd,
-        smoke_tests
+        smoke_tests, provider_name
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
@@ -158,7 +162,7 @@ _UPSERT_SQL = """
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?
+        ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         status             = excluded.status,
@@ -189,7 +193,10 @@ _UPSERT_SQL = """
         -- #252: same pattern — once a worker has emitted a smoke-test
         -- list, a later upsert without one (e.g. agent reload) can't
         -- erase it.
-        smoke_tests        = COALESCE(excluded.smoke_tests, smoke_tests)
+        smoke_tests        = COALESCE(excluded.smoke_tests, smoke_tests),
+        -- #324: once a provider_name is recorded at dispatch, a later
+        -- upsert without one (e.g. agent reload) must not clear it.
+        provider_name      = COALESCE(excluded.provider_name, provider_name)
 """
 
 
@@ -429,15 +436,26 @@ def record_dispatched(
     assignment_id: str,
     proposal: Proposal,
     repo_github: str,
+    provider_name: str | None = None,
 ) -> None:
-    """Record a newly dispatched assignment in the assignments table."""
+    """Record a newly dispatched assignment in the assignments table.
+
+    Args:
+        assignment_id: The agent-assigned ID from the dispatch response.
+        proposal: The proposal that was dispatched.
+        repo_github: The ``owner/repo`` GitHub identifier.
+        provider_name: The *resolved* provider name (after the spec > repo >
+            default precedence chain).  ``None`` for callers that predate
+            #324 — the TUI shows the implicit default ("claude") when NULL.
+    """
     conn = get_connection()
     conn.execute(
         """INSERT INTO assignments (
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
-            files_allowed, model, dispatched_at, required_gates
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
+            files_allowed, model, dispatched_at, required_gates,
+            provider_name
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO NOTHING""",
         (
             assignment_id,
@@ -452,6 +470,7 @@ def record_dispatched(
             proposal.model,
             time.time(),
             json.dumps(list(proposal.required_gates)),
+            provider_name,
         ),
     )
     conn.commit()
@@ -469,8 +488,9 @@ def record_dispatched_assignment(
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, review_of_assignment_id,
-            review_target, required_gates, review_iteration
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            review_target, required_gates, review_iteration,
+            provider_name
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -482,7 +502,10 @@ def record_dispatched_assignment(
             review_of_assignment_id = excluded.review_of_assignment_id,
             review_target = excluded.review_target,
             required_gates = excluded.required_gates,
-            review_iteration = excluded.review_iteration""",
+            review_iteration = excluded.review_iteration,
+            -- #324: COALESCE so a retry/re-dispatch doesn't clear a
+            -- previously-recorded provider_name from the original dispatch.
+            provider_name = COALESCE(excluded.provider_name, provider_name)""",
         (
             assignment.assignment_id or "",
             assignment.machine_name,
@@ -499,6 +522,7 @@ def record_dispatched_assignment(
             assignment.review_target,
             json.dumps(list(assignment.required_gates)),
             assignment.review_iteration,
+            assignment.provider_name,
         ),
     )
     conn.commit()
