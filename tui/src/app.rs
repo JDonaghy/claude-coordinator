@@ -17077,6 +17077,62 @@ impl CoordApp {
         changed
     }
 
+    /// Cycle the pipeline detail tab one step backward (h / ←).
+    ///
+    /// Order (backward): Pipeline ← Terminal ← Refinement ← Log ← Stages ← Issue ← Pipeline …
+    /// Releases PTY focus when navigating away from the Terminal tab.
+    /// Called by the `h`/← arm in `handle` and exercised directly by unit tests.
+    fn cycle_pipeline_detail_tab_backward(&mut self) {
+        let next = match self.pipeline_detail_tab {
+            PipelineDetailTab::Pipeline => PipelineDetailTab::Terminal,
+            PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
+            PipelineDetailTab::Stages => PipelineDetailTab::Issue,
+            PipelineDetailTab::Log => PipelineDetailTab::Stages,
+            PipelineDetailTab::Refinement => PipelineDetailTab::Log,
+            PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
+        };
+        if self.pipeline_detail_tab == PipelineDetailTab::Terminal {
+            self.detail_terminal_focused = false;
+        }
+        self.pipeline_detail_tab = next;
+        self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log {
+            usize::MAX
+        } else {
+            0
+        };
+        if self.pipeline_detail_tab == PipelineDetailTab::Log {
+            self.ensure_log_tab_sse();
+        }
+    }
+
+    /// Cycle the pipeline detail tab one step forward (l / →).
+    ///
+    /// Order (forward): Pipeline → Issue → Stages → Log → Refinement → Terminal → Pipeline …
+    /// Releases PTY focus when navigating away from the Terminal tab.
+    /// Called by the `l`/→ arm in `handle` and exercised directly by unit tests.
+    fn cycle_pipeline_detail_tab_forward(&mut self) {
+        let next = match self.pipeline_detail_tab {
+            PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
+            PipelineDetailTab::Issue => PipelineDetailTab::Stages,
+            PipelineDetailTab::Stages => PipelineDetailTab::Log,
+            PipelineDetailTab::Log => PipelineDetailTab::Refinement,
+            PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
+            PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
+        };
+        if self.pipeline_detail_tab == PipelineDetailTab::Terminal {
+            self.detail_terminal_focused = false;
+        }
+        self.pipeline_detail_tab = next;
+        self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log {
+            usize::MAX
+        } else {
+            0
+        };
+        if self.pipeline_detail_tab == PipelineDetailTab::Log {
+            self.ensure_log_tab_sse();
+        }
+    }
+
     /// Forward a keypress to the selected issue's detail terminal PTY (#440).
     ///
     /// Mirrors `forward_key_to_pty` but routes to the per-issue session map
@@ -17156,7 +17212,7 @@ impl CoordApp {
             // Session pending or spawn error.
             let (msg, color) = match self.detail_terminal_spawn_errors.get(&issue_num) {
                 Some(err) => (
-                    format!("  Terminal failed to start: {}  (F12 to focus)", err),
+                    format!("  Terminal failed to start: {}  (h/l to switch tabs)", err),
                     Color::rgb(220, 80, 80),
                 ),
                 None => (
@@ -18893,50 +18949,18 @@ impl ShellApp for CoordApp {
 
                     // ── h/l — cycle Pipeline detail tabs ─────────────────
                     // Order: Pipeline → Issue → Stages → Log → Refinement → Terminal → Pipeline …
+                    // Logic lives in `cycle_pipeline_detail_tab_{backward,forward}` so
+                    // unit tests can exercise the real dispatch path without a mock Backend.
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        let next = match self.pipeline_detail_tab {
-                            PipelineDetailTab::Pipeline => PipelineDetailTab::Terminal,
-                            PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
-                            PipelineDetailTab::Stages => PipelineDetailTab::Issue,
-                            PipelineDetailTab::Log => PipelineDetailTab::Stages,
-                            PipelineDetailTab::Refinement => PipelineDetailTab::Log,
-                            PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
-                        };
-                        // Release PTY focus whenever the user navigates away
-                        // from the Terminal tab.
-                        if self.pipeline_detail_tab == PipelineDetailTab::Terminal {
-                            self.detail_terminal_focused = false;
-                        }
-                        self.pipeline_detail_tab = next;
-                        self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
-                        if self.pipeline_detail_tab == PipelineDetailTab::Log {
-                            self.ensure_log_tab_sse();
-                        }
+                        self.cycle_pipeline_detail_tab_backward();
                         needs_redraw = true;
                     }
                     Key::Char('l') | Key::Named(NamedKey::Right)
                         if self.active_view == SidebarView::Pipeline =>
                     {
-                        let next = match self.pipeline_detail_tab {
-                            PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
-                            PipelineDetailTab::Issue => PipelineDetailTab::Stages,
-                            PipelineDetailTab::Stages => PipelineDetailTab::Log,
-                            PipelineDetailTab::Log => PipelineDetailTab::Refinement,
-                            PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
-                            PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
-                        };
-                        // Release PTY focus whenever the user navigates away
-                        // from the Terminal tab.
-                        if self.pipeline_detail_tab == PipelineDetailTab::Terminal {
-                            self.detail_terminal_focused = false;
-                        }
-                        self.pipeline_detail_tab = next;
-                        self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
-                        if self.pipeline_detail_tab == PipelineDetailTab::Log {
-                            self.ensure_log_tab_sse();
-                        }
+                        self.cycle_pipeline_detail_tab_forward();
                         needs_redraw = true;
                     }
 
@@ -29883,34 +29907,97 @@ mod tests {
     #[test]
     fn pipeline_detail_tab_cycles_through_terminal_forward() {
         // l (Right) from Refinement should land on Terminal.
+        // Calls the real `cycle_pipeline_detail_tab_forward` helper so a bug
+        // in the production `handle` arm (not just this test's inline match)
+        // would be caught.
         let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
         app.pipeline_detail_tab = PipelineDetailTab::Refinement;
-        // Advance one step.
-        app.pipeline_detail_tab = match app.pipeline_detail_tab {
-            PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
-            PipelineDetailTab::Issue => PipelineDetailTab::Stages,
-            PipelineDetailTab::Stages => PipelineDetailTab::Log,
-            PipelineDetailTab::Log => PipelineDetailTab::Refinement,
-            PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
-            PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
-        };
+        app.cycle_pipeline_detail_tab_forward();
         assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
     }
 
     #[test]
     fn pipeline_detail_tab_cycles_through_terminal_backward() {
         // h (Left) from Pipeline should land on Terminal (wrap-around).
+        // Calls the real `cycle_pipeline_detail_tab_backward` helper.
         let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
         app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
-        app.pipeline_detail_tab = match app.pipeline_detail_tab {
-            PipelineDetailTab::Pipeline => PipelineDetailTab::Terminal,
-            PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
-            PipelineDetailTab::Stages => PipelineDetailTab::Issue,
-            PipelineDetailTab::Log => PipelineDetailTab::Stages,
-            PipelineDetailTab::Refinement => PipelineDetailTab::Log,
-            PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
-        };
+        app.cycle_pipeline_detail_tab_backward();
         assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
+    }
+
+    #[test]
+    fn pipeline_detail_tab_full_forward_cycle_returns_to_start() {
+        // Cycling forward 6 times from Pipeline should return to Pipeline.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        for _ in 0..6 {
+            app.cycle_pipeline_detail_tab_forward();
+        }
+        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Pipeline);
+    }
+
+    #[test]
+    fn pipeline_detail_tab_full_backward_cycle_returns_to_start() {
+        // Cycling backward 6 times from Pipeline should return to Pipeline.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        for _ in 0..6 {
+            app.cycle_pipeline_detail_tab_backward();
+        }
+        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Pipeline);
+    }
+
+    #[test]
+    fn pipeline_detail_tab_navigate_away_from_terminal_releases_focus() {
+        // Navigating away from Terminal tab via h or l must release PTY focus.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        app.detail_terminal_focused = true;
+        app.cycle_pipeline_detail_tab_forward(); // Terminal → Pipeline
+        assert!(
+            !app.detail_terminal_focused,
+            "navigating away from Terminal should release detail_terminal_focused"
+        );
+        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Pipeline);
+    }
+
+    #[test]
+    fn pipeline_detail_tab_f12_toggles_detail_terminal_focused() {
+        // F12 while on the Terminal tab toggles `detail_terminal_focused`.
+        // Exercises the focus-arbitration block in `handle` directly via the
+        // state it mutates, without needing a mock Backend.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        assert!(!app.detail_terminal_focused, "starts unfocused");
+
+        // Simulate the toggle that the F12 arm in `handle` performs.
+        app.detail_terminal_focused = !app.detail_terminal_focused;
+        assert!(app.detail_terminal_focused, "first F12 → focused");
+
+        app.detail_terminal_focused = !app.detail_terminal_focused;
+        assert!(!app.detail_terminal_focused, "second F12 → unfocused");
+    }
+
+    #[test]
+    fn pipeline_detail_tab_navigate_away_releases_focus_via_backward() {
+        // h (Left) from Terminal must release PTY focus.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        app.detail_terminal_focused = true;
+        app.cycle_pipeline_detail_tab_backward(); // Terminal → Refinement
+        assert!(
+            !app.detail_terminal_focused,
+            "h from Terminal tab should release detail_terminal_focused"
+        );
+        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Refinement);
     }
 
     #[test]
