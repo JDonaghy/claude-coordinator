@@ -632,16 +632,22 @@ def dispatch_review(
     # an unattended path, so refuse to route them through a provider
     # whose capabilities mark it ``human_attended_only``.  Deferred import
     # keeps the review module free of a module-level cycle with the
-    # provider registry.  On refusal we surface the error to the caller
-    # rather than silently dropping the review.
+    # provider registry.  On refusal we return None (same as "auto_dispatch
+    # off" / "machine unreachable") so callers leave review_state as
+    # 'pending' and retry on the next notify call — consistent with how
+    # _reassign handles the same guard in reconcile.py.
     from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
-    guard_unattended_dispatch(
-        spec_provider=None,
-        repo_provider=repo.provider,
-        providers_cfg=config.providers,
-        models_cfg=config.models,
-        where="auto-dispatch review",
-    )
+    try:
+        guard_unattended_dispatch(
+            spec_provider=None,
+            repo_provider=repo.provider,
+            providers_cfg=config.providers,
+            models_cfg=config.models,
+            where="auto-dispatch review",
+        )
+    except ValueError as exc:
+        print(f"[review] skipping auto-dispatch review: {exc}")
+        return None
 
     pr = pr_lookup(
         repo.github,
