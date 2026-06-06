@@ -58,16 +58,18 @@ use crate::settings::{
 };
 use quadraui::accelerator::{parse_key_binding, ParsedBinding};
 use quadraui::{
-    Backend, Badge, ChatController, ChatControllerEvent, ChatRole, ChatTurn, Color, Decoration,
+    Backend, Badge, ChatController, ChatControllerEvent, ChatRole, ChatTurn,
+    Color, Decoration,
     Dialog, DialogButton, DialogHit, DialogInput, DialogLayout, DialogMeasure,
     DialogSeverity, DialogTextInput,
-    Key, ListItem, ListView, MouseButton, NamedKey,
+    Key, ListItem, ListView, Modifiers, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
     StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
     ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
 };
+use quadraui::terminal_engine::TerminalMouseKind;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -11521,6 +11523,7 @@ impl CoordApp {
             UiEvent::MouseDown {
                 position,
                 button: MouseButton::Left,
+                modifiers,
                 ..
             } => {
                 let pos = *position;
@@ -11543,7 +11546,24 @@ impl CoordApp {
                     }
                     false
                 } else if ctx.in_main(pos.x, pos.y) {
-                    self.mouse_main_click(pos, ctx.main_bounds(), lh)
+                    let main_b = ctx.main_bounds();
+                    let char_w = backend.char_width();
+                    // #454: Forward click to the embedded PTY when mouse
+                    // reporting is enabled. Returns true only if the PTY
+                    // consumed it (i.e. mouse reporting is on); fall through
+                    // to normal TUI click handling otherwise.
+                    if self.terminal_mouse_event(
+                        TerminalMouseKind::Press,
+                        MouseButton::Left,
+                        pos,
+                        *modifiers,
+                        main_b,
+                        lh,
+                        char_w,
+                    ) {
+                        return true;
+                    }
+                    self.mouse_main_click(pos, main_b, lh)
                 } else {
                     false
                 }
@@ -11635,13 +11655,14 @@ impl CoordApp {
                 let pos = *position;
                 let d = *delta;
                 let lh = backend.line_height();
+                let char_w = backend.char_width();
                 if ctx.in_sidebar(pos.x, pos.y) {
                     if let Some(sidebar_b) = ctx.sidebar_bounds() {
                         return self.mouse_sidebar_scroll(event, d, sidebar_b, backend, lh);
                     }
                     false
                 } else if ctx.in_main(pos.x, pos.y) {
-                    self.mouse_main_scroll(d, ctx.main_bounds(), lh)
+                    self.mouse_main_scroll(d, pos, ctx.main_bounds(), lh, char_w)
                 } else {
                     false
                 }
@@ -11652,7 +11673,11 @@ impl CoordApp {
             // host having to track button bounds across frames.  A
             // change in the hovered id triggers a redraw.
             UiEvent::MouseMoved { .. } => {
-                let pos = if let UiEvent::MouseMoved { position, .. } = event { *position } else { return false; };
+                let (pos, buttons) = if let UiEvent::MouseMoved { position, buttons } = event {
+                    (*position, *buttons)
+                } else {
+                    return false;
+                };
                 let lh = backend.line_height();
                 let mut redraw = false;
                 // Forward to the active sidebar so scrollbar drag tracks the cursor.
@@ -11686,6 +11711,30 @@ impl CoordApp {
                         redraw |= self.panel_toolbar_hover.clear();
                     }
                 } else if ctx.in_main(pos.x, pos.y) {
+                    // #454: forward cursor motion to the embedded PTY when
+                    // mouse-reporting mode is active.  `forward_mouse`
+                    // returns false when reporting is off, so there is no
+                    // performance cost on the common idle path.
+                    let char_w = backend.char_width();
+                    let main_b = ctx.main_bounds();
+                    let btn = if buttons.right {
+                        MouseButton::Right
+                    } else if buttons.middle {
+                        MouseButton::Middle
+                    } else {
+                        MouseButton::Left
+                    };
+                    redraw |= self.terminal_mouse_event(
+                        TerminalMouseKind::Move,
+                        btn,
+                        pos,
+                        Modifiers::default(),
+                        main_b,
+                        lh,
+                        char_w,
+                    );
+                    // Note: intentional fall-through — toolbar hover tracking
+                    // below still runs even when the PTY consumed the move.
                     if let Some(toolbar) = self.panel_toolbar() {
                         let panel = SidebarPanel {
                             id: WidgetId::new("panel-toolbar"),
@@ -11740,8 +11789,11 @@ impl CoordApp {
                 redraw
             }
 
-            // Forward MouseUp to the active sidebar to release any scrollbar drag.
-            UiEvent::MouseUp { .. } => {
+            // Forward MouseUp to the active sidebar to release any scrollbar drag,
+            // and forward the release to the embedded PTY when mouse reporting is on.
+            UiEvent::MouseUp { button, position, .. } => {
+                let pos = *position;
+                let btn = *button;
                 if let Some(sidebar_b) = ctx.sidebar_bounds() {
                     match self.active_view {
                         SidebarView::Board => {
@@ -11751,6 +11803,24 @@ impl CoordApp {
                             self.pipeline_sidebar.handle(event, backend, sidebar_b);
                         }
                         _ => {}
+                    }
+                }
+                // #454: forward button release to the embedded PTY when mouse
+                // reporting is enabled (gated inside forward_mouse itself).
+                if ctx.in_main(pos.x, pos.y) {
+                    let lh = backend.line_height();
+                    let char_w = backend.char_width();
+                    let main_b = ctx.main_bounds();
+                    if self.terminal_mouse_event(
+                        TerminalMouseKind::Release,
+                        btn,
+                        pos,
+                        Modifiers::default(),
+                        main_b,
+                        lh,
+                        char_w,
+                    ) {
+                        return true;
                     }
                 }
                 false
@@ -11987,7 +12057,6 @@ impl CoordApp {
         if self.active_view == SidebarView::Settings {
             // Route click to FormController. FormController::handle_cached
             // uses metrics cached by render_and_cache().
-            use quadraui::Modifiers;
             let click_event = UiEvent::MouseDown {
                 widget: None,
                 button: MouseButton::Left,
@@ -12162,6 +12231,76 @@ impl CoordApp {
         false
     }
 
+    /// Forward a mouse event to the active embedded terminal PTY (standalone
+    /// `SidebarView::Terminal` or `PipelineDetailTab::Terminal`).
+    ///
+    /// Returns `true` when the PTY consumed the event — caller should trigger
+    /// a redraw and skip any local fallback handling.  Returns `false` when
+    /// - no terminal view is active,
+    /// - the cursor is outside the terminal content area, or
+    /// - `forward_mouse` reports that the PTY has mouse reporting off (for
+    ///   Press/Release/Move) or neither mouse reporting nor alt-screen
+    ///   active (for wheel events).
+    ///
+    /// The coordinate translation mirrors the render path: for the standalone
+    /// terminal, `main_b` is the full main content rect (no toolbar).  For the
+    /// detail terminal, `main_b.y + lh*1.4` is the content-area top edge.
+    fn terminal_mouse_event(
+        &mut self,
+        kind: TerminalMouseKind,
+        button: MouseButton,
+        pos: Point,
+        modifiers: Modifiers,
+        main_b: Rect,
+        lh: f32,
+        char_w: f32,
+    ) -> bool {
+        let cw = char_w.max(1.0);
+        let ch = lh.max(1.0);
+        match self.active_view {
+            SidebarView::Terminal => {
+                // Terminal surface occupies the full main content rect (the
+                // Terminal view has no panel toolbar, so main_b == the PTY area).
+                let in_rect = pos.x >= main_b.x
+                    && pos.x < main_b.x + main_b.width
+                    && pos.y >= main_b.y
+                    && pos.y < main_b.y + main_b.height;
+                if !in_rect {
+                    return false;
+                }
+                let col = ((pos.x - main_b.x) / cw) as u16;
+                let row = ((pos.y - main_b.y) / ch) as u16;
+                if let Some(ref mut sess) = self.terminal_session {
+                    return sess.forward_mouse(kind, button, col, row, modifiers);
+                }
+                false
+            }
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                // Content area starts below the tab bar (lh * 1.4 rows).
+                let tab_h = lh * 1.4;
+                let content_y = main_b.y + tab_h;
+                let in_rect = pos.x >= main_b.x
+                    && pos.x < main_b.x + main_b.width
+                    && pos.y >= content_y
+                    && pos.y < main_b.y + main_b.height;
+                if !in_rect {
+                    return false;
+                }
+                let col = ((pos.x - main_b.x) / cw) as u16;
+                let row = ((pos.y - content_y) / ch) as u16;
+                if let Some(issue_num) = self.selected_issue_number() {
+                    if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
+                        return sess.forward_mouse(kind, button, col, row, modifiers);
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Scroll wheel in the sidebar.
     fn mouse_sidebar_scroll(
         &mut self,
@@ -12208,7 +12347,7 @@ impl CoordApp {
     }
 
     /// Scroll wheel in the main panel (detail / machine detail).
-    fn mouse_main_scroll(&mut self, delta: ScrollDelta, main_b: Rect, lh: f32) -> bool {
+    fn mouse_main_scroll(&mut self, delta: ScrollDelta, pos: Point, main_b: Rect, lh: f32, char_w: f32) -> bool {
         let visible = content_visible_rows(main_b, lh);
         // Stash the live viewport size — `watch_log_list` uses this to compute
         // a stick-to-bottom offset that keeps the last line on screen.
@@ -12341,8 +12480,44 @@ impl CoordApp {
                         // the chat's internal scrollbar.
                     }
                     PipelineDetailTab::Terminal => {
-                        // #440: PTY scrollback (quadraui #283) is out of
-                        // scope for this PR; swallow wheel events here.
+                        // #454: Forward scroll to the PTY when the child has
+                        // mouse reporting or is on the alt screen; otherwise
+                        // scroll local scrollback (3 rows per notch).
+                        let tab_h = lh * 1.4;
+                        let content_y = main_b.y + tab_h;
+                        let in_term = pos.x >= main_b.x
+                            && pos.x < main_b.x + main_b.width
+                            && pos.y >= content_y
+                            && pos.y < main_b.y + main_b.height;
+                        if in_term && delta.y != 0.0 {
+                            let kind = if delta.y > 0.0 {
+                                TerminalMouseKind::WheelUp
+                            } else {
+                                TerminalMouseKind::WheelDown
+                            };
+                            let col = ((pos.x - main_b.x) / char_w.max(1.0)) as u16;
+                            let row = ((pos.y - content_y) / lh.max(1.0)) as u16;
+                            if let Some(issue_num) = self.selected_issue_number() {
+                                if let Some(sess) =
+                                    self.detail_terminal_sessions.get_mut(&issue_num)
+                                {
+                                    if !sess.forward_mouse(
+                                        kind,
+                                        MouseButton::Left,
+                                        col,
+                                        row,
+                                        Modifiers::default(),
+                                    ) {
+                                        // No PTY mouse reporting — scroll local scrollback.
+                                        if delta.y > 0.0 {
+                                            sess.scroll_up(3);
+                                        } else {
+                                            sess.scroll_down(3);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 let _ = visible;
@@ -12358,11 +12533,38 @@ impl CoordApp {
                 self.settings_form.borrow_mut().handle_cached(&scroll_event, main_b);
                 true
             }
-            // #424: Terminal pane handles scroll via the PTY scrollback
-            // (history/scroll_offset).  Mouse-wheel scrollback is OUT
-            // OF SCOPE for this PR — copy-out + scrollbar drag come in
-            // quadraui #283 / coord #326.  Swallow the wheel for now.
-            SidebarView::Terminal => true,
+            // #454: Terminal pane — forward scroll wheel to the PTY when
+            // the child has mouse reporting enabled or is on the alt screen
+            // (e.g. tmux, vim, less).  Fall back to local scrollback when
+            // forward_mouse returns false.
+            SidebarView::Terminal => {
+                if let Some(ref mut sess) = self.terminal_session {
+                    if delta.y != 0.0 {
+                        let kind = if delta.y > 0.0 {
+                            TerminalMouseKind::WheelUp
+                        } else {
+                            TerminalMouseKind::WheelDown
+                        };
+                        let col = ((pos.x - main_b.x) / char_w.max(1.0)) as u16;
+                        let row = ((pos.y - main_b.y) / lh.max(1.0)) as u16;
+                        if !sess.forward_mouse(
+                            kind,
+                            MouseButton::Left,
+                            col,
+                            row,
+                            Modifiers::default(),
+                        ) {
+                            // No PTY mouse reporting — scroll local scrollback.
+                            if delta.y > 0.0 {
+                                sess.scroll_up(3);
+                            } else {
+                                sess.scroll_down(3);
+                            }
+                        }
+                    }
+                }
+                true
+            }
         }
     }
 
