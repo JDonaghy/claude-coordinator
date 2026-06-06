@@ -54,7 +54,7 @@ def dispatch(
     # one) → per-repo ``Repo.provider`` → ``config.providers.default``.
     # Deferred import so the unattended dispatch surface stays free of a
     # module-level cycle with the provider registry.
-    from coord.providers import guard_unattended_dispatch, resolve_provider_name  # noqa: PLC0415
+    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
     spec_provider = getattr(proposal, "provider", None)
     # #324: resolve the effective provider name (spec > repo > default) so
     # the coordinator DB always records the winning provider regardless of

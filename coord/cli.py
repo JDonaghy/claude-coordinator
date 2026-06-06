@@ -1746,7 +1746,12 @@ def approve(
 
         repo = cfg.repo(p.repo_name)
         if repo is not None:
-            record_dispatched(assignment_id=assignment_id, proposal=p, repo_github=repo.github)
+            record_dispatched(
+                assignment_id=assignment_id,
+                proposal=p,
+                repo_github=repo.github,
+                provider_name=response.get("_provider_name"),
+            )
 
         try:
             do_not_touch = compute_do_not_touch(p, peers=selected, in_flight=in_flight)
@@ -2120,6 +2125,7 @@ def assign(
         assignment_id=assignment_id,
         proposal=proposal,
         repo_github=repo_cfg.github,
+        provider_name=response.get("_provider_name"),
     )
 
     # Post briefing to GitHub
@@ -2641,6 +2647,7 @@ def chat_continue(
         assignment_id=assignment_id,
         proposal=proposal,
         repo_github=repo_cfg.github,
+        provider_name=response.get("_provider_name"),
     )
 
     # Print the new assignment ID on stdout so callers (e.g. TUI) can bind.
@@ -5032,7 +5039,12 @@ def _dispatch_followup(
 
     response = dispatch(proposal, cfg)
     assignment_id = response.get("id", "pending")
-    record_dispatched(assignment_id=assignment_id, proposal=proposal, repo_github=repo.github)
+    record_dispatched(
+        assignment_id=assignment_id,
+        proposal=proposal,
+        repo_github=repo.github,
+        provider_name=response.get("_provider_name"),
+    )
 
     in_flight = load_dispatched()
     do_not_touch = compute_do_not_touch(proposal, peers=[], in_flight=in_flight)

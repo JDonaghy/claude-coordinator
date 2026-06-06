@@ -1026,6 +1026,7 @@ def _make_provider(
     *,
     enforces_deny_list: bool = True,
     resume: bool = True,
+    inject: bool = True,
     build_argv: list[str] | None = None,
     initial_input_bytes: bytes | None = None,
 ):
@@ -1040,7 +1041,7 @@ def _make_provider(
         def capabilities(self):
             return Capabilities(
                 resume=resume,
-                inject=True,
+                inject=inject,
                 cost_reporting=False,
                 true_system_prompt=True,
                 enforces_deny_list=enforces_deny_list,
@@ -1365,6 +1366,74 @@ class TestCapabilityGates:
         a = server.assign(
             _spec(repo, provider="unknown", resume_session_id="ses-no-gate")
         )
+        final = server.wait_for(a.id, timeout=5)
+        assert final.status == DONE
+        server.shutdown()
+
+    def test_inject_message_refused_when_provider_inject_is_false(
+        self, tmp_path: Path
+    ) -> None:
+        """inject_message raises RuntimeError when provider.capabilities().inject=False.
+
+        This gates stdin-injection on providers that don't expose it (e.g.
+        PTY-only or batch backends) so callers get a clear error rather than
+        silently writing to an unresponsive pipe (#324).
+        """
+        import time as _time
+
+        repo = _init_repo(tmp_path / "repo")
+        # Provider with inject=False; worker blocks on stdin so the assignment
+        # stays RUNNING long enough for inject_message to be called.
+        no_inject_provider = _make_provider(
+            inject=False,
+            build_argv=["/bin/sh", "-c", "read line; echo done"],
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"no-inject": no_inject_provider},
+        )
+        a = server.assign(_spec(repo, provider="no-inject"))
+        # Wait until running
+        for _ in range(50):
+            if server.get(a.id).status == RUNNING:
+                break
+            _time.sleep(0.02)
+        assert server.get(a.id).status == RUNNING, "assignment never reached RUNNING"
+        with pytest.raises(RuntimeError, match="inject=False"):
+            server.inject_message(a.id, "should be refused")
+        # Clean shutdown: assignment will finish once we unblock or the server stops
+        server.shutdown()
+
+    def test_inject_message_allowed_when_provider_inject_is_true(
+        self, tmp_path: Path
+    ) -> None:
+        """inject_message succeeds when provider.capabilities().inject=True."""
+        import time as _time
+
+        repo = _init_repo(tmp_path / "repo")
+        # Provider with inject=True (the default); worker reads two lines.
+        inject_provider = _make_provider(
+            inject=True,
+            build_argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"yes-inject": inject_provider},
+        )
+        a = server.assign(_spec(repo, provider="yes-inject"))
+        # Wait until running
+        for _ in range(50):
+            if server.get(a.id).status == RUNNING:
+                break
+            _time.sleep(0.02)
+        # Should NOT raise
+        server.inject_message(a.id, "injected")
         final = server.wait_for(a.id, timeout=5)
         assert final.status == DONE
         server.shutdown()
