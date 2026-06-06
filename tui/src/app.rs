@@ -3765,6 +3765,12 @@ pub struct CoordApp {
     /// detail area).  Same shape and lifecycle as
     /// `sidebar_action_bar_hover`.
     panel_toolbar_hover: ToolbarHoverTracker,
+    /// Hover state for the pipeline action bar — the `[ Go ⏎ ]` /
+    /// `[ Retry ⏎ ]` strip drawn above the stage boxes when a
+    /// dispatchable stage exists.  Separate from `panel_toolbar_hover`
+    /// because the action bar is rendered directly with `draw_toolbar`
+    /// (not through a `SidebarPanel`), so it needs its own tracker.
+    pipeline_action_bar_hover: ToolbarHoverTracker,
 
     /// Index of the currently-selected stage in the Pipeline > Stages
     /// tab.  `None` defaults to "no stage selected" — first arrow / click
@@ -4120,6 +4126,7 @@ impl CoordApp {
             purge_days: 7,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
+            pipeline_action_bar_hover: ToolbarHoverTracker::new(),
             pipeline_focused_stage: None,
             pipeline_stage_content_scroll: 0,
             settings: TuiSettings::load(),
@@ -7742,6 +7749,32 @@ impl CoordApp {
         let view = self.build_pipeline_widget()?;
         view.stages.iter().enumerate().find_map(|(i, s)| {
             s.action.as_ref().map(|label| (label.clone(), i))
+        })
+    }
+
+    /// Build the [`Toolbar`] for the pipeline action bar (the `[ Go ⏎ ]` /
+    /// `[ Retry ⏎ ]` strip above the stage boxes) when any stage is
+    /// dispatchable.  Returns `None` when no stage is actionable.
+    ///
+    /// Extracted so the render path and the mouse-move hover-update path
+    /// share one definition and can't drift apart.
+    fn pipeline_action_bar_toolbar(&self) -> Option<Toolbar> {
+        let (label, _stage_idx) = self.pipeline_action_button()?;
+        Some(Toolbar {
+            id: WidgetId::new("pipeline-action-bar"),
+            buttons: vec![ToolbarButton::Action {
+                id: WidgetId::new("pipeline-action:dispatch"),
+                label: label.clone(),
+                icon: None,
+                key_hint: Some("⏎".to_string()),
+                enabled: true,
+                is_active: false,
+                tooltip: format!(
+                    "Dispatch {} for the active stage (Enter)",
+                    label.to_lowercase()
+                ),
+            }],
+            bg: None,
         })
     }
 
@@ -11621,10 +11654,37 @@ impl CoordApp {
                     } else {
                         redraw |= self.panel_toolbar_hover.clear();
                     }
+                    // #438: hover tracking for the pipeline action bar
+                    // ([ Go ⏎ ] / [ Retry ⏎ ] strip below the tab row).
+                    // Pipeline has no panel toolbar so content starts at
+                    // main_b.y + tab_h — compute bar_rect the same way
+                    // the render path does and feed it to `toolbar_layout`.
+                    if self.active_view == SidebarView::Pipeline
+                        && self.pipeline_detail_tab == PipelineDetailTab::Pipeline
+                    {
+                        if let Some(action_toolbar) = self.pipeline_action_bar_toolbar() {
+                            let main_b = ctx.main_bounds();
+                            let tab_h = lh * 1.4;
+                            let bar_h = pipeline_action_bar_height(true, lh);
+                            let bar_rect = Rect::new(
+                                main_b.x,
+                                main_b.y + tab_h,
+                                main_b.width,
+                                bar_h,
+                            );
+                            let layout = backend.toolbar_layout(bar_rect, &action_toolbar);
+                            redraw |= self.pipeline_action_bar_hover.update(&layout, pos.x, pos.y);
+                        } else {
+                            redraw |= self.pipeline_action_bar_hover.clear();
+                        }
+                    } else {
+                        redraw |= self.pipeline_action_bar_hover.clear();
+                    }
                     redraw |= self.sidebar_action_bar_hover.clear();
                 } else {
                     redraw |= self.sidebar_action_bar_hover.clear();
                     redraw |= self.panel_toolbar_hover.clear();
+                    redraw |= self.pipeline_action_bar_hover.clear();
                 }
                 redraw
             }
@@ -15539,6 +15599,12 @@ impl CoordApp {
         // row-level actions live on the action bar (#270) or right-
         // click menu (#259-#262, #266); the panel toolbar is reserved
         // for genuine panel-wide ops.
+        //
+        // #438: Pipeline toolbar removed — every verb it offered is
+        // covered by an existing keybind (N=notify, r=ready, m/M=merge,
+        // R=retry) and the per-stage Go/Retry action lives in the
+        // pipeline-action-bar just below the tab row.  Reclaims `2*lh`
+        // of vertical space for the pipeline list.
         let buttons: Vec<ToolbarButton> = match self.active_view {
             SidebarView::Board => {
                 vec![
@@ -15556,48 +15622,13 @@ impl CoordApp {
                     ),
                 ]
             }
-            SidebarView::Pipeline => {
-                // Ready is meaningful when a pipeline issue is selected
-                // and has a coord_repo mapping (otherwise `coord ready`
-                // has nowhere to send the gh call).
-                let ready_enabled = self
-                    .pipeline_sel
-                    .and_then(|i| self.pipeline_issues.get(i))
-                    .map(|i| i.coord_repo.is_some())
-                    .unwrap_or(false);
-                // Retry on Pipeline view requires either an active stage
-                // (Go/Retry button attached) or a Test-failed bounce.
-                let retry_enabled = self.can_bounce_work_after_test_fail()
-                    || self
-                        .build_pipeline_widget()
-                        .map(|w| w.stages.iter().any(|s| s.action.is_some()))
-                        .unwrap_or(false);
-                vec![
-                    toolbar_button("notify", "[N]otify", true),
-                    toolbar_button("ready", "[r]eady", ready_enabled),
-                    // #272-followup: enable Merge only when the
-                    // classifier says the selected issue is actually
-                    // mergeable.  Disabled buttons render dimmed but
-                    // keep their id (so hover tooltips can fire) and
-                    // refuse clicks — better UX than silently
-                    // dispatching a futile `coord merge`.
-                    toolbar_button(
-                        "merge",
-                        "[M]erge",
-                        matches!(
-                            self.pipeline_merge_state(),
-                            PipelineMergeState::Ready { .. }
-                                | PipelineMergeState::BlockedOnCi { .. }
-                        ),
-                    ),
-                    toolbar_button("retry", "[R]etry", retry_enabled),
-                ]
-            }
-            // Machines, Settings, Terminal: no panel-level verbs.
-            // (#424: Terminal is a pure pass-through pane — keys go to
-            // the PTY or to view-switching; there's no coord-level verb
-            // that makes sense at the panel-bar level.)
-            SidebarView::Machines | SidebarView::Settings | SidebarView::Terminal => {
+            // Pipeline, Machines, Settings, Terminal: no panel-level toolbar.
+            // Pipeline verbs are fully covered by keybinds; Terminal is a
+            // pure pass-through pane (#424).
+            SidebarView::Pipeline
+            | SidebarView::Machines
+            | SidebarView::Settings
+            | SidebarView::Terminal => {
                 return None
             }
         };
@@ -17185,8 +17216,12 @@ impl ShellApp for CoordApp {
                             // stage is dispatchable.  Eats `bar_h` from the
                             // top of `content_rect`; the stage row and meta
                             // body shift down by the same amount.
-                            let action_btn = self.pipeline_action_button();
-                            let bar_h = pipeline_action_bar_height(action_btn.is_some(), lh);
+                            // #438: use the shared helper so render and
+                            // hover-tracking always agree on the toolbar
+                            // shape; pass the live hover id so the button
+                            // tints on mouse-over.
+                            let action_toolbar = self.pipeline_action_bar_toolbar();
+                            let bar_h = pipeline_action_bar_height(action_toolbar.is_some(), lh);
                             let bar_rect = Rect::new(content_rect.x, content_rect.y, content_rect.width, bar_h);
                             let pv_origin = Rect::new(
                                 content_rect.x,
@@ -17201,24 +17236,13 @@ impl ShellApp for CoordApp {
                                 content_rect.width,
                                 (content_rect.height - bar_h - pv_rect.height).max(0.0),
                             );
-                            if let Some((label, _)) = action_btn {
-                                let toolbar = Toolbar {
-                                    id: WidgetId::new("pipeline-action-bar"),
-                                    buttons: vec![ToolbarButton::Action {
-                                        id: WidgetId::new("pipeline-action:dispatch"),
-                                        label: label.clone(),
-                                        icon: None,
-                                        key_hint: Some("⏎".to_string()),
-                                        enabled: true,
-                                        is_active: false,
-                                        tooltip: format!(
-                                            "Dispatch {} for the active stage (Enter)",
-                                            label.to_lowercase()
-                                        ),
-                                    }],
-                                    bg: None,
-                                };
-                                backend.draw_toolbar(bar_rect, &toolbar, None, None);
+                            if let Some(toolbar) = action_toolbar {
+                                backend.draw_toolbar(
+                                    bar_rect,
+                                    &toolbar,
+                                    self.pipeline_action_bar_hover.hovered_id(),
+                                    None,
+                                );
                             }
                             if let Some(view) = self.build_pipeline_widget() {
                                 backend.draw_pipeline_view(pv_rect, &pipeline_view_for_render(&view));
@@ -20622,6 +20646,7 @@ mod tests {
             purge_days: 7,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
+            pipeline_action_bar_hover: ToolbarHoverTracker::new(),
             pipeline_focused_stage: None,
             pipeline_stage_content_scroll: 0,
             settings: TuiSettings::default(),
@@ -21224,6 +21249,7 @@ mod tests {
     // clicking inside a stage box sets focus (Body hit) rather than
     // dispatching. The dispatch path now lives behind the button bar — see
     // `mouse_click_on_pipeline_action_bar_dispatches` below.
+    // #438: Pipeline has no panel toolbar — tb_h is 0.
     #[test]
     fn mouse_click_on_pipeline_stage_body_focuses() {
         let mut app = make_pipeline_app();
@@ -21234,7 +21260,8 @@ mod tests {
         // Use a large content rect so the layout produces well-separated stages.
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let lh: f32 = 1.0;
-        let tb_h = lh * 2.0;
+        // #438: Pipeline has no panel toolbar — no toolbar offset.
+        let tb_h = 0.0_f32;
         let tab_h = lh * 1.4;
         let content_rect = Rect::new(
             main_b.x,
@@ -21270,6 +21297,8 @@ mod tests {
     // the active stage's action — same path the inline `[Go]` button used to
     // own. With no assignments, Work is Pending and carries the [Go]; the bar
     // click should reach `dispatch_pipeline_stage(0)`.
+    // #438: Pipeline has no panel toolbar — tb_h is 0 and content starts at
+    // main_b.y + tab_h directly.
     #[test]
     fn mouse_click_on_pipeline_action_bar_dispatches() {
         let mut app = make_pipeline_app();
@@ -21285,13 +21314,13 @@ mod tests {
 
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let lh: f32 = 1.0;
-        let tb_h = lh * 2.0;
+        // #438: no panel toolbar on Pipeline; content starts directly after the tab row.
         let tab_h = lh * 1.4;
         let content_rect = Rect::new(
             main_b.x,
-            main_b.y + tb_h + tab_h,
+            main_b.y + tab_h,
             main_b.width,
-            (main_b.height - tb_h - tab_h).max(0.0),
+            (main_b.height - tab_h).max(0.0),
         );
         let bar_h = pipeline_action_bar_height(true, lh);
         // Click in the middle of the bar strip.
@@ -23522,11 +23551,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_button_disabled_when_blocked_on_review() {
-        // The toolbar Merge button should render disabled when the
-        // selected issue can't actually be merged — the primitive's
-        // hit_test then refuses clicks and the user sees the dimmed
-        // affordance.
+    fn merge_gated_when_blocked_on_review() {
+        // #438: Pipeline toolbar is gone, but the underlying merge-state
+        // classifier must still return BlockedOnReview when a
+        // request-changes verdict is present.  `dispatch_pipeline_merge_for_selected_issue`
+        // (the m/M keybind path) posts a toast and must NOT spawn `coord merge`.
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
@@ -23543,27 +23572,25 @@ mod tests {
         review.review_verdict = Some("request-changes".to_string());
         app.data.assignments.push(review);
 
-        let bar = app.panel_toolbar().expect("Pipeline toolbar present");
-        let merge_btn = bar
-            .buttons
-            .iter()
-            .find_map(|b| match b {
-                ToolbarButton::Action { id, enabled, label, .. }
-                    if id.as_str() == "toolbar:merge" =>
-                {
-                    Some((label.clone(), *enabled))
-                }
-                _ => None,
-            })
-            .expect("Merge button present on Pipeline toolbar");
+        // Verify the classifier returns BlockedOnReview.
         assert!(
-            merge_btn.0.contains("[M]erge"),
-            "found wrong button by id: label={:?}",
-            merge_btn.0,
+            matches!(
+                app.pipeline_merge_state(),
+                PipelineMergeState::BlockedOnReview { .. }
+            ),
+            "merge state must be BlockedOnReview when review has request-changes; got {:?}",
+            app.pipeline_merge_state(),
+        );
+        // Verify the keybind/dispatch path surfaces a toast and does not spawn.
+        let toasts_before = app.toasts.len();
+        let _ = app.dispatch_pipeline_merge_for_selected_issue();
+        assert!(
+            app.toasts.len() > toasts_before || !app.command_runner.is_running(),
+            "blocked merge must either toast the user or not spawn coord merge",
         );
         assert!(
-            !merge_btn.1,
-            "Merge button must render disabled when review blocks the merge",
+            !app.command_runner.is_running(),
+            "must not spawn coord merge when blocked on review",
         );
     }
 
@@ -26803,40 +26830,32 @@ mod tests {
     }
 
     #[test]
-    fn panel_toolbar_pipeline_contains_pipeline_verbs() {
-        // #192 / #263: Pipeline toolbar now Notify · Ready · Merge · Retry.
-        // Plan dropped — Plan-stage rendering is per-issue (#258), not
-        // a panel-wide verb.
+    fn panel_toolbar_pipeline_is_absent() {
+        // #438: Pipeline panel toolbar removed — every verb it offered
+        // (Notify/Ready/Merge/Retry) has a keybind, and the per-stage
+        // Go action lives in the pipeline-action-bar below the tab row.
+        // panel_toolbar() must return None for the Pipeline view so the
+        // toolbar row is not drawn and 2*lh of vertical space is reclaimed.
         let app = make_pipeline_app();
         let mut app = app;
         app.active_view = SidebarView::Pipeline;
-        let bar = app.panel_toolbar().expect("Pipeline has a toolbar");
-        let labels = toolbar_action_labels(&bar);
-        for expected in &["[N]otify", "[r]eady", "[M]erge", "[R]etry"] {
-            assert!(
-                labels.iter().any(|l| l.contains(expected)),
-                "Pipeline toolbar missing {:?}; got {:?}",
-                expected,
-                labels,
-            );
-        }
         assert!(
-            !labels.iter().any(|l| l.contains("[P]lan")),
-            "Pipeline toolbar should not include [P]lan; got {:?}",
-            labels,
+            app.panel_toolbar().is_none(),
+            "Pipeline view must not have a panel toolbar",
         );
     }
 
     #[test]
-    fn panel_toolbar_settings_and_machines_have_no_toolbar() {
-        // Settings and Machines have no panel-level verbs — toolbar
-        // should be absent so the form / detail list expands to fill the
-        // full main panel.
+    fn panel_toolbar_settings_machines_pipeline_have_no_toolbar() {
+        // Settings, Machines, and Pipeline (#438) have no panel-level
+        // toolbar — absent so the content expands to fill the full panel.
         let mut app = make_app_default();
         app.active_view = SidebarView::Settings;
-        assert!(app.panel_toolbar().is_none());
+        assert!(app.panel_toolbar().is_none(), "Settings must have no toolbar");
         app.active_view = SidebarView::Machines;
-        assert!(app.panel_toolbar().is_none());
+        assert!(app.panel_toolbar().is_none(), "Machines must have no toolbar");
+        app.active_view = SidebarView::Pipeline;
+        assert!(app.panel_toolbar().is_none(), "Pipeline must have no toolbar (#438)");
     }
 
     #[test]
