@@ -1,0 +1,9 @@
+{"type":"session.start","session_id":"oc-sess-abc123","model":"claude-sonnet-4-5","timestamp":1717891200}
+{"type":"message.partial","session_id":"oc-sess-abc123","role":"assistant","content":{"type":"text","text":"I'll help you implement that. Let me start by reading the relevant files."}}
+{"type":"tool.use","session_id":"oc-sess-abc123","tool":"read","input":{"path":"coord/providers/__init__.py"}}
+{"type":"tool.result","session_id":"oc-sess-abc123","tool":"read","output":{"content":"(file content omitted for brevity)"}}
+{"type":"message.partial","session_id":"oc-sess-abc123","role":"assistant","content":{"type":"text","text":"Now I'll implement the changes to the provider registry."}}
+{"type":"tool.use","session_id":"oc-sess-abc123","tool":"write","input":{"path":"coord/providers/opencode.py","content":"(new file content)"}}
+{"type":"tool.result","session_id":"oc-sess-abc123","tool":"write","output":{"success":true}}
+{"type":"message.complete","session_id":"oc-sess-abc123","role":"assistant","num_turns":3}
+{"type":"session.complete","session_id":"oc-sess-abc123","num_turns":3,"usage":{"input_tokens":1500,"output_tokens":800,"cost_usd":0.0092}}
