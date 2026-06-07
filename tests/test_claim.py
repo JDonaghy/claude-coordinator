@@ -9,6 +9,7 @@ from coord.claim import (
     claim_message,
     find_work_claim,
     has_active_followup,
+    has_active_work_followup,
 )
 from coord.models import Assignment, Board
 
@@ -316,3 +317,143 @@ def test_running_work_assignment_still_blocks_claim() -> None:
     claim = find_work_claim(42, "api", "acme/api", board, branch_lookup=lambda *a: [])
     assert claim is not None
     assert claim.source == "board"
+
+
+# ── has_active_work_followup (#459) ─────────────────────────────────────────
+
+
+def test_has_active_work_followup_detects_running_work() -> None:
+    """A running work assignment for the same issue blocks review dispatch."""
+    board = Board(active=[_active(issue=16, repo="api", type_="work", aid="work-2")])
+    assert has_active_work_followup(board, repo_name="api", issue_number=16)
+
+
+def test_has_active_work_followup_detects_conflict_fix() -> None:
+    """A running conflict-fix for the same issue also blocks review dispatch."""
+    board = Board(active=[_active(issue=16, repo="api", type_="conflict-fix", aid="cf-1")])
+    assert has_active_work_followup(board, repo_name="api", issue_number=16)
+
+
+def test_has_active_work_followup_ignores_other_issue() -> None:
+    board = Board(active=[_active(issue=99, repo="api", type_="work", aid="work-x")])
+    assert not has_active_work_followup(board, repo_name="api", issue_number=16)
+
+
+def test_has_active_work_followup_ignores_other_repo() -> None:
+    board = Board(active=[_active(issue=16, repo="other", type_="work", aid="work-y")])
+    assert not has_active_work_followup(board, repo_name="api", issue_number=16)
+
+
+def test_has_active_work_followup_ignores_review_type() -> None:
+    """An active review should not trigger the work-followup guard."""
+    board = Board(active=[
+        _active(issue=16, repo="api", type_="review", review_of="work-1", aid="rev-1"),
+    ])
+    assert not has_active_work_followup(board, repo_name="api", issue_number=16)
+
+
+def test_has_active_work_followup_ignores_failed_work() -> None:
+    """A failed work assignment is not 'active' — should not block."""
+    failed = _active(issue=16, repo="api", type_="work", aid="work-bad")
+    failed.status = "failed"
+    board = Board(active=[failed])
+    assert not has_active_work_followup(board, repo_name="api", issue_number=16)
+
+
+def test_has_active_work_followup_returns_false_for_empty_board() -> None:
+    assert not has_active_work_followup(Board(), repo_name="api", issue_number=16)
+
+
+# ── Integration: dispatch_review respects the work-followup guard (#459) ────
+
+
+def test_dispatch_review_skipped_when_active_work_rewriting_branch() -> None:
+    """dispatch_review returns None when a work assignment is actively running
+    for the same issue, even if the completed assignment has no review yet."""
+    from coord.config import Config, ReviewsConfig
+    from coord.models import Machine, Repo
+    from coord.review import dispatch_review
+
+    repo = Repo(name="api", github="acme/api", depends_on=[], default_branch="main")
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            Machine(name="laptop", host="laptop.tail", repos=["api"],
+                    repo_paths={"api": "/w"}, capabilities=[]),
+            Machine(name="server", host="server.tail", repos=["api"],
+                    repo_paths={"api": "/s"}, capabilities=[]),
+        ],
+        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+    )
+
+    completed = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=16,
+        issue_title="X", status="done", branch="issue-16-fix",
+        assignment_id="work-1", type="work",
+    )
+    # A coord-bounce fix (work type) is actively rewriting the branch.
+    active_fix = _active(issue=16, repo="api", type_="work", aid="work-2")
+    board = Board(active=[active_fix])
+
+    class _Client:
+        def post(self, url, *, json, timeout):
+            raise AssertionError("should not POST a review while fix is live")
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=_Client(),
+        pr_lookup=lambda repo_github, **kw: {"number": 1, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+    )
+    assert result is None
+
+
+def test_dispatch_review_proceeds_when_no_active_work() -> None:
+    """dispatch_review proceeds normally when there's no active work for the issue."""
+    from unittest.mock import patch
+    from coord.config import Config, ReviewsConfig
+    from coord.models import Machine, Repo
+    from coord.review import dispatch_review
+
+    repo = Repo(name="api", github="acme/api", depends_on=[], default_branch="main")
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            Machine(name="laptop", host="laptop.tail", repos=["api"],
+                    repo_paths={"api": "/w"}, capabilities=[]),
+            Machine(name="server", host="server.tail", repos=["api"],
+                    repo_paths={"api": "/s"}, capabilities=[]),
+        ],
+        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+    )
+
+    completed = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=16,
+        issue_title="X", status="done", branch="issue-16-fix",
+        assignment_id="work-1", type="work",
+    )
+    board = Board()  # No active assignments — review should proceed.
+
+    posted: list[dict] = []
+
+    class _Client:
+        def post(self, url, *, json, timeout):
+            posted.append(json)
+
+            class _Resp:
+                def raise_for_status(self):
+                    pass
+                def json(self):
+                    return {"assignment_id": "rev-new"}
+            return _Resp()
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=_Client(),
+        pr_lookup=lambda repo_github, **kw: {"number": 1, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+    )
+    assert result is not None
+    assert posted, "expected an HTTP POST to dispatch the review"
