@@ -35,4 +35,4 @@ It hinges on the **embedded terminal feeling like a real terminal** — selectio
 
 - **Agents / coordinator brain:** treat this as the standing objective behind all planning and triage. Bias proposals toward unblocking the critical path above; don't silently drift to unrelated backlog.
 - **Humans:** edit freely as priorities shift; keep it short, re-date Status. Commit + push so every machine and every agent picks it up (it propagates via git, like all coordinator state).
-- **Future:** surface + edit this directly in the coord-tui board so the goal is visible and changeable where planning happens (design under discussion — see issue once filed).
+- **Future:** surface + edit this directly in the coord-tui board, inject it into worker briefings (cross-repo reach), and bias `coord plan` toward it — tracked in **#469**.
