@@ -12546,13 +12546,14 @@ impl CoordApp {
         } else if self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal
         {
-            // #440/#446: Pipeline detail Terminal tab — same F12 model as
+            // #440/#467: Pipeline detail Terminal tab — same F12 model as
             // the standalone pane but scoped to the selected issue's session.
-            // `s` (released only) launches a remote ssh+tmux claude session.
+            // `s` (released only) launches a local `coord assign --interactive`
+            // claude session for the selected issue.
             if self.detail_terminal_focused {
                 " PTY focused — F12 = release  (typed keys go to the shell) ".to_string()
             } else {
-                " PTY released — F12 = focus  ·  s = remote session  ·  j/k=nav  h/l=tabs  q=quit ".to_string()
+                " PTY released — F12 = focus  ·  s = interactive claude  ·  j/k=nav  h/l=tabs  q=quit ".to_string()
             }
         } else if self.active_view == SidebarView::Machines {
             // Machines panel action hints.
@@ -17141,15 +17142,16 @@ impl CoordApp {
 
         // 3. Poll all sessions for output.
         //
-        //    Note: an earlier iteration of #446 tried to auto-inject the
-        //    claude kickoff prompt here, gated on the remote claude's
-        //    `bracketed_paste_enabled()` readiness signal.  Live smoke
-        //    found that `bracketed_paste_enabled()` never flips true
-        //    through ssh — so the kickoff never injected.  The current
-        //    design copies the kickoff to the system clipboard at launch
-        //    time instead (see `launch_remote_session_for_selected_issue`)
-        //    and leaves the actual paste + submit to the human.  This
-        //    keeps the session strictly attended (ToS §3.7 / #437).
+        //    Note: #446 explored auto-injecting a kickoff prompt here
+        //    (gated on `TerminalSession::bracketed_paste_enabled()` and
+        //    later via a clipboard hand-off), but the readiness signal
+        //    never flipped true through ssh.  The current design
+        //    (#467) drops the auto-inject entirely: the launcher line
+        //    runs `coord assign --interactive`, which uses the existing
+        //    `interactive.py` seed path to land the briefing in the
+        //    claude input box.  The TUI does not touch the PTY output
+        //    beyond drawing it — the session stays strictly human-
+        //    attended (Anthropic ToS §3.7 / #437).
         for sess in self.detail_terminal_sessions.values_mut() {
             if sess.poll() {
                 changed = true;
@@ -17273,82 +17275,25 @@ impl CoordApp {
         self.detail_terminal_scrollbar_drag.take().is_some()
     }
 
-    /// Resolve the ssh hostname for a remote session on the given issue (#446).
+    /// Resolve the coord-local repo name for an issue (#467).
+    ///
+    /// This is the value passed as `<repo>` in the auto-runned
+    /// `coord assign --interactive --repo <repo> <N>` line.  It matches
+    /// the repo names declared in `coordinator.yml` (the same names
+    /// `coord assign` accepts on its CLI).
     ///
     /// Resolution order:
-    /// 1. A **running** assignment for this issue → use that machine's host.
-    /// 2. Any assignment for this issue (done / failed / pending) → fall back
-    ///    to its machine's host (reattach to the tmux session).
-    /// 3. First machine in `data.machines` whose `repos` list contains the
-    ///    issue's coord-local repo name.
-    /// 4. No match → `None` (caller shows an error toast).
-    fn remote_session_host_for_issue(&self, issue_num: u64) -> Option<String> {
-        // Steps 1 & 2: find the most relevant assignment for this issue.
-        // Prefer running over any other status by scoring running=1, rest=0.
-        let machine_name = self
-            .data
-            .assignments
-            .iter()
-            .filter(|a| a.issue_number == issue_num)
-            .max_by_key(|a| if a.status == "running" { 1u8 } else { 0u8 })
-            .map(|a| a.machine.clone());
-
-        if let Some(name) = machine_name {
-            if let Some(m) = self.data.machines.iter().find(|m| m.name == name) {
-                if !m.host.is_empty() {
-                    return Some(m.host.clone());
-                }
-            }
-        }
-
-        // Step 3: fall back to the first machine that lists the issue's repo.
-        let coord_repo = self
-            .pipeline_issues
-            .iter()
-            .find(|iss| iss.number == issue_num)
-            .and_then(|iss| iss.coord_repo.clone());
-
-        if let Some(repo) = coord_repo {
-            for m in &self.data.machines {
-                if !m.host.is_empty() && m.repos.iter().any(|r| r == &repo) {
-                    return Some(m.host.clone());
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Resolve the remote repo *directory name* for an issue (#446).
-    ///
-    /// Every machine in the fleet checks each repo out under `~/src/<name>`
-    /// (confirmed via per-machine `repo_paths` in `coordinator.yml`), so
-    /// the directory basename of the local checkout is the same name that
-    /// works on every other machine.
-    ///
-    /// Resolution order (mirrors [`detail_terminal_cwd`]):
-    /// 1. Basename of `pipeline_repo_paths[repo_key]` if it exists.
-    /// 2. `issue.coord_repo` (typically the bare repo name).
-    /// 3. Last segment of `issue.repo_slug` (`"owner/repo"` → `"repo"`).
+    /// 1. `issue.coord_repo` — the coord-local repo name.
+    /// 2. Last segment of `issue.repo_slug` (`"owner/repo"` → `"repo"`).
     ///
     /// Returns `None` only when the issue itself isn't in
-    /// `pipeline_issues` (caller surfaces a toast).
-    fn remote_repo_dir_for_issue(&self, issue_num: u64) -> Option<String> {
+    /// `pipeline_issues` or when neither field yields a non-empty name
+    /// (caller surfaces a toast).
+    fn coord_repo_for_issue(&self, issue_num: u64) -> Option<String> {
         let issue = self
             .pipeline_issues
             .iter()
             .find(|iss| iss.number == issue_num)?;
-        let repo_key = issue.coord_repo.as_deref().unwrap_or(&issue.repo_slug);
-        if let Some(path) = self.data.pipeline_repo_paths.get(repo_key) {
-            if let Some(name) = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-            {
-                if !name.is_empty() {
-                    return Some(name.to_string());
-                }
-            }
-        }
         if let Some(cr) = issue.coord_repo.as_deref() {
             if !cr.is_empty() {
                 return Some(cr.to_string());
@@ -17362,50 +17307,34 @@ impl CoordApp {
             .map(|s| s.to_string())
     }
 
-    /// Launch a remote human-attended `claude` session over ssh + tmux (#446).
+    /// Launch a local human-attended `claude` session for the selected
+    /// pipeline issue (#467; supersedes the ssh+tmux launcher previously
+    /// built for #446).
     ///
     /// # What this does
     ///
-    /// 1. Resolves the target host via [`remote_session_host_for_issue`] and
-    ///    the remote repo directory name via [`remote_repo_dir_for_issue`].
-    /// 2. Kills any existing PTY for this issue (replaced by drop when we
-    ///    `insert` the new session).
-    /// 3. Spawns a local shell session (`TerminalSession::spawn`) using the
+    /// 1. Resolves the coord-local repo name via [`coord_repo_for_issue`].
+    /// 2. Spawns a local shell session (`TerminalSession::spawn`) using the
     ///    same path as the lazy-spawn in `drive_detail_terminals`.
-    /// 4. Auto-runs the ssh+tmux launch line (with trailing `\r`).  The
-    ///    inner command does `cd ~/src/<repo> && exec ~/.local/bin/claude`
-    ///    so `claude` starts in the repo working tree (smoke-found
-    ///    regression: without the `cd`, claude opened in `$HOME`).
-    ///    `tmux new-session -A -s coord-issue-N` reattaches to an existing
-    ///    tmux session if one is already running — closing/reopening the tab
-    ///    is safe.  `~/.local/bin/claude` is the absolute path because
-    ///    `claude` is NOT on the bash `PATH` over ssh (only zsh sources it).
-    /// 5. **Copies** the claude kick-off prompt to the system clipboard via
-    ///    `backend.services().clipboard().write_text(...)`.  An earlier
-    ///    iteration tried to auto-inject the prompt via a bracketed paste
-    ///    gated on `TerminalSession::bracketed_paste_enabled()`, but live
-    ///    smoke found that the readiness signal never flips true through
-    ///    ssh — the kickoff never landed.  Putting the kickoff on the
-    ///    clipboard keeps the session strictly human-attended (ToS §3.7 /
-    ///    #437): the human pastes and presses Enter; we never auto-submit
-    ///    instructions to the AI.
-    /// 6. Auto-focuses the PTY so the human can interact immediately.
-    fn launch_remote_session_for_selected_issue(&mut self, backend: &mut dyn Backend) {
+    /// 3. Auto-runs `coord assign --interactive --repo <repo> <N>` (with a
+    ///    trailing `\r`).  Only the *launcher* is auto-run — `coord assign
+    ///    --interactive` then drives the existing `interactive.py` seed
+    ///    path (bracketed-paste + readiness gate) so the briefing lands
+    ///    in claude's input box pre-filled.  There is NO manual kickoff
+    ///    injection from the TUI, NO clipboard hack, and NO ssh.
+    /// 4. Auto-focuses the PTY so the human can interact immediately.
+    ///
+    /// The session stays strictly human-attended: the TUI never parses the
+    /// session TTY for completion or verdict and never auto-advances the
+    /// pipeline state (Anthropic ToS §3.7 / #437).
+    fn launch_interactive_session_for_selected_issue(&mut self) {
         let Some(issue_num) = self.selected_issue_number() else {
             return;
         };
 
-        let Some(host) = self.remote_session_host_for_issue(issue_num) else {
+        let Some(repo) = self.coord_repo_for_issue(issue_num) else {
             self.pipeline_status = Some((
-                "No machine found for this issue — cannot launch remote session".to_string(),
-                Instant::now(),
-            ));
-            return;
-        };
-
-        let Some(repo_dir) = self.remote_repo_dir_for_issue(issue_num) else {
-            self.pipeline_status = Some((
-                "Cannot resolve repo directory for this issue — remote session not launched"
+                "Cannot resolve repo for this issue — interactive session not launched"
                     .to_string(),
                 Instant::now(),
             ));
@@ -17427,31 +17356,22 @@ impl CoordApp {
             10_000,
         ) {
             Ok(mut sess) => {
-                // Auto-run the launcher line.  `tmux new-session -A` reattaches
-                // to an existing `coord-issue-N` session instead of creating a
-                // second one, so pressing `s` again is safe while a session is
-                // still running on the remote machine.
-                let launch_line = build_remote_launch_cmd(&host, issue_num, &repo_dir);
+                // Auto-run the launcher line.  Re-pressing `s` while a
+                // previous interactive session is still alive replaces the
+                // old PTY (old session is dropped on `insert`).
+                let launch_line = build_interactive_launch_cmd(&repo, issue_num);
                 sess.send_str(&launch_line);
 
                 // Replace any existing session (the old one is dropped here).
                 self.detail_terminal_sessions.insert(issue_num, sess);
                 self.detail_terminal_spawn_errors.remove(&issue_num);
 
-                // Copy the kickoff prompt to the system clipboard so the
-                // human can paste it into claude with a single shortcut
-                // once the remote session is live.  No trailing CR/LF —
-                // they press Enter to submit (ToS §3.7 / #437).
-                let kickoff = build_remote_kickoff_prompt(issue_num);
-                backend.services().clipboard().write_text(&kickoff);
-
-                // Pipeline status hint so the human knows the kickoff is
-                // ready to paste.  Includes the remote cwd cue so they
-                // recognise the prompt is repo-scoped.
+                // Pipeline status hint so the human knows the launcher
+                // line is on its way.
                 self.pipeline_status = Some((
                     format!(
-                        "Kickoff copied to clipboard — paste into claude (session is in ~/src/{})",
-                        repo_dir,
+                        "Launching `coord assign --interactive --repo {} {}` …",
+                        repo, issue_num,
                     ),
                     Instant::now(),
                 ));
@@ -17547,48 +17467,50 @@ impl CoordApp {
     }
 }
 
-// ── #446: Remote session command builders ─────────────────────────────────────
+// ── #467: Interactive launcher command builder ────────────────────────────────
 
-/// Build the ssh+tmux launch line that auto-runs when the user presses `s`
-/// in the Pipeline detail Terminal tab.
+/// Build the local launcher line that auto-runs when the user presses `s`
+/// in the Pipeline detail Terminal tab (#467).
 ///
-/// The trailing `\r` is intentional — it auto-submits the line so the ssh
-/// connection starts immediately.  Only the *launcher* is auto-run; the
-/// claude kick-off prompt (see [`build_remote_kickoff_prompt`]) is
-/// pre-filled without `\r` so the human reviews it before pressing Enter.
+/// The trailing `\r` is intentional — it auto-submits the line so the
+/// launcher starts immediately.  Only the *launcher* is auto-run; the
+/// briefing / kickoff prompt is then driven by `coord assign --interactive`
+/// itself (the existing `interactive.py` seed path: bracketed-paste +
+/// readiness gate) — so the TUI does NOT inject any prompt, copy anything
+/// to the clipboard, or talk to the remote `ssh`/`tmux` stack.
 ///
-/// `~/.local/bin/claude` is an absolute path because `claude` is NOT on the
-/// bash PATH over ssh (zsh login shells load `~/.zshrc` which sets it up,
-/// but `ssh -t host "cmd"` uses a non-login bash).
+/// The session is strictly human-attended: the TUI never parses the TTY
+/// for completion or verdict and never auto-advances the pipeline state
+/// (Anthropic ToS §3.7 / #437).  The launcher only ESTABLISHES the
+/// session.
 ///
-/// `cd ~/src/<repo_dir>` puts `claude` in the right working tree before
-/// `exec`-ing it (smoke-found regression: without the `cd`, claude opens
-/// in `$HOME` on the remote machine).  `tmux new-session -A` only runs
-/// the command on *first create* — when reattaching to an existing
-/// `coord-issue-<N>` session, the original cwd is preserved, so the `cd`
-/// is correctly skipped on reattach.
-///
-/// `tmux new-session -A -s coord-issue-<N>` reattaches to an existing tmux
-/// session with that name if one already exists, so re-pressing `s` (or
-/// closing/reopening the Terminal tab) reattaches cleanly instead of
-/// spawning a second `claude` process.
-fn build_remote_launch_cmd(host: &str, issue_num: u64, repo_dir: &str) -> String {
+/// `<repo>` is shell-quoted via [`shell_quote_arg`] so a repo name that
+/// contains spaces or shell metacharacters can't break the line; the
+/// issue number is `u64`, so it never needs quoting.
+fn build_interactive_launch_cmd(repo: &str, issue_num: u64) -> String {
     format!(
-        "ssh -t {} \"tmux new-session -A -s coord-issue-{} 'cd ~/src/{} && exec ~/.local/bin/claude'\"\r",
-        host, issue_num, repo_dir,
+        "coord assign --interactive --repo {} {}\r",
+        shell_quote_arg(repo),
+        issue_num,
     )
 }
 
-/// Build the one-liner kick-off prompt that is pre-filled (but NOT
-/// auto-submitted) into the remote claude session (#446).
+/// Minimal POSIX shell quoter for a single argument (#467).
 ///
-/// The human reads the pre-filled text and presses Enter to start.  This
-/// keeps the session human-attended and ToS-compliant (§3.7 / #437).
-/// The string intentionally has no trailing `\r` or `\n`.
-fn build_remote_kickoff_prompt(issue_num: u64) -> String {
-    format!(
-        "Work on issue #{issue_num}: read it with `gh issue view {issue_num}`, then get started and ask me questions as you go."
-    )
+/// Returns the argument unchanged when it is non-empty and consists only
+/// of POSIX-safe characters (`[A-Za-z0-9_./-]`); otherwise wraps it in
+/// single quotes and escapes any embedded single quotes via the standard
+/// `'\''` trick.  Empty strings round-trip as `''`.
+fn shell_quote_arg(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+    if safe {
+        s.to_string()
+    } else {
+        let escaped = s.replace('\'', r"'\''");
+        format!("'{}'", escaped)
+    }
 }
 
 /// Convert a `Key` + `Modifiers` pair to the byte sequence sent to a
@@ -18238,9 +18160,11 @@ impl ShellApp for CoordApp {
         //     * When unfocused, keys flow through to normal dispatch.
         //   - Outside this condition this block is a no-op.
         //
-        // #446 addition (PTY released only):
-        //   * `s` launches a remote human-attended `claude` session over
-        //     ssh + tmux and auto-focuses the PTY.
+        // #467 addition (PTY released only; supersedes the ssh+tmux
+        // launcher built for #446):
+        //   * `s` launches a local human-attended `claude` session via
+        //     `coord assign --interactive --repo <repo> <N>` and
+        //     auto-focuses the PTY.
         if self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal
         {
@@ -18257,15 +18181,15 @@ impl ShellApp for CoordApp {
                     let _ = self.forward_key_to_detail_terminal(key, modifiers);
                     return Reaction::Redraw;
                 }
-                // ── #446: `s` = launch remote ssh+tmux claude session ──────
+                // ── #467: `s` = launch local `coord assign --interactive` ──
                 // Only fires when the PTY is *released* (not focused), so the
-                // letter 's' still reaches the remote shell when in PTY mode.
+                // letter 's' still reaches the live shell when in PTY mode.
                 if matches!(key, Key::Char('s'))
                     && !modifiers.ctrl
                     && !modifiers.alt
                     && !modifiers.shift
                 {
-                    self.launch_remote_session_for_selected_issue(backend);
+                    self.launch_interactive_session_for_selected_issue();
                     return Reaction::Redraw;
                 }
             }
@@ -30514,249 +30438,135 @@ mod tests {
             .write_input(b"exit\r");
     }
 
-    // ── #446: remote session command builders ─────────────────────────────────
+    // ── #467: local `coord assign --interactive` launcher ────────────────────
+    //
+    // Replaces the #446 ssh+tmux launcher tests (deleted with the launcher
+    // itself).  The Pipeline detail Terminal tab now auto-runs
+    // `coord assign --interactive --repo <repo> <N>` in the embedded PTY;
+    // the session is strictly human-attended.
 
     #[test]
-    fn build_remote_launch_cmd_contains_host_and_issue() {
-        let cmd =
-            build_remote_launch_cmd("precision.tailnet.ts.net", 446, "claude-coordinator");
-        assert!(
-            cmd.contains("precision.tailnet.ts.net"),
-            "command must contain the target host"
-        );
-        assert!(
-            cmd.contains("coord-issue-446"),
-            "tmux session name must embed the issue number"
-        );
-        assert!(
-            cmd.contains("~/.local/bin/claude"),
-            "must use absolute path to claude (not bare 'claude' which isn't on bash PATH over ssh)"
-        );
-        assert!(
-            cmd.contains("tmux new-session -A"),
-            "must use -A flag so reconnecting reattaches instead of spawning a second claude"
-        );
-        assert!(
-            cmd.ends_with('\r'),
-            "launch line must end with \\r to auto-run (only the launcher, not the kickoff prompt)"
-        );
-    }
-
-    #[test]
-    fn build_remote_launch_cmd_ssh_dash_t_flag() {
-        // ssh -t allocates a PTY on the remote side, required for an
-        // interactive tmux session.
-        let cmd = build_remote_launch_cmd("myhost", 123, "my-repo");
-        assert!(
-            cmd.contains("ssh -t "),
-            "must pass -t to ssh so tmux gets a PTY"
-        );
-    }
-
-    #[test]
-    fn build_remote_launch_cmd_cd_into_repo_then_exec_claude() {
-        // Smoke-found regression #446: claude must open in the repo
-        // checkout, not in `$HOME` on the remote machine.  The inner
-        // tmux command must `cd ~/src/<repo>` before launching claude.
-        let cmd = build_remote_launch_cmd("hostA", 446, "claude-coordinator");
-        assert!(
-            cmd.contains("cd ~/src/claude-coordinator && exec ~/.local/bin/claude"),
-            "launch must cd into ~/src/<repo> and exec claude; got: {}",
+    fn build_interactive_launch_cmd_is_exact_local_string() {
+        // Pin the exact rendered line — the TUI's job is to construct this
+        // string verbatim so the local `coord` CLI runs the human-attended
+        // interactive launcher.
+        let cmd = build_interactive_launch_cmd("claude-coordinator", 467);
+        assert_eq!(
             cmd,
-        );
-        // Repo dir is templated — different repo, different cd target.
-        let cmd2 = build_remote_launch_cmd("hostA", 99, "quadraui");
-        assert!(
-            cmd2.contains("cd ~/src/quadraui && exec ~/.local/bin/claude"),
-            "launch must template the repo dir; got: {}",
-            cmd2,
-        );
-        // Host + issue still propagate alongside the new cd.
-        assert!(
-            cmd2.contains("ssh -t hostA "),
-            "host must still be present alongside cd"
-        );
-        assert!(
-            cmd2.contains("coord-issue-99"),
-            "issue number must still be in the tmux session name"
+            "coord assign --interactive --repo claude-coordinator 467\r",
         );
     }
 
     #[test]
-    fn build_remote_kickoff_prompt_no_trailing_cr() {
-        let prompt = build_remote_kickoff_prompt(446);
-        assert!(
-            !prompt.ends_with('\r'),
-            "kickoff prompt must NOT end with \\r — the human presses Enter (ToS §3.7)"
-        );
-        assert!(
-            !prompt.ends_with('\n'),
-            "kickoff prompt must NOT end with \\n"
-        );
-        assert!(
-            prompt.contains("446"),
-            "kickoff prompt must reference the issue number"
-        );
-        assert!(
-            prompt.contains("gh issue view"),
-            "kickoff prompt should guide claude to read the issue"
-        );
-    }
-
-    #[test]
-    fn build_remote_kickoff_prompt_references_issue_number() {
-        // Parameterised: each issue number is embedded in the prompt.
-        for &n in &[1u64, 99, 446, 1000] {
-            let p = build_remote_kickoff_prompt(n);
-            assert!(
-                p.contains(&n.to_string()),
-                "prompt for issue #{n} must contain the number"
-            );
-        }
-    }
-
-    // ── #446: remote_session_host_for_issue ───────────────────────────────────
-
-    fn make_machine(name: &str, host: &str, repos: Vec<&str>) -> Machine {
-        Machine {
-            name: name.to_string(),
-            host: host.to_string(),
-            reachable: true,
-            active_count: 0,
-            repos: repos.into_iter().map(|s| s.to_string()).collect(),
-            version: None,
-            worktree_bytes: 0,
-        }
-    }
-
-    #[test]
-    fn remote_session_host_from_running_assignment() {
-        // A running assignment for issue 123 on "precision" → host returned.
-        let mut a = make_assignment_typed("running", 123, "my-repo", Some("work"));
-        a.machine = "precision".to_string();
-        let mut app = make_test_app(BoardData {
-            assignments: vec![a],
-            machines: vec![make_machine("precision", "precision.tailnet.ts.net", vec!["my-repo"])],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![PipelineIssue {
-            number: 123,
-            title: "test".to_string(),
-            body: String::new(),
-            repo_slug: "owner/my-repo".to_string(),
-            coord_repo: Some("my-repo".to_string()),
-            matched_labels: vec![],
-            all_labels: vec![],
-            is_closed: false,
-        }];
-        app.pipeline_sel = Some(0);
+    fn build_interactive_launch_cmd_ends_with_cr_to_auto_run() {
+        // Trailing \r submits the launcher line so the PTY actually runs
+        // it without a manual Enter.  Without this the line just sits in
+        // the shell input buffer.
+        let cmd = build_interactive_launch_cmd("anything", 1);
+        assert!(cmd.ends_with('\r'), "launcher must end with \\r; got: {cmd:?}");
+        // No double-Enter — only ONE \r at the end.
         assert_eq!(
-            app.remote_session_host_for_issue(123),
-            Some("precision.tailnet.ts.net".to_string())
+            cmd.matches('\r').count(),
+            1,
+            "launcher must contain exactly one \\r (auto-run, not auto-submit-twice)",
+        );
+        // No stray \n either — the briefing is delivered by
+        // `coord assign --interactive` itself, not by us.
+        assert!(!cmd.contains('\n'), "launcher must not embed newlines");
+    }
+
+    #[test]
+    fn build_interactive_launch_cmd_invokes_coord_assign_interactive() {
+        // The launcher MUST route through the existing
+        // `coord assign --interactive` path so the briefing seed is
+        // bracketed-paste-delivered by interactive.py rather than
+        // ad-hoc-injected by the TUI.
+        let cmd = build_interactive_launch_cmd("claude-coordinator", 467);
+        assert!(
+            cmd.starts_with("coord assign --interactive "),
+            "must invoke `coord assign --interactive`; got: {cmd:?}",
+        );
+        assert!(
+            cmd.contains("--repo claude-coordinator"),
+            "must pass --repo <repo>; got: {cmd:?}",
+        );
+        // Issue number trails the flags as a positional argument.
+        assert!(
+            cmd.contains(" 467\r"),
+            "must end with ` <issue>\\r`; got: {cmd:?}",
+        );
+        // No ssh, no tmux, no clipboard — the abandoned remote path is
+        // gone (#446 → #467).
+        assert!(!cmd.contains("ssh "), "must not invoke ssh");
+        assert!(!cmd.contains("tmux"), "must not invoke tmux");
+    }
+
+    #[test]
+    fn build_interactive_launch_cmd_templates_repo_and_issue() {
+        // Same shape, different repo + issue → both fields propagate.
+        let cmd = build_interactive_launch_cmd("quadraui", 99);
+        assert_eq!(cmd, "coord assign --interactive --repo quadraui 99\r");
+        let cmd2 = build_interactive_launch_cmd("coord-tui", 1234);
+        assert_eq!(cmd2, "coord assign --interactive --repo coord-tui 1234\r");
+    }
+
+    #[test]
+    fn build_interactive_launch_cmd_quotes_repo_with_spaces() {
+        // Defensive: a repo name that contains whitespace must be quoted
+        // so the local shell sees it as a single argument.  Single
+        // quotes also block shell-metachar interpretation.
+        let cmd = build_interactive_launch_cmd("my repo", 42);
+        assert!(
+            cmd.contains("--repo 'my repo' 42"),
+            "repo with spaces must be single-quoted; got: {cmd:?}",
         );
     }
 
     #[test]
-    fn remote_session_host_prefers_running_over_done() {
-        // Two assignments for the same issue: done on machine-a, running on
-        // machine-b.  The running assignment's host must be preferred.
-        let mut done_a = make_assignment_typed("done", 55, "repo", Some("work"));
-        done_a.machine = "machine-a".to_string();
-        let mut run_b = make_assignment_typed("running", 55, "repo", Some("review"));
-        run_b.machine = "machine-b".to_string();
-        let app = make_test_app(BoardData {
-            assignments: vec![done_a, run_b],
-            machines: vec![
-                make_machine("machine-a", "host-a.ts.net", vec!["repo"]),
-                make_machine("machine-b", "host-b.ts.net", vec!["repo"]),
-            ],
-            ..BoardData::default()
-        });
-        assert_eq!(
-            app.remote_session_host_for_issue(55),
-            Some("host-b.ts.net".to_string())
+    fn build_interactive_launch_cmd_quotes_repo_with_shell_metachars() {
+        // `$` / `;` / `&` / backticks must not be passed unquoted — they
+        // would otherwise be interpreted by the local shell.
+        let cmd = build_interactive_launch_cmd("evil;rm -rf /", 1);
+        assert!(
+            cmd.contains("--repo 'evil;rm -rf /' 1"),
+            "shell metachars must be quoted away; got: {cmd:?}",
+        );
+        // An embedded single quote is escaped via the standard '\'' trick.
+        let cmd2 = build_interactive_launch_cmd("a'b", 2);
+        assert!(
+            cmd2.contains(r"--repo 'a'\''b' 2"),
+            "embedded single quotes must be escaped; got: {cmd2:?}",
         );
     }
 
     #[test]
-    fn remote_session_host_fallback_to_machine_repos() {
-        // No assignment exists, but a machine lists the issue's coord-repo.
-        let app = make_test_app(BoardData {
-            assignments: vec![],
-            machines: vec![make_machine("worker", "worker.ts.net", vec!["target-repo"])],
-            ..BoardData::default()
-        });
-        // Simulate pipeline_issues with a coord_repo match.
-        let mut app = app;
+    fn shell_quote_arg_passes_safe_strings_through() {
+        // Common repo names (alphanumeric + `-`/`_`/`.`/`/`) are passed
+        // through verbatim — no unnecessary quoting noise.
+        assert_eq!(shell_quote_arg("claude-coordinator"), "claude-coordinator");
+        assert_eq!(shell_quote_arg("coord_tui"), "coord_tui");
+        assert_eq!(shell_quote_arg("v1.2.3"), "v1.2.3");
+        assert_eq!(shell_quote_arg("a/b"), "a/b");
+    }
+
+    #[test]
+    fn shell_quote_arg_quotes_empty_string() {
+        // Empty argument must round-trip as `''` so the positional
+        // argument still gets passed (and `coord` reports a useful error
+        // rather than silently dropping it).
+        assert_eq!(shell_quote_arg(""), "''");
+    }
+
+    // ── #467: coord_repo_for_issue ──────────────────────────────────────────
+
+    #[test]
+    fn coord_repo_for_issue_uses_coord_repo_field() {
+        // The coord-local repo name lives in `issue.coord_repo` after the
+        // brain resolves it from coordinator.yml; that's the value we
+        // pass as `--repo <repo>`.
+        let mut app = make_test_app(BoardData::default());
         app.pipeline_issues = vec![PipelineIssue {
-            number: 77,
-            title: "fallback test".to_string(),
-            body: String::new(),
-            repo_slug: "org/target-repo".to_string(),
-            coord_repo: Some("target-repo".to_string()),
-            matched_labels: vec![],
-            all_labels: vec![],
-            is_closed: false,
-        }];
-        assert_eq!(
-            app.remote_session_host_for_issue(77),
-            Some("worker.ts.net".to_string())
-        );
-    }
-
-    #[test]
-    fn remote_session_host_none_when_no_match() {
-        // No assignment, no machine with matching repo → None.
-        let mut app = make_test_app(BoardData {
-            assignments: vec![],
-            machines: vec![make_machine("other", "other.ts.net", vec!["unrelated-repo"])],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![PipelineIssue {
-            number: 99,
-            title: "orphan".to_string(),
-            body: String::new(),
-            repo_slug: "org/no-match".to_string(),
-            coord_repo: Some("my-repo".to_string()),
-            matched_labels: vec![],
-            all_labels: vec![],
-            is_closed: false,
-        }];
-        app.pipeline_sel = Some(0);
-        assert_eq!(app.remote_session_host_for_issue(99), None);
-    }
-
-    #[test]
-    fn remote_session_host_skips_empty_host() {
-        // Machine exists with a matching repo but has an empty host string
-        // (e.g. local machine entry) → must not be returned.
-        let mut a = make_assignment_typed("running", 10, "repo", Some("work"));
-        a.machine = "localbox".to_string();
-        let app = make_test_app(BoardData {
-            assignments: vec![a],
-            machines: vec![make_machine("localbox", "", vec!["repo"])],
-            ..BoardData::default()
-        });
-        // No other machine → None.
-        assert_eq!(app.remote_session_host_for_issue(10), None);
-    }
-
-    // ── #446: remote_repo_dir_for_issue ───────────────────────────────────────
-
-    #[test]
-    fn remote_repo_dir_uses_basename_of_pipeline_repo_path() {
-        // pipeline_repo_paths['foo'] = '/home/john/src/foo' → dir = 'foo'.
-        let mut paths = std::collections::HashMap::new();
-        paths.insert(
-            "claude-coordinator".to_string(),
-            "/home/john/src/claude-coordinator".to_string(),
-        );
-        let mut app = make_test_app(BoardData {
-            pipeline_repo_paths: paths,
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![PipelineIssue {
-            number: 446,
+            number: 467,
             title: "t".to_string(),
             body: String::new(),
             repo_slug: "JDonaghy/claude-coordinator".to_string(),
@@ -30766,34 +30576,16 @@ mod tests {
             is_closed: false,
         }];
         assert_eq!(
-            app.remote_repo_dir_for_issue(446),
+            app.coord_repo_for_issue(467),
             Some("claude-coordinator".to_string()),
         );
     }
 
     #[test]
-    fn remote_repo_dir_falls_back_to_coord_repo_when_no_path_mapped() {
-        // No pipeline_repo_paths entry → use issue.coord_repo.
-        let mut app = make_test_app(BoardData::default());
-        app.pipeline_issues = vec![PipelineIssue {
-            number: 77,
-            title: "t".to_string(),
-            body: String::new(),
-            repo_slug: "org/quadraui".to_string(),
-            coord_repo: Some("quadraui".to_string()),
-            matched_labels: vec![],
-            all_labels: vec![],
-            is_closed: false,
-        }];
-        assert_eq!(
-            app.remote_repo_dir_for_issue(77),
-            Some("quadraui".to_string()),
-        );
-    }
-
-    #[test]
-    fn remote_repo_dir_falls_back_to_repo_slug_last_segment() {
-        // No path, no coord_repo → use the last segment of "owner/repo".
+    fn coord_repo_for_issue_falls_back_to_repo_slug_last_segment() {
+        // Defensive: when the coord-local repo name isn't known, fall
+        // back to the last segment of `"owner/repo"` so the launcher
+        // still has something to pass.
         let mut app = make_test_app(BoardData::default());
         app.pipeline_issues = vec![PipelineIssue {
             number: 1,
@@ -30806,105 +30598,39 @@ mod tests {
             is_closed: false,
         }];
         assert_eq!(
-            app.remote_repo_dir_for_issue(1),
+            app.coord_repo_for_issue(1),
             Some("some-repo".to_string()),
         );
     }
 
     #[test]
-    fn remote_repo_dir_none_when_issue_missing() {
+    fn coord_repo_for_issue_skips_empty_coord_repo() {
+        // An empty `coord_repo` string must NOT short-circuit the
+        // fallback — fall through to the repo-slug last segment so the
+        // launcher line still has a non-empty `--repo` value.
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "t".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo-slug-name".to_string(),
+            coord_repo: Some(String::new()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        assert_eq!(
+            app.coord_repo_for_issue(7),
+            Some("repo-slug-name".to_string()),
+        );
+    }
+
+    #[test]
+    fn coord_repo_for_issue_none_when_issue_missing() {
+        // The Pipeline detail-tab launcher fires only with a selected
+        // issue; `None` here causes the caller to surface a toast
+        // instead of constructing a half-baked command.
         let app = make_test_app(BoardData::default());
-        assert_eq!(app.remote_repo_dir_for_issue(999), None);
-    }
-
-    // ── #446: clipboard-based kickoff handoff ────────────────────────────────
-
-    /// Test backend stub: a `PlatformServices` implementation that records
-    /// every `Clipboard::write_text` call into an interior `RefCell<String>`.
-    ///
-    /// The auto-seed path used to inject the kickoff prompt via bracketed
-    /// paste (gated on the remote claude's `bracketed_paste_enabled()`),
-    /// but live smoke found the readiness signal never flips through ssh.
-    /// The current design copies the kickoff to the clipboard at launch
-    /// time and leaves the actual paste + submit to the human — this stub
-    /// lets the test capture what `launch_remote_session_for_selected_issue`
-    /// places on the clipboard.
-    struct StubClipboard {
-        last_write: std::cell::RefCell<Option<String>>,
-    }
-
-    impl quadraui::backend::Clipboard for StubClipboard {
-        fn read_text(&self) -> Option<String> {
-            self.last_write.borrow().clone()
-        }
-        fn write_text(&self, text: &str) {
-            *self.last_write.borrow_mut() = Some(text.to_string());
-        }
-    }
-
-    struct StubPlatformServices {
-        clipboard: StubClipboard,
-    }
-
-    impl quadraui::backend::PlatformServices for StubPlatformServices {
-        fn clipboard(&self) -> &dyn quadraui::backend::Clipboard {
-            &self.clipboard
-        }
-        fn show_file_open_dialog(
-            &self,
-            _opts: quadraui::backend::FileDialogOptions,
-        ) -> Option<std::path::PathBuf> {
-            None
-        }
-        fn show_file_save_dialog(
-            &self,
-            _opts: quadraui::backend::FileDialogOptions,
-        ) -> Option<std::path::PathBuf> {
-            None
-        }
-        fn send_notification(&self, _n: quadraui::backend::Notification) {}
-        fn open_url(&self, _url: &str) {}
-        fn platform_name(&self) -> &'static str {
-            "test"
-        }
-    }
-
-    /// Smoke-level: a freshly-constructed `StubPlatformServices` round-trips
-    /// `write_text` → `read_text` via the inner `RefCell`.  Guards the test
-    /// stub itself so a later test failure can't be blamed on the stub.
-    #[test]
-    fn stub_clipboard_round_trips_write_then_read() {
-        use quadraui::backend::Clipboard;
-        let svc = StubClipboard {
-            last_write: std::cell::RefCell::new(None),
-        };
-        assert_eq!(svc.read_text(), None);
-        svc.write_text("hello world");
-        assert_eq!(svc.read_text(), Some("hello world".to_string()));
-    }
-
-    /// `build_remote_kickoff_prompt(N)` is the exact text we now place on
-    /// the system clipboard at launch time.  This test pins that contract:
-    /// the prompt mentions the issue number and `gh issue view`, ends
-    /// without CR/LF (human presses Enter — ToS §3.7 / #437), and survives
-    /// being shuttled through the clipboard unchanged.
-    #[test]
-    fn launch_kickoff_payload_is_what_we_copy_to_clipboard() {
-        use quadraui::backend::{Clipboard, PlatformServices};
-        let expected = build_remote_kickoff_prompt(446);
-        let svc = StubPlatformServices {
-            clipboard: StubClipboard {
-                last_write: std::cell::RefCell::new(None),
-            },
-        };
-        // Simulate the exact call the launch path makes.
-        svc.clipboard().write_text(&expected);
-        let got = svc.clipboard().read_text();
-        assert_eq!(got, Some(expected.clone()));
-        // Cross-check the kickoff invariants while we have it isolated.
-        assert!(!expected.ends_with('\r'));
-        assert!(!expected.ends_with('\n'));
-        assert!(expected.contains("446"));
-        assert!(expected.contains("gh issue view"));
+        assert_eq!(app.coord_repo_for_issue(999), None);
     }
 }
