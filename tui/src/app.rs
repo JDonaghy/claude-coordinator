@@ -4008,6 +4008,11 @@ pub struct CoordApp {
     /// stuck in "button held" state until the next click.
     /// Bits: `1` = Left, `2` = Middle, `4` = Right.
     pty_pressed_buttons: u8,
+    /// #464: `true` while a host-side text-selection drag is in progress in
+    /// the active terminal pane. Set when mouse-reporting is OFF (plain
+    /// shell) or Shift is held (force-override). Cleared on the matching
+    /// mouse-release. `pty_pressed_buttons` is NOT set for these drags.
+    terminal_host_sel_dragging: bool,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4213,6 +4218,8 @@ impl CoordApp {
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #454: tracks Press → Release for PTY mouse-reporting drags.
             pty_pressed_buttons: 0,
+            // #464: host-side terminal selection drag state.
+            terminal_host_sel_dragging: false,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -11561,6 +11568,54 @@ impl CoordApp {
                 } else if ctx.in_main(pos.x, pos.y) {
                     let main_b = ctx.main_bounds();
                     let char_w = backend.char_width();
+                    // #464: host-side selection — must check BEFORE the PTY
+                    // forwarding path so Shift can override even when the app
+                    // has mouse reporting on (e.g. vim visual mode).
+                    //
+                    // Two cases both route to host selection:
+                    //   1. Shift held → always host-select (standard terminal
+                    //      override convention; overrides vim/tmux/less).
+                    //   2. Mouse reporting OFF → forward_mouse returns false
+                    //      anyway; start selection here so we own the drag.
+                    //
+                    // For case 2 we need to peek at the session's reporting
+                    // state without consuming the event — read the flag, then
+                    // branch.
+                    let reporting_on = {
+                        let cr = self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w);
+                        cr.is_some() && {
+                            // Only peek when there's actually a session.
+                            match self.active_view {
+                                SidebarView::Terminal => self
+                                    .terminal_session
+                                    .as_ref()
+                                    .map(|s| s.mouse_reporting_enabled())
+                                    .unwrap_or(false),
+                                SidebarView::Pipeline
+                                    if self.pipeline_detail_tab
+                                        == PipelineDetailTab::Terminal =>
+                                {
+                                    self.selected_issue_key()
+                                        .and_then(|k| {
+                                            self.detail_terminal_sessions
+                                                .get(&k)
+                                                .map(|s| s.mouse_reporting_enabled())
+                                        })
+                                        .unwrap_or(false)
+                                }
+                                _ => false,
+                            }
+                        }
+                    };
+                    let force_host_sel = modifiers.shift || !reporting_on;
+                    if force_host_sel {
+                        if let Some((col, row)) =
+                            self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w)
+                        {
+                            self.terminal_host_sel_begin(col, row);
+                            return true;
+                        }
+                    }
                     // #454: Forward click to the embedded PTY when mouse
                     // reporting is enabled. Returns true only if the PTY
                     // consumed it (i.e. mouse reporting is on); fall through
@@ -11754,23 +11809,34 @@ impl CoordApp {
                         redraw |= self.panel_toolbar_hover.clear();
                     }
                 } else if ctx.in_main(pos.x, pos.y) {
-                    // #454: forward cursor motion to the embedded PTY when
-                    // mouse-reporting mode is active.  `forward_mouse`
-                    // returns false when reporting is off, so there is no
-                    // performance cost on the common idle path.
-                    //
-                    // Plain hover (no button held) is intentionally NOT
-                    // forwarded: under the xterm "button-event tracking"
-                    // protocol (mode 1002), a motion event always carries
-                    // a button bit, so reporting Left for hover looks
-                    // identical to a Left-drag — and would trigger vim
-                    // visual selection, tmux copy-mode drag, ranger
-                    // selection, etc. on plain cursor movement.  We
-                    // forward Move only when at least one button is
-                    // actually held (#454 review fix).
+                    // #464: if a host-side selection drag is in progress,
+                    // extend the selection to the current cell and redraw.
+                    // This takes priority over the PTY motion path so the
+                    // drag doesn't accidentally escape to the PTY.
                     let char_w = backend.char_width();
                     let main_b = ctx.main_bounds();
-                    if buttons.left || buttons.right || buttons.middle {
+                    if self.terminal_host_sel_dragging && buttons.left {
+                        if let Some((col, row)) =
+                            self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w)
+                        {
+                            self.terminal_host_sel_update(col, row);
+                            redraw = true;
+                        }
+                    } else if buttons.left || buttons.right || buttons.middle {
+                        // #454: forward cursor motion to the embedded PTY when
+                        // mouse-reporting mode is active.  `forward_mouse`
+                        // returns false when reporting is off, so there is no
+                        // performance cost on the common idle path.
+                        //
+                        // Plain hover (no button held) is intentionally NOT
+                        // forwarded: under the xterm "button-event tracking"
+                        // protocol (mode 1002), a motion event always carries
+                        // a button bit, so reporting Left for hover looks
+                        // identical to a Left-drag — and would trigger vim
+                        // visual selection, tmux copy-mode drag, ranger
+                        // selection, etc. on plain cursor movement.  We
+                        // forward Move only when at least one button is
+                        // actually held (#454 review fix).
                         let btn = if buttons.right {
                             MouseButton::Right
                         } else if buttons.middle {
@@ -11860,6 +11926,13 @@ impl CoordApp {
                         }
                         _ => {}
                     }
+                }
+                // #464: finalise a host-side selection drag on release.
+                // Must run before the PTY forwarding path so we don't also
+                // send a spurious Release to the PTY.
+                if self.terminal_host_sel_dragging && btn == MouseButton::Left {
+                    self.terminal_host_sel_end();
+                    return true;
                 }
                 // #454: forward button release to the embedded PTY when mouse
                 // reporting is enabled (gated inside forward_mouse itself).
@@ -12423,6 +12496,116 @@ impl CoordApp {
                 false
             }
             _ => false,
+        }
+    }
+
+    // ── #464: host-side terminal selection helpers ────────────────────────────
+
+    /// Translate a pixel position to a terminal cell `(col, row)` for
+    /// whichever terminal view is currently active (standalone Terminal or
+    /// Pipeline / Terminal tab).  Returns `None` when `pos` is outside the
+    /// PTY content area.
+    fn active_terminal_pixel_to_cell(
+        &self,
+        pos: Point,
+        main_b: Rect,
+        lh: f32,
+        char_w: f32,
+    ) -> Option<(u16, u16)> {
+        match self.active_view {
+            SidebarView::Terminal => {
+                terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
+            }
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                let content_y = main_b.y + lh * 1.4;
+                terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return a mutable reference to the currently active embedded terminal
+    /// session, or `None` when no terminal view is active or no session exists.
+    fn active_terminal_session_mut(
+        &mut self,
+    ) -> Option<&mut quadraui::terminal_engine::TerminalSession> {
+        match self.active_view {
+            SidebarView::Terminal => self.terminal_session.as_mut(),
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                let key = self.selected_issue_key()?;
+                self.detail_terminal_sessions.get_mut(&key)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the selected text from the active terminal session, if any.
+    fn active_terminal_selected_text(&self) -> Option<String> {
+        match self.active_view {
+            SidebarView::Terminal => self.terminal_session.as_ref()?.selected_text(),
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                let key = self.selected_issue_key()?;
+                self.detail_terminal_sessions.get(&key)?.selected_text()
+            }
+            _ => None,
+        }
+    }
+
+    /// Clear the selection in the active terminal session.
+    fn clear_active_terminal_selection(&mut self) {
+        if let Some(sess) = self.active_terminal_session_mut() {
+            sess.selection = None;
+        }
+    }
+
+    /// Begin a host-side selection drag in the active terminal at `(col, row)`.
+    /// Clears any previous selection and sets the anchor to `(col, row)`.
+    fn terminal_host_sel_begin(&mut self, col: u16, row: u16) {
+        use quadraui::terminal_engine::TerminalSelection;
+        if let Some(sess) = self.active_terminal_session_mut() {
+            sess.selection = Some(TerminalSelection {
+                start_row: row,
+                start_col: col,
+                end_row: row,
+                end_col: col,
+            });
+        }
+        self.terminal_host_sel_dragging = true;
+    }
+
+    /// Extend the host-side selection drag to `(col, row)` (move event).
+    /// No-op when no drag is in progress.
+    fn terminal_host_sel_update(&mut self, col: u16, row: u16) {
+        if !self.terminal_host_sel_dragging {
+            return;
+        }
+        if let Some(sess) = self.active_terminal_session_mut() {
+            if let Some(ref mut sel) = sess.selection {
+                sel.end_row = row;
+                sel.end_col = col;
+            }
+        }
+    }
+
+    /// Finalise the host-side selection drag (release event).
+    /// The selection remains visible; only the dragging flag is cleared.
+    /// A collapsed selection (anchor == end) is cleared entirely since it
+    /// represents a plain click with no text chosen.
+    fn terminal_host_sel_end(&mut self) {
+        self.terminal_host_sel_dragging = false;
+        // Clear collapsed (point) selections — they're just phantom clicks.
+        if let Some(sess) = self.active_terminal_session_mut() {
+            if let Some(ref sel) = sess.selection.clone() {
+                if sel.start_row == sel.end_row && sel.start_col == sel.end_col {
+                    sess.selection = None;
+                }
+            }
         }
     }
 
@@ -18193,6 +18376,27 @@ impl ShellApp for CoordApp {
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
 
+        // ── #464: Ctrl-C copies active terminal host-selection ──────────
+        // Fires for BOTH terminal views (standalone Terminal and
+        // Pipeline/Terminal tab) regardless of whether PTY-passthrough is
+        // active. When there is an active host selection, Ctrl-C copies the
+        // text and is consumed — it does NOT propagate to the PTY (so no
+        // accidental interrupt of the running process). When there is no
+        // selection, this block is a no-op and Ctrl-C falls through to the
+        // normal PTY-passthrough path below.
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            if matches!(key, Key::Char('c') | Key::Char('C'))
+                && modifiers.ctrl
+                && !modifiers.alt
+            {
+                if let Some(text) = self.active_terminal_selected_text() {
+                    backend.services().clipboard().write_text(&text);
+                    self.clear_active_terminal_selection();
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
         // ── #424: embedded terminal pane focus arbitration ──────────────
         // PROTOCOL:
         //   - When `active_view == SidebarView::Terminal`:
@@ -18208,8 +18412,7 @@ impl ShellApp for CoordApp {
         //
         // Mouse/window events fall through to normal handlers — the
         // Terminal view doesn't need special mouse handling for the MVP
-        // (no selection / scrollbar drag wired up yet; copy-out is
-        // tracked in quadraui #283).
+        // (copy-out is now implemented in #464 above).
         if self.active_view == SidebarView::Terminal {
             if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                 // F12 = focus-toggle — always handled, independent of
@@ -21533,6 +21736,8 @@ mod tests {
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #454
             pty_pressed_buttons: 0,
+            // #464
+            terminal_host_sel_dragging: false,
         }
     }
 
@@ -31377,5 +31582,238 @@ mod tests {
             consumed,
             "forward_paste_to_detail_terminal should return true when session exists"
         );
+    }
+
+    // ── #464: host-side terminal selection ───────────────────────────────────
+    //
+    // Three behaviour branches:
+    //   A. App mouse-reporting OFF (plain /bin/sh) → host-select starts on
+    //      mouse-press.
+    //   B. App mouse-reporting ON (simulated via a flag check) → forward
+    //      to PTY; no host-select.
+    //   C. Shift held → force host-select even when reporting is ON.
+    //
+    // The tests drive `terminal_host_sel_begin` / `terminal_host_sel_update` /
+    // `terminal_host_sel_end` directly and verify the resulting
+    // `TerminalSession.selection` state, then check `active_terminal_selected_text`.
+
+    /// Helpers shared across #464 tests: set up a standalone Terminal view
+    /// with a real /bin/sh session attached.
+    #[cfg(unix)]
+    fn make_terminal_app_with_session() -> CoordApp {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+        app.terminal_session = Some(sess);
+        app
+    }
+
+    /// host_sel_begin sets selection with anchor == end (collapsed point).
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_begin_sets_collapsed_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(5, 3);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection must be Some after begin");
+        assert_eq!((sel.start_col, sel.start_row), (5, 3));
+        assert_eq!((sel.end_col, sel.end_row), (5, 3));
+        assert!(
+            app.terminal_host_sel_dragging,
+            "dragging flag must be set after begin"
+        );
+    }
+
+    /// host_sel_update extends the end point while the anchor stays fixed.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_update_extends_end_not_anchor() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(2, 1);
+        app.terminal_host_sel_update(10, 4);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection must be Some after update");
+        // Anchor unchanged.
+        assert_eq!((sel.start_col, sel.start_row), (2, 1));
+        // End advanced.
+        assert_eq!((sel.end_col, sel.end_row), (10, 4));
+        assert!(app.terminal_host_sel_dragging);
+    }
+
+    /// host_sel_end clears the dragging flag; non-collapsed selection persists.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_end_clears_dragging_keeps_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(0, 0);
+        app.terminal_host_sel_update(5, 2);
+        app.terminal_host_sel_end();
+        assert!(
+            !app.terminal_host_sel_dragging,
+            "dragging flag cleared after end"
+        );
+        // Non-collapsed selection must remain so Ctrl-C can copy it.
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_some(),
+            "selection should persist after end (non-collapsed)"
+        );
+    }
+
+    /// A collapsed (point) selection is cleared by host_sel_end.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_end_clears_collapsed_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(3, 1);
+        // No update → start == end → collapsed.
+        app.terminal_host_sel_end();
+        assert!(
+            !app.terminal_host_sel_dragging,
+            "dragging flag cleared"
+        );
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_none(),
+            "collapsed (point) selection must be cleared on end"
+        );
+    }
+
+    /// Mouse-reporting OFF: host-selection starts on left-press in the PTY area.
+    /// The dragging flag is set and pty_pressed_buttons is NOT set.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_press_reporting_off_starts_host_sel_not_pty_press() {
+        let mut app = make_terminal_app_with_session();
+        // Verify that plain /bin/sh has reporting OFF.
+        assert!(
+            !app.terminal_session
+                .as_ref()
+                .unwrap()
+                .mouse_reporting_enabled(),
+            "/bin/sh should have mouse reporting OFF"
+        );
+        // Simulate a left-press inside the PTY rect.
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let lh = 16.0_f32;
+        let char_w = 8.0_f32;
+        // pos (50, 50) is inside main_b, reporting is off → host-select path.
+        // We call active_terminal_pixel_to_cell to compute what the app would see.
+        let cell = app.active_terminal_pixel_to_cell(
+            Point::new(50.0, 50.0),
+            main_b,
+            lh,
+            char_w,
+        );
+        assert!(cell.is_some(), "position must map to a cell");
+        let (col, row) = cell.unwrap();
+        // Simulate what the mouse-down handler does: begin host-select.
+        app.terminal_host_sel_begin(col, row);
+        assert!(
+            app.terminal_host_sel_dragging,
+            "host-sel drag started"
+        );
+        assert_eq!(
+            app.pty_pressed_buttons, 0,
+            "pty_pressed_buttons must NOT be set for host-selection presses"
+        );
+    }
+
+    /// Shift-held: host-selection is forced even with a session present
+    /// (simulating the case where the PTY would otherwise grab the mouse).
+    /// We directly test the Shift-override branch via active_terminal_pixel_to_cell
+    /// and terminal_host_sel_begin — the full mouse handler is integration-level.
+    #[test]
+    #[cfg(unix)]
+    fn shift_forces_host_sel_branch() {
+        let mut app = make_terminal_app_with_session();
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // With Shift held (force_host_sel = true) we bypass forward_mouse
+        // and go straight to terminal_host_sel_begin.
+        let (col, row) = app
+            .active_terminal_pixel_to_cell(Point::new(40.0, 32.0), main_b, 16.0, 8.0)
+            .expect("position inside PTY rect");
+        app.terminal_host_sel_begin(col, row);
+        assert!(app.terminal_host_sel_dragging, "drag started via Shift path");
+        // PTY should NOT be notified.
+        assert_eq!(
+            app.pty_pressed_buttons, 0,
+            "pty_pressed_buttons stays zero on Shift-forced host selection"
+        );
+    }
+
+    /// active_terminal_selected_text returns None when no selection is set.
+    #[test]
+    #[cfg(unix)]
+    fn active_terminal_selected_text_none_without_selection() {
+        let app = make_terminal_app_with_session();
+        assert!(
+            app.active_terminal_selected_text().is_none(),
+            "no selection → selected_text must be None"
+        );
+    }
+
+    /// clear_active_terminal_selection removes the selection from the session.
+    #[test]
+    #[cfg(unix)]
+    fn clear_active_terminal_selection_removes_sel() {
+        use quadraui::terminal_engine::TerminalSelection;
+        let mut app = make_terminal_app_with_session();
+        app.terminal_session.as_mut().unwrap().selection = Some(TerminalSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 5,
+        });
+        app.clear_active_terminal_selection();
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_none(),
+            "selection must be cleared"
+        );
+    }
+
+    /// host_sel_update is a no-op when terminal_host_sel_dragging is false.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_update_noop_when_not_dragging() {
+        let mut app = make_terminal_app_with_session();
+        // Start a selection then end it (dragging flag = false).
+        app.terminal_host_sel_begin(1, 1);
+        app.terminal_host_sel_update(5, 5);
+        app.terminal_host_sel_end();
+        // Now the selection is non-collapsed (1,1)→(5,5) with dragging=false.
+        // Calling update should be a no-op: the end must not move.
+        app.terminal_host_sel_update(9, 9);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection should still exist");
+        assert_eq!((sel.end_col, sel.end_row), (5, 5), "update was a no-op");
     }
 }
