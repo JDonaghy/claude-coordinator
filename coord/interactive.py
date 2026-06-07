@@ -318,32 +318,6 @@ class InteractiveFinalizeResult:
     seam_outcome: object | None = None  # StoreOutcome | None
 
 
-def _commits_ahead(wt_path: Path, base: str) -> int | None:
-    """Mirror of :meth:`coord.agent.AgentServer._commits_ahead`.
-
-    Kept as a thin wrapper so the launcher (which never imports the
-    agent server) doesn't pull in the full :class:`AgentServer` graph
-    just to count commits.  Logic is byte-identical to #448's primitive
-    — same ref precedence (``origin/<base>`` first, then ``<base>``),
-    same ``None`` semantics on git failure (callers must treat ``None``
-    as "unknown, assume non-zero" to avoid false advisories).
-    """
-    for ref in (f"origin/{base}", base):
-        try:
-            raw = subprocess.run(
-                ["git", "rev-list", "--count", f"{ref}..HEAD"],
-                cwd=str(wt_path),
-                capture_output=True,
-                text=True,
-                timeout=15.0,
-                check=True,
-            ).stdout
-            return int(raw.strip())
-        except (subprocess.SubprocessError, ValueError, OSError):
-            continue
-    return None
-
-
 def _git_push(wt_path: Path, *, timeout: float = 60.0) -> tuple[bool, str | None]:
     """``git push -u origin HEAD`` with a clean (ok, error) return shape.
 
@@ -475,6 +449,10 @@ def finalize_interactive_exit(
     # Step 2 — count commits ahead of the base.  None = git failed; the
     # seam treats that as "unknown, assume non-zero" so a git outage
     # never falsely flags an advisory.
+    # Deferred import of the shared primitive from coord.agent (#466) so
+    # this module stays importable in isolation without pulling in the full
+    # AgentServer graph at module load time.
+    from coord.agent import _commits_ahead  # noqa: PLC0415
     commits = None
     if wt_path.exists():
         commits = _commits_ahead(wt_path, base_branch)

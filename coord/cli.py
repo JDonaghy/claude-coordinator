@@ -1997,7 +1997,7 @@ def assign(
 
         repo_path = machine_obj.repo_path(repo) or str(Path.cwd())
 
-        effective_plan_only_int = plan_only or (
+        effective_plan_only = plan_only or (
             cfg.dispatch.require_plan and not no_plan
         )
         # The interactive launcher uses the *current* checkout, not a
@@ -2041,7 +2041,7 @@ def assign(
             issue_title=issue_title,
             briefing=briefing,
             model=resolved_model,
-            type="plan" if effective_plan_only_int else "work",
+            type="plan" if effective_plan_only else "work",
             provider="claude-pty",
         )
 
@@ -2061,7 +2061,7 @@ def assign(
             rationale="manual --interactive dispatch (human-attended)",
             briefing=briefing,
             model=resolved_model,
-            type="plan" if effective_plan_only_int else "work",
+            type="plan" if effective_plan_only else "work",
             required_gates=[],
         )
         record_dispatched(
@@ -2079,7 +2079,6 @@ def assign(
         # report a structured result before exiting.  Also prepend a
         # short reminder to the briefing so the operator notices.
         os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
-        os.environ["COORD_REPO_NAME"] = repo
         report_reminder = (
             f"[Coordinator assignment {assignment_id}] "
             "Before you exit, please run `coord report-result "

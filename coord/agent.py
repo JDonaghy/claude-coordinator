@@ -409,6 +409,29 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     return result.stdout.strip()
 
 
+def _commits_ahead(wt_path: Path, base: str) -> int | None:
+    """Number of commits HEAD is ahead of *base* in the worktree.
+
+    Tries ``origin/<base>..HEAD`` first (the authoritative check when a
+    remote is configured); falls back to ``<base>..HEAD`` for local-only
+    repos (test fixtures and airgapped machines).  Returns ``None`` when
+    both lookups fail (e.g. detached HEAD, base branch missing entirely).
+
+    Callers should treat ``None`` as "unknown, assume non-zero" so a git
+    failure never triggers a false advisory.
+
+    This is the shared primitive used by both :meth:`AgentServer._commits_ahead`
+    and :func:`coord.interactive.finalize_interactive_exit` (#466).
+    """
+    for ref in (f"origin/{base}", base):
+        try:
+            raw = _git(wt_path, "rev-list", "--count", f"{ref}..HEAD")
+            return int(raw.strip())
+        except (_GitError, ValueError):
+            continue
+    return None
+
+
 def _safe_realpath(path: str) -> str:
     try:
         return os.path.realpath(path)
@@ -2470,21 +2493,11 @@ class AgentServer:
     def _commits_ahead(self, wt_path: Path, base: str) -> int | None:
         """Number of commits HEAD is ahead of *base* in the worktree.
 
-        Tries ``origin/<base>..HEAD`` first (the authoritative check when a
-        remote is configured); falls back to ``<base>..HEAD`` for local-only
-        repos (test fixtures and airgapped machines).  Returns ``None`` when
-        both lookups fail (e.g. detached HEAD, base branch missing entirely).
-
-        Callers should treat ``None`` as "unknown, assume non-zero" so a git
-        failure never triggers a false advisory.
+        Delegates to the module-level :func:`_commits_ahead` primitive (#466)
+        which is also used by :func:`coord.interactive.finalize_interactive_exit`
+        so the two callers share a single implementation.
         """
-        for ref in (f"origin/{base}", base):
-            try:
-                raw = _git(wt_path, "rev-list", "--count", f"{ref}..HEAD")
-                return int(raw.strip())
-            except (_GitError, ValueError):
-                continue
-        return None
+        return _commits_ahead(wt_path, base)
 
     def _reap(
         self,

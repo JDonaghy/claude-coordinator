@@ -460,7 +460,10 @@ class TestReportResultCli:
 
     def test_missing_assignment_id_errors(self, config_file: Path) -> None:
         """No --assignment and no $COORD_ASSIGNMENT_ID → user-facing error."""
-        env_clean = {}  # don't inherit COORD_ASSIGNMENT_ID from CI
+        # Pass None for the var explicitly — Click's CliRunner only iterates
+        # the env dict to apply overrides; an empty dict leaves os.environ
+        # untouched, so a COORD_ASSIGNMENT_ID leaked from a prior test would
+        # silently make this test pass with the wrong code path.
         result = CliRunner().invoke(
             main,
             [
@@ -469,7 +472,7 @@ class TestReportResultCli:
                 "--summary", "x",
                 "--config", str(config_file),
             ],
-            env=env_clean,
+            env={"COORD_ASSIGNMENT_ID": None},
         )
         assert result.exit_code == 2
         assert "assignment" in result.output.lower()
@@ -536,12 +539,18 @@ class TestInteractiveClaim:
         assert rec["machine_name"] == "laptop"
         assert rec["repo_name"] == "api"
         assert rec["issue_number"] == 42
-        # And the assignment id was injected into the launcher's env so
-        # the agent can echo it to `coord report-result --assignment`.
+        # The assignment id must be injected into the process env so the
+        # interactive agent can run `coord report-result --assignment
+        # $COORD_ASSIGNMENT_ID`.  Wrap the assertion + cleanup in
+        # try/finally so the env var is always removed even when the
+        # assertion fails — a leaked var would contaminate later tests.
         import os
-        assert os.environ.get("COORD_ASSIGNMENT_ID")
-        del os.environ["COORD_ASSIGNMENT_ID"]
-        del os.environ["COORD_REPO_NAME"]
+        try:
+            assert os.environ.get("COORD_ASSIGNMENT_ID"), (
+                "COORD_ASSIGNMENT_ID was not set in the process env"
+            )
+        finally:
+            os.environ.pop("COORD_ASSIGNMENT_ID", None)
 
     def test_interactive_refuses_duplicate_via_claim_check(
         self, config_file: Path,
