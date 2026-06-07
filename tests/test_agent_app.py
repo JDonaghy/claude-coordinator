@@ -81,7 +81,9 @@ def test_assign_then_status(tmp_path: Path) -> None:
     body = r.json()
     assert len(body["completed"]) == 1
     assert body["completed"][0]["id"] == aid
-    assert body["completed"][0]["status"] == "done"
+    # Worker makes no commits → advisory (#448); "done" is also valid
+    # for workers that do make commits.
+    assert body["completed"][0]["status"] in ("done", "advisory")
     # worktree_path should be present in status response
     assert body["completed"][0]["worktree_path"] is not None
     server.shutdown()
@@ -221,22 +223,47 @@ def test_logs_endpoint_returns_log_content(tmp_path: Path) -> None:
     assert r.status_code == 200
     assert "hello-from-worker" in r.text
     assert "X-Coord-Log-Total" in r.headers
-    assert r.headers["X-Coord-Log-Status"] == "done"
+    # Worker makes no commits → advisory (#448); both statuses are terminal.
+    assert r.headers["X-Coord-Log-Status"] in ("done", "advisory")
     server.shutdown()
 
 
 def test_logs_endpoint_supports_since(tmp_path: Path) -> None:
+    """The `since` parameter returns bytes starting at the given offset.
+
+    The reap thread may append a few footer lines after the status flips
+    (#448 adds an advisory check and a final status line), so the test
+    avoids asserting an exact end-of-log boundary — the log can only grow
+    monotonically.  Instead it validates the since-offset mechanism by
+    choosing an offset well inside the log (not at the very end).
+    """
+    import time as _time
+
     repo = _init_repo(tmp_path / "repo")
     client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo line"], repo_path=repo)
     r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
     aid = r.json()["id"]
     server.wait_for(aid)
 
+    # Fetch the full log — it must contain the worker's output.
     full = client.get(f"/logs/{aid}").text
+    assert "line" in full, "log must contain worker output"
+
+    # since=0 must return at least as many bytes as 'full' (log can only grow).
     head = client.get(f"/logs/{aid}", params={"since": 0}).text
-    tail = client.get(f"/logs/{aid}", params={"since": len(full) - 5}).text
-    assert head == full
-    assert len(tail) == 5
+    assert head.startswith(full), "since=0 must return the full log"
+
+    # Pick a stable midpoint offset that is well inside the initial log
+    # content and can't race with reap's footer writes.
+    mid = max(1, len(full) // 2)
+    tail = client.get(f"/logs/{aid}", params={"since": mid}).text
+    # The bytes from 'mid' onward must match the full log at that position.
+    # Capture the log again at the same moment for a consistent comparison.
+    full_now = client.get(f"/logs/{aid}", params={"since": 0}).text
+    assert full_now[mid:] == tail, (
+        f"since={mid} returned wrong slice; "
+        f"expected {full_now[mid:]!r}, got {tail!r}"
+    )
     server.shutdown()
 
 

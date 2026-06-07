@@ -393,7 +393,8 @@ def test_safety_gate_no_provider_is_a_no_op(tmp_path: Path) -> None:
     )
     record = server.assign(spec)
     final = server.wait_for(record.id, timeout=10.0)
-    assert final.status in ("done", "failed")  # spawn succeeded, no gate raised
+    # spawn succeeded, no gate raised; no commits → advisory (#448)
+    assert final.status in ("done", "failed", "advisory")
     server.shutdown()
 
 
@@ -424,7 +425,8 @@ def test_safety_gate_unknown_provider_falls_back_to_default(tmp_path: Path) -> N
     final = server.wait_for(record.id, timeout=10.0)
     # Spawn used worker_command (legacy path) — the gate never fired
     # because the named provider wasn't in the registry.
-    assert final.status in ("done", "failed")
+    # No commits → advisory (#448); "done" or "failed" also valid.
+    assert final.status in ("done", "failed", "advisory")
     server.shutdown()
 
 
@@ -462,7 +464,8 @@ def test_default_path_uses_legacy_worker_command_when_no_providers(
     )
     record = server.assign(spec)
     final = server.wait_for(record.id, timeout=10.0)
-    assert final.status == "done"
+    # Worker makes no commits → advisory (#448)
+    assert final.status in ("done", "advisory")
     assert captured == [["/bin/sh", "-c", "echo legacy-output"]]
     log = Path(final.log_path).read_text()
     assert "legacy-output" in log
