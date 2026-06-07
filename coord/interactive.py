@@ -50,6 +50,7 @@ import sys
 import termios
 import time
 import tty
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -276,10 +277,6 @@ def launch_human_attended_interactive(
 
 
 # ── #466 git-floor backstop ─────────────────────────────────────────────────
-
-
-# Result class for the backstop — small and dataclass-y for test ergonomics.
-from dataclasses import dataclass  # noqa: E402  — co-located with the helper
 
 
 @dataclass

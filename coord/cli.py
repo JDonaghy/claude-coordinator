@@ -2045,13 +2045,10 @@ def assign(
             provider="claude-pty",
         )
 
-        # Record the dispatched assignment up front so:
-        #   * claim detection refuses a duplicate the second the human
-        #     hits Enter on a parallel `coord assign --interactive`,
-        #   * the board shows the in-flight interactive session,
-        #   * the issue_store seam has a row to UPDATE on exit.
         # Build a minimal Proposal — only the fields record_dispatched
-        # consumes need to be set.
+        # consumes need to be set.  The actual record_dispatched call is
+        # deferred until after the dry-run gate below so `--dry-run`
+        # leaves no phantom "running" row in the DB.
         proposal = Proposal(
             id=0,
             machine_name=machine,
@@ -2064,29 +2061,8 @@ def assign(
             type="plan" if effective_plan_only else "work",
             required_gates=[],
         )
-        record_dispatched(
-            assignment_id=assignment_id,
-            proposal=proposal,
-            repo_github=repo_cfg.github,
-            provider_name="claude-pty",
-        )
 
         argv = provider.build_command(spec, resolved_model=resolved_model)
-
-        # #466: Inject the assignment id into the agent's process env so
-        # the interactive Claude session can run
-        # `coord report-result --assignment $COORD_ASSIGNMENT_ID …` to
-        # report a structured result before exiting.  Also prepend a
-        # short reminder to the briefing so the operator notices.
-        os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
-        report_reminder = (
-            f"[Coordinator assignment {assignment_id}] "
-            "Before you exit, please run `coord report-result "
-            f"--assignment {assignment_id} --status <done|blocked|"
-            "already-implemented> [--verdict approve|request-changes] "
-            "--summary <text>` so the coordinator records the result.\n\n"
-        )
-        effective_briefing = report_reminder + briefing
 
         click.echo(
             f"{machine} (local TTY) → {repo} #{issue}: {issue_title}"
@@ -2103,7 +2079,38 @@ def assign(
             click.echo(f"  cwd: {repo_path}")
             return
 
-        # Surface the in-flight assignment on the board immediately.
+        # State mutations (DB row, env var, board write) ONLY on real
+        # dispatch — never in dry-run.  Record up front so:
+        #   * claim detection refuses a duplicate the second the human
+        #     hits Enter on a parallel `coord assign --interactive`,
+        #   * the board shows the in-flight interactive session,
+        #   * the issue_store seam has a row to UPDATE on exit.
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github=repo_cfg.github,
+            provider_name="claude-pty",
+        )
+
+        # #466: Inject the assignment id into the agent's process env so
+        # the interactive Claude session can run
+        # `coord report-result --assignment $COORD_ASSIGNMENT_ID …` to
+        # report a structured result before exiting.  Also prepend a
+        # short reminder to the briefing so the operator notices.
+        os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+        report_reminder = (
+            f"[Coordinator assignment {assignment_id}] "
+            "Before you exit, please run `coord report-result "
+            f"--assignment {assignment_id} --status <done|blocked|"
+            "already-implemented> [--verdict approve|request-changes] "
+            "--summary <text>` so the coordinator records the result.\n\n"
+        )
+        effective_briefing = report_reminder + briefing
+
+        # Update board metadata (round_number / board_initialized).
+        # `record_dispatched` already wrote the assignment row, so the
+        # build_board → save_board round-trip is a no-op for the
+        # assignments table; the useful side-effect is board_meta.
         save_board(build_board())
 
         started_at = _time.time()

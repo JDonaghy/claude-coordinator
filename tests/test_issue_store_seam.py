@@ -585,6 +585,62 @@ class TestInteractiveClaim:
         assert "skipping" in result.output.lower()
         launch.assert_not_called()
 
+    def test_interactive_dry_run_does_not_record_assignment(
+        self, config_file: Path,
+    ) -> None:
+        """`--interactive --dry-run` must NOT write a phantom `running`
+        row to the DB, set ``COORD_ASSIGNMENT_ID``, or call the
+        launcher.  Otherwise the user's standard "dry-run then real"
+        workflow leaves a stuck row that claim-detection then refuses
+        the real invocation against."""
+        import os
+
+        # Make sure the env var is clean before the test so we can
+        # confidently assert it's still unset afterwards.
+        had_env = "COORD_ASSIGNMENT_ID" in os.environ
+        prior_env = os.environ.get("COORD_ASSIGNMENT_ID")
+        os.environ.pop("COORD_ASSIGNMENT_ID", None)
+
+        try:
+            with patch(
+                "coord.github_ops.get_issue",
+                return_value={"title": "fix X", "body": "do the thing"},
+            ), patch(
+                "coord.interactive.launch_human_attended_interactive",
+            ) as launch, patch(
+                "coord.interactive.finalize_interactive_exit",
+            ) as finalize:
+                result = CliRunner().invoke(
+                    main,
+                    [
+                        "assign", "laptop", "api", "42",
+                        "--config", str(config_file),
+                        "--interactive",
+                        "--dry-run",
+                    ],
+                )
+
+            assert result.exit_code == 0, result.output
+            assert "dry run" in result.output.lower()
+            # Nothing should be launched or finalized in dry-run mode.
+            launch.assert_not_called()
+            finalize.assert_not_called()
+            # No assignment row should be written — the next real
+            # invocation against the same issue would otherwise be
+            # refused by claim-detection.
+            records = state_mod.load_dispatched()
+            assert len(records) == 0, (
+                "dry-run wrote a phantom assignment row: "
+                f"{[r.get('assignment_id') for r in records]}"
+            )
+            # The dispatch-time env var must not leak from dry-run.
+            assert "COORD_ASSIGNMENT_ID" not in os.environ
+        finally:
+            # Restore whatever the env looked like before the test.
+            os.environ.pop("COORD_ASSIGNMENT_ID", None)
+            if had_env and prior_env is not None:
+                os.environ["COORD_ASSIGNMENT_ID"] = prior_env
+
 
 # ── git-floor backstop: real git operations ────────────────────────────────
 
