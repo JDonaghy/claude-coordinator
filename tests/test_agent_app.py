@@ -237,8 +237,6 @@ def test_logs_endpoint_supports_since(tmp_path: Path) -> None:
     monotonically.  Instead it validates the since-offset mechanism by
     choosing an offset well inside the log (not at the very end).
     """
-    import time as _time
-
     repo = _init_repo(tmp_path / "repo")
     client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo line"], repo_path=repo)
     r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))

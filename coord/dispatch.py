@@ -9,6 +9,7 @@ import httpx
 
 from coord import github_ops
 from coord.comments import (
+    format_advisory,
     format_briefing,
     format_completion,
     format_failure,
@@ -316,5 +317,28 @@ def post_failure(
         duration_seconds=duration_seconds,
         log_path=log_path,
         error=error,
+    )
+    github_ops.post_issue_comment(repo_github, issue_number, body)
+
+
+def post_advisory(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_github: str,
+    repo_name: str,
+    issue_number: int,
+    duration_seconds: float | None = None,
+    log_path: str | None = None,
+    reason: str = "",
+) -> None:
+    body = format_advisory(
+        assignment_id=assignment_id,
+        machine_name=machine_name,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        duration_seconds=duration_seconds,
+        log_path=log_path,
+        reason=reason,
     )
     github_ops.post_issue_comment(repo_github, issue_number, body)

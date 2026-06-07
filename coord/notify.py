@@ -21,6 +21,7 @@ def _agent_host(machine_name: str) -> str | None:
 
 from coord import github_ops
 from coord.comments import (
+    EVENT_ADVISORY,
     EVENT_COMPLETION,
     EVENT_FAILURE,
     EVENT_PLAN,
@@ -29,7 +30,7 @@ from coord.comments import (
     format_stuck,
 )
 from coord.config import Config
-from coord.dispatch import AGENT_PORT, post_completion, post_failure
+from coord.dispatch import AGENT_PORT, post_advisory, post_completion, post_failure
 from coord.progress import parse_progress
 from coord.state import (
     load_dispatched,
@@ -121,13 +122,11 @@ def detect_transitions(config: Config) -> list[tuple[Transition, dict, dict]]:
             elif entry_status in ("failed", "cancelled"):
                 event = EVENT_FAILURE
             elif entry_status == "advisory":
-                # #448: advisory (0-commit clean exit) is surfaced via
-                # coord status but intentionally does not post a GitHub
-                # comment. The issue stays open for manual follow-up; a
-                # spurious "completed" comment would be misleading since
-                # no code was merged. Operators relying on GitHub can see
-                # the coordinator's status output instead.
-                continue
+                # #448: advisory (0-commit clean exit) — post a distinctive
+                # GitHub comment so operators who rely on GitHub (not just
+                # coord status) know the worker finished with no code change
+                # and that human review is needed.
+                event = EVENT_ADVISORY
             else:
                 continue
             transitions.append(
@@ -706,6 +705,19 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             )
     elif transition.event == EVENT_COMPLETION:
         post_completion(exit_code=transition.exit_code or 0, **common)
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+    elif transition.event == EVENT_ADVISORY:
+        # #448: 0-commit clean exit — post a distinctive advisory comment.
+        # No ❌ emoji, no re-dispatch suggestion; just surfaces the advisory
+        # state on GitHub so operators not watching coord status are informed.
+        post_advisory(
+            reason=entry.get("zero_commit_reason") or "",
+            **common,
+        )
         mark_notified(
             transition.assignment_id,
             transition.event,

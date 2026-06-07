@@ -94,6 +94,37 @@ class TestDetectTransitions:
         with patch.object(notify_mod, "_agent_status", return_value=None):
             assert notify_mod.detect_transitions(config) == []
 
+    def test_advisory_transition_detected(self, coord_dir: Path, config: Config) -> None:
+        """An advisory agent entry must produce a Transition with event='advisory'.
+
+        Bug 1 (pre-fix): advisory fell through to the else/continue branch and
+        was silently dropped — no GitHub comment was ever posted.
+        """
+        _record("adv1")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("adv1", "advisory")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status):
+            transitions = notify_mod.detect_transitions(config)
+        assert len(transitions) == 1, "advisory must produce exactly one Transition"
+        t, _, _ = transitions[0]
+        assert t.event == "advisory"
+        assert t.assignment_id == "adv1"
+
+    def test_advisory_transition_not_failure(self, coord_dir: Path, config: Config) -> None:
+        """Advisory must NOT produce an event='failure' transition."""
+        _record("adv2")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("adv2", "advisory")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status):
+            transitions = notify_mod.detect_transitions(config)
+        assert transitions, "expected at least one transition"
+        t, _, _ = transitions[0]
+        assert t.event != "failure", "advisory must not be treated as failure"
+
 
 class TestRun:
     def test_posts_completion_and_marks_notified(self, coord_dir: Path, config: Config) -> None:
@@ -133,6 +164,89 @@ class TestRun:
         body = mock_post.call_args.args[2]
         assert "Coordinator: Assignment Failed" in body
         assert "bad config" in body
+
+
+# ── #448: advisory (0-commit clean exit) notify ─────────────────────────────
+
+
+class TestAdvisoryNotify:
+    """Advisory (0-commit clean exit) must post a GitHub comment, not be dropped."""
+
+    def test_advisory_posts_comment(self, coord_dir: Path, config: Config) -> None:
+        """run() posts an advisory comment for advisory entries."""
+        _record("adv-run1")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("adv-run1", "advisory")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            posted, _stuck = notify_mod.run(config)
+        assert len(posted) == 1, "advisory transition must appear in posted list"
+        mock_post.assert_called_once()
+        body = mock_post.call_args.args[2]
+        assert "Advisory" in body, "comment must be clearly labelled as advisory"
+        assert "0 Commits" in body or "0 commits" in body or "no commits" in body.lower()
+
+    def test_advisory_not_failure_comment(self, coord_dir: Path, config: Config) -> None:
+        """The advisory comment must NOT say 'Assignment Failed' or use ❌."""
+        _record("adv-run2")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("adv-run2", "advisory")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "Assignment Failed" not in body
+        assert "❌" not in body
+
+    def test_advisory_marked_notified(self, coord_dir: Path, config: Config) -> None:
+        """After advisory notify, the assignment is in the notified ledger."""
+        _record("adv-run3")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("adv-run3", "advisory")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        assert "adv-run3" in state_mod.load_notified()
+
+    def test_advisory_idempotent(self, coord_dir: Path, config: Config) -> None:
+        """Running notify twice for the same advisory only posts once."""
+        _record("adv-run4")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("adv-run4", "advisory")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+            posted_again, _ = notify_mod.run(config)
+        assert mock_post.call_count == 1, "advisory comment must be posted exactly once"
+        assert posted_again == []
+
+    def test_advisory_includes_zero_commit_reason(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """When zero_commit_reason is set, it appears in the advisory comment."""
+        _record("adv-run5")
+        reason = "Feature was already implemented in coord/agent.py"
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "adv-run5", "advisory", zero_commit_reason=reason
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert reason in body, "zero_commit_reason must appear in advisory comment"
 
 
 class TestBranchCapture:
