@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from coord.agent import (
+    ADVISORY,
     DONE,
     FAILED,
     PENDING,
@@ -107,7 +108,8 @@ def test_worker_branches_from_origin_not_local(
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE, f"assignment failed: {final.error}"
+    # Worker makes no git commits (only echoes to a file) → advisory (#448)
+    assert final.status in (DONE, ADVISORY), f"assignment failed: {final.error}"
 
     recorded = out_file.read_text()
     assert f"BASE_SHA={origin_sha}" in recorded, (
@@ -189,7 +191,8 @@ def test_no_remote_falls_back_to_local(
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE, f"assignment failed: {final.error}"
+    # Worker makes no commits, no remote → advisory via local fallback (#448)
+    assert final.status == ADVISORY, f"assignment failed: {final.error}"
     server.shutdown()
 
 
@@ -218,7 +221,9 @@ def test_unpushed_commits_warning_in_log(
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448); unpushed-commits warning
+    # is in the log regardless of advisory status.
+    assert final.status in (DONE, ADVISORY)
     assert final.log_path is not None
     log_text = Path(final.log_path).read_text()
     assert "ahead of origin/develop" in log_text, (
@@ -271,7 +276,8 @@ def test_stale_remote_tracking_ref_does_not_hijack_fresh_branch(
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE, f"assignment failed: {final.error}"
+    # Worker makes no git commits (only echoes to a file) → advisory (#448)
+    assert final.status in (DONE, ADVISORY), f"assignment failed: {final.error}"
 
     recorded = out_file.read_text()
     assert f"BASE_SHA={origin_sha}" in recorded, (
@@ -388,7 +394,8 @@ def test_setup_worktree_frees_stale_branch(tmp_path: Path) -> None:
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE, (
+    # Worker makes no commits (local-only repo) → advisory (#448)
+    assert final.status == ADVISORY, (
         f"assignment failed despite stale worktree eviction: {final.error}"
     )
     # The stale worktree should have been cleaned up by _free_branch_in_worktrees.

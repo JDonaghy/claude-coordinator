@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from coord.agent import (
+    ADVISORY,
     DONE,
     FAILED,
     RUNNING,
@@ -124,7 +125,7 @@ class TestWorktreeCreation:
         )
         a = server.assign(_spec(repo))
         final = server.wait_for(a.id, timeout=10)
-        assert final.status == DONE
+        assert final.status in (DONE, ADVISORY)  # no commits → advisory (#448)
         assert canary.exists()
         branch = canary.read_text().strip()
         assert branch.startswith("issue-1-")
@@ -144,7 +145,7 @@ class TestWorktreeCreation:
         server = _server(tmp_path, repo)
         a = server.assign(_spec(repo, issue_number=42, issue_title="Add widget"))
         final = server.wait_for(a.id, timeout=10)
-        assert final.status == DONE
+        assert final.status in (DONE, ADVISORY)  # no commits → advisory (#448)
         assert final.branch == "issue-42-add-widget"
         server.shutdown()
 
@@ -159,7 +160,7 @@ class TestWorktreeCreation:
         )
         a = server.assign(_spec(repo))
         final = server.wait_for(a.id, timeout=10)
-        assert final.status == DONE
+        assert final.status in (DONE, ADVISORY)  # no commits → advisory (#448)
         worker_cwd = cwd_file.read_text().strip()
         # Worker should NOT be in the main repo
         assert worker_cwd != str(repo)
@@ -174,7 +175,7 @@ class TestWorktreeCleanup:
         server = _server(tmp_path, repo)
         a = server.assign(_spec(repo))
         final = server.wait_for(a.id, timeout=10)
-        assert final.status == DONE
+        assert final.status in (DONE, ADVISORY)  # no commits → advisory (#448)
         # Worktree should be cleaned up
         assert not Path(final.worktree_path).exists()
         server.shutdown()
@@ -491,8 +492,8 @@ class TestParallelWorktrees:
         # Both should eventually complete
         final1 = server.wait_for(a1.id, timeout=10)
         final2 = server.wait_for(a2.id, timeout=10)
-        assert final1.status == DONE
-        assert final2.status == DONE
+        assert final1.status in (DONE, ADVISORY)  # no commits → advisory (#448)
+        assert final2.status in (DONE, ADVISORY)  # no commits → advisory (#448)
         assert final1.branch == "issue-10-first"
         assert final2.branch == "issue-11-second"
         server.shutdown()

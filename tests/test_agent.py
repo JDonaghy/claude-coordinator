@@ -13,6 +13,7 @@ import pytest
 import pytest
 
 from coord.agent import (
+    ADVISORY,
     CANCELLED,
     DONE,
     FAILED,
@@ -127,7 +128,8 @@ def test_assign_success(tmp_path: Path) -> None:
     server = _server(tmp_path, repo_path=repo)
     a = server.assign(_spec(repo))
     final = server.wait_for(a.id)
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert final.exit_code == 0
     assert final.worktree_path is not None
     log = Path(final.log_path).read_text()
@@ -247,7 +249,8 @@ def test_spawn_bash_wrap_enabled_routes_through_bash(tmp_path: Path) -> None:
         final = server.wait_for(a.id)
     finally:
         agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert captured, "Popen was not called"
     assert captured[0][:2] == ["bash", "-c"]
     assert captured[0][2] == "exec /bin/sh -c 'echo worker-output'"
@@ -283,7 +286,8 @@ def test_spawn_bash_wrap_disabled_uses_bare_argv(tmp_path: Path) -> None:
         final = server.wait_for(a.id)
     finally:
         agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert captured and captured[0] == ["/bin/sh", "-c", "echo worker-output"]
     server.shutdown()
 
@@ -635,7 +639,8 @@ def test_reap_captures_claude_session_id(tmp_path: Path) -> None:
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert final.claude_session_id == session_id
 
     # Also visible in the /status serialisation (to_dict)
@@ -1105,7 +1110,8 @@ class TestProviderLayerDispatch:
         finally:
             agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
 
-        assert final.status == DONE
+        # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
         assert captured, "Popen was not called"
         # The legacy path must use sentinel_argv directly (no provider seam).
         assert captured[0] == sentinel_argv, (
@@ -1166,7 +1172,8 @@ class TestProviderLayerDispatch:
         finally:
             agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
 
-        assert final.status == DONE
+        # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
         assert captured, "Popen was not called"
         assert captured[0] == provider_argv, (
             f"expected provider argv {provider_argv!r}, got {captured[0]!r}"
@@ -1209,7 +1216,8 @@ class TestProviderLayerDispatch:
         finally:
             agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
 
-        assert final.status == DONE
+        # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
         assert captured and captured[0] == legacy_argv, (
             "unknown provider should fall back to legacy worker_command"
         )
@@ -1354,8 +1362,8 @@ class TestCapabilityGates:
         # resume_session_id set but no named provider → no gate, runs the legacy path
         a = server.assign(_spec(repo, resume_session_id="ses-no-gate"))
         final = server.wait_for(a.id, timeout=5)
-        # No exception raised, assignment completes normally
-        assert final.status == DONE
+        # No exception raised, assignment completes; no commits → advisory (#448)
+        assert final.status == ADVISORY
         server.shutdown()
 
     def test_resume_gate_no_op_when_provider_not_in_registry(
@@ -1369,7 +1377,8 @@ class TestCapabilityGates:
             _spec(repo, provider="unknown", resume_session_id="ses-no-gate")
         )
         final = server.wait_for(a.id, timeout=5)
-        assert final.status == DONE
+        # No commits → advisory (#448)
+        assert final.status == ADVISORY
         server.shutdown()
 
     def test_inject_message_refused_when_provider_inject_is_false(
@@ -1437,7 +1446,8 @@ class TestCapabilityGates:
         # Should NOT raise
         server.inject_message(a.id, "injected")
         final = server.wait_for(a.id, timeout=5)
-        assert final.status == DONE
+        # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
         server.shutdown()
 
 

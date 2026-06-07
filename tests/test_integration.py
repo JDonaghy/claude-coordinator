@@ -15,7 +15,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from starlette.testclient import TestClient
 
-from coord.agent import AgentServer, AssignmentSpec, DONE, FAILED
+from coord.agent import ADVISORY, AgentServer, AssignmentSpec, DONE, FAILED
 from coord.agent_app import build_app
 from coord.brain import build_prompt, gather_context, parse_proposals
 from coord.config import Config
@@ -192,7 +192,8 @@ class TestFullLoop:
         # 6. Wait for the worker to finish
         assignment_id = result["id"]
         final = agent_server.wait_for(assignment_id)
-        assert final.status == DONE
+        # Worker ("echo worker done") makes no commits → advisory (#448)
+        assert final.status in (DONE, ADVISORY)
         assert final.exit_code == 0
 
         # 7. Verify log was written

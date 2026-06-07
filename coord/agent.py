@@ -66,6 +66,10 @@ RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
 CANCELLED = "cancelled"
+# #448: exit_code==0 but 0 commits pushed. Not a hard failure (auto_reassign
+# would loop forever on "already implemented" reports); not a clean DONE
+# either. Human should review and decide whether to re-dispatch or close.
+ADVISORY = "advisory"
 
 # Maximum number of terminal (done/failed/cancelled) assignments retained in
 # memory and persisted to agent_state.json (#452).  Oldest entries (by
@@ -625,6 +629,9 @@ class AgentAssignment:
     # restart.  The coordinator reads it from the `/status` response and
     # writes it to the coordinator DB (see coord/notify.py).
     claude_session_id: str | None = None
+    # #448: advisory reason when the worker exited cleanly (exit_code==0) but
+    # pushed 0 commits.  None on all other status values.
+    zero_commit_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -1059,7 +1066,7 @@ class AgentServer:
             completed = sum(
                 1
                 for a in self._assignments.values()
-                if a.status in (DONE, FAILED, CANCELLED)
+                if a.status in (DONE, FAILED, CANCELLED, ADVISORY)
             )
         worktree_bytes = self._cached_worktree_bytes()
         artifact_bytes = self._cached_artifact_bytes()
@@ -2454,6 +2461,25 @@ class AgentServer:
         thread.start()
         self._persist()
 
+    def _commits_ahead(self, wt_path: Path, base: str) -> int | None:
+        """Number of commits HEAD is ahead of *base* in the worktree.
+
+        Tries ``origin/<base>..HEAD`` first (the authoritative check when a
+        remote is configured); falls back to ``<base>..HEAD`` for local-only
+        repos (test fixtures and airgapped machines).  Returns ``None`` when
+        both lookups fail (e.g. detached HEAD, base branch missing entirely).
+
+        Callers should treat ``None`` as "unknown, assume non-zero" so a git
+        failure never triggers a false advisory.
+        """
+        for ref in (f"origin/{base}", base):
+            try:
+                raw = _git(wt_path, "rev-list", "--count", f"{ref}..HEAD")
+                return int(raw.strip())
+            except (_GitError, ValueError):
+                continue
+        return None
+
     def _reap(
         self,
         assignment_id: str,
@@ -2563,6 +2589,29 @@ class AgentServer:
                         except OSError:
                             pass
 
+        # #448: compute commits-ahead OUTSIDE the lock (git I/O) so the
+        # advisory check doesn't stall other threads.  Only runs when
+        # exit_code==0 and a worktree exists to inspect.  None → unknown
+        # (git failed) → treat as non-zero to avoid false advisories.
+        _zero_commit_reason: str | None = None
+        if exit_code == 0 and assignment is not None and assignment.worktree_path:
+            _wt_advisory = Path(assignment.worktree_path)
+            if _wt_advisory.exists():
+                _base = assignment.spec.branch or "main"
+                _ahead = self._commits_ahead(_wt_advisory, _base)
+                if _ahead == 0:
+                    _zero_commit_reason = (
+                        "worker exited cleanly but pushed 0 commits"
+                    )
+                    try:
+                        with open(assignment.log_path, "a") as reopen:
+                            reopen.write(
+                                "# reap: advisory — 0 commits ahead of "
+                                f"{_base}; status set to advisory\n"
+                            )
+                    except OSError:
+                        pass
+
         # This block MUST always run regardless of push outcome so that
         # the assignment transitions out of 'running'.
         try:
@@ -2581,7 +2630,15 @@ class AgentServer:
                 assignment.branch = captured_branch
             # Cancel sets status before this runs; respect it.
             if assignment.status == RUNNING:
-                assignment.status = DONE if exit_code == 0 else FAILED
+                if exit_code == 0:
+                    if _zero_commit_reason is not None:
+                        # #448: clean exit but no commits → advisory, not done.
+                        assignment.status = ADVISORY
+                        assignment.zero_commit_reason = _zero_commit_reason
+                    else:
+                        assignment.status = DONE
+                else:
+                    assignment.status = FAILED
             self._processes.pop(assignment_id, None)
 
         # #315/#324: parse the log for the worker's claude session_id (from the

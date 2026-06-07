@@ -1332,7 +1332,17 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             if entry is None:
                 continue
             branch = entry.get("branch")
-            if entry.get("status") == "done":
+            agent_status = entry.get("status")
+            if agent_status == "done":
+                board.mark_done_by_id(
+                    a.assignment_id,
+                    finished_at=entry.get("finished_at"),
+                    branch=branch,
+                )
+            elif agent_status == "advisory":
+                # #448: 0-commit clean exit — treat as done on the board so
+                # the assignment doesn't block; the advisory section below
+                # flags it for human attention.
                 board.mark_done_by_id(
                     a.assignment_id,
                     finished_at=entry.get("finished_at"),
@@ -1347,6 +1357,24 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         if reconciled:
             save_board(board)
             click.echo(f"\n  (reconciled {reconciled} assignment(s) from live agent data)")
+
+    # #448: surface advisory assignments (0 commits, clean exit) so the
+    # operator knows they need attention without having to dig into logs.
+    advisory_entries = [
+        e for e in agent_completed.values()
+        if e.get("status") == "advisory"
+    ]
+    if advisory_entries:
+        click.echo("")
+        click.echo("⚠ Advisory (needs attention — worker exited cleanly with 0 commits):")
+        for e in advisory_entries:
+            spec = e.get("spec", {})
+            reason = e.get("zero_commit_reason") or "0 commits pushed"
+            click.echo(
+                f"  #{spec.get('issue_number', '?')}: "
+                f"{spec.get('issue_title', '?')} "
+                f"[{spec.get('repo_name', '?')}]  — {reason}"
+            )
 
     blocked = compute_blocked(cfg.repos, board.active)
     if blocked:
