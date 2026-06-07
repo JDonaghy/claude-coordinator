@@ -244,3 +244,99 @@ def test_reconcile_dispatches_review_when_no_active_work(config: Config) -> None
         "dispatch_review should be called when there's no active work for the issue"
     )
     assert completed_work.review_state == "dispatched"
+
+
+# ── #448 fix iter 2: cli.py inline reconcile mirrors reconcile.py for advisory ──
+
+
+def test_cli_status_reconcile_advisory_sets_status_and_review_state(
+    tmp_path, coord_db
+) -> None:
+    """Regression for fix-iter-2 of #448: the inline reconcile inside
+    `coord status` must also set status='advisory' and review_state='advisory'
+    on advisory entries.
+
+    Without this fix, cli.py's reconcile path silently left advisory work
+    assignments as status='done', review_state=None — meaning a follow-up
+    `coord notify` would dispatch a spurious review for a branch with zero
+    commits (the reviewer gets an empty diff).
+    """
+    from click.testing import CliRunner
+
+    from coord import state as state_mod
+    from coord.cli import main
+
+    # Minimal config: one machine, one repo.
+    config_file = tmp_path / "coordinator.yml"
+    config_file.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+    )
+
+    # Active assignment that the agent will report as advisory.
+    active = Assignment(
+        machine_name="laptop", repo_name="api",
+        issue_number=42, issue_title="Maybe already done",
+        status="running", assignment_id="adv-cli-1",
+        type="work",
+    )
+    state_mod.save_board(Board(active=[active]))
+
+    # Fake the live agent /status to return an advisory completion.
+    from coord.network import MachineStatus, StatusResult, ONLINE
+
+    status_data = {
+        "active": [],
+        "completed": [{
+            "id": "adv-cli-1",
+            "status": "advisory",
+            "finished_at": 100.0,
+            "branch": "issue-42-maybe-already-done",
+            "zero_commit_reason": "worker exited cleanly but pushed 0 commits",
+            "spec": {
+                "type": "work",
+                "issue_number": 42,
+                "issue_title": "Maybe already done",
+                "repo_name": "api",
+            },
+        }],
+        "version": "0.0.0",
+    }
+
+    fake_machine_status = MachineStatus(
+        machine=Machine(name="laptop", host="laptop.tail", repos=["api"]),
+        state=ONLINE,
+        latency_ms=1.0,
+    )
+
+    with patch("coord.network.check_all", return_value=[fake_machine_status]), \
+         patch("coord.network.fetch_status", return_value=StatusResult(data=status_data)):
+        result = CliRunner().invoke(
+            main, ["status", "--config", str(config_file), "--timeout", "0.1"],
+        )
+
+    assert result.exit_code == 0, result.output
+
+    # Verify the saved board: advisory must be persisted with status="advisory"
+    # AND review_state="advisory" — not status="done" + review_state=None,
+    # which would trigger a spurious review on the next coord notify.
+    board = state_mod.load_board()
+    assert board is not None
+    assert board.active == [], (
+        "advisory should have moved out of active"
+    )
+    completed = [a for a in board.completed if a.assignment_id == "adv-cli-1"]
+    assert len(completed) == 1, (
+        f"advisory must be in board.completed (got {len(completed)} matches)"
+    )
+    done = completed[0]
+    assert done.status == "advisory", (
+        f"cli.py reconcile must set status='advisory' (got {done.status!r}); "
+        "leaving it as 'done' lets _dispatch_board_pending_reviews mistake "
+        "an advisory for a normal completion"
+    )
+    assert done.review_state == "advisory", (
+        f"cli.py reconcile must set review_state='advisory' (got "
+        f"{done.review_state!r}); leaving it as None lets the notify "
+        "review-dispatch loop fire a spurious review for a 0-commit branch"
+    )

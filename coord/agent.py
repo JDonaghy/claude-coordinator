@@ -71,6 +71,12 @@ CANCELLED = "cancelled"
 # either. Human should review and decide whether to re-dispatch or close.
 ADVISORY = "advisory"
 
+# #448: spec types that are expected to push commits, so a clean exit with
+# zero commits is interesting (advisory).  Review/smoke workers commit
+# nothing by design and must NOT be flagged advisory.  conflict-fix is
+# expected to rebase + force-push, so it stays in scope.
+_ADVISORY_TYPES = ("work", "conflict-fix")
+
 # Maximum number of terminal (done/failed/cancelled) assignments retained in
 # memory and persisted to agent_state.json (#452).  Oldest entries (by
 # finished_at, falling back to started_at) are dropped once this limit is
@@ -2593,9 +2599,9 @@ class AgentServer:
         # advisory check doesn't stall other threads.  Only runs when
         # exit_code==0 and a worktree exists to inspect.  None → unknown
         # (git failed) → treat as non-zero to avoid false advisories.
-        # Gate on spec.type so that review/smoke workers — which commit
-        # nothing by design — are never falsely flagged as advisory.
-        _ADVISORY_TYPES = ("work", "conflict-fix")
+        # _ADVISORY_TYPES (module constant) gates this on spec.type so that
+        # review/smoke workers — which commit nothing by design — are
+        # never falsely flagged as advisory.
         _zero_commit_reason: str | None = None
         if (exit_code == 0 and assignment is not None
                 and assignment.worktree_path
