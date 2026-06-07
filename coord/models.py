@@ -152,7 +152,7 @@ class Assignment:
     files_forbidden: list[str] = field(default_factory=list)
     briefing: str = ""
     assignment_id: str | None = None
-    status: str = "pending"  # pending | running | done | failed
+    status: str = "pending"  # pending | running | done | failed | advisory
     branch: str | None = None
     pr_url: str | None = None
     dispatched_at: float | None = None

@@ -38,6 +38,10 @@ _STUCK_THRESHOLD = 300.0  # 5 minutes
 # bucketed as FAILED on the client.  Not yet in coord.events — defined here
 # until a shared constants refactor can move it.
 ASSIGNMENT_CANCELLED = "assignment_cancelled"
+# #448: advisory (0-commit clean exit) is neither a green completion nor a
+# red failure — it's a "needs attention" state.  Route it to a distinct
+# event so the dashboard can style it appropriately (warning, not failure).
+ASSIGNMENT_ADVISORY = "assignment_advisory"
 
 
 def _fetch_agent_status(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
@@ -139,10 +143,15 @@ async def _poll_once(
             }
             status = entry.get("status")
             # Bug 1 fix: three-way branch — cancelled must not fire FAILED.
+            # #448: advisory routes to a distinct event so the dashboard does
+            # not paint a 0-commit clean exit as a failure.
             if status == "done":
                 event_source.publish(ASSIGNMENT_COMPLETED, payload)
             elif status == "cancelled":
                 event_source.publish(ASSIGNMENT_CANCELLED, payload)
+            elif status == "advisory":
+                payload["zero_commit_reason"] = entry.get("zero_commit_reason")
+                event_source.publish(ASSIGNMENT_ADVISORY, payload)
             else:  # "failed" and any other unexpected terminal status
                 payload["exit_code"] = entry.get("exit_code")
                 event_source.publish(ASSIGNMENT_FAILED, payload)

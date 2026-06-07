@@ -1342,12 +1342,19 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             elif agent_status == "advisory":
                 # #448: 0-commit clean exit — treat as done on the board so
                 # the assignment doesn't block; the advisory section below
-                # flags it for human attention.
-                board.mark_done_by_id(
+                # flags it for human attention.  Mirror reconcile.py: set
+                # status="advisory" (mark_done_by_id leaves it as "done")
+                # and review_state="advisory" on work assignments so that
+                # the review-dispatch loop in coord notify skips them.
+                done = board.mark_done_by_id(
                     a.assignment_id,
                     finished_at=entry.get("finished_at"),
                     branch=branch,
                 )
+                if done is not None:
+                    done.status = "advisory"
+                    if done.type == "work":
+                        done.review_state = "advisory"
             else:
                 board.mark_failed_by_id(
                     a.assignment_id,
