@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from coord.config import Config
+from coord.config import Config, ReviewsConfig
 from coord.models import Assignment, Board, Machine, Repo
 from coord.reconcile import reconcile
 
@@ -65,3 +65,99 @@ def test_failed_status_propagates_without_branch(config: Config) -> None:
         reconcile(board, config)
     failed = board.completed[0]
     assert failed.status == "failed"
+
+
+# ── #459: reconcile skips review dispatch when a work assignment is active ──
+
+
+def test_reconcile_skips_review_when_active_work_for_same_issue(config: Config) -> None:
+    """reconcile must NOT dispatch a review for a completed assignment when an
+    active work assignment is rewriting the same issue's branch (#459)."""
+    # The board already has a completed "work-old" and an active "work-new"
+    # for the same (repo, issue). Reconcile should leave review_state as
+    # "pending" without calling dispatch_review.
+    cfg_with_reviews = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"],
+                          repo_paths={"api": "/w"})],
+        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+    )
+
+    completed_work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=42,
+        issue_title="t", status="done", branch="issue-42-fix",
+        assignment_id="work-old", type="work", review_state="pending",
+        test_state="passed",  # satisfy the default test gate
+    )
+    active_fix = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=42,
+        issue_title="t", status="running", branch="issue-42-fix2",
+        assignment_id="work-new", type="work",
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        active=[active_fix],
+        completed=[completed_work],
+    )
+
+    review_dispatches: list[str] = []
+
+    def _fake_dispatch_review(completed, board, config, **kwargs):
+        review_dispatches.append(completed.assignment_id)
+        return None
+
+    # Agent reports nothing new — we only care about the review-dispatch loop.
+    fake_status = {"active": [], "completed": []}
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.review.dispatch_review", _fake_dispatch_review):
+        reconcile(board, cfg_with_reviews)
+
+    assert review_dispatches == [], (
+        "dispatch_review must not be called while an active work assignment "
+        "is rewriting the same issue's branch"
+    )
+    # review_state should remain "pending" for the next reconcile pass.
+    assert completed_work.review_state == "pending"
+
+
+def test_reconcile_dispatches_review_when_no_active_work(config: Config) -> None:
+    """reconcile should dispatch review when no active work exists for the issue."""
+    cfg_with_reviews = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"],
+                          repo_paths={"api": "/w"})],
+        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+    )
+
+    completed_work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=42,
+        issue_title="t", status="done", branch="issue-42-fix",
+        assignment_id="work-done", type="work", review_state="pending",
+        test_state="passed",  # satisfy the default test gate
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        active=[],
+        completed=[completed_work],
+    )
+
+    review_dispatches: list[str] = []
+
+    def _fake_dispatch_review(completed, board, config, **kwargs):
+        review_dispatches.append(completed.assignment_id)
+        # Return a fake review Assignment to trigger review_state = "dispatched".
+        return Assignment(
+            machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="[review] t", status="running",
+            assignment_id="rev-new", type="review",
+        )
+
+    fake_status = {"active": [], "completed": []}
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.review.dispatch_review", _fake_dispatch_review):
+        reconcile(board, cfg_with_reviews)
+
+    assert review_dispatches == ["work-done"], (
+        "dispatch_review should be called when there's no active work for the issue"
+    )
+    assert completed_work.review_state == "dispatched"

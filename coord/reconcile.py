@@ -247,6 +247,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # We iterate board.completed (not just newly-done) so that a failed
     # dispatch on a previous reconcile pass is retried here automatically.
     from coord.review import dispatch_review
+    from coord.claim import has_active_work_followup
 
     # #200: gate review auto-dispatch on the Test stage verdict. If the pipeline
     # includes a "test" gate, hold off on review until the user records a
@@ -268,6 +269,17 @@ def reconcile(board: Board, config: Config) -> list[str]:
         if test_gate_active and completed.test_state not in ("passed", "skipped"):
             # Either no verdict yet, or verdict was "failed" — either way the
             # work is not ready for review. The next reconcile pass will re-check.
+            continue
+        # #459: skip review dispatch when a work or conflict-fix is actively
+        # rewriting this issue's branch (e.g. a coord-bounce fix iteration).
+        # Reviewing stale code now produces a verdict on code that's about to
+        # change. Leave review_state as "pending" so the next reconcile pass
+        # retries once the active fix finishes.
+        if has_active_work_followup(
+            board,
+            repo_name=completed.repo_name,
+            issue_number=completed.issue_number,
+        ):
             continue
         review = dispatch_review(completed, board, config)
         if review is not None:

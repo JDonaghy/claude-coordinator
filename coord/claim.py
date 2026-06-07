@@ -127,6 +127,35 @@ def has_active_followup(
     return False
 
 
+def has_active_work_followup(
+    board: Board,
+    *,
+    repo_name: str,
+    issue_number: int,
+) -> bool:
+    """True if a work or conflict-fix assignment is actively running for (repo, issue).
+
+    Used before dispatching a review to skip when a coord-bounce fix is
+    actively rewriting the branch — dispatching a review against stale code
+    produces a verdict on code that's about to change and causes unnecessary
+    churn.  The existing ``has_active_followup`` covers duplicate-review
+    dedupe; this covers the orthogonal case where a *work* re-run (not a
+    review) is live for the same issue.
+
+    Called from both the reconcile review-dispatch loop and ``dispatch_review``
+    for defence in depth.
+    """
+    _WORK_TYPES = frozenset({"work", "conflict-fix"})
+    for a in board.active:
+        if a.type not in _WORK_TYPES:
+            continue
+        if a.status == "failed":
+            continue
+        if a.repo_name == repo_name and a.issue_number == issue_number:
+            return True
+    return False
+
+
 # ── Default branch lookup (uses gh) ─────────────────────────────────────────
 
 
