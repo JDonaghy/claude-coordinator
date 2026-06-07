@@ -1965,8 +1965,22 @@ def assign(
     # the only one that can launch it; the unattended dispatch sites
     # (dispatch/review/reconcile) refuse the same capability.
     if interactive:
+        # #466: The interactive launcher path now CLAIMS the issue and
+        # RECORDS the dispatched assignment up front (it used to write
+        # nothing then sys.exit), and on session exit invokes the
+        # git-floor backstop in :func:`finalize_interactive_exit` so the
+        # board ALWAYS gets a terminal completion — even if the human
+        # closed the TTY without typing `coord report-result`.  Both the
+        # backstop and the report-result subcommand write through the
+        # single :mod:`coord.issue_store` seam so the future #183
+        # IssueStore + coordination MCP can slot in without changing any
+        # of these call sites.
+        import time as _time  # noqa: PLC0415
+        import uuid as _uuid  # noqa: PLC0415
+
         from coord.providers import ClaudePtyProvider  # noqa: PLC0415
         from coord.interactive import (  # noqa: PLC0415
+            finalize_interactive_exit,
             launch_human_attended_interactive,
         )
 
@@ -1981,17 +1995,45 @@ def assign(
                 "NOT report human_attended_only=True; refusing to launch."
             )
 
-        repo_path = machine_obj.repo_path(repo) or str(
-            Path.cwd()
+        repo_path = machine_obj.repo_path(repo) or str(Path.cwd())
+
+        effective_plan_only = plan_only or (
+            cfg.dispatch.require_plan and not no_plan
+        )
+        # The interactive launcher uses the *current* checkout, not a
+        # fresh worktree — `coord agent` worktrees only exist on the
+        # agent-server path.  Treat the resolved repo_path as the
+        # worktree for the git-floor backstop.
+        worktree_path = repo_path
+        repo_default_branch = repo_cfg.default_branch or "main"
+
+        # ── Claim check.  Without this an operator can spawn two
+        # interactive sessions on the same issue and both push competing
+        # branches.  --force bypasses the check (mirrors the
+        # claude -p path below).
+        from coord.claim import claim_message, find_work_claim  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            build_board,
+            record_dispatched,
+            save_board,
         )
 
-        # Build an AssignmentSpec so the provider produces the same argv
-        # the agent-side spawn would build.  Note: provider="claude-pty"
-        # is set so any downstream introspection records the right value;
-        # we do NOT POST this spec anywhere.
+        board_check = build_board()
+        if not force:
+            claim = find_work_claim(issue, repo, repo_cfg.github, board_check)
+            if claim is not None:
+                click.echo(
+                    f"  skipping: {claim_message(claim)}",
+                    err=True,
+                )
+                sys.exit(1)
+
         from coord.agent import AssignmentSpec  # noqa: PLC0415
+        from coord.models import Proposal  # noqa: PLC0415
 
         resolved_model = model if model else cfg.models.default
+        assignment_id = _uuid.uuid4().hex[:12]
+
         spec = AssignmentSpec(
             repo_name=repo,
             repo_path=repo_path,
@@ -1999,15 +2041,34 @@ def assign(
             issue_title=issue_title,
             briefing=briefing,
             model=resolved_model,
-            type="plan" if (plan_only or (cfg.dispatch.require_plan and not no_plan)) else "work",
+            type="plan" if effective_plan_only else "work",
             provider="claude-pty",
         )
+
+        # Build a minimal Proposal — only the fields record_dispatched
+        # consumes need to be set.  The actual record_dispatched call is
+        # deferred until after the dry-run gate below so `--dry-run`
+        # leaves no phantom "running" row in the DB.
+        proposal = Proposal(
+            id=0,
+            machine_name=machine,
+            repo_name=repo,
+            issue_number=issue,
+            issue_title=issue_title,
+            rationale="manual --interactive dispatch (human-attended)",
+            briefing=briefing,
+            model=resolved_model,
+            type="plan" if effective_plan_only else "work",
+            required_gates=[],
+        )
+
         argv = provider.build_command(spec, resolved_model=resolved_model)
 
         click.echo(
             f"{machine} (local TTY) → {repo} #{issue}: {issue_title}"
         )
         click.echo("  mode: HUMAN-ATTENDED interactive launch (#437)")
+        click.echo(f"  assignment id: {assignment_id}")
         click.echo(
             "  the briefing will be PRE-FILLED in the input box; "
             "press Enter to submit; Ctrl-C / `/exit` to end the session."
@@ -2017,15 +2078,87 @@ def assign(
             click.echo(f"  would exec: {argv}")
             click.echo(f"  cwd: {repo_path}")
             return
-        # The launcher relays the operator's TTY to/from the child's
-        # PTY master, injects the bracketed-paste pre-fill ONCE after
-        # readiness, then exits when the child exits.  No coordinator
-        # state is mutated; no GitHub call is made.
+
+        # State mutations (DB row, env var, board write) ONLY on real
+        # dispatch — never in dry-run.  Record up front so:
+        #   * claim detection refuses a duplicate the second the human
+        #     hits Enter on a parallel `coord assign --interactive`,
+        #   * the board shows the in-flight interactive session,
+        #   * the issue_store seam has a row to UPDATE on exit.
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github=repo_cfg.github,
+            provider_name="claude-pty",
+        )
+
+        # #466: Inject the assignment id into the agent's process env so
+        # the interactive Claude session can run
+        # `coord report-result --assignment $COORD_ASSIGNMENT_ID …` to
+        # report a structured result before exiting.  Also prepend a
+        # short reminder to the briefing so the operator notices.
+        os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+        report_reminder = (
+            f"[Coordinator assignment {assignment_id}] "
+            "Before you exit, please run `coord report-result "
+            f"--assignment {assignment_id} --status <done|blocked|"
+            "already-implemented> [--verdict approve|request-changes] "
+            "--summary <text>` so the coordinator records the result.\n\n"
+        )
+        effective_briefing = report_reminder + briefing
+
+        # Update board metadata (round_number / board_initialized).
+        # `record_dispatched` already wrote the assignment row, so the
+        # build_board → save_board round-trip is a no-op for the
+        # assignments table; the useful side-effect is board_meta.
+        save_board(build_board())
+
+        started_at = _time.time()
         exit_code = launch_human_attended_interactive(
-            argv, briefing, cwd=repo_path
+            argv, effective_briefing, cwd=repo_path,
         )
         if exit_code != 0:
             click.echo(f"  claude exited with status {exit_code}", err=True)
+
+        # #466 — git-floor backstop.  ALWAYS write a terminal state for
+        # this assignment through the issue_store seam, regardless of
+        # whether the agent typed `coord report-result` first.  The
+        # finalizer respects an existing report (it checks the DB row's
+        # status before clobbering).
+        try:
+            finalize_result = finalize_interactive_exit(
+                assignment_id=assignment_id,
+                repo_name=repo,
+                repo_github=repo_cfg.github,
+                issue_number=issue,
+                machine_name=machine,
+                worktree_path=worktree_path,
+                base_branch=repo_default_branch,
+                exit_code=exit_code,
+                started_at=started_at,
+                log_path=None,
+            )
+            if finalize_result.already_recorded:
+                click.echo(
+                    "  result already recorded via `coord report-result`; "
+                    "backstop did not overwrite",
+                )
+            else:
+                click.echo(
+                    f"  backstop: status={finalize_result.terminal_status} "
+                    f"commits_ahead={finalize_result.commits_ahead}"
+                )
+                if not finalize_result.push_ok:
+                    click.echo(
+                        f"  warning: git push failed: {finalize_result.push_error}",
+                        err=True,
+                    )
+        except Exception as exc:  # noqa: BLE001 — best-effort backstop
+            click.echo(
+                f"  warning: backstop failed to record completion: {exc}",
+                err=True,
+            )
+
         sys.exit(exit_code)
 
     # Build a Proposal inline
@@ -2723,6 +2856,145 @@ def stop(assignment_id: str, config_path: Path) -> None:
     board.mark_failed_by_id(assignment_id)
     save_board(board)
     click.echo(f"Board updated: {assignment.repo_name} #{assignment.issue_number} marked failed")
+
+
+@main.command(
+    "report-result",
+    help=(
+        "Report the outcome of an interactive session through the "
+        "coordinator's issue_store seam (#466). "
+        "REQUIRED for review sessions where the verdict can only come "
+        "from the agent."
+    ),
+)
+@click.option(
+    "--assignment", "assignment_id_opt", default=None,
+    help="The assignment id (defaults to $COORD_ASSIGNMENT_ID).",
+)
+@click.option(
+    "--status",
+    type=click.Choice(["done", "blocked", "already-implemented"]),
+    required=True,
+    help=(
+        "Terminal result: `done` = work landed; `blocked` = cannot proceed; "
+        "`already-implemented` = nothing to do (advisory)."
+    ),
+)
+@click.option(
+    "--verdict",
+    type=click.Choice(["approve", "request-changes"]),
+    default=None,
+    help=(
+        "Review verdict — only meaningful for review sessions where no "
+        "commits are pushed. Recorded so the merge-gate sees the same "
+        "field a claude-p reviewer would have populated."
+    ),
+)
+@click.option(
+    "--summary", default="",
+    help="One-paragraph summary posted on the issue under the result.",
+)
+@_CONFIG_OPTION
+def report_result(
+    assignment_id_opt: str | None,
+    status: str,
+    verdict: str | None,
+    summary: str,
+    config_path: Path,
+) -> None:
+    """``coord report-result --assignment <id> --status <s> [--verdict <v>] --summary <text>``
+
+    The single coordinator-mediated command an interactive Claude
+    session may invoke before it exits.  Writes the outcome through the
+    :mod:`coord.issue_store` seam (same path the git-floor backstop
+    uses), so the GitHub message bus and the local DB see a
+    structurally-identical completion regardless of which mechanism
+    produced it.
+    """
+    import os as _os  # noqa: PLC0415
+
+    from coord import issue_store  # noqa: PLC0415
+    from coord.state import build_board, load_dispatched  # noqa: PLC0415
+
+    assignment_id = assignment_id_opt or _os.environ.get("COORD_ASSIGNMENT_ID")
+    if not assignment_id:
+        click.echo(
+            "error: --assignment is required (or set $COORD_ASSIGNMENT_ID)",
+            err=True,
+        )
+        sys.exit(2)
+
+    cfg = _load_config(config_path)
+
+    # Look up the assignment metadata.  Prefer the dispatched ledger
+    # because it always has repo_github, then fall back to the live
+    # board for in-flight rows that haven't been queried elsewhere.
+    record = next(
+        (r for r in load_dispatched() if r.get("assignment_id") == assignment_id),
+        None,
+    )
+    repo_github: str | None = None
+    repo_name: str | None = None
+    machine_name: str | None = None
+    issue_number: int | None = None
+    branch: str | None = None
+    if record is not None:
+        repo_github = record.get("repo_github")
+        repo_name = record.get("repo_name")
+        machine_name = record.get("machine_name")
+        issue_number = record.get("issue_number")
+
+    board = build_board()
+    assignment_obj = board.find_by_id(assignment_id)
+    if assignment_obj is not None:
+        repo_name = repo_name or assignment_obj.repo_name
+        machine_name = machine_name or assignment_obj.machine_name
+        issue_number = issue_number or assignment_obj.issue_number
+        branch = assignment_obj.branch
+        if repo_github is None:
+            repo_cfg = cfg.repo(assignment_obj.repo_name)
+            if repo_cfg is not None:
+                repo_github = repo_cfg.github
+
+    # Final fallback: if a config repo matches the recorded repo_name,
+    # use its github slug.
+    if repo_github is None and repo_name is not None:
+        repo_cfg = cfg.repo(repo_name)
+        if repo_cfg is not None:
+            repo_github = repo_cfg.github
+
+    if not (repo_github and repo_name and machine_name and issue_number):
+        click.echo(
+            f"error: could not resolve assignment {assignment_id!r} from "
+            "board/dispatched ledger; pass --assignment with a known id "
+            "or run from the originating coordinator machine.",
+            err=True,
+        )
+        sys.exit(1)
+
+    record_obj = issue_store.ResultRecord(
+        assignment_id=assignment_id,
+        machine_name=machine_name,
+        repo_name=repo_name,
+        repo_github=repo_github,
+        issue_number=int(issue_number),
+        status=status,  # type: ignore[arg-type]
+        verdict=verdict,  # type: ignore[arg-type]
+        summary=summary,
+        branch=branch,
+    )
+    try:
+        outcome = issue_store.post_result(record_obj)
+    except ValueError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(2)
+
+    click.echo(
+        f"result recorded: status={outcome.status} event={outcome.event} "
+        f"posted_to_github={outcome.posted}"
+    )
+    if outcome.error:
+        click.echo(f"  github post warning: {outcome.error}", err=True)
 
 
 def _maybe_reconcile_branch(
