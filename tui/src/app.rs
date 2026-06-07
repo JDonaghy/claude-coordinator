@@ -17315,6 +17315,40 @@ impl CoordApp {
         true
     }
 
+    /// Forward a clipboard paste to the embedded terminal PTY (#468).
+    ///
+    /// If the PTY has bracketed-paste mode active (DEC private mode 2004,
+    /// `ESC[?2004h`), wraps the text in `ESC[200~` … `ESC[201~` before
+    /// writing so the receiving application can distinguish a paste from
+    /// typed characters.  Otherwise the text is sent as raw bytes.
+    ///
+    /// No trailing carriage-return is appended — the human must press
+    /// Enter to submit (avoids auto-execute / paste-injection risks).
+    ///
+    /// Returns `true` when the paste was consumed (session exists);
+    /// `false` when no live session is available.
+    fn forward_paste_to_pty(&mut self, text: &str) -> bool {
+        let Some(sess) = self.terminal_session.as_mut() else {
+            return false;
+        };
+        if sess.is_exited() {
+            // Swallow paste to a dead PTY rather than letting it fall
+            // through to TUI chrome — matches forward_key_to_pty.
+            return true;
+        }
+        sess.scroll_reset();
+        if sess.bracketed_paste_enabled() {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            sess.write_input(&bytes);
+        } else {
+            sess.write_input(text.as_bytes());
+        }
+        true
+    }
+
     // ── #440: per-issue detail-view terminal helpers ──────────────────────
 
     /// Return the issue number for the currently-selected pipeline issue,
@@ -17448,6 +17482,39 @@ impl CoordApp {
         sess.scroll_reset();
         if let Some(bytes) = key_to_pty_bytes(key.clone(), *mods) {
             sess.write_input(&bytes);
+        }
+        true
+    }
+
+    /// Forward a clipboard paste to the selected issue's detail terminal
+    /// PTY (#468).
+    ///
+    /// Mirrors `forward_paste_to_pty` but routes to the per-issue session
+    /// map.  When bracketed-paste mode (DEC private mode 2004) is active
+    /// the text is wrapped in `ESC[200~` … `ESC[201~`; otherwise it is
+    /// sent as raw bytes.  No trailing carriage-return is appended.
+    ///
+    /// Returns `true` when the paste was consumed; `false` when no live
+    /// session exists for the selected issue.
+    fn forward_paste_to_detail_terminal(&mut self, text: &str) -> bool {
+        let Some(issue_key) = self.selected_issue_key() else {
+            return false;
+        };
+        let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) else {
+            return false;
+        };
+        if sess.is_exited() {
+            return true;
+        }
+        sess.scroll_reset();
+        if sess.bracketed_paste_enabled() {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            sess.write_input(&bytes);
+        } else {
+            sess.write_input(text.as_bytes());
         }
         true
     }
@@ -18164,6 +18231,16 @@ impl ShellApp for CoordApp {
                     return Reaction::Redraw;
                 }
             }
+            // #468: forward host-clipboard paste to the PTY when focused.
+            // Wraps in ESC[200~…ESC[201~ when the PTY has bracketed-paste
+            // mode enabled; otherwise sends raw bytes.  No trailing \r —
+            // let the human press Enter.
+            if self.terminal_focused {
+                if let UiEvent::ClipboardPaste(text) = &event {
+                    let _ = self.forward_paste_to_pty(text);
+                    return Reaction::Redraw;
+                }
+            }
         }
 
         // ── #440: Pipeline detail Terminal tab focus arbitration ─────────
@@ -18190,6 +18267,13 @@ impl ShellApp for CoordApp {
                 }
                 if self.detail_terminal_focused {
                     let _ = self.forward_key_to_detail_terminal(key, modifiers);
+                    return Reaction::Redraw;
+                }
+            }
+            // #468: forward host-clipboard paste to the per-issue PTY.
+            if self.detail_terminal_focused {
+                if let UiEvent::ClipboardPaste(text) = &event {
+                    let _ = self.forward_paste_to_detail_terminal(text);
                     return Reaction::Redraw;
                 }
             }
@@ -31094,5 +31178,204 @@ mod tests {
         if let Some(ref mut sess) = app.terminal_session {
             sess.write_input(b"exit\r");
         }
+    }
+
+    // ── #468: paste-forward tests ─────────────────────────────────────────
+
+    /// With no session, forward_paste_to_pty must return false (not panic).
+    #[test]
+    fn paste_to_pty_returns_false_with_no_session() {
+        let mut app = make_app_default();
+        assert!(
+            app.terminal_session.is_none(),
+            "fresh app should have no terminal session"
+        );
+        assert!(
+            !app.forward_paste_to_pty("hello"),
+            "forward_paste_to_pty should return false when no session exists"
+        );
+    }
+
+    /// With no selected issue, forward_paste_to_detail_terminal must return false.
+    #[test]
+    fn paste_to_detail_terminal_returns_false_with_no_session() {
+        let mut app = make_app_default();
+        assert!(
+            !app.forward_paste_to_detail_terminal("hello"),
+            "forward_paste_to_detail_terminal should return false with no issue selected"
+        );
+    }
+
+    /// Raw path: when `bracketed_paste_enabled()` is false (the default for
+    /// a plain shell), the text is forwarded as-is so the shell can execute it.
+    #[test]
+    #[cfg(unix)]
+    fn paste_to_pty_raw_when_bracketed_paste_disabled() {
+        use std::time::{Duration, Instant};
+
+        let mut app = make_app_default();
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Mode 2004 must be off by default.
+        assert!(
+            !sess.bracketed_paste_enabled(),
+            "bracketed paste must be off before the child requests it"
+        );
+
+        app.terminal_session = Some(sess);
+
+        // Send a command via the raw paste path.  No trailing \r — send
+        // Enter separately to keep the no-auto-submit contract visible.
+        let consumed = app.forward_paste_to_pty("echo __raw_paste_marker__");
+        assert!(consumed, "forward_paste_to_pty should return true when a session exists");
+
+        // Enter submits the command.
+        app.terminal_session.as_mut().unwrap().write_input(b"\r");
+
+        // Poll until the marker echoes back from the shell.
+        let start = Instant::now();
+        let mut found = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            app.terminal_session.as_mut().unwrap().poll();
+            if app
+                .terminal_session
+                .as_ref()
+                .unwrap()
+                .full_text()
+                .contains("__raw_paste_marker__")
+            {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            found,
+            "raw paste should have delivered text to shell; full_text={:?}",
+            app.terminal_session.as_ref().unwrap().full_text(),
+        );
+
+        // Tidy up.
+        app.terminal_session.as_mut().unwrap().write_input(b"exit\r");
+    }
+
+    /// Bracketed path: when `bracketed_paste_enabled()` is true the helper
+    /// wraps the text in ESC[200~…ESC[201~ before writing.  Verified by
+    /// enabling mode 2004 via the child process and then calling the helper.
+    #[test]
+    #[cfg(unix)]
+    fn paste_to_pty_bracketed_when_mode_2004_enabled() {
+        use std::time::{Duration, Instant};
+
+        fn poll_until(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = Instant::now();
+            let limit = Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        let mut app = make_app_default();
+        let cwd = std::env::temp_dir();
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Have the child emit ESC[?2004h so the terminal emulator enables
+        // mode 2004 — this is what interactive programs (e.g. claude -p) do.
+        sess.send_str("printf '\\033[?2004h'\n");
+        assert!(
+            poll_until(&mut sess, 5_000, |s| s.bracketed_paste_enabled()),
+            "bracketed paste should be enabled after child emits ESC[?2004h"
+        );
+
+        app.terminal_session = Some(sess);
+
+        // Confirm we take the bracketed branch — method must return true and
+        // the session must still be alive after the write.
+        let consumed = app.forward_paste_to_pty("hello bracketed");
+        assert!(
+            consumed,
+            "forward_paste_to_pty should return true when session exists"
+        );
+        assert!(
+            !app.terminal_session.as_ref().unwrap().is_exited(),
+            "session must still be alive after a bracketed paste write"
+        );
+
+        // Tidy up.
+        app.terminal_session.as_mut().unwrap().send_str("exit\n");
+    }
+
+    /// Bracketed path for the detail terminal: same logic as the main
+    /// terminal but routed through `forward_paste_to_detail_terminal`.
+    #[test]
+    #[cfg(unix)]
+    fn paste_to_detail_terminal_bracketed_when_mode_2004_enabled() {
+        use std::time::{Duration, Instant};
+
+        fn poll_until(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = Instant::now();
+            let limit = Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        let mut app = make_app_default();
+
+        // Set up a selected pipeline issue so selected_issue_key() works.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 468,
+            title: "paste test".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+
+        let cwd = std::env::temp_dir();
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        sess.send_str("printf '\\033[?2004h'\n");
+        assert!(
+            poll_until(&mut sess, 5_000, |s| s.bracketed_paste_enabled()),
+            "mode 2004 should be enabled after child emits ESC[?2004h"
+        );
+
+        let issue_key = ("owner/repo".to_string(), 468u64);
+        app.detail_terminal_sessions.insert(issue_key, sess);
+
+        let consumed = app.forward_paste_to_detail_terminal("hello detail bracketed");
+        assert!(
+            consumed,
+            "forward_paste_to_detail_terminal should return true when session exists"
+        );
     }
 }
