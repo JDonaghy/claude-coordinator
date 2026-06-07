@@ -120,6 +120,14 @@ def detect_transitions(config: Config) -> list[tuple[Transition, dict, dict]]:
                 event = EVENT_COMPLETION
             elif entry_status in ("failed", "cancelled"):
                 event = EVENT_FAILURE
+            elif entry_status == "advisory":
+                # #448: advisory (0-commit clean exit) is surfaced via
+                # coord status but intentionally does not post a GitHub
+                # comment. The issue stays open for manual follow-up; a
+                # spurious "completed" comment would be misleading since
+                # no code was merged. Operators relying on GitHub can see
+                # the coordinator's status output instead.
+                continue
             else:
                 continue
             transitions.append(

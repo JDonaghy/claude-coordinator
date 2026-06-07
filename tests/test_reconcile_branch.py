@@ -67,6 +67,89 @@ def test_failed_status_propagates_without_branch(config: Config) -> None:
     assert failed.status == "failed"
 
 
+# ── #448: reconcile must not mark advisory as failed ─────────────────────────
+
+
+def test_advisory_status_moves_to_completed_not_failed(config: Config) -> None:
+    """An advisory entry from the agent must be moved to board.completed with
+    status='advisory', NOT 'failed'. Bug 1: previously the else-branch called
+    mark_failed_by_id on any non-done, non-cancelled entry, which triggered
+    auto_reassign loops for 0-commit advisory completions."""
+    board = _board()
+    fake_status = {
+        "active": [],
+        "completed": [{"id": "abc", "status": "advisory", "finished_at": 1.0}],
+    }
+    with patch("coord.reconcile._query_agent", return_value=fake_status):
+        changed = reconcile(board, config)
+
+    assert changed == ["abc"]
+    # Assignment must have moved from active to completed.
+    assert board.active == []
+    assert len(board.completed) == 1
+    advisory = board.completed[0]
+    # Status must be "advisory", not "done" or "failed".
+    assert advisory.status == "advisory", (
+        f"expected advisory, got {advisory.status!r} — "
+        "reconcile() wrongly called mark_failed_by_id on advisory entry"
+    )
+
+
+def test_advisory_work_review_state_is_not_pending(config: Config) -> None:
+    """Advisory work assignments must not enter the review-dispatch loop.
+    review_state should be set to 'advisory' (not 'pending') so no review
+    worker is spawned for a 0-commit branch."""
+    board = _board()
+    fake_status = {
+        "active": [],
+        "completed": [{"id": "abc", "status": "advisory", "finished_at": 1.0}],
+    }
+    dispatch_calls: list[str] = []
+
+    def _fake_dispatch_review(completed, board, config, **kwargs):
+        dispatch_calls.append(completed.assignment_id)
+        return None
+
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.review.dispatch_review", _fake_dispatch_review):
+        reconcile(board, config)
+
+    advisory = board.completed[0]
+    assert advisory.review_state == "advisory", (
+        "advisory work should have review_state='advisory', not 'pending'"
+    )
+    assert dispatch_calls == [], (
+        "dispatch_review must not be called for an advisory work assignment"
+    )
+
+
+def test_advisory_does_not_trigger_auto_reassign(config: Config) -> None:
+    """auto_reassign must not fire for advisory assignments (the exact loop
+    the issue aimed to prevent)."""
+    cfg_with_reassign = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+    )
+    # Monkey-patch auto_reassign onto the concurrency object.
+    cfg_with_reassign.concurrency.auto_reassign = True  # type: ignore[attr-defined]
+
+    board = _board()
+    fake_status = {
+        "active": [],
+        "completed": [{"id": "abc", "status": "advisory", "finished_at": 1.0}],
+    }
+    reassign_calls: list[str] = []
+
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.reconcile._reassign", side_effect=reassign_calls.append) as mock_reassign:
+        mock_reassign.return_value = None
+        reconcile(board, cfg_with_reassign)
+
+    assert reassign_calls == [], (
+        "_reassign must not be called for advisory — that would create an infinite loop"
+    )
+
+
 # ── #459: reconcile skips review dispatch when a work assignment is active ──
 
 
