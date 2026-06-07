@@ -2593,8 +2593,13 @@ class AgentServer:
         # advisory check doesn't stall other threads.  Only runs when
         # exit_code==0 and a worktree exists to inspect.  None → unknown
         # (git failed) → treat as non-zero to avoid false advisories.
+        # Gate on spec.type so that review/smoke workers — which commit
+        # nothing by design — are never falsely flagged as advisory.
+        _ADVISORY_TYPES = ("work", "conflict-fix")
         _zero_commit_reason: str | None = None
-        if exit_code == 0 and assignment is not None and assignment.worktree_path:
+        if (exit_code == 0 and assignment is not None
+                and assignment.worktree_path
+                and assignment.spec.type in _ADVISORY_TYPES):
             _wt_advisory = Path(assignment.worktree_path)
             if _wt_advisory.exists():
                 _base = assignment.spec.branch or "main"
