@@ -460,6 +460,144 @@ def _sanitize_branch(branch: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", branch).strip("-")
 
 
+# Regex that matches git's "branch/path already used by worktree at '<path>'"
+# error, which fires when the requested branch is already checked out in another
+# worktree.  The captured group is the conflicting worktree's path.
+_WT_COLLISION_RE = re.compile(r"already used by worktree at '([^']+)'")
+
+
+def _parse_worktree_porcelain(output: str) -> list[dict[str, str]]:
+    """Parse ``git worktree list --porcelain`` output into a list of dicts.
+
+    Each dict may have keys: ``worktree`` (absolute path), ``HEAD`` (SHA),
+    ``branch`` (short name with ``refs/heads/`` prefix stripped), and
+    ``bare`` (literal string ``"true"`` when the entry is a bare worktree).
+    Missing fields (e.g. ``branch`` in detached-HEAD state) are simply absent.
+    """
+    worktrees: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            if current:
+                worktrees.append(current)
+                current = {}
+        elif line.startswith("worktree "):
+            current["worktree"] = line[len("worktree "):]
+        elif line.startswith("HEAD "):
+            current["HEAD"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            raw = line[len("branch "):]
+            current["branch"] = (
+                raw[len("refs/heads/"):] if raw.startswith("refs/heads/") else raw
+            )
+        elif line.strip() == "bare":
+            current["bare"] = "true"
+    if current:
+        worktrees.append(current)
+    return worktrees
+
+
+def _free_branch_in_worktrees(
+    repo_path: Path,
+    branch_name: str,
+    exclude_path: str,
+    *,
+    log_path: str | None = None,
+) -> None:
+    """Remove any worktree that has *branch_name* checked out, except *exclude_path*.
+
+    Runs ``git worktree list --porcelain`` to find conflicting worktrees, then
+    force-removes each one and prunes the git admin entries.  Called immediately
+    before every ``git worktree add`` in :meth:`AgentServer._setup_worktree` so
+    that a stale prior-assignment worktree (e.g. a crashed worker whose
+    ``_cleanup_worktree`` never ran) does not block the next dispatch on the
+    same branch.
+
+    Silently tolerates git errors — if the list or removal fails, the
+    subsequent ``worktree add`` will still surface a clear error.
+    """
+    try:
+        output = _git(repo_path, "worktree", "list", "--porcelain")
+    except _GitError:
+        return
+
+    removed = 0
+    for wt in _parse_worktree_porcelain(output):
+        wt_path = wt.get("worktree", "")
+        if wt.get("branch", "") != branch_name:
+            continue
+        if wt_path == exclude_path:
+            continue
+        # Found a conflicting worktree — force-remove it.
+        if log_path:
+            _append_log_line(
+                log_path,
+                f"# worktree-free: removing worktree {wt_path!r} "
+                f"holding branch {branch_name!r} before new add\n",
+            )
+        try:
+            _git(repo_path, "worktree", "remove", wt_path, "--force")
+            removed += 1
+        except _GitError:
+            try:
+                shutil.rmtree(wt_path, ignore_errors=True)
+                removed += 1
+            except OSError:
+                pass
+
+    if removed:
+        try:
+            _git(repo_path, "worktree", "prune")
+        except _GitError:
+            pass
+
+
+def _git_worktree_add(
+    repo_path: Path,
+    add_args: list[str],
+    *,
+    log_path: str | None = None,
+) -> None:
+    """Run ``git worktree add <add_args>``, retrying once on a branch collision.
+
+    If the first attempt fails with git's "already used by worktree at '<path>'"
+    message (the branch is checked out in a stale worktree that slipped past the
+    proactive :func:`_free_branch_in_worktrees` call — e.g. a race), the
+    conflicting worktree is force-removed, git prunes the stale admin entry, and
+    the add is retried exactly once.  Any other git error, or a failure after the
+    single retry, is re-raised so the caller sees a clear ``_GitError``.
+    """
+    try:
+        _git(repo_path, "worktree", "add", *add_args)
+        return
+    except _GitError as exc:
+        m = _WT_COLLISION_RE.search(str(exc))
+        if not m:
+            raise  # unrelated error — propagate unchanged
+        conflicting_path = m.group(1)
+
+    # Retry path: free the conflicting worktree and try again once.
+    if log_path:
+        _append_log_line(
+            log_path,
+            f"# worktree-add: collision on {conflicting_path!r}; "
+            "force-removing and retrying\n",
+        )
+    try:
+        _git(repo_path, "worktree", "remove", conflicting_path, "--force")
+    except _GitError:
+        try:
+            shutil.rmtree(conflicting_path, ignore_errors=True)
+        except OSError:
+            pass
+    try:
+        _git(repo_path, "worktree", "prune")
+    except _GitError:
+        pass
+    # One retry only — raises if it fails again.
+    _git(repo_path, "worktree", "add", *add_args)
+
+
 @dataclass
 class AgentAssignment:
     """Server-side record. Carries the spec plus runtime metadata."""
@@ -1186,6 +1324,20 @@ class AgentServer:
         with self._lock:
             assignments = dict(self._assignments)
 
+        # #460 (Part 3): collect branches that PENDING assignments will need so
+        # the 300 s recent-skip is bypassed for terminal worktrees that hold one
+        # of those branches.  Without this, a terminal worktree from a just-
+        # failed assignment would block the next dispatch on the same branch
+        # until the cooldown expires, causing _setup_worktree to collide even
+        # after the proactive _free_branch_in_worktrees call.
+        pending_branches: set[str] = set()
+        for _a in assignments.values():
+            if _a.status == PENDING:
+                b = _a.spec.target_branch or (
+                    f"issue-{_a.spec.issue_number}-{_slugify(_a.spec.issue_title)}"
+                )
+                pending_branches.add(b)
+
         cleaned = 0
         kept = 0
         bytes_freed = 0
@@ -1203,11 +1355,20 @@ class AgentServer:
 
             # Skip recently-finished assignments — the worker process may
             # still be tearing down and have open file handles in the tree.
+            # Exception: if a PENDING assignment needs the same branch, clean
+            # it up now so the next _setup_worktree doesn't collide (#460).
             if a is not None and a.finished_at is not None:
                 age = now - a.finished_at
                 if age < recent_secs:
-                    kept += 1
-                    continue
+                    terminal_branch = a.branch or (
+                        a.spec.target_branch or
+                        f"issue-{a.spec.issue_number}-{_slugify(a.spec.issue_title)}"
+                    )
+                    if terminal_branch not in pending_branches:
+                        kept += 1
+                        continue
+                    # Fall through to cleanup — a pending assignment needs
+                    # this branch and we must not let the cooldown block it.
 
             # Skip directories that were created very recently even when
             # we don't (yet) have an assignment record.  This closes the
@@ -1737,16 +1898,33 @@ class AgentServer:
             except _GitError:
                 pass
 
+        # #460 (Part 1): proactively evict any other worktree that has
+        # branch_name checked out before the add.  This handles serial
+        # fix/retry/PR-worker dispatches on the same branch where the prior
+        # assignment's worktree was not yet cleaned up (e.g. crash before
+        # _cleanup_worktree ran, or clean_worktrees held back by the 300 s
+        # recent-skip).  The call is a no-op when no conflicting worktree exists.
+        _free_branch_in_worktrees(
+            repo_path, branch_name, str(worktree_path),
+            log_path=assignment.log_path,
+        )
+
         if origin_has_branch:
             # Continuation/retry — force the worktree's branch to the remote
             # tip (#389), discarding any divergent local copy of the branch.
-            _git(
-                repo_path, "worktree", "add", "-B", branch_name,
-                str(worktree_path), f"origin/{branch_name}",
+            # #460 (Part 2): _git_worktree_add retries once on collision.
+            _git_worktree_add(
+                repo_path,
+                ["-B", branch_name, str(worktree_path), f"origin/{branch_name}"],
+                log_path=assignment.log_path,
             )
         elif local_has_branch and not has_origin:
             # Local-only repo (no remote) — reuse the local branch as before.
-            _git(repo_path, "worktree", "add", str(worktree_path), branch_name)
+            _git_worktree_add(
+                repo_path,
+                [str(worktree_path), branch_name],
+                log_path=assignment.log_path,
+            )
         else:
             # Fresh branch, OR an untrusted local-only leftover in a repo that
             # has a remote (#389).  Delete any colliding local branch so `-b`
@@ -1765,15 +1943,24 @@ class AgentServer:
                 _git(repo_path, "branch", "-D", branch_name)
             except _GitError:
                 pass
-            _git(
-                repo_path, "worktree", "add", "-b", branch_name,
-                str(worktree_path), start_point,
+            _git_worktree_add(
+                repo_path,
+                ["-b", branch_name, str(worktree_path), start_point],
+                log_path=assignment.log_path,
             )
 
         return worktree_path
 
     def _cleanup_worktree(self, assignment: AgentAssignment) -> None:
-        """Remove the worktree for a finished assignment. Best-effort."""
+        """Remove the worktree for a finished assignment. Best-effort.
+
+        #460 (Part 3 — synchronous teardown): always ensures git's worktree
+        admin entries are pruned, even when the physical directory was already
+        removed out-of-band.  Without the prune step a stale admin entry would
+        keep the branch "checked out" from git's perspective, causing the next
+        ``_setup_worktree`` to fail with a collision error until a ``prune``
+        ran separately.
+        """
         if not assignment.worktree_path:
             return
         wt_path = Path(assignment.worktree_path)
@@ -1781,9 +1968,16 @@ class AgentServer:
         try:
             if wt_path.exists():
                 _git(repo_path, "worktree", "remove", str(wt_path), "--force")
+            else:
+                # Directory already gone (crash / rmtree before prune) — prune
+                # the stale git admin entry so the branch is freed immediately.
+                _git(repo_path, "worktree", "prune")
         except _GitError:
             try:
                 shutil.rmtree(wt_path, ignore_errors=True)
+            except OSError:
+                pass
+            try:
                 _git(repo_path, "worktree", "prune")
             except _GitError:
                 pass
