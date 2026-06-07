@@ -2,6 +2,10 @@
 
 CLI tool + per-machine agent server that coordinates Claude Code workers across multiple machines and repos over Tailscale.
 
+## Current Goal — read first
+
+**[`GOAL.md`](GOAL.md) holds the current north-star objective** — the living, cross-repo / cross-machine goal that should bias all planning, triage, and dispatch. It is meta-level (above any single issue, repo, or session) and changes as priorities evolve: read it first, plan against it, and keep it current. `coordinator.yml` is the source of truth for *topology*; `GOAL.md` is the source of truth for *intent*.
+
 ## Architecture
 
 ```
