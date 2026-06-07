@@ -3982,14 +3982,16 @@ pub struct CoordApp {
     terminal_spawn_error: Option<String>,
     // ── #440: per-issue detail-view terminals ──────────────────────────
     /// Per-issue terminal sessions for the Pipeline detail Terminal tab.
-    /// Keyed by issue number.  Lazily spawned the first time the user
+    /// Keyed by `(repo_slug, issue_number)` (#455) so that same-numbered
+    /// issues in different repos (e.g. quadraui #336 vs coord #336) each
+    /// get their own session.  Lazily spawned the first time the user
     /// opens the Terminal tab for a given issue; kept running while the
     /// issue stays in `pipeline_issues`; dropped when the issue leaves
     /// the pipeline (on the next load that no longer contains it).
-    detail_terminal_sessions: std::collections::HashMap<u64, quadraui::terminal_engine::TerminalSession>,
+    detail_terminal_sessions: std::collections::HashMap<(String, u64), quadraui::terminal_engine::TerminalSession>,
     /// Spawn errors for per-issue terminals (shown as a one-line
-    /// placeholder in the Terminal tab).
-    detail_terminal_spawn_errors: std::collections::HashMap<u64, String>,
+    /// placeholder in the Terminal tab).  Keyed by `(repo_slug, issue_number)`.
+    detail_terminal_spawn_errors: std::collections::HashMap<(String, u64), String>,
     /// Focus state for the Pipeline detail Terminal tab.  `true` when
     /// keypresses route to the selected issue's PTY.  F12 toggles.
     /// Independent of `terminal_focused` (the standalone pane's flag).
@@ -9623,10 +9625,11 @@ impl CoordApp {
                 self.pipeline_issues = issues;
                 // #440: prune terminal sessions for issues that are no
                 // longer in the pipeline so we don't keep stale PTYs.
-                let live_nums: std::collections::HashSet<u64> =
-                    self.pipeline_issues.iter().map(|i| i.number).collect();
-                self.detail_terminal_sessions.retain(|k, _| live_nums.contains(k));
-                self.detail_terminal_spawn_errors.retain(|k, _| live_nums.contains(k));
+                // #455: key by (repo_slug, number) to avoid collisions across repos.
+                let live_keys: std::collections::HashSet<(String, u64)> =
+                    self.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
+                self.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
+                self.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
                 self.pipeline_loader = None;
                 self.rebuild_pipeline_sidebar(prev_sel);
                 true
@@ -12354,8 +12357,8 @@ impl CoordApp {
                 if let Some((col, row)) =
                     terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
                 {
-                    if let Some(issue_num) = self.selected_issue_number() {
-                        if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
+                    if let Some(issue_key) = self.selected_issue_key() {
+                        if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) {
                             return sess.forward_mouse(kind, button, col, row, modifiers);
                         }
                     }
@@ -12406,8 +12409,8 @@ impl CoordApp {
                 let content_y = main_b.y + lh * 1.4;
                 let (col, row) =
                     terminal_pixel_to_cell_clamped(pos, main_b, content_y, char_w, lh);
-                if let Some(issue_num) = self.selected_issue_number() {
-                    if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
+                if let Some(issue_key) = self.selected_issue_key() {
+                    if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) {
                         return sess.forward_mouse(
                             TerminalMouseKind::Release,
                             button,
@@ -12622,9 +12625,9 @@ impl CoordApp {
                                 } else {
                                     TerminalMouseKind::WheelDown
                                 };
-                                if let Some(issue_num) = self.selected_issue_number() {
+                                if let Some(issue_key) = self.selected_issue_key() {
                                     if let Some(sess) =
-                                        self.detail_terminal_sessions.get_mut(&issue_num)
+                                        self.detail_terminal_sessions.get_mut(&issue_key)
                                     {
                                         if !sess.forward_mouse(
                                             kind,
@@ -17316,20 +17319,31 @@ impl CoordApp {
 
     /// Return the issue number for the currently-selected pipeline issue,
     /// or `None` when nothing is selected.
+    /// Kept for unit tests; production code uses `selected_issue_key()`.
+    #[cfg(test)]
     fn selected_issue_number(&self) -> Option<u64> {
         self.pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
             .map(|issue| issue.number)
     }
 
+    /// Return the `(repo_slug, issue_number)` key for the currently selected
+    /// Pipeline issue, used to index `detail_terminal_sessions` and
+    /// `detail_terminal_spawn_errors` (#455).
+    fn selected_issue_key(&self) -> Option<(String, u64)> {
+        self.pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .map(|issue| (issue.repo_slug.clone(), issue.number))
+    }
+
     /// Return a sensible cwd for a per-issue detail terminal.  Uses the
     /// repo path from `pipeline_repo_paths` when it exists and is a
     /// directory; falls back to `current_dir()`.
-    fn detail_terminal_cwd(&self, issue_num: u64) -> std::path::PathBuf {
+    fn detail_terminal_cwd(&self, issue_key: &(String, u64)) -> std::path::PathBuf {
         if let Some(issue) = self
             .pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
-            .filter(|iss| iss.number == issue_num)
+            .filter(|iss| iss.repo_slug == issue_key.0 && iss.number == issue_key.1)
         {
             let repo_key = issue.coord_repo.as_deref().unwrap_or(&issue.repo_slug);
             if let Some(path) = self.data.pipeline_repo_paths.get(repo_key) {
@@ -17362,12 +17376,12 @@ impl CoordApp {
         if self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal
         {
-            if let Some(issue_num) = self.selected_issue_number() {
-                if !self.detail_terminal_sessions.contains_key(&issue_num)
-                    && !self.detail_terminal_spawn_errors.contains_key(&issue_num)
+            if let Some(issue_key) = self.selected_issue_key() {
+                if !self.detail_terminal_sessions.contains_key(&issue_key)
+                    && !self.detail_terminal_spawn_errors.contains_key(&issue_key)
                 {
                     if let Some((cols, rows)) = self.detail_terminal_pending_dims.get() {
-                        let cwd = self.detail_terminal_cwd(issue_num);
+                        let cwd = self.detail_terminal_cwd(&issue_key);
                         let shell = quadraui::terminal_engine::default_shell();
                         match quadraui::terminal_engine::TerminalSession::spawn(
                             cols.max(20),
@@ -17377,12 +17391,12 @@ impl CoordApp {
                             10_000, // 10 000-line scrollback
                         ) {
                             Ok(sess) => {
-                                self.detail_terminal_sessions.insert(issue_num, sess);
+                                self.detail_terminal_sessions.insert(issue_key, sess);
                                 changed = true;
                             }
                             Err(e) => {
                                 self.detail_terminal_spawn_errors
-                                    .insert(issue_num, e.to_string());
+                                    .insert(issue_key, e.to_string());
                                 changed = true;
                             }
                         }
@@ -17420,10 +17434,10 @@ impl CoordApp {
         key: &Key,
         mods: &quadraui::Modifiers,
     ) -> bool {
-        let Some(issue_num) = self.selected_issue_number() else {
+        let Some(issue_key) = self.selected_issue_key() else {
             return false;
         };
-        let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) else {
+        let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) else {
             return false;
         };
         if sess.is_exited() {
@@ -17452,7 +17466,7 @@ impl CoordApp {
         let rows = (rect.height / lh).floor().max(1.0) as u16;
         self.detail_terminal_pending_dims.set(Some((cols, rows)));
 
-        let Some(issue_num) = self.selected_issue_number() else {
+        let Some(issue_key) = self.selected_issue_key() else {
             // No issue selected — show a neutral placeholder.
             backend.draw_list(
                 rect,
@@ -17474,7 +17488,7 @@ impl CoordApp {
             return;
         };
 
-        if let Some(sess) = self.detail_terminal_sessions.get(&issue_num) {
+        if let Some(sess) = self.detail_terminal_sessions.get(&issue_key) {
             let total = sess.history_len() + sess.rows() as usize;
             let sb = if total > sess.rows() as usize {
                 Some(sess.scrollbar_state(None))
@@ -17482,13 +17496,13 @@ impl CoordApp {
                 None
             };
             let snapshot = sess.to_terminal(
-                WidgetId::new(format!("detail-terminal:{}", issue_num)),
+                WidgetId::new(format!("detail-terminal:{}:{}", issue_key.0, issue_key.1)),
                 sb,
             );
             backend.draw_terminal(rect, &snapshot);
         } else {
             // Session pending or spawn error.
-            let (msg, color) = match self.detail_terminal_spawn_errors.get(&issue_num) {
+            let (msg, color) = match self.detail_terminal_spawn_errors.get(&issue_key) {
                 Some(err) => (
                     format!("  Terminal failed to start: {}  (F12 to focus)", err),
                     Color::rgb(220, 80, 80),
@@ -30384,8 +30398,9 @@ mod tests {
         let mut app = make_app_default();
         // Pretend issue #1 has an active session (use a marker in the error
         // map since we can't easily inject a real TerminalSession here).
-        app.detail_terminal_spawn_errors.insert(1, "test-error".to_string());
-        app.detail_terminal_spawn_errors.insert(2, "test-error-2".to_string());
+        // Keys are (repo_slug, number) per #455.
+        app.detail_terminal_spawn_errors.insert(("o/r".to_string(), 1), "test-error".to_string());
+        app.detail_terminal_spawn_errors.insert(("o/r".to_string(), 2), "test-error-2".to_string());
 
         // Simulate a pipeline refresh that drops issue #1 but keeps #2.
         let new_issues = vec![PipelineIssue {
@@ -30398,21 +30413,84 @@ mod tests {
             all_labels: vec![],
             is_closed: false,
         }];
-        // Apply the same logic that apply_pipeline_load uses.
+        // Apply the same logic that poll_pipeline_loader uses.
         app.pipeline_issues = new_issues;
-        let live_nums: std::collections::HashSet<u64> =
-            app.pipeline_issues.iter().map(|i| i.number).collect();
-        app.detail_terminal_sessions.retain(|k, _| live_nums.contains(k));
-        app.detail_terminal_spawn_errors.retain(|k, _| live_nums.contains(k));
+        let live_keys: std::collections::HashSet<(String, u64)> =
+            app.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
+        app.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
+        app.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
 
         // Issue #1 should have been pruned; issue #2 should remain.
         assert!(
-            !app.detail_terminal_spawn_errors.contains_key(&1),
+            !app.detail_terminal_spawn_errors.contains_key(&("o/r".to_string(), 1)),
             "stale session for #1 should be pruned"
         );
         assert!(
-            app.detail_terminal_spawn_errors.contains_key(&2),
+            app.detail_terminal_spawn_errors.contains_key(&("o/r".to_string(), 2)),
             "kept session for #2 should remain"
+        );
+    }
+
+    /// #455: same issue number in two different repos must get independent
+    /// session / error slots — no collision.
+    #[test]
+    fn detail_terminal_sessions_keyed_by_repo_and_number() {
+        let mut app = make_app_default();
+
+        // Two repos, both happen to have an issue #336.
+        let key_a = ("quadraui/quadraui".to_string(), 336u64);
+        let key_b = ("JDonaghy/claude-coordinator".to_string(), 336u64);
+
+        app.detail_terminal_spawn_errors.insert(key_a.clone(), "err-a".to_string());
+        app.detail_terminal_spawn_errors.insert(key_b.clone(), "err-b".to_string());
+
+        // Both entries must coexist independently.
+        assert_eq!(
+            app.detail_terminal_spawn_errors.get(&key_a).map(String::as_str),
+            Some("err-a"),
+            "quadraui #336 slot should hold err-a"
+        );
+        assert_eq!(
+            app.detail_terminal_spawn_errors.get(&key_b).map(String::as_str),
+            Some("err-b"),
+            "coordinator #336 slot should hold err-b"
+        );
+        assert_eq!(app.detail_terminal_spawn_errors.len(), 2, "must have two distinct entries");
+
+        // selected_issue_key() returns the right composite key.
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 336,
+                title: "quadraui issue".to_string(),
+                body: String::new(),
+                repo_slug: "quadraui/quadraui".to_string(),
+                coord_repo: None,
+                matched_labels: vec![],
+                all_labels: vec![],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 336,
+                title: "coord issue".to_string(),
+                body: String::new(),
+                repo_slug: "JDonaghy/claude-coordinator".to_string(),
+                coord_repo: None,
+                matched_labels: vec![],
+                all_labels: vec![],
+                is_closed: false,
+            },
+        ];
+        app.pipeline_sel = Some(0);
+        assert_eq!(
+            app.selected_issue_key(),
+            Some(("quadraui/quadraui".to_string(), 336)),
+            "selected_issue_key must include repo slug"
+        );
+        app.pipeline_sel = Some(1);
+        assert_eq!(
+            app.selected_issue_key(),
+            Some(("JDonaghy/claude-coordinator".to_string(), 336)),
+            "different repo with same number gives different key"
         );
     }
 
@@ -30464,7 +30542,9 @@ mod tests {
             80, 24, "/bin/sh", &cwd, 1000,
         )
         .expect("spawn /bin/sh");
-        app.detail_terminal_sessions.insert(440, sess);
+        // Key is (repo_slug, issue_number) per #455.
+        let issue_key = ("owner/repo".to_string(), 440u64);
+        app.detail_terminal_sessions.insert(issue_key.clone(), sess);
 
         // Type 'echo __detail_marker__' + Enter via forward_key_to_detail_terminal.
         let line = "echo __detail_marker__";
@@ -30476,16 +30556,16 @@ mod tests {
         for ch in line.chars() {
             let bytes = key_to_pty_bytes(Key::Char(ch), quadraui::Modifiers::default())
                 .expect("char must encode");
-            app.detail_terminal_sessions.get_mut(&440).unwrap().write_input(&bytes);
+            app.detail_terminal_sessions.get_mut(&issue_key).unwrap().write_input(&bytes);
         }
-        app.detail_terminal_sessions.get_mut(&440).unwrap().write_input(&enter_bytes);
+        app.detail_terminal_sessions.get_mut(&issue_key).unwrap().write_input(&enter_bytes);
 
         // Poll until marker appears or 5 s elapse.
         let start = Instant::now();
         let mut found = false;
         while start.elapsed() < Duration::from_secs(5) {
-            app.detail_terminal_sessions.get_mut(&440).unwrap().poll();
-            if app.detail_terminal_sessions[&440].full_text().contains("__detail_marker__") {
+            app.detail_terminal_sessions.get_mut(&issue_key).unwrap().poll();
+            if app.detail_terminal_sessions[&issue_key].full_text().contains("__detail_marker__") {
                 found = true;
                 break;
             }
@@ -30494,12 +30574,12 @@ mod tests {
         assert!(
             found,
             "echo output not visible in per-issue PTY within 5s; full_text={:?}",
-            app.detail_terminal_sessions[&440].full_text(),
+            app.detail_terminal_sessions[&issue_key].full_text(),
         );
 
         // Tidy up.
         app.detail_terminal_sessions
-            .get_mut(&440)
+            .get_mut(&issue_key)
             .unwrap()
             .write_input(b"exit\r");
     }
