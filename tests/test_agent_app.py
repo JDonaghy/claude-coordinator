@@ -464,3 +464,48 @@ def test_artifact_manifest_rejects_path_traversal(tmp_path: Path) -> None:
     # Also verify that a valid pair returns None when the stash is genuinely absent.
     manifest = server.artifact_manifest("myrepo", "issue-1-branch")
     assert manifest is None
+
+
+# ─── #207: /metrics endpoint ─────────────────────────────────────────────────
+
+def test_metrics_returns_expected_keys(tmp_path):
+    """GET /metrics returns JSON with the five expected numeric keys."""
+    pytest = __import__("pytest")
+    psutil = pytest.importorskip("psutil")  # skip if psutil not installed
+    del psutil  # only needed to confirm availability
+
+    client, _ = _client(tmp_path)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    body = r.json()
+    assert "cpu_percent" in body
+    assert "mem_percent" in body
+    assert "mem_used_mb" in body
+    assert "mem_total_mb" in body
+    assert "timestamp" in body
+    # Values must be non-negative numbers.
+    assert body["cpu_percent"] >= 0.0
+    assert 0.0 <= body["mem_percent"] <= 100.0
+    assert body["mem_used_mb"] > 0
+    assert body["mem_total_mb"] >= body["mem_used_mb"]
+
+
+def test_metrics_no_psutil(tmp_path):
+    """GET /metrics returns 503 when psutil is unavailable."""
+    import sys
+
+    client, _ = _client(tmp_path)
+
+    # Simulate psutil not being importable by blocking it from sys.modules.
+    original = sys.modules.get("psutil", None)
+    sys.modules["psutil"] = None  # type: ignore[assignment]
+    try:
+        r = client.get("/metrics")
+        # Should return 503 with an error body.
+        assert r.status_code == 503
+        assert "error" in r.json()
+    finally:
+        if original is None:
+            sys.modules.pop("psutil", None)
+        else:
+            sys.modules["psutil"] = original

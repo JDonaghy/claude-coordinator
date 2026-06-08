@@ -58,13 +58,13 @@ use crate::settings::{
 };
 use quadraui::accelerator::{parse_key_binding, ParsedBinding};
 use quadraui::{
-    Backend, Badge, ChatController, ChatControllerEvent, ChatRole, ChatTurn,
+    Backend, Badge, Chart, ChartKind, ChatController, ChatControllerEvent, ChatRole, ChatTurn,
     Color, Decoration,
     Dialog, DialogButton, DialogHit, DialogInput, DialogLayout, DialogMeasure,
     DialogSeverity, DialogTextInput,
     Key, ListItem, ListView, Modifiers, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
-    Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
+    Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, Series, ShellApp,
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
     StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
     ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
@@ -839,6 +839,60 @@ fn spawn_machine_health(host: &str, port: u16) -> std::sync::mpsc::Receiver<Resu
         let _ = tx.send(result);
     });
     rx
+}
+
+// ─── #207: Machine metrics (CPU + memory) ───────────────────────────────────
+
+/// How many samples to keep per machine (5 min @ 5 s/sample).
+const METRICS_HISTORY: usize = 60;
+/// How often to poll each reachable machine's `/metrics` endpoint.
+const METRICS_CADENCE: Duration = Duration::from_secs(5);
+
+/// One `/metrics` snapshot from a remote agent.
+#[derive(Clone, Copy)]
+struct MetricSample {
+    cpu: f32,
+    mem: f32,
+}
+
+/// In-flight metrics fetch for one machine.
+struct PendingMetrics {
+    machine: String,
+    rx: std::sync::mpsc::Receiver<Result<MetricSample, String>>,
+}
+
+/// Spawn a background thread that fetches `/metrics` from a remote agent.
+fn spawn_machine_metrics(host: &str, port: u16, machine: String) -> PendingMetrics {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = format!("http://{}:{}/metrics", host, port);
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(3))
+            .build();
+        let result = match agent.get(&url).call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(v) => {
+                        let cpu = v
+                            .get("cpu_percent")
+                            .and_then(|x| x.as_f64())
+                            .unwrap_or(0.0) as f32;
+                        let mem = v
+                            .get("mem_percent")
+                            .and_then(|x| x.as_f64())
+                            .unwrap_or(0.0) as f32;
+                        Ok(MetricSample { cpu, mem })
+                    }
+                    Err(e) => Err(format!("json: {}", e)),
+                },
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+    PendingMetrics { machine, rx }
 }
 
 // ─── #336: Artifact manifest types ──────────────────────────────────────────
@@ -4013,6 +4067,18 @@ pub struct CoordApp {
     /// shell) or Shift is held (force-override). Cleared on the matching
     /// mouse-release. `pty_pressed_buttons` is NOT set for these drags.
     terminal_host_sel_dragging: bool,
+
+    // ── #207: Machine metrics sparklines ─────────────────────────────────
+    /// Rolling ring-buffer of CPU + memory samples per machine, keyed by
+    /// machine name.  Capped at [`METRICS_HISTORY`] entries (60 × 5 s =
+    /// 5 minutes).  Populated by background `/metrics` polls.
+    machine_metrics: std::collections::HashMap<String, std::collections::VecDeque<MetricSample>>,
+    /// In-flight `/metrics` fetches — one entry per machine per poll cycle.
+    /// Drained each tick; completed entries update `machine_metrics`.
+    pending_metrics: Vec<PendingMetrics>,
+    /// When the last `/metrics` poll round was kicked.  The next round fires
+    /// after [`METRICS_CADENCE`] has elapsed and the Machines panel is visible.
+    metrics_last_polled: Instant,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4220,6 +4286,10 @@ impl CoordApp {
             pty_pressed_buttons: 0,
             // #464: host-side terminal selection drag state.
             terminal_host_sel_dragging: false,
+            // #207: machine metrics sparklines.
+            machine_metrics: std::collections::HashMap::new(),
+            pending_metrics: Vec::new(),
+            metrics_last_polled: Instant::now(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -6625,6 +6695,137 @@ impl CoordApp {
         }
     }
 
+    // ── #207: Machine metrics sparklines ─────────────────────────────────
+
+    /// Render CPU and memory sparklines for the currently-selected machine
+    /// into `area`.  The area is split vertically: top half = CPU sparkline
+    /// with a label row, bottom half = memory sparkline with a label row.
+    ///
+    /// When no samples have been collected yet (e.g. the machine is
+    /// unreachable or the user just switched to the Machines panel), a
+    /// subdued placeholder is drawn instead so the layout stays stable.
+    fn render_machine_sparklines(&self, backend: &mut dyn Backend, area: Rect, lh: f32) {
+        if area.height < lh * 2.0 {
+            return; // Not enough vertical room to be useful.
+        }
+
+        let machine_name = match self.data.machines.get(self.machine_sel) {
+            Some(m) => &m.name,
+            None => return,
+        };
+
+        let samples: &[MetricSample] = self
+            .machine_metrics
+            .get(machine_name)
+            .map(|d| d.as_slices().0) // front slice; fine for display
+            .unwrap_or(&[]);
+
+        // Split area into top (CPU) and bottom (Mem) halves.
+        let half_h = area.height / 2.0;
+        let cpu_area = Rect::new(area.x, area.y, area.width, half_h);
+        let mem_area = Rect::new(area.x, area.y + half_h, area.width, half_h);
+
+        // Render CPU row.
+        let cpu_data: Vec<f64> = samples.iter().map(|s| s.cpu as f64).collect();
+        let last_cpu = samples.last().map(|s| s.cpu).unwrap_or(0.0);
+        self.render_metric_sparkline(
+            backend, cpu_area, lh,
+            "CPU",
+            last_cpu,
+            cpu_data,
+            Color::rgb(80, 160, 240),
+        );
+
+        // Render memory row.
+        let mem_data: Vec<f64> = samples.iter().map(|s| s.mem as f64).collect();
+        let last_mem = samples.last().map(|s| s.mem).unwrap_or(0.0);
+        self.render_metric_sparkline(
+            backend, mem_area, lh,
+            "Mem",
+            last_mem,
+            mem_data,
+            Color::rgb(120, 200, 120),
+        );
+    }
+
+    /// Draw a single labelled sparkline row.
+    ///
+    /// Layout: one `lh`-tall label+value row on top, the rest of the
+    /// rect for the sparkline chart body.  When `data` is empty a
+    /// placeholder "—" value is shown and no chart is drawn.
+    fn render_metric_sparkline(
+        &self,
+        backend: &mut dyn Backend,
+        area: Rect,
+        lh: f32,
+        label: &str,
+        last_val: f32,
+        data: Vec<f64>,
+        color: Color,
+    ) {
+        if area.height < lh {
+            return;
+        }
+        let label_h = lh;
+        let chart_h = (area.height - label_h).max(0.0);
+        let label_rect = Rect::new(area.x, area.y, area.width, label_h);
+        let chart_rect = Rect::new(area.x, area.y + label_h, area.width, chart_h);
+
+        // Label row — "CPU  42%" or "Mem  67%" with subdued colouring.
+        let val_str = if data.is_empty() {
+            "  —".to_string()
+        } else {
+            format!("  {:.0}%", last_val)
+        };
+        backend.draw_list(label_rect, &ListView {
+            id: WidgetId::new(format!("metric-label-{}", label.to_lowercase())),
+            title: None,
+            items: vec![ListItem {
+                text: StyledText {
+                    spans: vec![
+                        StyledSpan::with_fg(
+                            format!(" {} ", label),
+                            Color::rgb(120, 120, 140),
+                        ),
+                        StyledSpan::with_fg(val_str, color),
+                    ],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            }],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+        });
+
+        // Sparkline body — only when we have data and enough vertical room.
+        if data.is_empty() || chart_h < 1.0 {
+            return;
+        }
+        let chart = Chart {
+            id: WidgetId::new(format!("metric-chart-{}", label.to_lowercase())),
+            kind: ChartKind::Sparkline,
+            series: vec![Series {
+                label: label.to_string(),
+                data,
+                color: Some(color),
+                fill: false,
+            }],
+            x_label: None,
+            y_label: None,
+            y_range: Some((0.0, 100.0)),
+            x_range: None,
+            show_legend: false,
+            y_ticks: None,
+            x_ticks: None,
+            show_grid: false,
+        };
+        backend.draw_chart(chart_rect, &chart, None, None);
+    }
 
     // ── Pipeline panel ────────────────────────────────────────────────────
 
@@ -16917,6 +17118,49 @@ impl CoordApp {
             }
         }
 
+        // #207: Machine metrics polling — only when the Machines panel is
+        // visible so we don't burn background threads when the user is on
+        // another view.
+        if self.active_view == SidebarView::Machines {
+            // Drain any completed in-flight metrics fetches first.
+            let mut drained: Vec<PendingMetrics> = Vec::new();
+            for pm in self.pending_metrics.drain(..) {
+                match pm.rx.try_recv() {
+                    Ok(Ok(sample)) => {
+                        let buf = self.machine_metrics
+                            .entry(pm.machine)
+                            .or_default();
+                        buf.push_back(sample);
+                        if buf.len() > METRICS_HISTORY {
+                            buf.pop_front();
+                        }
+                        needs_redraw = true;
+                    }
+                    Ok(Err(_)) => {}  // fetch failed — silently skip
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Still in flight — put it back.
+                        drained.push(pm);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                }
+            }
+            self.pending_metrics = drained;
+
+            // Kick a new round when the cadence has elapsed and no fetches
+            // are outstanding (avoids piling up requests when the agent is slow).
+            if self.pending_metrics.is_empty()
+                && self.metrics_last_polled.elapsed() >= METRICS_CADENCE
+            {
+                self.metrics_last_polled = Instant::now();
+                for m in &self.data.machines {
+                    if m.reachable && !m.host.is_empty() {
+                        let pm = spawn_machine_metrics(&m.host, 7433, m.name.clone());
+                        self.pending_metrics.push(pm);
+                    }
+                }
+            }
+        }
+
         needs_redraw
     }
 
@@ -18071,7 +18315,16 @@ impl ShellApp for CoordApp {
                 }
             }
             SidebarView::Machines => {
-                backend.draw_list(m, &self.machine_detail_list());
+                // #207: Reserve two sparkline rows (CPU + mem) at the bottom
+                // of the main panel.  Each row is 2 × lh tall: one cell for
+                // the label line and one for the chart body.  When there are
+                // no metrics yet the area shows a subtle placeholder.
+                let chart_h = lh * 4.0; // 2 rows × 2 lh each
+                let detail_h = (m.height - chart_h).max(0.0);
+                let detail_rect = Rect::new(m.x, m.y, m.width, detail_h);
+                let chart_rect = Rect::new(m.x, m.y + detail_h, m.width, chart_h);
+                backend.draw_list(detail_rect, &self.machine_detail_list());
+                self.render_machine_sparklines(backend, chart_rect, lh);
             }
             SidebarView::Settings => {
                 // Build form for the current category and render via
@@ -21790,6 +22043,10 @@ mod tests {
             pty_pressed_buttons: 0,
             // #464
             terminal_host_sel_dragging: false,
+            // #207
+            machine_metrics: std::collections::HashMap::new(),
+            pending_metrics: Vec::new(),
+            metrics_last_polled: Instant::now(),
         }
     }
 

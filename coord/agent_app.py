@@ -492,6 +492,33 @@ def build_app(
             status_code=202,
         )
 
+    async def metrics(_request: Request) -> JSONResponse:
+        """#207: Return CPU and memory metrics for the agent machine.
+
+        Uses ``psutil`` for sub-millisecond, non-blocking snapshots.
+        ``cpu_percent(interval=None)`` returns the CPU utilisation since
+        the previous call (or since process start on the very first call),
+        which is essentially free — no sleep, no blocking.
+        """
+        try:
+            import psutil  # lazy import — keeps startup fast on old agents
+        except ImportError:
+            return JSONResponse(
+                {"error": "psutil not installed on this agent"},
+                status_code=503,
+            )
+        cpu = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        return JSONResponse(
+            {
+                "cpu_percent": cpu,
+                "mem_percent": vm.percent,
+                "mem_used_mb": round(vm.used / (1024 * 1024), 1),
+                "mem_total_mb": round(vm.total / (1024 * 1024), 1),
+                "timestamp": time.time(),
+            }
+        )
+
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/status", status, methods=["GET"]),
@@ -506,5 +533,7 @@ def build_app(
         Route("/worktree-clean", worktree_clean, methods=["POST"]),
         # #305: artifact stash manifest (GET /artifact/<repo>/<branch>)
         Route("/artifact/{repo}/{branch}", artifact_manifest, methods=["GET"]),
+        # #207: CPU + memory snapshot for TUI sparklines
+        Route("/metrics", metrics, methods=["GET"]),
     ]
     return Starlette(routes=routes)
