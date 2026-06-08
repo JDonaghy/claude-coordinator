@@ -3597,8 +3597,9 @@ def _apply_label_change(
         "MACHINE is the local name from coordinator.yml."
     ),
 )
+@_CONFIG_OPTION
 @click.argument("machine")
-def pause(machine: str) -> None:
+def pause(config_path: Path, machine: str) -> None:
     from coord.machine_pause import pause as _pause
     changed = _pause(machine)
     if changed:
@@ -3613,8 +3614,9 @@ def pause(machine: str) -> None:
         "again.  No-op if the machine wasn't paused."
     ),
 )
+@_CONFIG_OPTION
 @click.argument("machine")
-def unpause(machine: str) -> None:
+def unpause(config_path: Path, machine: str) -> None:
     from coord.machine_pause import unpause as _unpause
     changed = _unpause(machine)
     if changed:
