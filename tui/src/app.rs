@@ -13768,7 +13768,7 @@ impl CoordApp {
             }
         } else if self.active_view == SidebarView::Machines {
             // Machines panel action hints.
-            " r=restart  u=update  c=clean worktrees  q=quit ".to_string()
+            " r=restart  u=update  c=clean worktrees  p=pause/unpause  q=quit ".to_string()
         } else if self.active_view == SidebarView::Pipeline && self.test_gate_actionable() {
             // #200: surface the Test gate keybinds when actionable for the
             // currently-selected pipeline issue.
@@ -21477,6 +21477,48 @@ impl ShellApp for CoordApp {
                                     "agent clean-worktrees runs after current command",
                                     ToastSeverity::Info,
                                 );
+                            }
+                            needs_redraw = true;
+                        }
+                    }
+
+                    // ── p — Machines: pause/unpause routing toggle ────────
+                    Key::Char('p') if self.active_view == SidebarView::Machines => {
+                        if let Some(m) = self.data.machines.get(self.machine_sel) {
+                            let name = m.name.clone();
+                            let is_paused = self.paused_machines.contains(&name);
+                            let cmd = if is_paused { "unpause" } else { "pause" };
+                            use crate::commands::SpawnQueuedOutcome;
+                            let outcome =
+                                self.command_runner.spawn_queued(&[cmd, &name]);
+                            match outcome {
+                                SpawnQueuedOutcome::Deduped => {}
+                                SpawnQueuedOutcome::Queued => {
+                                    let verb = if is_paused { "resume" } else { "pause" };
+                                    self.push_toast(
+                                        "Machine routing",
+                                        &format!(
+                                            "{}: {} queued — will run after current command.",
+                                            name, verb
+                                        ),
+                                        ToastSeverity::Info,
+                                    );
+                                }
+                                SpawnQueuedOutcome::Started => {
+                                    // Optimistic local update so the badge
+                                    // reflects the new state immediately.
+                                    if is_paused {
+                                        self.paused_machines.remove(&name);
+                                    } else {
+                                        self.paused_machines.insert(name.clone());
+                                    }
+                                    let verb = if is_paused { "resumed" } else { "paused" };
+                                    self.push_toast(
+                                        "Machine routing",
+                                        &format!("{}: {}", name, verb),
+                                        ToastSeverity::Info,
+                                    );
+                                }
                             }
                             needs_redraw = true;
                         }
