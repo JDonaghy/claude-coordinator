@@ -32,6 +32,15 @@ On **2026-06-15** Anthropic begins billing `claude -p` / Agent SDK at full API r
 - 🧭 **Open design Q — where do automated tests gate?** Recommendation: keep automated tests a *work-stage* expectation (workers already run build+test) enforced by **CI on the PR** — but **CI is pytest-only**, so Rust repos (tui/quadraui/vimcode) have no automated gate today; they need an explicit `cargo build && cargo test` gate (extend CI, or a pre-merge verify step) rather than a separate pre-PR stage for Python. The distinct lifecycle **Test/Smoke** stage is the *human* smoke after review-approve (#465).
 - 🛡 **Open reliability:** precision agent unreachable (paused — needs an AGENT_OPERATIONS look); a PyPI release + `coord agent update` still pending to propagate agent-side #480/#448/#466 bits to the fleet.
 
+## Horizon (beyond the deadline)
+
+Once the local interactive lifecycle is solid, the direction is **coord-tui as a "control center"**: one developer driving human-attended interactive `claude` sessions across a **fleet of ssh-reachable machines** (cloud VMs / lab boxes over Tailscale or a corp network), to **scale what a single developer can do** — a local box can't run >1 compute-heavy job (Rust `cargo build`/`test`) at once. Two legs sharing **one ssh + tmux substrate**:
+
+- **#486** — remote interactive sessions (revives #446): launch/drive `claude` on a selected remote machine, PTY into the TUI pane.
+- **#487** — resilience: host sessions in tmux named sessions so they **survive a control-center crash and are reattachable** (today's local `pty.fork` dies with the TUI).
+
+Enabled by #478 (result-out) + #480 (worktree isolation). Possibly a multi-tenant service later (monetization TBD). **Not a June-15 blocker** — the local MVP (#467) is the escape hatch; this is the scale-up. See `project_fleet_control_center_vision` in coordinator memory.
+
 ## How to use this doc
 
 - **Agents / coordinator brain:** treat this as the standing objective behind all planning and triage. Bias proposals toward unblocking the critical path above; don't silently drift to unrelated backlog.
