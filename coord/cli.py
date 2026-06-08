@@ -1995,7 +1995,11 @@ def assign(
                 "NOT report human_attended_only=True; refusing to launch."
             )
 
-        repo_path = machine_obj.repo_path(repo) or str(Path.cwd())
+        # Expand `~` — repo_paths in coordinator.yml use `~/src/...`, and unlike
+        # the agent (which expands everywhere) this local interactive launch
+        # passes the path straight to the child's cwd, so a literal `~` would
+        # fail with "No such file or directory".  Local launch ⇒ local home.
+        repo_path = str(Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser())
 
         effective_plan_only = plan_only or (
             cfg.dispatch.require_plan and not no_plan
