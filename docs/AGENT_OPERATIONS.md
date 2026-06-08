@@ -63,6 +63,33 @@ curl -s http://<host>:7433/health | python3 -m json.tool
 
 The `version` field should match the latest PyPI release.
 
+## Graphify graph: reseed a machine's local clone
+
+`graphify-out/` is **not** tracked in git (claude-coordinator, vimcode, and quadraui all gitignore it as of 2026-06-07). Each repo's knowledge graph is a regenerable, machine-local cache rebuilt by the `post-commit` / `post-checkout` git hooks. PyPI agent installs have no clone and don't need this — it applies only to machines with a **local git checkout** of these repos (the dev machine, and any worker box that builds/tests them).
+
+**One-time migration** — the first time a clone pulls the commit that stopped tracking `graphify-out/`, git wants to delete the now-untracked files, but the hooks keep them dirty, so the pull may abort with *"local changes would be overwritten"*. Discard the (regenerable) cache first, then pull:
+
+```bash
+cd <repo>            # e.g. ~/src/quadraui
+rm -rf graphify-out  # safe — regenerable cache
+git pull             # now clean
+```
+
+**Reseed the graph** — one-time per machine per repo. Restores the rich semantic + community graph (AST-only refresh is free on every commit thereafter):
+
+```bash
+/graphify            # in a Claude Code session at the repo root
+# or headless:  graphify .
+```
+
+Then ensure the hooks are installed so the graph stays current after the seed:
+
+```bash
+graphify hook install   # idempotent; appends to any existing post-commit hook
+```
+
+Without the seed, queries have no `graph.json` to read until the next commit triggers an AST-only rebuild — and `post-checkout` will **not** bootstrap a graph when `graphify-out/` is absent, so the explicit one-time seed is required.
+
 ## Routine upgrade (all agents)
 
 From the coordinator machine:

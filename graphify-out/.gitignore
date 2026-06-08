@@ -1,21 +1,9 @@
-# Track only the durable, queryable graph artifacts:
-#   graph.json, GRAPH_REPORT.md, manifest.json, .graphify_labels.json
-# Everything below is regenerable by the post-commit/post-checkout hooks,
-# machine-specific, or a stray snapshot — so it stays out of git.
-# (gitignore has no inline comments; keep each rule on its own line.)
-
-# content-hashed extraction cache — regenerable, grows unbounded
-cache/
-
-# absolute machine-specific paths (scan root / interpreter)
-.graphify_root
-.graphify_python
-
-# regenerable viz; not emitted above 5000 nodes (graphify export html)
-graph.html
-
-# local token-cost tracker
-cost.json
-
-# stray dated output snapshots (e.g. 2026-06-07/)
-20*/
+# graphify-out/ is a regenerable, machine-local cache rebuilt by the
+# post-commit / post-checkout git hooks — we do NOT commit it:
+#   - every machine rebuilds locally (one-time `/graphify` seed, then free
+#     AST refresh on each commit), so sharing the built copy is redundant
+#   - graph.json is multi-MB and rewritten every commit -> history bloat and
+#     guaranteed merge conflicts across parallel worker branches
+# Only this .gitignore is tracked, so the rule reaches every clone.
+*
+!.gitignore
