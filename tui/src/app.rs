@@ -11581,37 +11581,36 @@ impl CoordApp {
                     // For case 2 we need to peek at the session's reporting
                     // state without consuming the event — read the flag, then
                     // branch.
-                    let reporting_on = {
-                        let cr = self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w);
-                        cr.is_some() && {
-                            // Only peek when there's actually a session.
-                            match self.active_view {
-                                SidebarView::Terminal => self
-                                    .terminal_session
-                                    .as_ref()
-                                    .map(|s| s.mouse_reporting_enabled())
-                                    .unwrap_or(false),
-                                SidebarView::Pipeline
-                                    if self.pipeline_detail_tab
-                                        == PipelineDetailTab::Terminal =>
-                                {
-                                    self.selected_issue_key()
-                                        .and_then(|k| {
-                                            self.detail_terminal_sessions
-                                                .get(&k)
-                                                .map(|s| s.mouse_reporting_enabled())
-                                        })
-                                        .unwrap_or(false)
-                                }
-                                _ => false,
+                    // Compute cell coordinates once; reuse for both the
+                    // reporting-state peek and the host-select branch (avoids
+                    // a redundant coordinate translation on every mouse-down).
+                    let cr = self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w);
+                    let reporting_on = cr.is_some() && {
+                        // Only peek when there's actually a session.
+                        match self.active_view {
+                            SidebarView::Terminal => self
+                                .terminal_session
+                                .as_ref()
+                                .map(|s| s.mouse_reporting_enabled())
+                                .unwrap_or(false),
+                            SidebarView::Pipeline
+                                if self.pipeline_detail_tab
+                                    == PipelineDetailTab::Terminal =>
+                            {
+                                self.selected_issue_key()
+                                    .and_then(|k| {
+                                        self.detail_terminal_sessions
+                                            .get(&k)
+                                            .map(|s| s.mouse_reporting_enabled())
+                                    })
+                                    .unwrap_or(false)
                             }
+                            _ => false,
                         }
                     };
                     let force_host_sel = modifiers.shift || !reporting_on;
                     if force_host_sel {
-                        if let Some((col, row)) =
-                            self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w)
-                        {
+                        if let Some((col, row)) = cr {
                             self.terminal_host_sel_begin(col, row);
                             return true;
                         }
@@ -12573,6 +12572,7 @@ impl CoordApp {
 
     /// Begin a host-side selection drag in the active terminal at `(col, row)`.
     /// Clears any previous selection and sets the anchor to `(col, row)`.
+    /// No-op (dragging flag not set) when there is no active terminal session.
     fn terminal_host_sel_begin(&mut self, col: u16, row: u16) {
         use quadraui::terminal_engine::TerminalSelection;
         if let Some(sess) = self.active_terminal_session_mut() {
@@ -12582,6 +12582,8 @@ impl CoordApp {
                 end_row: row,
                 end_col: col,
             });
+        } else {
+            return;
         }
         self.terminal_host_sel_dragging = true;
     }
@@ -12608,10 +12610,10 @@ impl CoordApp {
         self.terminal_host_sel_dragging = false;
         // Clear collapsed (point) selections — they're just phantom clicks.
         if let Some(sess) = self.active_terminal_session_mut() {
-            if let Some(ref sel) = sess.selection.clone() {
-                if sel.start_row == sel.end_row && sel.start_col == sel.end_col {
-                    sess.selection = None;
-                }
+            if matches!(&sess.selection, Some(sel)
+                if sel.start_row == sel.end_row && sel.start_col == sel.end_col)
+            {
+                sess.selection = None;
             }
         }
     }
@@ -18406,6 +18408,10 @@ impl ShellApp for CoordApp {
                 if let Some(text) = self.active_terminal_selected_text() {
                     backend.services().clipboard().write_text(&text);
                     self.clear_active_terminal_selection();
+                    // Platform contract (#464): emit TextCopied so copy-confirmation
+                    // UI and future listeners observe terminal copies, matching the
+                    // quadraui built-in text-selection copy path (tui/run.rs:258).
+                    let _ = self.handle(UiEvent::TextCopied(text), backend, ctx);
                     return Reaction::Redraw;
                 }
             }
