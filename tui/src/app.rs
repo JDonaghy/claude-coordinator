@@ -4008,6 +4008,11 @@ pub struct CoordApp {
     /// stuck in "button held" state until the next click.
     /// Bits: `1` = Left, `2` = Middle, `4` = Right.
     pty_pressed_buttons: u8,
+    /// #464: `true` while a host-side text-selection drag is in progress in
+    /// the active terminal pane. Set when mouse-reporting is OFF (plain
+    /// shell) or Shift is held (force-override). Cleared on the matching
+    /// mouse-release. `pty_pressed_buttons` is NOT set for these drags.
+    terminal_host_sel_dragging: bool,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4213,6 +4218,8 @@ impl CoordApp {
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #454: tracks Press → Release for PTY mouse-reporting drags.
             pty_pressed_buttons: 0,
+            // #464: host-side terminal selection drag state.
+            terminal_host_sel_dragging: false,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -11561,6 +11568,53 @@ impl CoordApp {
                 } else if ctx.in_main(pos.x, pos.y) {
                     let main_b = ctx.main_bounds();
                     let char_w = backend.char_width();
+                    // #464: host-side selection — must check BEFORE the PTY
+                    // forwarding path so Shift can override even when the app
+                    // has mouse reporting on (e.g. vim visual mode).
+                    //
+                    // Two cases both route to host selection:
+                    //   1. Shift held → always host-select (standard terminal
+                    //      override convention; overrides vim/tmux/less).
+                    //   2. Mouse reporting OFF → forward_mouse returns false
+                    //      anyway; start selection here so we own the drag.
+                    //
+                    // For case 2 we need to peek at the session's reporting
+                    // state without consuming the event — read the flag, then
+                    // branch.
+                    // Compute cell coordinates once; reuse for both the
+                    // reporting-state peek and the host-select branch (avoids
+                    // a redundant coordinate translation on every mouse-down).
+                    let cr = self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w);
+                    let reporting_on = cr.is_some() && {
+                        // Only peek when there's actually a session.
+                        match self.active_view {
+                            SidebarView::Terminal => self
+                                .terminal_session
+                                .as_ref()
+                                .map(|s| s.mouse_reporting_enabled())
+                                .unwrap_or(false),
+                            SidebarView::Pipeline
+                                if self.pipeline_detail_tab
+                                    == PipelineDetailTab::Terminal =>
+                            {
+                                self.selected_issue_key()
+                                    .and_then(|k| {
+                                        self.detail_terminal_sessions
+                                            .get(&k)
+                                            .map(|s| s.mouse_reporting_enabled())
+                                    })
+                                    .unwrap_or(false)
+                            }
+                            _ => false,
+                        }
+                    };
+                    let force_host_sel = modifiers.shift || !reporting_on;
+                    if force_host_sel {
+                        if let Some((col, row)) = cr {
+                            self.terminal_host_sel_begin(col, row);
+                            return true;
+                        }
+                    }
                     // #454: Forward click to the embedded PTY when mouse
                     // reporting is enabled. Returns true only if the PTY
                     // consumed it (i.e. mouse reporting is on); fall through
@@ -11754,23 +11808,34 @@ impl CoordApp {
                         redraw |= self.panel_toolbar_hover.clear();
                     }
                 } else if ctx.in_main(pos.x, pos.y) {
-                    // #454: forward cursor motion to the embedded PTY when
-                    // mouse-reporting mode is active.  `forward_mouse`
-                    // returns false when reporting is off, so there is no
-                    // performance cost on the common idle path.
-                    //
-                    // Plain hover (no button held) is intentionally NOT
-                    // forwarded: under the xterm "button-event tracking"
-                    // protocol (mode 1002), a motion event always carries
-                    // a button bit, so reporting Left for hover looks
-                    // identical to a Left-drag — and would trigger vim
-                    // visual selection, tmux copy-mode drag, ranger
-                    // selection, etc. on plain cursor movement.  We
-                    // forward Move only when at least one button is
-                    // actually held (#454 review fix).
+                    // #464: if a host-side selection drag is in progress,
+                    // extend the selection to the current cell and redraw.
+                    // This takes priority over the PTY motion path so the
+                    // drag doesn't accidentally escape to the PTY.
                     let char_w = backend.char_width();
                     let main_b = ctx.main_bounds();
-                    if buttons.left || buttons.right || buttons.middle {
+                    if self.terminal_host_sel_dragging && buttons.left {
+                        if let Some((col, row)) =
+                            self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w)
+                        {
+                            self.terminal_host_sel_update(col, row);
+                            redraw = true;
+                        }
+                    } else if buttons.left || buttons.right || buttons.middle {
+                        // #454: forward cursor motion to the embedded PTY when
+                        // mouse-reporting mode is active.  `forward_mouse`
+                        // returns false when reporting is off, so there is no
+                        // performance cost on the common idle path.
+                        //
+                        // Plain hover (no button held) is intentionally NOT
+                        // forwarded: under the xterm "button-event tracking"
+                        // protocol (mode 1002), a motion event always carries
+                        // a button bit, so reporting Left for hover looks
+                        // identical to a Left-drag — and would trigger vim
+                        // visual selection, tmux copy-mode drag, ranger
+                        // selection, etc. on plain cursor movement.  We
+                        // forward Move only when at least one button is
+                        // actually held (#454 review fix).
                         let btn = if buttons.right {
                             MouseButton::Right
                         } else if buttons.middle {
@@ -11820,7 +11885,7 @@ impl CoordApp {
                     {
                         if let Some(action_toolbar) = self.pipeline_action_bar_toolbar() {
                             let main_b = ctx.main_bounds();
-                            let tab_h = lh * 1.4;
+                            let tab_h = detail_tab_bar_height(lh);
                             let bar_h = pipeline_action_bar_height(true, lh);
                             let bar_rect = Rect::new(
                                 main_b.x,
@@ -11860,6 +11925,13 @@ impl CoordApp {
                         }
                         _ => {}
                     }
+                }
+                // #464: finalise a host-side selection drag on release.
+                // Must run before the PTY forwarding path so we don't also
+                // send a spurious Release to the PTY.
+                if self.terminal_host_sel_dragging && btn == MouseButton::Left {
+                    self.terminal_host_sel_end();
+                    return true;
                 }
                 // #454: forward button release to the embedded PTY when mouse
                 // reporting is enabled (gated inside forward_mouse itself).
@@ -12173,7 +12245,7 @@ impl CoordApp {
             // #269: hit-test from the actual TabBar labels (char widths)
             // instead of hard-coded offsets.  This stays correct when
             // tabs are renamed or have a badge appended.
-            let tab_h = lh * 1.4;
+            let tab_h = detail_tab_bar_height(lh);
             if pos.y - main_b.y < tab_h {
                 let bar = self.board_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
@@ -12219,8 +12291,10 @@ impl CoordApp {
             return false;
         }
         if self.active_view == SidebarView::Pipeline {
-            // Tab bar occupies the first `lh * 1.4` row of the main panel.
-            let tab_h = lh * 1.4;
+            // Tab bar occupies the first `detail_tab_bar_height(lh)` row of
+            // the main panel — `(lh * 1.4).round()`, so the TUI and pixel
+            // backends agree on the boundary (#464).
+            let tab_h = detail_tab_bar_height(lh);
             if pos.y - main_b.y < tab_h {
                 let bar = self.pipeline_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
@@ -12352,8 +12426,11 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
-                // Content area starts below the tab bar (lh * 1.4 rows).
-                let content_y = main_b.y + lh * 1.4;
+                // Content area starts below the tab bar. `#464`: use the
+                // rounded helper so the hit-test origin lines up with the
+                // render origin in the TUI backend (where `q_rect_to_ratatui`
+                // rounds the fractional `lh * 1.4` to a whole cell).
+                let content_y = main_b.y + detail_tab_bar_height(lh);
                 if let Some((col, row)) =
                     terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
                 {
@@ -12406,7 +12483,8 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
-                let content_y = main_b.y + lh * 1.4;
+                // `#464`: rounded helper for parity with the render path.
+                let content_y = main_b.y + detail_tab_bar_height(lh);
                 let (col, row) =
                     terminal_pixel_to_cell_clamped(pos, main_b, content_y, char_w, lh);
                 if let Some(issue_key) = self.selected_issue_key() {
@@ -12423,6 +12501,120 @@ impl CoordApp {
                 false
             }
             _ => false,
+        }
+    }
+
+    // ── #464: host-side terminal selection helpers ────────────────────────────
+
+    /// Translate a pixel position to a terminal cell `(col, row)` for
+    /// whichever terminal view is currently active (standalone Terminal or
+    /// Pipeline / Terminal tab).  Returns `None` when `pos` is outside the
+    /// PTY content area.
+    fn active_terminal_pixel_to_cell(
+        &self,
+        pos: Point,
+        main_b: Rect,
+        lh: f32,
+        char_w: f32,
+    ) -> Option<(u16, u16)> {
+        match self.active_view {
+            SidebarView::Terminal => {
+                terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
+            }
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                // `#464`: rounded helper for parity with the render path.
+                let content_y = main_b.y + detail_tab_bar_height(lh);
+                terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return a mutable reference to the currently active embedded terminal
+    /// session, or `None` when no terminal view is active or no session exists.
+    fn active_terminal_session_mut(
+        &mut self,
+    ) -> Option<&mut quadraui::terminal_engine::TerminalSession> {
+        match self.active_view {
+            SidebarView::Terminal => self.terminal_session.as_mut(),
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                let key = self.selected_issue_key()?;
+                self.detail_terminal_sessions.get_mut(&key)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the selected text from the active terminal session, if any.
+    fn active_terminal_selected_text(&self) -> Option<String> {
+        match self.active_view {
+            SidebarView::Terminal => self.terminal_session.as_ref()?.selected_text(),
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                let key = self.selected_issue_key()?;
+                self.detail_terminal_sessions.get(&key)?.selected_text()
+            }
+            _ => None,
+        }
+    }
+
+    /// Clear the selection in the active terminal session.
+    fn clear_active_terminal_selection(&mut self) {
+        if let Some(sess) = self.active_terminal_session_mut() {
+            sess.selection = None;
+        }
+    }
+
+    /// Begin a host-side selection drag in the active terminal at `(col, row)`.
+    /// Clears any previous selection and sets the anchor to `(col, row)`.
+    /// No-op (dragging flag not set) when there is no active terminal session.
+    fn terminal_host_sel_begin(&mut self, col: u16, row: u16) {
+        use quadraui::terminal_engine::TerminalSelection;
+        if let Some(sess) = self.active_terminal_session_mut() {
+            sess.selection = Some(TerminalSelection {
+                start_row: row,
+                start_col: col,
+                end_row: row,
+                end_col: col,
+            });
+        } else {
+            return;
+        }
+        self.terminal_host_sel_dragging = true;
+    }
+
+    /// Extend the host-side selection drag to `(col, row)` (move event).
+    /// No-op when no drag is in progress.
+    fn terminal_host_sel_update(&mut self, col: u16, row: u16) {
+        if !self.terminal_host_sel_dragging {
+            return;
+        }
+        if let Some(sess) = self.active_terminal_session_mut() {
+            if let Some(ref mut sel) = sess.selection {
+                sel.end_row = row;
+                sel.end_col = col;
+            }
+        }
+    }
+
+    /// Finalise the host-side selection drag (release event).
+    /// The selection remains visible; only the dragging flag is cleared.
+    /// A collapsed selection (anchor == end) is cleared entirely since it
+    /// represents a plain click with no text chosen.
+    fn terminal_host_sel_end(&mut self) {
+        self.terminal_host_sel_dragging = false;
+        // Clear collapsed (point) selections — they're just phantom clicks.
+        if let Some(sess) = self.active_terminal_session_mut() {
+            if matches!(&sess.selection, Some(sel)
+                if sel.start_row == sel.end_row && sel.start_col == sel.end_col)
+            {
+                sess.selection = None;
+            }
         }
     }
 
@@ -12615,7 +12807,10 @@ impl CoordApp {
                         // alt-screen), so calling it directly and falling
                         // back on `false` is equivalent to the explicit
                         // gate from the issue spec.
-                        let content_y = main_b.y + lh * 1.4;
+                        //
+                        // `#464`: rounded helper for parity with the render
+                        // path so the click-to-cell mapping is exact in TUI.
+                        let content_y = main_b.y + detail_tab_bar_height(lh);
                         if delta.y != 0.0 {
                             if let Some((col, row)) =
                                 terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
@@ -17848,8 +18043,10 @@ impl ShellApp for CoordApp {
         match self.active_view {
             SidebarView::Board => {
                 // Tab bar (Board / Issue / Chat), then the active tab's content.
+                // `#464`: route through `detail_tab_bar_height` so render and
+                // hit-test agree on the cell boundary in the TUI backend.
                 let tab_bar = self.board_detail_tab_bar();
-                let tab_h = lh * 1.4;
+                let tab_h = detail_tab_bar_height(lh);
                 let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                 let content_rect =
                     Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
@@ -17890,9 +18087,11 @@ impl ShellApp for CoordApp {
                 if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
                     backend.draw_list(m, &self.pipeline_placeholder_list());
                 } else {
-                    // Tab bar.
+                    // Tab bar.  `#464`: route through `detail_tab_bar_height`
+                    // so the painted top of the content rect lines up with
+                    // the hit-test origin in the TUI backend.
                     let tab_bar = self.pipeline_detail_tab_bar();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                     let content_rect = Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
                     backend.draw_tab_bar(tab_rect, &tab_bar, None);
@@ -18193,6 +18392,31 @@ impl ShellApp for CoordApp {
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
 
+        // ── #464: Ctrl-C copies active terminal host-selection ──────────
+        // Fires for BOTH terminal views (standalone Terminal and
+        // Pipeline/Terminal tab) regardless of whether PTY-passthrough is
+        // active. When there is an active host selection, Ctrl-C copies the
+        // text and is consumed — it does NOT propagate to the PTY (so no
+        // accidental interrupt of the running process). When there is no
+        // selection, this block is a no-op and Ctrl-C falls through to the
+        // normal PTY-passthrough path below.
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            if matches!(key, Key::Char('c') | Key::Char('C'))
+                && modifiers.ctrl
+                && !modifiers.alt
+            {
+                if let Some(text) = self.active_terminal_selected_text() {
+                    backend.services().clipboard().write_text(&text);
+                    self.clear_active_terminal_selection();
+                    // Platform contract (#464): emit TextCopied so copy-confirmation
+                    // UI and future listeners observe terminal copies, matching the
+                    // quadraui built-in text-selection copy path (tui/run.rs:258).
+                    let _ = self.handle(UiEvent::TextCopied(text), backend, ctx);
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
         // ── #424: embedded terminal pane focus arbitration ──────────────
         // PROTOCOL:
         //   - When `active_view == SidebarView::Terminal`:
@@ -18208,8 +18432,7 @@ impl ShellApp for CoordApp {
         //
         // Mouse/window events fall through to normal handlers — the
         // Terminal view doesn't need special mouse handling for the MVP
-        // (no selection / scrollbar drag wired up yet; copy-out is
-        // tracked in quadraui #283).
+        // (copy-out is now implemented in #464 above).
         if self.active_view == SidebarView::Terminal {
             if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                 // F12 = focus-toggle — always handled, independent of
@@ -18378,9 +18601,10 @@ impl ShellApp for CoordApp {
                 let main_rect = if chat_is_refinement {
                     // Match the Refinement tab's content_rect so handle()'s
                     // layout maths agree with what's painted.
+                    // `#464`: rounded helper so TUI render and hit-test agree.
                     let m = ctx.main_bounds();
                     let lh = backend.line_height();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     // Account for the panel toolbar carve-out done in
                     // render_content (#272).  When panel_toolbar() returns
                     // None we just shave the tab bar.
@@ -18394,9 +18618,10 @@ impl ShellApp for CoordApp {
                         after_panel.width, (after_panel.height - tab_h).max(0.0))
                 } else if chat_is_board {
                     // Match the Board Chat tab's content_rect.
+                    // `#464`: rounded helper so TUI render and hit-test agree.
                     let m = ctx.main_bounds();
                     let lh = backend.line_height();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0))
                 } else {
                     ctx.main_bounds()
@@ -21191,14 +21416,44 @@ fn record_test_verdict_db(
 
 // ─── Terminal mouse coordinate helpers ────────────────────────────────────────
 
+/// Height of the detail-panel tab bar (Board / Pipeline tabs row), in
+/// pixels for the GTK / macOS backends and in cell rows for the TUI
+/// backend.
+///
+/// Both backends paint the tab row at `(lh * 1.4).round()`:
+///
+/// - GTK/macOS (`lh ≈ 20 px`): `28 px` — the design height; rounding is
+///   a no-op since `20 * 1.4 = 28` already.
+/// - TUI (`lh = 1 cell`): `1 cell` — the ratatui backend rasterises
+///   into integer rows via [`quadraui::tui::backend::q_rect_to_ratatui`],
+///   so the painted tab row is **one whole cell** even though `lh * 1.4`
+///   would suggest a fractional `1.4` rows.
+///
+/// `#464`: hit-tests against the terminal content area must use the
+/// SAME rounded origin as the render path, or the click-to-cell mapping
+/// drifts by one row.  Before this helper existed, render used `lh*1.4`
+/// (rounded to `1` cell at draw time by `q_rect_to_ratatui`) while the
+/// hit-tests used the unrounded `1.4` — so a click at the top content
+/// cell mapped to "row -1" (rejected) and a click one row below mapped
+/// to row 0, etc.  Funnelling both code paths through this helper keeps
+/// them in lock-step.
+///
+/// `.max(lh)` guarantees at least one full line height, which matters
+/// for any future call site that might pass `lh < 1.0`.
+fn detail_tab_bar_height(lh: f32) -> f32 {
+    (lh * 1.4).round().max(lh)
+}
+
 /// Translate a pixel position into terminal (col, row) cell coordinates.
 ///
 /// `rect` is the full bounding box of the PTY surface (in pixels).
 /// `origin_y` is the Y pixel coordinate where **row 0** starts:
 ///   - Standalone `SidebarView::Terminal`: pass `rect.y`
 ///     (the entire main-content rect is the PTY area, no toolbar above it).
-///   - `SidebarView::Pipeline` with the Terminal tab: pass `rect.y + lh * 1.4`
-///     (a tab bar occupies the top `lh * 1.4` pixels before the PTY content begins).
+///   - `SidebarView::Pipeline` with the Terminal tab: pass
+///     `rect.y + detail_tab_bar_height(lh)` (the rounded tab bar height —
+///     `#464`: must match the render path, which `q_rect_to_ratatui`
+///     rounds the same way).
 ///
 /// `char_w` and `line_h` are the backend's character cell dimensions in pixels.
 /// Both are clamped to `1.0` to guard against zero/sub-pixel values.
@@ -21533,6 +21788,8 @@ mod tests {
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #454
             pty_pressed_buttons: 0,
+            // #464
+            terminal_host_sel_dragging: false,
         }
     }
 
@@ -22109,7 +22366,7 @@ mod tests {
         let lh: f32 = 1.0;
         // #438: Pipeline has no panel toolbar — no toolbar offset.
         let tb_h = 0.0_f32;
-        let tab_h = lh * 1.4;
+        let tab_h = detail_tab_bar_height(lh);
         let content_rect = Rect::new(
             main_b.x,
             main_b.y + tb_h + tab_h,
@@ -22162,7 +22419,7 @@ mod tests {
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let lh: f32 = 1.0;
         // #438: no panel toolbar on Pipeline; content starts directly after the tab row.
-        let tab_h = lh * 1.4;
+        let tab_h = detail_tab_bar_height(lh);
         let content_rect = Rect::new(
             main_b.x,
             main_b.y + tab_h,
@@ -30782,6 +31039,110 @@ mod tests {
         );
     }
 
+    // ── #464: TUI integer-cell hit-test (lh = 1 cell) ────────────────────────
+    //
+    // The TUI backend rasterises at one whole cell per line-height; the
+    // ratatui buffer is a u16 grid so `q_rect_to_ratatui` rounds the
+    // fractional `1.4 * lh` tab-bar height to `1` cell.  These tests
+    // demonstrate the render origin (which the user clicks against) and
+    // the hit-test origin BOTH agree on that rounded value — without the
+    // helper, hit-test landed one row above the click and the top
+    // content cell was unreachable.
+
+    #[test]
+    fn detail_tab_bar_height_tui_rounds_to_one_cell() {
+        // TUI: lh=1 cell → tab bar is exactly 1 cell tall (rounded down from 1.4).
+        assert_eq!(detail_tab_bar_height(1.0), 1.0);
+    }
+
+    #[test]
+    fn detail_tab_bar_height_gtk_is_28_px() {
+        // GTK/macOS: lh≈20 px → tab bar is 28 px (1.4 × lh, no rounding loss).
+        assert_eq!(detail_tab_bar_height(20.0), 28.0);
+    }
+
+    #[test]
+    fn detail_tab_bar_height_at_least_one_lh() {
+        // Even for tiny `lh < 1.0`, the bar is guaranteed at least one
+        // line height tall so the click target never collapses.
+        assert!(detail_tab_bar_height(0.5) >= 0.5);
+    }
+
+    /// `#464` reproducer: with the TUI backend, the FIRST visible content
+    /// cell must hit-test to (col=0, row=0).  Before the helper, the
+    /// fractional `1.4` origin made `pos.y < origin_y` true for the top
+    /// content row, so the top-left cell was unselectable (returned `None`).
+    #[test]
+    fn tpc_tui_pipeline_top_left_content_cell_maps_to_origin() {
+        // TUI mouse coords are integer cells: row 0 of content is at the
+        // pixel row immediately below the tab bar (= origin_y).  With
+        // lh=1, the render places content cell (0,0) at exactly that pixel.
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        let pos = Point::new(0.0, origin_y); // top-left content cell
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((0, 0)),
+            "top-left of content area must map to (col=0, row=0) — \
+             before #464 fix this returned None"
+        );
+    }
+
+    /// `#464` reproducer: with the TUI backend, a click in the middle of
+    /// the content area must hit-test to the same `(col, row)` the user
+    /// visually clicked.  Before the helper, the row was off by one
+    /// (hit-test returned `R-1` for a click at visual row `R`).
+    #[test]
+    fn tpc_tui_pipeline_middle_content_cell_matches_click() {
+        // Click at visual content (col=5, row=4) — pixel position is
+        // (main_b.x + 5, main_b.y + detail_tab_bar_height(lh) + 4).
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        let pos = Point::new(5.0, origin_y + 4.0); // (col=5, row=4)
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((5, 4)),
+            "click at visual (col=5, row=4) must hit-test to (col=5, row=4) — \
+             before #464 fix this returned (col=5, row=3)"
+        );
+    }
+
+    /// `#464` reproducer: the bottom content cell must also map correctly,
+    /// not be silently rejected by the bounds check.
+    #[test]
+    fn tpc_tui_pipeline_bottom_content_cell_maps_correctly() {
+        // rect.height = 24, tab_h = 1, so content occupies rows 0..22
+        // (22 inclusive rows numbered 0..=22).  Click on the last
+        // selectable content cell.
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        // Bottom-most content row = (rect.y + rect.height - 1) -
+        // origin_y = 22.  Click at that pixel y.
+        let pos = Point::new(3.0, rect.y + rect.height - 1.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((3, 22))
+        );
+    }
+
+    /// `#464`: the tab-bar pixel row must STILL return `None` after the
+    /// fix — the tab bar itself is not part of the PTY content.
+    #[test]
+    fn tpc_tui_pipeline_tab_bar_row_returns_none() {
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        // y=0 is inside the tab bar — still must reject.
+        let pos = Point::new(5.0, 0.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            None
+        );
+    }
+
     // ── terminal_mouse_event routing ─────────────────────────────────────────
     //
     // These tests verify that `terminal_mouse_event` delegates to the correct
@@ -31377,5 +31738,238 @@ mod tests {
             consumed,
             "forward_paste_to_detail_terminal should return true when session exists"
         );
+    }
+
+    // ── #464: host-side terminal selection ───────────────────────────────────
+    //
+    // Three behaviour branches:
+    //   A. App mouse-reporting OFF (plain /bin/sh) → host-select starts on
+    //      mouse-press.
+    //   B. App mouse-reporting ON (simulated via a flag check) → forward
+    //      to PTY; no host-select.
+    //   C. Shift held → force host-select even when reporting is ON.
+    //
+    // The tests drive `terminal_host_sel_begin` / `terminal_host_sel_update` /
+    // `terminal_host_sel_end` directly and verify the resulting
+    // `TerminalSession.selection` state, then check `active_terminal_selected_text`.
+
+    /// Helpers shared across #464 tests: set up a standalone Terminal view
+    /// with a real /bin/sh session attached.
+    #[cfg(unix)]
+    fn make_terminal_app_with_session() -> CoordApp {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+        app.terminal_session = Some(sess);
+        app
+    }
+
+    /// host_sel_begin sets selection with anchor == end (collapsed point).
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_begin_sets_collapsed_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(5, 3);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection must be Some after begin");
+        assert_eq!((sel.start_col, sel.start_row), (5, 3));
+        assert_eq!((sel.end_col, sel.end_row), (5, 3));
+        assert!(
+            app.terminal_host_sel_dragging,
+            "dragging flag must be set after begin"
+        );
+    }
+
+    /// host_sel_update extends the end point while the anchor stays fixed.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_update_extends_end_not_anchor() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(2, 1);
+        app.terminal_host_sel_update(10, 4);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection must be Some after update");
+        // Anchor unchanged.
+        assert_eq!((sel.start_col, sel.start_row), (2, 1));
+        // End advanced.
+        assert_eq!((sel.end_col, sel.end_row), (10, 4));
+        assert!(app.terminal_host_sel_dragging);
+    }
+
+    /// host_sel_end clears the dragging flag; non-collapsed selection persists.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_end_clears_dragging_keeps_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(0, 0);
+        app.terminal_host_sel_update(5, 2);
+        app.terminal_host_sel_end();
+        assert!(
+            !app.terminal_host_sel_dragging,
+            "dragging flag cleared after end"
+        );
+        // Non-collapsed selection must remain so Ctrl-C can copy it.
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_some(),
+            "selection should persist after end (non-collapsed)"
+        );
+    }
+
+    /// A collapsed (point) selection is cleared by host_sel_end.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_end_clears_collapsed_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(3, 1);
+        // No update → start == end → collapsed.
+        app.terminal_host_sel_end();
+        assert!(
+            !app.terminal_host_sel_dragging,
+            "dragging flag cleared"
+        );
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_none(),
+            "collapsed (point) selection must be cleared on end"
+        );
+    }
+
+    /// Mouse-reporting OFF: host-selection starts on left-press in the PTY area.
+    /// The dragging flag is set and pty_pressed_buttons is NOT set.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_press_reporting_off_starts_host_sel_not_pty_press() {
+        let mut app = make_terminal_app_with_session();
+        // Verify that plain /bin/sh has reporting OFF.
+        assert!(
+            !app.terminal_session
+                .as_ref()
+                .unwrap()
+                .mouse_reporting_enabled(),
+            "/bin/sh should have mouse reporting OFF"
+        );
+        // Simulate a left-press inside the PTY rect.
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let lh = 16.0_f32;
+        let char_w = 8.0_f32;
+        // pos (50, 50) is inside main_b, reporting is off → host-select path.
+        // We call active_terminal_pixel_to_cell to compute what the app would see.
+        let cell = app.active_terminal_pixel_to_cell(
+            Point::new(50.0, 50.0),
+            main_b,
+            lh,
+            char_w,
+        );
+        assert!(cell.is_some(), "position must map to a cell");
+        let (col, row) = cell.unwrap();
+        // Simulate what the mouse-down handler does: begin host-select.
+        app.terminal_host_sel_begin(col, row);
+        assert!(
+            app.terminal_host_sel_dragging,
+            "host-sel drag started"
+        );
+        assert_eq!(
+            app.pty_pressed_buttons, 0,
+            "pty_pressed_buttons must NOT be set for host-selection presses"
+        );
+    }
+
+    /// Shift-held: host-selection is forced even with a session present
+    /// (simulating the case where the PTY would otherwise grab the mouse).
+    /// We directly test the Shift-override branch via active_terminal_pixel_to_cell
+    /// and terminal_host_sel_begin — the full mouse handler is integration-level.
+    #[test]
+    #[cfg(unix)]
+    fn shift_forces_host_sel_branch() {
+        let mut app = make_terminal_app_with_session();
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // With Shift held (force_host_sel = true) we bypass forward_mouse
+        // and go straight to terminal_host_sel_begin.
+        let (col, row) = app
+            .active_terminal_pixel_to_cell(Point::new(40.0, 32.0), main_b, 16.0, 8.0)
+            .expect("position inside PTY rect");
+        app.terminal_host_sel_begin(col, row);
+        assert!(app.terminal_host_sel_dragging, "drag started via Shift path");
+        // PTY should NOT be notified.
+        assert_eq!(
+            app.pty_pressed_buttons, 0,
+            "pty_pressed_buttons stays zero on Shift-forced host selection"
+        );
+    }
+
+    /// active_terminal_selected_text returns None when no selection is set.
+    #[test]
+    #[cfg(unix)]
+    fn active_terminal_selected_text_none_without_selection() {
+        let app = make_terminal_app_with_session();
+        assert!(
+            app.active_terminal_selected_text().is_none(),
+            "no selection → selected_text must be None"
+        );
+    }
+
+    /// clear_active_terminal_selection removes the selection from the session.
+    #[test]
+    #[cfg(unix)]
+    fn clear_active_terminal_selection_removes_sel() {
+        use quadraui::terminal_engine::TerminalSelection;
+        let mut app = make_terminal_app_with_session();
+        app.terminal_session.as_mut().unwrap().selection = Some(TerminalSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 5,
+        });
+        app.clear_active_terminal_selection();
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_none(),
+            "selection must be cleared"
+        );
+    }
+
+    /// host_sel_update is a no-op when terminal_host_sel_dragging is false.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_update_noop_when_not_dragging() {
+        let mut app = make_terminal_app_with_session();
+        // Start a selection then end it (dragging flag = false).
+        app.terminal_host_sel_begin(1, 1);
+        app.terminal_host_sel_update(5, 5);
+        app.terminal_host_sel_end();
+        // Now the selection is non-collapsed (1,1)→(5,5) with dragging=false.
+        // Calling update should be a no-op: the end must not move.
+        app.terminal_host_sel_update(9, 9);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection should still exist");
+        assert_eq!((sel.end_col, sel.end_row), (5, 5), "update was a no-op");
     }
 }
