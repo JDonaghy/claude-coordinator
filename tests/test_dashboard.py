@@ -541,6 +541,47 @@ class TestPollOnce:
         assert len(es._history) == 1
         assert es._history[0].type == ASSIGNMENT_CANCELLED
 
+    def test_running_to_advisory_fires_assignment_advisory(self) -> None:
+        """#448 regression: advisory must fire ASSIGNMENT_ADVISORY, not FAILED.
+
+        Without the dashboard fix, advisory fell through to the else-branch
+        and emitted a red ASSIGNMENT_FAILED toast for a clean 0-commit exit.
+        """
+        from coord.dashboard.server import ASSIGNMENT_ADVISORY, _poll_once
+        from coord.events import ASSIGNMENT_FAILED, EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        seen: set[str] = set()
+        orphaned: dict[str, float] = {}
+        board = self._running_board("adv1")
+
+        agent_resp = {
+            "active": [],
+            "completed": [{
+                "id": "adv1",
+                "status": "advisory",
+                "zero_commit_reason": "worker exited cleanly but pushed 0 commits",
+            }],
+        }
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+            return_value=agent_resp,
+        ):
+            asyncio.run(_poll_once(config, es, seen, orphaned, board=board, now=1000.0))
+
+        assert len(es._history) == 1
+        event = es._history[0]
+        assert event.type == ASSIGNMENT_ADVISORY, (
+            f"expected {ASSIGNMENT_ADVISORY}, got {event.type!r} — "
+            "advisory must not be routed to ASSIGNMENT_FAILED"
+        )
+        assert event.type != ASSIGNMENT_FAILED
+        # zero_commit_reason should be carried through to the client.
+        assert event.data.get("zero_commit_reason") == (
+            "worker exited cleanly but pushed 0 commits"
+        )
+
     def test_absent_over_threshold_appears_in_possibly_stuck(self) -> None:
         """An assignment absent from agent data past the threshold is stuck."""
         from coord.dashboard.server import _poll_once

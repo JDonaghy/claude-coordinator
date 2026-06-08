@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-coordinator"
-version = "0.4.21"
+version = "0.4.24"
 description = "Coordinate Claude Code workers across multiple machines and repos."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,6 +24,7 @@ dependencies = [
     "httpx>=0.27",
     "starlette>=0.37",
     "uvicorn>=0.30",
+    "psutil>=5.9",
 ]
 
 [project.urls]

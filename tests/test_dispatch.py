@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import sqlite3
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from coord.config import Config
+from coord.config import Config, ProviderDef, ProvidersConfig
 from coord.dispatch import dispatch, post_briefing
 from coord.models import Machine, Proposal, Repo
 
@@ -50,7 +51,10 @@ class TestDispatch:
         mock_post.return_value = mock_resp
 
         result = dispatch(proposal, config)
-        assert result == {"ok": True}
+        # #324: dispatch() injects _provider_name metadata into the result dict
+        # so callers can record it without re-resolving the config chain.
+        assert result["ok"] is True
+        assert "_provider_name" in result  # injected by dispatch()
         mock_post.assert_called_once()
         call_args = mock_post.call_args
         assert "laptop.tailnet" in call_args.args[0]
@@ -462,3 +466,209 @@ class TestNewIssueGuidance:
         dispatch(p, cfg)
         payload = mock_post.call_args.kwargs["json"]
         assert "new_issue_guidance" not in payload
+
+
+class TestProviderDispatch:
+    """#324: dispatch() resolves provider name and threads it through the payload and DB."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_default_provider_omitted_from_payload(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """When the effective provider is 'claude' (the default), the wire
+        payload must NOT include 'provider' — older agents reject unknown keys
+        and the no-config parity requirement demands byte-identical payloads."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "provider" not in payload, (
+            "default provider 'claude' must not appear in wire payload "
+            "(no-config parity, #324)"
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_non_default_provider_in_payload(self, mock_post: MagicMock) -> None:
+        """When the repo configures a non-default provider, its name is sent
+        in the payload so the agent routes the assignment correctly."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="fast-claude")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "fast-claude": ProviderDef(type="claude"),
+                    "claude": ProviderDef(type="claude"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "fast-claude", (
+            f"expected provider='fast-claude' in payload, got {payload.get('provider')!r}"
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_result_contains_provider_name_metadata(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """dispatch() returns _provider_name in the result dict so callers
+        can persist the resolved name without re-resolving the config chain."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "def"}
+        mock_post.return_value = mock_resp
+
+        result = dispatch(proposal, config)
+        assert "_provider_name" in result, (
+            "dispatch() must inject _provider_name into the return dict (#324)"
+        )
+        assert result["_provider_name"] == "claude"  # default config
+
+    @patch("coord.dispatch.httpx.post")
+    def test_result_provider_name_reflects_repo_override(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """When the repo configures a non-default provider, _provider_name in
+        the result reflects the resolved (not just the spec-level) name."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "ghi"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="fast-claude")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "fast-claude": ProviderDef(type="claude"),
+                    "claude": ProviderDef(type="claude"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        result = dispatch(p, cfg)
+        assert result["_provider_name"] == "fast-claude"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_spec_provider_override_beats_repo(self, mock_post: MagicMock) -> None:
+        """proposal.provider (spec-level) beats repo.provider in the resolution
+        chain and is reflected in both the payload and _provider_name."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "xyz"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="repo-provider")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "repo-provider": ProviderDef(type="claude"),
+                    "spec-provider": ProviderDef(type="claude"),
+                    "claude": ProviderDef(type="claude"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            provider="spec-provider",  # explicit spec override
+        )
+        result = dispatch(p, cfg)
+        assert result["_provider_name"] == "spec-provider"
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "spec-provider"
+
+
+class TestProviderNamePersistence:
+    """#324: record_dispatched() persists provider_name on the assignment row."""
+
+    def test_record_dispatched_stores_provider_name(self) -> None:
+        """provider_name kwarg is persisted in the assignments table."""
+        import sqlite3
+        from coord.db import override_connection, close
+        from coord.state import record_dispatched, load_dispatched
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        from coord.db import _ensure_schema
+        _ensure_schema(conn)
+        override_connection(conn)
+        try:
+            p = Proposal(
+                id=1, machine_name="laptop", repo_name="api",
+                issue_number=10, issue_title="Fix auth", rationale="ok",
+                briefing="do the thing", type="work",
+            )
+            record_dispatched(
+                assignment_id="asgn-001",
+                proposal=p,
+                repo_github="acme/api",
+                provider_name="fast-claude",
+            )
+            rows = load_dispatched()
+            assert rows, "expected at least one dispatched row"
+            # The raw row should carry provider_name
+            row = conn.execute(
+                "SELECT provider_name FROM assignments WHERE assignment_id=?",
+                ("asgn-001",),
+            ).fetchone()
+            assert row is not None
+            assert row["provider_name"] == "fast-claude"
+        finally:
+            close()
+
+    def test_record_dispatched_provider_name_defaults_to_null(self) -> None:
+        """When provider_name is not passed, the column stays NULL (backward
+        compat — existing callers in cli.py don't pass the arg)."""
+        import sqlite3
+        from coord.db import override_connection, close
+        from coord.state import record_dispatched
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        from coord.db import _ensure_schema
+        _ensure_schema(conn)
+        override_connection(conn)
+        try:
+            p = Proposal(
+                id=1, machine_name="laptop", repo_name="api",
+                issue_number=10, issue_title="Fix auth", rationale="ok",
+                briefing="do the thing", type="work",
+            )
+            record_dispatched(
+                assignment_id="asgn-002",
+                proposal=p,
+                repo_github="acme/api",
+                # no provider_name → default None
+            )
+            row = conn.execute(
+                "SELECT provider_name FROM assignments WHERE assignment_id=?",
+                ("asgn-002",),
+            ).fetchone()
+            assert row is not None
+            assert row["provider_name"] is None
+        finally:
+            close()

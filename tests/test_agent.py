@@ -13,12 +13,15 @@ import pytest
 import pytest
 
 from coord.agent import (
+    ADVISORY,
     CANCELLED,
     DONE,
     FAILED,
     RUNNING,
+    AgentAssignment,
     AgentServer,
     AssignmentSpec,
+    _COMPLETED_HISTORY_CAP,
     _worker_subprocess_env,
     default_worker_command,
 )
@@ -125,7 +128,8 @@ def test_assign_success(tmp_path: Path) -> None:
     server = _server(tmp_path, repo_path=repo)
     a = server.assign(_spec(repo))
     final = server.wait_for(a.id)
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert final.exit_code == 0
     assert final.worktree_path is not None
     log = Path(final.log_path).read_text()
@@ -245,7 +249,8 @@ def test_spawn_bash_wrap_enabled_routes_through_bash(tmp_path: Path) -> None:
         final = server.wait_for(a.id)
     finally:
         agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert captured, "Popen was not called"
     assert captured[0][:2] == ["bash", "-c"]
     assert captured[0][2] == "exec /bin/sh -c 'echo worker-output'"
@@ -281,7 +286,8 @@ def test_spawn_bash_wrap_disabled_uses_bare_argv(tmp_path: Path) -> None:
         final = server.wait_for(a.id)
     finally:
         agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert captured and captured[0] == ["/bin/sh", "-c", "echo worker-output"]
     server.shutdown()
 
@@ -633,7 +639,8 @@ def test_reap_captures_claude_session_id(tmp_path: Path) -> None:
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert final.claude_session_id == session_id
 
     # Also visible in the /status serialisation (to_dict)
@@ -1017,3 +1024,620 @@ def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:
     assert _sanitize_branch("feature/my-thing") == "feature-my-thing"
     assert _sanitize_branch("issue-305-artifact-pull") == "issue-305-artifact-pull"
     assert _sanitize_branch("refs/heads/main") == "refs-heads-main"
+
+
+# ── #324: Provider-layer routing and capability gates ─────────────────────────
+
+
+def _make_provider(
+    *,
+    enforces_deny_list: bool = True,
+    resume: bool = True,
+    inject: bool = True,
+    build_argv: list[str] | None = None,
+    initial_input_bytes: bytes | None = None,
+):
+    """Create a minimal duck-typed provider object for testing.
+
+    Returns an object with the same interface as coord.providers.base.Provider
+    without importing from coord.providers (keeps the test free of the cycle).
+    """
+    from coord.providers.base import Capabilities
+
+    class _FakeProvider:
+        def capabilities(self):
+            return Capabilities(
+                resume=resume,
+                inject=inject,
+                cost_reporting=False,
+                true_system_prompt=True,
+                enforces_deny_list=enforces_deny_list,
+                billing_mode="unknown",
+            )
+
+        def build_command(self, spec, *, resolved_model=None, **_kwargs):
+            if build_argv is not None:
+                return list(build_argv)
+            return ["/bin/sh", "-c", "echo provider-argv"]
+
+        def initial_input(self, spec):
+            if initial_input_bytes is not None:
+                return initial_input_bytes
+            import json as _json
+            payload = {"type": "user", "message": {"role": "user", "content": spec.briefing}}
+            return (_json.dumps(payload) + "\n").encode()
+
+        def result_marker(self):
+            return '"type":"result"'
+
+        def env(self):
+            return {}
+
+        def parse_log(self, log_path, tail_bytes=65536):
+            pass
+
+    return _FakeProvider()
+
+
+class TestProviderLayerDispatch:
+    """#324: _spawn() routes through the provider layer for non-PTY providers."""
+
+    def test_no_config_parity_uses_worker_command(self, tmp_path: Path) -> None:
+        """When spec.provider is None, _spawn uses self.worker_command — the
+        legacy path.  The argv captured at Popen time must be identical to
+        what worker_command returns (no-config parity, #324 requirement #1)."""
+        import coord.agent as agent_mod
+
+        repo = _init_repo(tmp_path / "repo")
+        sentinel_argv = ["/bin/sh", "-c", "echo legacy-path"]
+
+        captured: list[list[str]] = []
+        real_popen = agent_mod.subprocess.Popen
+
+        def recording_popen(spawn_argv, *args, **kwargs):
+            if kwargs.get("start_new_session"):
+                captured.append(spawn_argv)
+            return real_popen(spawn_argv, *args, **kwargs)
+
+        server = _server(
+            tmp_path, argv=sentinel_argv, repo_path=repo, bash_wrap_spawn=False
+        )
+        agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+        try:
+            # spec.provider is None → no provider in registry → legacy path
+            a = server.assign(_spec(repo))
+            final = server.wait_for(a.id, timeout=5)
+        finally:
+            agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+        # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
+        assert captured, "Popen was not called"
+        # The legacy path must use sentinel_argv directly (no provider seam).
+        assert captured[0] == sentinel_argv, (
+            f"no-config parity: expected {sentinel_argv!r}, got {captured[0]!r}"
+        )
+        server.shutdown()
+
+    def test_no_config_parity_stdin_is_user_message_line(self, tmp_path: Path) -> None:
+        """With spec.provider=None, the initial stdin must be _user_message_line
+        of the briefing — byte-identical to the pre-#324 path."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(
+            tmp_path,
+            argv=["/bin/sh", "-c", "read line; echo $line"],
+            repo_path=repo,
+        )
+        # No provider set → legacy path
+        a = server.assign(_spec(repo, briefing="parity-check"))
+        final = server.wait_for(a.id, timeout=5)
+        log = Path(final.log_path).read_text()
+        # The stdin line must be a stream-json user message (same as _user_message_line)
+        assert '"type": "user"' in log or '"type":"user"' in log
+        assert "parity-check" in log
+        server.shutdown()
+
+    def test_provider_in_registry_uses_build_command(self, tmp_path: Path) -> None:
+        """When spec.provider names a provider in the registry, _spawn calls
+        provider.build_command() instead of self.worker_command()."""
+        import coord.agent as agent_mod
+
+        repo = _init_repo(tmp_path / "repo")
+        provider_argv = ["/bin/sh", "-c", "echo provider-path"]
+        legacy_argv = ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-APPEAR"]
+        fake_provider = _make_provider(build_argv=provider_argv)
+
+        captured: list[list[str]] = []
+        real_popen = agent_mod.subprocess.Popen
+
+        def recording_popen(spawn_argv, *args, **kwargs):
+            if kwargs.get("start_new_session"):
+                captured.append(spawn_argv)
+            return real_popen(spawn_argv, *args, **kwargs)
+
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: legacy_argv,
+            repo_paths={"api": str(repo)},
+            providers={"myprovider": fake_provider},
+            bash_wrap_spawn=False,
+        )
+        agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+        try:
+            spec = _spec(repo, provider="myprovider")
+            a = server.assign(spec)
+            final = server.wait_for(a.id, timeout=5)
+        finally:
+            agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+        # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
+        assert captured, "Popen was not called"
+        assert captured[0] == provider_argv, (
+            f"expected provider argv {provider_argv!r}, got {captured[0]!r}"
+        )
+        log = Path(final.log_path).read_text()
+        assert "legacy-SHOULD-NOT-APPEAR" not in log
+        assert "provider-path" in log
+        server.shutdown()
+
+    def test_provider_unknown_name_falls_back_to_legacy(self, tmp_path: Path) -> None:
+        """When spec.provider names a provider NOT in the registry, _spawn uses
+        the legacy path (worker_command) — unknown providers are silently ignored
+        to avoid breaking deployments during registry propagation."""
+        import coord.agent as agent_mod
+
+        repo = _init_repo(tmp_path / "repo")
+        legacy_argv = ["/bin/sh", "-c", "echo legacy-fallback"]
+        captured: list[list[str]] = []
+        real_popen = agent_mod.subprocess.Popen
+
+        def recording_popen(spawn_argv, *args, **kwargs):
+            if kwargs.get("start_new_session"):
+                captured.append(spawn_argv)
+            return real_popen(spawn_argv, *args, **kwargs)
+
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: legacy_argv,
+            repo_paths={"api": str(repo)},
+            providers={},  # empty registry
+            bash_wrap_spawn=False,
+        )
+        agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+        try:
+            spec = _spec(repo, provider="nonexistent-provider")
+            a = server.assign(spec)
+            final = server.wait_for(a.id, timeout=5)
+        finally:
+            agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+        # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
+        assert captured and captured[0] == legacy_argv, (
+            "unknown provider should fall back to legacy worker_command"
+        )
+        server.shutdown()
+
+    def test_provider_initial_input_reaches_worker_stdin(self, tmp_path: Path) -> None:
+        """initial_input() from the provider is written to the worker's stdin."""
+        repo = _init_repo(tmp_path / "repo")
+
+        # The worker echoes its first stdin line to stdout; we capture via log.
+        import json as _json
+        custom_briefing = "provider-briefing-text"
+        custom_bytes = (
+            _json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": custom_briefing},
+            }) + "\n"
+        ).encode()
+
+        fake_provider = _make_provider(
+            build_argv=["/bin/sh", "-c", "read line; echo $line"],
+            initial_input_bytes=custom_bytes,
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "read line; echo $line"],
+            repo_paths={"api": str(repo)},
+            providers={"myprovider": fake_provider},
+        )
+        spec = _spec(repo, provider="myprovider", briefing="should-not-appear")
+        a = server.assign(spec)
+        final = server.wait_for(a.id, timeout=5)
+        log = Path(final.log_path).read_text()
+        assert custom_briefing in log, f"provider.initial_input bytes not in log: {log!r}"
+        server.shutdown()
+
+
+class TestCapabilityGates:
+    """#324/#425: assign() enforces capability gates before spawning."""
+
+    def test_deny_list_gate_refuses_work_on_unverified_provider(
+        self, tmp_path: Path
+    ) -> None:
+        """work type on enforces_deny_list=False provider must raise ValueError."""
+        repo = _init_repo(tmp_path / "repo")
+        unsafe_provider = _make_provider(enforces_deny_list=False)
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"unsafe": unsafe_provider},
+        )
+        with pytest.raises(ValueError, match="enforces_deny_list=False"):
+            server.assign(_spec(repo, type="work", provider="unsafe"))
+
+    def test_deny_list_gate_refuses_review_on_unverified_provider(
+        self, tmp_path: Path
+    ) -> None:
+        """review type on enforces_deny_list=False provider must raise ValueError."""
+        repo = _init_repo(tmp_path / "repo")
+        unsafe_provider = _make_provider(enforces_deny_list=False)
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"unsafe": unsafe_provider},
+        )
+        with pytest.raises(ValueError, match="enforces_deny_list=False"):
+            server.assign(_spec(repo, type="review", provider="unsafe"))
+
+    def test_deny_list_gate_allows_plan_on_unverified_provider(
+        self, tmp_path: Path
+    ) -> None:
+        """plan type is non-mutating; unverified provider is allowed."""
+        repo = _init_repo(tmp_path / "repo")
+        # plan type is read-only — safe even on providers that don't enforce deny list
+        unsafe_provider = _make_provider(
+            enforces_deny_list=False,
+            build_argv=["/bin/sh", "-c", "exit 0"],
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"unsafe": unsafe_provider},
+        )
+        # Must NOT raise — plan is in non-WRITE_CAPABLE_SPEC_TYPES
+        a = server.assign(_spec(repo, type="plan", provider="unsafe"))
+        server.wait_for(a.id, timeout=5)
+        server.shutdown()
+
+    def test_resume_gate_refuses_when_provider_lacks_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """resume_session_id on a provider with capabilities().resume=False must raise."""
+        repo = _init_repo(tmp_path / "repo")
+        no_resume_provider = _make_provider(resume=False)
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"no-resume": no_resume_provider},
+        )
+        with pytest.raises(ValueError, match="resume=False"):
+            server.assign(
+                _spec(repo, provider="no-resume", resume_session_id="ses-123")
+            )
+
+    def test_resume_gate_passes_when_provider_supports_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """resume_session_id on a provider with capabilities().resume=True is allowed."""
+        repo = _init_repo(tmp_path / "repo")
+        resumable_provider = _make_provider(
+            resume=True,
+            build_argv=["/bin/sh", "-c", "exit 0"],
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"resumable": resumable_provider},
+        )
+        # Must NOT raise — provider supports resume
+        a = server.assign(
+            _spec(repo, provider="resumable", resume_session_id="ses-abc")
+        )
+        server.wait_for(a.id, timeout=5)
+        server.shutdown()
+
+    def test_resume_gate_no_op_when_no_provider(self, tmp_path: Path) -> None:
+        """With spec.provider=None the resume gate is a no-op (legacy path)."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        # resume_session_id set but no named provider → no gate, runs the legacy path
+        a = server.assign(_spec(repo, resume_session_id="ses-no-gate"))
+        final = server.wait_for(a.id, timeout=5)
+        # No exception raised, assignment completes; no commits → advisory (#448)
+        assert final.status == ADVISORY
+        server.shutdown()
+
+    def test_resume_gate_no_op_when_provider_not_in_registry(
+        self, tmp_path: Path
+    ) -> None:
+        """When spec.provider is set but not in registry, resume gate is skipped."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)  # no providers registry
+        # Named provider but not in registry → falls back to legacy path, no gate
+        a = server.assign(
+            _spec(repo, provider="unknown", resume_session_id="ses-no-gate")
+        )
+        final = server.wait_for(a.id, timeout=5)
+        # No commits → advisory (#448)
+        assert final.status == ADVISORY
+        server.shutdown()
+
+    def test_inject_message_refused_when_provider_inject_is_false(
+        self, tmp_path: Path
+    ) -> None:
+        """inject_message raises RuntimeError when provider.capabilities().inject=False.
+
+        This gates stdin-injection on providers that don't expose it (e.g.
+        PTY-only or batch backends) so callers get a clear error rather than
+        silently writing to an unresponsive pipe (#324).
+        """
+        import time as _time
+
+        repo = _init_repo(tmp_path / "repo")
+        # Provider with inject=False; worker blocks on stdin so the assignment
+        # stays RUNNING long enough for inject_message to be called.
+        no_inject_provider = _make_provider(
+            inject=False,
+            build_argv=["/bin/sh", "-c", "read line; echo done"],
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"no-inject": no_inject_provider},
+        )
+        a = server.assign(_spec(repo, provider="no-inject"))
+        # Wait until running
+        for _ in range(50):
+            if server.get(a.id).status == RUNNING:
+                break
+            _time.sleep(0.02)
+        assert server.get(a.id).status == RUNNING, "assignment never reached RUNNING"
+        with pytest.raises(RuntimeError, match="inject=False"):
+            server.inject_message(a.id, "should be refused")
+        # Clean shutdown: assignment will finish once we unblock or the server stops
+        server.shutdown()
+
+    def test_inject_message_allowed_when_provider_inject_is_true(
+        self, tmp_path: Path
+    ) -> None:
+        """inject_message succeeds when provider.capabilities().inject=True."""
+        import time as _time
+
+        repo = _init_repo(tmp_path / "repo")
+        # Provider with inject=True (the default); worker reads two lines.
+        inject_provider = _make_provider(
+            inject=True,
+            build_argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"yes-inject": inject_provider},
+        )
+        a = server.assign(_spec(repo, provider="yes-inject"))
+        # Wait until running
+        for _ in range(50):
+            if server.get(a.id).status == RUNNING:
+                break
+            _time.sleep(0.02)
+        # Should NOT raise
+        server.inject_message(a.id, "injected")
+        final = server.wait_for(a.id, timeout=5)
+        # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
+        server.shutdown()
+
+
+# ── #452: Completed-assignment history cap ─────────────────────────────────────
+
+
+class TestCompletedHistoryCap:
+    """Verify that terminal assignments are pruned to _COMPLETED_HISTORY_CAP (#452)."""
+
+    def _make_spec(self, repo_path: Path) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+        )
+
+    def test_persist_caps_terminal_assignments(self, tmp_path: Path) -> None:
+        """100 terminal assignments → _persist() keeps only the most recent 50
+        in both memory and on disk; oldest entries are evicted."""
+        N = 100
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        # Inject N synthetic terminal assignments directly (bypasses worker spawn).
+        # Use monotonically increasing finished_at so "recent" is well-defined.
+        spec = self._make_spec(repo)
+        for i in range(N):
+            a = AgentAssignment(
+                id=f"cap{i:04d}",
+                spec=spec,
+                status=DONE,
+                started_at=float(i),
+                finished_at=float(i),
+                exit_code=0,
+            )
+            server._assignments[a.id] = a
+
+        server._persist()
+
+        # ── In-memory state must be bounded ──────────────────────────────────
+        assert len(server._assignments) <= _COMPLETED_HISTORY_CAP, (
+            f"in-memory assignments not capped: {len(server._assignments)} > "
+            f"{_COMPLETED_HISTORY_CAP}"
+        )
+
+        # The most recent N/2 entries (highest finished_at) must survive.
+        kept_ids = {a.id for a in server._assignments.values()}
+        for i in range(N // 2, N):  # cap0050 … cap0099
+            assert f"cap{i:04d}" in kept_ids, (
+                f"recent assignment cap{i:04d} was incorrectly dropped"
+            )
+
+        # The oldest N/2 entries must be gone.
+        for i in range(N // 2):  # cap0000 … cap0049
+            assert f"cap{i:04d}" not in kept_ids, (
+                f"old assignment cap{i:04d} was incorrectly retained"
+            )
+
+        # ── Persisted file must be bounded ────────────────────────────────────
+        state = json.loads(server.state_path.read_text())
+        assert len(state["assignments"]) <= _COMPLETED_HISTORY_CAP, (
+            f"persisted assignments not capped: {len(state['assignments'])} > "
+            f"{_COMPLETED_HISTORY_CAP}"
+        )
+        file_ids = {a["id"] for a in state["assignments"]}
+        for i in range(N // 2, N):
+            assert f"cap{i:04d}" in file_ids, (
+                f"recent assignment cap{i:04d} missing from persisted state"
+            )
+        for i in range(N // 2):
+            assert f"cap{i:04d}" not in file_ids, (
+                f"old assignment cap{i:04d} should not be in persisted state"
+            )
+
+    def test_active_assignments_are_never_pruned(self, tmp_path: Path) -> None:
+        """Active (pending/running) assignments must not be touched by the cap,
+        even when terminal count is below the cap."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        # Inject a mix of terminal and active assignments.
+        for i in range(30):
+            a = AgentAssignment(
+                id=f"done{i:03d}",
+                spec=spec,
+                status=DONE,
+                finished_at=float(i),
+                exit_code=0,
+            )
+            server._assignments[a.id] = a
+
+        active_id = "active-sentinel"
+        server._assignments[active_id] = AgentAssignment(
+            id=active_id,
+            spec=spec,
+            status=RUNNING,
+            started_at=999.0,
+        )
+
+        server._persist()
+
+        # Active assignment must still be in memory and on disk.
+        assert active_id in server._assignments, "active assignment was pruned"
+        state = json.loads(server.state_path.read_text())
+        assert any(a["id"] == active_id for a in state["assignments"]), (
+            "active assignment missing from persisted state"
+        )
+
+    def test_load_state_prunes_bloated_file(self, tmp_path: Path) -> None:
+        """A pre-existing state file with > _COMPLETED_HISTORY_CAP terminal
+        assignments is pruned in-memory immediately on load, so the first
+        /status poll after restart is already bounded (#452)."""
+        N = 80  # above the cap
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+
+        # Write a bloated state file directly (simulates a pre-fix agent).
+        spec_dict = {
+            "repo_name": "api",
+            "repo_path": str(tmp_path),
+            "issue_number": 1,
+            "issue_title": "t",
+            "briefing": "b",
+            "files_allowed": [],
+            "files_forbidden": [],
+            "branch": "main",
+        }
+        assignments = []
+        for i in range(N):
+            assignments.append({
+                "id": f"old{i:04d}",
+                "status": DONE,
+                "pid": None,
+                "started_at": float(i),
+                "finished_at": float(i),
+                "exit_code": 0,
+                "log_path": None,
+                "error": None,
+                "branch": None,
+                "worktree_path": None,
+                "claude_session_id": None,
+                "spec": dict(spec_dict),
+            })
+        (state_dir / "agent_state.json").write_text(
+            json.dumps({"machine": "test", "capabilities": [], "repos": ["api"],
+                        "assignments": assignments})
+        )
+
+        # Instantiate the server — _load_state() should prune immediately.
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=state_dir,
+        )
+
+        assert len(server._assignments) <= _COMPLETED_HISTORY_CAP, (
+            f"_load_state() did not prune bloated file: "
+            f"{len(server._assignments)} > {_COMPLETED_HISTORY_CAP}"
+        )
+        # The most recent entries (highest finished_at) must be kept.
+        kept_ids = set(server._assignments.keys())
+        for i in range(N - _COMPLETED_HISTORY_CAP, N):  # old0030 … old0079
+            assert f"old{i:04d}" in kept_ids, (
+                f"recent assignment old{i:04d} was incorrectly dropped on load"
+            )
+
+    def test_list_assignments_completed_is_bounded(self, tmp_path: Path) -> None:
+        """list_assignments()['completed'] must not exceed the cap after _persist."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        for i in range(70):
+            a = AgentAssignment(
+                id=f"la{i:04d}",
+                spec=spec,
+                status=DONE,
+                finished_at=float(i),
+                exit_code=0,
+            )
+            server._assignments[a.id] = a
+
+        server._persist()  # triggers in-memory prune
+
+        listing = server.list_assignments()
+        assert len(listing["completed"]) <= _COMPLETED_HISTORY_CAP, (
+            f"list_assignments() returned {len(listing['completed'])} completed items, "
+            f"expected ≤ {_COMPLETED_HISTORY_CAP}"
+        )

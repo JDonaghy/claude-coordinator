@@ -66,6 +66,22 @@ RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
 CANCELLED = "cancelled"
+# #448: exit_code==0 but 0 commits pushed. Not a hard failure (auto_reassign
+# would loop forever on "already implemented" reports); not a clean DONE
+# either. Human should review and decide whether to re-dispatch or close.
+ADVISORY = "advisory"
+
+# #448: spec types that are expected to push commits, so a clean exit with
+# zero commits is interesting (advisory).  Review/smoke workers commit
+# nothing by design and must NOT be flagged advisory.  conflict-fix is
+# expected to rebase + force-push, so it stays in scope.
+_ADVISORY_TYPES = ("work", "conflict-fix")
+
+# Maximum number of terminal (done/failed/cancelled) assignments retained in
+# memory and persisted to agent_state.json (#452).  Oldest entries (by
+# finished_at, falling back to started_at) are dropped once this limit is
+# exceeded.  Active (pending/running) assignments are never pruned.
+_COMPLETED_HISTORY_CAP = 50
 
 
 # ── Reap tuning ───────────────────────────────────────────────────────────────
@@ -130,16 +146,43 @@ def _killpg_safe(pid: int, sig: int) -> None:
 def _log_has_result(log_path: str) -> bool:
     """Return True if the log contains a final result event.
 
-    Checks for both the stream-json ``"type":"result"`` marker (written by
-    ``claude -p`` / :class:`ClaudeProvider`) and the PTY sentinel
-    ``# pty: worker exited`` (stamped by the PTY pump thread after the
-    interactive ``claude`` subprocess exits — see
-    :data:`coord.providers.claude_pty.PTY_RESULT_MARKER`).
+    Two completion markers are recognised:
+
+    * the stream-json ``{"type":"result"}`` event written by ``claude -p`` /
+      :class:`ClaudeProvider`, and
+    * the PTY sentinel ``# pty: worker exited`` (stamped by the PTY pump
+      thread after the interactive ``claude`` subprocess exits — see
+      :data:`coord.providers.claude_pty.PTY_RESULT_MARKER`).
+
+    Both are matched **per line, structurally** rather than as a raw substring
+    over the whole file. A naive substring scan false-positives whenever a
+    worker merely *reads* a file that contains the marker text — e.g. a task
+    touching ``coord/agent.py`` or ``coord/providers/claude*.py`` echoes the
+    literal back inside a ``tool_result`` payload — which reaps the worker
+    mid-task and records it as a clean ``done`` (the #324/#325 no-op
+    completions, 2026-06-06). So:
+
+    * the stream-json marker counts only when the line parses as a JSON object
+      whose **top-level** ``type`` is ``"result"`` (a ``tool_result`` carrying
+      the string is a top-level ``"type":"user"`` line and is ignored), and
+    * the PTY sentinel counts only as a standalone log line (it is a
+      ``#``-comment the coordinator writes itself; a worker reading the source
+      sees it embedded in a ``{...}`` JSON line, never as a bare line).
     """
     try:
         with open(log_path, "rb") as f:
-            content = f.read()
-            return _RESULT_LINE_MARKER in content or _PTY_RESULT_LINE_MARKER in content
+            for raw in f:
+                if raw.lstrip().startswith(_PTY_RESULT_LINE_MARKER):
+                    return True
+                if _RESULT_LINE_MARKER not in raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(event, dict) and event.get("type") == "result":
+                    return True
+            return False
     except OSError:
         return False
 
@@ -366,6 +409,29 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     return result.stdout.strip()
 
 
+def _commits_ahead(wt_path: Path, base: str) -> int | None:
+    """Number of commits HEAD is ahead of *base* in the worktree.
+
+    Tries ``origin/<base>..HEAD`` first (the authoritative check when a
+    remote is configured); falls back to ``<base>..HEAD`` for local-only
+    repos (test fixtures and airgapped machines).  Returns ``None`` when
+    both lookups fail (e.g. detached HEAD, base branch missing entirely).
+
+    Callers should treat ``None`` as "unknown, assume non-zero" so a git
+    failure never triggers a false advisory.
+
+    This is the shared primitive used by both :meth:`AgentServer._commits_ahead`
+    and :func:`coord.interactive.finalize_interactive_exit` (#466).
+    """
+    for ref in (f"origin/{base}", base):
+        try:
+            raw = _git(wt_path, "rev-list", "--count", f"{ref}..HEAD")
+            return int(raw.strip())
+        except (_GitError, ValueError):
+            continue
+    return None
+
+
 def _safe_realpath(path: str) -> str:
     try:
         return os.path.realpath(path)
@@ -433,6 +499,144 @@ def _sanitize_branch(branch: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", branch).strip("-")
 
 
+# Regex that matches git's "branch/path already used by worktree at '<path>'"
+# error, which fires when the requested branch is already checked out in another
+# worktree.  The captured group is the conflicting worktree's path.
+_WT_COLLISION_RE = re.compile(r"already used by worktree at '([^']+)'")
+
+
+def _parse_worktree_porcelain(output: str) -> list[dict[str, str]]:
+    """Parse ``git worktree list --porcelain`` output into a list of dicts.
+
+    Each dict may have keys: ``worktree`` (absolute path), ``HEAD`` (SHA),
+    ``branch`` (short name with ``refs/heads/`` prefix stripped), and
+    ``bare`` (literal string ``"true"`` when the entry is a bare worktree).
+    Missing fields (e.g. ``branch`` in detached-HEAD state) are simply absent.
+    """
+    worktrees: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            if current:
+                worktrees.append(current)
+                current = {}
+        elif line.startswith("worktree "):
+            current["worktree"] = line[len("worktree "):]
+        elif line.startswith("HEAD "):
+            current["HEAD"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            raw = line[len("branch "):]
+            current["branch"] = (
+                raw[len("refs/heads/"):] if raw.startswith("refs/heads/") else raw
+            )
+        elif line.strip() == "bare":
+            current["bare"] = "true"
+    if current:
+        worktrees.append(current)
+    return worktrees
+
+
+def _free_branch_in_worktrees(
+    repo_path: Path,
+    branch_name: str,
+    exclude_path: str,
+    *,
+    log_path: str | None = None,
+) -> None:
+    """Remove any worktree that has *branch_name* checked out, except *exclude_path*.
+
+    Runs ``git worktree list --porcelain`` to find conflicting worktrees, then
+    force-removes each one and prunes the git admin entries.  Called immediately
+    before every ``git worktree add`` in :meth:`AgentServer._setup_worktree` so
+    that a stale prior-assignment worktree (e.g. a crashed worker whose
+    ``_cleanup_worktree`` never ran) does not block the next dispatch on the
+    same branch.
+
+    Silently tolerates git errors — if the list or removal fails, the
+    subsequent ``worktree add`` will still surface a clear error.
+    """
+    try:
+        output = _git(repo_path, "worktree", "list", "--porcelain")
+    except _GitError:
+        return
+
+    removed = 0
+    for wt in _parse_worktree_porcelain(output):
+        wt_path = wt.get("worktree", "")
+        if wt.get("branch", "") != branch_name:
+            continue
+        if wt_path == exclude_path:
+            continue
+        # Found a conflicting worktree — force-remove it.
+        if log_path:
+            _append_log_line(
+                log_path,
+                f"# worktree-free: removing worktree {wt_path!r} "
+                f"holding branch {branch_name!r} before new add\n",
+            )
+        try:
+            _git(repo_path, "worktree", "remove", wt_path, "--force")
+            removed += 1
+        except _GitError:
+            try:
+                shutil.rmtree(wt_path, ignore_errors=True)
+                removed += 1
+            except OSError:
+                pass
+
+    if removed:
+        try:
+            _git(repo_path, "worktree", "prune")
+        except _GitError:
+            pass
+
+
+def _git_worktree_add(
+    repo_path: Path,
+    add_args: list[str],
+    *,
+    log_path: str | None = None,
+) -> None:
+    """Run ``git worktree add <add_args>``, retrying once on a branch collision.
+
+    If the first attempt fails with git's "already used by worktree at '<path>'"
+    message (the branch is checked out in a stale worktree that slipped past the
+    proactive :func:`_free_branch_in_worktrees` call — e.g. a race), the
+    conflicting worktree is force-removed, git prunes the stale admin entry, and
+    the add is retried exactly once.  Any other git error, or a failure after the
+    single retry, is re-raised so the caller sees a clear ``_GitError``.
+    """
+    try:
+        _git(repo_path, "worktree", "add", *add_args)
+        return
+    except _GitError as exc:
+        m = _WT_COLLISION_RE.search(str(exc))
+        if not m:
+            raise  # unrelated error — propagate unchanged
+        conflicting_path = m.group(1)
+
+    # Retry path: free the conflicting worktree and try again once.
+    if log_path:
+        _append_log_line(
+            log_path,
+            f"# worktree-add: collision on {conflicting_path!r}; "
+            "force-removing and retrying\n",
+        )
+    try:
+        _git(repo_path, "worktree", "remove", conflicting_path, "--force")
+    except _GitError:
+        try:
+            shutil.rmtree(conflicting_path, ignore_errors=True)
+        except OSError:
+            pass
+    try:
+        _git(repo_path, "worktree", "prune")
+    except _GitError:
+        pass
+    # One retry only — raises if it fails again.
+    _git(repo_path, "worktree", "add", *add_args)
+
+
 @dataclass
 class AgentAssignment:
     """Server-side record. Carries the spec plus runtime metadata."""
@@ -454,6 +658,9 @@ class AgentAssignment:
     # restart.  The coordinator reads it from the `/status` response and
     # writes it to the coordinator DB (see coord/notify.py).
     claude_session_id: str | None = None
+    # #448: advisory reason when the worker exited cleanly (exit_code==0) but
+    # pushed 0 commits.  None on all other status values.
+    zero_commit_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -888,7 +1095,7 @@ class AgentServer:
             completed = sum(
                 1
                 for a in self._assignments.values()
-                if a.status in (DONE, FAILED, CANCELLED)
+                if a.status in (DONE, FAILED, CANCELLED, ADVISORY)
             )
         worktree_bytes = self._cached_worktree_bytes()
         artifact_bytes = self._cached_artifact_bytes()
@@ -1159,6 +1366,20 @@ class AgentServer:
         with self._lock:
             assignments = dict(self._assignments)
 
+        # #460 (Part 3): collect branches that PENDING assignments will need so
+        # the 300 s recent-skip is bypassed for terminal worktrees that hold one
+        # of those branches.  Without this, a terminal worktree from a just-
+        # failed assignment would block the next dispatch on the same branch
+        # until the cooldown expires, causing _setup_worktree to collide even
+        # after the proactive _free_branch_in_worktrees call.
+        pending_branches: set[str] = set()
+        for _a in assignments.values():
+            if _a.status == PENDING:
+                b = _a.spec.target_branch or (
+                    f"issue-{_a.spec.issue_number}-{_slugify(_a.spec.issue_title)}"
+                )
+                pending_branches.add(b)
+
         cleaned = 0
         kept = 0
         bytes_freed = 0
@@ -1176,11 +1397,20 @@ class AgentServer:
 
             # Skip recently-finished assignments — the worker process may
             # still be tearing down and have open file handles in the tree.
+            # Exception: if a PENDING assignment needs the same branch, clean
+            # it up now so the next _setup_worktree doesn't collide (#460).
             if a is not None and a.finished_at is not None:
                 age = now - a.finished_at
                 if age < recent_secs:
-                    kept += 1
-                    continue
+                    terminal_branch = a.branch or (
+                        a.spec.target_branch or
+                        f"issue-{a.spec.issue_number}-{_slugify(a.spec.issue_title)}"
+                    )
+                    if terminal_branch not in pending_branches:
+                        kept += 1
+                        continue
+                    # Fall through to cleanup — a pending assignment needs
+                    # this branch and we must not let the cooldown block it.
 
             # Skip directories that were created very recently even when
             # we don't (yet) have an assignment record.  This closes the
@@ -1337,15 +1567,18 @@ class AgentServer:
                     f"pull_repos references repos with no repo_path on this agent: {unknown}"
                 )
 
-        # #425 safety gate: refuse write-capable assignment types on any
-        # provider that does NOT enforce the deny-list.  Non-mutating
-        # types (plan / refinement / test-chat / new-issue-chat) may still
-        # use unverified providers because they can't push code or open
-        # PRs.  When ``spec.provider`` is None or unknown, this gate is a
-        # no-op and the default ``claude -p`` path runs unchanged.
+        # #425/#324 capability gates: only run when spec.provider names a
+        # provider in this agent's registry.  When spec.provider is None or
+        # unknown, both gates are no-ops and the default ``claude -p`` path
+        # runs unchanged (no-config parity requirement, #324).
         if spec.provider is not None and spec.provider in self._providers:
             provider_obj = self._providers[spec.provider]
             caps = provider_obj.capabilities()  # type: ignore[attr-defined]
+
+            # Safety gate (#425): refuse write-capable assignment types on any
+            # provider that does NOT enforce the deny-list.  Non-mutating
+            # types (plan / refinement / test-chat / new-issue-chat) may still
+            # use unverified providers because they can't push code or open PRs.
             if (
                 not caps.enforces_deny_list
                 and spec.type in WRITE_CAPABLE_SPEC_TYPES
@@ -1359,6 +1592,21 @@ class AgentServer:
                     "non-mutating type (plan, refinement, test-chat, "
                     "new-issue-chat) or switch to a provider that enforces "
                     "the deny-list (e.g. 'claude')."
+                )
+
+            # Resume gate (#324): refuse session-resume when the provider
+            # doesn't support the --resume flag.  A provider with
+            # capabilities().resume=False has no concept of session continuity;
+            # passing resume_session_id would be silently ignored, misleading
+            # the coordinator into thinking the worker loaded the prior context.
+            if spec.resume_session_id and not caps.resume:
+                raise ValueError(
+                    f"refusing to resume session {spec.resume_session_id!r} "
+                    f"on provider {spec.provider!r}: "
+                    "capabilities().resume=False — this provider does not "
+                    "support session resume via --resume.  Use a provider "
+                    "with resume=True (e.g. 'claude') or dispatch without "
+                    "resume_session_id."
                 )
 
         assignment = AgentAssignment(
@@ -1462,9 +1710,10 @@ class AgentServer:
         """Inject a new user message into a running worker via its stdin.
 
         Raises :class:`KeyError` when the assignment doesn't exist on this
-        agent, :class:`RuntimeError` when the worker isn't running, and
-        :class:`BrokenPipeError` when the worker closed its stdin (e.g.
-        already finished or crashed).
+        agent, :class:`RuntimeError` when the worker isn't running or when the
+        assignment's provider does not support message injection
+        (``capabilities().inject=False``), and :class:`BrokenPipeError` when
+        the worker closed its stdin (e.g. already finished or crashed).
 
         The worker picks up the message at its next turn boundary — between
         tool calls, not mid-tool.  Each injection appends a `# inject:`
@@ -1478,6 +1727,18 @@ class AgentServer:
                 raise RuntimeError(
                     f"assignment {assignment_id} is {assignment.status!r}, not running"
                 )
+            # #324: capability gate — refuse injection when the provider
+            # reports capabilities().inject=False.  A provider without stdin-
+            # injection support (e.g. a PTY-only backend) must opt out here so
+            # callers get a clear error rather than silently writing bytes to an
+            # stdin pipe that the provider may not even expose.
+            spec = assignment.spec
+            if spec.provider is not None and spec.provider in self._providers:
+                if not self._providers[spec.provider].capabilities().inject:
+                    raise RuntimeError(
+                        f"provider {spec.provider!r} does not support message injection "
+                        f"(capabilities().inject=False)"
+                    )
             proc = self._processes.get(assignment_id)
         if proc is None or proc.stdin is None or proc.poll() is not None:
             raise BrokenPipeError(
@@ -1679,16 +1940,33 @@ class AgentServer:
             except _GitError:
                 pass
 
+        # #460 (Part 1): proactively evict any other worktree that has
+        # branch_name checked out before the add.  This handles serial
+        # fix/retry/PR-worker dispatches on the same branch where the prior
+        # assignment's worktree was not yet cleaned up (e.g. crash before
+        # _cleanup_worktree ran, or clean_worktrees held back by the 300 s
+        # recent-skip).  The call is a no-op when no conflicting worktree exists.
+        _free_branch_in_worktrees(
+            repo_path, branch_name, str(worktree_path),
+            log_path=assignment.log_path,
+        )
+
         if origin_has_branch:
             # Continuation/retry — force the worktree's branch to the remote
             # tip (#389), discarding any divergent local copy of the branch.
-            _git(
-                repo_path, "worktree", "add", "-B", branch_name,
-                str(worktree_path), f"origin/{branch_name}",
+            # #460 (Part 2): _git_worktree_add retries once on collision.
+            _git_worktree_add(
+                repo_path,
+                ["-B", branch_name, str(worktree_path), f"origin/{branch_name}"],
+                log_path=assignment.log_path,
             )
         elif local_has_branch and not has_origin:
             # Local-only repo (no remote) — reuse the local branch as before.
-            _git(repo_path, "worktree", "add", str(worktree_path), branch_name)
+            _git_worktree_add(
+                repo_path,
+                [str(worktree_path), branch_name],
+                log_path=assignment.log_path,
+            )
         else:
             # Fresh branch, OR an untrusted local-only leftover in a repo that
             # has a remote (#389).  Delete any colliding local branch so `-b`
@@ -1707,15 +1985,24 @@ class AgentServer:
                 _git(repo_path, "branch", "-D", branch_name)
             except _GitError:
                 pass
-            _git(
-                repo_path, "worktree", "add", "-b", branch_name,
-                str(worktree_path), start_point,
+            _git_worktree_add(
+                repo_path,
+                ["-b", branch_name, str(worktree_path), start_point],
+                log_path=assignment.log_path,
             )
 
         return worktree_path
 
     def _cleanup_worktree(self, assignment: AgentAssignment) -> None:
-        """Remove the worktree for a finished assignment. Best-effort."""
+        """Remove the worktree for a finished assignment. Best-effort.
+
+        #460 (Part 3 — synchronous teardown): always ensures git's worktree
+        admin entries are pruned, even when the physical directory was already
+        removed out-of-band.  Without the prune step a stale admin entry would
+        keep the branch "checked out" from git's perspective, causing the next
+        ``_setup_worktree`` to fail with a collision error until a ``prune``
+        ran separately.
+        """
         if not assignment.worktree_path:
             return
         wt_path = Path(assignment.worktree_path)
@@ -1723,9 +2010,16 @@ class AgentServer:
         try:
             if wt_path.exists():
                 _git(repo_path, "worktree", "remove", str(wt_path), "--force")
+            else:
+                # Directory already gone (crash / rmtree before prune) — prune
+                # the stale git admin entry so the branch is freed immediately.
+                _git(repo_path, "worktree", "prune")
         except _GitError:
             try:
                 shutil.rmtree(wt_path, ignore_errors=True)
+            except OSError:
+                pass
+            try:
                 _git(repo_path, "worktree", "prune")
             except _GitError:
                 pass
@@ -1768,11 +2062,17 @@ class AgentServer:
         self._persist()
 
     def _spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
-        # #425: ADDITIVE PTY branch — when the assignment names a provider
-        # in the agent's registry AND that provider is the PTY type, route
-        # to :meth:`_spawn_pty`.  In every other case the legacy code path
-        # below runs unchanged (byte-for-byte) so no-config behaviour is
-        # identical to pre-#425.
+        # #324/#425: provider-layer routing.
+        #
+        # When the assignment names a provider in this agent's registry, route
+        # through the provider seam:
+        #   - PTY providers → background thread via ``_spawn_pty``.
+        #   - All other providers (e.g. ClaudeProvider) → ``build_command``
+        #     and ``initial_input`` instead of the legacy helpers.
+        #
+        # When spec.provider is None OR the name is not in the registry, the
+        # legacy code path below runs **unchanged** (byte-for-byte identical to
+        # pre-#324) so no-config deployments are not affected.
         spec = assignment.spec
         if spec.provider is not None and spec.provider in self._providers:
             # Deferred import keeps the cycle latent at module load time.
@@ -1800,7 +2100,24 @@ class AgentServer:
                 thread.start()
                 return
 
-        argv = self.worker_command(assignment.spec)
+            # #324: Non-PTY provider path (e.g. ClaudeProvider).
+            # Use the provider seam for both argv and initial stdin.
+            # ``ClaudeProvider.build_command(spec)`` produces the same argv as
+            # ``default_worker_command(spec)`` (parity enforced by test_providers.py),
+            # so the agent output is byte-for-byte identical when the provider
+            # is a ClaudeProvider.
+            argv: list[str] = provider_obj.build_command(  # type: ignore[attr-defined]
+                spec, resolved_model=spec.model
+            )
+            initial_input: bytes = provider_obj.initial_input(spec)  # type: ignore[attr-defined]
+        else:
+            # Legacy / no-config path — byte-identical to pre-#324.  Used
+            # whenever spec.provider is None or not in the registry so that
+            # deployments without a providers block in coordinator.yml are
+            # completely unaffected by this change.
+            argv = self.worker_command(assignment.spec)
+            initial_input = _user_message_line(assignment.spec.briefing)
+
         log_fh = open(assignment.log_path, "a")  # noqa: SIM115 — handle closed in _reap
 
         argv_oneline = shlex.join(argv).replace("\n", "\\n")
@@ -1818,6 +2135,15 @@ class AgentServer:
         # spawn — only the immediate parent of claude changes.
         spawn_argv = _maybe_bash_wrap(argv, self.bash_wrap_spawn)
 
+        # #324: Merge provider.env() on top of the base worker env.  The PTY
+        # path (_spawn_pty) does the equivalent at its own Popen site; both
+        # paths must stay in sync.  For the legacy / no-provider path,
+        # env() is effectively {} so the result is identical to calling
+        # _worker_subprocess_env() directly (no-config parity preserved).
+        _spawn_env = _worker_subprocess_env()
+        if spec.provider is not None and spec.provider in self._providers:
+            _spawn_env.update(self._providers[spec.provider].env())
+
         try:
             proc = subprocess.Popen(
                 spawn_argv,
@@ -1829,7 +2155,7 @@ class AgentServer:
                 # #402: strip the agent's own venv from the worker's PATH so a
                 # worker's `pip install -e .` can't clobber the agent's runtime
                 # venv from a soon-to-be-reaped worktree.
-                env=_worker_subprocess_env(),
+                env=_spawn_env,
             )
         except (FileNotFoundError, OSError) as e:
             log_fh.write(f"\n# spawn failed: {e}\n")
@@ -1849,9 +2175,13 @@ class AgentServer:
         # initial briefing; for a --resume re-dispatch (`spec.resume_session_id`
         # set) it is the next user turn written into the restored conversation.
         # Either way the worker sees it as a stream-json user message.
+        #
+        # #324: ``initial_input`` is either from ``provider.initial_input(spec)``
+        # (provider path) or ``_user_message_line(spec.briefing)`` (legacy path).
+        # Both produce the same bytes for ClaudeProvider — parity maintained.
         try:
             assert proc.stdin is not None
-            proc.stdin.write(_user_message_line(assignment.spec.briefing))
+            proc.stdin.write(initial_input)
             proc.stdin.flush()
         except (BrokenPipeError, OSError) as e:
             log_fh.write(f"\n# failed to send initial briefing: {e}\n")
@@ -2160,6 +2490,15 @@ class AgentServer:
         thread.start()
         self._persist()
 
+    def _commits_ahead(self, wt_path: Path, base: str) -> int | None:
+        """Number of commits HEAD is ahead of *base* in the worktree.
+
+        Delegates to the module-level :func:`_commits_ahead` primitive (#466)
+        which is also used by :func:`coord.interactive.finalize_interactive_exit`
+        so the two callers share a single implementation.
+        """
+        return _commits_ahead(wt_path, base)
+
     def _reap(
         self,
         assignment_id: str,
@@ -2167,11 +2506,56 @@ class AgentServer:
         log_fh,
         log_path: str,
     ) -> None:
+        # #324: Resolve the provider for this assignment so _wait_for_proc_or_result
+        # uses provider.result_marker() and the session-id parse below uses
+        # provider.parse_log().  Look up BEFORE the wait so the marker check
+        # uses the right sentinel from the start.  For ClaudeProvider these
+        # calls delegate to the same functions used previously — behavior is
+        # byte-identical; the seam is now complete for future providers.
+        with self._lock:
+            _reap_start = self._assignments.get(assignment_id)
+        _reap_provider = None
+        if _reap_start is not None:
+            _rp_name = _reap_start.spec.provider
+            if _rp_name is not None and _rp_name in self._providers:
+                _reap_provider = self._providers[_rp_name]
+
+        # Build a log_has_result callable from the provider's result_marker.
+        # When the provider's marker matches the built-in default we reuse
+        # _log_has_result (which adds per-line JSON validation to avoid false
+        # positives).  A provider with a different marker gets a simple byte-
+        # substring check that also recognises the PTY sentinel so PTY-spawned
+        # assignments are reaped correctly regardless of provider.
+        if _reap_provider is not None:
+            _marker_bytes = _reap_provider.result_marker().encode()
+            if _marker_bytes == _RESULT_LINE_MARKER:
+                # Default marker — reuse the JSON-validating checker.
+                _log_has_result_fn = _log_has_result
+            else:
+                # Non-default marker — plain substring check per line.
+                def _log_has_result_fn(  # type: ignore[misc]
+                    lp: str, *, _m: bytes = _marker_bytes
+                ) -> bool:
+                    try:
+                        with open(lp, "rb") as _f:
+                            for _line in _f:
+                                if _line.lstrip().startswith(_PTY_RESULT_LINE_MARKER):
+                                    return True
+                                if _m in _line:
+                                    return True
+                        return False
+                    except OSError:
+                        return False
+        else:
+            _log_has_result_fn = _log_has_result
+
         # Use a polling wait that handles claude-cli's well-known habit of
         # not exiting after emitting its final result event (a child of the
         # process group keeps the session alive). See #228.
         exit_code = _wait_for_proc_or_result(
-            proc, log_path, first_output_timeout=self.first_output_timeout
+            proc, log_path,
+            first_output_timeout=self.first_output_timeout,
+            log_has_result=_log_has_result_fn,
         )
         log_fh.close()
 
@@ -2224,6 +2608,34 @@ class AgentServer:
                         except OSError:
                             pass
 
+        # #448: compute commits-ahead OUTSIDE the lock (git I/O) so the
+        # advisory check doesn't stall other threads.  Only runs when
+        # exit_code==0 and a worktree exists to inspect.  None → unknown
+        # (git failed) → treat as non-zero to avoid false advisories.
+        # _ADVISORY_TYPES (module constant) gates this on spec.type so that
+        # review/smoke workers — which commit nothing by design — are
+        # never falsely flagged as advisory.
+        _zero_commit_reason: str | None = None
+        if (exit_code == 0 and assignment is not None
+                and assignment.worktree_path
+                and assignment.spec.type in _ADVISORY_TYPES):
+            _wt_advisory = Path(assignment.worktree_path)
+            if _wt_advisory.exists():
+                _base = assignment.spec.branch or "main"
+                _ahead = self._commits_ahead(_wt_advisory, _base)
+                if _ahead == 0:
+                    _zero_commit_reason = (
+                        "worker exited cleanly but pushed 0 commits"
+                    )
+                    try:
+                        with open(assignment.log_path, "a") as reopen:
+                            reopen.write(
+                                "# reap: advisory — 0 commits ahead of "
+                                f"{_base}; status set to advisory\n"
+                            )
+                    except OSError:
+                        pass
+
         # This block MUST always run regardless of push outcome so that
         # the assignment transitions out of 'running'.
         try:
@@ -2242,20 +2654,41 @@ class AgentServer:
                 assignment.branch = captured_branch
             # Cancel sets status before this runs; respect it.
             if assignment.status == RUNNING:
-                assignment.status = DONE if exit_code == 0 else FAILED
+                if exit_code == 0:
+                    if _zero_commit_reason is not None:
+                        # #448: clean exit but no commits → advisory, not done.
+                        assignment.status = ADVISORY
+                        assignment.zero_commit_reason = _zero_commit_reason
+                    else:
+                        assignment.status = DONE
+                else:
+                    assignment.status = FAILED
             self._processes.pop(assignment_id, None)
 
-        # #315: parse the log for the worker's claude session_id (from the
+        # #315/#324: parse the log for the worker's claude session_id (from the
         # `system.init` event emitted by `claude -p --output-format stream-json`).
         # Done OUTSIDE the lock so the log parse (I/O + JSON) doesn't stall
         # other threads; the field write is the only mutation, and assignment
         # objects are only dropped under the lock so the reference is safe.
+        # #324: route through provider.parse_log() when a provider is registered
+        # so future providers can customise log parsing.  ClaudeProvider delegates
+        # to coord.worker_events.parse_log — byte-identical to the old path.
         if assignment is not None and assignment.claude_session_id is None:
             try:
-                from coord.worker_events import is_stream_json, parse_log  # noqa: PLC0415
+                from coord.worker_events import is_stream_json  # noqa: PLC0415
                 lp = assignment.log_path
                 if lp and is_stream_json(lp):
-                    summary = parse_log(lp, tail_bytes=0)
+                    _parse_provider_name = assignment.spec.provider
+                    if (
+                        _parse_provider_name is not None
+                        and _parse_provider_name in self._providers
+                    ):
+                        summary = self._providers[_parse_provider_name].parse_log(
+                            lp, tail_bytes=0
+                        )
+                    else:
+                        from coord.worker_events import parse_log  # noqa: PLC0415
+                        summary = parse_log(lp, tail_bytes=0)
                     if summary.session_id:
                         assignment.claude_session_id = summary.session_id
             except Exception:  # noqa: BLE001
@@ -2279,8 +2712,34 @@ class AgentServer:
         if assignment is not None:
             self._cleanup_worktree(assignment)
 
+    def _prune_completed_history(self) -> None:
+        """Drop oldest terminal assignments over _COMPLETED_HISTORY_CAP (#452).
+
+        Caller must hold self._lock (or call from __init__ before threads
+        start).  Active (pending/running) assignments are never pruned.
+        """
+        terminal = [
+            a for a in self._assignments.values()
+            if a.status not in (PENDING, RUNNING)
+        ]
+        if len(terminal) > _COMPLETED_HISTORY_CAP:
+            terminal.sort(
+                key=lambda a: (
+                    a.finished_at if a.finished_at is not None
+                    else a.started_at if a.started_at is not None
+                    else 0.0
+                ),
+                reverse=True,
+            )
+            for old in terminal[_COMPLETED_HISTORY_CAP:]:
+                self._assignments.pop(old.id, None)
+
     def _persist(self) -> None:
         with self._lock:
+            # Cap terminal assignments to keep both in-memory state and the
+            # persisted file bounded (#452).  Active (pending/running)
+            # assignments are never touched so in-flight work is safe.
+            self._prune_completed_history()
             data = {
                 "machine": self.machine_name,
                 "capabilities": self.capabilities,
@@ -2314,6 +2773,11 @@ class AgentServer:
                 if a.finished_at is None:
                     a.finished_at = time.time()
             self._assignments[a.id] = a
+
+        # Cap terminal history immediately on load so the first /status poll
+        # after a restart with a bloated state file is already bounded (#452).
+        # No lock needed here — __init__ hasn't started any threads yet.
+        self._prune_completed_history()
 
         # Prune stale worktrees on startup
         self._prune_worktrees()

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from coord.providers.base import Capabilities, Provider, WorkerSummary
 from coord.providers.claude import ClaudeProvider
 from coord.providers.claude_pty import ClaudePtyProvider
+from coord.providers.opencode import OpenCodeProvider
 
 if TYPE_CHECKING:
     from coord.config import ModelsConfig, ProviderDef, ProvidersConfig
@@ -28,6 +29,7 @@ __all__ = [
     "Capabilities",
     "ClaudeProvider",
     "ClaudePtyProvider",
+    "OpenCodeProvider",
     "Provider",
     "WorkerSummary",
     "build_provider",
@@ -73,9 +75,16 @@ def build_provider(
         # consumed in this PR; threading `model` / `env` / `extra_args`
         # is left to a follow-up wiring issue.
         return ClaudePtyProvider(binary=definition.binary)
+    if ptype == "opencode":
+        # #325: OpenCode (sst/opencode) worker backend — uses the operator's
+        # own API keys, runs `opencode run BRIEFING`.  `attach_url` is wired
+        # here because it is OpenCode-specific (not a cross-provider concern).
+        # `model` / `env` / `extra_args` threading is left to the follow-up
+        # wiring issue (#324).
+        return OpenCodeProvider(binary=definition.binary, attach_url=definition.attach_url)
     raise ValueError(
         f"Unknown provider type {ptype!r} (provider name: {name!r}). "
-        f"Supported types: ['claude', 'claude-pty']"
+        f"Supported types: ['claude', 'claude-pty', 'opencode']"
     )
 
 

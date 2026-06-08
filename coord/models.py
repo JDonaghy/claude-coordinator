@@ -152,7 +152,7 @@ class Assignment:
     files_forbidden: list[str] = field(default_factory=list)
     briefing: str = ""
     assignment_id: str | None = None
-    status: str = "pending"  # pending | running | done | failed
+    status: str = "pending"  # pending | running | done | failed | advisory
     branch: str | None = None
     pr_url: str | None = None
     dispatched_at: float | None = None
@@ -218,6 +218,13 @@ class Assignment:
     # block.  None = no block emitted (graceful TUI placeholder); [] =
     # explicit "(none — change is internal)"; non-empty list = bullets.
     smoke_tests: list[str] | None = None
+    # #324: resolved provider name recorded at dispatch time so the TUI
+    # can surface it in the assignment detail panel (#327).  None means
+    # "dispatched before #324 landed or via a path that doesn't set this
+    # field" — the TUI should show the implicit default ("claude") in that
+    # case.  Always the *resolved* name (after the spec > repo > default
+    # precedence chain), not just the raw proposal.provider field.
+    provider_name: str | None = None
 
 
 @dataclass
@@ -251,6 +258,13 @@ class Proposal:
     # so the worker loads the prior claude conversation and continues it.
     # Only set by `coord chat-continue`; regular dispatches leave this None.
     resume_session_id: str | None = None
+    # #324: optional provider override for this proposal's worker.  Mirrors
+    # ``Repo.provider`` and ``AssignmentSpec.provider`` — uses the same
+    # precedence chain: spec > repo > providers.default.  When None the
+    # coordinator and agent both fall back to the global default.  Set by the
+    # brain when a repo's configured provider should be overridden for this
+    # specific dispatch.
+    provider: str | None = None
 
 
 @dataclass

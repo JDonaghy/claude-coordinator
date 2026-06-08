@@ -2,6 +2,19 @@
 
 CLI tool + per-machine agent server that coordinates Claude Code workers across multiple machines and repos over Tailscale.
 
+## Current Goal — read first
+
+**[`GOAL.md`](GOAL.md) holds the current north-star objective** — the living, cross-repo / cross-machine goal that should bias all planning, triage, and dispatch. It is meta-level (above any single issue, repo, or session) and changes as priorities evolve: read it first, plan against it, and keep it current. `coordinator.yml` is the source of truth for *topology*; `GOAL.md` is the source of truth for *intent*.
+
+## Codebase navigation — query the graph first
+
+This repo ships a **graphify** knowledge graph in `graphify-out/` (`graph.json`,
+`GRAPH_REPORT.md`), kept current automatically by `post-commit` / `post-checkout`
+git hooks. For any architecture / "where is this handled" / "what calls this" /
+file-relationship question, **query the graph first** (the `graphify` skill, or the
+graphify CLI) before reaching for grep/Read. Grep/Read are for exact-string or
+line-level confirmation — not the first move.
+
 ## Architecture
 
 ```
@@ -174,8 +187,23 @@ The coordinator session (typically Opus) costs ~10x more per token than Sonnet w
 - **Why a merge/review isn't happening**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#when-a-merge-isnt-happening) — the Test gate (manual `coord test --passed`/P-S verdict) that silently blocks review→merge, plus a gate-by-gate checklist (review approved? CI green? PR conflict? queue clog / `--order`? post-bounce keying?). **Check here first when "Go does nothing" or a story stalls with no review.**
 - **Why an issue is in the Pipeline you never dispatched**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#when-an-issue-is-sitting-in-the-pipeline-you-never-dispatched) — Board vs Pipeline membership is **label-driven**: an open issue with a `status:ready` label (set by `coord ready`, and by the refinement / new-issue chat finalize step) shows as a Pipeline "ready" card even with zero assignments. **Drop it back with `coord backlog <repo> <issue>`** (strips `status:*`). This is the `status:ready` limbo → see #359.
 - **Releasing to PyPI is a tag push, not `twine upload`.** Bump `pyproject.toml` + `coord/__init__.py` (must match), push main, then push a `vX.Y.Z` tag — `.github/workflows/publish.yml` builds and publishes with the `PYPI_API_TOKEN` repo secret (not available locally). **Agent-side changes (anything in `coord/agent.py`, e.g. worker prompts) only reach agents after a release + `coord agent update`;** coordinator-only code is live from the editable install immediately. Full steps in [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md#publishing-a-release-pypi).
-- **Agents are installed from PyPI**, not from a local git clone. The `~/src/claude-coordinator` directory only exists on the coordinator-development machine; remote agent machines should have only `~/.coord-venv` with `pip install claude-coordinator`. Editable installs on remote agents are the source of most upgrade failures.
-- When an upgrade fails (`coord agent update --machine X` reports `did not come back`, or the version doesn't advance), see [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md). The most common fix is converting an editable install to PyPI — that doc has the exact commands.
+- **INVARIANT: every remote agent's `~/.coord-venv` MUST be a PyPI install (`pip install claude-coordinator`), never editable.** This is the single most-recurring fleet failure — it has bitten us repeatedly (precision again on 2026-06-07). When the install is PyPI, `coord agent update` runs `pip install --upgrade` and a released `vX.Y.Z` lands cleanly. When it's editable, update silently downgrades to **`editable (git pull)` mode** — it `git pull`s a local checkout instead of pulling the release, so version bumps never propagate and the agent often "did not come back."
+  - **Root cause (what keeps undoing it):** someone ran `pip install -e .` into `~/.coord-venv` (a setup or troubleshooting step) — the editable **install** is the problem, **not** the `~/src/<repo>` checkout itself. The #402 PATH-strip only stops *workers* from poisoning the venv via bare `pip`; it does **nothing** about a pre-existing editable install or a deliberate `pip install -e .`.
+  - **DO NOT "fix" drift by deleting `~/src/<repo>`.** That checkout is the **worker worktree base** — the agent runs `git worktree add` from it (worker worktrees in `~/.coord/worktrees/` are worktrees *of* `~/src/<repo>`), so deleting it breaks every task for that repo on that machine (only machines that still have the checkout can run work — bit us on dellserver+precision 2026-06-07). The checkout is required and harmless; **fix only the install.** (`docs/AGENT_OPERATIONS.md`'s old "the clone can be deleted" line referred to the *editable-install source*, not the worktree base — don't read it as "delete the repo.")
+  - **Detect drift (do this proactively, e.g. at session start / before relying on a release):**
+    ```bash
+    ssh <host> '~/.coord-venv/bin/pip show claude-coordinator | grep -i "editable\|location"'
+    # Any "Editable project location:" line  ⇒  drift. PyPI installs show only a site-packages Location.
+    ```
+  - **Fix (convert the install only — KEEP the `~/src/<repo>` checkout):**
+    ```bash
+    ssh <host> '~/.coord-venv/bin/pip uninstall -y claude-coordinator \
+      && ~/.coord-venv/bin/pip install --upgrade claude-coordinator'
+    # then restart so the new code loads (the /update self-restart does NOT take under systemd — #404):
+    ssh <host> 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent'
+    ```
+    Never `rm -rf ~/src/<repo>` to fix drift — it's the worker worktree base (see above).
+  **Before touching any agent install, READ [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md) end-to-end — do not re-derive it.** It already has: the exact convert-to-PyPI commands (§"Convert an editable install to PyPI"), the restart — the agent is a **systemd user service**, so use `systemctl --user restart coord-agent` (§"Manual restart"; the `/update` in-process `os.execv` restart does **not** reliably take under systemd — it leaves the **same PID + stale version**), and the fact that **`✗ did not come back` is usually a false negative** (the agent is online; the restart just didn't take — §"Upgrade via the raw /update endpoint"). So: `did not come back` / version-won't-advance ≠ automatically editable drift — check the running version/PID first, then pick drift-fix vs. plain `systemctl --user restart coord-agent`.
 - New machines: `docs/AGENT_OPERATIONS.md` also covers first-time install and verification.
 - **`coord-tui` depends on `quadraui` by a relative path (`../../quadraui/quadraui`).** Workers touching `tui/src/**` or `tui/Cargo.toml` build against whatever branch is currently checked out in `~/src/quadraui`. If a `tui/` task consumes a not-yet-merged quadraui feature, the briefing **must** name the quadraui PR/branch — the worker is expected to `git -C ~/src/quadraui fetch && git -C ~/src/quadraui checkout <branch>` before `cargo build`, and restore the original branch before finishing. Without this, the worker's build silently picks up the wrong `quadraui` and produces a PR that won't compile on anyone else's checkout once that quadraui PR moves. **Verify build EXIT=0 from `tui/` after restoring the original branch.**
 - **`coord-tui` ships as a locally-built binary, not via PyPI.** After a tui/ PR merges, the user needs to rebuild and reinstall locally: `cd tui && cargo build && cp target/debug/coord-tui ~/.local/bin/coord-tui`. The PyPI release flow above does not apply to coord-tui. Workers should not attempt to bump versions for tui-only changes.

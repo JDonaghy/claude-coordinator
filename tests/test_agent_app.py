@@ -81,7 +81,9 @@ def test_assign_then_status(tmp_path: Path) -> None:
     body = r.json()
     assert len(body["completed"]) == 1
     assert body["completed"][0]["id"] == aid
-    assert body["completed"][0]["status"] == "done"
+    # Worker makes no commits → advisory (#448); "done" is also valid
+    # for workers that do make commits.
+    assert body["completed"][0]["status"] in ("done", "advisory")
     # worktree_path should be present in status response
     assert body["completed"][0]["worktree_path"] is not None
     server.shutdown()
@@ -221,22 +223,45 @@ def test_logs_endpoint_returns_log_content(tmp_path: Path) -> None:
     assert r.status_code == 200
     assert "hello-from-worker" in r.text
     assert "X-Coord-Log-Total" in r.headers
-    assert r.headers["X-Coord-Log-Status"] == "done"
+    # Worker makes no commits → advisory (#448); both statuses are terminal.
+    assert r.headers["X-Coord-Log-Status"] in ("done", "advisory")
     server.shutdown()
 
 
 def test_logs_endpoint_supports_since(tmp_path: Path) -> None:
+    """The `since` parameter returns bytes starting at the given offset.
+
+    The reap thread may append a few footer lines after the status flips
+    (#448 adds an advisory check and a final status line), so the test
+    avoids asserting an exact end-of-log boundary — the log can only grow
+    monotonically.  Instead it validates the since-offset mechanism by
+    choosing an offset well inside the log (not at the very end).
+    """
     repo = _init_repo(tmp_path / "repo")
     client, server = _client(tmp_path, argv=["/bin/sh", "-c", "echo line"], repo_path=repo)
     r = client.post("/assign", json=_payload(tmp_path, repo_path=repo))
     aid = r.json()["id"]
     server.wait_for(aid)
 
+    # Fetch the full log — it must contain the worker's output.
     full = client.get(f"/logs/{aid}").text
+    assert "line" in full, "log must contain worker output"
+
+    # since=0 must return at least as many bytes as 'full' (log can only grow).
     head = client.get(f"/logs/{aid}", params={"since": 0}).text
-    tail = client.get(f"/logs/{aid}", params={"since": len(full) - 5}).text
-    assert head == full
-    assert len(tail) == 5
+    assert head.startswith(full), "since=0 must return the full log"
+
+    # Pick a stable midpoint offset that is well inside the initial log
+    # content and can't race with reap's footer writes.
+    mid = max(1, len(full) // 2)
+    tail = client.get(f"/logs/{aid}", params={"since": mid}).text
+    # The bytes from 'mid' onward must match the full log at that position.
+    # Capture the log again at the same moment for a consistent comparison.
+    full_now = client.get(f"/logs/{aid}", params={"since": 0}).text
+    assert full_now[mid:] == tail, (
+        f"since={mid} returned wrong slice; "
+        f"expected {full_now[mid:]!r}, got {tail!r}"
+    )
     server.shutdown()
 
 
@@ -439,3 +464,48 @@ def test_artifact_manifest_rejects_path_traversal(tmp_path: Path) -> None:
     # Also verify that a valid pair returns None when the stash is genuinely absent.
     manifest = server.artifact_manifest("myrepo", "issue-1-branch")
     assert manifest is None
+
+
+# ─── #207: /metrics endpoint ─────────────────────────────────────────────────
+
+def test_metrics_returns_expected_keys(tmp_path):
+    """GET /metrics returns JSON with the five expected numeric keys."""
+    pytest = __import__("pytest")
+    psutil = pytest.importorskip("psutil")  # skip if psutil not installed
+    del psutil  # only needed to confirm availability
+
+    client, _ = _client(tmp_path)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    body = r.json()
+    assert "cpu_percent" in body
+    assert "mem_percent" in body
+    assert "mem_used_mb" in body
+    assert "mem_total_mb" in body
+    assert "timestamp" in body
+    # Values must be non-negative numbers.
+    assert body["cpu_percent"] >= 0.0
+    assert 0.0 <= body["mem_percent"] <= 100.0
+    assert body["mem_used_mb"] > 0
+    assert body["mem_total_mb"] >= body["mem_used_mb"]
+
+
+def test_metrics_no_psutil(tmp_path):
+    """GET /metrics returns 503 when psutil is unavailable."""
+    import sys
+
+    client, _ = _client(tmp_path)
+
+    # Simulate psutil not being importable by blocking it from sys.modules.
+    original = sys.modules.get("psutil", None)
+    sys.modules["psutil"] = None  # type: ignore[assignment]
+    try:
+        r = client.get("/metrics")
+        # Should return 503 with an error body.
+        assert r.status_code == 503
+        assert "error" in r.json()
+    finally:
+        if original is None:
+            sys.modules.pop("psutil", None)
+        else:
+            sys.modules["psutil"] = original

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from coord.agent import (
+    ADVISORY,
     DONE,
     FAILED,
     AgentServer,
@@ -161,7 +162,8 @@ class TestPullRepos:
         )
         a = server.assign(spec)
         final = server.wait_for(a.id, timeout=15)
-        assert final.status == DONE
+        # Worker makes no commits (echo only) → advisory (#448)
+        assert final.status == ADVISORY
 
         updated = subprocess.run(
             ["git", "rev-parse", "HEAD"],

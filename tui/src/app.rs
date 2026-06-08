@@ -57,15 +57,18 @@ use crate::settings::{
 };
 use quadraui::accelerator::{parse_key_binding, ParsedBinding};
 use quadraui::{
-    Backend, Badge, ButtonMask, ChatController, ChatControllerEvent, ChatRole, ChatTurn, Color,
-    Decoration, Dialog, DialogButton, DialogHit, DialogInput, DialogLayout, DialogMeasure,
-    DialogSeverity, DialogTextInput, Key, ListItem, ListView, MouseButton, NamedKey, PipelineHit,
-    PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView, Point, Reaction, Rect,
-    ScrollDelta, ScrollMode, Scrollbar, SectionSize, ShellApp, ShellConfig, ShellContext,
-    SidebarPanel, SidebarPanelHit, StageStatus, StatusBar, StatusBarSegment, StyledSpan,
-    StyledText, TabBar, TabItem, TextRegion, Toolbar, ToolbarButton, ToolbarHoverTracker,
-    ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
+    Backend, Badge, Chart, ChartKind, ChatController, ChatControllerEvent, ChatRole, ChatTurn,
+    Color, Decoration,
+    Dialog, DialogButton, DialogHit, DialogInput, DialogLayout, DialogMeasure,
+    DialogSeverity, DialogTextInput,
+    Key, ListItem, ListView, Modifiers, MouseButton, NamedKey,
+    PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
+    Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, Series, ShellApp,
+    ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
+    StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
+    ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
 };
+use quadraui::terminal_engine::TerminalMouseKind;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -841,6 +844,60 @@ fn spawn_machine_health(
         let _ = tx.send(result);
     });
     rx
+}
+
+// ─── #207: Machine metrics (CPU + memory) ───────────────────────────────────
+
+/// How many samples to keep per machine (5 min @ 5 s/sample).
+const METRICS_HISTORY: usize = 60;
+/// How often to poll each reachable machine's `/metrics` endpoint.
+const METRICS_CADENCE: Duration = Duration::from_secs(5);
+
+/// One `/metrics` snapshot from a remote agent.
+#[derive(Clone, Copy)]
+struct MetricSample {
+    cpu: f32,
+    mem: f32,
+}
+
+/// In-flight metrics fetch for one machine.
+struct PendingMetrics {
+    machine: String,
+    rx: std::sync::mpsc::Receiver<Result<MetricSample, String>>,
+}
+
+/// Spawn a background thread that fetches `/metrics` from a remote agent.
+fn spawn_machine_metrics(host: &str, port: u16, machine: String) -> PendingMetrics {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = format!("http://{}:{}/metrics", host, port);
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(3))
+            .build();
+        let result = match agent.get(&url).call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(v) => {
+                        let cpu = v
+                            .get("cpu_percent")
+                            .and_then(|x| x.as_f64())
+                            .unwrap_or(0.0) as f32;
+                        let mem = v
+                            .get("mem_percent")
+                            .and_then(|x| x.as_f64())
+                            .unwrap_or(0.0) as f32;
+                        Ok(MetricSample { cpu, mem })
+                    }
+                    Err(e) => Err(format!("json: {}", e)),
+                },
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
+    });
+    PendingMetrics { machine, rx }
 }
 
 // ─── #336: Artifact manifest types ──────────────────────────────────────────
@@ -4068,15 +4125,16 @@ pub struct CoordApp {
     terminal_spawn_error: Option<String>,
     // ── #440: per-issue detail-view terminals ──────────────────────────
     /// Per-issue terminal sessions for the Pipeline detail Terminal tab.
-    /// Keyed by issue number.  Lazily spawned the first time the user
+    /// Keyed by `(repo_slug, issue_number)` (#455) so that same-numbered
+    /// issues in different repos (e.g. quadraui #336 vs coord #336) each
+    /// get their own session.  Lazily spawned the first time the user
     /// opens the Terminal tab for a given issue; kept running while the
     /// issue stays in `pipeline_issues`; dropped when the issue leaves
     /// the pipeline (on the next load that no longer contains it).
-    detail_terminal_sessions:
-        std::collections::HashMap<u64, quadraui::terminal_engine::TerminalSession>,
+    detail_terminal_sessions: std::collections::HashMap<(String, u64), quadraui::terminal_engine::TerminalSession>,
     /// Spawn errors for per-issue terminals (shown as a one-line
-    /// placeholder in the Terminal tab).
-    detail_terminal_spawn_errors: std::collections::HashMap<u64, String>,
+    /// placeholder in the Terminal tab).  Keyed by `(repo_slug, issue_number)`.
+    detail_terminal_spawn_errors: std::collections::HashMap<(String, u64), String>,
     /// Focus state for the Pipeline detail Terminal tab.  `true` when
     /// keypresses route to the selected issue's PTY.  F12 toggles.
     /// Independent of `terminal_focused` (the standalone pane's flag).
@@ -4085,35 +4143,31 @@ pub struct CoordApp {
     /// `render_detail_terminal_tab` (`&self`) and applied by `tick`
     /// (`&mut self`).
     detail_terminal_pending_dims: std::cell::Cell<Option<(u16, u16)>>,
-    /// #446: per-issue terminal rect captured by `render_detail_terminal_tab`
-    /// (`&self`) so mouse handlers can route Scroll/MouseDown over the
-    /// terminal area to the PTY scrollback even though they only have the
-    /// full `main` rect to work with.  Cell so the renderer can stash it.
-    detail_terminal_pending_rect: std::cell::Cell<Option<Rect>>,
-    /// #446: in-progress scrollbar thumb drag for the per-issue detail
-    /// terminal, captured at `MouseDown` time and consulted by
-    /// `MouseMoved` / `MouseUp`.  Mirrors the example pattern in
-    /// `quadraui/examples/common/terminal_app.rs`.
-    detail_terminal_scrollbar_drag: Option<DetailTerminalScrollbarDrag>,
-}
+    /// #454: bitmask of mouse buttons whose `Press` was forwarded to an
+    /// embedded PTY but whose matching `Release` has not yet been
+    /// forwarded.  Used so that a release fires even when the cursor
+    /// has been dragged outside the terminal content area — without it,
+    /// terminal apps (vim visual mode, tmux mouse drag, less) stay
+    /// stuck in "button held" state until the next click.
+    /// Bits: `1` = Left, `2` = Middle, `4` = Right.
+    pty_pressed_buttons: u8,
+    /// #464: `true` while a host-side text-selection drag is in progress in
+    /// the active terminal pane. Set when mouse-reporting is OFF (plain
+    /// shell) or Shift is held (force-override). Cleared on the matching
+    /// mouse-release. `pty_pressed_buttons` is NOT set for these drags.
+    terminal_host_sel_dragging: bool,
 
-/// #446: snapshot of the scrollbar-drag geometry captured at `MouseDown`.
-///
-/// Mirrors the `ScrollbarDrag` struct from `terminal_app.rs` so that
-/// `MouseMoved` can compute a stable scroll-offset even if the terminal
-/// dimensions change mid-drag.
-#[derive(Debug, Clone, Copy)]
-struct DetailTerminalScrollbarDrag {
-    /// Issue number whose session the drag targets.
-    issue_num: u64,
-    /// Y coordinate of the top of the scrollbar track.
-    track_y: f32,
-    /// Height of the scrollbar track.
-    track_h: f32,
-    /// Total line count from the scrollbar state snapshot.
-    total: usize,
-    /// Visible line count from the scrollbar state snapshot.
-    visible: usize,
+    // ── #207: Machine metrics sparklines ─────────────────────────────────
+    /// Rolling ring-buffer of CPU + memory samples per machine, keyed by
+    /// machine name.  Capped at [`METRICS_HISTORY`] entries (60 × 5 s =
+    /// 5 minutes).  Populated by background `/metrics` polls.
+    machine_metrics: std::collections::HashMap<String, std::collections::VecDeque<MetricSample>>,
+    /// In-flight `/metrics` fetches — one entry per machine per poll cycle.
+    /// Drained each tick; completed entries update `machine_metrics`.
+    pending_metrics: Vec<PendingMetrics>,
+    /// When the last `/metrics` poll round was kicked.  The next round fires
+    /// after [`METRICS_CADENCE`] has elapsed and the Machines panel is visible.
+    metrics_last_polled: Instant,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4317,9 +4371,14 @@ impl CoordApp {
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
-            // #446: per-issue terminal rect + scrollbar-drag state.
-            detail_terminal_pending_rect: std::cell::Cell::new(None),
-            detail_terminal_scrollbar_drag: None,
+            // #454: tracks Press → Release for PTY mouse-reporting drags.
+            pty_pressed_buttons: 0,
+            // #464: host-side terminal selection drag state.
+            terminal_host_sel_dragging: false,
+            // #207: machine metrics sparklines.
+            machine_metrics: std::collections::HashMap::new(),
+            pending_metrics: Vec::new(),
+            metrics_last_polled: Instant::now(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -6885,6 +6944,138 @@ impl CoordApp {
             h_scroll: 0,
             max_content_width: None,
         }
+    }
+
+    // ── #207: Machine metrics sparklines ─────────────────────────────────
+
+    /// Render CPU and memory sparklines for the currently-selected machine
+    /// into `area`.  The area is split vertically: top half = CPU sparkline
+    /// with a label row, bottom half = memory sparkline with a label row.
+    ///
+    /// When no samples have been collected yet (e.g. the machine is
+    /// unreachable or the user just switched to the Machines panel), a
+    /// subdued placeholder is drawn instead so the layout stays stable.
+    fn render_machine_sparklines(&self, backend: &mut dyn Backend, area: Rect, lh: f32) {
+        if area.height < lh * 2.0 {
+            return; // Not enough vertical room to be useful.
+        }
+
+        let machine_name = match self.data.machines.get(self.machine_sel) {
+            Some(m) => &m.name,
+            None => return,
+        };
+
+        let samples: &[MetricSample] = self
+            .machine_metrics
+            .get(machine_name)
+            .map(|d| d.as_slices().0) // front slice; fine for display
+            .unwrap_or(&[]);
+
+        // Split area into top (CPU) and bottom (Mem) halves.
+        let half_h = area.height / 2.0;
+        let cpu_area = Rect::new(area.x, area.y, area.width, half_h);
+        let mem_area = Rect::new(area.x, area.y + half_h, area.width, half_h);
+
+        // Render CPU row.
+        let cpu_data: Vec<f64> = samples.iter().map(|s| s.cpu as f64).collect();
+        let last_cpu = samples.last().map(|s| s.cpu).unwrap_or(0.0);
+        self.render_metric_sparkline(
+            backend, cpu_area, lh,
+            "CPU",
+            last_cpu,
+            cpu_data,
+            Color::rgb(80, 160, 240),
+        );
+
+        // Render memory row.
+        let mem_data: Vec<f64> = samples.iter().map(|s| s.mem as f64).collect();
+        let last_mem = samples.last().map(|s| s.mem).unwrap_or(0.0);
+        self.render_metric_sparkline(
+            backend, mem_area, lh,
+            "Mem",
+            last_mem,
+            mem_data,
+            Color::rgb(120, 200, 120),
+        );
+    }
+
+    /// Draw a single labelled sparkline row.
+    ///
+    /// Layout: one `lh`-tall label+value row on top, the rest of the
+    /// rect for the sparkline chart body.  When `data` is empty a
+    /// placeholder "—" value is shown and no chart is drawn.
+    fn render_metric_sparkline(
+        &self,
+        backend: &mut dyn Backend,
+        area: Rect,
+        lh: f32,
+        label: &str,
+        last_val: f32,
+        data: Vec<f64>,
+        color: Color,
+    ) {
+        if area.height < lh {
+            return;
+        }
+        let label_h = lh;
+        let chart_h = (area.height - label_h).max(0.0);
+        let label_rect = Rect::new(area.x, area.y, area.width, label_h);
+        let chart_rect = Rect::new(area.x, area.y + label_h, area.width, chart_h);
+
+        // Label row — "CPU  42%" or "Mem  67%" with subdued colouring.
+        let val_str = if data.is_empty() {
+            "  —".to_string()
+        } else {
+            format!("  {:.0}%", last_val)
+        };
+        backend.draw_list(label_rect, &ListView {
+            id: WidgetId::new(format!("metric-label-{}", label.to_lowercase())),
+            title: None,
+            items: vec![ListItem {
+                text: StyledText {
+                    spans: vec![
+                        StyledSpan::with_fg(
+                            format!(" {} ", label),
+                            Color::rgb(120, 120, 140),
+                        ),
+                        StyledSpan::with_fg(val_str, color),
+                    ],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            }],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+        });
+
+        // Sparkline body — only when we have data and enough vertical room.
+        if data.is_empty() || chart_h < 1.0 {
+            return;
+        }
+        let chart = Chart {
+            id: WidgetId::new(format!("metric-chart-{}", label.to_lowercase())),
+            kind: ChartKind::Sparkline,
+            series: vec![Series {
+                label: label.to_string(),
+                data,
+                color: Some(color),
+                fill: false,
+            }],
+            x_label: None,
+            y_label: None,
+            y_range: Some((0.0, 100.0)),
+            x_range: None,
+            show_legend: false,
+            y_ticks: None,
+            x_ticks: None,
+            show_grid: false,
+        };
+        backend.draw_chart(chart_rect, &chart, None, None);
     }
 
     // ── Pipeline panel ────────────────────────────────────────────────────
@@ -10052,12 +10243,11 @@ impl CoordApp {
                 self.pipeline_issues = issues;
                 // #440: prune terminal sessions for issues that are no
                 // longer in the pipeline so we don't keep stale PTYs.
-                let live_nums: std::collections::HashSet<u64> =
-                    self.pipeline_issues.iter().map(|i| i.number).collect();
-                self.detail_terminal_sessions
-                    .retain(|k, _| live_nums.contains(k));
-                self.detail_terminal_spawn_errors
-                    .retain(|k, _| live_nums.contains(k));
+                // #455: key by (repo_slug, number) to avoid collisions across repos.
+                let live_keys: std::collections::HashSet<(String, u64)> =
+                    self.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
+                self.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
+                self.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
                 self.pipeline_loader = None;
                 self.rebuild_pipeline_sidebar(prev_sel);
                 true
@@ -12076,6 +12266,7 @@ impl CoordApp {
             UiEvent::MouseDown {
                 position,
                 button: MouseButton::Left,
+                modifiers,
                 ..
             } => {
                 let pos = *position;
@@ -12098,7 +12289,75 @@ impl CoordApp {
                     }
                     false
                 } else if ctx.in_main(pos.x, pos.y) {
-                    self.mouse_main_click(pos, ctx.main_bounds(), lh)
+                    let main_b = ctx.main_bounds();
+                    let char_w = backend.char_width();
+                    // #464: host-side selection — must check BEFORE the PTY
+                    // forwarding path so Shift can override even when the app
+                    // has mouse reporting on (e.g. vim visual mode).
+                    //
+                    // Two cases both route to host selection:
+                    //   1. Shift held → always host-select (standard terminal
+                    //      override convention; overrides vim/tmux/less).
+                    //   2. Mouse reporting OFF → forward_mouse returns false
+                    //      anyway; start selection here so we own the drag.
+                    //
+                    // For case 2 we need to peek at the session's reporting
+                    // state without consuming the event — read the flag, then
+                    // branch.
+                    // Compute cell coordinates once; reuse for both the
+                    // reporting-state peek and the host-select branch (avoids
+                    // a redundant coordinate translation on every mouse-down).
+                    let cr = self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w);
+                    let reporting_on = cr.is_some() && {
+                        // Only peek when there's actually a session.
+                        match self.active_view {
+                            SidebarView::Terminal => self
+                                .terminal_session
+                                .as_ref()
+                                .map(|s| s.mouse_reporting_enabled())
+                                .unwrap_or(false),
+                            SidebarView::Pipeline
+                                if self.pipeline_detail_tab
+                                    == PipelineDetailTab::Terminal =>
+                            {
+                                self.selected_issue_key()
+                                    .and_then(|k| {
+                                        self.detail_terminal_sessions
+                                            .get(&k)
+                                            .map(|s| s.mouse_reporting_enabled())
+                                    })
+                                    .unwrap_or(false)
+                            }
+                            _ => false,
+                        }
+                    };
+                    let force_host_sel = modifiers.shift || !reporting_on;
+                    if force_host_sel {
+                        if let Some((col, row)) = cr {
+                            self.terminal_host_sel_begin(col, row);
+                            return true;
+                        }
+                    }
+                    // #454: Forward click to the embedded PTY when mouse
+                    // reporting is enabled. Returns true only if the PTY
+                    // consumed it (i.e. mouse reporting is on); fall through
+                    // to normal TUI click handling otherwise.
+                    if self.terminal_mouse_event(
+                        TerminalMouseKind::Press,
+                        MouseButton::Left,
+                        pos,
+                        *modifiers,
+                        main_b,
+                        lh,
+                        char_w,
+                    ) {
+                        // Remember the press so the matching `Release`
+                        // fires even if the user drags out of the panel
+                        // before releasing (#454 review fix).
+                        self.pty_pressed_buttons |= pty_button_bit(MouseButton::Left);
+                        return true;
+                    }
+                    self.mouse_main_click(pos, main_b, lh)
                 } else {
                     false
                 }
@@ -12106,6 +12365,7 @@ impl CoordApp {
             UiEvent::MouseDown {
                 position,
                 button: MouseButton::Right,
+                modifiers,
                 ..
             } => {
                 // #259: right-click opens a context menu for the row
@@ -12114,6 +12374,7 @@ impl CoordApp {
                 // gets focused / selected, then open the menu using the
                 // newly-selected row as the target.
                 let pos = *position;
+                let modifiers = *modifiers;
                 if ctx.in_sidebar(pos.x, pos.y) {
                     if let Some(sidebar_b) = ctx.sidebar_bounds() {
                         // Pre-select the row under the cursor by routing
@@ -12180,6 +12441,30 @@ impl CoordApp {
                             return true;
                         }
                     }
+                } else if ctx.in_main(pos.x, pos.y) {
+                    // #454: Forward right-click Press to the embedded PTY when
+                    // mouse reporting is enabled.  Without this the PTY would
+                    // receive an orphaned Release (from the MouseUp arm) with
+                    // no corresponding Press, breaking right-click in apps
+                    // such as vim or tmux.
+                    let main_b = ctx.main_bounds();
+                    let char_w = backend.char_width();
+                    let lh = backend.line_height();
+                    if self.terminal_mouse_event(
+                        TerminalMouseKind::Press,
+                        MouseButton::Right,
+                        pos,
+                        modifiers,
+                        main_b,
+                        lh,
+                        char_w,
+                    ) {
+                        // Mirror the Left-button path: remember the press
+                        // so the matching `Release` fires even if the
+                        // user releases outside the panel (#454 fix-2).
+                        self.pty_pressed_buttons |= pty_button_bit(MouseButton::Right);
+                        return true;
+                    }
                 }
                 false
             }
@@ -12190,13 +12475,14 @@ impl CoordApp {
                 let pos = *position;
                 let d = *delta;
                 let lh = backend.line_height();
+                let char_w = backend.char_width();
                 if ctx.in_sidebar(pos.x, pos.y) {
                     if let Some(sidebar_b) = ctx.sidebar_bounds() {
                         return self.mouse_sidebar_scroll(event, d, sidebar_b, backend, lh);
                     }
                     false
                 } else if ctx.in_main(pos.x, pos.y) {
-                    self.mouse_main_scroll(d, ctx.main_bounds(), lh)
+                    self.mouse_main_scroll(d, pos, ctx.main_bounds(), lh, char_w)
                 } else {
                     false
                 }
@@ -12207,27 +12493,11 @@ impl CoordApp {
             // host having to track button bounds across frames.  A
             // change in the hovered id triggers a redraw.
             UiEvent::MouseMoved { .. } => {
-                let pos = if let UiEvent::MouseMoved { position, .. } = event {
-                    *position
+                let (pos, buttons) = if let UiEvent::MouseMoved { position, buttons } = event {
+                    (*position, *buttons)
                 } else {
                     return false;
                 };
-                // #446: if a detail-terminal scrollbar drag is in flight
-                // and the left button is still down, update it.  Mirrors
-                // the example pattern in `terminal_app.rs`.
-                if self.detail_terminal_scrollbar_drag.is_some() {
-                    let left_down = matches!(
-                        event,
-                        UiEvent::MouseMoved {
-                            buttons: ButtonMask { left: true, .. },
-                            ..
-                        }
-                    );
-                    if left_down {
-                        self.apply_detail_terminal_scrollbar_drag(pos.y);
-                        return true;
-                    }
-                }
                 let lh = backend.line_height();
                 let mut redraw = false;
                 // Forward to the active sidebar so scrollbar drag tracks the cursor.
@@ -12261,6 +12531,54 @@ impl CoordApp {
                         redraw |= self.panel_toolbar_hover.clear();
                     }
                 } else if ctx.in_main(pos.x, pos.y) {
+                    // #464: if a host-side selection drag is in progress,
+                    // extend the selection to the current cell and redraw.
+                    // This takes priority over the PTY motion path so the
+                    // drag doesn't accidentally escape to the PTY.
+                    let char_w = backend.char_width();
+                    let main_b = ctx.main_bounds();
+                    if self.terminal_host_sel_dragging && buttons.left {
+                        if let Some((col, row)) =
+                            self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w)
+                        {
+                            self.terminal_host_sel_update(col, row);
+                            redraw = true;
+                        }
+                    } else if buttons.left || buttons.right || buttons.middle {
+                        // #454: forward cursor motion to the embedded PTY when
+                        // mouse-reporting mode is active.  `forward_mouse`
+                        // returns false when reporting is off, so there is no
+                        // performance cost on the common idle path.
+                        //
+                        // Plain hover (no button held) is intentionally NOT
+                        // forwarded: under the xterm "button-event tracking"
+                        // protocol (mode 1002), a motion event always carries
+                        // a button bit, so reporting Left for hover looks
+                        // identical to a Left-drag — and would trigger vim
+                        // visual selection, tmux copy-mode drag, ranger
+                        // selection, etc. on plain cursor movement.  We
+                        // forward Move only when at least one button is
+                        // actually held (#454 review fix).
+                        let btn = if buttons.right {
+                            MouseButton::Right
+                        } else if buttons.middle {
+                            MouseButton::Middle
+                        } else {
+                            // buttons.left is true by the outer guard.
+                            MouseButton::Left
+                        };
+                        redraw |= self.terminal_mouse_event(
+                            TerminalMouseKind::Move,
+                            btn,
+                            pos,
+                            Modifiers::default(),
+                            main_b,
+                            lh,
+                            char_w,
+                        );
+                    }
+                    // Note: intentional fall-through — toolbar hover tracking
+                    // below still runs even when the PTY consumed the move.
                     if let Some(toolbar) = self.panel_toolbar() {
                         let panel = SidebarPanel {
                             id: WidgetId::new("panel-toolbar"),
@@ -12290,7 +12608,7 @@ impl CoordApp {
                     {
                         if let Some(action_toolbar) = self.pipeline_action_bar_toolbar() {
                             let main_b = ctx.main_bounds();
-                            let tab_h = lh * 1.4;
+                            let tab_h = detail_tab_bar_height(lh);
                             let bar_h = pipeline_action_bar_height(true, lh);
                             let bar_rect =
                                 Rect::new(main_b.x, main_b.y + tab_h, main_b.width, bar_h);
@@ -12311,12 +12629,11 @@ impl CoordApp {
                 redraw
             }
 
-            // Forward MouseUp to the active sidebar to release any scrollbar drag.
-            UiEvent::MouseUp { .. } => {
-                // #446: release any in-progress detail-terminal scrollbar
-                // drag before forwarding to the sidebar (which is unaware
-                // of the detail terminal's drag state).
-                let detail_drag_released = self.end_detail_terminal_scrollbar_drag();
+            // Forward MouseUp to the active sidebar to release any scrollbar drag,
+            // and forward the release to the embedded PTY when mouse reporting is on.
+            UiEvent::MouseUp { button, position, .. } => {
+                let pos = *position;
+                let btn = *button;
                 if let Some(sidebar_b) = ctx.sidebar_bounds() {
                     match self.active_view {
                         SidebarView::Board => {
@@ -12328,7 +12645,57 @@ impl CoordApp {
                         _ => {}
                     }
                 }
-                detail_drag_released
+                // #464: finalise a host-side selection drag on release.
+                // Must run before the PTY forwarding path so we don't also
+                // send a spurious Release to the PTY.
+                if self.terminal_host_sel_dragging && btn == MouseButton::Left {
+                    self.terminal_host_sel_end();
+                    return true;
+                }
+                // #454: forward button release to the embedded PTY when mouse
+                // reporting is enabled (gated inside forward_mouse itself).
+                //
+                // Two paths into the release:
+                //   - Cursor still in_main → normal, position-driven
+                //     forward via `terminal_mouse_event`.
+                //   - Cursor outside in_main but we have an outstanding
+                //     PTY press for this button → the user dragged out of
+                //     the panel; force-forward with the position clamped
+                //     to the PTY rect so the terminal app gets its
+                //     matching Release (vim visual mode, tmux drag, less
+                //     would otherwise stay "button held" forever).
+                let bit = pty_button_bit(btn);
+                let press_outstanding = bit != 0 && (self.pty_pressed_buttons & bit) != 0;
+                let lh = backend.line_height();
+                let char_w = backend.char_width();
+                let main_b = ctx.main_bounds();
+                let in_main = ctx.in_main(pos.x, pos.y);
+                let mut consumed = false;
+                if in_main {
+                    consumed = self.terminal_mouse_event(
+                        TerminalMouseKind::Release,
+                        btn,
+                        pos,
+                        Modifiers::default(),
+                        main_b,
+                        lh,
+                        char_w,
+                    );
+                }
+                if press_outstanding && !consumed {
+                    // Out-of-bounds release: clamp position to the PTY
+                    // content rect and force-forward so the PTY sees the
+                    // matching Release.  `terminal_force_release` handles
+                    // both the standalone and Pipeline/Terminal sessions.
+                    consumed = self.terminal_force_release(btn, pos, main_b, lh, char_w);
+                }
+                if press_outstanding {
+                    self.pty_pressed_buttons &= !bit;
+                }
+                if consumed {
+                    return true;
+                }
+                false
             }
 
             _ => false,
@@ -12573,7 +12940,6 @@ impl CoordApp {
         if self.active_view == SidebarView::Settings {
             // Route click to FormController. FormController::handle_cached
             // uses metrics cached by render_and_cache().
-            use quadraui::Modifiers;
             let click_event = UiEvent::MouseDown {
                 widget: None,
                 button: MouseButton::Left,
@@ -12612,7 +12978,7 @@ impl CoordApp {
             // #269: hit-test from the actual TabBar labels (char widths)
             // instead of hard-coded offsets.  This stays correct when
             // tabs are renamed or have a badge appended.
-            let tab_h = lh * 1.4;
+            let tab_h = detail_tab_bar_height(lh);
             if pos.y - main_b.y < tab_h {
                 let bar = self.board_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
@@ -12658,17 +13024,10 @@ impl CoordApp {
             return false;
         }
         if self.active_view == SidebarView::Pipeline {
-            // #446: in the Terminal detail tab, a click in the scrollbar
-            // column starts a thumb drag.  Try this BEFORE the tab-row
-            // hit-test so a drag-start near the top of the terminal isn't
-            // mis-routed as a tab click.
-            if self.pipeline_detail_tab == PipelineDetailTab::Terminal
-                && self.try_start_detail_terminal_scrollbar_drag(pos)
-            {
-                return true;
-            }
-            // Tab bar occupies the first `lh * 1.4` row of the main panel.
-            let tab_h = lh * 1.4;
+            // Tab bar occupies the first `detail_tab_bar_height(lh)` row of
+            // the main panel — `(lh * 1.4).round()`, so the TUI and pixel
+            // backends agree on the boundary (#464).
+            let tab_h = detail_tab_bar_height(lh);
             if pos.y - main_b.y < tab_h {
                 let bar = self.pipeline_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
@@ -12764,6 +13123,238 @@ impl CoordApp {
         false
     }
 
+    /// Forward a mouse event to the active embedded terminal PTY (standalone
+    /// `SidebarView::Terminal` or `PipelineDetailTab::Terminal`).
+    ///
+    /// Returns `true` when the PTY consumed the event — caller should trigger
+    /// a redraw and skip any local fallback handling.  Returns `false` when
+    /// - no terminal view is active,
+    /// - the cursor is outside the terminal content area, or
+    /// - `forward_mouse` reports that the PTY has mouse reporting off (for
+    ///   Press/Release/Move) or neither mouse reporting nor alt-screen
+    ///   active (for wheel events).
+    ///
+    /// The coordinate translation mirrors the render path: for the standalone
+    /// terminal, `main_b` is the full main content rect (no toolbar).  For the
+    /// detail terminal, `main_b.y + lh*1.4` is the content-area top edge.
+    fn terminal_mouse_event(
+        &mut self,
+        kind: TerminalMouseKind,
+        button: MouseButton,
+        pos: Point,
+        modifiers: Modifiers,
+        main_b: Rect,
+        lh: f32,
+        char_w: f32,
+    ) -> bool {
+        match self.active_view {
+            SidebarView::Terminal => {
+                // Terminal surface occupies the full main content rect (the
+                // Terminal view has no panel toolbar, so main_b == the PTY area).
+                if let Some((col, row)) =
+                    terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
+                {
+                    if let Some(ref mut sess) = self.terminal_session {
+                        return sess.forward_mouse(kind, button, col, row, modifiers);
+                    }
+                }
+                false
+            }
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                // Content area starts below the tab bar. `#464`: use the
+                // rounded helper so the hit-test origin lines up with the
+                // render origin in the TUI backend (where `q_rect_to_ratatui`
+                // rounds the fractional `lh * 1.4` to a whole cell).
+                let content_y = main_b.y + detail_tab_bar_height(lh);
+                if let Some((col, row)) =
+                    terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+                {
+                    if let Some(issue_key) = self.selected_issue_key() {
+                        if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) {
+                            return sess.forward_mouse(kind, button, col, row, modifiers);
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// #454: force-forward a `Release` to the active terminal session even
+    /// when `pos` lies outside the PTY content rect.  Mirrors
+    /// [`terminal_mouse_event`]'s routing (standalone Terminal vs
+    /// Pipeline/Terminal tab) but uses [`terminal_pixel_to_cell_clamped`]
+    /// so the cell coordinates land inside the visible grid.
+    ///
+    /// Called from the `MouseUp` arm when `pty_pressed_buttons` records an
+    /// outstanding press for `button` — without this fallback, terminal
+    /// apps that opted into mouse reporting would stay stuck in
+    /// "button held" state after the user drags out of the panel
+    /// (vim visual mode, tmux mouse drag, less, ranger, …).
+    fn terminal_force_release(
+        &mut self,
+        button: MouseButton,
+        pos: Point,
+        main_b: Rect,
+        lh: f32,
+        char_w: f32,
+    ) -> bool {
+        match self.active_view {
+            SidebarView::Terminal => {
+                let (col, row) =
+                    terminal_pixel_to_cell_clamped(pos, main_b, main_b.y, char_w, lh);
+                if let Some(ref mut sess) = self.terminal_session {
+                    return sess.forward_mouse(
+                        TerminalMouseKind::Release,
+                        button,
+                        col,
+                        row,
+                        Modifiers::default(),
+                    );
+                }
+                false
+            }
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                // `#464`: rounded helper for parity with the render path.
+                let content_y = main_b.y + detail_tab_bar_height(lh);
+                let (col, row) =
+                    terminal_pixel_to_cell_clamped(pos, main_b, content_y, char_w, lh);
+                if let Some(issue_key) = self.selected_issue_key() {
+                    if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) {
+                        return sess.forward_mouse(
+                            TerminalMouseKind::Release,
+                            button,
+                            col,
+                            row,
+                            Modifiers::default(),
+                        );
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    // ── #464: host-side terminal selection helpers ────────────────────────────
+
+    /// Translate a pixel position to a terminal cell `(col, row)` for
+    /// whichever terminal view is currently active (standalone Terminal or
+    /// Pipeline / Terminal tab).  Returns `None` when `pos` is outside the
+    /// PTY content area.
+    fn active_terminal_pixel_to_cell(
+        &self,
+        pos: Point,
+        main_b: Rect,
+        lh: f32,
+        char_w: f32,
+    ) -> Option<(u16, u16)> {
+        match self.active_view {
+            SidebarView::Terminal => {
+                terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
+            }
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                // `#464`: rounded helper for parity with the render path.
+                let content_y = main_b.y + detail_tab_bar_height(lh);
+                terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return a mutable reference to the currently active embedded terminal
+    /// session, or `None` when no terminal view is active or no session exists.
+    fn active_terminal_session_mut(
+        &mut self,
+    ) -> Option<&mut quadraui::terminal_engine::TerminalSession> {
+        match self.active_view {
+            SidebarView::Terminal => self.terminal_session.as_mut(),
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                let key = self.selected_issue_key()?;
+                self.detail_terminal_sessions.get_mut(&key)
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the selected text from the active terminal session, if any.
+    fn active_terminal_selected_text(&self) -> Option<String> {
+        match self.active_view {
+            SidebarView::Terminal => self.terminal_session.as_ref()?.selected_text(),
+            SidebarView::Pipeline
+                if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
+            {
+                let key = self.selected_issue_key()?;
+                self.detail_terminal_sessions.get(&key)?.selected_text()
+            }
+            _ => None,
+        }
+    }
+
+    /// Clear the selection in the active terminal session.
+    fn clear_active_terminal_selection(&mut self) {
+        if let Some(sess) = self.active_terminal_session_mut() {
+            sess.selection = None;
+        }
+    }
+
+    /// Begin a host-side selection drag in the active terminal at `(col, row)`.
+    /// Clears any previous selection and sets the anchor to `(col, row)`.
+    /// No-op (dragging flag not set) when there is no active terminal session.
+    fn terminal_host_sel_begin(&mut self, col: u16, row: u16) {
+        use quadraui::terminal_engine::TerminalSelection;
+        if let Some(sess) = self.active_terminal_session_mut() {
+            sess.selection = Some(TerminalSelection {
+                start_row: row,
+                start_col: col,
+                end_row: row,
+                end_col: col,
+            });
+        } else {
+            return;
+        }
+        self.terminal_host_sel_dragging = true;
+    }
+
+    /// Extend the host-side selection drag to `(col, row)` (move event).
+    /// No-op when no drag is in progress.
+    fn terminal_host_sel_update(&mut self, col: u16, row: u16) {
+        if !self.terminal_host_sel_dragging {
+            return;
+        }
+        if let Some(sess) = self.active_terminal_session_mut() {
+            if let Some(ref mut sel) = sess.selection {
+                sel.end_row = row;
+                sel.end_col = col;
+            }
+        }
+    }
+
+    /// Finalise the host-side selection drag (release event).
+    /// The selection remains visible; only the dragging flag is cleared.
+    /// A collapsed selection (anchor == end) is cleared entirely since it
+    /// represents a plain click with no text chosen.
+    fn terminal_host_sel_end(&mut self) {
+        self.terminal_host_sel_dragging = false;
+        // Clear collapsed (point) selections — they're just phantom clicks.
+        if let Some(sess) = self.active_terminal_session_mut() {
+            if matches!(&sess.selection, Some(sel)
+                if sel.start_row == sel.end_row && sel.start_col == sel.end_col)
+            {
+                sess.selection = None;
+            }
+        }
+    }
+
     /// Scroll wheel in the sidebar.
     fn mouse_sidebar_scroll(
         &mut self,
@@ -12810,7 +13401,7 @@ impl CoordApp {
     }
 
     /// Scroll wheel in the main panel (detail / machine detail).
-    fn mouse_main_scroll(&mut self, delta: ScrollDelta, main_b: Rect, lh: f32) -> bool {
+    fn mouse_main_scroll(&mut self, delta: ScrollDelta, pos: Point, main_b: Rect, lh: f32, char_w: f32) -> bool {
         let visible = content_visible_rows(main_b, lh);
         // Stash the live viewport size — `watch_log_list` uses this to compute
         // a stick-to-bottom offset that keeps the last line on screen.
@@ -12949,17 +13540,48 @@ impl CoordApp {
                         // the chat's internal scrollbar.
                     }
                     PipelineDetailTab::Terminal => {
-                        // #446: route wheel events to the selected issue's
-                        // PTY scrollback.  Mirrors the pattern in
-                        // `quadraui/examples/common/terminal_app.rs`:
-                        // positive y = scroll up (into history), negative y
-                        // = scroll down (toward live).
-                        if let Some(issue_num) = self.selected_issue_number() {
-                            if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
-                                if delta.y > 0.0 {
-                                    sess.scroll_up(3);
-                                } else if delta.y < 0.0 {
-                                    sess.scroll_down(3);
+                        // #454: Forward scroll to the PTY when the child has
+                        // mouse reporting or is on the alt screen; otherwise
+                        // scroll local scrollback (3 rows per notch).
+                        //
+                        // `forward_mouse` for `WheelUp`/`WheelDown` already
+                        // gates internally on
+                        // `should_forward_wheel()` (mouse reporting OR
+                        // alt-screen), so calling it directly and falling
+                        // back on `false` is equivalent to the explicit
+                        // gate from the issue spec.
+                        //
+                        // `#464`: rounded helper for parity with the render
+                        // path so the click-to-cell mapping is exact in TUI.
+                        let content_y = main_b.y + detail_tab_bar_height(lh);
+                        if delta.y != 0.0 {
+                            if let Some((col, row)) =
+                                terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+                            {
+                                let kind = if delta.y > 0.0 {
+                                    TerminalMouseKind::WheelUp
+                                } else {
+                                    TerminalMouseKind::WheelDown
+                                };
+                                if let Some(issue_key) = self.selected_issue_key() {
+                                    if let Some(sess) =
+                                        self.detail_terminal_sessions.get_mut(&issue_key)
+                                    {
+                                        if !sess.forward_mouse(
+                                            kind,
+                                            MouseButton::Left,
+                                            col,
+                                            row,
+                                            Modifiers::default(),
+                                        ) {
+                                            // No PTY mouse reporting — scroll local scrollback.
+                                            if delta.y > 0.0 {
+                                                sess.scroll_up(3);
+                                            } else {
+                                                sess.scroll_down(3);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -12980,11 +13602,44 @@ impl CoordApp {
                     .handle_cached(&scroll_event, main_b);
                 true
             }
-            // #424: Terminal pane handles scroll via the PTY scrollback
-            // (history/scroll_offset).  Mouse-wheel scrollback is OUT
-            // OF SCOPE for this PR — copy-out + scrollbar drag come in
-            // quadraui #283 / coord #326.  Swallow the wheel for now.
-            SidebarView::Terminal => true,
+            // #454: Terminal pane — forward scroll wheel to the PTY when
+            // the child has mouse reporting enabled or is on the alt screen
+            // (e.g. tmux, vim, less).  Fall back to local scrollback when
+            // forward_mouse returns false.
+            //
+            // `forward_mouse` for wheel kinds gates internally on
+            // `should_forward_wheel()` (mouse reporting OR alt-screen),
+            // matching the explicit gate from the issue spec.
+            SidebarView::Terminal => {
+                if delta.y != 0.0 {
+                    if let Some((col, row)) =
+                        terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
+                    {
+                        if let Some(ref mut sess) = self.terminal_session {
+                            let kind = if delta.y > 0.0 {
+                                TerminalMouseKind::WheelUp
+                            } else {
+                                TerminalMouseKind::WheelDown
+                            };
+                            if !sess.forward_mouse(
+                                kind,
+                                MouseButton::Left,
+                                col,
+                                row,
+                                Modifiers::default(),
+                            ) {
+                                // No PTY mouse reporting — scroll local scrollback.
+                                if delta.y > 0.0 {
+                                    sess.scroll_up(3);
+                                } else {
+                                    sess.scroll_down(3);
+                                }
+                            }
+                        }
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -17288,6 +17943,49 @@ impl CoordApp {
             }
         }
 
+        // #207: Machine metrics polling — only when the Machines panel is
+        // visible so we don't burn background threads when the user is on
+        // another view.
+        if self.active_view == SidebarView::Machines {
+            // Drain any completed in-flight metrics fetches first.
+            let mut drained: Vec<PendingMetrics> = Vec::new();
+            for pm in self.pending_metrics.drain(..) {
+                match pm.rx.try_recv() {
+                    Ok(Ok(sample)) => {
+                        let buf = self.machine_metrics
+                            .entry(pm.machine)
+                            .or_default();
+                        buf.push_back(sample);
+                        if buf.len() > METRICS_HISTORY {
+                            buf.pop_front();
+                        }
+                        needs_redraw = true;
+                    }
+                    Ok(Err(_)) => {}  // fetch failed — silently skip
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Still in flight — put it back.
+                        drained.push(pm);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                }
+            }
+            self.pending_metrics = drained;
+
+            // Kick a new round when the cadence has elapsed and no fetches
+            // are outstanding (avoids piling up requests when the agent is slow).
+            if self.pending_metrics.is_empty()
+                && self.metrics_last_polled.elapsed() >= METRICS_CADENCE
+            {
+                self.metrics_last_polled = Instant::now();
+                for m in &self.data.machines {
+                    if m.reachable && !m.host.is_empty() {
+                        let pm = spawn_machine_metrics(&m.host, 7433, m.name.clone());
+                        self.pending_metrics.push(pm);
+                    }
+                }
+            }
+        }
+
         needs_redraw
     }
 
@@ -17908,24 +18606,69 @@ impl CoordApp {
         true
     }
 
+    /// Forward a clipboard paste to the embedded terminal PTY (#468).
+    ///
+    /// If the PTY has bracketed-paste mode active (DEC private mode 2004,
+    /// `ESC[?2004h`), wraps the text in `ESC[200~` … `ESC[201~` before
+    /// writing so the receiving application can distinguish a paste from
+    /// typed characters.  Otherwise the text is sent as raw bytes.
+    ///
+    /// No trailing carriage-return is appended — the human must press
+    /// Enter to submit (avoids auto-execute / paste-injection risks).
+    ///
+    /// Returns `true` when the paste was consumed (session exists);
+    /// `false` when no live session is available.
+    fn forward_paste_to_pty(&mut self, text: &str) -> bool {
+        let Some(sess) = self.terminal_session.as_mut() else {
+            return false;
+        };
+        if sess.is_exited() {
+            // Swallow paste to a dead PTY rather than letting it fall
+            // through to TUI chrome — matches forward_key_to_pty.
+            return true;
+        }
+        sess.scroll_reset();
+        if sess.bracketed_paste_enabled() {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            sess.write_input(&bytes);
+        } else {
+            sess.write_input(text.as_bytes());
+        }
+        true
+    }
+
     // ── #440: per-issue detail-view terminal helpers ──────────────────────
 
     /// Return the issue number for the currently-selected pipeline issue,
     /// or `None` when nothing is selected.
+    /// Kept for unit tests; production code uses `selected_issue_key()`.
+    #[cfg(test)]
     fn selected_issue_number(&self) -> Option<u64> {
         self.pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
             .map(|issue| issue.number)
     }
 
+    /// Return the `(repo_slug, issue_number)` key for the currently selected
+    /// Pipeline issue, used to index `detail_terminal_sessions` and
+    /// `detail_terminal_spawn_errors` (#455).
+    fn selected_issue_key(&self) -> Option<(String, u64)> {
+        self.pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .map(|issue| (issue.repo_slug.clone(), issue.number))
+    }
+
     /// Return a sensible cwd for a per-issue detail terminal.  Uses the
     /// repo path from `pipeline_repo_paths` when it exists and is a
     /// directory; falls back to `current_dir()`.
-    fn detail_terminal_cwd(&self, issue_num: u64) -> std::path::PathBuf {
+    fn detail_terminal_cwd(&self, issue_key: &(String, u64)) -> std::path::PathBuf {
         if let Some(issue) = self
             .pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
-            .filter(|iss| iss.number == issue_num)
+            .filter(|iss| iss.repo_slug == issue_key.0 && iss.number == issue_key.1)
         {
             let repo_key = issue.coord_repo.as_deref().unwrap_or(&issue.repo_slug);
             if let Some(path) = self.data.pipeline_repo_paths.get(repo_key) {
@@ -17958,12 +18701,12 @@ impl CoordApp {
         if self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal
         {
-            if let Some(issue_num) = self.selected_issue_number() {
-                if !self.detail_terminal_sessions.contains_key(&issue_num)
-                    && !self.detail_terminal_spawn_errors.contains_key(&issue_num)
+            if let Some(issue_key) = self.selected_issue_key() {
+                if !self.detail_terminal_sessions.contains_key(&issue_key)
+                    && !self.detail_terminal_spawn_errors.contains_key(&issue_key)
                 {
                     if let Some((cols, rows)) = self.detail_terminal_pending_dims.get() {
-                        let cwd = self.detail_terminal_cwd(issue_num);
+                        let cwd = self.detail_terminal_cwd(&issue_key);
                         let shell = quadraui::terminal_engine::default_shell();
                         match quadraui::terminal_engine::TerminalSession::spawn(
                             cols.max(20),
@@ -17973,12 +18716,12 @@ impl CoordApp {
                             10_000, // 10 000-line scrollback
                         ) {
                             Ok(sess) => {
-                                self.detail_terminal_sessions.insert(issue_num, sess);
+                                self.detail_terminal_sessions.insert(issue_key, sess);
                                 changed = true;
                             }
                             Err(e) => {
                                 self.detail_terminal_spawn_errors
-                                    .insert(issue_num, e.to_string());
+                                    .insert(issue_key, e.to_string());
                                 changed = true;
                             }
                         }
@@ -18022,11 +18765,15 @@ impl CoordApp {
     ///
     /// Mirrors `forward_key_to_pty` but routes to the per-issue session map
     /// rather than the standalone terminal session.
-    fn forward_key_to_detail_terminal(&mut self, key: &Key, mods: &quadraui::Modifiers) -> bool {
-        let Some(issue_num) = self.selected_issue_number() else {
+    fn forward_key_to_detail_terminal(
+        &mut self,
+        key: &Key,
+        mods: &quadraui::Modifiers,
+    ) -> bool {
+        let Some(issue_key) = self.selected_issue_key() else {
             return false;
         };
-        let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) else {
+        let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) else {
             return false;
         };
         if sess.is_exited() {
@@ -18041,155 +18788,80 @@ impl CoordApp {
         true
     }
 
-    /// Try to start a detail-terminal scrollbar drag (#446).
+    /// Forward a clipboard paste to the selected issue's detail terminal
+    /// PTY (#468).
     ///
-    /// Mirrors the `MouseDown` branch in
-    /// `quadraui/examples/common/terminal_app.rs`: when the user clicks
-    /// in the rightmost column of the terminal rect *and* the session
-    /// has overflowing scrollback, capture the geometry and apply an
-    /// initial drag.  Returns `true` if the click was consumed by the
-    /// drag-start (caller must skip other click routing); `false` when
-    /// the click is unrelated (no session, scrollbar not visible, or
-    /// click is outside the scrollbar column).
-    fn try_start_detail_terminal_scrollbar_drag(&mut self, pos: Point) -> bool {
-        // Only meaningful while the Terminal detail tab is showing.
-        if self.active_view != SidebarView::Pipeline
-            || self.pipeline_detail_tab != PipelineDetailTab::Terminal
-        {
+    /// Mirrors `forward_paste_to_pty` but routes to the per-issue session
+    /// map.  When bracketed-paste mode (DEC private mode 2004) is active
+    /// the text is wrapped in `ESC[200~` … `ESC[201~`; otherwise it is
+    /// sent as raw bytes.  No trailing carriage-return is appended.
+    ///
+    /// Returns `true` when the paste was consumed; `false` when no live
+    /// session exists for the selected issue.
+    fn forward_paste_to_detail_terminal(&mut self, text: &str) -> bool {
+        let Some(issue_key) = self.selected_issue_key() else {
             return false;
+        };
+        let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) else {
+            return false;
+        };
+        if sess.is_exited() {
+            return true;
         }
-        let Some(rect) = self.detail_terminal_pending_rect.get() else {
-            return false;
-        };
-        let Some(issue_num) = self.selected_issue_number() else {
-            return false;
-        };
-        // Rightmost column = scrollbar.  Match the example pattern
-        // (`scrollbar_col = vp.width - 1.0`).
-        let sb_col = (rect.x + rect.width - 1.0).max(rect.x);
-        let in_scrollbar = pos.x >= sb_col && pos.y >= rect.y && pos.y < rect.y + rect.height;
-        if !in_scrollbar {
-            return false;
+        sess.scroll_reset();
+        if sess.bracketed_paste_enabled() {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            sess.write_input(&bytes);
+        } else {
+            sess.write_input(text.as_bytes());
         }
-        let Some(sess) = self.detail_terminal_sessions.get(&issue_num) else {
-            return false;
-        };
-        let total = sess.history_len() + sess.rows() as usize;
-        let visible = sess.rows() as usize;
-        if total <= visible {
-            // Scrollbar not visible — nothing to drag.
-            return false;
-        }
-        let drag = DetailTerminalScrollbarDrag {
-            issue_num,
-            track_y: rect.y,
-            track_h: rect.height,
-            total,
-            visible,
-        };
-        self.detail_terminal_scrollbar_drag = Some(drag);
-        self.apply_detail_terminal_scrollbar_drag(pos.y);
         true
     }
 
-    /// Apply an in-progress detail-terminal scrollbar drag at Y (#446).
+    /// Resolve the coord-local repo name + per-issue terminal key for the
+    /// currently-selected Pipeline row (#467).
     ///
-    /// Mirrors `apply_scrollbar_drag` in `terminal_app.rs`: the scrollbar
-    /// is **inverted** — dragging to the top of the track shows the
-    /// oldest history, dragging to the bottom shows the live view.
-    fn apply_detail_terminal_scrollbar_drag(&mut self, y: f32) {
-        let (issue_num, track_y, track_h, max_scroll) = match self.detail_terminal_scrollbar_drag {
-            Some(d) => (
-                d.issue_num,
-                d.track_y,
-                d.track_h,
-                d.total.saturating_sub(d.visible),
-            ),
-            None => return,
+    /// Reads the SELECTED `pipeline_issues` row directly rather than looking
+    /// an issue up by number: issue numbers are not unique across repos
+    /// (e.g. vimcode #207 vs claude-coordinator #207), so a number lookup
+    /// could resolve the wrong repo and dispatch the wrong issue (#480).
+    /// Returns `(coord_repo_name, (repo_slug, number))`.
+    fn selected_issue_repo_and_key(&self) -> Option<(String, (String, u64))> {
+        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let repo = match issue.coord_repo.as_deref() {
+            Some(cr) if !cr.is_empty() => cr.to_string(),
+            _ => issue
+                .repo_slug
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())?
+                .to_string(),
         };
-        if track_h <= 0.0 {
-            return;
-        }
-        // fraction 0 = top of track, 1 = bottom of track
-        let fraction = ((y - track_y) / track_h).clamp(0.0, 1.0);
-        // Inverted: top → max history, bottom → live (offset 0)
-        let offset = ((1.0 - fraction) * max_scroll as f32).round() as usize;
-        if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
-            sess.set_scroll_offset(offset);
-        }
-    }
-
-    /// End any in-progress detail-terminal scrollbar drag (#446).  Returns
-    /// `true` if a drag was actually released so the caller can request a
-    /// redraw.
-    fn end_detail_terminal_scrollbar_drag(&mut self) -> bool {
-        self.detail_terminal_scrollbar_drag.take().is_some()
-    }
-
-    /// Resolve the coord-local repo name for an issue (#467).
-    ///
-    /// This is the value passed as `<repo>` in the auto-runned
-    /// `coord assign --interactive --repo <repo> <N>` line.  It matches
-    /// the repo names declared in `coordinator.yml` (the same names
-    /// `coord assign` accepts on its CLI).
-    ///
-    /// Resolution order:
-    /// 1. `issue.coord_repo` — the coord-local repo name.
-    /// 2. Last segment of `issue.repo_slug` (`"owner/repo"` → `"repo"`).
-    ///
-    /// Returns `None` only when the issue itself isn't in
-    /// `pipeline_issues` or when neither field yields a non-empty name
-    /// (caller surfaces a toast).
-    fn coord_repo_for_issue(&self, issue_num: u64) -> Option<String> {
-        let issue = self
-            .pipeline_issues
-            .iter()
-            .find(|iss| iss.number == issue_num)?;
-        if let Some(cr) = issue.coord_repo.as_deref() {
-            if !cr.is_empty() {
-                return Some(cr.to_string());
-            }
-        }
-        issue
-            .repo_slug
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+        Some((repo, (issue.repo_slug.clone(), issue.number)))
     }
 
     /// Launch a local human-attended `claude` session for the selected
     /// pipeline issue (#467; supersedes the ssh+tmux launcher previously
     /// built for #446).
     ///
-    /// # What this does
-    ///
-    /// 1. Resolves the coord-local repo name via [`coord_repo_for_issue`].
-    /// 2. Spawns a local shell session (`TerminalSession::spawn`) using the
-    ///    same path as the lazy-spawn in `drive_detail_terminals`.
-    /// 3. Auto-runs `coord assign --interactive --repo <repo> <N>` (with a
-    ///    trailing `\r`).  Only the *launcher* is auto-run — `coord assign
-    ///    --interactive` then drives the existing `interactive.py` seed
-    ///    path (bracketed-paste + readiness gate) so the briefing lands
-    ///    in claude's input box pre-filled.  There is NO manual kickoff
-    ///    injection from the TUI, NO clipboard hack, and NO ssh.
-    /// 4. Auto-focuses the PTY so the human can interact immediately.
-    ///
-    /// The session stays strictly human-attended: the TUI never parses the
-    /// session TTY for completion or verdict and never auto-advances the
-    /// pipeline state (Anthropic ToS §3.7 / #437).
+    /// Spawns a local shell session (`TerminalSession::spawn`) into the
+    /// per-issue map and auto-runs `coord assign --interactive …` (the
+    /// existing `interactive.py` seed path delivers the briefing).  The
+    /// session stays strictly human-attended — the TUI never parses the
+    /// session TTY for completion/verdict and never auto-advances the
+    /// pipeline (Anthropic ToS §3.7 / #437).
     fn launch_interactive_session_for_selected_issue(&mut self, mode: InteractiveLaunchMode) {
-        let Some(issue_num) = self.selected_issue_number() else {
-            return;
-        };
-
-        let Some(repo) = self.coord_repo_for_issue(issue_num) else {
+        let Some((repo, issue_key)) = self.selected_issue_repo_and_key() else {
             self.pipeline_status = Some((
                 "Cannot resolve repo for this issue — interactive session not launched".to_string(),
                 Instant::now(),
             ));
             return;
         };
+        let issue_num = issue_key.1;
 
         // `coord assign` needs a MACHINE positional; for a local human-attended
         // launch that's this machine (hostname-matched into coordinator.yml).
@@ -18212,7 +18884,7 @@ impl CoordApp {
             .map(|p| p.to_string_lossy().into_owned());
 
         let (cols, rows) = self.detail_terminal_pending_dims.get().unwrap_or((80, 24));
-        let cwd = self.detail_terminal_cwd(issue_num);
+        let cwd = self.detail_terminal_cwd(&issue_key);
         let shell = quadraui::terminal_engine::default_shell();
 
         match quadraui::terminal_engine::TerminalSession::spawn(
@@ -18223,9 +18895,8 @@ impl CoordApp {
             10_000,
         ) {
             Ok(mut sess) => {
-                // Auto-run the launcher line.  Re-pressing `s` while a
-                // previous interactive session is still alive replaces the
-                // old PTY (old session is dropped on `insert`).
+                // Auto-run the launcher line.  Re-pressing `s` while a previous
+                // interactive session is still alive replaces the old PTY.
                 let launch_line = build_interactive_launch_cmd(
                     cfg_path.as_deref(),
                     &machine,
@@ -18235,12 +18906,9 @@ impl CoordApp {
                 );
                 sess.send_str(&launch_line);
 
-                // Replace any existing session (the old one is dropped here).
-                self.detail_terminal_sessions.insert(issue_num, sess);
-                self.detail_terminal_spawn_errors.remove(&issue_num);
+                self.detail_terminal_sessions.insert(issue_key.clone(), sess);
+                self.detail_terminal_spawn_errors.remove(&issue_key);
 
-                // Pipeline status hint so the human knows the launcher
-                // line is on its way.
                 let verb = match mode {
                     InteractiveLaunchMode::Work => "work",
                     InteractiveLaunchMode::Plan => "plan→work",
@@ -18257,8 +18925,7 @@ impl CoordApp {
                 self.detail_terminal_focused = true;
             }
             Err(e) => {
-                self.detail_terminal_spawn_errors
-                    .insert(issue_num, e.to_string());
+                self.detail_terminal_spawn_errors.insert(issue_key, e.to_string());
             }
         }
     }
@@ -18276,11 +18943,8 @@ impl CoordApp {
         let cols = (rect.width / cell_w).floor().max(1.0) as u16;
         let rows = (rect.height / lh).floor().max(1.0) as u16;
         self.detail_terminal_pending_dims.set(Some((cols, rows)));
-        // #446: stash the exact rect for mouse handlers (Scroll / scrollbar
-        // drag).  Cell so the `&self` render path can write to it.
-        self.detail_terminal_pending_rect.set(Some(rect));
 
-        let Some(issue_num) = self.selected_issue_number() else {
+        let Some(issue_key) = self.selected_issue_key() else {
             // No issue selected — show a neutral placeholder.
             backend.draw_list(
                 rect,
@@ -18302,19 +18966,21 @@ impl CoordApp {
             return;
         };
 
-        if let Some(sess) = self.detail_terminal_sessions.get(&issue_num) {
+        if let Some(sess) = self.detail_terminal_sessions.get(&issue_key) {
             let total = sess.history_len() + sess.rows() as usize;
             let sb = if total > sess.rows() as usize {
                 Some(sess.scrollbar_state(None))
             } else {
                 None
             };
-            let snapshot =
-                sess.to_terminal(WidgetId::new(format!("detail-terminal:{}", issue_num)), sb);
+            let snapshot = sess.to_terminal(
+                WidgetId::new(format!("detail-terminal:{}:{}", issue_key.0, issue_key.1)),
+                sb,
+            );
             backend.draw_terminal(rect, &snapshot);
         } else {
             // Session pending or spawn error.
-            let (msg, color) = match self.detail_terminal_spawn_errors.get(&issue_num) {
+            let (msg, color) = match self.detail_terminal_spawn_errors.get(&issue_key) {
                 Some(err) => (
                     format!("  Terminal failed to start: {}  (F12 to focus)", err),
                     Color::rgb(220, 80, 80),
@@ -18691,8 +19357,10 @@ impl ShellApp for CoordApp {
         match self.active_view {
             SidebarView::Board => {
                 // Tab bar (Board / Issue / Chat), then the active tab's content.
+                // `#464`: route through `detail_tab_bar_height` so render and
+                // hit-test agree on the cell boundary in the TUI backend.
                 let tab_bar = self.board_detail_tab_bar();
-                let tab_h = lh * 1.4;
+                let tab_h = detail_tab_bar_height(lh);
                 let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                 let content_rect =
                     Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
@@ -18717,7 +19385,16 @@ impl ShellApp for CoordApp {
                 }
             }
             SidebarView::Machines => {
-                backend.draw_list(m, &self.machine_detail_list());
+                // #207: Reserve two sparkline rows (CPU + mem) at the bottom
+                // of the main panel.  Each row is 2 × lh tall: one cell for
+                // the label line and one for the chart body.  When there are
+                // no metrics yet the area shows a subtle placeholder.
+                let chart_h = lh * 4.0; // 2 rows × 2 lh each
+                let detail_h = (m.height - chart_h).max(0.0);
+                let detail_rect = Rect::new(m.x, m.y, m.width, detail_h);
+                let chart_rect = Rect::new(m.x, m.y + detail_h, m.width, chart_h);
+                backend.draw_list(detail_rect, &self.machine_detail_list());
+                self.render_machine_sparklines(backend, chart_rect, lh);
             }
             SidebarView::Settings => {
                 // Build form for the current category and render via
@@ -18733,9 +19410,11 @@ impl ShellApp for CoordApp {
                 if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
                     backend.draw_list(m, &self.pipeline_placeholder_list());
                 } else {
-                    // Tab bar.
+                    // Tab bar.  `#464`: route through `detail_tab_bar_height`
+                    // so the painted top of the content rect lines up with
+                    // the hit-test origin in the TUI backend.
                     let tab_bar = self.pipeline_detail_tab_bar();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                     let content_rect =
                         Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
@@ -19047,6 +19726,31 @@ impl ShellApp for CoordApp {
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
 
+        // ── #464: Ctrl-C copies active terminal host-selection ──────────
+        // Fires for BOTH terminal views (standalone Terminal and
+        // Pipeline/Terminal tab) regardless of whether PTY-passthrough is
+        // active. When there is an active host selection, Ctrl-C copies the
+        // text and is consumed — it does NOT propagate to the PTY (so no
+        // accidental interrupt of the running process). When there is no
+        // selection, this block is a no-op and Ctrl-C falls through to the
+        // normal PTY-passthrough path below.
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            if matches!(key, Key::Char('c') | Key::Char('C'))
+                && modifiers.ctrl
+                && !modifiers.alt
+            {
+                if let Some(text) = self.active_terminal_selected_text() {
+                    backend.services().clipboard().write_text(&text);
+                    self.clear_active_terminal_selection();
+                    // Platform contract (#464): emit TextCopied so copy-confirmation
+                    // UI and future listeners observe terminal copies, matching the
+                    // quadraui built-in text-selection copy path (tui/run.rs:258).
+                    let _ = self.handle(UiEvent::TextCopied(text), backend, ctx);
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
         // ── #424: embedded terminal pane focus arbitration ──────────────
         // PROTOCOL:
         //   - When `active_view == SidebarView::Terminal`:
@@ -19062,8 +19766,7 @@ impl ShellApp for CoordApp {
         //
         // Mouse/window events fall through to normal handlers — the
         // Terminal view doesn't need special mouse handling for the MVP
-        // (no selection / scrollbar drag wired up yet; copy-out is
-        // tracked in quadraui #283).
+        // (copy-out is now implemented in #464 above).
         if self.active_view == SidebarView::Terminal {
             if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                 // F12 = focus-toggle — always handled, independent of
@@ -19082,6 +19785,16 @@ impl ShellApp for CoordApp {
                     // return value (a missing PTY just swallows the key
                     // — the placeholder pane shows why).
                     let _ = self.forward_key_to_pty(key, modifiers);
+                    return Reaction::Redraw;
+                }
+            }
+            // #468: forward host-clipboard paste to the PTY when focused.
+            // Wraps in ESC[200~…ESC[201~ when the PTY has bracketed-paste
+            // mode enabled; otherwise sends raw bytes.  No trailing \r —
+            // let the human press Enter.
+            if self.terminal_focused {
+                if let UiEvent::ClipboardPaste(text) = &event {
+                    let _ = self.forward_paste_to_pty(text);
                     return Reaction::Redraw;
                 }
             }
@@ -19128,6 +19841,13 @@ impl ShellApp for CoordApp {
                     && !modifiers.shift
                 {
                     self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Work);
+                    return Reaction::Redraw;
+                }
+            }
+            // #468: forward host-clipboard paste to the per-issue PTY.
+            if self.detail_terminal_focused {
+                if let UiEvent::ClipboardPaste(text) = &event {
+                    let _ = self.forward_paste_to_detail_terminal(text);
                     return Reaction::Redraw;
                 }
             }
@@ -19237,9 +19957,10 @@ impl ShellApp for CoordApp {
                 let main_rect = if chat_is_refinement {
                     // Match the Refinement tab's content_rect so handle()'s
                     // layout maths agree with what's painted.
+                    // `#464`: rounded helper so TUI render and hit-test agree.
                     let m = ctx.main_bounds();
                     let lh = backend.line_height();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     // Account for the panel toolbar carve-out done in
                     // render_content (#272).  When panel_toolbar() returns
                     // None we just shave the tab bar.
@@ -19261,9 +19982,10 @@ impl ShellApp for CoordApp {
                     )
                 } else if chat_is_board {
                     // Match the Board Chat tab's content_rect.
+                    // `#464`: rounded helper so TUI render and hit-test agree.
                     let m = ctx.main_bounds();
                     let lh = backend.line_height();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0))
                 } else {
                     ctx.main_bounds()
@@ -22161,6 +22883,117 @@ fn record_test_verdict_db(
     record_test_verdict_conn(&conn, assignment_id, verdict, reason)
 }
 
+// ─── Terminal mouse coordinate helpers ────────────────────────────────────────
+
+/// Height of the detail-panel tab bar (Board / Pipeline tabs row), in
+/// pixels for the GTK / macOS backends and in cell rows for the TUI
+/// backend.
+///
+/// Both backends paint the tab row at `(lh * 1.4).round()`:
+///
+/// - GTK/macOS (`lh ≈ 20 px`): `28 px` — the design height; rounding is
+///   a no-op since `20 * 1.4 = 28` already.
+/// - TUI (`lh = 1 cell`): `1 cell` — the ratatui backend rasterises
+///   into integer rows via [`quadraui::tui::backend::q_rect_to_ratatui`],
+///   so the painted tab row is **one whole cell** even though `lh * 1.4`
+///   would suggest a fractional `1.4` rows.
+///
+/// `#464`: hit-tests against the terminal content area must use the
+/// SAME rounded origin as the render path, or the click-to-cell mapping
+/// drifts by one row.  Before this helper existed, render used `lh*1.4`
+/// (rounded to `1` cell at draw time by `q_rect_to_ratatui`) while the
+/// hit-tests used the unrounded `1.4` — so a click at the top content
+/// cell mapped to "row -1" (rejected) and a click one row below mapped
+/// to row 0, etc.  Funnelling both code paths through this helper keeps
+/// them in lock-step.
+///
+/// `.max(lh)` guarantees at least one full line height, which matters
+/// for any future call site that might pass `lh < 1.0`.
+fn detail_tab_bar_height(lh: f32) -> f32 {
+    (lh * 1.4).round().max(lh)
+}
+
+/// Translate a pixel position into terminal (col, row) cell coordinates.
+///
+/// `rect` is the full bounding box of the PTY surface (in pixels).
+/// `origin_y` is the Y pixel coordinate where **row 0** starts:
+///   - Standalone `SidebarView::Terminal`: pass `rect.y`
+///     (the entire main-content rect is the PTY area, no toolbar above it).
+///   - `SidebarView::Pipeline` with the Terminal tab: pass
+///     `rect.y + detail_tab_bar_height(lh)` (the rounded tab bar height —
+///     `#464`: must match the render path, which `q_rect_to_ratatui`
+///     rounds the same way).
+///
+/// `char_w` and `line_h` are the backend's character cell dimensions in pixels.
+/// Both are clamped to `1.0` to guard against zero/sub-pixel values.
+///
+/// Returns `None` when `pos` lies outside the active PTY area
+/// (left of `rect.x`, right of `rect.x + rect.width`, above `origin_y`, or
+/// below `rect.y + rect.height`).
+fn terminal_pixel_to_cell(
+    pos: Point,
+    rect: Rect,
+    origin_y: f32,
+    char_w: f32,
+    line_h: f32,
+) -> Option<(u16, u16)> {
+    let cw = char_w.max(1.0);
+    let ch = line_h.max(1.0);
+    if pos.x < rect.x
+        || pos.x >= rect.x + rect.width
+        || pos.y < origin_y
+        || pos.y >= rect.y + rect.height
+    {
+        return None;
+    }
+    let col = ((pos.x - rect.x) / cw) as u16;
+    let row = ((pos.y - origin_y) / ch) as u16;
+    Some((col, row))
+}
+
+/// Clamping variant of [`terminal_pixel_to_cell`] used by the `Release`
+/// path (#454): when the cursor has been dragged outside the PTY content
+/// area, we still need to forward a `Release` to the embedded terminal —
+/// the canonical xterm-mouse protocol assumes every `Press` is matched by
+/// a `Release`.  Clamping `pos` to the content rect yields a valid
+/// `(col, row)` for the edge cell instead of dropping the event.
+///
+/// The right/bottom edges are exclusive, mirroring
+/// [`terminal_pixel_to_cell`]: we clamp to `width - 1` / `height - 1` so
+/// the returned cell stays inside the visible grid.
+fn terminal_pixel_to_cell_clamped(
+    pos: Point,
+    rect: Rect,
+    origin_y: f32,
+    char_w: f32,
+    line_h: f32,
+) -> (u16, u16) {
+    let cw = char_w.max(1.0);
+    let ch = line_h.max(1.0);
+    // `rect.width.max(1.0) - 1.0` keeps the right edge inclusive for
+    // clamping while keeping `terminal_pixel_to_cell`'s exclusive
+    // semantics for the bounds check above.
+    let right_inclusive = rect.x + (rect.width.max(1.0) - 1.0);
+    let bottom_inclusive = rect.y + (rect.height.max(1.0) - 1.0);
+    let cx = pos.x.clamp(rect.x, right_inclusive);
+    let cy = pos.y.clamp(origin_y, bottom_inclusive);
+    let col = ((cx - rect.x) / cw) as u16;
+    let row = ((cy - origin_y) / ch) as u16;
+    (col, row)
+}
+
+/// Map a [`MouseButton`] to the bit used in `pty_pressed_buttons` (#454).
+/// Returns `0` for buttons we do not track (X1/X2/Other) so that a Press
+/// for those buttons never sets a Release-pending flag.
+fn pty_button_bit(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Middle => 2,
+        MouseButton::Right => 4,
+        _ => 0,
+    }
+}
+
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -22431,9 +23264,14 @@ mod tests {
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
-            // #446
-            detail_terminal_pending_rect: std::cell::Cell::new(None),
-            detail_terminal_scrollbar_drag: None,
+            // #454
+            pty_pressed_buttons: 0,
+            // #464
+            terminal_host_sel_dragging: false,
+            // #207
+            machine_metrics: std::collections::HashMap::new(),
+            pending_metrics: Vec::new(),
+            metrics_last_polled: Instant::now(),
         }
     }
 
@@ -23013,7 +23851,7 @@ mod tests {
         let lh: f32 = 1.0;
         // #438: Pipeline has no panel toolbar — no toolbar offset.
         let tb_h = 0.0_f32;
-        let tab_h = lh * 1.4;
+        let tab_h = detail_tab_bar_height(lh);
         let content_rect = Rect::new(
             main_b.x,
             main_b.y + tb_h + tab_h,
@@ -23069,7 +23907,7 @@ mod tests {
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let lh: f32 = 1.0;
         // #438: no panel toolbar on Pipeline; content starts directly after the tab row.
-        let tab_h = lh * 1.4;
+        let tab_h = detail_tab_bar_height(lh);
         let content_rect = Rect::new(
             main_b.x,
             main_b.y + tab_h,
@@ -31826,10 +32664,9 @@ mod tests {
         let mut app = make_app_default();
         // Pretend issue #1 has an active session (use a marker in the error
         // map since we can't easily inject a real TerminalSession here).
-        app.detail_terminal_spawn_errors
-            .insert(1, "test-error".to_string());
-        app.detail_terminal_spawn_errors
-            .insert(2, "test-error-2".to_string());
+        // Keys are (repo_slug, number) per #455.
+        app.detail_terminal_spawn_errors.insert(("o/r".to_string(), 1), "test-error".to_string());
+        app.detail_terminal_spawn_errors.insert(("o/r".to_string(), 2), "test-error-2".to_string());
 
         // Simulate a pipeline refresh that drops issue #1 but keeps #2.
         let new_issues = vec![PipelineIssue {
@@ -31842,23 +32679,84 @@ mod tests {
             all_labels: vec![],
             is_closed: false,
         }];
-        // Apply the same logic that apply_pipeline_load uses.
+        // Apply the same logic that poll_pipeline_loader uses.
         app.pipeline_issues = new_issues;
-        let live_nums: std::collections::HashSet<u64> =
-            app.pipeline_issues.iter().map(|i| i.number).collect();
-        app.detail_terminal_sessions
-            .retain(|k, _| live_nums.contains(k));
-        app.detail_terminal_spawn_errors
-            .retain(|k, _| live_nums.contains(k));
+        let live_keys: std::collections::HashSet<(String, u64)> =
+            app.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
+        app.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
+        app.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
 
         // Issue #1 should have been pruned; issue #2 should remain.
         assert!(
-            !app.detail_terminal_spawn_errors.contains_key(&1),
+            !app.detail_terminal_spawn_errors.contains_key(&("o/r".to_string(), 1)),
             "stale session for #1 should be pruned"
         );
         assert!(
-            app.detail_terminal_spawn_errors.contains_key(&2),
+            app.detail_terminal_spawn_errors.contains_key(&("o/r".to_string(), 2)),
             "kept session for #2 should remain"
+        );
+    }
+
+    /// #455: same issue number in two different repos must get independent
+    /// session / error slots — no collision.
+    #[test]
+    fn detail_terminal_sessions_keyed_by_repo_and_number() {
+        let mut app = make_app_default();
+
+        // Two repos, both happen to have an issue #336.
+        let key_a = ("quadraui/quadraui".to_string(), 336u64);
+        let key_b = ("JDonaghy/claude-coordinator".to_string(), 336u64);
+
+        app.detail_terminal_spawn_errors.insert(key_a.clone(), "err-a".to_string());
+        app.detail_terminal_spawn_errors.insert(key_b.clone(), "err-b".to_string());
+
+        // Both entries must coexist independently.
+        assert_eq!(
+            app.detail_terminal_spawn_errors.get(&key_a).map(String::as_str),
+            Some("err-a"),
+            "quadraui #336 slot should hold err-a"
+        );
+        assert_eq!(
+            app.detail_terminal_spawn_errors.get(&key_b).map(String::as_str),
+            Some("err-b"),
+            "coordinator #336 slot should hold err-b"
+        );
+        assert_eq!(app.detail_terminal_spawn_errors.len(), 2, "must have two distinct entries");
+
+        // selected_issue_key() returns the right composite key.
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 336,
+                title: "quadraui issue".to_string(),
+                body: String::new(),
+                repo_slug: "quadraui/quadraui".to_string(),
+                coord_repo: None,
+                matched_labels: vec![],
+                all_labels: vec![],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 336,
+                title: "coord issue".to_string(),
+                body: String::new(),
+                repo_slug: "JDonaghy/claude-coordinator".to_string(),
+                coord_repo: None,
+                matched_labels: vec![],
+                all_labels: vec![],
+                is_closed: false,
+            },
+        ];
+        app.pipeline_sel = Some(0);
+        assert_eq!(
+            app.selected_issue_key(),
+            Some(("quadraui/quadraui".to_string(), 336)),
+            "selected_issue_key must include repo slug"
+        );
+        app.pipeline_sel = Some(1);
+        assert_eq!(
+            app.selected_issue_key(),
+            Some(("JDonaghy/claude-coordinator".to_string(), 336)),
+            "different repo with same number gives different key"
         );
     }
 
@@ -31906,9 +32804,13 @@ mod tests {
         // Manually spawn a session into the per-issue map (bypasses the lazy
         // spawn in drive_detail_terminals which needs pending_dims from render).
         let cwd = std::env::temp_dir();
-        let sess = quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
-            .expect("spawn /bin/sh");
-        app.detail_terminal_sessions.insert(440, sess);
+        let sess = quadraui::terminal_engine::TerminalSession::spawn(
+            80, 24, "/bin/sh", &cwd, 1000,
+        )
+        .expect("spawn /bin/sh");
+        // Key is (repo_slug, issue_number) per #455.
+        let issue_key = ("owner/repo".to_string(), 440u64);
+        app.detail_terminal_sessions.insert(issue_key.clone(), sess);
 
         // Type 'echo __detail_marker__' + Enter via forward_key_to_detail_terminal.
         let line = "echo __detail_marker__";
@@ -31918,25 +32820,16 @@ mod tests {
         for ch in line.chars() {
             let bytes = key_to_pty_bytes(Key::Char(ch), quadraui::Modifiers::default())
                 .expect("char must encode");
-            app.detail_terminal_sessions
-                .get_mut(&440)
-                .unwrap()
-                .write_input(&bytes);
+            app.detail_terminal_sessions.get_mut(&issue_key).unwrap().write_input(&bytes);
         }
-        app.detail_terminal_sessions
-            .get_mut(&440)
-            .unwrap()
-            .write_input(&enter_bytes);
+        app.detail_terminal_sessions.get_mut(&issue_key).unwrap().write_input(&enter_bytes);
 
         // Poll until marker appears or 5 s elapse.
         let start = Instant::now();
         let mut found = false;
         while start.elapsed() < Duration::from_secs(5) {
-            app.detail_terminal_sessions.get_mut(&440).unwrap().poll();
-            if app.detail_terminal_sessions[&440]
-                .full_text()
-                .contains("__detail_marker__")
-            {
+            app.detail_terminal_sessions.get_mut(&issue_key).unwrap().poll();
+            if app.detail_terminal_sessions[&issue_key].full_text().contains("__detail_marker__") {
                 found = true;
                 break;
             }
@@ -31945,14 +32838,1062 @@ mod tests {
         assert!(
             found,
             "echo output not visible in per-issue PTY within 5s; full_text={:?}",
-            app.detail_terminal_sessions[&440].full_text(),
+            app.detail_terminal_sessions[&issue_key].full_text(),
         );
 
         // Tidy up.
         app.detail_terminal_sessions
-            .get_mut(&440)
+            .get_mut(&issue_key)
             .unwrap()
             .write_input(b"exit\r");
+    }
+
+    // ── terminal_pixel_to_cell ────────────────────────────────────────────────
+    //
+    // These tests exercise the coordinate-translation helper in isolation, before
+    // any session exists.  They cover:
+    //   (a) the standalone Terminal branch: origin_y == rect.y
+    //   (b) the Pipeline/Terminal branch:  origin_y == rect.y + tab_h
+    //   (c) boundary / out-of-bounds cases for all four edges
+    //   (d) char_w / line_h clamping to 1.0
+
+    #[test]
+    fn tpc_top_left_corner_maps_to_origin() {
+        // Clicking the very first pixel of the PTY area should be (col=0, row=0).
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(10.0, 20.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn tpc_mid_rect_correct_col_row() {
+        // x-offset = 24 px / 8 px-per-col = col 3
+        // y-offset = 32 px / 16 px-per-row = row 2
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(34.0, 52.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0),
+            Some((3, 2))
+        );
+    }
+
+    #[test]
+    fn tpc_outside_left_returns_none() {
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(9.9, 30.0);
+        assert_eq!(terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0), None);
+    }
+
+    #[test]
+    fn tpc_at_right_edge_exclusive_returns_none() {
+        // x == rect.x + rect.width is *outside* (exclusive upper bound)
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(90.0, 30.0); // 10 + 80 = 90 → None
+        assert_eq!(terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0), None);
+    }
+
+    #[test]
+    fn tpc_outside_top_returns_none() {
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(30.0, 19.9);
+        assert_eq!(terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0), None);
+    }
+
+    #[test]
+    fn tpc_at_bottom_edge_exclusive_returns_none() {
+        // y == rect.y + rect.height is *outside* (exclusive upper bound)
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(30.0, 60.0); // 20 + 40 = 60 → None
+        assert_eq!(terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0), None);
+    }
+
+    /// Pipeline/Terminal branch: the tab bar occupies `lh * 1.4` pixels above
+    /// the content area, so `origin_y = rect.y + lh * 1.4`.
+    #[test]
+    fn tpc_pipeline_tab_bar_area_returns_none() {
+        let rect = Rect::new(0.0, 0.0, 100.0, 80.0);
+        let lh = 16.0_f32;
+        let origin_y = rect.y + lh * 1.4; // 22.4
+        // Cursor in the tab bar (y=10 < 22.4) → None
+        let in_tab = Point::new(50.0, 10.0);
+        assert_eq!(terminal_pixel_to_cell(in_tab, rect, origin_y, 8.0, lh), None);
+    }
+
+    #[test]
+    fn tpc_pipeline_content_just_below_tab_bar_is_row_zero() {
+        let rect = Rect::new(0.0, 0.0, 100.0, 80.0);
+        let lh = 16.0_f32;
+        let origin_y = rect.y + lh * 1.4; // 22.4
+        // Cursor at y == origin_y → row 0; x=50 / cw=8 → col 6
+        let just_below = Point::new(50.0, 22.4);
+        assert_eq!(
+            terminal_pixel_to_cell(just_below, rect, origin_y, 8.0, lh),
+            Some((6, 0))
+        );
+    }
+
+    #[test]
+    fn tpc_pipeline_content_mid_area_correct_row_offset() {
+        // The row is measured from origin_y, NOT from rect.y.
+        // y=54.4, origin_y=22.4 → y_offset=32.0 / 16 = row 2
+        // x=16.0 / 8.0 = col 2
+        let rect = Rect::new(0.0, 0.0, 100.0, 80.0);
+        let lh = 16.0_f32;
+        let origin_y = rect.y + lh * 1.4; // 22.4
+        let pos = Point::new(16.0, 54.4);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 8.0, lh),
+            Some((2, 2))
+        );
+    }
+
+    #[test]
+    fn tpc_zero_char_dimensions_clamped_to_one() {
+        // char_w=0.0 / line_h=0.0 must clamp to 1.0 (no divide-by-zero).
+        let rect = Rect::new(0.0, 0.0, 50.0, 50.0);
+        let pos = Point::new(5.0, 10.0);
+        // cw=1.0 → col=5;  ch=1.0 → row=10
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, rect.y, 0.0, 0.0),
+            Some((5, 10))
+        );
+    }
+
+    // ── #464: TUI integer-cell hit-test (lh = 1 cell) ────────────────────────
+    //
+    // The TUI backend rasterises at one whole cell per line-height; the
+    // ratatui buffer is a u16 grid so `q_rect_to_ratatui` rounds the
+    // fractional `1.4 * lh` tab-bar height to `1` cell.  These tests
+    // demonstrate the render origin (which the user clicks against) and
+    // the hit-test origin BOTH agree on that rounded value — without the
+    // helper, hit-test landed one row above the click and the top
+    // content cell was unreachable.
+
+    #[test]
+    fn detail_tab_bar_height_tui_rounds_to_one_cell() {
+        // TUI: lh=1 cell → tab bar is exactly 1 cell tall (rounded down from 1.4).
+        assert_eq!(detail_tab_bar_height(1.0), 1.0);
+    }
+
+    #[test]
+    fn detail_tab_bar_height_gtk_is_28_px() {
+        // GTK/macOS: lh≈20 px → tab bar is 28 px (1.4 × lh, no rounding loss).
+        assert_eq!(detail_tab_bar_height(20.0), 28.0);
+    }
+
+    #[test]
+    fn detail_tab_bar_height_at_least_one_lh() {
+        // Even for tiny `lh < 1.0`, the bar is guaranteed at least one
+        // line height tall so the click target never collapses.
+        assert!(detail_tab_bar_height(0.5) >= 0.5);
+    }
+
+    /// `#464` reproducer: with the TUI backend, the FIRST visible content
+    /// cell must hit-test to (col=0, row=0).  Before the helper, the
+    /// fractional `1.4` origin made `pos.y < origin_y` true for the top
+    /// content row, so the top-left cell was unselectable (returned `None`).
+    #[test]
+    fn tpc_tui_pipeline_top_left_content_cell_maps_to_origin() {
+        // TUI mouse coords are integer cells: row 0 of content is at the
+        // pixel row immediately below the tab bar (= origin_y).  With
+        // lh=1, the render places content cell (0,0) at exactly that pixel.
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        let pos = Point::new(0.0, origin_y); // top-left content cell
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((0, 0)),
+            "top-left of content area must map to (col=0, row=0) — \
+             before #464 fix this returned None"
+        );
+    }
+
+    /// `#464` reproducer: with the TUI backend, a click in the middle of
+    /// the content area must hit-test to the same `(col, row)` the user
+    /// visually clicked.  Before the helper, the row was off by one
+    /// (hit-test returned `R-1` for a click at visual row `R`).
+    #[test]
+    fn tpc_tui_pipeline_middle_content_cell_matches_click() {
+        // Click at visual content (col=5, row=4) — pixel position is
+        // (main_b.x + 5, main_b.y + detail_tab_bar_height(lh) + 4).
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        let pos = Point::new(5.0, origin_y + 4.0); // (col=5, row=4)
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((5, 4)),
+            "click at visual (col=5, row=4) must hit-test to (col=5, row=4) — \
+             before #464 fix this returned (col=5, row=3)"
+        );
+    }
+
+    /// `#464` reproducer: the bottom content cell must also map correctly,
+    /// not be silently rejected by the bounds check.
+    #[test]
+    fn tpc_tui_pipeline_bottom_content_cell_maps_correctly() {
+        // rect.height = 24, tab_h = 1, so content occupies rows 0..22
+        // (22 inclusive rows numbered 0..=22).  Click on the last
+        // selectable content cell.
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        // Bottom-most content row = (rect.y + rect.height - 1) -
+        // origin_y = 22.  Click at that pixel y.
+        let pos = Point::new(3.0, rect.y + rect.height - 1.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((3, 22))
+        );
+    }
+
+    /// `#464`: the tab-bar pixel row must STILL return `None` after the
+    /// fix — the tab bar itself is not part of the PTY content.
+    #[test]
+    fn tpc_tui_pipeline_tab_bar_row_returns_none() {
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        // y=0 is inside the tab bar — still must reject.
+        let pos = Point::new(5.0, 0.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            None
+        );
+    }
+
+    // ── terminal_mouse_event routing ─────────────────────────────────────────
+    //
+    // These tests verify that `terminal_mouse_event` delegates to the correct
+    // branch for each SidebarView.  Because no real TerminalSession is wired up
+    // in `make_test_app`, every call returns `false` — the useful invariant is
+    // that neither branch panics and the code compiles against both view paths.
+
+    #[test]
+    fn terminal_mouse_event_terminal_view_no_session_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // Point inside the PTY rect — returns false because session is None.
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            MouseButton::Left,
+            Point::new(50.0, 50.0),
+            Modifiers::default(),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_mouse_event_terminal_view_outside_rect_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(100.0, 50.0, 80.0, 40.0);
+        // Point outside the rect — returns false immediately without touching session.
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            quadraui::MouseButton::Left,
+            Point::new(10.0, 10.0), // well outside
+            quadraui::Modifiers::default(),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_mouse_event_pipeline_terminal_tab_no_session_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // Point inside the content area (below the tab bar).
+        let lh = 16.0_f32;
+        let content_y = main_b.y + lh * 1.4; // 22.4
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            quadraui::MouseButton::Left,
+            Point::new(50.0, content_y + 5.0), // just inside the PTY content
+            quadraui::Modifiers::default(),
+            main_b,
+            lh,
+            8.0,
+        );
+        assert!(!result); // no session → false
+    }
+
+    #[test]
+    fn terminal_mouse_event_pipeline_terminal_tab_in_tab_bar_returns_false() {
+        // A point in the tab bar (above origin_y) must return false — it lies
+        // outside the PTY content rect and should never reach forward_mouse.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let lh = 16.0_f32;
+        // y=5.0 is inside the tab bar (tab_h=22.4), not in the PTY area.
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            quadraui::MouseButton::Left,
+            Point::new(50.0, 5.0),
+            quadraui::Modifiers::default(),
+            main_b,
+            lh,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_mouse_event_non_terminal_view_returns_false() {
+        // Board view has no PTY — the _ arm must return false immediately.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Board;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.terminal_mouse_event(
+            TerminalMouseKind::Press,
+            MouseButton::Left,
+            Point::new(50.0, 50.0),
+            Modifiers::default(),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    // ── terminal_pixel_to_cell_clamped ───────────────────────────────────────
+    //
+    // The clamping variant is used by the release-outside-bounds path
+    // (#454 review fix 1).  Unlike `terminal_pixel_to_cell`, it returns
+    // a valid cell even when `pos` is outside the rect: clamps left/top
+    // to the origin and right/bottom to width-1 / height-1.
+
+    #[test]
+    fn tpc_clamped_inside_rect_matches_unclamped() {
+        // For a point already inside the rect, the clamped variant
+        // should agree with the unclamped variant.
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(34.0, 52.0);
+        let unclamped = terminal_pixel_to_cell(pos, rect, rect.y, 8.0, 16.0).unwrap();
+        let clamped = terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0);
+        assert_eq!(unclamped, clamped);
+    }
+
+    #[test]
+    fn tpc_clamped_outside_left_clamps_to_col_zero() {
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(-50.0, 30.0); // way left of the rect
+        assert_eq!(
+            terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0),
+            (0, 0),
+        );
+    }
+
+    #[test]
+    fn tpc_clamped_outside_right_clamps_to_last_col() {
+        // rect.width = 80 → right_inclusive = rect.x + 79.0
+        // 79.0 / 8.0 = col 9 (last visible col in an 80-wide rect at 8 px/cell)
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(1000.0, 30.0);
+        let (col, row) = terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0);
+        assert_eq!(col, 9);
+        // 30.0 - 20.0 = 10 → 10 / 16 = row 0
+        assert_eq!(row, 0);
+    }
+
+    #[test]
+    fn tpc_clamped_outside_below_clamps_to_last_row() {
+        // rect.height = 40 → bottom_inclusive = rect.y + 39.0
+        // 39.0 / 16.0 = row 2
+        let rect = Rect::new(10.0, 20.0, 80.0, 40.0);
+        let pos = Point::new(34.0, 1000.0);
+        let (col, row) = terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0);
+        assert_eq!(col, 3);
+        assert_eq!(row, 2);
+    }
+
+    #[test]
+    fn tpc_clamped_zero_dimensions_dont_panic() {
+        // width=0, height=0 → max(1.0)-1.0 = 0.0, so right == rect.x; cell is (0,0).
+        let rect = Rect::new(0.0, 0.0, 0.0, 0.0);
+        let pos = Point::new(100.0, 100.0);
+        assert_eq!(
+            terminal_pixel_to_cell_clamped(pos, rect, rect.y, 8.0, 16.0),
+            (0, 0),
+        );
+    }
+
+    // ── pty_button_bit ────────────────────────────────────────────────────────
+
+    #[test]
+    fn pty_button_bit_mapping_is_distinct() {
+        // Left/Middle/Right must each map to a distinct non-zero bit;
+        // X1/X2/Other must map to 0 so they don't trigger the release
+        // bookkeeping (we don't forward them to the PTY anyway).
+        assert_eq!(pty_button_bit(MouseButton::Left), 1);
+        assert_eq!(pty_button_bit(MouseButton::Middle), 2);
+        assert_eq!(pty_button_bit(MouseButton::Right), 4);
+        assert_eq!(pty_button_bit(MouseButton::X1), 0);
+        assert_eq!(pty_button_bit(MouseButton::X2), 0);
+        assert_eq!(pty_button_bit(MouseButton::Other(7)), 0);
+    }
+
+    // ── pty_pressed_buttons field initial state ──────────────────────────────
+
+    #[test]
+    fn pty_pressed_buttons_starts_at_zero() {
+        // Press tracking starts empty — no outstanding releases on first frame.
+        let app = make_test_app(BoardData::default());
+        assert_eq!(app.pty_pressed_buttons, 0);
+    }
+
+    // ── terminal_force_release routing ───────────────────────────────────────
+    //
+    // The release-outside-bounds helper (#454 review fix 1).  Without a
+    // real session attached, both branches return false; the invariant
+    // is that neither panics and the routing matches `terminal_mouse_event`.
+
+    #[test]
+    fn terminal_force_release_terminal_view_no_session_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // Far-out-of-bounds position must not panic in the clamp path.
+        let result = app.terminal_force_release(
+            MouseButton::Left,
+            Point::new(-500.0, -500.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_force_release_pipeline_terminal_no_session_returns_false() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.terminal_force_release(
+            MouseButton::Right,
+            Point::new(9999.0, 9999.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    #[test]
+    fn terminal_force_release_non_terminal_view_returns_false() {
+        // Board view: no PTY routing → false, no panic.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Board;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.terminal_force_release(
+            MouseButton::Left,
+            Point::new(50.0, 50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(!result);
+    }
+
+    // ── mouse_main_scroll: wheel-forwarding path (#454 review issue 3) ───────
+    //
+    // The wheel arms in `mouse_main_scroll` were previously uncovered.
+    // These tests verify the SidebarView::Terminal and Pipeline/Terminal
+    // branches don't panic, return the expected redraw flag, and fall
+    // through cleanly when no session is attached.  An integration test
+    // below spawns a real /bin/sh to verify the local-scrollback fallback.
+
+    #[test]
+    fn mouse_main_scroll_terminal_view_no_session_returns_true() {
+        // Terminal view always returns `true` (consumes the wheel) even
+        // when no session is wired up — there is no other widget to fall
+        // through to in this view.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0), // wheel up
+            Point::new(50.0, 50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn mouse_main_scroll_terminal_view_wheel_outside_rect_no_panic() {
+        // Position outside the PTY rect → terminal_pixel_to_cell returns
+        // None, so no forwarding and no local scrollback work.  Must not
+        // panic and must still report `true` (Terminal view consumes wheel).
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0),
+            Point::new(-50.0, -50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn mouse_main_scroll_pipeline_terminal_no_session_returns_true() {
+        // Pipeline/Terminal tab: wheel path runs but no session is mapped
+        // for the selected issue → no forwarding, no panic.  Pipeline arm
+        // returns true unconditionally.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // Position must be inside the content area (below tab bar of
+        // `lh*1.4 = 22.4`).
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, -1.0),
+            Point::new(50.0, 50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn mouse_main_scroll_pipeline_terminal_wheel_in_tab_bar_no_op() {
+        // Click in the tab bar (y < tab_h) → terminal_pixel_to_cell
+        // returns None → no forwarding, no scrollback work, no panic.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0),
+            Point::new(50.0, 5.0), // y=5 < tab_h=22.4
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+    }
+
+    /// Integration test: spawn a real /bin/sh and verify the wheel
+    /// fallback engages local scrollback when mouse reporting is OFF.
+    /// `scroll_offset` advances by 3 rows per wheel notch (matching the
+    /// fallback in the SidebarView::Terminal arm).
+    #[test]
+    #[cfg(unix)]
+    fn mouse_main_scroll_terminal_wheel_falls_back_to_local_scrollback() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+
+        // Spawn a real session so forward_mouse can be invoked.
+        let cwd = std::env::temp_dir();
+        let mut sess = quadraui::terminal_engine::TerminalSession::spawn(
+            80, 24, "/bin/sh", &cwd, 1000,
+        )
+        .expect("spawn /bin/sh");
+
+        // Seed enough history to exceed one wheel-up worth (3 rows).
+        for _ in 0..10 {
+            sess.write_input(b"echo seed\r");
+        }
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            sess.poll();
+            if sess.history_len() >= 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(sess.history_len() >= 5, "need history to scroll into");
+        assert!(
+            !sess.mouse_reporting_enabled(),
+            "plain /bin/sh shouldn't enable mouse reporting",
+        );
+        app.terminal_session = Some(sess);
+
+        // Wheel-up from inside the PTY rect: forward_mouse returns false
+        // (no reporting, no alt-screen), so the fallback scrolls history.
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let before = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .scroll_offset();
+        let result = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0),
+            Point::new(50.0, 50.0),
+            main_b,
+            16.0,
+            8.0,
+        );
+        assert!(result);
+        let after = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .scroll_offset();
+        assert_eq!(
+            after.saturating_sub(before),
+            3,
+            "wheel-up notch should scroll local history by 3 rows when \
+             forward_mouse returns false (mouse reporting OFF)",
+        );
+
+        // Tidy up.
+        if let Some(ref mut sess) = app.terminal_session {
+            sess.write_input(b"exit\r");
+        }
+    }
+
+    // ── #468: paste-forward tests ─────────────────────────────────────────
+
+    /// With no session, forward_paste_to_pty must return false (not panic).
+    #[test]
+    fn paste_to_pty_returns_false_with_no_session() {
+        let mut app = make_app_default();
+        assert!(
+            app.terminal_session.is_none(),
+            "fresh app should have no terminal session"
+        );
+        assert!(
+            !app.forward_paste_to_pty("hello"),
+            "forward_paste_to_pty should return false when no session exists"
+        );
+    }
+
+    /// With no selected issue, forward_paste_to_detail_terminal must return false.
+    #[test]
+    fn paste_to_detail_terminal_returns_false_with_no_session() {
+        let mut app = make_app_default();
+        assert!(
+            !app.forward_paste_to_detail_terminal("hello"),
+            "forward_paste_to_detail_terminal should return false with no issue selected"
+        );
+    }
+
+    /// Raw path: when `bracketed_paste_enabled()` is false (the default for
+    /// a plain shell), the text is forwarded as-is so the shell can execute it.
+    #[test]
+    #[cfg(unix)]
+    fn paste_to_pty_raw_when_bracketed_paste_disabled() {
+        use std::time::{Duration, Instant};
+
+        let mut app = make_app_default();
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Mode 2004 must be off by default.
+        assert!(
+            !sess.bracketed_paste_enabled(),
+            "bracketed paste must be off before the child requests it"
+        );
+
+        app.terminal_session = Some(sess);
+
+        // Send a command via the raw paste path.  No trailing \r — send
+        // Enter separately to keep the no-auto-submit contract visible.
+        let consumed = app.forward_paste_to_pty("echo __raw_paste_marker__");
+        assert!(consumed, "forward_paste_to_pty should return true when a session exists");
+
+        // Enter submits the command.
+        app.terminal_session.as_mut().unwrap().write_input(b"\r");
+
+        // Poll until the marker echoes back from the shell.
+        let start = Instant::now();
+        let mut found = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            app.terminal_session.as_mut().unwrap().poll();
+            if app
+                .terminal_session
+                .as_ref()
+                .unwrap()
+                .full_text()
+                .contains("__raw_paste_marker__")
+            {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            found,
+            "raw paste should have delivered text to shell; full_text={:?}",
+            app.terminal_session.as_ref().unwrap().full_text(),
+        );
+
+        // Tidy up.
+        app.terminal_session.as_mut().unwrap().write_input(b"exit\r");
+    }
+
+    /// Bracketed path: when `bracketed_paste_enabled()` is true the helper
+    /// wraps the text in ESC[200~…ESC[201~ before writing.  Verified by
+    /// enabling mode 2004 via the child process and then calling the helper.
+    #[test]
+    #[cfg(unix)]
+    fn paste_to_pty_bracketed_when_mode_2004_enabled() {
+        use std::time::{Duration, Instant};
+
+        fn poll_until(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = Instant::now();
+            let limit = Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        let mut app = make_app_default();
+        let cwd = std::env::temp_dir();
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Have the child emit ESC[?2004h so the terminal emulator enables
+        // mode 2004 — this is what interactive programs (e.g. claude -p) do.
+        sess.send_str("printf '\\033[?2004h'\n");
+        assert!(
+            poll_until(&mut sess, 5_000, |s| s.bracketed_paste_enabled()),
+            "bracketed paste should be enabled after child emits ESC[?2004h"
+        );
+
+        app.terminal_session = Some(sess);
+
+        // Confirm we take the bracketed branch — method must return true and
+        // the session must still be alive after the write.
+        let consumed = app.forward_paste_to_pty("hello bracketed");
+        assert!(
+            consumed,
+            "forward_paste_to_pty should return true when session exists"
+        );
+        assert!(
+            !app.terminal_session.as_ref().unwrap().is_exited(),
+            "session must still be alive after a bracketed paste write"
+        );
+
+        // Tidy up.
+        app.terminal_session.as_mut().unwrap().send_str("exit\n");
+    }
+
+    /// Bracketed path for the detail terminal: same logic as the main
+    /// terminal but routed through `forward_paste_to_detail_terminal`.
+    #[test]
+    #[cfg(unix)]
+    fn paste_to_detail_terminal_bracketed_when_mode_2004_enabled() {
+        use std::time::{Duration, Instant};
+
+        fn poll_until(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = Instant::now();
+            let limit = Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        let mut app = make_app_default();
+
+        // Set up a selected pipeline issue so selected_issue_key() works.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 468,
+            title: "paste test".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+
+        let cwd = std::env::temp_dir();
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        sess.send_str("printf '\\033[?2004h'\n");
+        assert!(
+            poll_until(&mut sess, 5_000, |s| s.bracketed_paste_enabled()),
+            "mode 2004 should be enabled after child emits ESC[?2004h"
+        );
+
+        let issue_key = ("owner/repo".to_string(), 468u64);
+        app.detail_terminal_sessions.insert(issue_key, sess);
+
+        let consumed = app.forward_paste_to_detail_terminal("hello detail bracketed");
+        assert!(
+            consumed,
+            "forward_paste_to_detail_terminal should return true when session exists"
+        );
+    }
+
+    // ── #464: host-side terminal selection ───────────────────────────────────
+    //
+    // Three behaviour branches:
+    //   A. App mouse-reporting OFF (plain /bin/sh) → host-select starts on
+    //      mouse-press.
+    //   B. App mouse-reporting ON (simulated via a flag check) → forward
+    //      to PTY; no host-select.
+    //   C. Shift held → force host-select even when reporting is ON.
+    //
+    // The tests drive `terminal_host_sel_begin` / `terminal_host_sel_update` /
+    // `terminal_host_sel_end` directly and verify the resulting
+    // `TerminalSession.selection` state, then check `active_terminal_selected_text`.
+
+    /// Helpers shared across #464 tests: set up a standalone Terminal view
+    /// with a real /bin/sh session attached.
+    #[cfg(unix)]
+    fn make_terminal_app_with_session() -> CoordApp {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+        app.terminal_session = Some(sess);
+        app
+    }
+
+    /// host_sel_begin sets selection with anchor == end (collapsed point).
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_begin_sets_collapsed_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(5, 3);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection must be Some after begin");
+        assert_eq!((sel.start_col, sel.start_row), (5, 3));
+        assert_eq!((sel.end_col, sel.end_row), (5, 3));
+        assert!(
+            app.terminal_host_sel_dragging,
+            "dragging flag must be set after begin"
+        );
+    }
+
+    /// host_sel_update extends the end point while the anchor stays fixed.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_update_extends_end_not_anchor() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(2, 1);
+        app.terminal_host_sel_update(10, 4);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection must be Some after update");
+        // Anchor unchanged.
+        assert_eq!((sel.start_col, sel.start_row), (2, 1));
+        // End advanced.
+        assert_eq!((sel.end_col, sel.end_row), (10, 4));
+        assert!(app.terminal_host_sel_dragging);
+    }
+
+    /// host_sel_end clears the dragging flag; non-collapsed selection persists.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_end_clears_dragging_keeps_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(0, 0);
+        app.terminal_host_sel_update(5, 2);
+        app.terminal_host_sel_end();
+        assert!(
+            !app.terminal_host_sel_dragging,
+            "dragging flag cleared after end"
+        );
+        // Non-collapsed selection must remain so Ctrl-C can copy it.
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_some(),
+            "selection should persist after end (non-collapsed)"
+        );
+    }
+
+    /// A collapsed (point) selection is cleared by host_sel_end.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_end_clears_collapsed_selection() {
+        let mut app = make_terminal_app_with_session();
+        app.terminal_host_sel_begin(3, 1);
+        // No update → start == end → collapsed.
+        app.terminal_host_sel_end();
+        assert!(
+            !app.terminal_host_sel_dragging,
+            "dragging flag cleared"
+        );
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_none(),
+            "collapsed (point) selection must be cleared on end"
+        );
+    }
+
+    /// Mouse-reporting OFF: host-selection starts on left-press in the PTY area.
+    /// The dragging flag is set and pty_pressed_buttons is NOT set.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_press_reporting_off_starts_host_sel_not_pty_press() {
+        let mut app = make_terminal_app_with_session();
+        // Verify that plain /bin/sh has reporting OFF.
+        assert!(
+            !app.terminal_session
+                .as_ref()
+                .unwrap()
+                .mouse_reporting_enabled(),
+            "/bin/sh should have mouse reporting OFF"
+        );
+        // Simulate a left-press inside the PTY rect.
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let lh = 16.0_f32;
+        let char_w = 8.0_f32;
+        // pos (50, 50) is inside main_b, reporting is off → host-select path.
+        // We call active_terminal_pixel_to_cell to compute what the app would see.
+        let cell = app.active_terminal_pixel_to_cell(
+            Point::new(50.0, 50.0),
+            main_b,
+            lh,
+            char_w,
+        );
+        assert!(cell.is_some(), "position must map to a cell");
+        let (col, row) = cell.unwrap();
+        // Simulate what the mouse-down handler does: begin host-select.
+        app.terminal_host_sel_begin(col, row);
+        assert!(
+            app.terminal_host_sel_dragging,
+            "host-sel drag started"
+        );
+        assert_eq!(
+            app.pty_pressed_buttons, 0,
+            "pty_pressed_buttons must NOT be set for host-selection presses"
+        );
+    }
+
+    /// Shift-held: host-selection is forced even with a session present
+    /// (simulating the case where the PTY would otherwise grab the mouse).
+    /// We directly test the Shift-override branch via active_terminal_pixel_to_cell
+    /// and terminal_host_sel_begin — the full mouse handler is integration-level.
+    #[test]
+    #[cfg(unix)]
+    fn shift_forces_host_sel_branch() {
+        let mut app = make_terminal_app_with_session();
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        // With Shift held (force_host_sel = true) we bypass forward_mouse
+        // and go straight to terminal_host_sel_begin.
+        let (col, row) = app
+            .active_terminal_pixel_to_cell(Point::new(40.0, 32.0), main_b, 16.0, 8.0)
+            .expect("position inside PTY rect");
+        app.terminal_host_sel_begin(col, row);
+        assert!(app.terminal_host_sel_dragging, "drag started via Shift path");
+        // PTY should NOT be notified.
+        assert_eq!(
+            app.pty_pressed_buttons, 0,
+            "pty_pressed_buttons stays zero on Shift-forced host selection"
+        );
+    }
+
+    /// active_terminal_selected_text returns None when no selection is set.
+    #[test]
+    #[cfg(unix)]
+    fn active_terminal_selected_text_none_without_selection() {
+        let app = make_terminal_app_with_session();
+        assert!(
+            app.active_terminal_selected_text().is_none(),
+            "no selection → selected_text must be None"
+        );
+    }
+
+    /// clear_active_terminal_selection removes the selection from the session.
+    #[test]
+    #[cfg(unix)]
+    fn clear_active_terminal_selection_removes_sel() {
+        use quadraui::terminal_engine::TerminalSelection;
+        let mut app = make_terminal_app_with_session();
+        app.terminal_session.as_mut().unwrap().selection = Some(TerminalSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 5,
+        });
+        app.clear_active_terminal_selection();
+        assert!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .selection
+                .is_none(),
+            "selection must be cleared"
+        );
+    }
+
+    /// host_sel_update is a no-op when terminal_host_sel_dragging is false.
+    #[test]
+    #[cfg(unix)]
+    fn host_sel_update_noop_when_not_dragging() {
+        let mut app = make_terminal_app_with_session();
+        // Start a selection then end it (dragging flag = false).
+        app.terminal_host_sel_begin(1, 1);
+        app.terminal_host_sel_update(5, 5);
+        app.terminal_host_sel_end();
+        // Now the selection is non-collapsed (1,1)→(5,5) with dragging=false.
+        // Calling update should be a no-op: the end must not move.
+        app.terminal_host_sel_update(9, 9);
+        let sel = app
+            .terminal_session
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .expect("selection should still exist");
+        assert_eq!((sel.end_col, sel.end_row), (5, 5), "update was a no-op");
     }
 
     // ── #467: local `coord assign --interactive` launcher ────────────────────
@@ -32150,13 +34091,10 @@ mod tests {
         assert_eq!(shell_quote_arg(""), "''");
     }
 
-    // ── #467: coord_repo_for_issue ──────────────────────────────────────────
+    // ── #467 / #480: selected_issue_repo_and_key (Bug A — repo from selected row) ──
 
     #[test]
-    fn coord_repo_for_issue_uses_coord_repo_field() {
-        // The coord-local repo name lives in `issue.coord_repo` after the
-        // brain resolves it from coordinator.yml; that's the value we
-        // pass as `--repo <repo>`.
+    fn selected_issue_repo_and_key_uses_coord_repo_field() {
         let mut app = make_test_app(BoardData::default());
         app.pipeline_issues = vec![PipelineIssue {
             number: 467,
@@ -32168,17 +34106,18 @@ mod tests {
             all_labels: vec![],
             is_closed: false,
         }];
+        app.pipeline_sel = Some(0);
         assert_eq!(
-            app.coord_repo_for_issue(467),
-            Some("claude-coordinator".to_string()),
+            app.selected_issue_repo_and_key(),
+            Some((
+                "claude-coordinator".to_string(),
+                ("JDonaghy/claude-coordinator".to_string(), 467),
+            )),
         );
     }
 
     #[test]
-    fn coord_repo_for_issue_falls_back_to_repo_slug_last_segment() {
-        // Defensive: when the coord-local repo name isn't known, fall
-        // back to the last segment of `"owner/repo"` so the launcher
-        // still has something to pass.
+    fn selected_issue_repo_and_key_falls_back_to_repo_slug_last_segment() {
         let mut app = make_test_app(BoardData::default());
         app.pipeline_issues = vec![PipelineIssue {
             number: 1,
@@ -32190,37 +34129,54 @@ mod tests {
             all_labels: vec![],
             is_closed: false,
         }];
-        assert_eq!(app.coord_repo_for_issue(1), Some("some-repo".to_string()),);
-    }
-
-    #[test]
-    fn coord_repo_for_issue_skips_empty_coord_repo() {
-        // An empty `coord_repo` string must NOT short-circuit the
-        // fallback — fall through to the repo-slug last segment so the
-        // launcher line still has a non-empty `--repo` value.
-        let mut app = make_test_app(BoardData::default());
-        app.pipeline_issues = vec![PipelineIssue {
-            number: 7,
-            title: "t".to_string(),
-            body: String::new(),
-            repo_slug: "owner/repo-slug-name".to_string(),
-            coord_repo: Some(String::new()),
-            matched_labels: vec![],
-            all_labels: vec![],
-            is_closed: false,
-        }];
+        app.pipeline_sel = Some(0);
         assert_eq!(
-            app.coord_repo_for_issue(7),
-            Some("repo-slug-name".to_string()),
+            app.selected_issue_repo_and_key(),
+            Some(("some-repo".to_string(), ("owner/some-repo".to_string(), 1))),
         );
     }
 
     #[test]
-    fn coord_repo_for_issue_none_when_issue_missing() {
-        // The Pipeline detail-tab launcher fires only with a selected
-        // issue; `None` here causes the caller to surface a toast
-        // instead of constructing a half-baked command.
+    fn selected_issue_repo_and_key_none_without_selection() {
         let app = make_test_app(BoardData::default());
-        assert_eq!(app.coord_repo_for_issue(999), None);
+        assert_eq!(app.selected_issue_repo_and_key(), None);
+    }
+
+    #[test]
+    fn selected_issue_repo_and_key_resolves_from_selected_row_not_number() {
+        // #480 Bug A regression: issue numbers are NOT unique across repos.
+        // Two #207 rows (claude-coordinator + vimcode); the SELECTED row must
+        // determine the repo, not a by-number lookup that would always match
+        // the first row regardless of which is selected.
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 207,
+                title: "coord 207".to_string(),
+                body: String::new(),
+                repo_slug: "JDonaghy/claude-coordinator".to_string(),
+                coord_repo: Some("claude-coordinator".to_string()),
+                matched_labels: vec![],
+                all_labels: vec![],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 207,
+                title: "vimcode 207".to_string(),
+                body: String::new(),
+                repo_slug: "JDonaghy/vimcode".to_string(),
+                coord_repo: Some("vimcode".to_string()),
+                matched_labels: vec![],
+                all_labels: vec![],
+                is_closed: false,
+            },
+        ];
+        // Select the SECOND row (vimcode #207).
+        app.pipeline_sel = Some(1);
+        assert_eq!(
+            app.selected_issue_repo_and_key(),
+            Some(("vimcode".to_string(), ("JDonaghy/vimcode".to_string(), 207))),
+            "must resolve vimcode from the selected row, not coord from a by-number match",
+        );
     }
 }

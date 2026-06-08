@@ -7,6 +7,7 @@ worker has emitted its final result event.
 
 from __future__ import annotations
 
+import json
 import signal
 import subprocess
 from pathlib import Path
@@ -47,11 +48,61 @@ def test_log_has_result_false_for_missing_file(tmp_path: Path) -> None:
     assert not _log_has_result(str(tmp_path / "nonexistent"))
 
 
-def test_log_has_result_handles_binary_safe_scan(tmp_path: Path) -> None:
-    """The marker is a byte-string; binary scan must not mis-decode utf-8."""
+def test_log_has_result_skips_binary_noise_but_finds_real_result(tmp_path: Path) -> None:
+    """Binary/garbage lines are skipped without crashing; a genuine top-level
+    result event on its own line is still detected.
+
+    (Replaces the old whole-file substring scan: binary noise that merely
+    *contains* the marker bytes is no longer a completion — only a parseable
+    top-level ``{"type":"result"}`` line is.)
+    """
     log = tmp_path / "log"
-    log.write_bytes(b'\xff\xfe' + _RESULT_LINE_MARKER + b'\xff')
+    log.write_bytes(
+        b'\xff\xfe binary noise containing "type":"result" but not valid json\n'
+        b'{"type":"result","subtype":"success","is_error":false}\n'
+    )
     assert _log_has_result(str(log))
+
+
+def test_log_has_result_ignores_marker_inside_tool_result(tmp_path: Path) -> None:
+    """Regression (#324/#325, 2026-06-06): a worker that *reads* a file
+    containing the literal ``"type":"result"`` echoes it back inside a
+    ``tool_result`` payload. That line's top-level ``type`` is ``"user"``, not
+    ``"result"``, so it must NOT count as the worker's own completion — else
+    the reap thread force-kills the worker mid-task and records the no-op as
+    ``done`` (the green-box bug).
+    """
+    log = tmp_path / "log"
+    tool_result_line = json.dumps({
+        "type": "user",
+        "message": {"content": [{
+            "type": "tool_result",
+            "content": 'coord/agent.py: _RESULT_LINE_MARKER = \'"type":"result"\'',
+        }]},
+    })
+    log.write_text(
+        '{"type":"assistant","message":{}}\n'
+        + tool_result_line + "\n"
+    )
+    assert not _log_has_result(str(log))
+
+
+def test_log_has_result_ignores_pty_marker_inside_tool_result(tmp_path: Path) -> None:
+    """Same regression class for the PTY sentinel: a worker reading
+    coord/providers/claude_pty.py echoes the marker string inside a
+    ``tool_result``; only a *standalone* sentinel line counts, not the string
+    embedded in a JSON payload.
+    """
+    log = tmp_path / "log"
+    tool_result_line = json.dumps({
+        "type": "user",
+        "message": {"content": [{
+            "type": "tool_result",
+            "content": 'PTY_RESULT_MARKER = "# pty: worker exited"',
+        }]},
+    })
+    log.write_text(tool_result_line + "\n")
+    assert not _log_has_result(str(log))
 
 
 def test_log_has_result_finds_pty_marker(tmp_path: Path) -> None:

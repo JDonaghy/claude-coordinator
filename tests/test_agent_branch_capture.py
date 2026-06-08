@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from coord.agent import DONE, FAILED, AgentServer, AssignmentSpec
+from coord.agent import ADVISORY, DONE, FAILED, AgentServer, AssignmentSpec
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -47,7 +47,8 @@ def test_branch_captured_from_worktree(
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert final.branch == "issue-42-add-feature-x"
 
     # /status exposes it too
@@ -76,7 +77,8 @@ def test_worktree_path_stored_on_assignment(
     assert a.worktree_path is not None
     assert "worktrees" in a.worktree_path
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     server.shutdown()
 
 
@@ -137,7 +139,8 @@ def test_fresh_branch_ignores_existing_local_branch(
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE
+    # Worker makes no commits (fresh branch from main) → advisory (#448)
+    assert final.status == ADVISORY
     assert final.branch == "issue-42-add-feature-x"
 
     # The branch tip in the main repo should match main, not the stale branch
@@ -237,7 +240,8 @@ def test_local_only_leftover_branch_not_reused_when_origin_exists(
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE
+    # Worker makes no commits (fresh from origin/main) → advisory (#448)
+    assert final.status == ADVISORY
     assert final.branch == "issue-42-add-feature-x"
 
     # The worker's branch must start from origin/main — NOT the stale leftover.
@@ -338,7 +342,8 @@ def test_target_branch_overrides_slugified_title(
     )
     a1 = server.assign(spec1)
     final1 = server.wait_for(a1.id, timeout=10)
-    assert final1.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final1.status == ADVISORY
     original_branch = final1.branch  # `issue-42-add-feature-x`
     assert original_branch == "issue-42-add-feature-x"
 
@@ -353,7 +358,8 @@ def test_target_branch_overrides_slugified_title(
     )
     a2 = server.assign(spec2)
     final2 = server.wait_for(a2.id, timeout=10)
-    assert final2.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final2.status == ADVISORY
     # Captured branch must be the original — not a `[fix-1]` derivation.
     assert final2.branch == original_branch, (
         f"target_branch override failed: expected {original_branch!r}, "
@@ -379,6 +385,7 @@ def test_no_target_branch_uses_slugified_title(
     )
     a = server.assign(spec)
     final = server.wait_for(a.id, timeout=10)
-    assert final.status == DONE
+    # Worker makes no commits → advisory (#448)
+    assert final.status == ADVISORY
     assert final.branch == "issue-99-my-cool-change"
     server.shutdown()

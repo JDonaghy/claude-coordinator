@@ -18,6 +18,7 @@ EVENT_COMPLETION = "completion"
 EVENT_FAILURE = "failure"
 EVENT_STUCK = "stuck"
 EVENT_PLAN = "plan"
+EVENT_ADVISORY = "advisory"
 
 
 @dataclass
@@ -211,6 +212,51 @@ def format_failure(
         lines.append("")
         lines.append("### Error")
         lines.append(error.strip())
+    return "\n".join(lines)
+
+
+def format_advisory(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    duration_seconds: float | None = None,
+    log_path: str | None = None,
+    reason: str = "",
+) -> str:
+    """Format an advisory comment for a 0-commit clean exit.
+
+    Distinct from both completion (no code was produced) and failure (the
+    worker exited cleanly — exit_code 0 — so no error occurred).  Human
+    review is needed to decide next steps.
+    """
+    marker = _marker(
+        EVENT_ADVISORY,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        issue=issue_number,
+    )
+    lines = [
+        "## Coordinator: Advisory — Worker Exited With 0 Commits",
+        marker,
+        f"**Machine:** {machine_name}",
+        f"**Status:** advisory",
+        f"**Duration:** {_fmt_duration(duration_seconds)}",
+    ]
+    if log_path:
+        lines.append(f"**Log:** `{log_path}`")
+    lines.append("")
+    lines.append(
+        "The worker exited cleanly (exit code 0) but pushed **no commits**. "
+        "This typically means the feature was already implemented or no change "
+        "was needed. Human review is required to decide the next step."
+    )
+    if reason.strip():
+        lines.append("")
+        lines.append("### Worker note")
+        lines.append(reason.strip())
     return "\n".join(lines)
 
 

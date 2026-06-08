@@ -617,10 +617,22 @@ def dispatch_review(
 
     # Dedupe: don't fire a second review if one's already in flight for this
     # completed work assignment.
-    from coord.claim import has_active_followup
+    from coord.claim import has_active_followup, has_active_work_followup
 
     if has_active_followup(
         board, of_assignment_id=completed.assignment_id, assignment_type="review"
+    ):
+        return None
+
+    # #459: skip review if a work or conflict-fix is actively rewriting the
+    # branch for this issue (e.g. a coord-bounce fix iteration). Reviewing
+    # stale code now would produce a verdict on code that's about to change.
+    # Leave the caller's review_state as "pending" so the next reconcile pass
+    # retries once the active fix finishes.
+    if has_active_work_followup(
+        board,
+        repo_name=completed.repo_name,
+        issue_number=completed.issue_number,
     ):
         return None
 

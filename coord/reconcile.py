@@ -224,6 +224,36 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 elif done.type == "conflict-fix":
                     # #241: re-enqueue the parent merge entry for retry.
                     _on_conflict_fix_done(done, succeeded=True)
+        elif entry.get("status") == "advisory":
+            # #448: worker exited cleanly but pushed 0 commits. Move to
+            # completed with status "advisory" — NOT "failed" — so that
+            # auto_reassign does not loop on it. Review is also skipped
+            # because there is no code to review on the branch.
+            done = board.mark_done_by_id(
+                a.assignment_id,
+                finished_at=entry.get("finished_at"),
+                branch=branch,
+            )
+            if done is not None:
+                # mark_done_by_id sets status="done"; correct it to "advisory".
+                done.status = "advisory"
+                if done.type == "work":
+                    # No code pushed → nothing to review. Set review_state to
+                    # "advisory" so the review-dispatch loop skips this entry.
+                    done.review_state = "advisory"
+                elif done.type == "review":
+                    # Defensive (should not occur after Bug 2 fix): review
+                    # workers that somehow hit advisory still advance the
+                    # original work assignment's review_state.
+                    orig_id = done.review_of_assignment_id
+                    if orig_id:
+                        orig = board.find_by_id(orig_id)
+                        if orig is not None:
+                            orig.review_state = "done"
+                elif done.type == "conflict-fix":
+                    # A conflict-fix with 0 commits didn't resolve anything.
+                    _on_conflict_fix_done(done, succeeded=False)
+            # NOTE: do NOT add to newly_failed — prevents auto_reassign loop.
         else:
             # Defensive: don't downgrade a DB-done assignment to failed when
             # the agent reports cancelled (e.g. after POST /cancel cleanup
@@ -247,6 +277,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # We iterate board.completed (not just newly-done) so that a failed
     # dispatch on a previous reconcile pass is retried here automatically.
     from coord.review import dispatch_review
+    from coord.claim import has_active_work_followup
 
     # #200: gate review auto-dispatch on the Test stage verdict. If the pipeline
     # includes a "test" gate, hold off on review until the user records a
@@ -268,6 +299,17 @@ def reconcile(board: Board, config: Config) -> list[str]:
         if test_gate_active and completed.test_state not in ("passed", "skipped"):
             # Either no verdict yet, or verdict was "failed" — either way the
             # work is not ready for review. The next reconcile pass will re-check.
+            continue
+        # #459: skip review dispatch when a work or conflict-fix is actively
+        # rewriting this issue's branch (e.g. a coord-bounce fix iteration).
+        # Reviewing stale code now produces a verdict on code that's about to
+        # change. Leave review_state as "pending" so the next reconcile pass
+        # retries once the active fix finishes.
+        if has_active_work_followup(
+            board,
+            repo_name=completed.repo_name,
+            issue_number=completed.issue_number,
+        ):
             continue
         review = dispatch_review(completed, board, config)
         if review is not None:
