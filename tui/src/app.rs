@@ -11886,7 +11886,7 @@ impl CoordApp {
                     {
                         if let Some(action_toolbar) = self.pipeline_action_bar_toolbar() {
                             let main_b = ctx.main_bounds();
-                            let tab_h = lh * 1.4;
+                            let tab_h = detail_tab_bar_height(lh);
                             let bar_h = pipeline_action_bar_height(true, lh);
                             let bar_rect = Rect::new(
                                 main_b.x,
@@ -12246,7 +12246,7 @@ impl CoordApp {
             // #269: hit-test from the actual TabBar labels (char widths)
             // instead of hard-coded offsets.  This stays correct when
             // tabs are renamed or have a badge appended.
-            let tab_h = lh * 1.4;
+            let tab_h = detail_tab_bar_height(lh);
             if pos.y - main_b.y < tab_h {
                 let bar = self.board_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
@@ -12292,8 +12292,10 @@ impl CoordApp {
             return false;
         }
         if self.active_view == SidebarView::Pipeline {
-            // Tab bar occupies the first `lh * 1.4` row of the main panel.
-            let tab_h = lh * 1.4;
+            // Tab bar occupies the first `detail_tab_bar_height(lh)` row of
+            // the main panel — `(lh * 1.4).round()`, so the TUI and pixel
+            // backends agree on the boundary (#464).
+            let tab_h = detail_tab_bar_height(lh);
             if pos.y - main_b.y < tab_h {
                 let bar = self.pipeline_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
@@ -12425,8 +12427,11 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
-                // Content area starts below the tab bar (lh * 1.4 rows).
-                let content_y = main_b.y + lh * 1.4;
+                // Content area starts below the tab bar. `#464`: use the
+                // rounded helper so the hit-test origin lines up with the
+                // render origin in the TUI backend (where `q_rect_to_ratatui`
+                // rounds the fractional `lh * 1.4` to a whole cell).
+                let content_y = main_b.y + detail_tab_bar_height(lh);
                 if let Some((col, row)) =
                     terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
                 {
@@ -12479,7 +12484,8 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
-                let content_y = main_b.y + lh * 1.4;
+                // `#464`: rounded helper for parity with the render path.
+                let content_y = main_b.y + detail_tab_bar_height(lh);
                 let (col, row) =
                     terminal_pixel_to_cell_clamped(pos, main_b, content_y, char_w, lh);
                 if let Some(issue_key) = self.selected_issue_key() {
@@ -12519,7 +12525,8 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
-                let content_y = main_b.y + lh * 1.4;
+                // `#464`: rounded helper for parity with the render path.
+                let content_y = main_b.y + detail_tab_bar_height(lh);
                 terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
             }
             _ => None,
@@ -12798,7 +12805,10 @@ impl CoordApp {
                         // alt-screen), so calling it directly and falling
                         // back on `false` is equivalent to the explicit
                         // gate from the issue spec.
-                        let content_y = main_b.y + lh * 1.4;
+                        //
+                        // `#464`: rounded helper for parity with the render
+                        // path so the click-to-cell mapping is exact in TUI.
+                        let content_y = main_b.y + detail_tab_bar_height(lh);
                         if delta.y != 0.0 {
                             if let Some((col, row)) =
                                 terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
@@ -18031,8 +18041,10 @@ impl ShellApp for CoordApp {
         match self.active_view {
             SidebarView::Board => {
                 // Tab bar (Board / Issue / Chat), then the active tab's content.
+                // `#464`: route through `detail_tab_bar_height` so render and
+                // hit-test agree on the cell boundary in the TUI backend.
                 let tab_bar = self.board_detail_tab_bar();
-                let tab_h = lh * 1.4;
+                let tab_h = detail_tab_bar_height(lh);
                 let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                 let content_rect =
                     Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
@@ -18073,9 +18085,11 @@ impl ShellApp for CoordApp {
                 if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
                     backend.draw_list(m, &self.pipeline_placeholder_list());
                 } else {
-                    // Tab bar.
+                    // Tab bar.  `#464`: route through `detail_tab_bar_height`
+                    // so the painted top of the content rect lines up with
+                    // the hit-test origin in the TUI backend.
                     let tab_bar = self.pipeline_detail_tab_bar();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                     let content_rect = Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
                     backend.draw_tab_bar(tab_rect, &tab_bar, None);
@@ -18581,9 +18595,10 @@ impl ShellApp for CoordApp {
                 let main_rect = if chat_is_refinement {
                     // Match the Refinement tab's content_rect so handle()'s
                     // layout maths agree with what's painted.
+                    // `#464`: rounded helper so TUI render and hit-test agree.
                     let m = ctx.main_bounds();
                     let lh = backend.line_height();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     // Account for the panel toolbar carve-out done in
                     // render_content (#272).  When panel_toolbar() returns
                     // None we just shave the tab bar.
@@ -18597,9 +18612,10 @@ impl ShellApp for CoordApp {
                         after_panel.width, (after_panel.height - tab_h).max(0.0))
                 } else if chat_is_board {
                     // Match the Board Chat tab's content_rect.
+                    // `#464`: rounded helper so TUI render and hit-test agree.
                     let m = ctx.main_bounds();
                     let lh = backend.line_height();
-                    let tab_h = lh * 1.4;
+                    let tab_h = detail_tab_bar_height(lh);
                     Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0))
                 } else {
                     ctx.main_bounds()
@@ -21394,14 +21410,44 @@ fn record_test_verdict_db(
 
 // ─── Terminal mouse coordinate helpers ────────────────────────────────────────
 
+/// Height of the detail-panel tab bar (Board / Pipeline tabs row), in
+/// pixels for the GTK / macOS backends and in cell rows for the TUI
+/// backend.
+///
+/// Both backends paint the tab row at `(lh * 1.4).round()`:
+///
+/// - GTK/macOS (`lh ≈ 20 px`): `28 px` — the design height; rounding is
+///   a no-op since `20 * 1.4 = 28` already.
+/// - TUI (`lh = 1 cell`): `1 cell` — the ratatui backend rasterises
+///   into integer rows via [`quadraui::tui::backend::q_rect_to_ratatui`],
+///   so the painted tab row is **one whole cell** even though `lh * 1.4`
+///   would suggest a fractional `1.4` rows.
+///
+/// `#464`: hit-tests against the terminal content area must use the
+/// SAME rounded origin as the render path, or the click-to-cell mapping
+/// drifts by one row.  Before this helper existed, render used `lh*1.4`
+/// (rounded to `1` cell at draw time by `q_rect_to_ratatui`) while the
+/// hit-tests used the unrounded `1.4` — so a click at the top content
+/// cell mapped to "row -1" (rejected) and a click one row below mapped
+/// to row 0, etc.  Funnelling both code paths through this helper keeps
+/// them in lock-step.
+///
+/// `.max(lh)` guarantees at least one full line height, which matters
+/// for any future call site that might pass `lh < 1.0`.
+fn detail_tab_bar_height(lh: f32) -> f32 {
+    (lh * 1.4).round().max(lh)
+}
+
 /// Translate a pixel position into terminal (col, row) cell coordinates.
 ///
 /// `rect` is the full bounding box of the PTY surface (in pixels).
 /// `origin_y` is the Y pixel coordinate where **row 0** starts:
 ///   - Standalone `SidebarView::Terminal`: pass `rect.y`
 ///     (the entire main-content rect is the PTY area, no toolbar above it).
-///   - `SidebarView::Pipeline` with the Terminal tab: pass `rect.y + lh * 1.4`
-///     (a tab bar occupies the top `lh * 1.4` pixels before the PTY content begins).
+///   - `SidebarView::Pipeline` with the Terminal tab: pass
+///     `rect.y + detail_tab_bar_height(lh)` (the rounded tab bar height —
+///     `#464`: must match the render path, which `q_rect_to_ratatui`
+///     rounds the same way).
 ///
 /// `char_w` and `line_h` are the backend's character cell dimensions in pixels.
 /// Both are clamped to `1.0` to guard against zero/sub-pixel values.
@@ -22314,7 +22360,7 @@ mod tests {
         let lh: f32 = 1.0;
         // #438: Pipeline has no panel toolbar — no toolbar offset.
         let tb_h = 0.0_f32;
-        let tab_h = lh * 1.4;
+        let tab_h = detail_tab_bar_height(lh);
         let content_rect = Rect::new(
             main_b.x,
             main_b.y + tb_h + tab_h,
@@ -22367,7 +22413,7 @@ mod tests {
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let lh: f32 = 1.0;
         // #438: no panel toolbar on Pipeline; content starts directly after the tab row.
-        let tab_h = lh * 1.4;
+        let tab_h = detail_tab_bar_height(lh);
         let content_rect = Rect::new(
             main_b.x,
             main_b.y + tab_h,
@@ -30984,6 +31030,110 @@ mod tests {
         assert_eq!(
             terminal_pixel_to_cell(pos, rect, rect.y, 0.0, 0.0),
             Some((5, 10))
+        );
+    }
+
+    // ── #464: TUI integer-cell hit-test (lh = 1 cell) ────────────────────────
+    //
+    // The TUI backend rasterises at one whole cell per line-height; the
+    // ratatui buffer is a u16 grid so `q_rect_to_ratatui` rounds the
+    // fractional `1.4 * lh` tab-bar height to `1` cell.  These tests
+    // demonstrate the render origin (which the user clicks against) and
+    // the hit-test origin BOTH agree on that rounded value — without the
+    // helper, hit-test landed one row above the click and the top
+    // content cell was unreachable.
+
+    #[test]
+    fn detail_tab_bar_height_tui_rounds_to_one_cell() {
+        // TUI: lh=1 cell → tab bar is exactly 1 cell tall (rounded down from 1.4).
+        assert_eq!(detail_tab_bar_height(1.0), 1.0);
+    }
+
+    #[test]
+    fn detail_tab_bar_height_gtk_is_28_px() {
+        // GTK/macOS: lh≈20 px → tab bar is 28 px (1.4 × lh, no rounding loss).
+        assert_eq!(detail_tab_bar_height(20.0), 28.0);
+    }
+
+    #[test]
+    fn detail_tab_bar_height_at_least_one_lh() {
+        // Even for tiny `lh < 1.0`, the bar is guaranteed at least one
+        // line height tall so the click target never collapses.
+        assert!(detail_tab_bar_height(0.5) >= 0.5);
+    }
+
+    /// `#464` reproducer: with the TUI backend, the FIRST visible content
+    /// cell must hit-test to (col=0, row=0).  Before the helper, the
+    /// fractional `1.4` origin made `pos.y < origin_y` true for the top
+    /// content row, so the top-left cell was unselectable (returned `None`).
+    #[test]
+    fn tpc_tui_pipeline_top_left_content_cell_maps_to_origin() {
+        // TUI mouse coords are integer cells: row 0 of content is at the
+        // pixel row immediately below the tab bar (= origin_y).  With
+        // lh=1, the render places content cell (0,0) at exactly that pixel.
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        let pos = Point::new(0.0, origin_y); // top-left content cell
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((0, 0)),
+            "top-left of content area must map to (col=0, row=0) — \
+             before #464 fix this returned None"
+        );
+    }
+
+    /// `#464` reproducer: with the TUI backend, a click in the middle of
+    /// the content area must hit-test to the same `(col, row)` the user
+    /// visually clicked.  Before the helper, the row was off by one
+    /// (hit-test returned `R-1` for a click at visual row `R`).
+    #[test]
+    fn tpc_tui_pipeline_middle_content_cell_matches_click() {
+        // Click at visual content (col=5, row=4) — pixel position is
+        // (main_b.x + 5, main_b.y + detail_tab_bar_height(lh) + 4).
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        let pos = Point::new(5.0, origin_y + 4.0); // (col=5, row=4)
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((5, 4)),
+            "click at visual (col=5, row=4) must hit-test to (col=5, row=4) — \
+             before #464 fix this returned (col=5, row=3)"
+        );
+    }
+
+    /// `#464` reproducer: the bottom content cell must also map correctly,
+    /// not be silently rejected by the bounds check.
+    #[test]
+    fn tpc_tui_pipeline_bottom_content_cell_maps_correctly() {
+        // rect.height = 24, tab_h = 1, so content occupies rows 0..22
+        // (22 inclusive rows numbered 0..=22).  Click on the last
+        // selectable content cell.
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        // Bottom-most content row = (rect.y + rect.height - 1) -
+        // origin_y = 22.  Click at that pixel y.
+        let pos = Point::new(3.0, rect.y + rect.height - 1.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            Some((3, 22))
+        );
+    }
+
+    /// `#464`: the tab-bar pixel row must STILL return `None` after the
+    /// fix — the tab bar itself is not part of the PTY content.
+    #[test]
+    fn tpc_tui_pipeline_tab_bar_row_returns_none() {
+        let rect = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let lh = 1.0_f32;
+        let origin_y = rect.y + detail_tab_bar_height(lh); // 1.0
+        // y=0 is inside the tab bar — still must reject.
+        let pos = Point::new(5.0, 0.0);
+        assert_eq!(
+            terminal_pixel_to_cell(pos, rect, origin_y, 1.0, lh),
+            None
         );
     }
 
