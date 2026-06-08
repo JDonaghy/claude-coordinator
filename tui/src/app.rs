@@ -18203,6 +18203,14 @@ impl CoordApp {
             return;
         }
 
+        // Pass the TUI's resolved coordinator.yml path so `coord assign` finds
+        // it regardless of the embedded terminal's cwd (the issue's repo dir).
+        let cfg_path = self
+            .command_runner
+            .config_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+
         let (cols, rows) = self.detail_terminal_pending_dims.get().unwrap_or((80, 24));
         let cwd = self.detail_terminal_cwd(issue_num);
         let shell = quadraui::terminal_engine::default_shell();
@@ -18218,7 +18226,13 @@ impl CoordApp {
                 // Auto-run the launcher line.  Re-pressing `s` while a
                 // previous interactive session is still alive replaces the
                 // old PTY (old session is dropped on `insert`).
-                let launch_line = build_interactive_launch_cmd(&machine, &repo, issue_num, mode);
+                let launch_line = build_interactive_launch_cmd(
+                    cfg_path.as_deref(),
+                    &machine,
+                    &repo,
+                    issue_num,
+                    mode,
+                );
                 sess.send_str(&launch_line);
 
                 // Replace any existing session (the old one is dropped here).
@@ -18371,11 +18385,20 @@ fn interactive_plan_briefing(issue_num: u64) -> String {
 /// contains spaces or shell metacharacters can't break the line; the
 /// issue number is `u64`, so it never needs quoting.
 fn build_interactive_launch_cmd(
+    config_path: Option<&str>,
     machine: &str,
     repo: &str,
     issue_num: u64,
     mode: InteractiveLaunchMode,
 ) -> String {
+    // `coord` finds `coordinator.yml` in its cwd by default, but the embedded
+    // terminal's cwd is the issue's repo (which usually isn't the coordinator
+    // checkout), so inject `--config <path>` — the same path the TUI's
+    // CommandRunner uses — right after the subcommand.
+    let cfg = match config_path {
+        Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
+        _ => String::new(),
+    };
     // `coord assign` takes positional MACHINE REPO ISSUE — there is NO --repo
     // option.  Options precede the positionals.  `--no-plan` forces type=work
     // (full Read/Edit/Write/Bash tools) regardless of `dispatch.require_plan`,
@@ -18385,11 +18408,12 @@ fn build_interactive_launch_cmd(
     let r = shell_quote_arg(repo);
     match mode {
         InteractiveLaunchMode::Work => format!(
-            "coord assign --interactive --no-plan {} {} {}\r",
-            m, r, issue_num,
+            "coord assign {}--interactive --no-plan {} {} {}\r",
+            cfg, m, r, issue_num,
         ),
         InteractiveLaunchMode::Plan => format!(
-            "coord assign --interactive --no-plan --briefing {} {} {} {}\r",
+            "coord assign {}--interactive --no-plan --briefing {} {} {} {}\r",
+            cfg,
             shell_quote_arg(&interactive_plan_briefing(issue_num)),
             m,
             r,
@@ -31944,6 +31968,7 @@ mod tests {
         // string verbatim so the local `coord` CLI runs the human-attended
         // interactive launcher.
         let cmd = build_interactive_launch_cmd(
+            None,
             "elitebook",
             "claude-coordinator",
             467,
@@ -31956,11 +31981,29 @@ mod tests {
     }
 
     #[test]
+    fn build_interactive_launch_cmd_injects_config_path() {
+        // The embedded terminal's cwd is the issue's repo, so the launcher must
+        // pass --config so `coord` finds coordinator.yml (#467).
+        let cmd = build_interactive_launch_cmd(
+            Some("/home/john/src/claude-coordinator/coordinator.yml"),
+            "elitebook",
+            "claude-coordinator",
+            467,
+            InteractiveLaunchMode::Work,
+        );
+        assert_eq!(
+            cmd,
+            "coord assign --config /home/john/src/claude-coordinator/coordinator.yml --interactive --no-plan elitebook claude-coordinator 467\r",
+        );
+    }
+
+    #[test]
     fn build_interactive_launch_cmd_ends_with_cr_to_auto_run() {
         // Trailing \r submits the launcher line so the PTY actually runs
         // it without a manual Enter.  Without this the line just sits in
         // the shell input buffer.
-        let cmd = build_interactive_launch_cmd("m", "anything", 1, InteractiveLaunchMode::Work);
+        let cmd =
+            build_interactive_launch_cmd(None, "m", "anything", 1, InteractiveLaunchMode::Work);
         assert!(
             cmd.ends_with('\r'),
             "launcher must end with \\r; got: {cmd:?}"
@@ -31983,6 +32026,7 @@ mod tests {
         // bracketed-paste-delivered by interactive.py rather than
         // ad-hoc-injected by the TUI.
         let cmd = build_interactive_launch_cmd(
+            None,
             "elitebook",
             "claude-coordinator",
             467,
@@ -32010,10 +32054,11 @@ mod tests {
     #[test]
     fn build_interactive_launch_cmd_templates_repo_and_issue() {
         // Same shape, different repo + issue → both fields propagate.
-        let cmd = build_interactive_launch_cmd("m", "quadraui", 99, InteractiveLaunchMode::Work);
+        let cmd =
+            build_interactive_launch_cmd(None, "m", "quadraui", 99, InteractiveLaunchMode::Work);
         assert_eq!(cmd, "coord assign --interactive --no-plan m quadraui 99\r");
         let cmd2 =
-            build_interactive_launch_cmd("m", "coord-tui", 1234, InteractiveLaunchMode::Work);
+            build_interactive_launch_cmd(None, "m", "coord-tui", 1234, InteractiveLaunchMode::Work);
         assert_eq!(
             cmd2,
             "coord assign --interactive --no-plan m coord-tui 1234\r"
@@ -32026,6 +32071,7 @@ mod tests {
         // briefing via --briefing, so the session plans then implements in one
         // session.
         let cmd = build_interactive_launch_cmd(
+            None,
             "elitebook",
             "claude-coordinator",
             467,
@@ -32055,7 +32101,8 @@ mod tests {
         // Defensive: a repo name that contains whitespace must be quoted
         // so the local shell sees it as a single argument.  Single
         // quotes also block shell-metachar interpretation.
-        let cmd = build_interactive_launch_cmd("m", "my repo", 42, InteractiveLaunchMode::Work);
+        let cmd =
+            build_interactive_launch_cmd(None, "m", "my repo", 42, InteractiveLaunchMode::Work);
         assert!(
             cmd.contains("'my repo' 42"),
             "repo with spaces must be single-quoted; got: {cmd:?}",
@@ -32066,14 +32113,19 @@ mod tests {
     fn build_interactive_launch_cmd_quotes_repo_with_shell_metachars() {
         // `$` / `;` / `&` / backticks must not be passed unquoted — they
         // would otherwise be interpreted by the local shell.
-        let cmd =
-            build_interactive_launch_cmd("m", "evil;rm -rf /", 1, InteractiveLaunchMode::Work);
+        let cmd = build_interactive_launch_cmd(
+            None,
+            "m",
+            "evil;rm -rf /",
+            1,
+            InteractiveLaunchMode::Work,
+        );
         assert!(
             cmd.contains("'evil;rm -rf /' 1"),
             "shell metachars must be quoted away; got: {cmd:?}",
         );
         // An embedded single quote is escaped via the standard '\'' trick.
-        let cmd2 = build_interactive_launch_cmd("m", "a'b", 2, InteractiveLaunchMode::Work);
+        let cmd2 = build_interactive_launch_cmd(None, "m", "a'b", 2, InteractiveLaunchMode::Work);
         assert!(
             cmd2.contains(r"'a'\''b' 2"),
             "embedded single quotes must be escaped; got: {cmd2:?}",
