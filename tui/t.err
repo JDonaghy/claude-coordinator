@@ -1,5 +1,0 @@
-   Compiling coord-tui v0.1.0 (/home/john/src/cc-446-merge/tui)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.48s
-     Running unittests src/lib.rs (target/debug/deps/coord_tui-0d1642dc752f226d)
-     Running unittests src/main.rs (target/debug/deps/coord_tui-a4445d4199d6491b)
-   Doc-tests coord_tui
