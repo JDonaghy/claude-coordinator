@@ -12909,6 +12909,20 @@ impl CoordApp {
         lifecycle: &PipelineRowLifecycle,
     ) -> Vec<ContextMenuItem> {
         let mut items: Vec<ContextMenuItem> = Vec::new();
+        // #467: human-attended interactive launchers — always available for a
+        // real issue row.  Work implements directly; Plan plans then implements
+        // in the SAME session.
+        if issue_number.is_some() {
+            items.push(ContextMenuItem::action(
+                "start-work-interactive",
+                "Start work (interactive)",
+            ));
+            items.push(ContextMenuItem::action(
+                "start-plan-interactive",
+                "Start plan (interactive)",
+            ));
+            items.push(ContextMenuItem::separator());
+        }
         match lifecycle {
             PipelineRowLifecycle::New => {
                 items.push(ContextMenuItem::action(
@@ -15303,6 +15317,20 @@ impl CoordApp {
             // first.  Reuses the existing Pipeline-stage dispatcher so
             // the click + the [Go] button on the stage strip share one
             // code path.
+            // #467: human-attended interactive launchers from the row menu.
+            // Both switch to the detail Terminal tab so the spawned session
+            // is visible.  Work implements directly; Plan plans-then-works in
+            // the same session (work tools via --no-plan + plan-first briefing).
+            "start-work-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Work);
+                true
+            }
+            "start-plan-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Plan);
+                true
+            }
             "start-with-plan" => {
                 let dispatched = self.dispatch_pipeline_plan();
                 if !dispatched {
@@ -16053,6 +16081,8 @@ fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "send-to-pipeline" => Some("→"),
         "drop-to-backlog" => Some("↩"),
         "drop-to-refining" => Some("↶"),
+        "start-work-interactive" => Some("⌨"),
+        "start-plan-interactive" => Some("⌨"),
         "start-with-plan" => Some("☰"),
         "start-skip-plan" => Some("▶"),
         "watch" => Some("◉"),
@@ -17327,7 +17357,7 @@ impl CoordApp {
     /// The session stays strictly human-attended: the TUI never parses the
     /// session TTY for completion or verdict and never auto-advances the
     /// pipeline state (Anthropic ToS §3.7 / #437).
-    fn launch_interactive_session_for_selected_issue(&mut self) {
+    fn launch_interactive_session_for_selected_issue(&mut self, mode: InteractiveLaunchMode) {
         let Some(issue_num) = self.selected_issue_number() else {
             return;
         };
@@ -17359,7 +17389,7 @@ impl CoordApp {
                 // Auto-run the launcher line.  Re-pressing `s` while a
                 // previous interactive session is still alive replaces the
                 // old PTY (old session is dropped on `insert`).
-                let launch_line = build_interactive_launch_cmd(&repo, issue_num);
+                let launch_line = build_interactive_launch_cmd(&repo, issue_num, mode);
                 sess.send_str(&launch_line);
 
                 // Replace any existing session (the old one is dropped here).
@@ -17368,10 +17398,14 @@ impl CoordApp {
 
                 // Pipeline status hint so the human knows the launcher
                 // line is on its way.
+                let verb = match mode {
+                    InteractiveLaunchMode::Work => "work",
+                    InteractiveLaunchMode::Plan => "plan→work",
+                };
                 self.pipeline_status = Some((
                     format!(
-                        "Launching `coord assign --interactive --repo {} {}` …",
-                        repo, issue_num,
+                        "Launching interactive {} session for {} #{} …",
+                        verb, repo, issue_num,
                     ),
                     Instant::now(),
                 ));
@@ -17469,8 +17503,30 @@ impl CoordApp {
 
 // ── #467: Interactive launcher command builder ────────────────────────────────
 
-/// Build the local launcher line that auto-runs when the user presses `s`
-/// in the Pipeline detail Terminal tab (#467).
+/// #467: which kind of human-attended interactive session to launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InteractiveLaunchMode {
+    /// Implement the issue directly (work tools; default issue-body briefing).
+    Work,
+    /// Plan first, then implement in the SAME session.  Uses work tools
+    /// (`--no-plan`, so the session can code after planning) seeded with a
+    /// plan-then-work briefing.
+    Plan,
+}
+
+/// #467: briefing seeded into a `Plan` interactive session — plan first, get
+/// human sign-off, then implement in the same session.  Apostrophe-free so
+/// [`shell_quote_arg`] wraps it cleanly in single quotes.
+fn interactive_plan_briefing(issue_num: u64) -> String {
+    format!(
+        "Plan-then-implement for issue #{n} in this session. First read it with `gh issue view {n}`, then propose a concise implementation plan and ask me to confirm it. Once I approve, implement the plan here in this same session — do not stop after planning.",
+        n = issue_num,
+    )
+}
+
+/// Build the local launcher line that auto-runs when the user picks a
+/// "Start … (interactive)" action (#467) or presses `s` in the Pipeline
+/// detail Terminal tab.
 ///
 /// The trailing `\r` is intentional — it auto-submits the line so the
 /// launcher starts immediately.  Only the *launcher* is auto-run; the
@@ -17487,12 +17543,27 @@ impl CoordApp {
 /// `<repo>` is shell-quoted via [`shell_quote_arg`] so a repo name that
 /// contains spaces or shell metacharacters can't break the line; the
 /// issue number is `u64`, so it never needs quoting.
-fn build_interactive_launch_cmd(repo: &str, issue_num: u64) -> String {
-    format!(
-        "coord assign --interactive --repo {} {}\r",
-        shell_quote_arg(repo),
-        issue_num,
-    )
+fn build_interactive_launch_cmd(
+    repo: &str,
+    issue_num: u64,
+    mode: InteractiveLaunchMode,
+) -> String {
+    // `--no-plan` forces type=work (full Read/Edit/Write/Bash tools) regardless
+    // of `dispatch.require_plan`, so BOTH modes can actually implement — Plan
+    // just plans first per its seeded briefing.
+    match mode {
+        InteractiveLaunchMode::Work => format!(
+            "coord assign --interactive --no-plan --repo {} {}\r",
+            shell_quote_arg(repo),
+            issue_num,
+        ),
+        InteractiveLaunchMode::Plan => format!(
+            "coord assign --interactive --no-plan --repo {} {} --briefing {}\r",
+            shell_quote_arg(repo),
+            issue_num,
+            shell_quote_arg(&interactive_plan_briefing(issue_num)),
+        ),
+    }
 }
 
 /// Minimal POSIX shell quoter for a single argument (#467).
@@ -18189,7 +18260,7 @@ impl ShellApp for CoordApp {
                     && !modifiers.alt
                     && !modifiers.shift
                 {
-                    self.launch_interactive_session_for_selected_issue();
+                    self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Work);
                     return Reaction::Redraw;
                 }
             }
@@ -30450,10 +30521,14 @@ mod tests {
         // Pin the exact rendered line — the TUI's job is to construct this
         // string verbatim so the local `coord` CLI runs the human-attended
         // interactive launcher.
-        let cmd = build_interactive_launch_cmd("claude-coordinator", 467);
+        let cmd = build_interactive_launch_cmd(
+            "claude-coordinator",
+            467,
+            InteractiveLaunchMode::Work,
+        );
         assert_eq!(
             cmd,
-            "coord assign --interactive --repo claude-coordinator 467\r",
+            "coord assign --interactive --no-plan --repo claude-coordinator 467\r",
         );
     }
 
@@ -30462,7 +30537,7 @@ mod tests {
         // Trailing \r submits the launcher line so the PTY actually runs
         // it without a manual Enter.  Without this the line just sits in
         // the shell input buffer.
-        let cmd = build_interactive_launch_cmd("anything", 1);
+        let cmd = build_interactive_launch_cmd("anything", 1, InteractiveLaunchMode::Work);
         assert!(cmd.ends_with('\r'), "launcher must end with \\r; got: {cmd:?}");
         // No double-Enter — only ONE \r at the end.
         assert_eq!(
@@ -30481,7 +30556,11 @@ mod tests {
         // `coord assign --interactive` path so the briefing seed is
         // bracketed-paste-delivered by interactive.py rather than
         // ad-hoc-injected by the TUI.
-        let cmd = build_interactive_launch_cmd("claude-coordinator", 467);
+        let cmd = build_interactive_launch_cmd(
+            "claude-coordinator",
+            467,
+            InteractiveLaunchMode::Work,
+        );
         assert!(
             cmd.starts_with("coord assign --interactive "),
             "must invoke `coord assign --interactive`; got: {cmd:?}",
@@ -30504,10 +30583,37 @@ mod tests {
     #[test]
     fn build_interactive_launch_cmd_templates_repo_and_issue() {
         // Same shape, different repo + issue → both fields propagate.
-        let cmd = build_interactive_launch_cmd("quadraui", 99);
-        assert_eq!(cmd, "coord assign --interactive --repo quadraui 99\r");
-        let cmd2 = build_interactive_launch_cmd("coord-tui", 1234);
-        assert_eq!(cmd2, "coord assign --interactive --repo coord-tui 1234\r");
+        let cmd = build_interactive_launch_cmd("quadraui", 99, InteractiveLaunchMode::Work);
+        assert_eq!(cmd, "coord assign --interactive --no-plan --repo quadraui 99\r");
+        let cmd2 = build_interactive_launch_cmd("coord-tui", 1234, InteractiveLaunchMode::Work);
+        assert_eq!(cmd2, "coord assign --interactive --no-plan --repo coord-tui 1234\r");
+    }
+
+    #[test]
+    fn build_interactive_launch_cmd_plan_mode_seeds_plan_then_work_briefing() {
+        // #467: Plan mode forces work tools (--no-plan) AND seeds a plan-first
+        // briefing via --briefing, so the session plans then implements in one
+        // session.
+        let cmd = build_interactive_launch_cmd(
+            "claude-coordinator",
+            467,
+            InteractiveLaunchMode::Plan,
+        );
+        assert!(
+            cmd.starts_with(
+                "coord assign --interactive --no-plan --repo claude-coordinator 467 --briefing "
+            ),
+            "plan mode must force work tools and pass a briefing; got: {cmd:?}",
+        );
+        assert!(
+            cmd.contains("Plan-then-implement for issue #467"),
+            "plan briefing must reference the issue; got: {cmd:?}",
+        );
+        assert!(
+            cmd.contains("do not stop after planning"),
+            "plan briefing must instruct continue-to-work; got: {cmd:?}",
+        );
+        assert!(cmd.ends_with('\r'), "must auto-run; got: {cmd:?}");
     }
 
     #[test]
@@ -30515,7 +30621,7 @@ mod tests {
         // Defensive: a repo name that contains whitespace must be quoted
         // so the local shell sees it as a single argument.  Single
         // quotes also block shell-metachar interpretation.
-        let cmd = build_interactive_launch_cmd("my repo", 42);
+        let cmd = build_interactive_launch_cmd("my repo", 42, InteractiveLaunchMode::Work);
         assert!(
             cmd.contains("--repo 'my repo' 42"),
             "repo with spaces must be single-quoted; got: {cmd:?}",
@@ -30526,13 +30632,13 @@ mod tests {
     fn build_interactive_launch_cmd_quotes_repo_with_shell_metachars() {
         // `$` / `;` / `&` / backticks must not be passed unquoted — they
         // would otherwise be interpreted by the local shell.
-        let cmd = build_interactive_launch_cmd("evil;rm -rf /", 1);
+        let cmd = build_interactive_launch_cmd("evil;rm -rf /", 1, InteractiveLaunchMode::Work);
         assert!(
             cmd.contains("--repo 'evil;rm -rf /' 1"),
             "shell metachars must be quoted away; got: {cmd:?}",
         );
         // An embedded single quote is escaped via the standard '\'' trick.
-        let cmd2 = build_interactive_launch_cmd("a'b", 2);
+        let cmd2 = build_interactive_launch_cmd("a'b", 2, InteractiveLaunchMode::Work);
         assert!(
             cmd2.contains(r"--repo 'a'\''b' 2"),
             "embedded single quotes must be escaped; got: {cmd2:?}",
