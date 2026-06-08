@@ -46,27 +46,25 @@ use quadraui::compose::sidebar_system::{
     NavigationMode, SidebarEvent, SidebarSectionDef, SidebarSystem,
 };
 use quadraui::primitives::context_menu::{
-    ContextMenu, ContextMenuHit, ContextMenuItem as QuiContextMenuItem,
-    ContextMenuItemMeasure, ContextMenuLayout, ContextMenuPlacement,
+    ContextMenu, ContextMenuHit, ContextMenuItem as QuiContextMenuItem, ContextMenuItemMeasure,
+    ContextMenuLayout, ContextMenuPlacement,
 };
 use quadraui::primitives::form::{FieldKind, Form, FormEvent, FormField};
 use quadraui::primitives::toast::{ToastCorner, ToastItem, ToastSeverity, ToastStack};
 
 use crate::settings::{
-    LogCacheTtl, ModelPref, RefreshCadence, Theme, TuiSettings,
-    ACTION_PIPELINE_REFRESH,
+    LogCacheTtl, ModelPref, RefreshCadence, Theme, TuiSettings, ACTION_PIPELINE_REFRESH,
 };
 use quadraui::accelerator::{parse_key_binding, ParsedBinding};
 use quadraui::{
     Backend, Badge, ButtonMask, ChatController, ChatControllerEvent, ChatRole, ChatTurn, Color,
     Decoration, Dialog, DialogButton, DialogHit, DialogInput, DialogLayout, DialogMeasure,
-    DialogSeverity, DialogTextInput,
-    Key, ListItem, ListView, MouseButton, NamedKey,
-    PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
-    Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, ShellApp,
-    ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
-    StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
-    ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
+    DialogSeverity, DialogTextInput, Key, ListItem, ListView, MouseButton, NamedKey, PipelineHit,
+    PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView, Point, Reaction, Rect,
+    ScrollDelta, ScrollMode, Scrollbar, SectionSize, ShellApp, ShellConfig, ShellContext,
+    SidebarPanel, SidebarPanelHit, StageStatus, StatusBar, StatusBarSegment, StyledSpan,
+    StyledText, TabBar, TabItem, TextRegion, Toolbar, ToolbarButton, ToolbarHoverTracker,
+    ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
 };
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
@@ -805,7 +803,10 @@ struct MachineHealthResult {
 /// Spawn a background thread that fetches `/health` from a remote agent and
 /// parses the version + worktree_bytes fields.  Returns a `Receiver` that
 /// yields `Ok(result)` or `Err(error_string)`.
-fn spawn_machine_health(host: &str, port: u16) -> std::sync::mpsc::Receiver<Result<MachineHealthResult, String>> {
+fn spawn_machine_health(
+    host: &str,
+    port: u16,
+) -> std::sync::mpsc::Receiver<Result<MachineHealthResult, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let url = format!("http://{}:{}/health", host, port);
     std::thread::spawn(move || {
@@ -826,7 +827,10 @@ fn spawn_machine_health(host: &str, port: u16) -> std::sync::mpsc::Receiver<Resu
                             .get("worktree_bytes")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0);
-                        Ok(MachineHealthResult { version, worktree_bytes })
+                        Ok(MachineHealthResult {
+                            version,
+                            worktree_bytes,
+                        })
                     }
                     Err(e) => Err(format!("json: {}", e)),
                 },
@@ -908,8 +912,14 @@ fn parse_test_plan_steps(raw: &str) -> Option<Vec<TestPlanStep>> {
             Some(TestPlanStep {
                 kind,
                 cmd: s.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                label: s.get("label").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                check: s.get("check").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                label: s
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                check: s
+                    .get("check")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             })
         })
         .collect();
@@ -927,7 +937,11 @@ fn read_git_branch_head(repo_dir: &std::path::Path, branch: &str) -> Option<Stri
     use std::fs;
     // First try the loose ref file: .git/refs/heads/<branch>.
     // Branch names may contain slashes (feature/foo), which map to subdirs.
-    let loose = repo_dir.join(".git").join("refs").join("heads").join(branch);
+    let loose = repo_dir
+        .join(".git")
+        .join("refs")
+        .join("heads")
+        .join(branch);
     if let Ok(content) = fs::read_to_string(&loose) {
         let sha = content.trim().to_string();
         if !sha.is_empty() {
@@ -984,21 +998,16 @@ fn spawn_artifact_fetch(
                             .map(|arr| {
                                 arr.iter()
                                     .filter_map(|item| {
-                                        let name =
-                                            item.get("name")?.as_str()?.to_string();
-                                        let size = item
-                                            .get("size")
-                                            .and_then(|s| s.as_u64())
-                                            .unwrap_or(0);
+                                        let name = item.get("name")?.as_str()?.to_string();
+                                        let size =
+                                            item.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
                                         Some(ArtifactFile { name, size })
                                     })
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let total_bytes = v
-                            .get("total_bytes")
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
+                        let total_bytes =
+                            v.get("total_bytes").and_then(|t| t.as_u64()).unwrap_or(0);
                         let built_by_assignment_id = v
                             .get("built_by_assignment_id")
                             .and_then(|b| b.as_str())
@@ -1117,7 +1126,8 @@ fn spawn_chat_continue(
         // fire-and-forget did.  Failures still surface to the user via
         // the bind-timeout toast even without this log.
         let aid_short: String = old_assignment_id.chars().take(6).collect();
-        if let Ok(out) = cmd.stdin(std::process::Stdio::null())
+        if let Ok(out) = cmd
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -1126,7 +1136,9 @@ fn spawn_chat_continue(
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 eprintln!(
                     "[chat-continue] FAILED for old_aid={} status={:?}: {}",
-                    aid_short, out.status.code(), stderr,
+                    aid_short,
+                    out.status.code(),
+                    stderr,
                 );
             }
         }
@@ -1179,8 +1191,7 @@ struct IssueGroup {
 /// has chat-type assignments still lands in Backlog / Refining / Refined
 /// rather than being dragged into In-flight.
 fn is_workable_type(ty: &str) -> bool {
-    matches!(ty, "work" | "review" | "smoke" | "conflict-fix")
-        || ty.starts_with("fix-")
+    matches!(ty, "work" | "review" | "smoke" | "conflict-fix") || ty.starts_with("fix-")
 }
 
 impl IssueGroup {
@@ -1219,7 +1230,8 @@ impl IssueGroup {
         // into In-flight.  Only workable types count (see
         // `is_workable_type`).  None defaults to "work" which is workable.
         let has_real_work = self.assignments.iter().any(|a| {
-            a.assignment_type.as_deref()
+            a.assignment_type
+                .as_deref()
                 .map(is_workable_type)
                 .unwrap_or(true) // None → "work" → workable
         });
@@ -1239,9 +1251,7 @@ impl IssueGroup {
         if self.status_summary == "merged" {
             return "completed";
         }
-        if !self.has_open_record
-            && matches!(self.status_summary.as_str(), "done" | "merged")
-        {
+        if !self.has_open_record && matches!(self.status_summary.as_str(), "done" | "merged") {
             return "completed";
         }
         "in-flight"
@@ -1282,10 +1292,7 @@ enum ContextMenuTarget {
     /// Right-click on a Machines sidebar row.  Used for the routing-pause
     /// menu (`Pause` / `Resume`) — the user can steer agents away from a
     /// machine without editing coordinator.yml or shelling out.
-    MachineRow {
-        name: String,
-        is_paused: bool,
-    },
+    MachineRow { name: String, is_paused: bool },
 }
 
 /// #262: lifecycle bucket for a Pipeline sidebar row at right-click
@@ -1808,14 +1815,12 @@ fn json_str(json: &str, field: &str) -> Option<String> {
     loop {
         match chars.next()? {
             '"' => break,
-            '\\' => {
-                match chars.next()? {
-                    'n' => result.push(' '),
-                    't' => result.push(' '),
-                    'r' => {}
-                    c => result.push(c),
-                }
-            }
+            '\\' => match chars.next()? {
+                'n' => result.push(' '),
+                't' => result.push(' '),
+                'r' => {}
+                c => result.push(c),
+            },
             c => result.push(c),
         }
     }
@@ -1940,7 +1945,9 @@ fn extract_review_items(line: &str) -> Vec<ListItem> {
 
     let v_pos = line.find(verdict_marker);
     let b_pos = line.find(body_marker);
-    let (Some(v_pos), Some(b_pos)) = (v_pos, b_pos) else { return items; };
+    let (Some(v_pos), Some(b_pos)) = (v_pos, b_pos) else {
+        return items;
+    };
 
     // Verdict word: between the verdict marker and the next newline marker.
     let verdict_after = &line[v_pos + verdict_marker.len()..];
@@ -2032,7 +2039,11 @@ fn parse_json_event(line: &str, turn_n: &mut usize) -> Option<ListItem> {
     parse_json_event_inner(line, turn_n, None)
 }
 
-fn parse_json_event_inner(line: &str, turn_n: &mut usize, elapsed: Option<std::time::Duration>) -> Option<ListItem> {
+fn parse_json_event_inner(
+    line: &str,
+    turn_n: &mut usize,
+    elapsed: Option<std::time::Duration>,
+) -> Option<ListItem> {
     let type_val = json_str(line, "type")?;
     match type_val.as_str() {
         "system" => {
@@ -2083,14 +2094,19 @@ fn parse_json_event_inner(line: &str, turn_n: &mut usize, elapsed: Option<std::t
             let summary = match (!text_line.is_empty(), !tools.is_empty()) {
                 (true, true) => format!(
                     "[assistant] Turn {}{}  {}  tool_use={}",
-                    n, elapsed_str, text_line, tools.join(",")
+                    n,
+                    elapsed_str,
+                    text_line,
+                    tools.join(",")
                 ),
                 (true, false) => {
                     format!("[assistant] Turn {}{}  {}", n, elapsed_str, text_line)
                 }
                 (false, true) => format!(
                     "[assistant] Turn {}{}  tool_use={}",
-                    n, elapsed_str, tools.join(",")
+                    n,
+                    elapsed_str,
+                    tools.join(",")
                 ),
                 (false, false) => {
                     // No text block and no tool call — a reasoning-only turn.
@@ -2138,10 +2154,7 @@ fn parse_json_event_inner(line: &str, turn_n: &mut usize, elapsed: Option<std::t
             Some(activity_item(&text, Color::rgb(200, 200, 100)))
         }
 
-        "rate_limit_event" => Some(activity_item(
-            "[rate_limit]",
-            Color::rgb(220, 150, 50),
-        )),
+        "rate_limit_event" => Some(activity_item("[rate_limit]", Color::rgb(220, 150, 50))),
 
         _ => None,
     }
@@ -2250,11 +2263,7 @@ fn is_dispatchable_stage(name: &str) -> bool {
 /// when the stage hasn't started yet.
 fn pipeline_stage_item(name: &str, assignment: Option<&Assignment>) -> ListItem {
     let (indicator, color, detail_str) = match assignment {
-        None => (
-            "  -",
-            Color::rgb(100, 100, 100),
-            "pending".to_string(),
-        ),
+        None => ("  -", Color::rgb(100, 100, 100), "pending".to_string()),
         Some(a) => match a.status.as_str() {
             "running" => (
                 "  ~",
@@ -2282,10 +2291,7 @@ fn pipeline_stage_item(name: &str, assignment: Option<&Assignment>) -> ListItem 
         text: StyledText {
             spans: vec![
                 StyledSpan::with_fg(indicator, color),
-                StyledSpan::with_fg(
-                    format!(" {:8}", name),
-                    Color::rgb(180, 180, 200),
-                ),
+                StyledSpan::with_fg(format!(" {:8}", name), Color::rgb(180, 180, 200)),
                 StyledSpan::with_fg(format!("  {}", detail_str), color),
             ],
         },
@@ -2302,11 +2308,7 @@ fn pipeline_stage_item(name: &str, assignment: Option<&Assignment>) -> ListItem 
 /// Build a `ListItem` for the PR/Merge stage, sourced from `merge_queue`.
 fn pipeline_merge_item(entry: Option<&MergeQueueEntry>) -> ListItem {
     let (indicator, color, detail_str) = match entry {
-        None => (
-            "  -",
-            Color::rgb(100, 100, 100),
-            "pending".to_string(),
-        ),
+        None => ("  -", Color::rgb(100, 100, 100), "pending".to_string()),
         Some(e) => {
             let pr_label = match e.pr_number {
                 Some(n) => format!("PR #{}", n),
@@ -2316,7 +2318,11 @@ fn pipeline_merge_item(entry: Option<&MergeQueueEntry>) -> ListItem {
                 "merged" => ("  ✓", Color::rgb(120, 200, 120), pr_label),
                 "open" | "queued" => ("  ~", Color::rgb(80, 220, 80), pr_label),
                 "failed" => ("  ✗", Color::rgb(220, 70, 70), pr_label),
-                "human_required" => ("  !", Color::rgb(220, 100, 100), "needs manual rebase".to_string()),
+                "human_required" => (
+                    "  !",
+                    Color::rgb(220, 100, 100),
+                    "needs manual rebase".to_string(),
+                ),
                 _ => ("  -", Color::rgb(100, 100, 100), pr_label),
             }
         }
@@ -2460,7 +2466,9 @@ fn load_data() -> BoardData {
             }
         };
         let rows = match stmt.query_map([], |row| {
-            let repos_json: String = row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "[]".to_string());
+            let repos_json: String = row
+                .get::<_, Option<String>>(2)?
+                .unwrap_or_else(|| "[]".to_string());
             let repos: Vec<String> = serde_json::from_str(&repos_json).unwrap_or_default();
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, repos))
         }) {
@@ -2502,7 +2510,9 @@ fn load_data() -> BoardData {
     let machines: Vec<Machine> = probes
         .into_iter()
         .map(|(name, host, repos, tcp_rx, health_rx)| {
-            let tcp_reachable = tcp_rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false);
+            let tcp_reachable = tcp_rx
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap_or(false);
             // Health fetch has a 2 s connect + read timeout baked in; we wait
             // up to 2.1 s here so we never block past the in-flight deadline.
             let health = health_rx
@@ -2528,9 +2538,7 @@ fn load_data() -> BoardData {
 
     // ── Determine which machine is local ──────────────────────────────────
     // Match the OS hostname against the `host` column in the machines table.
-    let local_hostname = gethostname::gethostname()
-        .into_string()
-        .unwrap_or_default();
+    let local_hostname = gethostname::gethostname().into_string().unwrap_or_default();
     let local_machine = machine_rows
         .iter()
         .find(|(_, host, _)| *host == local_hostname)
@@ -2559,9 +2567,7 @@ fn load_data() -> BoardData {
         let rows = match stmt.query_map([], |row| {
             Ok(MergeQueueEntry {
                 assignment_id: row.get::<_, String>(0)?,
-                issue_number: row
-                    .get::<_, Option<i64>>(1)?
-                    .map(|n| n as u64),
+                issue_number: row.get::<_, Option<i64>>(1)?.map(|n| n as u64),
                 state: row.get::<_, String>(2)?,
                 pr_number: row.get::<_, Option<i64>>(3)?,
                 pr_url: row.get::<_, Option<String>>(4)?,
@@ -2606,7 +2612,9 @@ fn load_data() -> BoardData {
                 issue_number: row.get::<_, i64>(3)? as u64,
                 issue_title: row.get::<_, String>(4)?,
                 rationale: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                proposal_type: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "work".into()),
+                proposal_type: row
+                    .get::<_, Option<String>>(6)?
+                    .unwrap_or_else(|| "work".into()),
             })
         }) {
             Ok(r) => r,
@@ -2634,7 +2642,16 @@ fn load_data() -> BoardData {
              ORDER BY repo_name, number",
         ) {
             Ok(s) => s,
-            Err(_) => return BoardData { local_machine, assignments, machines, merge_queue, proposals, ..BoardData::default() },
+            Err(_) => {
+                return BoardData {
+                    local_machine,
+                    assignments,
+                    machines,
+                    merge_queue,
+                    proposals,
+                    ..BoardData::default()
+                }
+            }
         };
         let rows = match stmt.query_map([], |row| {
             let labels_raw: String = row.get(4).unwrap_or_default();
@@ -2645,13 +2662,24 @@ fn load_data() -> BoardData {
                 title: row.get::<_, String>(2)?,
                 body: row.get::<_, String>(3).unwrap_or_default(),
                 labels,
-                state: row.get::<_, String>(5).unwrap_or_else(|_| "open".to_string()),
+                state: row
+                    .get::<_, String>(5)
+                    .unwrap_or_else(|_| "open".to_string()),
                 milestone_number: row.get::<_, Option<i64>>(6).unwrap_or(None),
                 milestone_title: row.get::<_, Option<String>>(7).unwrap_or(None),
             })
         }) {
             Ok(r) => r,
-            Err(_) => return BoardData { local_machine, assignments, machines, merge_queue, proposals, ..BoardData::default() },
+            Err(_) => {
+                return BoardData {
+                    local_machine,
+                    assignments,
+                    machines,
+                    merge_queue,
+                    proposals,
+                    ..BoardData::default()
+                }
+            }
         };
         rows.filter_map(|r| r.ok()).collect()
     };
@@ -2711,7 +2739,10 @@ fn load_data() -> BoardData {
 /// `coord.plan_parser.WorkerPlan.from_dict`; tolerant of missing fields.
 fn parse_plan_data(v: &serde_json::Value) -> PlanData {
     fn s(v: &serde_json::Value, key: &str) -> String {
-        v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+        v.get(key)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
     }
     fn vs(v: &serde_json::Value, key: &str) -> Vec<String> {
         v.get(key)
@@ -2848,8 +2879,16 @@ fn spawn_issue_fetch(
                             .map(String::from);
                         let issue = FetchedIssue {
                             number,
-                            title: v.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                            body: v.get("body").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            title: v
+                                .get("title")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            body: v
+                                .get("body")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                             labels,
                             state: v
                                 .get("state")
@@ -2890,10 +2929,13 @@ fn spawn_pr_fetch(
     std::thread::spawn(move || {
         let output = std::process::Command::new("gh")
             .args([
-                "pr", "view",
+                "pr",
+                "view",
                 &pr_number.to_string(),
-                "--repo", &repo_slug,
-                "--json", "title,body,files,reviews",
+                "--repo",
+                &repo_slug,
+                "--json",
+                "title,body,files,reviews",
             ])
             .output();
         let result = match output {
@@ -2932,8 +2974,16 @@ fn spawn_pr_fetch(
                             })
                             .unwrap_or_default();
                         Ok(FetchedPr {
-                            title: v.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                            body: v.get("body").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                            title: v
+                                .get("title")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            body: v
+                                .get("body")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                             files,
                             reviews,
                         })
@@ -2956,8 +3006,7 @@ fn spawn_pr_fetch(
 /// coord/TUI writers per SQLite WAL semantics.
 fn upsert_issue_db(repo_name: &str, issue: &FetchedIssue) -> rusqlite::Result<()> {
     let conn = open_purge_conn()?;
-    let labels_json =
-        serde_json::to_string(&issue.labels).unwrap_or_else(|_| "[]".to_string());
+    let labels_json = serde_json::to_string(&issue.labels).unwrap_or_else(|_| "[]".to_string());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -3003,7 +3052,11 @@ fn upsert_issue_db(repo_name: &str, issue: &FetchedIssue) -> rusqlite::Result<()
 /// detects this on the next `tx.send()` call (which returns `Err`).  Under
 /// normal conditions this happens within 15 s (SSE keepalive interval); a
 /// 20-second read timeout acts as a safety net if keepalives stop.
-fn spawn_sse_watch(host: &str, id: &str, last_event_id: u64) -> std::sync::mpsc::Receiver<SseWatchMsg> {
+fn spawn_sse_watch(
+    host: &str,
+    id: &str,
+    last_event_id: u64,
+) -> std::sync::mpsc::Receiver<SseWatchMsg> {
     let (tx, rx) = std::sync::mpsc::channel();
     let url = format!("http://{}:7433/stream/{}", host, id);
     std::thread::spawn(move || {
@@ -3050,10 +3103,15 @@ fn spawn_sse_watch(host: &str, id: &str, last_event_id: u64) -> std::sync::mpsc:
                     let text = current_data.join("\n");
                     let keep_going = match current_event.as_str() {
                         "log" => tx
-                            .send(SseWatchMsg::Lines { last_id: current_id, text })
+                            .send(SseWatchMsg::Lines {
+                                last_id: current_id,
+                                text,
+                            })
                             .is_ok(),
                         "end" => {
-                            let _ = tx.send(SseWatchMsg::Done { last_id: current_id });
+                            let _ = tx.send(SseWatchMsg::Done {
+                                last_id: current_id,
+                            });
                             return;
                         }
                         _ => true, // unknown event type — ignore
@@ -3088,7 +3146,9 @@ fn spawn_sse_watch(host: &str, id: &str, last_event_id: u64) -> std::sync::mpsc:
         }
 
         // EOF: connection closed without an explicit `end` event.
-        let _ = tx.send(SseWatchMsg::Done { last_id: current_id });
+        let _ = tx.send(SseWatchMsg::Done {
+            last_id: current_id,
+        });
     });
     rx
 }
@@ -3125,10 +3185,7 @@ const PIPELINE_ACTION_HEIGHT: f32 = 1.0;
 ///
 /// Matches the constants used by `quadraui::tui::tui_pipeline_view_layout`;
 /// if those drift, the GTK and TUI flows could disagree on stage bounds.
-fn tui_pipeline_layout(
-    view: &QuiPipelineView,
-    rect: Rect,
-) -> quadraui::PipelineViewLayout {
+fn tui_pipeline_layout(view: &QuiPipelineView, rect: Rect) -> quadraui::PipelineViewLayout {
     let action_h = if view.stages.iter().any(|s| s.action.is_some()) {
         PIPELINE_ACTION_HEIGHT
     } else {
@@ -3137,12 +3194,7 @@ fn tui_pipeline_layout(
     view.layout(
         rect.x,
         rect.y,
-        quadraui::PipelineViewMeasure::new(
-            rect.width,
-            rect.height,
-            PIPELINE_ARROW_WIDTH,
-            action_h,
-        ),
+        quadraui::PipelineViewMeasure::new(rect.width, rect.height, PIPELINE_ARROW_WIDTH, action_h),
     )
 }
 
@@ -3166,10 +3218,7 @@ fn stage_badge(stage: &str) -> (String, Color) {
 /// blob it emits, and constructs a `PipelineLoaderResult`.  It runs in a
 /// background thread spawned from `maybe_kick_pipeline_loader` so the UI
 /// thread is never blocked on `gh`.
-fn fetch_pipeline_issues(
-    labels: &[String],
-    repos: &[(String, String)],
-) -> PipelineLoaderResult {
+fn fetch_pipeline_issues(labels: &[String], repos: &[(String, String)]) -> PipelineLoaderResult {
     if labels.is_empty() {
         return PipelineLoaderResult::Ok(Vec::new());
     }
@@ -3189,8 +3238,7 @@ fn fetch_pipeline_issues(
     // `gh search issues --state` only accepts "open" or "closed" (not "all"
     // — that's a `gh issue list` flag). To populate the Done lifecycle
     // section we have to query both states and merge.
-    let label_set: std::collections::HashSet<&str> =
-        labels.iter().map(|s| s.as_str()).collect();
+    let label_set: std::collections::HashSet<&str> = labels.iter().map(|s| s.as_str()).collect();
     let mut issues: Vec<PipelineIssue> = Vec::new();
     for state in ["open", "closed"] {
         let mut args: Vec<String> = vec![
@@ -3235,77 +3283,78 @@ fn fetch_pipeline_issues(
         };
 
         for item in &arr {
-        let number = item
-            .get("number")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
-        if number == 0 {
-            continue;
-        }
-        let title = item
-            .get("title")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
-        let repo_slug = item
-            .get("repository")
-            .and_then(|r| r.get("nameWithOwner"))
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| {
-                // `gh search issues` sometimes returns the repo as a string url-tail.
-                item.get("url").and_then(|u| u.as_str()).and_then(|u| {
-                    // https://<host>/owner/name/issues/123 — strip scheme+host,
-                    // then take the first two path segments as owner/repo.
-                    let path = u.splitn(4, "//").nth(1).unwrap_or(u);
-                    let mut parts = path.splitn(4, '/');
-                    parts.next(); // skip host
-                    let owner = parts.next()?;
-                    let repo = parts.next()?;
-                    if owner.is_empty() || repo.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{}/{}", owner, repo))
-                    }
+            let number = item.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+            if number == 0 {
+                continue;
+            }
+            let title = item
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let repo_slug = item
+                .get("repository")
+                .and_then(|r| r.get("nameWithOwner"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    // `gh search issues` sometimes returns the repo as a string url-tail.
+                    item.get("url").and_then(|u| u.as_str()).and_then(|u| {
+                        // https://<host>/owner/name/issues/123 — strip scheme+host,
+                        // then take the first two path segments as owner/repo.
+                        let path = u.splitn(4, "//").nth(1).unwrap_or(u);
+                        let mut parts = path.splitn(4, '/');
+                        parts.next(); // skip host
+                        let owner = parts.next()?;
+                        let repo = parts.next()?;
+                        if owner.is_empty() || repo.is_empty() {
+                            None
+                        } else {
+                            Some(format!("{}/{}", owner, repo))
+                        }
+                    })
                 })
-            })
-            .unwrap_or_default();
-        let issue_labels: Vec<String> = item
-            .get("labels")
-            .and_then(|l| l.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let matched_labels: Vec<String> = issue_labels
-            .iter()
-            .filter(|l| label_set.contains(l.as_str()))
-            .cloned()
-            .collect();
-        let body = item
-            .get("body")
-            .and_then(|b| b.as_str())
-            .unwrap_or("")
-            .to_string();
-        let coord_repo = slug_to_local.get(&repo_slug).cloned();
-        let is_closed = item
-            .get("state")
-            .and_then(|s| s.as_str())
-            .map(|s| s == "closed")
-            .unwrap_or(false);
-        let all_labels = issue_labels;
-        issues.push(PipelineIssue {
-            number,
-            title,
-            body,
-            repo_slug,
-            coord_repo,
-            matched_labels,
-            all_labels,
-            is_closed,
-        });
+                .unwrap_or_default();
+            let issue_labels: Vec<String> = item
+                .get("labels")
+                .and_then(|l| l.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| {
+                            x.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let matched_labels: Vec<String> = issue_labels
+                .iter()
+                .filter(|l| label_set.contains(l.as_str()))
+                .cloned()
+                .collect();
+            let body = item
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_string();
+            let coord_repo = slug_to_local.get(&repo_slug).cloned();
+            let is_closed = item
+                .get("state")
+                .and_then(|s| s.as_str())
+                .map(|s| s == "closed")
+                .unwrap_or(false);
+            let all_labels = issue_labels;
+            issues.push(PipelineIssue {
+                number,
+                title,
+                body,
+                repo_slug,
+                coord_repo,
+                matched_labels,
+                all_labels,
+                is_closed,
+            });
         }
     }
     // Stable order: by repo, then by issue number.
@@ -3347,9 +3396,13 @@ fn ci_stale_secs(cached: Option<&CiCheckSummary>, merge_eligible: bool) -> Optio
 /// silently retries on the next refresh.
 fn fetch_ci_check_summary(repo_slug: &str, pr_number: i64) -> Result<CiCheckSummary, String> {
     let args = [
-        "pr".to_string(), "checks".to_string(), pr_number.to_string(),
-        "--repo".to_string(), repo_slug.to_string(),
-        "--json".to_string(), "name,state,conclusion,link".to_string(),
+        "pr".to_string(),
+        "checks".to_string(),
+        pr_number.to_string(),
+        "--repo".to_string(),
+        repo_slug.to_string(),
+        "--json".to_string(),
+        "name,state,conclusion,link".to_string(),
     ];
     let output = std::process::Command::new("gh")
         .args(&args)
@@ -3361,8 +3414,8 @@ fn fetch_ci_check_summary(repo_slug: &str, pr_number: i64) -> Result<CiCheckSumm
     if stdout.is_empty() && !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    let value: serde_json::Value = serde_json::from_slice(stdout)
-        .map_err(|e| format!("gh JSON parse: {}", e))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(stdout).map_err(|e| format!("gh JSON parse: {}", e))?;
     let arr = value.as_array().cloned().unwrap_or_default();
 
     let mut passed = 0usize;
@@ -3371,14 +3424,26 @@ fn fetch_ci_check_summary(repo_slug: &str, pr_number: i64) -> Result<CiCheckSumm
     let mut failed_names: Vec<String> = Vec::new();
     let mut first_failed_url: Option<String> = None;
     for item in &arr {
-        let state = item.get("state").and_then(|s| s.as_str()).unwrap_or("").to_lowercase();
+        let state = item
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_lowercase();
         let conclusion = item
             .get("conclusion")
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_lowercase();
-        let name = item.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        let link = item.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let name = item
+            .get("name")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let link = item
+            .get("link")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
         let is_completed = state == "completed" || state == "complete";
         if !is_completed {
             running += 1;
@@ -3480,7 +3545,14 @@ fn load_pipeline_meta(
     // #349: repo_name → local checkout path on this machine.
     let repo_paths = read_map(conn, "pipeline_repo_paths");
 
-    (default_gates, tracked_labels, repos, require_plan, repo_run_cmds, repo_paths)
+    (
+        default_gates,
+        tracked_labels,
+        repos,
+        require_plan,
+        repo_run_cmds,
+        repo_paths,
+    )
 }
 
 // ─── Log items cache ──────────────────────────────────────────────────────────
@@ -3618,7 +3690,8 @@ pub struct CoordApp {
     /// Each entry stores `(fetched_at, items)`. Entries older than 30 s are
     /// re-fetched on the next render that needs them. `RefCell` is used so the
     /// cache can be updated from `&self` methods (render path).
-    remote_log_cache: std::cell::RefCell<std::collections::HashMap<String, (Instant, Vec<ListItem>)>>,
+    remote_log_cache:
+        std::cell::RefCell<std::collections::HashMap<String, (Instant, Vec<ListItem>)>>,
     /// Pending background board-data load.  `Some` while a load is in flight;
     /// `None` when idle.  Polled non-blockingly on every [`handle`] call.
     pending_data: Option<std::sync::mpsc::Receiver<BoardData>>,
@@ -3629,17 +3702,25 @@ pub struct CoordApp {
     ///
     /// Each `Receiver` yields `Ok(raw_content)` or `Err(error_message)`.
     /// `RefCell` allows mutation from `&self` render methods.
-    pending_log_fetches: std::cell::RefCell<std::collections::HashMap<String, std::sync::mpsc::Receiver<Result<String, String>>>>,
+    pending_log_fetches: std::cell::RefCell<
+        std::collections::HashMap<String, std::sync::mpsc::Receiver<Result<String, String>>>,
+    >,
     /// In-flight `gh issue view` fetches for Board Issue tab bodies that
     /// weren't in the local issues table (e.g. closed >7d ago and pruned).
     /// Keyed by `(repo_name, issue_number)`. The receiver yields `Ok(issue)`
     /// or `Err(error_message)`.
-    pending_issue_fetches: std::cell::RefCell<std::collections::HashMap<(String, u64), std::sync::mpsc::Receiver<Result<FetchedIssue, String>>>>,
+    pending_issue_fetches: std::cell::RefCell<
+        std::collections::HashMap<
+            (String, u64),
+            std::sync::mpsc::Receiver<Result<FetchedIssue, String>>,
+        >,
+    >,
     /// In-memory cache for successfully-fetched single issues. Survives until
     /// the TUI restarts; the background thread also upserts into the DB so
     /// the next `load_data()` finds it. No TTL — `coord sync` is the source
     /// of truth for invalidation.
-    fetched_issues_cache: std::cell::RefCell<std::collections::HashMap<(String, u64), FetchedIssue>>,
+    fetched_issues_cache:
+        std::cell::RefCell<std::collections::HashMap<(String, u64), FetchedIssue>>,
     /// Pending purge confirmation state.  `Some((assignments, issues))` means
     /// we are waiting for the user to confirm; `None` means not pending.
     ///
@@ -3829,7 +3910,10 @@ pub struct CoordApp {
     /// `poll_pending_pr_fetches` each tick; results land in
     /// `fetched_prs_cache`.
     pending_pr_fetches: std::cell::RefCell<
-        std::collections::HashMap<(String, i64), std::sync::mpsc::Receiver<Result<FetchedPr, String>>>,
+        std::collections::HashMap<
+            (String, i64),
+            std::sync::mpsc::Receiver<Result<FetchedPr, String>>,
+        >,
     >,
     /// In-memory cache of the latest `gh pr view` snapshot per PR.
     /// Populated by completed `pending_pr_fetches` rounds; consumed by
@@ -3984,7 +4068,8 @@ pub struct CoordApp {
     /// opens the Terminal tab for a given issue; kept running while the
     /// issue stays in `pipeline_issues`; dropped when the issue leaves
     /// the pipeline (on the next load that no longer contains it).
-    detail_terminal_sessions: std::collections::HashMap<u64, quadraui::terminal_engine::TerminalSession>,
+    detail_terminal_sessions:
+        std::collections::HashMap<u64, quadraui::terminal_engine::TerminalSession>,
     /// Spawn errors for per-issue terminals (shown as a one-line
     /// placeholder in the Terminal tab).
     detail_terminal_spawn_errors: std::collections::HashMap<u64, String>,
@@ -4064,21 +4149,21 @@ fn key_to_binding_str(key: &Key) -> String {
     match key {
         Key::Char(c) => c.to_ascii_lowercase().to_string(),
         Key::Named(n) => match n {
-            NamedKey::Escape    => "Escape".to_string(),
-            NamedKey::Enter     => "Enter".to_string(),
-            NamedKey::Tab       => "Tab".to_string(),
+            NamedKey::Escape => "Escape".to_string(),
+            NamedKey::Enter => "Enter".to_string(),
+            NamedKey::Tab => "Tab".to_string(),
             NamedKey::Backspace => "Backspace".to_string(),
-            NamedKey::Delete    => "Delete".to_string(),
-            NamedKey::Home      => "Home".to_string(),
-            NamedKey::End       => "End".to_string(),
-            NamedKey::PageUp    => "PageUp".to_string(),
-            NamedKey::PageDown  => "PageDown".to_string(),
-            NamedKey::Up        => "Up".to_string(),
-            NamedKey::Down      => "Down".to_string(),
-            NamedKey::Left      => "Left".to_string(),
-            NamedKey::Right     => "Right".to_string(),
-            NamedKey::F(n)      => format!("F{n}"),
-            _                   => String::new(),
+            NamedKey::Delete => "Delete".to_string(),
+            NamedKey::Home => "Home".to_string(),
+            NamedKey::End => "End".to_string(),
+            NamedKey::PageUp => "PageUp".to_string(),
+            NamedKey::PageDown => "PageDown".to_string(),
+            NamedKey::Up => "Up".to_string(),
+            NamedKey::Down => "Down".to_string(),
+            NamedKey::Left => "Left".to_string(),
+            NamedKey::Right => "Right".to_string(),
+            NamedKey::F(n) => format!("F{n}"),
+            _ => String::new(),
         },
     }
 }
@@ -4332,18 +4417,17 @@ impl CoordApp {
     /// dispatch site already gets corner feedback without each helper
     /// having to call `push_toast` explicitly.
     fn toast_stack(&self) -> Option<ToastStack> {
-        let mut items: Vec<ToastItem> = self
-            .toasts
-            .iter()
-            .map(|(it, _, _)| it.clone())
-            .collect();
+        let mut items: Vec<ToastItem> = self.toasts.iter().map(|(it, _, _)| it.clone()).collect();
         if let Some((msg, when)) = &self.pipeline_status {
             if when.elapsed() < TOAST_TTL {
                 items.push(ToastItem {
                     id: WidgetId::new(format!("pipeline-status-{}", when.elapsed().as_millis())),
                     title: "Pipeline".to_string(),
                     body: msg.clone(),
-                    severity: if msg.contains("no reachable") || msg.contains("no failed") || msg.contains("not found") {
+                    severity: if msg.contains("no reachable")
+                        || msg.contains("no failed")
+                        || msg.contains("not found")
+                    {
                         ToastSeverity::Warning
                     } else {
                         ToastSeverity::Info
@@ -4374,8 +4458,12 @@ impl CoordApp {
     /// connection and insert it into the pool (evicting the LRU entry if the
     /// pool has reached `WATCH_POOL_CAP`).
     fn open_watch_for_selected_issue(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
         let local_repo = issue.coord_repo.as_deref();
 
         let candidates: Vec<_> = self
@@ -4390,11 +4478,15 @@ impl CoordApp {
             .collect();
 
         // Prefer running → any non-done → most-recent done (read-only log review).
-        let pick = candidates.iter().copied().find(|a| a.status == "running")
+        let pick = candidates
+            .iter()
+            .copied()
+            .find(|a| a.status == "running")
             .or_else(|| candidates.iter().copied().find(|a| a.status != "done"))
             .or_else(|| {
                 candidates.iter().copied().max_by(|a, b| {
-                    a.dispatched_at.partial_cmp(&b.dispatched_at)
+                    a.dispatched_at
+                        .partial_cmp(&b.dispatched_at)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
             });
@@ -4445,7 +4537,8 @@ impl CoordApp {
                 };
                 // Evict the LRU entry if the pool is at capacity.
                 if self.watch_pool.len() >= WATCH_POOL_CAP {
-                    let lru_id = self.watch_pool
+                    let lru_id = self
+                        .watch_pool
                         .iter()
                         .min_by_key(|(_, ctx)| ctx.last_focused_at)
                         .map(|(id, _)| id.clone());
@@ -4453,14 +4546,17 @@ impl CoordApp {
                         self.watch_pool.remove(&id);
                     }
                 }
-                self.watch_pool.insert(aid.clone(), WatchContext {
-                    state,
-                    sse,
-                    inject_transcript: Vec::new(),
-                    inject_sse_offsets: Vec::new(),
-                    history_turns: Vec::new(),
-                    last_focused_at: Instant::now(),
-                });
+                self.watch_pool.insert(
+                    aid.clone(),
+                    WatchContext {
+                        state,
+                        sse,
+                        inject_transcript: Vec::new(),
+                        inject_sse_offsets: Vec::new(),
+                        history_turns: Vec::new(),
+                        last_focused_at: Instant::now(),
+                    },
+                );
                 self.watch_focused = Some(aid);
                 true
             }
@@ -4507,24 +4603,40 @@ impl CoordApp {
     fn ensure_log_tab_sse(&mut self) {
         // Pick the same assignment pipeline_log_list does (running → most
         // recent by dispatched_at) so the pool entry tracks the visible row.
-        let pick_id = self.pipeline_sel
+        let pick_id = self
+            .pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
             .and_then(|issue| {
                 let local_repo = issue.coord_repo.as_deref();
-                self.data.assignments.iter()
+                self.data
+                    .assignments
+                    .iter()
                     .filter(|a| a.issue_number == issue.number)
-                    .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+                    .filter(|a| match local_repo {
+                        Some(r) => a.repo == r,
+                        None => true,
+                    })
                     .find(|a| a.status == "running")
                     .or_else(|| {
-                        self.data.assignments.iter()
+                        self.data
+                            .assignments
+                            .iter()
                             .filter(|a| a.issue_number == issue.number)
-                            .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
-                            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
-                                .unwrap_or(std::cmp::Ordering::Equal))
+                            .filter(|a| match local_repo {
+                                Some(r) => a.repo == r,
+                                None => true,
+                            })
+                            .max_by(|a, b| {
+                                a.dispatched_at
+                                    .partial_cmp(&b.dispatched_at)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
                     })
                     .map(|a| a.id.clone())
             });
-        let Some(target) = pick_id else { return; };
+        let Some(target) = pick_id else {
+            return;
+        };
         // Pool already has the picked assignment? Leave it (live or done).
         if self.watch_pool.contains_key(&target) {
             return;
@@ -4537,8 +4649,12 @@ impl CoordApp {
     /// WITHOUT setting `watch_focused`.  Used by the Log tab and any other
     /// caller that wants background accumulation but not the watch overlay.
     fn open_sse_in_pool_for_selected_issue(&mut self) {
-        let Some(idx) = self.pipeline_sel else { return; };
-        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return; };
+        let Some(idx) = self.pipeline_sel else {
+            return;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return;
+        };
         let local_repo = issue.coord_repo.as_deref();
 
         let candidates: Vec<_> = self
@@ -4552,14 +4668,22 @@ impl CoordApp {
             })
             .collect();
 
-        let pick = candidates.iter().copied().find(|a| a.status == "running")
+        let pick = candidates
+            .iter()
+            .copied()
+            .find(|a| a.status == "running")
             .or_else(|| candidates.iter().copied().find(|a| a.status != "done"))
-            .or_else(|| candidates.iter().copied().max_by(|a, b| {
-                a.dispatched_at.partial_cmp(&b.dispatched_at)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }));
+            .or_else(|| {
+                candidates.iter().copied().max_by(|a, b| {
+                    a.dispatched_at
+                        .partial_cmp(&b.dispatched_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
 
-        let Some(a) = pick else { return; };
+        let Some(a) = pick else {
+            return;
+        };
         let aid = a.id.clone();
 
         // Already in the pool — nothing to do.
@@ -4571,7 +4695,10 @@ impl CoordApp {
             machine: a.machine.clone(),
             repo: a.repo.clone(),
             issue_number: a.issue_number,
-            assignment_type: a.assignment_type.clone().unwrap_or_else(|| "work".to_string()),
+            assignment_type: a
+                .assignment_type
+                .clone()
+                .unwrap_or_else(|| "work".to_string()),
             scroll: usize::MAX,
         };
         let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == a.machine) {
@@ -4596,7 +4723,8 @@ impl CoordApp {
             make_local_sse_state(&a.id)
         };
         if self.watch_pool.len() >= WATCH_POOL_CAP {
-            let lru_id = self.watch_pool
+            let lru_id = self
+                .watch_pool
                 .iter()
                 .min_by_key(|(_, ctx)| ctx.last_focused_at)
                 .map(|(id, _)| id.clone());
@@ -4604,14 +4732,17 @@ impl CoordApp {
                 self.watch_pool.remove(&id);
             }
         }
-        self.watch_pool.insert(aid, WatchContext {
-            state,
-            sse,
-            inject_transcript: Vec::new(),
-            inject_sse_offsets: Vec::new(),
-            history_turns: Vec::new(),
-            last_focused_at: Instant::now(),
-        });
+        self.watch_pool.insert(
+            aid,
+            WatchContext {
+                state,
+                sse,
+                inject_transcript: Vec::new(),
+                inject_sse_offsets: Vec::new(),
+                history_turns: Vec::new(),
+                last_focused_at: Instant::now(),
+            },
+        );
     }
 
     /// Force a fresh SSE connection for the focused watch session (R key).
@@ -4657,7 +4788,8 @@ impl CoordApp {
 
     /// Borrow the `WatchState` for the focused session, if any.
     fn focused_watch_state(&self) -> Option<&WatchState> {
-        self.watch_focused.as_ref()
+        self.watch_focused
+            .as_ref()
             .and_then(|id| self.watch_pool.get(id))
             .map(|ctx| &ctx.state)
     }
@@ -4670,7 +4802,8 @@ impl CoordApp {
 
     /// Borrow the inject transcript for the focused session (empty slice if none).
     fn focused_transcript(&self) -> &[ChatTurn] {
-        self.watch_focused.as_ref()
+        self.watch_focused
+            .as_ref()
             .and_then(|id| self.watch_pool.get(id))
             .map(|ctx| ctx.inject_transcript.as_slice())
             .unwrap_or(&[])
@@ -4680,7 +4813,11 @@ impl CoordApp {
     /// No-op when the watched assignment isn't a plan; toasts otherwise.
     fn approve_watched_plan(&mut self) -> bool {
         let (aid, issue_number, atype) = match self.focused_watch_state() {
-            Some(w) => (w.assignment_id.clone(), w.issue_number, w.assignment_type.clone()),
+            Some(w) => (
+                w.assignment_id.clone(),
+                w.issue_number,
+                w.assignment_type.clone(),
+            ),
             None => return false,
         };
         if atype != "plan" {
@@ -4691,9 +4828,7 @@ impl CoordApp {
             return false;
         }
         use crate::commands::SpawnQueuedOutcome;
-        let outcome = self
-            .command_runner
-            .spawn_queued(&["approve-plan", &aid]);
+        let outcome = self.command_runner.spawn_queued(&["approve-plan", &aid]);
         match outcome {
             SpawnQueuedOutcome::Started => {
                 self.pipeline_status = Some((
@@ -4705,11 +4840,18 @@ impl CoordApp {
                 self.close_watch();
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "approve-plan runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "approve-plan runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Find a running or non-done assignment for the currently-selected
@@ -4717,7 +4859,9 @@ impl CoordApp {
     /// `true` when a stop was dispatched, `false` when no candidate
     /// assignment was found (the caller toasts the user).
     fn dispatch_stop_for_selected_pipeline_row(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
         let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
             return false;
         };
@@ -4746,24 +4890,31 @@ impl CoordApp {
                     })
                     .find(|a| a.status != "done")
             });
-        let Some(a) = pick else { return false; };
+        let Some(a) = pick else {
+            return false;
+        };
         let aid = a.id.clone();
         let issue_n = a.issue_number;
         use crate::commands::SpawnQueuedOutcome;
         let outcome = self.command_runner.spawn_queued(&["stop", &aid]);
         match outcome {
             SpawnQueuedOutcome::Started => {
-                self.pipeline_status = Some((
-                    format!("stop dispatched for #{}", issue_n),
-                    Instant::now(),
-                ));
+                self.pipeline_status =
+                    Some((format!("stop dispatched for #{}", issue_n), Instant::now()));
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "stop runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "stop runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Open the PR for the currently-selected Pipeline row in the user's
@@ -4771,7 +4922,9 @@ impl CoordApp {
     /// child was spawned; `false` when no PR has been opened yet (the
     /// merge_queue entry has no `pr_number`).
     fn dispatch_open_pr_for_selected_pipeline_row(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else { return false; };
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
         let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
             return false;
         };
@@ -4783,9 +4936,11 @@ impl CoordApp {
         // browser open, not a coord-tui status).
         let _ = std::process::Command::new("gh")
             .args([
-                "pr", "view",
+                "pr",
+                "view",
                 &pr_number.to_string(),
-                "--repo", &issue.repo_slug,
+                "--repo",
+                &issue.repo_slug,
                 "--web",
             ])
             .stdin(std::process::Stdio::null())
@@ -4816,11 +4971,18 @@ impl CoordApp {
                 ));
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "stop runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "stop runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Build the body `ListView` for the watch overlay — the raw log lines
@@ -4832,7 +4994,9 @@ impl CoordApp {
     /// when SSE is unavailable (e.g. local assignment, no host).
     fn watch_log_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
-        let ctx = self.watch_focused.as_ref()
+        let ctx = self
+            .watch_focused
+            .as_ref()
             .and_then(|id| self.watch_pool.get(id));
         let title = match ctx {
             None => " WATCH ".to_string(),
@@ -4852,7 +5016,11 @@ impl CoordApp {
                         // word-wraps prose and shows arrow-prefixed tool calls —
                         // same format as the Log tab and `coord log` output.
                         let wrap_width = self.last_log_panel_cols.get().max(40);
-                        items.extend(parse_sse_log_readable(&sse.lines, &sse.line_times, wrap_width));
+                        items.extend(parse_sse_log_readable(
+                            &sse.lines,
+                            &sse.line_times,
+                            wrap_width,
+                        ));
                     }
                     if sse.done {
                         items.push(kv_item(
@@ -4884,7 +5052,9 @@ impl CoordApp {
         // a literal `items.len() - 40`, which clipped the latest lines on
         // smaller terminals.
         let visible_rows = self.last_main_visible_rows.get().max(1);
-        let scroll = self.watch_focused.as_ref()
+        let scroll = self
+            .watch_focused
+            .as_ref()
             .and_then(|id| self.watch_pool.get(id))
             .map(|ctx| {
                 if ctx.state.scroll == usize::MAX {
@@ -4930,11 +5100,18 @@ impl CoordApp {
     /// over the "Steer sent" confirmation toast.
     fn submit_inject_with_toast(&mut self, text: String, show_toast: bool) -> bool {
         let (aid, issue_number, machine_name, old_type) = match self.focused_watch_state() {
-            Some(w) => (w.assignment_id.clone(), w.issue_number, w.machine.clone(), w.assignment_type.clone()),
+            Some(w) => (
+                w.assignment_id.clone(),
+                w.issue_number,
+                w.machine.clone(),
+                w.assignment_type.clone(),
+            ),
             None => return false,
         };
         let text = text.trim().to_string();
-        if text.is_empty() { return false; }
+        if text.is_empty() {
+            return false;
+        }
         // #264: claude -p exits after `stop_reason: end_turn` (it doesn't
         // stay alive waiting for more injects), so once the assignment is
         // in `done` state any new POST /inject/{id} will return 410
@@ -4956,7 +5133,11 @@ impl CoordApp {
         // ("assignment is `done`, not running") and the message was lost.
         let worker_done = self.data.assignments.iter().any(|a| {
             a.id == aid && (a.status == "done" || a.status == "failed" || a.status == "cancelled")
-        }) || self.watch_pool.get(&aid).map(|ctx| ctx.sse.done).unwrap_or(false);
+        }) || self
+            .watch_pool
+            .get(&aid)
+            .map(|ctx| ctx.sse.done)
+            .unwrap_or(false);
         // Guard against double-dispatch: if a resume is already in flight,
         // refuse new submits with a hint rather than firing a second
         // chat-continue against the same session (which would race the
@@ -4972,7 +5153,9 @@ impl CoordApp {
             // Record the user turn in the transcript before the shell-out so
             // the typed text is visible immediately and can't disappear even
             // if the dispatch takes a moment.
-            let sse_offset_at_send = self.watch_pool.get(&aid)
+            let sse_offset_at_send = self
+                .watch_pool
+                .get(&aid)
                 .map(|ctx| ctx.sse.lines.len())
                 .unwrap_or(0);
             {
@@ -5011,10 +5194,8 @@ impl CoordApp {
                 arm_unix_secs,
                 old_type: Some(old_type),
             });
-            self.pipeline_status = Some((
-                format!("⏳ Resuming chat #{issue_number}…"),
-                Instant::now(),
-            ));
+            self.pipeline_status =
+                Some((format!("⏳ Resuming chat #{issue_number}…"), Instant::now()));
             return true;
         }
         let host = match self.data.machines.iter().find(|m| m.name == machine_name) {
@@ -5027,7 +5208,13 @@ impl CoordApp {
                 return false;
             }
         };
-        spawn_inject_post(&host, &aid, &text, issue_number, self.inject_fallback_tx.clone());
+        spawn_inject_post(
+            &host,
+            &aid,
+            &text,
+            issue_number,
+            self.inject_fallback_tx.clone(),
+        );
         // Optimistic toast: fire-and-forget; 409/410 will fall back via
         // inject_fallback_rx, so we surface the confirmation immediately
         // rather than waiting for the HTTP round-trip.  Use "Steer sent"
@@ -5054,7 +5241,9 @@ impl CoordApp {
         // all pile at the top of the transcript regardless of when they
         // were sent (the bug the user reported: "my message goes above
         // the ai messages not inline in order").
-        let sse_offset_at_send = self.watch_pool.get(&aid)
+        let sse_offset_at_send = self
+            .watch_pool
+            .get(&aid)
             .map(|ctx| ctx.sse.lines.len())
             .unwrap_or(0);
         {
@@ -5079,7 +5268,8 @@ impl CoordApp {
             // worked for worker-guidance chat — the user assumed the
             // assistant was "doing the work" via the Log tab — but for
             // refinement-chat the assistant's reply IS the deliverable.
-            let transcript = self.focused_watch_state()
+            let transcript = self
+                .focused_watch_state()
                 .map(|w| w.assignment_id.clone())
                 .and_then(|id| self.watch_pool.get(&id))
                 .map(chat_transcript_from_pool)
@@ -5120,10 +5310,18 @@ impl CoordApp {
         match self.command_runner.spawn_queued(&["sync", "--quiet"]) {
             SpawnQueuedOutcome::Started => {
                 self.issue_sync_last = Some(Instant::now());
-                self.push_toast("Sync", "Fetching open issues from GitHub…", ToastSeverity::Info);
+                self.push_toast(
+                    "Sync",
+                    "Fetching open issues from GitHub…",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("Sync", "Sync queued — will run after current command.", ToastSeverity::Info);
+                self.push_toast(
+                    "Sync",
+                    "Sync queued — will run after current command.",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {
                 // A sync is already running or already queued — nothing to do.
@@ -5159,7 +5357,8 @@ impl CoordApp {
                 // the DB has now confirmed a real merge_queue entry (any state).
                 // Once the row exists, merge_stage_status_for reads the real state.
                 self.pipeline_inflight_merges.retain(|(_, issue_number)| {
-                    !self.data
+                    !self
+                        .data
                         .merge_queue
                         .iter()
                         .any(|m| m.issue_number == Some(*issue_number))
@@ -5174,7 +5373,8 @@ impl CoordApp {
                 // fetch succeeded this cycle (version is Some).
                 for machine in &self.data.machines {
                     if machine.version.is_some() {
-                        self.machine_last_contact.insert(machine.name.clone(), Instant::now());
+                        self.machine_last_contact
+                            .insert(machine.name.clone(), Instant::now());
                     }
                 }
                 self.rebuild_board_sidebar();
@@ -5185,14 +5385,9 @@ impl CoordApp {
                 // Ring the terminal bell (BEL) when an assignment that was
                 // running is now done or failed, if the user enabled audio.
                 if self.settings.audio_on_completion && !prev_running.is_empty() {
-                    let newly_finished = self
-                        .data
-                        .assignments
-                        .iter()
-                        .any(|a| {
-                            (a.status == "done" || a.status == "failed")
-                                && prev_running.contains(&a.id)
-                        });
+                    let newly_finished = self.data.assignments.iter().any(|a| {
+                        (a.status == "done" || a.status == "failed") && prev_running.contains(&a.id)
+                    });
                     if newly_finished {
                         // BEL character — rings the terminal bell or triggers
                         // a system notification depending on terminal settings.
@@ -5220,9 +5415,10 @@ impl CoordApp {
                     .test_plan_pending
                     .iter()
                     .filter(|id| {
-                        self.data.assignments.iter().any(|a| {
-                            &a.id == *id && a.test_plan.is_some()
-                        })
+                        self.data
+                            .assignments
+                            .iter()
+                            .any(|a| &a.id == *id && a.test_plan.is_some())
                     })
                     .cloned()
                     .collect();
@@ -5411,7 +5607,9 @@ impl CoordApp {
                     2
                 }
             };
-            has_active(&a.1).cmp(&has_active(&b.1)).then_with(|| a.0.cmp(&b.0))
+            has_active(&a.1)
+                .cmp(&has_active(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
         });
 
         result
@@ -5439,7 +5637,11 @@ impl CoordApp {
         &'a self,
         issues: &'a [(String, Vec<IssueGroup>)],
         repo: &str,
-    ) -> Vec<(String, String, Vec<(&'static str, &'static str, Vec<(usize, &'a IssueGroup)>)>)> {
+    ) -> Vec<(
+        String,
+        String,
+        Vec<(&'static str, &'static str, Vec<(usize, &'a IssueGroup)>)>,
+    )> {
         let flat: &[IssueGroup] = match issues.iter().find(|(r, _)| r == repo) {
             Some((_, v)) => v,
             None => return Vec::new(),
@@ -5447,8 +5649,8 @@ impl CoordApp {
 
         // Bucket flat indices into milestones.
         let mut milestone_map: std::collections::BTreeMap<
-            (i64, String),          // (number, title) for sorting; number=i64::MAX for "no-milestone"
-            (String, String, Vec<usize>),  // (key, display_title, flat_indices)
+            (i64, String), // (number, title) for sorting; number=i64::MAX for "no-milestone"
+            (String, String, Vec<usize>), // (key, display_title, flat_indices)
         > = std::collections::BTreeMap::new();
 
         for (flat_idx, g) in flat.iter().enumerate() {
@@ -5470,7 +5672,13 @@ impl CoordApp {
                     let sort_key = (i64::MAX, String::new());
                     milestone_map
                         .entry(sort_key)
-                        .or_insert_with(|| ("no-milestone".to_string(), "No milestone".to_string(), Vec::new()))
+                        .or_insert_with(|| {
+                            (
+                                "no-milestone".to_string(),
+                                "No milestone".to_string(),
+                                Vec::new(),
+                            )
+                        })
                         .2
                         .push(flat_idx);
                 }
@@ -5488,18 +5696,18 @@ impl CoordApp {
             for fi in &flat_indices {
                 let g = &flat[*fi];
                 match g.lifecycle_section() {
-                    "backlog"    => backlog.push((*fi, g)),
-                    "refining"   => refining.push((*fi, g)),
-                    "refined"    => refined.push((*fi, g)),
-                    "in-flight"  => in_flight.push((*fi, g)),
-                    "completed"  => completed.push((*fi, g)),
-                    _            => backlog.push((*fi, g)),
+                    "backlog" => backlog.push((*fi, g)),
+                    "refining" => refining.push((*fi, g)),
+                    "refined" => refined.push((*fi, g)),
+                    "in-flight" => in_flight.push((*fi, g)),
+                    "completed" => completed.push((*fi, g)),
+                    _ => backlog.push((*fi, g)),
                 }
             }
             let status_groups: Vec<(&'static str, &'static str, Vec<(usize, &IssueGroup)>)> = [
-                ("Backlog",   "backlog",   backlog),
-                ("Refining",  "refining",  refining),
-                ("Refined",   "refined",   refined),
+                ("Backlog", "backlog", backlog),
+                ("Refining", "refining", refining),
+                ("Refined", "refined", refined),
                 ("In-flight", "in-flight", in_flight),
                 ("Completed", "completed", completed),
             ]
@@ -5559,7 +5767,11 @@ impl CoordApp {
                     milestone_map
                         .entry(sort_key)
                         .or_insert_with(|| {
-                            ("no-milestone".to_string(), "No milestone".to_string(), Vec::new())
+                            (
+                                "no-milestone".to_string(),
+                                "No milestone".to_string(),
+                                Vec::new(),
+                            )
                         })
                         .2
                         .push(flat_idx);
@@ -5629,7 +5841,8 @@ impl CoordApp {
         defs.push(SidebarSectionDef::form("board-search", "FILTER"));
 
         if self.has_proposals_section {
-            let mut def = SidebarSectionDef::new("section:proposals".to_string(), "PROPOSALS".to_string());
+            let mut def =
+                SidebarSectionDef::new("section:proposals".to_string(), "PROPOSALS".to_string());
             def.show_chevron = true;
             def.size = SectionSize::Content;
             defs.push(def);
@@ -5645,7 +5858,8 @@ impl CoordApp {
         self.board_repo_names = grouped.iter().map(|(r, _)| r.clone()).collect();
 
         self.board_sidebar = SidebarSystem::new(defs);
-        self.board_sidebar.set_navigation_mode(NavigationMode::Selection);
+        self.board_sidebar
+            .set_navigation_mode(NavigationMode::Selection);
         self.board_sidebar.set_allow_collapse(true);
         self.board_sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
@@ -5667,8 +5881,14 @@ impl CoordApp {
                     let text = StyledText {
                         spans: vec![
                             StyledSpan::with_fg(format!("[{}] ", p.id), Color::rgb(180, 180, 220)),
-                            StyledSpan::with_fg(format!("{} ", p.machine), Color::rgb(140, 200, 140)),
-                            StyledSpan::with_fg(format!("#{} ", p.issue_number), Color::rgb(150, 150, 240)),
+                            StyledSpan::with_fg(
+                                format!("{} ", p.machine),
+                                Color::rgb(140, 200, 140),
+                            ),
+                            StyledSpan::with_fg(
+                                format!("#{} ", p.issue_number),
+                                Color::rgb(150, 150, 240),
+                            ),
                             StyledSpan::plain(trunc(&p.issue_title, 18)),
                         ],
                     };
@@ -5687,7 +5907,10 @@ impl CoordApp {
             self.board_sidebar.set_rows(search_offset, rows);
             self.board_sidebar.set_section_badge(
                 search_offset,
-                Some(StyledText::plain(format!("({})", self.data.proposals.len()))),
+                Some(StyledText::plain(format!(
+                    "({})",
+                    self.data.proposals.len()
+                ))),
             );
         }
 
@@ -5712,10 +5935,14 @@ impl CoordApp {
 
                 let mut rows: Vec<TreeRow> = Vec::new();
 
-                for (milestone_idx, (m_key, m_display, group_issues)) in milestones.iter().enumerate() {
+                for (milestone_idx, (m_key, m_display, group_issues)) in
+                    milestones.iter().enumerate()
+                {
                     let mi = milestone_idx as u16;
 
-                    let m_has_inflight = group_issues.iter().any(|(_, g)| g.lifecycle_section() == "in-flight");
+                    let m_has_inflight = group_issues
+                        .iter()
+                        .any(|(_, g)| g.lifecycle_section() == "in-flight");
 
                     // Expand state: default to expanded when in-flight, else collapsed.
                     let m_is_exp = *self
@@ -5821,13 +6048,15 @@ impl CoordApp {
             let new_offset = search_offset + if self.has_proposals_section { 1 } else { 0 };
             if self.has_proposals_section {
                 if let Some(&was_collapsed) = prev_collapsed.get("__proposals__") {
-                    self.board_sidebar.set_collapsed(search_offset, was_collapsed);
+                    self.board_sidebar
+                        .set_collapsed(search_offset, was_collapsed);
                 }
             }
             let new_names: Vec<String> = self.board_repo_names.clone();
             for (i, name) in new_names.into_iter().enumerate() {
                 if let Some(&was_collapsed) = prev_collapsed.get(&name) {
-                    self.board_sidebar.set_collapsed(i + new_offset, was_collapsed);
+                    self.board_sidebar
+                        .set_collapsed(i + new_offset, was_collapsed);
                 }
             }
         }
@@ -5961,10 +6190,7 @@ impl CoordApp {
     /// Return the failed Assignment currently selected in the board sidebar.
     fn board_selected_failed_assignment(&self) -> Option<&Assignment> {
         let group = self.board_selected_issue_group()?;
-        let failed = group
-            .assignments
-            .iter()
-            .find(|a| a.status == "failed")?;
+        let failed = group.assignments.iter().find(|a| a.status == "failed")?;
         Some(failed)
     }
 
@@ -6149,7 +6375,11 @@ impl CoordApp {
             });
             items.push(kv_item("  Machine", &format!("  {}", p.machine), None));
             items.push(kv_item("  Repo", &format!("  {}", p.repo), None));
-            items.push(kv_item("  Issue", &format!("  #{}: {}", p.issue_number, p.issue_title), None));
+            items.push(kv_item(
+                "  Issue",
+                &format!("  #{}: {}", p.issue_number, p.issue_title),
+                None,
+            ));
             items.push(kv_item("  Type", &format!("  {}", p.proposal_type), None));
             items.push(kv_item("", "", None));
             items.push(ListItem {
@@ -6167,7 +6397,11 @@ impl CoordApp {
                 items.push(kv_item("", &format!("  {}", line), None));
             }
             items.push(kv_item("", "", None));
-            items.push(kv_item("", "  a=approve  A=approve all", Some(Color::rgb(180, 180, 120))));
+            items.push(kv_item(
+                "",
+                "  a=approve  A=approve all",
+                Some(Color::rgb(180, 180, 120)),
+            ));
             return ListView {
                 id: WidgetId::new("detail"),
                 title: Some(StyledText::plain(&format!("Proposal #{}", p.id))),
@@ -6192,10 +6426,7 @@ impl CoordApp {
                 let header_text = format!(" {} #{} ", repo, group.issue_number);
                 items.push(ListItem {
                     text: StyledText {
-                        spans: vec![StyledSpan::with_fg(
-                            &header_text,
-                            Color::rgb(210, 220, 255),
-                        )],
+                        spans: vec![StyledSpan::with_fg(&header_text, Color::rgb(210, 220, 255))],
                     },
                     icon: None,
                     detail: None,
@@ -6203,7 +6434,11 @@ impl CoordApp {
                 });
 
                 // Issue title
-                items.push(kv_item("", &format!("  {}", trunc(&group.issue_title, 52)), None));
+                items.push(kv_item(
+                    "",
+                    &format!("  {}", trunc(&group.issue_title, 52)),
+                    None,
+                ));
                 items.push(kv_item("", "", None)); // blank separator
 
                 // Pipeline stages sub-header
@@ -6400,7 +6635,11 @@ impl CoordApp {
 
         // 4. Fetch still in flight — return placeholder so the render doesn't block.
         if self.pending_log_fetches.borrow().contains_key(id) {
-            return vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))];
+            return vec![kv_item(
+                "",
+                "  Loading log…",
+                Some(Color::rgb(140, 140, 140)),
+            )];
         }
 
         // 5. Cache cold/stale and no fetch in flight. Look up host and spawn.
@@ -6415,8 +6654,14 @@ impl CoordApp {
             }
         };
         let rx = spawn_log_fetch(&host, id);
-        self.pending_log_fetches.borrow_mut().insert(id.to_string(), rx);
-        vec![kv_item("", "  Loading log…", Some(Color::rgb(140, 140, 140)))]
+        self.pending_log_fetches
+            .borrow_mut()
+            .insert(id.to_string(), rx);
+        vec![kv_item(
+            "",
+            "  Loading log…",
+            Some(Color::rgb(140, 140, 140)),
+        )]
     }
 
     /// Detail panel for the selected machine: status, version, workers, disk, history.
@@ -6442,9 +6687,10 @@ impl CoordApp {
                 items.push(kv_item("", "", None)); // blank
 
                 // ── Status + last-contact age ────────────────────────────
-                let last_contact_str = self.machine_last_contact.get(&m.name).map(|t| {
-                    format!("  ({} ago)", fmt_dur(t.elapsed().as_secs()))
-                });
+                let last_contact_str = self
+                    .machine_last_contact
+                    .get(&m.name)
+                    .map(|t| format!("  ({} ago)", fmt_dur(t.elapsed().as_secs())));
                 let (reach_str, reach_col) = if m.reachable {
                     ("reachable".to_string(), Color::rgb(80, 210, 80))
                 } else {
@@ -6481,7 +6727,11 @@ impl CoordApp {
                 // ── Local indicator ──────────────────────────────────────
                 let is_local = m.name == self.data.local_machine;
                 if is_local {
-                    items.push(kv_item("Location", "local", Some(Color::rgb(100, 180, 240))));
+                    items.push(kv_item(
+                        "Location",
+                        "local",
+                        Some(Color::rgb(100, 180, 240)),
+                    ));
                 }
 
                 items.push(kv_item("", "", None)); // blank
@@ -6497,10 +6747,7 @@ impl CoordApp {
                 items.push(ListItem {
                     text: StyledText {
                         spans: vec![StyledSpan::with_fg(
-                            format!(
-                                " ACTIVE WORKERS ({}) ",
-                                active_workers.len()
-                            ),
+                            format!(" ACTIVE WORKERS ({}) ", active_workers.len()),
                             Color::rgb(130, 130, 150),
                         )],
                     },
@@ -6635,7 +6882,6 @@ impl CoordApp {
             max_content_width: None,
         }
     }
-
 
     // ── Pipeline panel ────────────────────────────────────────────────────
 
@@ -6872,9 +7118,9 @@ impl CoordApp {
                 continue;
             }
             let prefix_lower = repo_name[..len].to_lowercase();
-            let collision = all_repos.iter().any(|r| {
-                r.as_str() != repo_name && r.to_lowercase().starts_with(&prefix_lower)
-            });
+            let collision = all_repos
+                .iter()
+                .any(|r| r.as_str() != repo_name && r.to_lowercase().starts_with(&prefix_lower));
             if !collision {
                 let mut chars = repo_name[..len].chars();
                 let tag: String = chars
@@ -6986,10 +7232,7 @@ impl CoordApp {
     /// read garbage).  When `None`, the function captures from the current
     /// in-memory state — that's correct for callers that haven't swapped
     /// `pipeline_issues`.  See [`capture_pipeline_selection_id`].
-    fn rebuild_pipeline_sidebar(
-        &mut self,
-        prev_sel_override: Option<(String, u64)>,
-    ) {
+    fn rebuild_pipeline_sidebar(&mut self, prev_sel_override: Option<(String, u64)>) {
         // Preserve selection across rebuilds by (repo_slug, issue#).  Use
         // the caller-provided value when available (it captured before any
         // pipeline_issues swap) and only fall back to the internal capture
@@ -7006,14 +7249,12 @@ impl CoordApp {
         // Preserve per-section collapse state by state key (section indices
         // may shift if sections appear/disappear between rebuilds, so we key
         // by the state identifier rather than the section index).
-        let prev_state_collapsed: std::collections::HashMap<&'static str, bool> =
-            self.pipeline_state_section_names
-                .iter()
-                .enumerate()
-                .map(|(i, &name)| {
-                    (name, self.pipeline_sidebar.is_collapsed(i + search_offset))
-                })
-                .collect();
+        let prev_state_collapsed: std::collections::HashMap<&'static str, bool> = self
+            .pipeline_state_section_names
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| (name, self.pipeline_sidebar.is_collapsed(i + search_offset)))
+            .collect();
 
         // Collect unique repo keys in stable order.
         let mut repos: Vec<String> = Vec::new();
@@ -7049,10 +7290,8 @@ impl CoordApp {
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
         defs.push(SidebarSectionDef::form("pipeline-search", "FILTER"));
         for &(lc_key, lc_label) in &state_sections {
-            let mut def = SidebarSectionDef::new(
-                format!("section:state:{}", lc_key),
-                lc_label.to_string(),
-            );
+            let mut def =
+                SidebarSectionDef::new(format!("section:state:{}", lc_key), lc_label.to_string());
             def.show_chevron = true;
             def.size = SectionSize::Content;
             defs.push(def);
@@ -7064,15 +7303,19 @@ impl CoordApp {
         sidebar.set_scroll_mode(ScrollMode::WholePanel);
 
         // Populate search form (section 0).
-        sidebar.set_form(0, self.pipeline_search.form("pipeline-search", "Filter issues…"));
+        sidebar.set_form(
+            0,
+            self.pipeline_search
+                .form("pipeline-search", "Filter issues…"),
+        );
 
         // Colour palette per lifecycle state — mirrors the Board's
         // In-flight / Completed / Refined palette for visual consistency.
         let state_color = |lc: &str| match lc {
             "in-progress" => Color::rgb(80, 220, 80),
-            "done"        => Color::rgb(120, 180, 120),
-            "pending"     => Color::rgb(140, 180, 240), // "New"
-            _             => Color::rgb(140, 140, 160),
+            "done" => Color::rgb(120, 180, 120),
+            "pending" => Color::rgb(140, 180, 240), // "New"
+            _ => Color::rgb(140, 140, 160),
         };
 
         // ── Populate rows for each state section ─────────────────────────
@@ -7098,9 +7341,10 @@ impl CoordApp {
                         } else {
                             Color::rgb(140, 140, 140)
                         };
-                        let has_live_stream = self.watch_pool.values().any(|ctx| {
-                            ctx.state.issue_number == issue.number && !ctx.sse.done
-                        });
+                        let has_live_stream = self
+                            .watch_pool
+                            .values()
+                            .any(|ctx| ctx.state.issue_number == issue.number && !ctx.sse.done);
                         let mut spans = vec![
                             StyledSpan::with_fg(
                                 format!("#{:<5}", issue.number),
@@ -7174,9 +7418,10 @@ impl CoordApp {
                             } else {
                                 Color::rgb(140, 140, 140)
                             };
-                            let has_live_stream = self.watch_pool.values().any(|ctx| {
-                                ctx.state.issue_number == issue.number && !ctx.sse.done
-                            });
+                            let has_live_stream = self
+                                .watch_pool
+                                .values()
+                                .any(|ctx| ctx.state.issue_number == issue.number && !ctx.sse.done);
                             let mut spans = vec![
                                 StyledSpan::with_fg(
                                     format!("#{:<5}", issue.number),
@@ -7280,7 +7525,8 @@ impl CoordApp {
         // that weren't present before stay expanded by default.
         for (i, &state_key) in self.pipeline_state_section_names.iter().enumerate() {
             if let Some(&was_collapsed) = prev_state_collapsed.get(state_key) {
-                self.pipeline_sidebar.set_collapsed(i + search_offset, was_collapsed);
+                self.pipeline_sidebar
+                    .set_collapsed(i + search_offset, was_collapsed);
             }
         }
         // Restore panel scroll so the visible area doesn't jump back to the
@@ -7293,7 +7539,8 @@ impl CoordApp {
         // than leaving `pipeline_focused_stage = None`.  When the same
         // issue is re-selected after a data refresh, keep the focus stable
         // so a 15 s refresh doesn't clobber the user's explicit choice.
-        let new_issue_num = self.pipeline_sel
+        let new_issue_num = self
+            .pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
             .map(|iss| iss.number);
         if new_issue_num != prev_issue_num {
@@ -7354,11 +7601,7 @@ impl CoordApp {
     /// assignments by exact `assignment_type`.  The "merge" stage is
     /// special-cased to read from the `merge_queue` table instead, since
     /// merges are not modelled as assignments.
-    fn stage_status_for(
-        &self,
-        issue: &PipelineIssue,
-        stage: &str,
-    ) -> StageStatus {
+    fn stage_status_for(&self, issue: &PipelineIssue, stage: &str) -> StageStatus {
         if stage == "merge" {
             return self.merge_stage_status_for(issue);
         }
@@ -7448,11 +7691,7 @@ impl CoordApp {
     /// `stage`, or None if no upstream stage has an assignment.
     ///
     /// Used by `stage_status_for` to detect stale downstream verdicts.
-    fn upstream_max_dispatched_at(
-        &self,
-        issue: &PipelineIssue,
-        stage: &str,
-    ) -> Option<f64> {
+    fn upstream_max_dispatched_at(&self, issue: &PipelineIssue, stage: &str) -> Option<f64> {
         let names = self.pipeline_stage_names_for_issue(issue);
         let idx = names.iter().position(|s| s == stage)?;
         if idx == 0 {
@@ -7462,9 +7701,7 @@ impl CoordApp {
             .iter()
             .flat_map(|s| self.assignments_for_stage(issue, s))
             .filter_map(|a| a.dispatched_at)
-            .fold(None, |acc, t| {
-                Some(acc.map_or(t, |x: f64| x.max(t)))
-            })
+            .fold(None, |acc, t| Some(acc.map_or(t, |x: f64| x.max(t))))
     }
 
     /// Resolve the merge stage status from `merge_queue` entries.
@@ -7483,7 +7720,10 @@ impl CoordApp {
         // disappears — without waiting for the next DB refresh to land the real
         // merge_queue entry.  The flag is cleared in apply_pending_data once the
         // entry exists in the DB, at which point the real state takes over.
-        if self.pipeline_inflight_merges.contains(&(issue.repo_slug.clone(), issue.number)) {
+        if self
+            .pipeline_inflight_merges
+            .contains(&(issue.repo_slug.clone(), issue.number))
+        {
             let has_real_entry = self
                 .data
                 .merge_queue
@@ -7555,7 +7795,11 @@ impl CoordApp {
         if work_status != StageStatus::Done {
             // Work is still Active/Pending/Failed/Stale — Test inherits Pending
             // (or Skipped for closed issues that bypassed Work).
-            return if issue.is_closed { StageStatus::Skipped } else { StageStatus::Pending };
+            return if issue.is_closed {
+                StageStatus::Skipped
+            } else {
+                StageStatus::Pending
+            };
         }
         // Work is done — read the verdict off the latest Work assignment.
         let work = self.assignments_for_stage(issue, "work");
@@ -7580,7 +7824,12 @@ impl CoordApp {
         // recent verdict; an in-flight re-test is handled above.
         let verdict = work
             .iter()
-            .filter(|a| a.test_state.as_deref().map(|s| !s.is_empty()).unwrap_or(false))
+            .filter(|a| {
+                a.test_state
+                    .as_deref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            })
             .max_by(|a, b| {
                 a.dispatched_at
                     .partial_cmp(&b.dispatched_at)
@@ -7614,7 +7863,11 @@ impl CoordApp {
                 _ => {}
             }
         }
-        if issue.is_closed { StageStatus::Skipped } else { StageStatus::Pending }
+        if issue.is_closed {
+            StageStatus::Skipped
+        } else {
+            StageStatus::Pending
+        }
     }
 
     /// Returns the *display* current stage for the sidebar badge — the
@@ -7702,8 +7955,9 @@ impl CoordApp {
     /// Wraps to the first stage from the last.  Resets the content
     /// scroll so the user starts at the top of the new content.
     fn focus_next_pipeline_stage(&mut self) {
-        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
-        else { return; };
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) else {
+            return;
+        };
         let stages = self.pipeline_stage_names_for_issue(issue);
         if stages.is_empty() {
             return;
@@ -7719,8 +7973,9 @@ impl CoordApp {
     /// Move the Pipeline > Stages focus to the previous stage (left).
     /// Wraps to the last stage from the first.
     fn focus_prev_pipeline_stage(&mut self) {
-        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
-        else { return; };
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) else {
+            return;
+        };
         let stages = self.pipeline_stage_names_for_issue(issue);
         if stages.is_empty() {
             return;
@@ -7766,8 +8021,12 @@ impl CoordApp {
     /// running on the selected pipeline issue.  Drives the Refinement
     /// tab's accent dot so the tab is discoverable without forcing focus.
     fn has_active_refinement_for_selected_issue(&self) -> bool {
-        let Some(sel) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(sel) else { return false; };
+        let Some(sel) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(sel) else {
+            return false;
+        };
         self.data.assignments.iter().any(|a| {
             a.issue_number == issue.number
                 && a.assignment_type.as_deref() == Some("refinement")
@@ -7781,12 +8040,32 @@ impl CoordApp {
     fn refinement_tab_placeholder_list(&self) -> ListView {
         let items = vec![
             kv_item("", "", None),
-            kv_item("", "  No refinement chat is open for this issue.", Some(Color::rgb(180, 180, 200))),
+            kv_item(
+                "",
+                "  No refinement chat is open for this issue.",
+                Some(Color::rgb(180, 180, 200)),
+            ),
             kv_item("", "", None),
-            kv_item("", "  To start one, right-click the issue on the Board panel and pick", Some(Color::rgb(140, 140, 160))),
-            kv_item("", "  \"Refine with chat\".  A claude -p worker will be seeded with the", Some(Color::rgb(140, 140, 160))),
-            kv_item("", "  issue + CLAUDE.md + repo file tree; this tab will switch to the", Some(Color::rgb(140, 140, 160))),
-            kv_item("", "  chat UI as soon as the worker is ready.", Some(Color::rgb(140, 140, 160))),
+            kv_item(
+                "",
+                "  To start one, right-click the issue on the Board panel and pick",
+                Some(Color::rgb(140, 140, 160)),
+            ),
+            kv_item(
+                "",
+                "  \"Refine with chat\".  A claude -p worker will be seeded with the",
+                Some(Color::rgb(140, 140, 160)),
+            ),
+            kv_item(
+                "",
+                "  issue + CLAUDE.md + repo file tree; this tab will switch to the",
+                Some(Color::rgb(140, 140, 160)),
+            ),
+            kv_item(
+                "",
+                "  chat UI as soon as the worker is ready.",
+                Some(Color::rgb(140, 140, 160)),
+            ),
         ];
         ListView {
             id: WidgetId::new("refinement-placeholder"),
@@ -7810,9 +8089,10 @@ impl CoordApp {
     /// bar and the Enter keybind dispatch the exact same stage.
     fn pipeline_action_button(&self) -> Option<(String, usize)> {
         let view = self.build_pipeline_widget()?;
-        view.stages.iter().enumerate().find_map(|(i, s)| {
-            s.action.as_ref().map(|label| (label.clone(), i))
-        })
+        view.stages
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| s.action.as_ref().map(|label| (label.clone(), i)))
     }
 
     /// Build the [`Toolbar`] for the pipeline action bar (the `[ Go ⏎ ]` /
@@ -7882,10 +8162,14 @@ impl CoordApp {
                 // Test label to "Building" so the Active badge has meaningful
                 // text (otherwise it'd just say "Test" while running).
                 if name == "test" && status == StageStatus::Active {
-                    if let Some(work_id) = self.assignments_for_stage(issue, "work")
+                    if let Some(work_id) = self
+                        .assignments_for_stage(issue, "work")
                         .iter()
-                        .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
-                            .unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|a, b| {
+                            a.dispatched_at
+                                .partial_cmp(&b.dispatched_at)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|a| a.id.clone())
                     {
                         if self.test_build_in_flight(&work_id) {
@@ -7897,7 +8181,8 @@ impl CoordApp {
                 // Prefer live SSE turn count when watching, fall back to local log.
                 // Elapsed is computed from dispatched_at to now (wall-clock).
                 if status == StageStatus::Active {
-                    let running = self.assignments_for_stage(issue, name)
+                    let running = self
+                        .assignments_for_stage(issue, name)
                         .into_iter()
                         .find(|a| a.status == "running");
                     if let Some(a) = running {
@@ -7905,8 +8190,11 @@ impl CoordApp {
                         // this assignment (not just the focused stream), so
                         // the badge updates even for background watches.
                         let turns = if let Some(ctx) = self.watch_pool.get(&a.id) {
-                            if ctx.sse.current_turn > 0 { ctx.sse.current_turn }
-                            else { self.turn_count_from_log(&a.id) }
+                            if ctx.sse.current_turn > 0 {
+                                ctx.sse.current_turn
+                            } else {
+                                self.turn_count_from_log(&a.id)
+                            }
                         } else {
                             self.turn_count_from_log(&a.id)
                         };
@@ -7926,9 +8214,9 @@ impl CoordApp {
                 }
                 // Skipped counts as "settled" for prior_all_done: a closed-issue
                 // stage that never ran is logically done.
-                let prior_all_done = statuses[..i].iter().all(|s| {
-                    *s == StageStatus::Done || *s == StageStatus::Skipped
-                });
+                let prior_all_done = statuses[..i]
+                    .iter()
+                    .all(|s| *s == StageStatus::Done || *s == StageStatus::Skipped);
                 let action = if !go_attached
                     && status == StageStatus::Pending
                     && prior_all_done
@@ -7961,9 +8249,7 @@ impl CoordApp {
         // Clamp the persisted focus to the current stage count so a
         // smaller pipeline (e.g. issue without a Plan stage) doesn't
         // get a focus pointing past its last stage.
-        let focused_stage = self
-            .pipeline_focused_stage
-            .filter(|&i| i < stages.len());
+        let focused_stage = self.pipeline_focused_stage.filter(|&i| i < stages.len());
         Some(QuiPipelineView {
             id: WidgetId::new("pipeline:detail"),
             stages,
@@ -7989,7 +8275,9 @@ impl CoordApp {
     /// pipeline issue. Returns None if no issue is selected or no work assignment
     /// exists yet.
     fn pipeline_selected_work_id(&self) -> Option<String> {
-        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))?;
         let work = self.assignments_for_stage(issue, "work");
         let latest = work.iter().max_by(|a, b| {
             a.dispatched_at
@@ -8053,8 +8341,9 @@ impl CoordApp {
     /// #200: True when the selected issue's Test stage is pending and ready
     /// for a verdict (Work is Done, no verdict yet).
     fn test_gate_actionable(&self) -> bool {
-        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
-        else { return false; };
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) else {
+            return false;
+        };
         let stages = self.pipeline_stage_names();
         if !stages.iter().any(|s| s == "test") {
             return false;
@@ -8067,8 +8356,12 @@ impl CoordApp {
     /// the currently focused stage is "test".  Used to gate the 1–9 step-run
     /// keybindings so they don't fire on unrelated digit presses elsewhere.
     fn is_test_stage_focused(&self) -> bool {
-        let Some(sel_idx) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(sel_idx) else { return false; };
+        let Some(sel_idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(sel_idx) else {
+            return false;
+        };
         let stage_names = self.pipeline_stage_names_for_issue(issue);
         self.pipeline_focused_stage
             .and_then(|fi| stage_names.get(fi).map(|n| n.as_str() == "test"))
@@ -8151,7 +8444,9 @@ impl CoordApp {
     /// pipeline issue.  Returns `(agent_host, repo, sanitized_branch, work_id)`
     /// when a work assignment with a known branch + machine is found, or `None`.
     fn artifact_fetch_target(&self) -> Option<(String, String, String, String)> {
-        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))?;
         let work = self.assignments_for_stage(issue, "work");
         let latest = work.iter().max_by(|a, b| {
             a.dispatched_at
@@ -8213,8 +8508,9 @@ impl CoordApp {
         if self.active_view != SidebarView::Pipeline {
             return false;
         }
-        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
-        else { return false; };
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) else {
+            return false;
+        };
         let stages = self.pipeline_stage_names();
         if !stages.iter().any(|s| s == "review") {
             return false;
@@ -8247,8 +8543,9 @@ impl CoordApp {
         if self.active_view != SidebarView::Pipeline {
             return false;
         }
-        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
-        else { return false; };
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) else {
+            return false;
+        };
         let stages = self.pipeline_stage_names();
         if !stages.iter().any(|s| s == "test") {
             return false;
@@ -8367,15 +8664,15 @@ impl CoordApp {
                     (-1, msg)
                 }
             };
-            let _ = tx.send(TestBuildOutcome { exit_code, first_error });
+            let _ = tx.send(TestBuildOutcome {
+                exit_code,
+                first_error,
+            });
         });
 
         self.push_toast(
             "Phase 1 build started",
-            &format!(
-                "#{} on {} — fetching and building…",
-                issue_number, branch
-            ),
+            &format!("#{} on {} — fetching and building…", issue_number, branch),
             ToastSeverity::Info,
         );
         self.test_build_jobs.insert(
@@ -8452,7 +8749,10 @@ impl CoordApp {
                         ToastSeverity::Info,
                     );
                 }
-                Ok(TestBuildOutcome { exit_code: code, first_error }) => {
+                Ok(TestBuildOutcome {
+                    exit_code: code,
+                    first_error,
+                }) => {
                     // Truncate the error to ~120 chars so the toast stays
                     // readable; the full log is at log_path for details.
                     let snippet = if first_error.is_empty() {
@@ -8476,7 +8776,8 @@ impl CoordApp {
                         "Phase 1 build ✗",
                         &format!(
                             "#{} build worker disappeared — see {}",
-                            job.issue_number, job.log_path.display()
+                            job.issue_number,
+                            job.log_path.display()
                         ),
                         ToastSeverity::Error,
                     );
@@ -8499,8 +8800,12 @@ impl CoordApp {
         if self.active_view != SidebarView::Pipeline {
             return;
         }
-        let Some(sel_idx) = self.pipeline_sel else { return; };
-        let Some(issue) = self.pipeline_issues.get(sel_idx).cloned() else { return; };
+        let Some(sel_idx) = self.pipeline_sel else {
+            return;
+        };
+        let Some(issue) = self.pipeline_issues.get(sel_idx).cloned() else {
+            return;
+        };
 
         // Determine which stage is focused and whether it's the "test" stage.
         let stage_names = self.pipeline_stage_names_for_issue(&issue);
@@ -8519,7 +8824,10 @@ impl CoordApp {
             .assignments
             .iter()
             .filter(|a| a.issue_number == issue.number)
-            .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
             .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
             .max_by(|a, b| {
                 a.dispatched_at
@@ -8527,7 +8835,9 @@ impl CoordApp {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .cloned();
-        let Some(work) = work else { return; };
+        let Some(work) = work else {
+            return;
+        };
         let work_id = work.id.clone();
 
         // ── Staleness check ────────────────────────────────────────────────
@@ -8535,25 +8845,19 @@ impl CoordApp {
         if self.test_plan_staleness_checked_for.as_deref() != Some(&work_id) {
             self.test_plan_staleness_checked_for = Some(work_id.clone());
             // Only check staleness when a plan AND a branch_head exist.
-            if let (Some(branch), Some(cached_head)) = (
-                &work.branch,
-                &work.test_plan_branch_head,
-            ) {
-                if let Some(local_path) =
-                    issue.coord_repo.as_ref().and_then(|r| {
-                        self.data.pipeline_repo_paths.get(r.as_str())
-                    })
+            if let (Some(branch), Some(cached_head)) = (&work.branch, &work.test_plan_branch_head) {
+                if let Some(local_path) = issue
+                    .coord_repo
+                    .as_ref()
+                    .and_then(|r| self.data.pipeline_repo_paths.get(r.as_str()))
                 {
                     let repo_dir = std::path::Path::new(local_path.as_str());
                     if let Some(live_head) = read_git_branch_head(repo_dir, branch) {
                         if &live_head != cached_head {
                             // Branch advanced — refresh the plan.
                             self.test_plan_pending.insert(work_id.clone());
-                            self.command_runner.spawn_queued(&[
-                                "test-plan",
-                                &work_id,
-                                "--refresh",
-                            ]);
+                            self.command_runner
+                                .spawn_queued(&["test-plan", &work_id, "--refresh"]);
                             return;
                         }
                     }
@@ -8578,15 +8882,22 @@ impl CoordApp {
     /// - `step_idx` is out of range for the plan.
     /// - A job for `(work_id, step_idx)` is already in flight.
     fn run_test_plan_step(&mut self, step_idx: usize) {
-        let Some(sel_idx) = self.pipeline_sel else { return; };
-        let Some(issue) = self.pipeline_issues.get(sel_idx).cloned() else { return; };
+        let Some(sel_idx) = self.pipeline_sel else {
+            return;
+        };
+        let Some(issue) = self.pipeline_issues.get(sel_idx).cloned() else {
+            return;
+        };
         let local_repo = issue.coord_repo.as_deref();
         let work = self
             .data
             .assignments
             .iter()
             .filter(|a| a.issue_number == issue.number)
-            .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
             .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
             .max_by(|a, b| {
                 a.dispatched_at
@@ -8594,9 +8905,15 @@ impl CoordApp {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .cloned();
-        let Some(work) = work else { return; };
-        let Some(ref steps) = work.test_plan else { return; };
-        let Some(step) = steps.get(step_idx) else { return; };
+        let Some(work) = work else {
+            return;
+        };
+        let Some(ref steps) = work.test_plan else {
+            return;
+        };
+        let Some(step) = steps.get(step_idx) else {
+            return;
+        };
         let work_id = work.id.clone();
         let key = (work_id.clone(), step_idx);
 
@@ -8650,10 +8967,14 @@ impl CoordApp {
                     }
                     // Truncate to MAX_OUTPUT bytes (safe: truncate at char boundary).
                     if combined.len() > MAX_OUTPUT {
-                        let truncated: String = combined.chars()
-                            .take(combined.char_indices()
-                                .take_while(|(b, _)| *b < MAX_OUTPUT)
-                                .count())
+                        let truncated: String = combined
+                            .chars()
+                            .take(
+                                combined
+                                    .char_indices()
+                                    .take_while(|(b, _)| *b < MAX_OUTPUT)
+                                    .count(),
+                            )
                             .collect();
                         combined = truncated;
                         combined.push_str("\n… (output truncated)");
@@ -8667,7 +8988,11 @@ impl CoordApp {
 
         self.test_step_jobs.insert(
             key,
-            TestStepJob { work_id, step_idx, rx },
+            TestStepJob {
+                work_id,
+                step_idx,
+                rx,
+            },
         );
         self.push_toast(
             &format!("Step {}", step_idx + 1),
@@ -8698,7 +9023,8 @@ impl CoordApp {
         }
         for (work_id, step_idx, exit_code, output) in done {
             self.test_step_jobs.remove(&(work_id.clone(), step_idx));
-            self.test_step_results.insert((work_id.clone(), step_idx), exit_code);
+            self.test_step_results
+                .insert((work_id.clone(), step_idx), exit_code);
             if !output.is_empty() {
                 self.test_step_output.insert((work_id, step_idx), output);
             }
@@ -8716,8 +9042,12 @@ impl CoordApp {
         // rendered — otherwise a click on the Plan stage (visible only
         // when the issue has a plan assignment) would resolve to the
         // wrong stage_name.
-        let Some(sel) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(sel).cloned() else { return false; };
+        let Some(sel) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(sel).cloned() else {
+            return false;
+        };
         let stage_name = match self
             .pipeline_stage_names_for_issue(&issue)
             .get(stage_idx)
@@ -8818,10 +9148,7 @@ impl CoordApp {
             .map(|a| a.id.clone());
         let Some(id) = assignment_id else {
             self.pipeline_status = Some((
-                format!(
-                    "no failed {} assignment found for #{}",
-                    stage, issue.number
-                ),
+                format!("no failed {} assignment found for #{}", stage, issue.number),
                 Instant::now(),
             ));
             return false;
@@ -8836,11 +9163,18 @@ impl CoordApp {
                 ));
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "retry runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "retry runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Dispatch the Work stage.
@@ -8850,8 +9184,12 @@ impl CoordApp {
     /// briefing for the new work assignment.  Otherwise falls back to a
     /// fresh `coord assign <machine> <repo> <issue>`.
     fn dispatch_pipeline_work(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
         let Some(coord_repo) = issue.coord_repo.clone() else {
             self.pipeline_status = Some((
                 format!(
@@ -8868,7 +9206,9 @@ impl CoordApp {
         // the briefing.
         if let Some(plan_id) = self.find_done_plan_assignment_id(&issue, &coord_repo) {
             use crate::commands::SpawnQueuedOutcome;
-            let outcome = self.command_runner.spawn_queued(&["approve-plan", &plan_id]);
+            let outcome = self
+                .command_runner
+                .spawn_queued(&["approve-plan", &plan_id]);
             match outcome {
                 SpawnQueuedOutcome::Started => {
                     self.pipeline_status = Some((
@@ -8881,11 +9221,18 @@ impl CoordApp {
                     ));
                 }
                 SpawnQueuedOutcome::Queued => {
-                    self.push_toast("⏳ Queued", "approve-plan runs after current command", ToastSeverity::Info);
+                    self.push_toast(
+                        "⏳ Queued",
+                        "approve-plan runs after current command",
+                        ToastSeverity::Info,
+                    );
                 }
                 SpawnQueuedOutcome::Deduped => {}
             }
-            return matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued);
+            return matches!(
+                outcome,
+                SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+            );
         }
 
         let Some(machine) = self.best_machine_for(&coord_repo) else {
@@ -8928,17 +9275,28 @@ impl CoordApp {
                 ));
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "assign runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "assign runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Dispatch the Plan stage: `coord assign --plan-only <machine> <repo> <issue>`.
     fn dispatch_pipeline_plan(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
         let Some(coord_repo) = issue.coord_repo.clone() else {
             self.pipeline_status = Some((
                 format!(
@@ -8989,11 +9347,18 @@ impl CoordApp {
                 ));
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "plan assign runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "plan assign runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Find the most recent done plan-typed assignment for this issue.
@@ -9021,8 +9386,12 @@ impl CoordApp {
     /// the worker we want a review for has just finished, and notify is
     /// idempotent for already-reviewed work.
     fn dispatch_pipeline_review(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
         use crate::commands::SpawnQueuedOutcome;
         let outcome = self.command_runner.spawn_queued(&["notify"]);
         match outcome {
@@ -9033,17 +9402,28 @@ impl CoordApp {
                 ));
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "notify runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "notify runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Dispatch the Merge stage: `coord merge --repo <coord_repo>`.
     fn dispatch_pipeline_merge(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else { return false; };
-        let Some(issue) = self.pipeline_issues.get(idx).cloned() else { return false; };
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
         let Some(coord_repo) = issue.coord_repo.clone() else {
             self.pipeline_status = Some((
                 format!(
@@ -9055,11 +9435,9 @@ impl CoordApp {
             return false;
         };
         use crate::commands::SpawnQueuedOutcome;
-        let outcome = self.command_runner.spawn_queued(&[
-            "merge",
-            "--repo",
-            &coord_repo,
-        ]);
+        let outcome = self
+            .command_runner
+            .spawn_queued(&["merge", "--repo", &coord_repo]);
         match outcome {
             SpawnQueuedOutcome::Started => {
                 // #290: mark the issue as in-flight so merge_stage_status_for returns
@@ -9075,11 +9453,18 @@ impl CoordApp {
                 ));
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "merge runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Kick off a background `gh search issues` poll (no-op if one is
@@ -9188,13 +9573,16 @@ impl CoordApp {
             // - terminal CI     → 600s (won't change; check rarely)
             // - no cache + eligible  → fetch now
             // - no cache + ineligible → skip entirely (blocked on review)
-            let needs_refresh = match ci_stale_secs(self.pipeline_ci_checks.get(&key), merge_eligible) {
-                None => false,
-                Some(threshold_secs) => match self.pipeline_ci_checks.get(&key) {
-                    Some(cached) => cached.fetched_at.elapsed() >= Duration::from_secs(threshold_secs),
-                    None => true, // threshold_secs == 0 for eligible+no-cache → fetch now
-                },
-            };
+            let needs_refresh =
+                match ci_stale_secs(self.pipeline_ci_checks.get(&key), merge_eligible) {
+                    None => false,
+                    Some(threshold_secs) => match self.pipeline_ci_checks.get(&key) {
+                        Some(cached) => {
+                            cached.fetched_at.elapsed() >= Duration::from_secs(threshold_secs)
+                        }
+                        None => true, // threshold_secs == 0 for eligible+no-cache → fetch now
+                    },
+                };
             if !needs_refresh {
                 continue;
             }
@@ -9263,15 +9651,18 @@ impl CoordApp {
         if self.active_view != SidebarView::Pipeline {
             return false;
         }
-        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
-        else { return false; };
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) else {
+            return false;
+        };
         // Need a queued merge entry that is not yet merged.
         let entry = self
             .data
             .merge_queue
             .iter()
             .find(|m| m.issue_number == Some(issue.number));
-        let Some(entry) = entry else { return false; };
+        let Some(entry) = entry else {
+            return false;
+        };
         if entry.state == "merged" {
             return false;
         }
@@ -9315,8 +9706,7 @@ impl CoordApp {
             .assignments
             .iter()
             .filter(|a| {
-                a.issue_number == issue.number
-                    && a.assignment_type.as_deref() == Some("work")
+                a.issue_number == issue.number && a.assignment_type.as_deref() == Some("work")
             })
             .map(|a| a.id.as_str())
             .collect();
@@ -9339,8 +9729,7 @@ impl CoordApp {
         // has_approved_review: the DB verdict is the source of truth regardless
         // of whether a formal GitHub PR review exists.
         if self.data.assignments.iter().any(|a| {
-            work_ids.contains(a.id.as_str())
-                && a.review_verdict.as_deref() == Some("approve")
+            work_ids.contains(a.id.as_str()) && a.review_verdict.as_deref() == Some("approve")
         }) {
             return true;
         }
@@ -9369,8 +9758,7 @@ impl CoordApp {
         if self.active_view != SidebarView::Pipeline {
             return PipelineMergeState::NotApplicable;
         }
-        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))
-        else {
+        let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) else {
             return PipelineMergeState::NotApplicable;
         };
         let Some(entry) = self
@@ -9464,7 +9852,11 @@ impl CoordApp {
                 // views).
                 match self.command_runner.spawn_queued(&["merge"]) {
                     SpawnQueuedOutcome::Queued => {
-                        self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+                        self.push_toast(
+                            "⏳ Queued",
+                            "merge runs after current command",
+                            ToastSeverity::Info,
+                        );
                     }
                     SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
                 }
@@ -9473,9 +9865,7 @@ impl CoordApp {
             PipelineMergeState::NoQueue { issue } => {
                 self.push_toast(
                     "Merge",
-                    &format!(
-                        "#{issue}: no PR queued yet — work hasn't pushed a branch."
-                    ),
+                    &format!("#{issue}: no PR queued yet — work hasn't pushed a branch."),
                     ToastSeverity::Warning,
                 );
                 true
@@ -9517,14 +9907,25 @@ impl CoordApp {
                     // still drive it from the TUI.
                     match self.command_runner.spawn_queued(&["merge"]) {
                         SpawnQueuedOutcome::Queued => {
-                            self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+                            self.push_toast(
+                                "⏳ Queued",
+                                "merge runs after current command",
+                                ToastSeverity::Info,
+                            );
                         }
                         SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
                     }
                 } else {
-                    match self.command_runner.spawn_queued(&["merge", "--repo", &repo]) {
+                    match self
+                        .command_runner
+                        .spawn_queued(&["merge", "--repo", &repo])
+                    {
                         SpawnQueuedOutcome::Queued => {
-                            self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+                            self.push_toast(
+                                "⏳ Queued",
+                                "merge runs after current command",
+                                ToastSeverity::Info,
+                            );
                         }
                         SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
                     }
@@ -9542,7 +9943,9 @@ impl CoordApp {
         if self.active_view != SidebarView::Pipeline {
             return None;
         }
-        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))?;
         let entry = self
             .data
             .merge_queue
@@ -9614,7 +10017,9 @@ impl CoordApp {
     /// merge queue entry.  Returns `None` when no PR is queued for the
     /// selected issue, or when no summary has been fetched yet.
     fn ci_summary_for_selected_issue(&self) -> Option<&CiCheckSummary> {
-        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))?;
         let entry = self
             .data
             .merge_queue
@@ -9645,8 +10050,10 @@ impl CoordApp {
                 // longer in the pipeline so we don't keep stale PTYs.
                 let live_nums: std::collections::HashSet<u64> =
                     self.pipeline_issues.iter().map(|i| i.number).collect();
-                self.detail_terminal_sessions.retain(|k, _| live_nums.contains(k));
-                self.detail_terminal_spawn_errors.retain(|k, _| live_nums.contains(k));
+                self.detail_terminal_sessions
+                    .retain(|k, _| live_nums.contains(k));
+                self.detail_terminal_spawn_errors
+                    .retain(|k, _| live_nums.contains(k));
                 self.pipeline_loader = None;
                 self.rebuild_pipeline_sidebar(prev_sel);
                 true
@@ -9680,7 +10087,11 @@ impl CoordApp {
                 "",
                 &format!(
                     "  No issues found with label(s): {}",
-                    if labels.is_empty() { "(none)".into() } else { labels }
+                    if labels.is_empty() {
+                        "(none)".into()
+                    } else {
+                        labels
+                    }
                 ),
                 Some(Color::rgb(140, 140, 140)),
             ));
@@ -9793,7 +10204,12 @@ impl CoordApp {
             .find(|oi| oi.repo_name == repo && oi.number == g.issue_number)
         {
             return issue_body_list(
-                Some((oi.number, oi.title.as_str(), oi.body.as_str(), &oi.labels[..])),
+                Some((
+                    oi.number,
+                    oi.title.as_str(),
+                    oi.body.as_str(),
+                    &oi.labels[..],
+                )),
                 self.detail_scroll,
                 "board-issue-body",
             );
@@ -9843,7 +10259,9 @@ impl CoordApp {
                 .map(|(_, slug)| slug.clone());
             if let Some(slug) = slug {
                 let rx = spawn_issue_fetch(slug, repo.clone(), g.issue_number);
-                self.pending_issue_fetches.borrow_mut().insert(key.clone(), rx);
+                self.pending_issue_fetches
+                    .borrow_mut()
+                    .insert(key.clone(), rx);
             } else {
                 // No slug → can't fetch. Show the title we have with a hint.
                 return issue_body_list(
@@ -9943,11 +10361,16 @@ impl CoordApp {
 
     /// Issue tab: title header + scrollable full body (j/k to scroll).
     fn pipeline_issue_body_list(&self) -> ListView {
-        let issue = self
-            .pipeline_sel
-            .and_then(|i| self.pipeline_issues.get(i));
+        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
         issue_body_list(
-            issue.map(|i| (i.number, i.title.as_str(), i.body.as_str(), &i.all_labels[..])),
+            issue.map(|i| {
+                (
+                    i.number,
+                    i.title.as_str(),
+                    i.body.as_str(),
+                    &i.all_labels[..],
+                )
+            }),
             self.pipeline_detail_scroll,
             "pipeline-issue-body",
         )
@@ -9966,14 +10389,26 @@ impl CoordApp {
         let mut items: Vec<ListItem> = Vec::new();
         if let Some(idx) = self.pipeline_sel {
             if let Some(issue) = self.pipeline_issues.get(idx) {
-                items.push(kv_item("Repo", &issue.repo_slug, Some(Color::rgb(160, 160, 180))));
+                items.push(kv_item(
+                    "Repo",
+                    &issue.repo_slug,
+                    Some(Color::rgb(160, 160, 180)),
+                ));
                 if let Some(local) = &issue.coord_repo {
                     items.push(kv_item("Local", local, Some(Color::rgb(140, 200, 140))));
                 } else {
-                    items.push(kv_item("Local", "(no coordinator.yml mapping)", Some(Color::rgb(220, 150, 80))));
+                    items.push(kv_item(
+                        "Local",
+                        "(no coordinator.yml mapping)",
+                        Some(Color::rgb(220, 150, 80)),
+                    ));
                 }
                 if !issue.matched_labels.is_empty() {
-                    items.push(kv_item("Labels", &issue.matched_labels.join(", "), Some(Color::rgb(160, 160, 180))));
+                    items.push(kv_item(
+                        "Labels",
+                        &issue.matched_labels.join(", "),
+                        Some(Color::rgb(160, 160, 180)),
+                    ));
                 }
                 items.push(kv_item(
                     "Gates",
@@ -9983,7 +10418,11 @@ impl CoordApp {
                 if let Some((msg, when)) = &self.pipeline_status {
                     if when.elapsed() < Duration::from_secs(8) {
                         items.push(kv_item("", "", None));
-                        items.push(kv_item("", &format!("  {}", msg), Some(Color::rgb(180, 180, 100))));
+                        items.push(kv_item(
+                            "",
+                            &format!("  {}", msg),
+                            Some(Color::rgb(180, 180, 100)),
+                        ));
                     }
                 }
 
@@ -10026,7 +10465,11 @@ impl CoordApp {
 
         // ── Meta summary (repo / labels / gates / status) ────────────
         if let Some(ref issue) = issue {
-            items.push(kv_item("Repo", &issue.repo_slug, Some(Color::rgb(160, 160, 180))));
+            items.push(kv_item(
+                "Repo",
+                &issue.repo_slug,
+                Some(Color::rgb(160, 160, 180)),
+            ));
             if let Some(local) = &issue.coord_repo {
                 items.push(kv_item("Local", local, Some(Color::rgb(140, 200, 140))));
             } else {
@@ -10111,11 +10554,7 @@ impl CoordApp {
     /// path, last-build outcome (persisted), suggested next commands —
     /// when the user is looking at an issue whose Test stage is in
     /// play (actionable or recently built).
-    fn append_test_guidance_rows(
-        &self,
-        items: &mut Vec<ListItem>,
-        issue: &PipelineIssue,
-    ) {
+    fn append_test_guidance_rows(&self, items: &mut Vec<ListItem>, issue: &PipelineIssue) {
         // Find the latest Work assignment for this issue (the build
         // hangs off its branch).
         let work = self.assignments_for_stage(issue, "work");
@@ -10124,7 +10563,9 @@ impl CoordApp {
                 .partial_cmp(&b.dispatched_at)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let Some(latest) = latest else { return; };
+        let Some(latest) = latest else {
+            return;
+        };
         // Show this block ONLY when the Test stage is in play (Active
         // or Pending with Work done).  Skip for issues that aren't at
         // the test step yet.
@@ -10144,11 +10585,7 @@ impl CoordApp {
             Some(Color::rgb(160, 200, 220)),
         ));
         if let Some(branch) = &latest.branch {
-            items.push(kv_item(
-                "  Branch",
-                branch,
-                Some(Color::rgb(160, 160, 180)),
-            ));
+            items.push(kv_item("  Branch", branch, Some(Color::rgb(160, 160, 180))));
         }
         // Local repo path — only when we have a coord-repo mapping.
         if let Some(local) = &issue.coord_repo {
@@ -10162,11 +10599,7 @@ impl CoordApp {
         // this repo.  Absent repos (no run_cmd set) silently skip.
         if let Some(local) = &issue.coord_repo {
             if let Some(cmd) = self.data.pipeline_repo_run_cmds.get(local.as_str()) {
-                items.push(kv_item(
-                    "  Run",
-                    cmd,
-                    Some(Color::rgb(200, 220, 160)),
-                ));
+                items.push(kv_item("  Run", cmd, Some(Color::rgb(200, 220, 160))));
             }
         }
         // Persistent build status.  Three states surfaced.
@@ -10176,7 +10609,10 @@ impl CoordApp {
                 let elapsed = job.started_at.elapsed().as_secs();
                 items.push(kv_item(
                     "  Build",
-                    &format!("running ({elapsed}s elapsed) — log {}", job.log_path.display()),
+                    &format!(
+                        "running ({elapsed}s elapsed) — log {}",
+                        job.log_path.display()
+                    ),
                     Some(Color::rgb(220, 180, 100)),
                 ));
             }
@@ -10195,7 +10631,10 @@ impl CoordApp {
                     "  Build",
                     &format!(
                         "✓ succeeded in {}s ({}s ago{}) — log {}",
-                        last.duration_secs, ago, branch_note, last.log_path.display()
+                        last.duration_secs,
+                        ago,
+                        branch_note,
+                        last.log_path.display()
                     ),
                     Some(Color::rgb(120, 200, 120)),
                 ));
@@ -10248,10 +10687,17 @@ impl CoordApp {
                 ));
             } else {
                 let snippet: String = pull.message.chars().take(80).collect();
-                let ellipsis = if pull.message.chars().count() > 80 { "…" } else { "" };
+                let ellipsis = if pull.message.chars().count() > 80 {
+                    "…"
+                } else {
+                    ""
+                };
                 items.push(kv_item(
                     "  Pull",
-                    &format!("✗ exit {} ({}s ago): {}{}", pull.exit_code, ago, snippet, ellipsis),
+                    &format!(
+                        "✗ exit {} ({}s ago): {}{}",
+                        pull.exit_code, ago, snippet, ellipsis
+                    ),
                     Some(Color::rgb(220, 100, 100)),
                 ));
             }
@@ -10286,11 +10732,7 @@ impl CoordApp {
                         .take(6)
                         .collect();
                     if !body_lines.is_empty() {
-                        items.push(kv_item(
-                            "  PR notes",
-                            "",
-                            Some(Color::rgb(160, 160, 180)),
-                        ));
+                        items.push(kv_item("  PR notes", "", Some(Color::rgb(160, 160, 180))));
                         for line in body_lines {
                             // Truncate any wildly long line so the
                             // single-row list doesn't blow out.
@@ -10302,11 +10744,7 @@ impl CoordApp {
                             ));
                         }
                         if pr.body.lines().count() > 6 {
-                            items.push(kv_item(
-                                "",
-                                "    …",
-                                Some(Color::rgb(140, 140, 160)),
-                            ));
+                            items.push(kv_item("", "    …", Some(Color::rgb(140, 140, 160))));
                         }
                     }
                     // Files-changed list — useful for "what should I
@@ -10336,18 +10774,18 @@ impl CoordApp {
                     // non-empty body when possible).  Filters out
                     // "COMMENTED" reviews with empty bodies that gh
                     // sometimes returns from sidecar bots.
-                    let latest_review = pr
-                        .reviews
-                        .iter()
-                        .rev()
-                        .find(|r| {
-                            r.state != "PENDING"
-                                && (!r.body.is_empty() || r.state == "APPROVED" || r.state == "CHANGES_REQUESTED")
-                        });
+                    let latest_review = pr.reviews.iter().rev().find(|r| {
+                        r.state != "PENDING"
+                            && (!r.body.is_empty()
+                                || r.state == "APPROVED"
+                                || r.state == "CHANGES_REQUESTED")
+                    });
                     if let Some(rev) = latest_review {
                         let (state_label, state_color) = match rev.state.as_str() {
                             "APPROVED" => ("✓ Approved", Color::rgb(120, 200, 120)),
-                            "CHANGES_REQUESTED" => ("✗ Changes Requested", Color::rgb(220, 100, 100)),
+                            "CHANGES_REQUESTED" => {
+                                ("✗ Changes Requested", Color::rgb(220, 100, 100))
+                            }
                             "COMMENTED" => ("Commented", Color::rgb(160, 200, 220)),
                             other => (other, Color::rgb(200, 200, 200)),
                         };
@@ -10397,11 +10835,7 @@ impl CoordApp {
                             ));
                         }
                         if rev.body.lines().count() > 10 {
-                            items.push(kv_item(
-                                "",
-                                "    …",
-                                Some(Color::rgb(140, 140, 160)),
-                            ));
+                            items.push(kv_item("", "    …", Some(Color::rgb(140, 140, 160))));
                         }
                     }
                 }
@@ -10491,7 +10925,9 @@ impl CoordApp {
 
         // Suggested next steps.
         let test_label = match test_status {
-            StageStatus::Failed => "previously failed — press R to re-dispatch Work, or P/F/S to re-record",
+            StageStatus::Failed => {
+                "previously failed — press R to re-dispatch Work, or P/F/S to re-record"
+            }
             _ => "press P=pass, F=fail, r=report+fix, S=skip after manual verification",
         };
         items.push(kv_item(
@@ -10612,7 +11048,11 @@ impl CoordApp {
 
         if !plan.estimate.is_empty() {
             rows.push(kv_item("", " Estimate", Some(label_color)));
-            rows.push(kv_item("", &format!("   {}", plan.estimate), Some(body_color)));
+            rows.push(kv_item(
+                "",
+                &format!("   {}", plan.estimate),
+                Some(body_color),
+            ));
             rows.push(kv_item("", "", None));
         }
 
@@ -10671,7 +11111,9 @@ impl CoordApp {
                     .partial_cmp(&b.dispatched_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-        let Some(review) = review else { return Vec::new() };
+        let Some(review) = review else {
+            return Vec::new();
+        };
         // Findings JSON was loaded with the board (no per-render DB
         // query).  When None, notify hasn't parsed this review yet —
         // running `coord notify` or `coord bounce` refreshes it.
@@ -10752,7 +11194,9 @@ impl CoordApp {
                     .partial_cmp(&b.dispatched_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-        let Some(work) = work_assignment else { return Vec::new() };
+        let Some(work) = work_assignment else {
+            return Vec::new();
+        };
         let work_id = work.id.clone();
         let mut rows: Vec<ListItem> = Vec::new();
 
@@ -10809,7 +11253,11 @@ impl CoordApp {
                     let status_color = if self.test_step_jobs.contains_key(&key) {
                         pending_color
                     } else if let Some(&exit) = self.test_step_results.get(&key) {
-                        if exit == 0 { ok_color } else { fail_color }
+                        if exit == 0 {
+                            ok_color
+                        } else {
+                            fail_color
+                        }
                     } else {
                         step_color
                     };
@@ -10865,11 +11313,7 @@ impl CoordApp {
                         Some(pending_color),
                     ));
                 } else {
-                    rows.push(kv_item(
-                        "",
-                        "   Preparing plan…",
-                        Some(pending_color),
-                    ));
+                    rows.push(kv_item("", "   Preparing plan…", Some(pending_color)));
                 }
                 rows.push(kv_item("", "", None));
             }
@@ -10886,10 +11330,17 @@ impl CoordApp {
                 ));
             } else {
                 let snippet: String = pull.message.chars().take(80).collect();
-                let ellipsis = if pull.message.chars().count() > 80 { "…" } else { "" };
+                let ellipsis = if pull.message.chars().count() > 80 {
+                    "…"
+                } else {
+                    ""
+                };
                 rows.push(kv_item(
                     "Last pull",
-                    &format!("✗ exit {} ({}s ago): {}{}", pull.exit_code, ago, snippet, ellipsis),
+                    &format!(
+                        "✗ exit {} ({}s ago): {}{}",
+                        pull.exit_code, ago, snippet, ellipsis
+                    ),
                     Some(fail_color),
                 ));
             }
@@ -10945,7 +11396,9 @@ impl CoordApp {
             .merge_queue
             .iter()
             .find(|m| m.issue_number == Some(issue.number));
-        let Some(entry) = entry else { return Vec::new() };
+        let Some(entry) = entry else {
+            return Vec::new();
+        };
         let mut rows: Vec<ListItem> = Vec::new();
         rows.push(kv_item(
             "State",
@@ -10965,11 +11418,7 @@ impl CoordApp {
     /// Plan / Work stage content — read the tail of the matching
     /// assignment's log file.  Returns an empty placeholder when no
     /// assignment exists or the log is unreadable.
-    fn stage_content_assignment_log(
-        &self,
-        issue: &PipelineIssue,
-        stage: &str,
-    ) -> Vec<ListItem> {
+    fn stage_content_assignment_log(&self, issue: &PipelineIssue, stage: &str) -> Vec<ListItem> {
         let local_repo = issue.coord_repo.as_deref();
         let assignment = self
             .data
@@ -10993,13 +11442,13 @@ impl CoordApp {
                     .partial_cmp(&b.dispatched_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-        let Some(a) = assignment else { return Vec::new() };
-        let log_path = std::path::PathBuf::from(
-            std::env::var("HOME").unwrap_or_default(),
-        )
-        .join(".coord")
-        .join("logs")
-        .join(format!("{}.log", a.id));
+        let Some(a) = assignment else {
+            return Vec::new();
+        };
+        let log_path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".coord")
+            .join("logs")
+            .join(format!("{}.log", a.id));
         let content = std::fs::read_to_string(&log_path).unwrap_or_default();
         if content.is_empty() {
             return vec![kv_item(
@@ -11021,7 +11470,8 @@ impl CoordApp {
                 "",
                 &format!(
                     "   (showing last 200 of {} lines from {}.log)",
-                    lines.len(), a.id,
+                    lines.len(),
+                    a.id,
                 ),
                 Some(Color::rgb(140, 140, 160)),
             ));
@@ -11053,16 +11503,29 @@ impl CoordApp {
         if let Some(issue) = issue {
             let local_repo = issue.coord_repo.as_deref();
             let assignment = self
-                .data.assignments.iter()
+                .data
+                .assignments
+                .iter()
                 .filter(|a| a.issue_number == issue.number)
-                .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
+                .filter(|a| match local_repo {
+                    Some(r) => a.repo == r,
+                    None => true,
+                })
                 .find(|a| a.status == "running")
                 .or_else(|| {
-                    self.data.assignments.iter()
+                    self.data
+                        .assignments
+                        .iter()
                         .filter(|a| a.issue_number == issue.number)
-                        .filter(|a| match local_repo { Some(r) => a.repo == r, None => true })
-                        .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
-                            .unwrap_or(std::cmp::Ordering::Equal))
+                        .filter(|a| match local_repo {
+                            Some(r) => a.repo == r,
+                            None => true,
+                        })
+                        .max_by(|a, b| {
+                            a.dispatched_at
+                                .partial_cmp(&b.dispatched_at)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
                 });
             if let Some(a) = assignment {
                 // Session elapsed header — always recomputed (time advances every
@@ -11074,21 +11537,33 @@ impl CoordApp {
                 let elapsed_header = match (a.dispatched_at, a.finished_at) {
                     (Some(start), Some(end)) => {
                         let secs = (end - start).max(0.0) as u64;
-                        format!("  {} · {} · elapsed {}",
+                        format!(
+                            "  {} · {} · elapsed {}",
                             a.assignment_type.as_deref().unwrap_or("work"),
                             a.machine,
-                            fmt_elapsed_mmss(secs))
+                            fmt_elapsed_mmss(secs)
+                        )
                     }
                     (Some(start), None) => {
                         let secs = (now_secs - start).max(0.0) as u64;
-                        format!("  {} · {} · running {}",
+                        format!(
+                            "  {} · {} · running {}",
                             a.assignment_type.as_deref().unwrap_or("work"),
                             a.machine,
-                            fmt_elapsed_mmss(secs))
+                            fmt_elapsed_mmss(secs)
+                        )
                     }
-                    _ => format!("  {} · {}", a.assignment_type.as_deref().unwrap_or("work"), a.machine),
+                    _ => format!(
+                        "  {} · {}",
+                        a.assignment_type.as_deref().unwrap_or("work"),
+                        a.machine
+                    ),
                 };
-                items.push(kv_item("", &elapsed_header, Some(Color::rgb(120, 120, 140))));
+                items.push(kv_item(
+                    "",
+                    &elapsed_header,
+                    Some(Color::rgb(120, 120, 140)),
+                ));
                 items.push(kv_item("", "", None));
 
                 // #385: readable wrapped rendering.  Panel width is set by
@@ -11104,25 +11579,28 @@ impl CoordApp {
                 if let Some(ctx) = self.watch_pool.get(&a.id) {
                     let sse = &ctx.sse;
                     if sse.lines.is_empty() && !sse.done {
-                        items.push(kv_item("", "  Connecting to log stream…", Some(Color::rgb(140, 140, 140))));
+                        items.push(kv_item(
+                            "",
+                            "  Connecting to log stream…",
+                            Some(Color::rgb(140, 140, 140)),
+                        ));
                     } else {
                         // #399 scroll-perf: check cache before re-parsing all lines.
                         let line_count = sse.lines.len();
                         let cache_valid = {
                             let cache = self.log_items_cache.borrow();
-                            cache.as_ref().map_or(false, |c|
+                            cache.as_ref().map_or(false, |c| {
                                 c.assignment_id == a.id
-                                && c.line_count == line_count
-                                && c.wrap_width == wrap_width
-                            )
+                                    && c.line_count == line_count
+                                    && c.wrap_width == wrap_width
+                            })
                         };
                         if cache_valid {
                             let cache = self.log_items_cache.borrow();
                             items.extend(cache.as_ref().unwrap().items.iter().cloned());
                         } else {
-                            let content_items = parse_sse_log_readable(
-                                &sse.lines, &sse.line_times, wrap_width,
-                            );
+                            let content_items =
+                                parse_sse_log_readable(&sse.lines, &sse.line_times, wrap_width);
                             *self.log_items_cache.borrow_mut() = Some(LogItemsCache {
                                 assignment_id: a.id.clone(),
                                 line_count,
@@ -11133,24 +11611,26 @@ impl CoordApp {
                         }
                     }
                     if sse.done {
-                        items.push(kv_item("", "  ── stream ended ──", Some(Color::rgb(90, 90, 90))));
+                        items.push(kv_item(
+                            "",
+                            "  ── stream ended ──",
+                            Some(Color::rgb(90, 90, 90)),
+                        ));
                     }
                 } else {
                     // For local logs, apply readable formatting directly.
                     // For remote/cached logs, fall back to get_activity_log.
-                    let log_path = coord_dir()
-                        .join("logs")
-                        .join(format!("{}.log", a.id));
+                    let log_path = coord_dir().join("logs").join(format!("{}.log", a.id));
                     if let Ok(content) = std::fs::read_to_string(&log_path) {
                         // #399 scroll-perf: cache local-file parse by byte length.
                         let line_count = content.len();
                         let cache_valid = {
                             let cache = self.log_items_cache.borrow();
-                            cache.as_ref().map_or(false, |c|
+                            cache.as_ref().map_or(false, |c| {
                                 c.assignment_id == a.id
-                                && c.line_count == line_count
-                                && c.wrap_width == wrap_width
-                            )
+                                    && c.line_count == line_count
+                                    && c.wrap_width == wrap_width
+                            })
                         };
                         if cache_valid {
                             let cache = self.log_items_cache.borrow();
@@ -11170,10 +11650,18 @@ impl CoordApp {
                     }
                 }
             } else {
-                items.push(kv_item("", "  (no assignment log available)", Some(Color::rgb(100, 100, 100))));
+                items.push(kv_item(
+                    "",
+                    "  (no assignment log available)",
+                    Some(Color::rgb(100, 100, 100)),
+                ));
             }
         } else {
-            items.push(kv_item("", "  (select an issue to view its log)", Some(Color::rgb(100, 100, 100))));
+            items.push(kv_item(
+                "",
+                "  (select an issue to view its log)",
+                Some(Color::rgb(100, 100, 100)),
+            ));
         }
         // Sticky-to-bottom: usize::MAX is the sentinel for "follow tail".
         // Compute the real offset here so draw_list gets a clamped value.
@@ -11186,10 +11674,7 @@ impl CoordApp {
         // #302: measure the widest row so the rasteriser knows when content
         // overflows and should paint a horizontal scrollbar. Width = the 3-char
         // "   " indent the rows carry + the item's visible text width.
-        let max_content_width = items
-            .iter()
-            .map(|it| 3 + it.text.visible_width())
-            .max();
+        let max_content_width = items.iter().map(|it| 3 + it.text.visible_width()).max();
         // Clamp the horizontal offset so it can't scroll past the content.
         let h_scroll = match max_content_width {
             Some(w) => self.pipeline_log_hscroll.min(w.saturating_sub(1)),
@@ -11211,9 +11696,14 @@ impl CoordApp {
     /// Count `[assistant]` turns in the local log for an assignment.
     /// Returns 0 when the log is not cached locally.
     fn turn_count_from_log(&self, assignment_id: &str) -> usize {
-        let path = coord_dir().join("logs").join(format!("{}.log", assignment_id));
-        let Ok(content) = std::fs::read_to_string(&path) else { return 0; };
-        content.lines()
+        let path = coord_dir()
+            .join("logs")
+            .join(format!("{}.log", assignment_id));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return 0;
+        };
+        content
+            .lines()
             .filter(|l| json_str(l, "type").as_deref() == Some("assistant"))
             .count()
     }
@@ -11225,7 +11715,11 @@ impl CoordApp {
             .and_then(|i| self.pipeline_issues.get(i))
             .cloned();
         let Some(issue) = issue else {
-            items.push(kv_item("", "(no issue selected)", Some(Color::rgb(140, 140, 140))));
+            items.push(kv_item(
+                "",
+                "(no issue selected)",
+                Some(Color::rgb(140, 140, 140)),
+            ));
             return ListView {
                 id: WidgetId::new("pipeline-stages"),
                 title: None,
@@ -11378,13 +11872,25 @@ impl CoordApp {
             .collect();
 
         if matching.is_empty() {
-            items.push(kv_item("", "    (not started)", Some(Color::rgb(140, 140, 140))));
+            items.push(kv_item(
+                "",
+                "    (not started)",
+                Some(Color::rgb(140, 140, 140)),
+            ));
             return;
         }
         for a in matching.iter() {
             let id_short: String = a.id.chars().take(8).collect();
-            items.push(kv_item("Assignment", &id_short, Some(Color::rgb(160, 200, 220))));
-            items.push(kv_item("Machine", &a.machine, Some(Color::rgb(210, 210, 210))));
+            items.push(kv_item(
+                "Assignment",
+                &id_short,
+                Some(Color::rgb(160, 200, 220)),
+            ));
+            items.push(kv_item(
+                "Machine",
+                &a.machine,
+                Some(Color::rgb(210, 210, 210)),
+            ));
             let status_color = match a.status.as_str() {
                 "running" => Color::rgb(220, 180, 100),
                 "done" => Color::rgb(120, 200, 120),
@@ -11399,10 +11905,18 @@ impl CoordApp {
                 items.push(kv_item("Model", model, Some(Color::rgb(180, 180, 180))));
             }
             if let Some(t) = a.dispatched_at {
-                items.push(kv_item("Dispatched", &format_unix_time(t), Some(Color::rgb(180, 180, 180))));
+                items.push(kv_item(
+                    "Dispatched",
+                    &format_unix_time(t),
+                    Some(Color::rgb(180, 180, 180)),
+                ));
             }
             if let Some(t) = a.finished_at {
-                items.push(kv_item("Finished", &format_unix_time(t), Some(Color::rgb(180, 180, 180))));
+                items.push(kv_item(
+                    "Finished",
+                    &format_unix_time(t),
+                    Some(Color::rgb(180, 180, 180)),
+                ));
             }
             if let Some(ec) = a.exit_code {
                 let ec_color = if ec == 0 {
@@ -11430,10 +11944,7 @@ impl CoordApp {
                 if let Some(verdict) = a.review_verdict.as_deref() {
                     let (label, color) = match verdict {
                         "approve" => ("✓ approved", Color::rgb(120, 200, 120)),
-                        "request-changes" => (
-                            "✗ changes requested",
-                            Color::rgb(220, 100, 100),
-                        ),
+                        "request-changes" => ("✗ changes requested", Color::rgb(220, 100, 100)),
                         other => (other, Color::rgb(220, 180, 100)),
                     };
                     items.push(kv_item("Verdict", label, Some(color)));
@@ -11458,12 +11969,20 @@ impl CoordApp {
             .filter(|m| m.issue_number == Some(issue.number))
             .collect();
         if entries.is_empty() {
-            items.push(kv_item("", "    (not queued)", Some(Color::rgb(140, 140, 140))));
+            items.push(kv_item(
+                "",
+                "    (not queued)",
+                Some(Color::rgb(140, 140, 140)),
+            ));
             return;
         }
         for e in entries {
             let id_short: String = e.assignment_id.chars().take(8).collect();
-            items.push(kv_item("Assignment", &id_short, Some(Color::rgb(160, 200, 220))));
+            items.push(kv_item(
+                "Assignment",
+                &id_short,
+                Some(Color::rgb(160, 200, 220)),
+            ));
             let state_color = match e.state.as_str() {
                 "merged" => Color::rgb(120, 200, 120),
                 "failed" | "human_required" => Color::rgb(220, 70, 70),
@@ -11492,7 +12011,11 @@ impl CoordApp {
                 ));
             }
             if let Some(pr) = e.pr_number {
-                items.push(kv_item("PR", &format!("#{}", pr), Some(Color::rgb(160, 200, 220))));
+                items.push(kv_item(
+                    "PR",
+                    &format!("#{}", pr),
+                    Some(Color::rgb(160, 200, 220)),
+                ));
             }
             if let Some(url) = &e.pr_url {
                 items.push(kv_item("URL", url, Some(Color::rgb(140, 170, 210))));
@@ -11501,10 +12024,7 @@ impl CoordApp {
             // exists.  Loading state is implicit — the row only renders once
             // the background fetch returns.
             if let Some(pr) = e.pr_number {
-                if let Some(summary) = self
-                    .pipeline_ci_checks
-                    .get(&(e.repo_github.clone(), pr))
-                {
+                if let Some(summary) = self.pipeline_ci_checks.get(&(e.repo_github.clone(), pr)) {
                     let terse = summary.terse();
                     let line = if summary.failed > 0 {
                         let names = summary.failed_names.join(", ");
@@ -11533,7 +12053,6 @@ impl CoordApp {
             }
         }
     }
-
 
     // ── Mouse dispatch ────────────────────────────────────────────────────
 
@@ -11625,9 +12144,7 @@ impl CoordApp {
                             })
                         }
                         SidebarView::Pipeline => {
-                            let sel = self
-                                .pipeline_sel
-                                .and_then(|i| self.pipeline_issues.get(i));
+                            let sel = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
                             let issue_number = sel.map(|i| i.number);
                             // #262: classify the row at right-click time
                             // so the menu offers Start only when New.
@@ -11663,7 +12180,9 @@ impl CoordApp {
                 false
             }
 
-            UiEvent::Scroll { position, delta, .. } => {
+            UiEvent::Scroll {
+                position, delta, ..
+            } => {
                 let pos = *position;
                 let d = *delta;
                 let lh = backend.line_height();
@@ -11684,14 +12203,22 @@ impl CoordApp {
             // host having to track button bounds across frames.  A
             // change in the hovered id triggers a redraw.
             UiEvent::MouseMoved { .. } => {
-                let pos = if let UiEvent::MouseMoved { position, .. } = event { *position } else { return false; };
+                let pos = if let UiEvent::MouseMoved { position, .. } = event {
+                    *position
+                } else {
+                    return false;
+                };
                 // #446: if a detail-terminal scrollbar drag is in flight
                 // and the left button is still down, update it.  Mirrors
                 // the example pattern in `terminal_app.rs`.
                 if self.detail_terminal_scrollbar_drag.is_some() {
-                    let left_down = matches!(event, UiEvent::MouseMoved {
-                        buttons: ButtonMask { left: true, .. }, ..
-                    });
+                    let left_down = matches!(
+                        event,
+                        UiEvent::MouseMoved {
+                            buttons: ButtonMask { left: true, .. },
+                            ..
+                        }
+                    );
                     if left_down {
                         self.apply_detail_terminal_scrollbar_drag(pos.y);
                         return true;
@@ -11705,7 +12232,9 @@ impl CoordApp {
                 if let Some(sidebar_b) = ctx.sidebar_bounds() {
                     let result = match self.active_view {
                         SidebarView::Board => self.board_sidebar.handle(event, backend, sidebar_b),
-                        SidebarView::Pipeline => self.pipeline_sidebar.handle(event, backend, sidebar_b),
+                        SidebarView::Pipeline => {
+                            self.pipeline_sidebar.handle(event, backend, sidebar_b)
+                        }
                         _ => SidebarEvent::Ignored,
                     };
                     if result != SidebarEvent::Ignored {
@@ -11721,9 +12250,7 @@ impl CoordApp {
                             toolbar_tui_measure,
                         );
                         if let Some(t) = layout.toolbar_layout.as_ref() {
-                            redraw |= self
-                                .sidebar_action_bar_hover
-                                .update(t, pos.x, pos.y);
+                            redraw |= self.sidebar_action_bar_hover.update(t, pos.x, pos.y);
                         } else {
                             redraw |= self.sidebar_action_bar_hover.clear();
                         }
@@ -11761,12 +12288,8 @@ impl CoordApp {
                             let main_b = ctx.main_bounds();
                             let tab_h = lh * 1.4;
                             let bar_h = pipeline_action_bar_height(true, lh);
-                            let bar_rect = Rect::new(
-                                main_b.x,
-                                main_b.y + tab_h,
-                                main_b.width,
-                                bar_h,
-                            );
+                            let bar_rect =
+                                Rect::new(main_b.x, main_b.y + tab_h, main_b.width, bar_h);
                             let layout = backend.toolbar_layout(bar_rect, &action_toolbar);
                             redraw |= self.pipeline_action_bar_hover.update(&layout, pos.x, pos.y);
                         } else {
@@ -11822,8 +12345,7 @@ impl CoordApp {
         // we've already dispatched the action.  Pass the shrunken rect
         // to the tree's hit-tester so its math doesn't see the bar row.
         let lh = backend.line_height();
-        let (sidebar_b, consumed) =
-            self.hit_test_sidebar_action_bar(pos, sidebar_b, lh);
+        let (sidebar_b, consumed) = self.hit_test_sidebar_action_bar(pos, sidebar_b, lh);
         let _ = backend; // backend reserved for hover updates wired below
         if consumed {
             return true;
@@ -11844,7 +12366,8 @@ impl CoordApp {
                                     let milestones = self.board_milestones_for_repo(&cache, &repo);
                                     if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
                                         let m_key = m_key.clone();
-                                        let entry = self.board_milestone_expanded
+                                        let entry = self
+                                            .board_milestone_expanded
                                             .entry((repo, m_key))
                                             .or_insert(true);
                                         *entry = !*entry;
@@ -11870,7 +12393,8 @@ impl CoordApp {
                                     let milestones = self.board_milestones_for_repo(&cache, &repo);
                                     if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
                                         let m_key = m_key.clone();
-                                        let entry = self.board_milestone_expanded
+                                        let entry = self
+                                            .board_milestone_expanded
                                             .entry((repo, m_key))
                                             .or_insert(true);
                                         *entry = !*entry;
@@ -11885,13 +12409,19 @@ impl CoordApp {
                         true
                     }
                     SidebarEvent::HeaderActivated { section: _ } => true,
-                    SidebarEvent::FormEvent { section: 0, event: FormEvent::TextInputChanged { ref value, .. } } => {
+                    SidebarEvent::FormEvent {
+                        section: 0,
+                        event: FormEvent::TextInputChanged { ref value, .. },
+                    } => {
                         self.board_search.set_value(value);
                         self.rebuild_board_sidebar();
                         true
                     }
                     // Click on the filter TextInput focuses it (emits FocusChanged).
-                    SidebarEvent::FormEvent { section: 0, event: FormEvent::FocusChanged { .. } } => {
+                    SidebarEvent::FormEvent {
+                        section: 0,
+                        event: FormEvent::FocusChanged { .. },
+                    } => {
                         self.board_search.focused = true;
                         self.board_sidebar.focus_form(0, true);
                         true
@@ -11907,7 +12437,8 @@ impl CoordApp {
                                 let milestone_idx = path[0] as usize;
                                 if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
                                     let m_key = m_key.clone();
-                                    let entry = self.board_milestone_expanded
+                                    let entry = self
+                                        .board_milestone_expanded
                                         .entry((repo, m_key))
                                         .or_insert(true);
                                     *entry = !*entry;
@@ -11944,18 +12475,23 @@ impl CoordApp {
                 let result = self.pipeline_sidebar.handle(event, backend, sidebar_b);
                 self.pipeline_sel = self.selected_pipeline_index();
                 if self.pipeline_sel != prev {
-                    self.pipeline_focused_stage =
-                        self.default_focused_stage_for_selected_issue();
+                    self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
                     self.pipeline_stage_content_scroll = 0;
                 }
                 match result {
-                    SidebarEvent::FormEvent { section: 0, event: FormEvent::TextInputChanged { ref value, .. } } => {
+                    SidebarEvent::FormEvent {
+                        section: 0,
+                        event: FormEvent::TextInputChanged { ref value, .. },
+                    } => {
                         self.pipeline_search.set_value(value);
                         self.rebuild_pipeline_sidebar(None);
                         true
                     }
                     // Click on the filter TextInput focuses it (emits FocusChanged).
-                    SidebarEvent::FormEvent { section: 0, event: FormEvent::FocusChanged { .. } } => {
+                    SidebarEvent::FormEvent {
+                        section: 0,
+                        event: FormEvent::FocusChanged { .. },
+                    } => {
                         self.pipeline_search.focused = true;
                         self.pipeline_sidebar.focus_form(0, true);
                         true
@@ -11967,8 +12503,7 @@ impl CoordApp {
                         let search_offset = 1usize;
                         if section >= search_offset {
                             let state_idx = section - search_offset;
-                            if let Some(&lc_key) =
-                                self.pipeline_state_section_names.get(state_idx)
+                            if let Some(&lc_key) = self.pipeline_state_section_names.get(state_idx)
                             {
                                 if lc_key != "in-progress" {
                                     let ri = path[0] as usize;
@@ -12025,8 +12560,7 @@ impl CoordApp {
         // shrink `main_b` for the rest of the handler so existing
         // tab-bar math (which expects (0..tab_h) from the panel's top)
         // continues to work unchanged.
-        let (content_main_b, toolbar_consumed) =
-            self.hit_test_panel_toolbar(pos, main_b, lh);
+        let (content_main_b, toolbar_consumed) = self.hit_test_panel_toolbar(pos, main_b, lh);
         if toolbar_consumed {
             return true;
         }
@@ -12042,7 +12576,10 @@ impl CoordApp {
                 position: pos,
                 modifiers: Modifiers::default(),
             };
-            let result = self.settings_form.borrow_mut().handle_cached(&click_event, main_b);
+            let result = self
+                .settings_form
+                .borrow_mut()
+                .handle_cached(&click_event, main_b);
             match result {
                 FormControllerEvent::FormAction(ref form_event) => {
                     // Sync keyboard focus indicator to the clicked field so
@@ -12090,9 +12627,7 @@ impl CoordApp {
                 return false;
             }
             // #316: click in Chat tab content area — handle CTA button clicks.
-            if self.board_detail_tab == BoardDetailTab::Chat
-                && self.inject_chat.is_none()
-            {
+            if self.board_detail_tab == BoardDetailTab::Chat && self.inject_chat.is_none() {
                 let content_rect = Rect::new(
                     main_b.x,
                     main_b.y + tab_h,
@@ -12101,8 +12636,10 @@ impl CoordApp {
                 );
                 let bar_h = lh * 2.0;
                 let bar_rect = Rect::new(content_rect.x, content_rect.y, content_rect.width, bar_h);
-                if pos.y >= bar_rect.y && pos.y < bar_rect.y + bar_rect.height
-                    && pos.x >= bar_rect.x && pos.x < bar_rect.x + bar_rect.width
+                if pos.y >= bar_rect.y
+                    && pos.y < bar_rect.y + bar_rect.height
+                    && pos.x >= bar_rect.x
+                    && pos.x < bar_rect.x + bar_rect.width
                 {
                     // Two equal-width buttons: left half → Refine, right half → New Issue.
                     let mid = bar_rect.x + bar_rect.width / 2.0;
@@ -12145,7 +12682,11 @@ impl CoordApp {
                             self.detail_terminal_focused = false;
                         }
                         self.pipeline_detail_tab = new_tab;
-                        self.pipeline_detail_scroll = if new_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
+                        self.pipeline_detail_scroll = if new_tab == PipelineDetailTab::Log {
+                            usize::MAX
+                        } else {
+                            0
+                        };
                         if new_tab == PipelineDetailTab::Log {
                             self.ensure_log_tab_sse();
                         }
@@ -12277,7 +12818,9 @@ impl CoordApp {
         if self.watch_focused.is_some() {
             // SSE log lines drive the count when present; fall back to the
             // remote-log cache when SSE isn't yet connected.
-            let items = self.watch_focused.as_ref()
+            let items = self
+                .watch_focused
+                .as_ref()
                 .and_then(|id| self.watch_pool.get(id))
                 .map(|ctx| ctx.sse.lines.len())
                 .unwrap_or_else(|| self.watch_log_list().items.len());
@@ -12298,7 +12841,11 @@ impl CoordApp {
                         // Wheel down → newer; once at the bottom, re-enable
                         // stick-to-bottom so future appends keep auto-scrolling.
                         let new_scroll = (w.scroll + 3).min(max);
-                        w.scroll = if new_scroll >= max { usize::MAX } else { new_scroll };
+                        w.scroll = if new_scroll >= max {
+                            usize::MAX
+                        } else {
+                            new_scroll
+                        };
                     }
                 }
             }
@@ -12404,9 +12951,7 @@ impl CoordApp {
                         // positive y = scroll up (into history), negative y
                         // = scroll down (toward live).
                         if let Some(issue_num) = self.selected_issue_number() {
-                            if let Some(sess) =
-                                self.detail_terminal_sessions.get_mut(&issue_num)
-                            {
+                            if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_num) {
                                 if delta.y > 0.0 {
                                     sess.scroll_up(3);
                                 } else if delta.y < 0.0 {
@@ -12426,7 +12971,9 @@ impl CoordApp {
                     position: Point::new(0.0, 0.0),
                     delta,
                 };
-                self.settings_form.borrow_mut().handle_cached(&scroll_event, main_b);
+                self.settings_form
+                    .borrow_mut()
+                    .handle_cached(&scroll_event, main_b);
                 true
             }
             // #424: Terminal pane handles scroll via the PTY scrollback
@@ -12508,7 +13055,12 @@ impl CoordApp {
         if let Some((label, elapsed)) = self.command_runner.running_info() {
             let depth = self.command_runner.queue_depth();
             let text = if depth > 0 {
-                format!(" {} ({:.0}s) · {} queued ", label, elapsed.as_secs_f64(), depth)
+                format!(
+                    " {} ({:.0}s) · {} queued ",
+                    label,
+                    elapsed.as_secs_f64(),
+                    depth
+                )
             } else {
                 format!(" {} ({:.0}s) ", label, elapsed.as_secs_f64())
             };
@@ -12566,7 +13118,8 @@ impl CoordApp {
             if self.can_trigger_test_build() {
                 " Test gate: B=build  T=chat  1–8=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
             } else {
-                " Test gate: T=chat  1–8=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit ".to_string()
+                " Test gate: T=chat  1–8=run step  P=pass  F=fail  r=report+fix  S=skip  q=quit "
+                    .to_string()
             }
         } else if self.can_bounce_work_after_test_fail() {
             // #236: Test just failed — the user's next step is to fix the
@@ -12588,7 +13141,11 @@ impl CoordApp {
             // bypasses.
             let summary = self.ci_summary_for_selected_issue().unwrap();
             let names = if summary.failed_names.len() > 2 {
-                format!("{} +{}", summary.failed_names[..2].join(", "), summary.failed_names.len() - 2)
+                format!(
+                    "{} +{}",
+                    summary.failed_names[..2].join(", "),
+                    summary.failed_names.len() - 2
+                )
             } else {
                 summary.failed_names.join(", ")
             };
@@ -12598,12 +13155,14 @@ impl CoordApp {
             // board.  Surface the block so the user doesn't press lowercase
             // `m` and silently merge unreviewed code.  Capital `M` runs
             // `coord merge --skip-review` for the deliberate override.
-            " Merge blocked: review not yet approved  R=dispatch review  M=merge anyway  q=quit ".to_string()
+            " Merge blocked: review not yet approved  R=dispatch review  M=merge anyway  q=quit "
+                .to_string()
         } else if self.active_view == SidebarView::Pipeline {
             // #194: Pipeline-specific hints: refresh, navigate, go, dismiss done.
             // #386: include i=steer on the Log tab so the feature is discoverable.
             if self.pipeline_detail_tab == PipelineDetailTab::Log {
-                " j/k=nav  Enter=go  i=steer  R=refresh  D=dismiss-done  h/l=tabs  q=quit ".to_string()
+                " j/k=nav  Enter=go  i=steer  R=refresh  D=dismiss-done  h/l=tabs  q=quit "
+                    .to_string()
             } else {
                 " j/k=nav  Enter=go  R=refresh  D=dismiss-done  h/l=tabs  q=quit ".to_string()
             }
@@ -12637,11 +13196,7 @@ impl CoordApp {
     ///
     /// Cross-references both `data.open_issues` (for labels + state)
     /// and `data.assignments` (for "has assignments → In-flight").
-    fn board_row_lifecycle(
-        &self,
-        repo_name: &str,
-        issue_number: u64,
-    ) -> BoardRowLifecycle {
+    fn board_row_lifecycle(&self, repo_name: &str, issue_number: u64) -> BoardRowLifecycle {
         let issue = self
             .data
             .open_issues
@@ -12655,15 +13210,11 @@ impl CoordApp {
         // bar both treated refined-once-then-rolled-back issues as
         // In-flight (no Refine option) even though they visually sit
         // in the Backlog section.
-        let has_assignment = self
-            .data
-            .assignments
-            .iter()
-            .any(|a| {
-                a.repo == repo_name
-                    && a.issue_number == issue_number
-                    && a.assignment_type.as_deref() != Some("refinement")
-            });
+        let has_assignment = self.data.assignments.iter().any(|a| {
+            a.repo == repo_name
+                && a.issue_number == issue_number
+                && a.assignment_type.as_deref() != Some("refinement")
+        });
         let Some(issue) = issue else {
             // No cache row — fall back on assignment presence; without
             // either signal we don't know the state.
@@ -12728,7 +13279,10 @@ impl CoordApp {
         if matches!(lifecycle, BoardRowLifecycle::Refining) {
             items.push(ContextMenuItem::action("mark-refined", "Mark Refined"));
             items.push(ContextMenuItem::action("refine-chat", "Refine with chat"));
-            items.push(ContextMenuItem::action("drop-to-backlog", "Drop to Backlog"));
+            items.push(ContextMenuItem::action(
+                "drop-to-backlog",
+                "Drop to Backlog",
+            ));
             items.push(ContextMenuItem::separator());
         }
         // #261: Send to Pipeline is only meaningful for Refined rows
@@ -12742,7 +13296,10 @@ impl CoordApp {
             ));
             // #266: symmetric to Mark Refined — let the user walk back
             // to Refining if they want to re-open scoping.
-            items.push(ContextMenuItem::action("drop-to-refining", "Drop to Refining"));
+            items.push(ContextMenuItem::action(
+                "drop-to-refining",
+                "Drop to Refining",
+            ));
             items.push(ContextMenuItem::separator());
         }
         // #410: "Send" dispatches the issue as a work assignment directly
@@ -12765,9 +13322,7 @@ impl CoordApp {
             ));
             items.push(ContextMenuItem::separator());
         }
-        items.push(
-            ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"),
-        );
+        items.push(ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"));
         items
     }
 
@@ -12877,7 +13432,9 @@ impl CoordApp {
     /// the "Address review findings" menu / action-bar item — only
     /// shown when there's actually a review for the user to address.
     fn selected_row_has_request_changes_for(&self, issue_number: Option<u64>) -> bool {
-        let Some(num) = issue_number else { return false; };
+        let Some(num) = issue_number else {
+            return false;
+        };
         // Match by issue number across both review and work assignments;
         // the link is via review_of_assignment_id.  Filter the review
         // pool by issue_number directly — cheaper than walking the
@@ -12939,10 +13496,7 @@ impl CoordApp {
                 // Watch is also reachable via Enter on the row; surfacing
                 // it here gives the no-right-click / Android-over-SSH
                 // path a clickable affordance.
-                items.push(
-                    ContextMenuItem::action("watch", "Watch")
-                        .with_shortcut("Enter"),
-                );
+                items.push(ContextMenuItem::action("watch", "Watch").with_shortcut("Enter"));
                 items.push(ContextMenuItem::action("stop", "Stop"));
                 // #bounce: when the latest review wants changes, offer to
                 // dispatch a fix worker (auto-loop's path) right from
@@ -12974,9 +13528,7 @@ impl CoordApp {
             ));
             items.push(ContextMenuItem::separator());
         }
-        items.push(
-            ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"),
-        );
+        items.push(ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"));
         items
     }
 
@@ -13019,11 +13571,7 @@ impl CoordApp {
     /// Render the open context menu (if any) on top of the rest of the UI.
     /// Caches the resolved layout so the click hit-test can match items
     /// without recomputing.  Pure render — no state mutation.
-    fn render_context_menu(
-        &self,
-        backend: &mut dyn Backend,
-        viewport: Rect,
-    ) {
+    fn render_context_menu(&self, backend: &mut dyn Backend, viewport: Rect) {
         let Some(state) = self.pending_context_menu.as_ref() else {
             return;
         };
@@ -13045,13 +13593,9 @@ impl CoordApp {
             .unwrap_or(0);
         let menu_width = (max_label + max_shortcut + 6).clamp(20, 60) as f32;
         let lh = backend.line_height();
-        let layout = menu.layout(
-            state.anchor.x,
-            state.anchor.y,
-            viewport,
-            menu_width,
-            |_| ContextMenuItemMeasure::new(lh),
-        );
+        let layout = menu.layout(state.anchor.x, state.anchor.y, viewport, menu_width, |_| {
+            ContextMenuItemMeasure::new(lh)
+        });
         backend.draw_context_menu(&menu, &layout);
         *self.context_menu_layout.borrow_mut() = Some(layout);
     }
@@ -13416,7 +13960,10 @@ impl CoordApp {
                 if wrapped.is_empty() {
                     vec![StyledText::plain("")]
                 } else {
-                    wrapped.into_iter().map(StyledText::plain).collect::<Vec<_>>()
+                    wrapped
+                        .into_iter()
+                        .map(StyledText::plain)
+                        .collect::<Vec<_>>()
                 }
             })
             .collect();
@@ -13498,7 +14045,11 @@ impl CoordApp {
             self.pending_test_fail = None;
         } else if self.pending_force_merge.is_some() {
             self.pending_force_merge = None;
-            self.push_toast("Force-merge cancelled", "CI gate stays in place", ToastSeverity::Info);
+            self.push_toast(
+                "Force-merge cancelled",
+                "CI gate stays in place",
+                ToastSeverity::Info,
+            );
         } else if self.pending_restart.is_some() {
             self.pending_restart = None;
         } else if self.pending_purge.is_some() {
@@ -13567,7 +14118,11 @@ impl CoordApp {
                 "submit" => {
                     let description = self.pending_report_fix.take().unwrap_or_default();
                     let description = description.trim().to_string();
-                    let reason_opt = if description.is_empty() { None } else { Some(description.as_str()) };
+                    let reason_opt = if description.is_empty() {
+                        None
+                    } else {
+                        Some(description.as_str())
+                    };
                     if self.record_test_verdict("failed", reason_opt) {
                         if let Some(work_id) = self.pipeline_selected_work_id() {
                             let args: Vec<String> = if description.is_empty() {
@@ -13625,7 +14180,11 @@ impl CoordApp {
                         .as_ref()
                         .map(|(_, b)| b.trim().to_string())
                         .unwrap_or_default();
-                    let reason_opt = if reason.is_empty() { None } else { Some(reason.as_str()) };
+                    let reason_opt = if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason.as_str())
+                    };
                     self.record_test_verdict("failed", reason_opt);
                     self.pending_test_fail = None;
                 }
@@ -13657,12 +14216,19 @@ impl CoordApp {
                         SpawnQueuedOutcome::Started => {
                             self.push_toast(
                                 "Force-merge dispatched",
-                                &format!("coord merge --force-merge{} — CI gate bypassed", scope_str),
+                                &format!(
+                                    "coord merge --force-merge{} — CI gate bypassed",
+                                    scope_str
+                                ),
                                 ToastSeverity::Warning,
                             );
                         }
                         SpawnQueuedOutcome::Queued => {
-                            self.push_toast("⏳ Queued", "force-merge runs after current command", ToastSeverity::Info);
+                            self.push_toast(
+                                "⏳ Queued",
+                                "force-merge runs after current command",
+                                ToastSeverity::Info,
+                            );
                         }
                         SpawnQueuedOutcome::Deduped => {}
                     }
@@ -13670,7 +14236,11 @@ impl CoordApp {
                 }
                 _ => {
                     self.pending_force_merge = None;
-                    self.push_toast("Force-merge cancelled", "CI gate stays in place", ToastSeverity::Info);
+                    self.push_toast(
+                        "Force-merge cancelled",
+                        "CI gate stays in place",
+                        ToastSeverity::Info,
+                    );
                 }
             }
             *self.dialog_layout.borrow_mut() = None;
@@ -13682,9 +14252,18 @@ impl CoordApp {
             match id {
                 "yes" => {
                     use crate::commands::SpawnQueuedOutcome;
-                    match self.command_runner.spawn_queued(&["agent", "restart", "--machine", &name]) {
+                    match self.command_runner.spawn_queued(&[
+                        "agent",
+                        "restart",
+                        "--machine",
+                        &name,
+                    ]) {
                         SpawnQueuedOutcome::Queued => {
-                            self.push_toast("⏳ Queued", "agent restart runs after current command", ToastSeverity::Info);
+                            self.push_toast(
+                                "⏳ Queued",
+                                "agent restart runs after current command",
+                                ToastSeverity::Info,
+                            );
                         }
                         SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
                     }
@@ -13706,16 +14285,18 @@ impl CoordApp {
                     match purge_done_assignments_db(secs) {
                         Ok((a, i)) => self.push_toast(
                             "Purge complete",
-                            &format!("Removed {} assignment{} + {} closed issue{}",
-                                a, if a == 1 { "" } else { "s" },
-                                i, if i == 1 { "" } else { "s" }),
+                            &format!(
+                                "Removed {} assignment{} + {} closed issue{}",
+                                a,
+                                if a == 1 { "" } else { "s" },
+                                i,
+                                if i == 1 { "" } else { "s" }
+                            ),
                             ToastSeverity::Info,
                         ),
-                        Err(e) => self.push_toast(
-                            "Purge failed",
-                            &format!("{}", e),
-                            ToastSeverity::Error,
-                        ),
+                        Err(e) => {
+                            self.push_toast("Purge failed", &format!("{}", e), ToastSeverity::Error)
+                        }
                     }
                     self.pending_purge = None;
                     self.refresh();
@@ -13764,8 +14345,11 @@ impl CoordApp {
             assignment_id: aid,
             then_dispatch,
         });
-        let action = if then_dispatch { "stopping worker, then marking ready + dispatching…" }
-                     else { "stopping worker, then marking ready…" };
+        let action = if then_dispatch {
+            "stopping worker, then marking ready + dispatching…"
+        } else {
+            "stopping worker, then marking ready…"
+        };
         self.push_toast(
             "Refine with chat",
             &format!("#{}: {}", issue_n, action),
@@ -13780,7 +14364,11 @@ impl CoordApp {
         self.refine_then_dispatch = false;
         if let Some(id) = self.watch_focused.clone() {
             self.command_runner.spawn_queued(&["stop", &id]);
-            let issue_n = self.watch_pool.get(&id).map(|c| c.state.issue_number).unwrap_or(0);
+            let issue_n = self
+                .watch_pool
+                .get(&id)
+                .map(|c| c.state.issue_number)
+                .unwrap_or(0);
             if issue_n != 0 {
                 self.push_toast(
                     "Refine cancelled",
@@ -13822,7 +14410,10 @@ impl CoordApp {
         // Resolve coord-local repo name → GitHub `owner/name` slug.  The
         // pipeline_repos map is the same one the merge-queue uses for
         // `gh pr` calls, so the slug is authoritative.
-        let repo_github = match self.data.pipeline_repos.iter()
+        let repo_github = match self
+            .data
+            .pipeline_repos
+            .iter()
             .find(|(coord, _)| coord == &repo_coord)
             .map(|(_, slug)| slug.clone())
         {
@@ -13842,7 +14433,9 @@ impl CoordApp {
         // Snapshot the SSE baseline BEFORE submit_inject runs.  Without
         // this, the assistant's reply lines couldn't be distinguished from
         // earlier turns.
-        let baseline_sse_lines = self.watch_pool.get(&aid)
+        let baseline_sse_lines = self
+            .watch_pool
+            .get(&aid)
             .map(|c| c.sse.lines.len())
             .unwrap_or(0);
         let today = today_yyyy_mm_dd();
@@ -13953,7 +14546,9 @@ impl CoordApp {
     ) -> bool {
         // `posting` lockout is read first so we don't accidentally
         // mutate the body while gh is in flight.
-        let posting = self.refinement_notes_modal.as_ref()
+        let posting = self
+            .refinement_notes_modal
+            .as_ref()
             .map(|m| m.posting)
             .unwrap_or(false);
         if posting {
@@ -14016,7 +14611,9 @@ impl CoordApp {
         self.refinement_notes_post_rx = Some(rx);
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new("gh");
-            cmd.arg("issue").arg("comment").arg(issue_number.to_string());
+            cmd.arg("issue")
+                .arg("comment")
+                .arg(issue_number.to_string());
             cmd.arg("--repo").arg(&repo_github);
             cmd.arg("--body").arg(&body);
             let out = cmd
@@ -14027,9 +14624,10 @@ impl CoordApp {
             let result = match out {
                 Ok(o) => RefinementNotesPostResult {
                     success: o.status.success(),
-                    stderr_first_line: first_meaningful_stderr_line(
-                        &String::from_utf8_lossy(&o.stderr),
-                    ).unwrap_or_default(),
+                    stderr_first_line: first_meaningful_stderr_line(&String::from_utf8_lossy(
+                        &o.stderr,
+                    ))
+                    .unwrap_or_default(),
                     issue_number,
                 },
                 Err(e) => RefinementNotesPostResult {
@@ -14110,25 +14708,29 @@ impl CoordApp {
         };
         // Centre the box at 80% of the viewport, clamped so it stays
         // sensible on a wide panel and doesn't disappear on a narrow one.
-        let width = (viewport.width * 0.8).clamp(40.0, 120.0).min(viewport.width.max(20.0));
+        let width = (viewport.width * 0.8)
+            .clamp(40.0, 120.0)
+            .min(viewport.width.max(20.0));
         let height = (viewport.height * 0.8).clamp(10.0, viewport.height.max(10.0));
         let x = viewport.x + ((viewport.width - width) / 2.0).max(0.0);
         let y = viewport.y + ((viewport.height - height) / 2.0).max(0.0);
         let modal_rect = Rect::new(x, y, width, height);
 
-        let mut items: Vec<ListItem> = modal.body.split('\n').map(|line| ListItem {
-            text: StyledText::plain(line.to_string()),
-            icon: None,
-            detail: None,
-            decoration: Decoration::default(),
-        }).collect();
+        let mut items: Vec<ListItem> = modal
+            .body
+            .split('\n')
+            .map(|line| ListItem {
+                text: StyledText::plain(line.to_string()),
+                icon: None,
+                detail: None,
+                decoration: Decoration::default(),
+            })
+            .collect();
         // Append a visible caret on the last line so the user can see
         // where their next char will land.  Hidden while posting.
         if !modal.posting {
             if let Some(last) = items.last_mut() {
-                let plain: String = last.text.spans.iter()
-                    .map(|s| s.text.as_str())
-                    .collect();
+                let plain: String = last.text.spans.iter().map(|s| s.text.as_str()).collect();
                 last.text = StyledText::plain(format!("{}_", plain));
             }
         }
@@ -14151,10 +14753,7 @@ impl CoordApp {
             decoration: Decoration::default(),
         });
 
-        let title = StyledText::plain(format!(
-            " Refinement notes → #{} ",
-            modal.issue_number,
-        ));
+        let title = StyledText::plain(format!(" Refinement notes → #{} ", modal.issue_number,));
         let list = ListView {
             id: WidgetId::new("refinement-notes-modal"),
             title: Some(title),
@@ -14190,7 +14789,9 @@ impl CoordApp {
         };
         let num_str = num.to_string();
         use crate::commands::SpawnQueuedOutcome;
-        let outcome = self.command_runner.spawn_queued(&["refine-chat", &repo, &num_str]);
+        let outcome = self
+            .command_runner
+            .spawn_queued(&["refine-chat", &repo, &num_str]);
         if outcome == SpawnQueuedOutcome::Deduped {
             return false;
         }
@@ -14204,7 +14805,10 @@ impl CoordApp {
             dispatched_at: Instant::now(),
         });
         let msg = if outcome == SpawnQueuedOutcome::Queued {
-            format!("#{}: refine-chat queued — will start after current command.", num)
+            format!(
+                "#{}: refine-chat queued — will start after current command.",
+                num
+            )
         } else {
             format!("#{}: starting refinement chat…", num)
         };
@@ -14240,14 +14844,22 @@ impl CoordApp {
         }
         // Find the matching assignment.  Prefer the newest dispatched
         // one in case there were prior aborted attempts on the same issue.
-        let pick = self.data.assignments.iter()
+        let pick = self
+            .data
+            .assignments
+            .iter()
             .filter(|a| a.issue_number == pending.issue_number)
             .filter(|a| a.assignment_type.as_deref() == Some("refinement"))
             .filter(|a| a.status == "running")
-            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
-                .unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .cloned();
-        let Some(asg) = pick else { return false; };
+        let Some(asg) = pick else {
+            return false;
+        };
 
         // Add to watch_pool (if not already), focus it, open chat.  Reuses
         // the worker-guidance overlay shape — refinement is a chat too.
@@ -14258,7 +14870,10 @@ impl CoordApp {
                 machine: asg.machine.clone(),
                 repo: asg.repo.clone(),
                 issue_number: asg.issue_number,
-                assignment_type: asg.assignment_type.clone().unwrap_or_else(|| "refinement".to_string()),
+                assignment_type: asg
+                    .assignment_type
+                    .clone()
+                    .unwrap_or_else(|| "refinement".to_string()),
                 scroll: usize::MAX,
             };
             let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
@@ -14283,21 +14898,26 @@ impl CoordApp {
                 make_local_sse_state(&aid)
             };
             if self.watch_pool.len() >= WATCH_POOL_CAP {
-                let lru_id = self.watch_pool.iter()
+                let lru_id = self
+                    .watch_pool
+                    .iter()
                     .min_by_key(|(_, ctx)| ctx.last_focused_at)
                     .map(|(id, _)| id.clone());
                 if let Some(id) = lru_id {
                     self.watch_pool.remove(&id);
                 }
             }
-            self.watch_pool.insert(aid.clone(), WatchContext {
-                state,
-                sse,
-                inject_transcript: Vec::new(),
-                inject_sse_offsets: Vec::new(),
-                history_turns: Vec::new(),
-                last_focused_at: Instant::now(),
-            });
+            self.watch_pool.insert(
+                aid.clone(),
+                WatchContext {
+                    state,
+                    sse,
+                    inject_transcript: Vec::new(),
+                    inject_sse_offsets: Vec::new(),
+                    history_turns: Vec::new(),
+                    last_focused_at: Instant::now(),
+                },
+            );
         }
         self.watch_focused = Some(aid.clone());
         // Open the inject_chat overlay so the user can type immediately.
@@ -14315,7 +14935,9 @@ impl CoordApp {
         // for the row before the tab shows the chat.
         self.active_view = SidebarView::Pipeline;
         self.pipeline_detail_tab = PipelineDetailTab::Refinement;
-        if let Some(idx) = self.pipeline_issues.iter()
+        if let Some(idx) = self
+            .pipeline_issues
+            .iter()
             .position(|i| i.number == pending.issue_number)
         {
             self.pipeline_sel = Some(idx);
@@ -14401,15 +15023,23 @@ impl CoordApp {
             );
             return true;
         }
-        let pick = self.data.assignments.iter()
+        let pick = self
+            .data
+            .assignments
+            .iter()
             .filter(|a| a.issue_number == 0)
             .filter(|a| a.repo == pending.repo)
             .filter(|a| a.assignment_type.as_deref() == Some(&*pending.assignment_type))
             .filter(|a| a.status == "running")
-            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
-                .unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .cloned();
-        let Some(asg) = pick else { return false; };
+        let Some(asg) = pick else {
+            return false;
+        };
 
         let aid = asg.id.clone();
         if !self.watch_pool.contains_key(&aid) {
@@ -14418,7 +15048,9 @@ impl CoordApp {
                 machine: asg.machine.clone(),
                 repo: asg.repo.clone(),
                 issue_number: 0,
-                assignment_type: asg.assignment_type.clone()
+                assignment_type: asg
+                    .assignment_type
+                    .clone()
                     .unwrap_or_else(|| pending.assignment_type.clone()),
                 scroll: usize::MAX,
             };
@@ -14444,21 +15076,26 @@ impl CoordApp {
                 make_local_sse_state(&aid)
             };
             if self.watch_pool.len() >= WATCH_POOL_CAP {
-                let lru_id = self.watch_pool.iter()
+                let lru_id = self
+                    .watch_pool
+                    .iter()
                     .min_by_key(|(_, ctx)| ctx.last_focused_at)
                     .map(|(id, _)| id.clone());
                 if let Some(id) = lru_id {
                     self.watch_pool.remove(&id);
                 }
             }
-            self.watch_pool.insert(aid.clone(), WatchContext {
-                state,
-                sse,
-                inject_transcript: Vec::new(),
-                inject_sse_offsets: Vec::new(),
-                history_turns: Vec::new(),
-                last_focused_at: Instant::now(),
-            });
+            self.watch_pool.insert(
+                aid.clone(),
+                WatchContext {
+                    state,
+                    sse,
+                    inject_transcript: Vec::new(),
+                    inject_sse_offsets: Vec::new(),
+                    history_turns: Vec::new(),
+                    last_focused_at: Instant::now(),
+                },
+            );
         }
         self.watch_focused = Some(aid.clone());
 
@@ -14485,7 +15122,11 @@ impl CoordApp {
         self.board_detail_tab = BoardDetailTab::Chat;
 
         self.pending_board_chat = None;
-        let label = if is_new_issue { "New issue chat" } else { "Board refinement" };
+        let label = if is_new_issue {
+            "New issue chat"
+        } else {
+            "Board refinement"
+        };
         self.push_toast(
             label,
             &format!("{}: chat ready — type to start.", pending.repo),
@@ -14509,7 +15150,10 @@ impl CoordApp {
             return false;
         };
         // Resolve the issue number and repo for the pending state.
-        let (issue_number, repo) = self.data.assignments.iter()
+        let (issue_number, repo) = self
+            .data
+            .assignments
+            .iter()
             .find(|a| a.id == work_id)
             .map(|a| (a.issue_number, a.repo.clone()))
             .unwrap_or((0, String::new()));
@@ -14527,7 +15171,10 @@ impl CoordApp {
             dispatched_at: Instant::now(),
         });
         let msg = if outcome == SpawnQueuedOutcome::Queued {
-            format!("#{}: test-chat queued — will start after current command.", issue_number)
+            format!(
+                "#{}: test-chat queued — will start after current command.",
+                issue_number
+            )
         } else {
             format!("#{}: starting test chat…", issue_number)
         };
@@ -14560,14 +15207,22 @@ impl CoordApp {
             return true;
         }
         // Find the matching assignment — newest running test-chat for this issue.
-        let pick = self.data.assignments.iter()
+        let pick = self
+            .data
+            .assignments
+            .iter()
             .filter(|a| a.issue_number == pending.issue_number)
             .filter(|a| a.assignment_type.as_deref() == Some("test-chat"))
             .filter(|a| a.status == "running")
-            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
-                .unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .cloned();
-        let Some(asg) = pick else { return false; };
+        let Some(asg) = pick else {
+            return false;
+        };
 
         let aid = asg.id.clone();
         if !self.watch_pool.contains_key(&aid) {
@@ -14576,7 +15231,10 @@ impl CoordApp {
                 machine: asg.machine.clone(),
                 repo: asg.repo.clone(),
                 issue_number: asg.issue_number,
-                assignment_type: asg.assignment_type.clone().unwrap_or_else(|| "test-chat".to_string()),
+                assignment_type: asg
+                    .assignment_type
+                    .clone()
+                    .unwrap_or_else(|| "test-chat".to_string()),
                 scroll: usize::MAX,
             };
             let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
@@ -14601,21 +15259,26 @@ impl CoordApp {
                 make_local_sse_state(&aid)
             };
             if self.watch_pool.len() >= WATCH_POOL_CAP {
-                let lru_id = self.watch_pool.iter()
+                let lru_id = self
+                    .watch_pool
+                    .iter()
                     .min_by_key(|(_, ctx)| ctx.last_focused_at)
                     .map(|(id, _)| id.clone());
                 if let Some(id) = lru_id {
                     self.watch_pool.remove(&id);
                 }
             }
-            self.watch_pool.insert(aid.clone(), WatchContext {
-                state,
-                sse,
-                inject_transcript: Vec::new(),
-                inject_sse_offsets: Vec::new(),
-                history_turns: Vec::new(),
-                last_focused_at: Instant::now(),
-            });
+            self.watch_pool.insert(
+                aid.clone(),
+                WatchContext {
+                    state,
+                    sse,
+                    inject_transcript: Vec::new(),
+                    inject_sse_offsets: Vec::new(),
+                    history_turns: Vec::new(),
+                    last_focused_at: Instant::now(),
+                },
+            );
         }
         self.watch_focused = Some(aid.clone());
         // Open the inject_chat overlay.
@@ -14629,7 +15292,9 @@ impl CoordApp {
         // Switch to the Refinement tab (the chat tab) on the Pipeline view.
         self.active_view = SidebarView::Pipeline;
         self.pipeline_detail_tab = PipelineDetailTab::Refinement;
-        if let Some(idx) = self.pipeline_issues.iter()
+        if let Some(idx) = self
+            .pipeline_issues
+            .iter()
             .position(|i| i.number == pending.issue_number)
         {
             self.pipeline_sel = Some(idx);
@@ -14676,12 +15341,16 @@ impl CoordApp {
             );
             return;
         };
-        let repo_github = self.watch_focused.as_ref()
+        let repo_github = self
+            .watch_focused
+            .as_ref()
             .and_then(|id| self.watch_pool.get(id))
             .map(|ctx| {
                 let repo = ctx.state.repo.clone();
                 // Look up the GitHub slug from the pipeline_repos map.
-                self.data.pipeline_repos.iter()
+                self.data
+                    .pipeline_repos
+                    .iter()
                     .find(|(name, _)| *name == repo)
                     .map(|(_, slug)| slug.clone())
                     .unwrap_or(repo)
@@ -14714,17 +15383,23 @@ impl CoordApp {
 
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new("gh");
-            cmd.args(["issue", "create",
-                "--repo", &repo_github,
-                "--title", &title,
-                "--body", &body,
+            cmd.args([
+                "issue",
+                "create",
+                "--repo",
+                &repo_github,
+                "--title",
+                &title,
+                "--body",
+                &body,
             ]);
             match cmd.output() {
                 Ok(out) => {
                     let success = out.status.success();
                     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    let first_err = stderr.lines()
+                    let first_err = stderr
+                        .lines()
                         .find(|l| !l.is_empty())
                         .unwrap_or("")
                         .to_string();
@@ -14747,7 +15422,9 @@ impl CoordApp {
 
     /// #316 Phase B: drain the file-issue post receiver.  Called each tick.
     fn poll_file_issue_post(&mut self) -> bool {
-        let Some(rx) = &self.file_issue_post_rx else { return false; };
+        let Some(rx) = &self.file_issue_post_rx else {
+            return false;
+        };
         match rx.try_recv() {
             Ok(result) => {
                 self.file_issue_post_rx = None;
@@ -14795,29 +15472,42 @@ impl CoordApp {
     /// #316 Phase B: render the file-issue edit modal as an overlay over the
     /// Board Chat tab content area.
     fn render_file_issue_modal(&self, backend: &mut dyn Backend, content_rect: Rect) {
-        let Some(modal) = &self.file_issue_modal else { return; };
+        let Some(modal) = &self.file_issue_modal else {
+            return;
+        };
         let lh = backend.line_height();
 
         // Modal background (reuse the refinement-notes-modal pattern).
         let modal_rect = shrink_rect(content_rect, lh * 2.0);
-        backend.draw_list(modal_rect, &ListView {
-            id: WidgetId::new("file-issue-modal-bg"),
-            title: None,
-            items: Vec::new(),
-            selected_idx: 0,
-            scroll_offset: 0,
-            has_focus: true,
-            bordered: true,
-            h_scroll: 0,
-            max_content_width: None,
-        });
+        backend.draw_list(
+            modal_rect,
+            &ListView {
+                id: WidgetId::new("file-issue-modal-bg"),
+                title: None,
+                items: Vec::new(),
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: true,
+                bordered: true,
+                h_scroll: 0,
+                max_content_width: None,
+            },
+        );
 
         let inner = shrink_rect(modal_rect, lh * 0.5);
         let mut items: Vec<ListItem> = Vec::new();
 
-        items.push(kv_item("", "  File New GitHub Issue", Some(Color::rgb(100, 200, 255))));
+        items.push(kv_item(
+            "",
+            "  File New GitHub Issue",
+            Some(Color::rgb(100, 200, 255)),
+        ));
         items.push(kv_item("", "", None));
-        items.push(kv_item("", &format!("  Repo: {}", modal.repo_github), Some(Color::rgb(140, 180, 140))));
+        items.push(kv_item(
+            "",
+            &format!("  Repo: {}", modal.repo_github),
+            Some(Color::rgb(140, 180, 140)),
+        ));
         items.push(kv_item("", "", None));
         items.push(kv_item("", "  TITLE ▸", Some(Color::rgb(200, 200, 100))));
         items.push(kv_item("", &format!("  {}", modal.title), None));
@@ -14834,20 +15524,27 @@ impl CoordApp {
         if modal.submitting {
             items.push(kv_item("", "  Submitting…", Some(Color::rgb(200, 180, 60))));
         } else {
-            items.push(kv_item("", "  Ctrl+Y — file issue  ·  Esc — cancel", Some(Color::rgb(140, 140, 160))));
+            items.push(kv_item(
+                "",
+                "  Ctrl+Y — file issue  ·  Esc — cancel",
+                Some(Color::rgb(140, 140, 160)),
+            ));
         }
 
-        backend.draw_list(inner, &ListView {
-            id: WidgetId::new("file-issue-modal"),
-            title: None,
-            items,
-            selected_idx: 0,
-            scroll_offset: 0,
-            has_focus: true,
-            bordered: false,
-            h_scroll: 0,
-            max_content_width: None,
-        });
+        backend.draw_list(
+            inner,
+            &ListView {
+                id: WidgetId::new("file-issue-modal"),
+                title: None,
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: true,
+                bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
+            },
+        );
     }
 
     /// #316 Phase A: render the Board Chat tab content.
@@ -14857,17 +15554,20 @@ impl CoordApp {
         let lh = backend.line_height();
         if self.chat_is_board_chat() {
             // Draw an opaque backing so the empty transcript area doesn't bleed through.
-            backend.draw_list(content_rect, &ListView {
-                id: WidgetId::new("board-chat-tab-bg"),
-                title: None,
-                items: Vec::new(),
-                selected_idx: 0,
-                scroll_offset: 0,
-                has_focus: false,
-                bordered: true,
-                h_scroll: 0,
-                max_content_width: None,
-            });
+            backend.draw_list(
+                content_rect,
+                &ListView {
+                    id: WidgetId::new("board-chat-tab-bg"),
+                    title: None,
+                    items: Vec::new(),
+                    selected_idx: 0,
+                    scroll_offset: 0,
+                    has_focus: false,
+                    bordered: true,
+                    h_scroll: 0,
+                    max_content_width: None,
+                },
+            );
             if let Some(ref chat) = self.inject_chat {
                 chat.render(backend, content_rect);
             }
@@ -14895,7 +15595,8 @@ impl CoordApp {
                         key_hint: Some("r".to_string()),
                         enabled: repo_known,
                         is_active: false,
-                        tooltip: "Start a board-level refinement chat for the selected repo".to_string(),
+                        tooltip: "Start a board-level refinement chat for the selected repo"
+                            .to_string(),
                     },
                     ToolbarButton::Action {
                         id: WidgetId::new("board-chat:new-issue"),
@@ -14915,27 +15616,54 @@ impl CoordApp {
             let mut items: Vec<ListItem> = Vec::new();
             items.push(kv_item("", "", None));
             if let Some(r) = repo {
-                items.push(kv_item("", &format!("  Repo: {}", r), Some(Color::rgb(140, 180, 140))));
+                items.push(kv_item(
+                    "",
+                    &format!("  Repo: {}", r),
+                    Some(Color::rgb(140, 180, 140)),
+                ));
             } else {
-                items.push(kv_item("", "  Select a repo in the sidebar first.", Some(Color::rgb(200, 140, 60))));
+                items.push(kv_item(
+                    "",
+                    "  Select a repo in the sidebar first.",
+                    Some(Color::rgb(200, 140, 60)),
+                ));
             }
             items.push(kv_item("", "", None));
-            items.push(kv_item("", "  Refine — explore ideas or discuss the codebase without", Some(Color::rgb(140, 140, 160))));
-            items.push(kv_item("", "  being tied to a specific issue.", Some(Color::rgb(140, 140, 160))));
+            items.push(kv_item(
+                "",
+                "  Refine — explore ideas or discuss the codebase without",
+                Some(Color::rgb(140, 140, 160)),
+            ));
+            items.push(kv_item(
+                "",
+                "  being tied to a specific issue.",
+                Some(Color::rgb(140, 140, 160)),
+            ));
             items.push(kv_item("", "", None));
-            items.push(kv_item("", "  New Issue — chat with an AI to draft a well-structured", Some(Color::rgb(140, 140, 160))));
-            items.push(kv_item("", "  issue body.  Press f when done to file it on GitHub.", Some(Color::rgb(140, 140, 160))));
-            backend.draw_list(text_rect, &ListView {
-                id: WidgetId::new("board-chat-empty"),
-                title: None,
-                items,
-                selected_idx: 0,
-                scroll_offset: 0,
-                has_focus: false,
-                bordered: false,
-                h_scroll: 0,
-                max_content_width: None,
-            });
+            items.push(kv_item(
+                "",
+                "  New Issue — chat with an AI to draft a well-structured",
+                Some(Color::rgb(140, 140, 160)),
+            ));
+            items.push(kv_item(
+                "",
+                "  issue body.  Press f when done to file it on GitHub.",
+                Some(Color::rgb(140, 140, 160)),
+            ));
+            backend.draw_list(
+                text_rect,
+                &ListView {
+                    id: WidgetId::new("board-chat-empty"),
+                    title: None,
+                    items,
+                    selected_idx: 0,
+                    scroll_offset: 0,
+                    has_focus: false,
+                    bordered: false,
+                    h_scroll: 0,
+                    max_content_width: None,
+                },
+            );
         }
     }
 
@@ -14982,18 +15710,32 @@ impl CoordApp {
         // than hardcoding "refinement" so that test-chat and new-issue-chat
         // continuations also rebind correctly.
         let dispatch_floor = pending.arm_unix_secs - 5.0;
-        let matching: Vec<_> = self.data.assignments.iter()
+        let matching: Vec<_> = self
+            .data
+            .assignments
+            .iter()
             .filter(|a| a.issue_number == pending.issue_number)
             .filter(|a| a.assignment_type == pending.old_type)
             .filter(|a| a.id != pending.old_assignment_id)
-            .filter(|a| a.dispatched_at.map(|d| d >= dispatch_floor).unwrap_or(false))
+            .filter(|a| {
+                a.dispatched_at
+                    .map(|d| d >= dispatch_floor)
+                    .unwrap_or(false)
+            })
             .collect();
-        let pick = matching.iter().copied()
+        let pick = matching
+            .iter()
+            .copied()
             .filter(|a| a.status == "running" || a.status == "done")
-            .max_by(|a, b| a.dispatched_at.partial_cmp(&b.dispatched_at)
-                .unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .cloned();
-        let Some(asg) = pick else { return false; };
+        let Some(asg) = pick else {
+            return false;
+        };
         let new_aid = asg.id.clone();
 
         // Capture the *full* chat history (user + assistant turns) from the
@@ -15004,14 +15746,15 @@ impl CoordApp {
         // user's turns survived rebind and the assistant's prior replies
         // visibly vanished — what the user reported as "blew away the
         // previous messages".
-        let history_turns: Vec<ChatTurn> = if let Some(old_ctx) = self.watch_pool.get(&pending.old_assignment_id) {
-            chat_transcript_from_pool(old_ctx)
-                .into_iter()
-                .filter(|t| !matches!(t.role, ChatRole::System))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let history_turns: Vec<ChatTurn> =
+            if let Some(old_ctx) = self.watch_pool.get(&pending.old_assignment_id) {
+                chat_transcript_from_pool(old_ctx)
+                    .into_iter()
+                    .filter(|t| !matches!(t.role, ChatRole::System))
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         // Build the new WatchContext for the new assignment (mirrors
         // maybe_bind_pending_refinement, but the overlay stays open).
@@ -15021,7 +15764,10 @@ impl CoordApp {
                 machine: asg.machine.clone(),
                 repo: asg.repo.clone(),
                 issue_number: asg.issue_number,
-                assignment_type: asg.assignment_type.clone().unwrap_or_else(|| "refinement".to_string()),
+                assignment_type: asg
+                    .assignment_type
+                    .clone()
+                    .unwrap_or_else(|| "refinement".to_string()),
                 scroll: usize::MAX,
             };
             let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
@@ -15046,25 +15792,30 @@ impl CoordApp {
                 make_local_sse_state(&new_aid)
             };
             if self.watch_pool.len() >= WATCH_POOL_CAP {
-                let lru_id = self.watch_pool.iter()
+                let lru_id = self
+                    .watch_pool
+                    .iter()
                     .min_by_key(|(_, ctx)| ctx.last_focused_at)
                     .map(|(id, _)| id.clone());
                 if let Some(id) = lru_id {
                     self.watch_pool.remove(&id);
                 }
             }
-            self.watch_pool.insert(new_aid.clone(), WatchContext {
-                state,
-                sse,
-                // inject_transcript / inject_sse_offsets are for NEW turns
-                // submitted in this worker's window; prior turns live in
-                // history_turns (already-rendered ChatTurns) so they survive
-                // every subsequent rebind without re-walking offsets.
-                inject_transcript: Vec::new(),
-                inject_sse_offsets: Vec::new(),
-                history_turns,
-                last_focused_at: Instant::now(),
-            });
+            self.watch_pool.insert(
+                new_aid.clone(),
+                WatchContext {
+                    state,
+                    sse,
+                    // inject_transcript / inject_sse_offsets are for NEW turns
+                    // submitted in this worker's window; prior turns live in
+                    // history_turns (already-rendered ChatTurns) so they survive
+                    // every subsequent rebind without re-walking offsets.
+                    inject_transcript: Vec::new(),
+                    inject_sse_offsets: Vec::new(),
+                    history_turns,
+                    last_focused_at: Instant::now(),
+                },
+            );
         }
         // Rebind the overlay to the new assignment.
         self.watch_focused = Some(new_aid.clone());
@@ -15103,7 +15854,9 @@ impl CoordApp {
         };
         let num_str = num.to_string();
         use crate::commands::SpawnQueuedOutcome;
-        let outcome = self.command_runner.spawn_queued(&[subcommand, &repo, &num_str]);
+        let outcome = self
+            .command_runner
+            .spawn_queued(&[subcommand, &repo, &num_str]);
         match outcome {
             SpawnQueuedOutcome::Deduped => {}
             SpawnQueuedOutcome::Queued => {
@@ -15143,7 +15896,10 @@ impl CoordApp {
         let Some(machine) = self.best_machine_for(&repo).cloned() else {
             self.push_toast(
                 "Send",
-                &format!("#{}: no reachable machine for {} — check coordinator.yml.", num, repo),
+                &format!(
+                    "#{}: no reachable machine for {} — check coordinator.yml.",
+                    num, repo
+                ),
                 ToastSeverity::Warning,
             );
             return false;
@@ -15181,11 +15937,18 @@ impl CoordApp {
                 self.maybe_kick_pipeline_loader();
             }
             SpawnQueuedOutcome::Queued => {
-                self.push_toast("⏳ Queued", "assign runs after current command", ToastSeverity::Info);
+                self.push_toast(
+                    "⏳ Queued",
+                    "assign runs after current command",
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Deduped => {}
         }
-        matches!(outcome, SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued)
+        matches!(
+            outcome,
+            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+        )
     }
 
     /// Route a context-menu `action_id` to the right behaviour.
@@ -15236,16 +15999,27 @@ impl CoordApp {
                     ContextMenuTarget::MachineRow { name, .. } => name.clone(),
                     _ => return false,
                 };
-                let cmd = if action_id == "machine-pause" { "pause" } else { "unpause" };
+                let cmd = if action_id == "machine-pause" {
+                    "pause"
+                } else {
+                    "unpause"
+                };
                 use crate::commands::SpawnQueuedOutcome;
                 let outcome = self.command_runner.spawn_queued(&[cmd, &name]);
                 match outcome {
                     SpawnQueuedOutcome::Deduped => return false,
                     SpawnQueuedOutcome::Queued => {
-                        let verb = if action_id == "machine-pause" { "pause" } else { "resume" };
+                        let verb = if action_id == "machine-pause" {
+                            "pause"
+                        } else {
+                            "resume"
+                        };
                         self.push_toast(
                             "Machine routing",
-                            &format!("{}: {} queued — will run after current command.", name, verb),
+                            &format!(
+                                "{}: {} queued — will run after current command.",
+                                name, verb
+                            ),
                             ToastSeverity::Info,
                         );
                     }
@@ -15258,7 +16032,11 @@ impl CoordApp {
                         } else {
                             self.paused_machines.remove(&name);
                         }
-                        let verb = if action_id == "machine-pause" { "paused" } else { "resumed" };
+                        let verb = if action_id == "machine-pause" {
+                            "paused"
+                        } else {
+                            "resumed"
+                        };
                         self.push_toast(
                             "Machine routing",
                             &format!("{}: {}", name, verb),
@@ -15451,7 +16229,9 @@ fn hit_tab_index_from_labels(labels: &[&str], origin_x: f32, click_x: f32) -> Op
 /// context-menu viewport so a menu anchored in the sidebar can extend
 /// rightward into the main panel without being clipped.
 fn union_rects(a: Option<Rect>, b: Rect) -> Rect {
-    let Some(a) = a else { return b; };
+    let Some(a) = a else {
+        return b;
+    };
     let x = a.x.min(b.x);
     let y = a.y.min(b.y);
     let right = (a.x + a.width).max(b.x + b.width);
@@ -15490,10 +16270,7 @@ fn build_quadraui_context_menu(state: &ContextMenuState) -> ContextMenu {
                 QuiContextMenuItem {
                     id: it.action_id.as_ref().map(WidgetId::new),
                     label: StyledText::plain(it.label.clone()),
-                    detail: it
-                        .shortcut
-                        .as_ref()
-                        .map(|s| StyledText::plain(s.clone())),
+                    detail: it.shortcut.as_ref().map(|s| StyledText::plain(s.clone())),
                     disabled: it.disabled,
                     ..Default::default()
                 }
@@ -15572,12 +16349,15 @@ impl CoordApp {
         // selected — the caller renders nothing in that case.
         let target = self.target_for_selected_sidebar_row()?;
         let menu_items = match &target {
-            ContextMenuTarget::BoardRow { issue_number, lifecycle, .. } => {
-                self.context_menu_items_for_board_row(*issue_number, lifecycle)
-            }
-            ContextMenuTarget::PipelineRow { issue_number, lifecycle } => {
-                self.context_menu_items_for_pipeline_row(*issue_number, lifecycle)
-            }
+            ContextMenuTarget::BoardRow {
+                issue_number,
+                lifecycle,
+                ..
+            } => self.context_menu_items_for_board_row(*issue_number, lifecycle),
+            ContextMenuTarget::PipelineRow {
+                issue_number,
+                lifecycle,
+            } => self.context_menu_items_for_pipeline_row(*issue_number, lifecycle),
             ContextMenuTarget::MachineRow { name, is_paused } => {
                 self.context_menu_items_for_machine_row(name, *is_paused)
             }
@@ -15798,9 +16578,7 @@ impl CoordApp {
             SidebarView::Pipeline
             | SidebarView::Machines
             | SidebarView::Settings
-            | SidebarView::Terminal => {
-                return None
-            }
+            | SidebarView::Terminal => return None,
         };
 
         Some(Toolbar {
@@ -15817,12 +16595,7 @@ impl CoordApp {
     /// the click to the panel body.  `shrunken_main_b` is `main_b` with
     /// the toolbar row carved off the top, ready for downstream tab-bar
     /// hit-tests (whose math expects `pos.y - main_b.y < tab_h`).
-    fn hit_test_panel_toolbar(
-        &mut self,
-        pos: Point,
-        main_b: Rect,
-        lh: f32,
-    ) -> (Rect, bool) {
+    fn hit_test_panel_toolbar(&mut self, pos: Point, main_b: Rect, lh: f32) -> (Rect, bool) {
         let Some(toolbar) = self.panel_toolbar() else {
             return (main_b, false);
         };
@@ -15848,9 +16621,7 @@ impl CoordApp {
             SidebarPanelHit::ToolbarEmpty => (content_rect, true),
             // Click landed below the toolbar — caller routes to the
             // tab bar / content beneath.
-            SidebarPanelHit::Content { .. } | SidebarPanelHit::Empty => {
-                (content_rect, false)
-            }
+            SidebarPanelHit::Content { .. } | SidebarPanelHit::Empty => (content_rect, false),
         }
     }
 
@@ -15895,7 +16666,11 @@ impl CoordApp {
                         self.last_notify = Instant::now();
                     }
                     SpawnQueuedOutcome::Queued => {
-                        self.push_toast("⏳ Queued", "notify runs after current command", ToastSeverity::Info);
+                        self.push_toast(
+                            "⏳ Queued",
+                            "notify runs after current command",
+                            ToastSeverity::Info,
+                        );
                     }
                     SpawnQueuedOutcome::Deduped => {}
                 }
@@ -15924,8 +16699,14 @@ impl CoordApp {
                 } else if let Some(a) = self.board_selected_failed_assignment() {
                     let id = a.id.clone();
                     use crate::commands::SpawnQueuedOutcome;
-                    if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&["retry", &id]) {
-                        self.push_toast("⏳ Queued", "retry runs after current command", ToastSeverity::Info);
+                    if let SpawnQueuedOutcome::Queued =
+                        self.command_runner.spawn_queued(&["retry", &id])
+                    {
+                        self.push_toast(
+                            "⏳ Queued",
+                            "retry runs after current command",
+                            ToastSeverity::Info,
+                        );
                     }
                 } else {
                     self.push_toast(
@@ -15953,9 +16734,7 @@ impl CoordApp {
                 true
             }
             "toolbar:ready" => {
-                let selected = self
-                    .pipeline_sel
-                    .and_then(|i| self.pipeline_issues.get(i));
+                let selected = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
                 match selected {
                     None => self.push_toast(
                         "Nothing to mark ready",
@@ -15974,7 +16753,10 @@ impl CoordApp {
                         let repo = issue.coord_repo.clone().unwrap();
                         let num_str = issue.number.to_string();
                         use crate::commands::SpawnQueuedOutcome;
-                        match self.command_runner.spawn_queued(&["ready", &repo, &num_str]) {
+                        match self
+                            .command_runner
+                            .spawn_queued(&["ready", &repo, &num_str])
+                        {
                             SpawnQueuedOutcome::Started => {
                                 self.pipeline_status = Some((
                                     format!("#{}: marking ready", issue.number),
@@ -15982,7 +16764,11 @@ impl CoordApp {
                                 ));
                             }
                             SpawnQueuedOutcome::Queued => {
-                                self.push_toast("⏳ Queued", "ready runs after current command", ToastSeverity::Info);
+                                self.push_toast(
+                                    "⏳ Queued",
+                                    "ready runs after current command",
+                                    ToastSeverity::Info,
+                                );
                             }
                             SpawnQueuedOutcome::Deduped => {}
                         }
@@ -16160,9 +16946,7 @@ impl CoordApp {
             // the user staring at an unchanged board with no feedback.
             if result.exit_code != 0 {
                 let reason = first_meaningful_stderr_line(&result.stderr)
-                    .unwrap_or_else(|| {
-                        format!("exit {} — no stderr captured", result.exit_code)
-                    });
+                    .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
                 self.push_toast(
                     "Command failed",
                     &format!("{}\n{}", result.label, reason),
@@ -16184,7 +16968,9 @@ impl CoordApp {
                     // was queued while this stop was running.  ready_started is
                     // true for both Started and Queued — it will run eventually.
                     use crate::commands::SpawnQueuedOutcome;
-                    let ready_outcome = self.command_runner.spawn_queued(&["ready", &p.repo, &issue_str]);
+                    let ready_outcome = self
+                        .command_runner
+                        .spawn_queued(&["ready", &p.repo, &issue_str]);
                     let ready_started = matches!(
                         ready_outcome,
                         SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
@@ -16224,14 +17010,20 @@ impl CoordApp {
                                 SpawnQueuedOutcome::Started => {
                                     self.push_toast(
                                         "Send",
-                                        &format!("#{} dispatched → {}", p.issue_number, machine_name),
+                                        &format!(
+                                            "#{} dispatched → {}",
+                                            p.issue_number, machine_name
+                                        ),
                                         ToastSeverity::Info,
                                     );
                                 }
                                 SpawnQueuedOutcome::Queued => {
                                     self.push_toast(
                                         "Send",
-                                        &format!("#{}: dispatch queued → {}", p.issue_number, machine_name),
+                                        &format!(
+                                            "#{}: dispatch queued → {}",
+                                            p.issue_number, machine_name
+                                        ),
                                         ToastSeverity::Info,
                                     );
                                 }
@@ -16242,7 +17034,10 @@ impl CoordApp {
                         } else {
                             self.push_toast(
                                 "Send",
-                                &format!("#{}: ready — but no reachable machine for {}.", p.issue_number, p.repo),
+                                &format!(
+                                    "#{}: ready — but no reachable machine for {}.",
+                                    p.issue_number, p.repo
+                                ),
                                 ToastSeverity::Warning,
                             );
                         }
@@ -16269,8 +17064,8 @@ impl CoordApp {
                         // Generic failure toast already fired from
                         // command_runner.poll() above — just capture the
                         // error text for the durable panel line.
-                        pull_message = first_meaningful_stderr_line(&result.stderr)
-                            .unwrap_or_else(|| {
+                        pull_message =
+                            first_meaningful_stderr_line(&result.stderr).unwrap_or_else(|| {
                                 format!("exit {} — no stderr captured", result.exit_code)
                             });
                     }
@@ -16375,7 +17170,10 @@ impl CoordApp {
             // Look up the old assignment's type so the resume bind matches
             // the same chat type (fixes #361: test-chat / new-issue-chat
             // continuations never rebound when filter was "refinement"-only).
-            let old_type = self.data.assignments.iter()
+            let old_type = self
+                .data
+                .assignments
+                .iter()
                 .find(|a| a.id == fb.aid)
                 .and_then(|a| a.assignment_type.clone());
             spawn_chat_continue(config_path, fb.aid.clone(), fb.text.clone());
@@ -16472,9 +17270,7 @@ impl CoordApp {
         }
         // #336: Trigger a fresh manifest fetch when the pipeline Test-stage
         // context is visible and the cache entry is absent or older than 30 s.
-        if self.artifact_fetch_rx.is_none()
-            && self.active_view == SidebarView::Pipeline
-        {
+        if self.artifact_fetch_rx.is_none() && self.active_view == SidebarView::Pipeline {
             if let Some((host, repo, sanitized, _work_id)) = self.artifact_fetch_target() {
                 let key = (repo.clone(), sanitized.clone());
                 let needs_fetch = match self.artifact_cache.get(&key) {
@@ -16645,13 +17441,15 @@ impl CoordApp {
         // Post-drain: reconnect or show error toast (no pool borrow held).
         if fail_limit_hit {
             // Include issue number so background-stream failures are identifiable.
-            let issue_num = self.watch_pool.get(id)
-                .map(|ctx| ctx.state.issue_number);
+            let issue_num = self.watch_pool.get(id).map(|ctx| ctx.state.issue_number);
             let is_focused = self.watch_focused.as_deref() == Some(id);
             let msg = if is_focused {
                 "Lost connection 3× in 10 s — press R to reconnect".to_string()
             } else if let Some(n) = issue_num {
-                format!("Lost connection to #{} 3× in 10 s — switch to it and press R", n)
+                format!(
+                    "Lost connection to #{} 3× in 10 s — switch to it and press R",
+                    n
+                )
             } else {
                 "Lost SSE connection 3× in 10 s".to_string()
             };
@@ -16756,7 +17554,10 @@ impl CoordApp {
             id: WidgetId::new("settings:cadence"),
             label: StyledText::plain("Cadence"),
             kind: FieldKind::SegmentedControl {
-                options: RefreshCadence::LABELS.iter().map(|s| s.to_string()).collect(),
+                options: RefreshCadence::LABELS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 selected_idx: self.settings.refresh_cadence.to_idx(),
             },
             hint: StyledText::plain("How often the board is reloaded from the database"),
@@ -16769,7 +17570,9 @@ impl CoordApp {
         fields.push(FormField {
             id: WidgetId::new("settings:audio"),
             label: StyledText::plain("Audio on completion"),
-            kind: FieldKind::Toggle { value: self.settings.audio_on_completion },
+            kind: FieldKind::Toggle {
+                value: self.settings.audio_on_completion,
+            },
             hint: StyledText::plain("Ring a bell when an assignment finishes"),
             disabled: false,
             validation: None,
@@ -16791,7 +17594,9 @@ impl CoordApp {
 
         // ── Keybindings ────────────────────────────────────────────────
         fields.push(settings_label("Keybindings"));
-        let refresh_key = self.settings.keybindings
+        let refresh_key = self
+            .settings
+            .keybindings
             .get(ACTION_PIPELINE_REFRESH)
             .map(|s| s.as_str())
             .unwrap_or("Ctrl+R");
@@ -16837,7 +17642,9 @@ impl CoordApp {
                     options: ModelPref::LABELS.iter().map(|s| s.to_string()).collect(),
                     selected_idx: current_pref.to_idx(),
                 },
-                hint: StyledText::plain("Session-level override; coordinator.yml is the project default"),
+                hint: StyledText::plain(
+                    "Session-level override; coordinator.yml is the project default",
+                ),
                 disabled: false,
                 validation: None,
             });
@@ -16894,7 +17701,10 @@ impl CoordApp {
         let field_id = field.id.clone();
 
         let event = match &field.kind {
-            FieldKind::SegmentedControl { options, selected_idx } => {
+            FieldKind::SegmentedControl {
+                options,
+                selected_idx,
+            } => {
                 let n = options.len();
                 if n == 0 {
                     return false;
@@ -16909,12 +17719,10 @@ impl CoordApp {
                     selected_idx: new_idx,
                 }
             }
-            FieldKind::Toggle { value } => {
-                FormEvent::ToggleChanged {
-                    id: field_id,
-                    value: !value,
-                }
-            }
+            FieldKind::Toggle { value } => FormEvent::ToggleChanged {
+                id: field_id,
+                value: !value,
+            },
             _ => return false,
         };
         self.apply_settings_event(&event)
@@ -16941,12 +17749,18 @@ impl CoordApp {
                     }
                     field_id if field_id.starts_with("settings:model:") => {
                         let machine = field_id["settings:model:".len()..].to_string();
-                        self.settings.machine_model.insert(machine, ModelPref::from_idx(*selected_idx));
+                        self.settings
+                            .machine_model
+                            .insert(machine, ModelPref::from_idx(*selected_idx));
                     }
                     _ => return false,
                 }
                 if let Err(e) = self.settings.save() {
-                    self.push_toast("Settings", &format!("could not persist settings: {e}"), ToastSeverity::Error);
+                    self.push_toast(
+                        "Settings",
+                        &format!("could not persist settings: {e}"),
+                        ToastSeverity::Error,
+                    );
                 }
                 true
             }
@@ -16954,7 +17768,11 @@ impl CoordApp {
                 if id.as_str() == "settings:audio" {
                     self.settings.audio_on_completion = *value;
                     if let Err(e) = self.settings.save() {
-                        self.push_toast("Settings", &format!("could not persist settings: {e}"), ToastSeverity::Error);
+                        self.push_toast(
+                            "Settings",
+                            &format!("could not persist settings: {e}"),
+                            ToastSeverity::Error,
+                        );
                     }
                     true
                 } else {
@@ -16966,10 +17784,16 @@ impl CoordApp {
                 if id.as_str().starts_with("settings:keybind:") =>
             {
                 let action = &id.as_str()["settings:keybind:".len()..];
-                self.settings.keybindings.insert(action.to_string(), value.clone());
+                self.settings
+                    .keybindings
+                    .insert(action.to_string(), value.clone());
                 self.parsed_keybindings = parse_keybindings(&self.settings);
                 if let Err(e) = self.settings.save() {
-                    self.push_toast("Settings", &format!("could not persist settings: {e}"), ToastSeverity::Error);
+                    self.push_toast(
+                        "Settings",
+                        &format!("could not persist settings: {e}"),
+                        ToastSeverity::Error,
+                    );
                 }
                 true
             }
@@ -17012,8 +17836,7 @@ impl CoordApp {
         //    the Terminal view (so the renderer has stashed real dims).
         if self.terminal_session.is_none() && self.terminal_spawn_error.is_none() {
             if let Some((cols, rows)) = self.terminal_pending_dims.get() {
-                let cwd = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
                 let shell = quadraui::terminal_engine::default_shell();
                 match quadraui::terminal_engine::TerminalSession::spawn(
                     cols.max(20),
@@ -17195,11 +18018,7 @@ impl CoordApp {
     ///
     /// Mirrors `forward_key_to_pty` but routes to the per-issue session map
     /// rather than the standalone terminal session.
-    fn forward_key_to_detail_terminal(
-        &mut self,
-        key: &Key,
-        mods: &quadraui::Modifiers,
-    ) -> bool {
+    fn forward_key_to_detail_terminal(&mut self, key: &Key, mods: &quadraui::Modifiers) -> bool {
         let Some(issue_num) = self.selected_issue_number() else {
             return false;
         };
@@ -17244,9 +18063,7 @@ impl CoordApp {
         // Rightmost column = scrollbar.  Match the example pattern
         // (`scrollbar_col = vp.width - 1.0`).
         let sb_col = (rect.x + rect.width - 1.0).max(rect.x);
-        let in_scrollbar = pos.x >= sb_col
-            && pos.y >= rect.y
-            && pos.y < rect.y + rect.height;
+        let in_scrollbar = pos.x >= sb_col && pos.y >= rect.y && pos.y < rect.y + rect.height;
         if !in_scrollbar {
             return false;
         }
@@ -17364,17 +18181,25 @@ impl CoordApp {
 
         let Some(repo) = self.coord_repo_for_issue(issue_num) else {
             self.pipeline_status = Some((
-                "Cannot resolve repo for this issue — interactive session not launched"
-                    .to_string(),
+                "Cannot resolve repo for this issue — interactive session not launched".to_string(),
                 Instant::now(),
             ));
             return;
         };
 
-        let (cols, rows) = self
-            .detail_terminal_pending_dims
-            .get()
-            .unwrap_or((80, 24));
+        // `coord assign` needs a MACHINE positional; for a local human-attended
+        // launch that's this machine (hostname-matched into coordinator.yml).
+        let machine = self.data.local_machine.clone();
+        if machine.is_empty() {
+            self.pipeline_status = Some((
+                "Cannot resolve the local machine (hostname not in coordinator.yml) — interactive session not launched"
+                    .to_string(),
+                Instant::now(),
+            ));
+            return;
+        }
+
+        let (cols, rows) = self.detail_terminal_pending_dims.get().unwrap_or((80, 24));
         let cwd = self.detail_terminal_cwd(issue_num);
         let shell = quadraui::terminal_engine::default_shell();
 
@@ -17389,7 +18214,7 @@ impl CoordApp {
                 // Auto-run the launcher line.  Re-pressing `s` while a
                 // previous interactive session is still alive replaces the
                 // old PTY (old session is dropped on `insert`).
-                let launch_line = build_interactive_launch_cmd(&repo, issue_num, mode);
+                let launch_line = build_interactive_launch_cmd(&machine, &repo, issue_num, mode);
                 sess.send_str(&launch_line);
 
                 // Replace any existing session (the old one is dropped here).
@@ -17466,10 +18291,8 @@ impl CoordApp {
             } else {
                 None
             };
-            let snapshot = sess.to_terminal(
-                WidgetId::new(format!("detail-terminal:{}", issue_num)),
-                sb,
-            );
+            let snapshot =
+                sess.to_terminal(WidgetId::new(format!("detail-terminal:{}", issue_num)), sb);
             backend.draw_terminal(rect, &snapshot);
         } else {
             // Session pending or spawn error.
@@ -17544,24 +18367,29 @@ fn interactive_plan_briefing(issue_num: u64) -> String {
 /// contains spaces or shell metacharacters can't break the line; the
 /// issue number is `u64`, so it never needs quoting.
 fn build_interactive_launch_cmd(
+    machine: &str,
     repo: &str,
     issue_num: u64,
     mode: InteractiveLaunchMode,
 ) -> String {
-    // `--no-plan` forces type=work (full Read/Edit/Write/Bash tools) regardless
-    // of `dispatch.require_plan`, so BOTH modes can actually implement — Plan
-    // just plans first per its seeded briefing.
+    // `coord assign` takes positional MACHINE REPO ISSUE — there is NO --repo
+    // option.  Options precede the positionals.  `--no-plan` forces type=work
+    // (full Read/Edit/Write/Bash tools) regardless of `dispatch.require_plan`,
+    // so BOTH modes can actually implement — Plan just plans first per its
+    // seeded briefing.
+    let m = shell_quote_arg(machine);
+    let r = shell_quote_arg(repo);
     match mode {
         InteractiveLaunchMode::Work => format!(
-            "coord assign --interactive --no-plan --repo {} {}\r",
-            shell_quote_arg(repo),
-            issue_num,
+            "coord assign --interactive --no-plan {} {} {}\r",
+            m, r, issue_num,
         ),
         InteractiveLaunchMode::Plan => format!(
-            "coord assign --interactive --no-plan --repo {} {} --briefing {}\r",
-            shell_quote_arg(repo),
-            issue_num,
+            "coord assign --interactive --no-plan --briefing {} {} {} {}\r",
             shell_quote_arg(&interactive_plan_briefing(issue_num)),
+            m,
+            r,
+            issue_num,
         ),
     }
 }
@@ -17881,7 +18709,8 @@ impl ShellApp for CoordApp {
                     let tab_bar = self.pipeline_detail_tab_bar();
                     let tab_h = lh * 1.4;
                     let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
-                    let content_rect = Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
+                    let content_rect =
+                        Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
                     backend.draw_tab_bar(tab_rect, &tab_bar, None);
 
                     match self.pipeline_detail_tab {
@@ -17896,7 +18725,12 @@ impl ShellApp for CoordApp {
                             // tints on mouse-over.
                             let action_toolbar = self.pipeline_action_bar_toolbar();
                             let bar_h = pipeline_action_bar_height(action_toolbar.is_some(), lh);
-                            let bar_rect = Rect::new(content_rect.x, content_rect.y, content_rect.width, bar_h);
+                            let bar_rect = Rect::new(
+                                content_rect.x,
+                                content_rect.y,
+                                content_rect.width,
+                                bar_h,
+                            );
                             let pv_origin = Rect::new(
                                 content_rect.x,
                                 content_rect.y + bar_h,
@@ -17919,7 +18753,8 @@ impl ShellApp for CoordApp {
                                 );
                             }
                             if let Some(view) = self.build_pipeline_widget() {
-                                backend.draw_pipeline_view(pv_rect, &pipeline_view_for_render(&view));
+                                backend
+                                    .draw_pipeline_view(pv_rect, &pipeline_view_for_render(&view));
                             } else {
                                 backend.draw_list(pv_rect, &self.pipeline_placeholder_list());
                             }
@@ -17938,7 +18773,11 @@ impl ShellApp for CoordApp {
                             // backends, `width` is in pixels and 1 px is below
                             // the thumb minimum so the scrollbar is a no-op —
                             // those backends use native scrolling.
-                            let sb_col_w = if content_rect.width >= 2.0 { 1.0_f32 } else { 0.0_f32 };
+                            let sb_col_w = if content_rect.width >= 2.0 {
+                                1.0_f32
+                            } else {
+                                0.0_f32
+                            };
                             let list_rect = Rect::new(
                                 content_rect.x,
                                 content_rect.y,
@@ -17980,13 +18819,7 @@ impl ShellApp for CoordApp {
                             let lines: Vec<String> = log_list
                                 .items
                                 .iter()
-                                .map(|it| {
-                                    it.text
-                                        .spans
-                                        .iter()
-                                        .map(|s| s.text.as_str())
-                                        .collect()
-                                })
+                                .map(|it| it.text.spans.iter().map(|s| s.text.as_str()).collect())
                                 .collect();
                             backend.draw_list(list_rect, &log_list);
                             // #312: register as a selectable TextRegion so the
@@ -18012,22 +18845,28 @@ impl ShellApp for CoordApp {
                                 // Paint an opaque backing first so the chat's
                                 // empty transcript zone doesn't bleed
                                 // through.
-                                backend.draw_list(content_rect, &ListView {
-                                    id: WidgetId::new("refinement-tab-bg"),
-                                    title: None,
-                                    items: Vec::new(),
-                                    selected_idx: 0,
-                                    scroll_offset: 0,
-                                    has_focus: false,
-                                    bordered: true,
-                                    h_scroll: 0,
-                                    max_content_width: None,
-                                });
+                                backend.draw_list(
+                                    content_rect,
+                                    &ListView {
+                                        id: WidgetId::new("refinement-tab-bg"),
+                                        title: None,
+                                        items: Vec::new(),
+                                        selected_idx: 0,
+                                        scroll_offset: 0,
+                                        has_focus: false,
+                                        bordered: true,
+                                        h_scroll: 0,
+                                        max_content_width: None,
+                                    },
+                                );
                                 if let Some(ref chat) = self.inject_chat {
                                     chat.render(backend, content_rect);
                                 }
                             } else {
-                                backend.draw_list(content_rect, &self.refinement_tab_placeholder_list());
+                                backend.draw_list(
+                                    content_rect,
+                                    &self.refinement_tab_placeholder_list(),
+                                );
                             }
                         }
                         PipelineDetailTab::Terminal => {
@@ -18062,10 +18901,7 @@ impl ShellApp for CoordApp {
                     } else {
                         None
                     };
-                    let snapshot = sess.to_terminal(
-                        WidgetId::new("coord-terminal:0"),
-                        sb,
-                    );
+                    let snapshot = sess.to_terminal(WidgetId::new("coord-terminal:0"), sb);
                     backend.draw_terminal(m, &snapshot);
                 } else {
                     // No session yet — show a one-line placeholder.  The
@@ -18111,17 +18947,20 @@ impl ShellApp for CoordApp {
         let chat_is_board = self.chat_is_board_chat();
         if let Some(ref chat) = self.inject_chat {
             if !chat_is_refinement && !chat_is_board {
-                backend.draw_list(m, &ListView {
-                    id: WidgetId::new("chat-backing"),
-                    title: None,
-                    items: Vec::new(),
-                    selected_idx: 0,
-                    scroll_offset: 0,
-                    has_focus: false,
-                    bordered: true,
-                    h_scroll: 0,
-                    max_content_width: None,
-                });
+                backend.draw_list(
+                    m,
+                    &ListView {
+                        id: WidgetId::new("chat-backing"),
+                        title: None,
+                        items: Vec::new(),
+                        selected_idx: 0,
+                        scroll_offset: 0,
+                        has_focus: false,
+                        bordered: true,
+                        h_scroll: 0,
+                        max_content_width: None,
+                    },
+                );
                 chat.render(backend, m);
             }
         }
@@ -18145,10 +18984,7 @@ impl ShellApp for CoordApp {
         // in the sidebar can flow rightward into the main area without
         // being clipped to the (narrow) sidebar width.
         if self.pending_context_menu.is_some() {
-            let viewport = union_rects(
-                layout.sidebar_content_bounds,
-                layout.main_content_bounds,
-            );
+            let viewport = union_rects(layout.sidebar_content_bounds, layout.main_content_bounds);
             self.render_context_menu(backend, viewport);
         } else {
             // Keep the cached layout in sync — clear it once the menu
@@ -18162,14 +18998,17 @@ impl ShellApp for CoordApp {
         // context menu, toasts, and panel content.  The viewport unions
         // sidebar + main so the dialog centers across the whole content
         // area (not just the narrow sidebar).
-        let dialog_viewport = union_rects(
-            layout.sidebar_content_bounds,
-            layout.main_content_bounds,
-        );
+        let dialog_viewport =
+            union_rects(layout.sidebar_content_bounds, layout.main_content_bounds);
         self.render_prompt_dialog(backend, dialog_viewport);
     }
 
-    fn handle(&mut self, event: UiEvent, backend: &mut dyn Backend, ctx: &ShellContext) -> Reaction {
+    fn handle(
+        &mut self,
+        event: UiEvent,
+        backend: &mut dyn Backend,
+        ctx: &ShellContext,
+    ) -> Reaction {
         let mut needs_redraw = false;
 
         // ── Drain pending background data load ──────────────────────────
@@ -18272,7 +19111,12 @@ impl ShellApp for CoordApp {
             if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                 match key {
                     Key::Named(NamedKey::Escape) => {
-                        if self.file_issue_modal.as_ref().map(|m| !m.submitting).unwrap_or(false) {
+                        if self
+                            .file_issue_modal
+                            .as_ref()
+                            .map(|m| !m.submitting)
+                            .unwrap_or(false)
+                        {
                             self.file_issue_modal = None;
                         }
                     }
@@ -18372,13 +19216,21 @@ impl ShellApp for CoordApp {
                     // render_content (#272).  When panel_toolbar() returns
                     // None we just shave the tab bar.
                     let after_panel = if self.panel_toolbar().is_some() {
-                        Rect::new(m.x, m.y + self.toolbar_height(lh), m.width,
-                            (m.height - self.toolbar_height(lh)).max(0.0))
+                        Rect::new(
+                            m.x,
+                            m.y + self.toolbar_height(lh),
+                            m.width,
+                            (m.height - self.toolbar_height(lh)).max(0.0),
+                        )
                     } else {
                         m
                     };
-                    Rect::new(after_panel.x, after_panel.y + tab_h,
-                        after_panel.width, (after_panel.height - tab_h).max(0.0))
+                    Rect::new(
+                        after_panel.x,
+                        after_panel.y + tab_h,
+                        after_panel.width,
+                        (after_panel.height - tab_h).max(0.0),
+                    )
                 } else if chat_is_board {
                     // Match the Board Chat tab's content_rect.
                     let m = ctx.main_bounds();
@@ -18420,7 +19272,11 @@ impl ShellApp for CoordApp {
                         }
                     }
                 }
-                let result = self.inject_chat.as_mut().unwrap().handle(&event, backend, main_rect);
+                let result = self
+                    .inject_chat
+                    .as_mut()
+                    .unwrap()
+                    .handle(&event, backend, main_rect);
                 match result {
                     ChatControllerEvent::Submit { text } => {
                         self.submit_inject(text);
@@ -18437,12 +19293,15 @@ impl ShellApp for CoordApp {
                         // #316 Board chat: Esc just closes the overlay;
                         // no status label to flip since there's no issue.
                         if chat_is_refinement {
-                            let issue_n = self.focused_watch_state()
+                            let issue_n = self
+                                .focused_watch_state()
                                 .map(|w| w.issue_number)
                                 .unwrap_or(0);
                             if issue_n != 0 {
                                 self.pending_refinement_close_prompt =
-                                    Some(PendingRefinementClosePrompt { issue_number: issue_n });
+                                    Some(PendingRefinementClosePrompt {
+                                        issue_number: issue_n,
+                                    });
                                 // Leave inject_chat open — the dialog renders
                                 // on top of it so the user can read the
                                 // transcript while deciding.
@@ -18524,7 +19383,11 @@ impl ShellApp for CoordApp {
                             .as_ref()
                             .map(|(_, b)| b.trim().to_string())
                             .unwrap_or_default();
-                        let reason_opt = if reason.is_empty() { None } else { Some(reason.as_str()) };
+                        let reason_opt = if reason.is_empty() {
+                            None
+                        } else {
+                            Some(reason.as_str())
+                        };
                         self.record_test_verdict("failed", reason_opt);
                         self.pending_test_fail = None;
                     }
@@ -18555,12 +19418,13 @@ impl ShellApp for CoordApp {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 match key {
                     Key::Named(NamedKey::Enter) => {
-                        let description = self
-                            .pending_report_fix
-                            .take()
-                            .unwrap_or_default();
+                        let description = self.pending_report_fix.take().unwrap_or_default();
                         let description = description.trim().to_string();
-                        let reason_opt = if description.is_empty() { None } else { Some(description.as_str()) };
+                        let reason_opt = if description.is_empty() {
+                            None
+                        } else {
+                            Some(description.as_str())
+                        };
                         // Record the failure verdict first.
                         if self.record_test_verdict("failed", reason_opt) {
                             // Then dispatch a fix worker via `coord fix`.
@@ -18631,8 +19495,17 @@ impl ShellApp for CoordApp {
                     Key::Char('y') | Key::Char('Y') => {
                         if let Some(name) = self.pending_restart.take() {
                             use crate::commands::SpawnQueuedOutcome;
-                            if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&["agent", "restart", "--machine", &name]) {
-                                self.push_toast("⏳ Queued", "agent restart runs after current command", ToastSeverity::Info);
+                            if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&[
+                                "agent",
+                                "restart",
+                                "--machine",
+                                &name,
+                            ]) {
+                                self.push_toast(
+                                    "⏳ Queued",
+                                    "agent restart runs after current command",
+                                    ToastSeverity::Info,
+                                );
                             }
                         }
                     }
@@ -18655,9 +19528,13 @@ impl ShellApp for CoordApp {
                         match purge_done_assignments_db(secs) {
                             Ok((a, i)) => self.push_toast(
                                 "Purge complete",
-                                &format!("Removed {} assignment{} + {} closed issue{}",
-                                    a, if a == 1 { "" } else { "s" },
-                                    i, if i == 1 { "" } else { "s" }),
+                                &format!(
+                                    "Removed {} assignment{} + {} closed issue{}",
+                                    a,
+                                    if a == 1 { "" } else { "s" },
+                                    i,
+                                    if i == 1 { "" } else { "s" }
+                                ),
                                 ToastSeverity::Info,
                             ),
                             Err(e) => self.push_toast(
@@ -18733,12 +19610,19 @@ impl ShellApp for CoordApp {
                             SpawnQueuedOutcome::Started => {
                                 self.push_toast(
                                     "Force-merge dispatched",
-                                    &format!("coord merge --force-merge{} — CI gate bypassed", scope_str),
+                                    &format!(
+                                        "coord merge --force-merge{} — CI gate bypassed",
+                                        scope_str
+                                    ),
                                     ToastSeverity::Warning,
                                 );
                             }
                             SpawnQueuedOutcome::Queued => {
-                                self.push_toast("⏳ Queued", "force-merge runs after current command", ToastSeverity::Info);
+                                self.push_toast(
+                                    "⏳ Queued",
+                                    "force-merge runs after current command",
+                                    ToastSeverity::Info,
+                                );
                             }
                             SpawnQueuedOutcome::Deduped => {}
                         }
@@ -18765,7 +19649,11 @@ impl ShellApp for CoordApp {
                     ACTION_PIPELINE_REFRESH => {
                         self.pipeline_last_load = None;
                         self.maybe_kick_pipeline_loader();
-                        self.push_toast("Pipeline", "Refreshing issues from GitHub…", ToastSeverity::Info);
+                        self.push_toast(
+                            "Pipeline",
+                            "Refreshing issues from GitHub…",
+                            ToastSeverity::Info,
+                        );
                         return Reaction::Redraw;
                     }
                     _ => {}
@@ -18789,8 +19677,7 @@ impl ShellApp for CoordApp {
                     }
                     // Backspace while search is active removes char before cursor.
                     Key::Named(NamedKey::Backspace)
-                        if self.active_view == SidebarView::Board
-                            && self.board_search.focused =>
+                        if self.active_view == SidebarView::Board && self.board_search.focused =>
                     {
                         self.board_search.backspace();
                         self.rebuild_board_sidebar();
@@ -18798,8 +19685,7 @@ impl ShellApp for CoordApp {
                     }
                     // Any printable char while search is active inserts at cursor.
                     Key::Char(ch)
-                        if self.active_view == SidebarView::Board
-                            && self.board_search.focused =>
+                        if self.active_view == SidebarView::Board && self.board_search.focused =>
                     {
                         self.board_search.insert_char(*ch);
                         self.rebuild_board_sidebar();
@@ -18807,8 +19693,7 @@ impl ShellApp for CoordApp {
                     }
                     // '/' activates search when not already active.
                     Key::Char('/')
-                        if self.active_view == SidebarView::Board
-                            && !self.board_search.focused =>
+                        if self.active_view == SidebarView::Board && !self.board_search.focused =>
                     {
                         self.board_search.focused = true;
                         self.rebuild_board_sidebar();
@@ -18861,7 +19746,9 @@ impl ShellApp for CoordApp {
                     // 'b' opens the ChatController guidance overlay. When the
                     // overlay is open, ALL events are intercepted earlier in
                     // handle() — these arms only fire when it is closed.
-                    Key::Char('b') if self.watch_focused.is_some() && self.inject_chat.is_none() => {
+                    Key::Char('b')
+                        if self.watch_focused.is_some() && self.inject_chat.is_none() =>
+                    {
                         if let Some(w) = self.focused_watch_state() {
                             let atype = w.assignment_type.clone();
                             let issue_n = w.issue_number;
@@ -18899,18 +19786,14 @@ impl ShellApp for CoordApp {
                     // The Log tab only seeds `watch_pool` without focusing, so
                     // `watch_focused.is_some()` is false there and j/k falls
                     // through to the dedicated Log-tab arms below (#308).
-                    Key::Char('j') | Key::Named(NamedKey::Down)
-                        if self.watch_focused.is_some() =>
-                    {
+                    Key::Char('j') | Key::Named(NamedKey::Down) if self.watch_focused.is_some() => {
                         if let Some(w) = self.focused_watch_state_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
                             w.scroll = current.saturating_add(1);
                         }
                         needs_redraw = true;
                     }
-                    Key::Char('k') | Key::Named(NamedKey::Up)
-                        if self.watch_focused.is_some() =>
-                    {
+                    Key::Char('k') | Key::Named(NamedKey::Up) if self.watch_focused.is_some() => {
                         if let Some(w) = self.focused_watch_state_mut() {
                             let current = if w.scroll == usize::MAX { 0 } else { w.scroll };
                             w.scroll = current.saturating_sub(1);
@@ -18956,8 +19839,7 @@ impl ShellApp for CoordApp {
                     {
                         let count = self.settings_interactive_field_ids().len();
                         if count > 0 {
-                            self.settings_field_sel =
-                                (self.settings_field_sel + 1).min(count - 1);
+                            self.settings_field_sel = (self.settings_field_sel + 1).min(count - 1);
                         }
                         needs_redraw = true;
                     }
@@ -18968,9 +19850,7 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
                     // Tab — next interactive field within the form
-                    Key::Named(NamedKey::Tab)
-                        if self.active_view == SidebarView::Settings =>
-                    {
+                    Key::Named(NamedKey::Tab) if self.active_view == SidebarView::Settings => {
                         let count = self.settings_interactive_field_ids().len();
                         if count > 1 {
                             self.settings_field_sel = (self.settings_field_sel + 1) % count;
@@ -19003,9 +19883,7 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── Tab — cycle sections within Board SidebarSystem ──
-                    Key::Named(NamedKey::Tab)
-                        if self.active_view == SidebarView::Board =>
-                    {
+                    Key::Named(NamedKey::Tab) if self.active_view == SidebarView::Board => {
                         let prev_sel = self.board_selected_issue();
                         let result = self.board_sidebar.handle(&event, backend, list_b);
                         if result != SidebarEvent::Ignored {
@@ -19092,16 +19970,14 @@ impl ShellApp for CoordApp {
                         if self.active_view == SidebarView::Pipeline
                             && self.pipeline_detail_tab == PipelineDetailTab::Log =>
                     {
-                        self.pipeline_log_hscroll =
-                            self.pipeline_log_hscroll.saturating_add(8);
+                        self.pipeline_log_hscroll = self.pipeline_log_hscroll.saturating_add(8);
                         needs_redraw = true;
                     }
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline
                             && self.pipeline_detail_tab == PipelineDetailTab::Log =>
                     {
-                        self.pipeline_log_hscroll =
-                            self.pipeline_log_hscroll.saturating_sub(8);
+                        self.pipeline_log_hscroll = self.pipeline_log_hscroll.saturating_sub(8);
                         needs_redraw = true;
                     }
 
@@ -19151,11 +20027,11 @@ impl ShellApp for CoordApp {
                             && self.inject_chat.is_none() =>
                     {
                         // Find the running assignment for the selected row.
-                        let running = self.pipeline_sel
+                        let running = self
+                            .pipeline_sel
                             .and_then(|i| self.pipeline_issues.get(i).cloned())
                             .and_then(|issue| {
-                                let local_repo =
-                                    issue.coord_repo.as_deref().map(|s| s.to_string());
+                                let local_repo = issue.coord_repo.as_deref().map(|s| s.to_string());
                                 self.data
                                     .assignments
                                     .iter()
@@ -19329,7 +20205,12 @@ impl ShellApp for CoordApp {
                             self.detail_terminal_focused = false;
                         }
                         self.pipeline_detail_tab = next;
-                        self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
+                        self.pipeline_detail_scroll =
+                            if self.pipeline_detail_tab == PipelineDetailTab::Log {
+                                usize::MAX
+                            } else {
+                                0
+                            };
                         if self.pipeline_detail_tab == PipelineDetailTab::Log {
                             self.ensure_log_tab_sse();
                         }
@@ -19352,7 +20233,12 @@ impl ShellApp for CoordApp {
                             self.detail_terminal_focused = false;
                         }
                         self.pipeline_detail_tab = next;
-                        self.pipeline_detail_scroll = if self.pipeline_detail_tab == PipelineDetailTab::Log { usize::MAX } else { 0 };
+                        self.pipeline_detail_scroll =
+                            if self.pipeline_detail_tab == PipelineDetailTab::Log {
+                                usize::MAX
+                            } else {
+                                0
+                            };
                         if self.pipeline_detail_tab == PipelineDetailTab::Log {
                             self.ensure_log_tab_sse();
                         }
@@ -19517,9 +20403,7 @@ impl ShellApp for CoordApp {
                     // ── Enter — Stages tab: switch to Log tab to view the
                     //              worker log inline.  Log tab: Go fires
                     //              the active stage.  Other tabs: Go fires.
-                    Key::Named(NamedKey::Enter)
-                        if self.active_view == SidebarView::Pipeline =>
-                    {
+                    Key::Named(NamedKey::Enter) if self.active_view == SidebarView::Pipeline => {
                         if self.pipeline_detail_tab == PipelineDetailTab::Stages {
                             self.pipeline_detail_tab = PipelineDetailTab::Log;
                             self.pipeline_detail_scroll = usize::MAX;
@@ -19563,18 +20447,14 @@ impl ShellApp for CoordApp {
                     // sets status:ready via gh. After the GH side returns,
                     // the next data refresh moves the row into the Pending
                     // lifecycle section and the Pipeline tab shows [Go].
-                    Key::Char('r')
-                        if self.active_view == SidebarView::Pipeline =>
-                    {
+                    Key::Char('r') if self.active_view == SidebarView::Pipeline => {
                         // #249 Principle 2: every no-op gives feedback.
                         // Without these toasts, pressing `r` on an issue
                         // with no coord_repo mapping (or no selection)
                         // looks identical to pressing `r` on a working
                         // issue — both render nothing, and the user is
                         // left guessing.
-                        let selected = self
-                            .pipeline_sel
-                            .and_then(|i| self.pipeline_issues.get(i));
+                        let selected = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
                         match selected {
                             None => {
                                 self.push_toast(
@@ -19599,7 +20479,10 @@ impl ShellApp for CoordApp {
                                 let num = issue.number;
                                 let num_str = num.to_string();
                                 use crate::commands::SpawnQueuedOutcome;
-                                match self.command_runner.spawn_queued(&["ready", &repo, &num_str]) {
+                                match self
+                                    .command_runner
+                                    .spawn_queued(&["ready", &repo, &num_str])
+                                {
                                     SpawnQueuedOutcome::Deduped => {}
                                     SpawnQueuedOutcome::Queued => {
                                         self.pipeline_status = Some((
@@ -19620,9 +20503,7 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── PageDown (Board only) ─────────────────────────────
-                    Key::Named(NamedKey::PageDown)
-                        if self.active_view == SidebarView::Board =>
-                    {
+                    Key::Named(NamedKey::PageDown) if self.active_view == SidebarView::Board => {
                         let prev_sel = self.board_selected_issue();
                         self.board_sidebar.handle(&event, backend, list_b);
                         let new_sel = self.board_selected_issue();
@@ -19633,9 +20514,7 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── PageUp (Board only) ───────────────────────────────
-                    Key::Named(NamedKey::PageUp)
-                        if self.active_view == SidebarView::Board =>
-                    {
+                    Key::Named(NamedKey::PageUp) if self.active_view == SidebarView::Board => {
                         let prev_sel = self.board_selected_issue();
                         self.board_sidebar.handle(&event, backend, list_b);
                         let new_sel = self.board_selected_issue();
@@ -19647,16 +20526,14 @@ impl ShellApp for CoordApp {
 
                     // ── Arrow cursor movement inside the search box ───────
                     Key::Named(NamedKey::Left)
-                        if self.active_view == SidebarView::Board
-                            && self.board_search.focused =>
+                        if self.active_view == SidebarView::Board && self.board_search.focused =>
                     {
                         self.board_search.cursor_left();
                         self.rebuild_board_sidebar();
                         needs_redraw = true;
                     }
                     Key::Named(NamedKey::Right)
-                        if self.active_view == SidebarView::Board
-                            && self.board_search.focused =>
+                        if self.active_view == SidebarView::Board && self.board_search.focused =>
                     {
                         self.board_search.cursor_right();
                         self.rebuild_board_sidebar();
@@ -19693,8 +20570,7 @@ impl ShellApp for CoordApp {
 
                     // ── S — force issue sync (Board panel) ───────────────
                     Key::Char('S')
-                        if self.active_view == SidebarView::Board
-                            && !self.board_search.focused =>
+                        if self.active_view == SidebarView::Board && !self.board_search.focused =>
                     {
                         self.force_issue_sync();
                         needs_redraw = true;
@@ -19713,7 +20589,11 @@ impl ShellApp for CoordApp {
                                 self.last_notify = Instant::now();
                             }
                             SpawnQueuedOutcome::Queued => {
-                                self.push_toast("⏳ Queued", "notify runs after current command", ToastSeverity::Info);
+                                self.push_toast(
+                                    "⏳ Queued",
+                                    "notify runs after current command",
+                                    ToastSeverity::Info,
+                                );
                             }
                             SpawnQueuedOutcome::Deduped => {}
                         }
@@ -19733,12 +20613,17 @@ impl ShellApp for CoordApp {
                     // active only when the selected merge entry is blocked
                     // on review so the keybind doesn't silently skip review
                     // on unrelated merges.
-                    Key::Char('M')
-                        if self.merge_blocked_on_review_for_selected_issue() =>
-                    {
+                    Key::Char('M') if self.merge_blocked_on_review_for_selected_issue() => {
                         use crate::commands::SpawnQueuedOutcome;
-                        if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&["merge", "--skip-review"]) {
-                            self.push_toast("⏳ Queued", "merge --skip-review runs after current command", ToastSeverity::Info);
+                        if let SpawnQueuedOutcome::Queued = self
+                            .command_runner
+                            .spawn_queued(&["merge", "--skip-review"])
+                        {
+                            self.push_toast(
+                                "⏳ Queued",
+                                "merge --skip-review runs after current command",
+                                ToastSeverity::Info,
+                            );
                         }
                         needs_redraw = true;
                     }
@@ -19790,10 +20675,15 @@ impl ShellApp for CoordApp {
                             } else {
                                 let name = m.name.clone();
                                 use crate::commands::SpawnQueuedOutcome;
-                                if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&[
-                                    "agent", "restart", "--machine", &name,
-                                ]) {
-                                    self.push_toast("⏳ Queued", "agent restart runs after current command", ToastSeverity::Info);
+                                if let SpawnQueuedOutcome::Queued = self
+                                    .command_runner
+                                    .spawn_queued(&["agent", "restart", "--machine", &name])
+                                {
+                                    self.push_toast(
+                                        "⏳ Queued",
+                                        "agent restart runs after current command",
+                                        ToastSeverity::Info,
+                                    );
                                 }
                             }
                             needs_redraw = true;
@@ -19806,9 +20696,16 @@ impl ShellApp for CoordApp {
                             let name = m.name.clone();
                             use crate::commands::SpawnQueuedOutcome;
                             if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&[
-                                "agent", "update", "--machine", &name,
+                                "agent",
+                                "update",
+                                "--machine",
+                                &name,
                             ]) {
-                                self.push_toast("⏳ Queued", "agent update runs after current command", ToastSeverity::Info);
+                                self.push_toast(
+                                    "⏳ Queued",
+                                    "agent update runs after current command",
+                                    ToastSeverity::Info,
+                                );
                             }
                             needs_redraw = true;
                         }
@@ -19820,9 +20717,16 @@ impl ShellApp for CoordApp {
                             let name = m.name.clone();
                             use crate::commands::SpawnQueuedOutcome;
                             if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&[
-                                "agent", "clean-worktrees", "--machine", &name,
+                                "agent",
+                                "clean-worktrees",
+                                "--machine",
+                                &name,
                             ]) {
-                                self.push_toast("⏳ Queued", "agent clean-worktrees runs after current command", ToastSeverity::Info);
+                                self.push_toast(
+                                    "⏳ Queued",
+                                    "agent clean-worktrees runs after current command",
+                                    ToastSeverity::Info,
+                                );
                             }
                             needs_redraw = true;
                         }
@@ -19855,8 +20759,14 @@ impl ShellApp for CoordApp {
                         } else if let Some(a) = self.board_selected_failed_assignment() {
                             let id = a.id.clone();
                             use crate::commands::SpawnQueuedOutcome;
-                            if let SpawnQueuedOutcome::Queued = self.command_runner.spawn_queued(&["retry", &id]) {
-                                self.push_toast("⏳ Queued", "retry runs after current command", ToastSeverity::Info);
+                            if let SpawnQueuedOutcome::Queued =
+                                self.command_runner.spawn_queued(&["retry", &id])
+                            {
+                                self.push_toast(
+                                    "⏳ Queued",
+                                    "retry runs after current command",
+                                    ToastSeverity::Info,
+                                );
                             }
                             needs_redraw = true;
                         } else {
@@ -19893,9 +20803,7 @@ impl ShellApp for CoordApp {
                     // or if the user manually re-runs `gh` (i.e. this is in-memory only).
                     // Only fires when the selected issue is in the Done lifecycle section,
                     // preventing accidental dismissal of active work.
-                    Key::Char('D')
-                        if self.active_view == SidebarView::Pipeline =>
-                    {
+                    Key::Char('D') if self.active_view == SidebarView::Pipeline => {
                         if let Some(idx) = self.pipeline_sel {
                             if let Some(issue) = self.pipeline_issues.get(idx).cloned() {
                                 if self.pipeline_lifecycle_section(&issue) == "done" {
@@ -19977,8 +20885,7 @@ impl ShellApp for CoordApp {
                     // auto-on-completion would clobber the user's working
                     // copy mid-edit.
                     Key::Char('B')
-                        if self.pending_test_fail.is_none()
-                            && self.can_trigger_test_build() =>
+                        if self.pending_test_fail.is_none() && self.can_trigger_test_build() =>
                     {
                         if let Some(work_id) = self.pipeline_selected_work_id() {
                             let (branch, issue_number) = self
@@ -20016,10 +20923,10 @@ impl ShellApp for CoordApp {
                             && self.artifact_badge_visible() =>
                     {
                         use crate::commands::SpawnQueuedOutcome;
-                        if let Some((_, repo, sanitized, work_id)) =
-                            self.artifact_fetch_target()
-                        {
-                            let outcome = self.command_runner.spawn_queued(&["pull-artifact", &work_id]);
+                        if let Some((_, repo, sanitized, work_id)) = self.artifact_fetch_target() {
+                            let outcome = self
+                                .command_runner
+                                .spawn_queued(&["pull-artifact", &work_id]);
                             if outcome != SpawnQueuedOutcome::Deduped {
                                 self.pending_artifact_pull =
                                     Some((work_id.clone(), repo, sanitized));
@@ -20028,8 +20935,7 @@ impl ShellApp for CoordApp {
                                 } else {
                                     "Pulling artifacts…"
                                 };
-                                self.pipeline_status =
-                                    Some((status_msg.into(), Instant::now()));
+                                self.pipeline_status = Some((status_msg.into(), Instant::now()));
                             }
                         }
                         needs_redraw = true;
@@ -20039,7 +20945,9 @@ impl ShellApp for CoordApp {
                 }
             }
 
-            UiEvent::WindowResized { .. } => { needs_redraw = true; }
+            UiEvent::WindowResized { .. } => {
+                needs_redraw = true;
+            }
 
             _ => {}
         }
@@ -20130,11 +21038,18 @@ impl ShellApp for CoordApp {
                 // end_turn).  Otherwise the strip stays on its initial
                 // "Refinement chat → repo #N" label and the chat looks like
                 // it's just slow when really the session is dead.
-                let assignment_state = self.data.assignments.iter()
+                let assignment_state = self
+                    .data
+                    .assignments
+                    .iter()
                     .find(|a| a.id == id)
                     .map(|a| (a.status.clone(), a.assignment_type.clone()));
                 if let Some((status, atype)) = assignment_state {
-                    let issue_number = self.watch_pool.get(&id).map(|c| c.state.issue_number).unwrap_or(0);
+                    let issue_number = self
+                        .watch_pool
+                        .get(&id)
+                        .map(|c| c.state.issue_number)
+                        .unwrap_or(0);
                     let is_board_chat = issue_number == 0;
                     if let Some(ref mut chat) = self.inject_chat {
                         let label = match atype.as_deref() {
@@ -20173,7 +21088,11 @@ impl ShellApp for CoordApp {
                             }
                         };
                         let target = if is_board_chat {
-                            let repo = self.watch_pool.get(&id).map(|c| c.state.repo.clone()).unwrap_or_default();
+                            let repo = self
+                                .watch_pool
+                                .get(&id)
+                                .map(|c| c.state.repo.clone())
+                                .unwrap_or_default();
                             format!("  {} → {}{}", label, repo, suffix)
                         } else {
                             format!("  {} → #{}{}", label, issue_number, suffix)
@@ -20187,7 +21106,8 @@ impl ShellApp for CoordApp {
             // Throttle the spinner-driven redraw to ~10 fps so we don't
             // burn the 60 fps repaint budget on a glyph that only
             // changes ten times a second.
-            let busy = self.chat_last_activity
+            let busy = self
+                .chat_last_activity
                 .map(|t| t.elapsed() < std::time::Duration::from_secs(2))
                 .unwrap_or(false);
             if let Some(ref mut chat) = self.inject_chat {
@@ -20249,7 +21169,8 @@ fn parse_issue_proposal(text: &str) -> Option<(String, String)> {
     // multiple proposals exist in the transcript.
     let title_prefix = "TITLE:";
     let lines: Vec<&str> = full_text.lines().collect();
-    let title_idx = lines.iter()
+    let title_idx = lines
+        .iter()
         .rposition(|l| l.trim_start().starts_with(title_prefix))?;
     let title = lines[title_idx]
         .trim_start()
@@ -20286,24 +21207,31 @@ fn extract_json_text_content(line: &str) -> Option<String> {
     loop {
         match chars.next() {
             None | Some('"') => break,
-            Some('\\') => {
-                match chars.next() {
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some(c) => out.push(c),
-                    None => break,
-                }
-            }
+            Some('\\') => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(c) => out.push(c),
+                None => break,
+            },
             Some(c) => out.push(c),
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Shrink a `Rect` inward on all sides by `margin` (clamped to zero).
 fn shrink_rect(r: Rect, margin: f32) -> Rect {
     let m = margin.min(r.width / 2.0).min(r.height / 2.0).max(0.0);
-    Rect::new(r.x + m, r.y + m, (r.width - 2.0 * m).max(0.0), (r.height - 2.0 * m).max(0.0))
+    Rect::new(
+        r.x + m,
+        r.y + m,
+        (r.width - 2.0 * m).max(0.0),
+        (r.height - 2.0 * m).max(0.0),
+    )
 }
 
 /// #264: Build a chat transcript from a pool entry — merges the
@@ -20648,7 +21576,12 @@ fn parse_sse_log_readable(
         } else {
             None
         };
-        items.extend(parse_json_events_readable(line, &mut turn_n, elapsed, wrap_width));
+        items.extend(parse_json_events_readable(
+            line,
+            &mut turn_n,
+            elapsed,
+            wrap_width,
+        ));
         // Surface structured review verdict after result events.
         if line.contains("\"type\":\"result\"") {
             items.extend(extract_review_items(line));
@@ -20674,7 +21607,12 @@ fn parse_log_content_readable(content: &str, wrap_width: usize) -> Vec<ListItem>
             continue;
         }
         if is_json {
-            items.extend(parse_json_events_readable(line, &mut turn_n, None, wrap_width));
+            items.extend(parse_json_events_readable(
+                line,
+                &mut turn_n,
+                None,
+                wrap_width,
+            ));
             if line.contains("\"type\":\"result\"") {
                 items.extend(extract_review_items(line));
             }
@@ -20924,11 +21862,15 @@ fn first_meaningful_stderr_line(stderr: &str) -> Option<String> {
 fn pipeline_view_for_render(view: &QuiPipelineView) -> QuiPipelineView {
     QuiPipelineView {
         id: view.id.clone(),
-        stages: view.stages.iter().map(|s| QuiPipelineStage {
-            label: s.label.clone(),
-            status: s.status.clone(),
-            action: None,
-        }).collect(),
+        stages: view
+            .stages
+            .iter()
+            .map(|s| QuiPipelineStage {
+                label: s.label.clone(),
+                status: s.status.clone(),
+                action: None,
+            })
+            .collect(),
         focused_stage: view.focused_stage,
     }
 }
@@ -20937,7 +21879,11 @@ fn pipeline_view_for_render(view: &QuiPipelineView) -> QuiPipelineView {
 /// any stage has a dispatchable action.  Zero when the bar is empty (no
 /// vertical space stolen from the stage row in that case).
 fn pipeline_action_bar_height(has_button: bool, lh: f32) -> f32 {
-    if has_button { lh * 1.5 } else { 0.0 }
+    if has_button {
+        lh * 1.5
+    } else {
+        0.0
+    }
 }
 
 /// Carve out the rect used by the PipelineView primitive at the top of the
@@ -20968,7 +21914,11 @@ fn issue_body_list(
     let mut items: Vec<ListItem> = Vec::new();
     match issue {
         None => {
-            items.push(kv_item("", " No issue selected", Some(Color::rgb(100, 100, 100))));
+            items.push(kv_item(
+                "",
+                " No issue selected",
+                Some(Color::rgb(100, 100, 100)),
+            ));
         }
         Some((number, title, body, labels)) => {
             items.push(ListItem {
@@ -20991,7 +21941,11 @@ fn issue_body_list(
             }
             items.push(kv_item("", "", None));
             if body.is_empty() {
-                items.push(kv_item("", " (no description)", Some(Color::rgb(100, 100, 100))));
+                items.push(kv_item(
+                    "",
+                    " (no description)",
+                    Some(Color::rgb(100, 100, 100)),
+                ));
             } else {
                 // #372-pattern: render the whole body through the markdown adapter
                 // so headings, bold, italic, inline code, lists, blockquotes, and
@@ -21029,7 +21983,10 @@ fn issue_body_list(
 /// Build a non-interactive category label `FormField` for the settings form.
 fn settings_label(text: &str) -> FormField {
     FormField {
-        id: WidgetId::new(format!("settings-label:{}", text.to_lowercase().replace(' ', "-"))),
+        id: WidgetId::new(format!(
+            "settings-label:{}",
+            text.to_lowercase().replace(' ', "-")
+        )),
         label: StyledText::plain(text.to_string()),
         kind: FieldKind::Label,
         hint: StyledText::default(),
@@ -21265,7 +22222,10 @@ mod tests {
     #[test]
     fn collapse_ws_flattens_newlines_and_runs() {
         assert_eq!(collapse_ws("a\n\nb   c\t d"), "a b c d");
-        assert_eq!(collapse_ws("  leading and trailing  "), "leading and trailing");
+        assert_eq!(
+            collapse_ws("  leading and trailing  "),
+            "leading and trailing"
+        );
         assert_eq!(collapse_ws(""), "");
     }
 
@@ -21280,7 +22240,10 @@ mod tests {
         let mut turn = 0;
         let item = parse_json_event(&line, &mut turn).expect("assistant item");
         let text: String = item.text.spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(text.contains(&long), "full text should be present: {text:?}");
+        assert!(
+            text.contains(&long),
+            "full text should be present: {text:?}"
+        );
         assert!(!text.contains('"'), "should not be debug-quoted: {text:?}");
     }
 
@@ -21294,7 +22257,10 @@ mod tests {
         let mut turn = 0;
         let item = parse_json_event(line, &mut turn).expect("assistant item");
         let text: String = item.text.spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(text.contains("weighing the two options"), "thinking missing: {text:?}");
+        assert!(
+            text.contains("weighing the two options"),
+            "thinking missing: {text:?}"
+        );
     }
 
     #[test]
@@ -21570,7 +22536,12 @@ mod tests {
 
     // ── Issue grouping (replaces old pipeline tests) ─────────────────────────
 
-    fn make_assignment_typed(status: &str, issue: u64, repo: &str, atype: Option<&str>) -> Assignment {
+    fn make_assignment_typed(
+        status: &str,
+        issue: u64,
+        repo: &str,
+        atype: Option<&str>,
+    ) -> Assignment {
         Assignment {
             id: format!("id-{}-{}", issue, status),
             repo: repo.to_string(),
@@ -21789,10 +22760,7 @@ mod tests {
         // text is JSON-encoded (`\n` → `\\n`).
         let line = r#"{"type":"result","result":"REVIEW_VERDICT: approve\nREVIEW_BODY:\n## Summary\n\nLGTM.\nEND_REVIEW"}"#;
         let items = extract_review_items(line);
-        let texts: Vec<String> = items
-            .iter()
-            .map(|i| i.text.spans[0].text.clone())
-            .collect();
+        let texts: Vec<String> = items.iter().map(|i| i.text.spans[0].text.clone()).collect();
         // First item is the verdict header.
         assert!(texts[0].contains("[review]"));
         assert!(texts[0].contains("approve"));
@@ -21813,7 +22781,8 @@ mod tests {
 
     #[test]
     fn parse_json_event_init_returns_item() {
-        let json = r#"{"type":"system","subtype":"init","model":"claude-sonnet-4-6","session_id":"abc"}"#;
+        let json =
+            r#"{"type":"system","subtype":"init","model":"claude-sonnet-4-6","session_id":"abc"}"#;
         let mut n = 0;
         let item = parse_json_event(json, &mut n);
         assert!(item.is_some());
@@ -22024,8 +22993,7 @@ mod tests {
             (main_b.height - tb_h - tab_h).max(0.0),
         );
         // Skip the bar; the stage row sits below it.
-        let bar_h = pipeline_action_bar_height(
-            app.pipeline_action_button().is_some(), lh);
+        let bar_h = pipeline_action_bar_height(app.pipeline_action_button().is_some(), lh);
         let pv_origin = Rect::new(
             content_rect.x,
             content_rect.y + bar_h,
@@ -22043,8 +23011,11 @@ mod tests {
 
         let result = app.mouse_main_click(click_pos, main_b, lh);
         assert!(result, "click on stage body should be handled");
-        assert_eq!(app.pipeline_focused_stage, Some(0),
-            "click on Work box should set pipeline_focused_stage = 0");
+        assert_eq!(
+            app.pipeline_focused_stage,
+            Some(0),
+            "click on Work box should set pipeline_focused_stage = 0"
+        );
     }
 
     // #303: clicking the pipeline action bar (above the stage row) dispatches
@@ -22061,7 +23032,8 @@ mod tests {
         app.pipeline_sel = Some(0);
 
         // Sanity: with no assignments, Work owns the [Go] action.
-        let (label, idx) = app.pipeline_action_button()
+        let (label, idx) = app
+            .pipeline_action_button()
             .expect("Work should carry a [Go] action when pristine");
         assert_eq!(label, "Go");
         assert_eq!(idx, 0);
@@ -22192,7 +23164,10 @@ mod tests {
     fn board_search_section_is_section_zero() {
         let mut app = make_app_default();
         app.rebuild_board_sidebar();
-        assert!(app.board_sidebar.form(0).is_some(), "section 0 should be the search form");
+        assert!(
+            app.board_sidebar.form(0).is_some(),
+            "section 0 should be the search form"
+        );
     }
 
     #[test]
@@ -22271,7 +23246,10 @@ mod tests {
         // rows after 7d) must NOT pollute In-flight.  Route to
         // Completed instead.
         let app = make_app_with_assignments(vec![make_assignment_typed(
-            "done", 42, "repo-a", Some("work"),
+            "done",
+            42,
+            "repo-a",
+            Some("work"),
         )]);
         // No open_issues entry → has_open_record is false.
         let cache = app.board_issues_cache.clone();
@@ -22289,7 +23267,10 @@ mod tests {
         // freshly-dispatched issue the brain hasn't synced yet — must
         // STAY in In-flight so the user can see it working.
         let app = make_app_with_assignments(vec![make_assignment_typed(
-            "running", 99, "repo-a", Some("work"),
+            "running",
+            99,
+            "repo-a",
+            Some("work"),
         )]);
         let cache = app.board_issues_cache.clone();
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
@@ -22301,7 +23282,10 @@ mod tests {
         // status_summary == "merged" implies the PR closed the issue
         // via `fixes #N` even before the brain has synced the close.
         let mut app = make_app_with_assignments(vec![make_assignment_typed(
-            "done", 7, "repo-a", Some("work"),
+            "done",
+            7,
+            "repo-a",
+            Some("work"),
         )]);
         // Cache says open, but the merge_queue marks the work merged
         // → status_summary becomes "merged" → Completed.
@@ -22361,10 +23345,8 @@ mod tests {
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
-        let by_key: std::collections::HashMap<&str, usize> = groups
-            .iter()
-            .map(|(k, v)| (*k, v.len()))
-            .collect();
+        let by_key: std::collections::HashMap<&str, usize> =
+            groups.iter().map(|(k, v)| (*k, v.len())).collect();
         assert_eq!(by_key.get("backlog"), Some(&1), "Backlog count");
         assert_eq!(by_key.get("refining"), Some(&1), "Refining count");
         assert_eq!(by_key.get("refined"), Some(&1), "Refined count");
@@ -22378,44 +23360,62 @@ mod tests {
         // One issue per section that has rows (Backlog, Refining,
         // Refined, In-flight, Completed).
         app.data.open_issues.push(OpenIssue {
-            repo_name: "repo-a".to_string(), number: 1,
-            title: "b".to_string(), body: String::new(),
-            state: "open".to_string(), labels: Vec::new(),
-            milestone_number: None, milestone_title: None,
+            repo_name: "repo-a".to_string(),
+            number: 1,
+            title: "b".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         app.data.open_issues.push(OpenIssue {
-            repo_name: "repo-a".to_string(), number: 2,
-            title: "r".to_string(), body: String::new(),
+            repo_name: "repo-a".to_string(),
+            number: 2,
+            title: "r".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:refining".to_string()],
-            milestone_number: None, milestone_title: None,
+            milestone_number: None,
+            milestone_title: None,
         });
         app.data.open_issues.push(OpenIssue {
-            repo_name: "repo-a".to_string(), number: 3,
-            title: "rd".to_string(), body: String::new(),
+            repo_name: "repo-a".to_string(),
+            number: 3,
+            title: "rd".to_string(),
+            body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:ready".to_string()],
-            milestone_number: None, milestone_title: None,
+            milestone_number: None,
+            milestone_title: None,
         });
         // Issue 4: in-flight (open issue with running assignment).
-        app.data.assignments.push(make_assignment_typed(
-            "running", 4, "repo-a", Some("work"),
-        ));
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 4, "repo-a", Some("work")));
         app.data.open_issues.push(OpenIssue {
-            repo_name: "repo-a".to_string(), number: 4,
-            title: "if".to_string(), body: String::new(),
-            state: "open".to_string(), labels: Vec::new(),
-            milestone_number: None, milestone_title: None,
+            repo_name: "repo-a".to_string(),
+            number: 4,
+            title: "if".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         // Issue 5: completed (closed issue with done assignment).
-        app.data.assignments.push(make_assignment_typed(
-            "done", 5, "repo-a", Some("work"),
-        ));
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 5, "repo-a", Some("work")));
         app.data.open_issues.push(OpenIssue {
-            repo_name: "repo-a".to_string(), number: 5,
-            title: "c".to_string(), body: String::new(),
-            state: "closed".to_string(), labels: Vec::new(),
-            milestone_number: None, milestone_title: None,
+            repo_name: "repo-a".to_string(),
+            number: 5,
+            title: "c".to_string(),
+            body: String::new(),
+            state: "closed".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
         });
         app.rebuild_board_sidebar();
         let cache = app.board_issues_cache.clone();
@@ -22433,7 +23433,10 @@ mod tests {
         // Completed, not In-flight, regardless of the assignment's own
         // status_summary.
         let mut app = make_app_with_assignments(vec![make_assignment_typed(
-            "done", 10, "repo-a", Some("work"),
+            "done",
+            10,
+            "repo-a",
+            Some("work"),
         )]);
         // Mark issue #10 as closed in the open_issues cache.
         app.data.open_issues.push(OpenIssue {
@@ -22546,17 +23549,18 @@ mod tests {
         let app = make_pipeline_app();
         assert_eq!(
             app.pipeline_stage_names(),
-            vec!["work".to_string(), "review".to_string(), "merge".to_string()]
+            vec![
+                "work".to_string(),
+                "review".to_string(),
+                "merge".to_string()
+            ]
         );
     }
 
     #[test]
     fn pipeline_stage_names_dedupes_explicit_work_in_gates() {
         let mut app = make_pipeline_app();
-        app.data.pipeline_default_gates = vec![
-            "work".to_string(),
-            "review".to_string(),
-        ];
+        app.data.pipeline_default_gates = vec!["work".to_string(), "review".to_string()];
         // Explicit "work" in default_gates must not duplicate the prepended one.
         assert_eq!(
             app.pipeline_stage_names(),
@@ -22607,7 +23611,10 @@ mod tests {
         let issue = app.pipeline_issues[0].clone();
         // Work stage has no assignments (plan one belongs to Plan).
         let work = app.assignments_for_stage(&issue, "work");
-        assert!(work.is_empty(), "plan must not fold into Work when Plan stage exists");
+        assert!(
+            work.is_empty(),
+            "plan must not fold into Work when Plan stage exists"
+        );
         // Plan stage owns the plan-typed assignment.
         let plan_stage = app.assignments_for_stage(&issue, "plan");
         assert_eq!(plan_stage.len(), 1);
@@ -22695,9 +23702,9 @@ mod tests {
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
         });
-        app.data.assignments.push(make_assignment_typed(
-            "running", 43, "api", Some("work"),
-        ));
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 43, "api", Some("work")));
         // Add #44 as closed with an assignment → Done.
         app.pipeline_issues.push(PipelineIssue {
             number: 44,
@@ -22709,9 +23716,9 @@ mod tests {
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: true,
         });
-        app.data.assignments.push(make_assignment_typed(
-            "done", 44, "api", Some("work"),
-        ));
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 44, "api", Some("work")));
 
         let groups = app.pipeline_groups_for_repo("api");
         let order: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
@@ -22737,7 +23744,9 @@ mod tests {
         app.pipeline_issues[0]
             .all_labels
             .retain(|l| !l.starts_with("status:"));
-        app.pipeline_issues[0].all_labels.push("status:refining".to_string());
+        app.pipeline_issues[0]
+            .all_labels
+            .push("status:refining".to_string());
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "refining");
     }
@@ -22745,7 +23754,9 @@ mod tests {
     #[test]
     fn rebuild_pipeline_sidebar_lifecycle_pending() {
         let mut app = make_pipeline_app();
-        app.pipeline_issues[0].all_labels.push("status:ready".to_string());
+        app.pipeline_issues[0]
+            .all_labels
+            .push("status:ready".to_string());
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "pending");
     }
@@ -22753,7 +23764,9 @@ mod tests {
     #[test]
     fn rebuild_pipeline_sidebar_lifecycle_in_progress_beats_ready_label() {
         let mut app = make_pipeline_app();
-        app.pipeline_issues[0].all_labels.push("status:ready".to_string());
+        app.pipeline_issues[0]
+            .all_labels
+            .push("status:ready".to_string());
         app.data.assignments.push(Assignment {
             id: "x1".to_string(),
             repo: "api".to_string(),
@@ -22784,7 +23797,9 @@ mod tests {
     #[test]
     fn rebuild_pipeline_sidebar_lifecycle_refinement_only_is_pending_not_in_progress() {
         let mut app = make_pipeline_app();
-        app.pipeline_issues[0].all_labels.push("status:ready".to_string());
+        app.pipeline_issues[0]
+            .all_labels
+            .push("status:ready".to_string());
         // A done refinement chat is scoping, not work — it must NOT pin a
         // status:ready issue to in-progress; it belongs in New (pending).
         app.data.assignments.push(Assignment {
@@ -22830,7 +23845,9 @@ mod tests {
         // Issue #42 is open (is_closed=false by default in make_pipeline_app).
         assert!(!app.pipeline_issues[0].is_closed);
         // Add a done work assignment for issue #42.
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
         // Add a merge_queue entry with state="merged" for issue #42.
         app.data.merge_queue.push(MergeQueueEntry {
             assignment_id: "w1".to_string(),
@@ -23260,9 +24277,9 @@ mod tests {
             all_labels: vec!["coord".to_string(), "status:ready".to_string()],
             is_closed: false,
         });
-        app.data.assignments.push(make_assignment_typed(
-            "running", 77, "api", Some("work"),
-        ));
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 77, "api", Some("work")));
 
         app.rebuild_pipeline_sidebar(None);
 
@@ -23339,7 +24356,10 @@ mod tests {
         assert!(!f.matches(99, "unrelated title"), "no substring → no match");
 
         f.set_value("COOL");
-        assert!(f.matches(7, "Add cool thing"), "case-insensitive title match");
+        assert!(
+            f.matches(7, "Add cool thing"),
+            "case-insensitive title match"
+        );
         assert!(!f.matches(7, "boring"), "no title substring → no match");
     }
 
@@ -23440,13 +24460,18 @@ mod tests {
         // Default selection lands on the first issue (#42) of the first
         // repo inside the "New" section.
         assert_eq!(
-            app.pipeline_sel.and_then(|i| app.pipeline_issues.get(i)).map(|i| i.number),
+            app.pipeline_sel
+                .and_then(|i| app.pipeline_issues.get(i))
+                .map(|i| i.number),
             Some(42),
         );
         // The active section is a state section, i.e. >= search_offset (1),
         // never the FILTER form at section 0.
         let active = app.pipeline_sidebar.active_section().unwrap();
-        assert!(active >= 1, "active section is a state section, not the FILTER form");
+        assert!(
+            active >= 1,
+            "active section is a state section, not the FILTER form"
+        );
         // Resolving the sidebar selection returns the same index as pipeline_sel.
         assert_eq!(app.selected_pipeline_index(), app.pipeline_sel);
     }
@@ -23496,16 +24521,16 @@ mod tests {
         // Three repos sharing first letter 'a'.
         let all = repos(&["alpha", "apricot", "azure"]);
         // "al" uniquely identifies "alpha", "ap" → "apricot", "az" → "azure".
-        assert_eq!(CoordApp::repo_tag("alpha",   &all), "Al");
+        assert_eq!(CoordApp::repo_tag("alpha", &all), "Al");
         assert_eq!(CoordApp::repo_tag("apricot", &all), "Ap");
-        assert_eq!(CoordApp::repo_tag("azure",   &all), "Az");
+        assert_eq!(CoordApp::repo_tag("azure", &all), "Az");
     }
 
     #[test]
     fn repo_tag_case_insensitive_collision_detection() {
         // Collision detection ignores case.
         let all = repos(&["Foo", "fuzz"]);
-        assert_eq!(CoordApp::repo_tag("Foo",  &all), "Fo");
+        assert_eq!(CoordApp::repo_tag("Foo", &all), "Fo");
         assert_eq!(CoordApp::repo_tag("fuzz", &all), "Fu");
     }
 
@@ -23515,9 +24540,9 @@ mod tests {
         // single-letter repo tag badge.  New/Done rows use path [ri, ii].
         let mut app = make_pipeline_app();
         // Make issue #42 active (add an assignment).
-        app.data.assignments.push(make_assignment_typed(
-            "running", 42, "api", Some("work"),
-        ));
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 42, "api", Some("work")));
         app.rebuild_pipeline_sidebar(None);
 
         // "Active" section must now be section 1.
@@ -23571,12 +24596,7 @@ mod tests {
 
     /// Helper: an assignment of `kind` (work/review/etc.) for issue 42 on `api`
     /// at the given dispatched_at, terminal status `done` unless overridden.
-    fn _stage_assignment(
-        id: &str,
-        kind: &str,
-        dispatched_at: f64,
-        status: &str,
-    ) -> Assignment {
+    fn _stage_assignment(id: &str, kind: &str, dispatched_at: f64, status: &str) -> Assignment {
         Assignment {
             id: id.to_string(),
             repo: "api".to_string(),
@@ -23606,10 +24626,16 @@ mod tests {
         // The user's #214 case: Work was re-dispatched after a request-changes
         // review. Previously Review showed Done (green); should now show Stale.
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "done"));
         // Work re-dispatched (later than the review).
-        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w2", "work", 300.0, "done"));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
         assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Stale);
@@ -23620,9 +24646,15 @@ mod tests {
         // A Failed review against an older Work is still Stale once Work re-runs:
         // the failure was about a diff that no longer exists.
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "failed"));
-        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "failed"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w2", "work", 300.0, "done"));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Stale);
     }
@@ -23631,8 +24663,12 @@ mod tests {
     fn stage_status_done_when_no_upstream_redispatch() {
         // Same setup minus the re-dispatch → Review stays Done (still trustworthy).
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "done"));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Done);
     }
@@ -23642,8 +24678,12 @@ mod tests {
         // Work is the first dispatchable stage; there's no upstream to invalidate
         // it. Even with multiple dispatched_at values, latest wins as Done.
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w2", "work", 300.0, "done"));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
     }
@@ -23653,9 +24693,15 @@ mod tests {
         // If a stage has a Running assignment, that wins over any verdict —
         // staleness only matters for terminal states.
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "running"));
-        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "running"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w2", "work", 300.0, "done"));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Active);
     }
@@ -23663,7 +24709,9 @@ mod tests {
     #[test]
     fn upstream_max_dispatched_at_returns_none_for_first_stage() {
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.upstream_max_dispatched_at(issue, "work"), None);
     }
@@ -23673,9 +24721,15 @@ mod tests {
         // Pipeline is work → review → merge. Querying upstream of merge should
         // see the latest dispatch across BOTH work AND review.
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 250.0, "done"));
-        app.data.assignments.push(_stage_assignment("w2", "work", 150.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 250.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w2", "work", 150.0, "done"));
         let issue = &app.pipeline_issues[0];
         // Max across {work,review} prior to merge = 250 (the review).
         assert_eq!(app.upstream_max_dispatched_at(issue, "merge"), Some(250.0));
@@ -23685,9 +24739,15 @@ mod tests {
     fn pipeline_widget_attaches_retry_to_stale_stage_when_prior_settled() {
         // Stale + upstream Done → [Retry] button so the user can re-run.
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
-        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w2", "work", 300.0, "done"));
         app.pipeline_sel = Some(0);
         let view = app.build_pipeline_widget().expect("widget");
         // Stage layout: work, review, merge.
@@ -23701,9 +24761,15 @@ mod tests {
         // Stale + upstream Running → no button (waiting for upstream to settle
         // before user can act).
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
-        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "running"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w2", "work", 300.0, "running"));
         app.pipeline_sel = Some(0);
         let view = app.build_pipeline_widget().expect("widget");
         let review = &view.stages[1];
@@ -23718,8 +24784,11 @@ mod tests {
     /// predates #200; this helper inserts the Test gate.
     fn make_pipeline_app_with_test_gate() -> CoordApp {
         let mut app = make_pipeline_app();
-        app.data.pipeline_default_gates =
-            vec!["test".to_string(), "review".to_string(), "merge".to_string()];
+        app.data.pipeline_default_gates = vec![
+            "test".to_string(),
+            "review".to_string(),
+            "merge".to_string(),
+        ];
         app
     }
 
@@ -23737,7 +24806,9 @@ mod tests {
     #[test]
     fn test_stage_pending_when_work_done_no_verdict() {
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Pending);
     }
@@ -23745,7 +24816,9 @@ mod tests {
     #[test]
     fn test_stage_done_when_passed() {
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Done);
     }
@@ -23753,7 +24826,9 @@ mod tests {
     #[test]
     fn test_stage_done_when_skipped() {
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("skipped")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("skipped")));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Done);
     }
@@ -23765,8 +24840,12 @@ mod tests {
         // Test must stay Done — reverting to Pending strands the Merge "Go"
         // button via prior_all_done.
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
-        app.data.assignments.push(_work_assignment("w2", 200.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w2", 200.0, "done", None));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.test_stage_status_for(issue), StageStatus::Done);
     }
@@ -23776,8 +24855,12 @@ mod tests {
         // A later fix-work that was actually re-tested and FAILED must win over
         // the earlier pass — the most recent carrier of a verdict decides.
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
-        app.data.assignments.push(_work_assignment("w2", 200.0, "done", Some("failed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w2", 200.0, "done", Some("failed")));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.test_stage_status_for(issue), StageStatus::Failed);
     }
@@ -23785,7 +24868,9 @@ mod tests {
     #[test]
     fn test_stage_failed_when_failed_verdict() {
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("failed")));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Failed);
     }
@@ -23793,7 +24878,9 @@ mod tests {
     #[test]
     fn test_stage_pending_when_work_not_done() {
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "running", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "running", None));
         let issue = &app.pipeline_issues[0];
         // Work is Active → Test inherits Pending (nothing to gate yet).
         assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Pending);
@@ -23807,8 +24894,12 @@ mod tests {
         // the prior pass is inherited — see
         // `test_stage_survives_review_bounce_fix_work_with_no_verdict`.)
         let mut app = make_pipeline_app_with_test_gate();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
-        app.data.assignments.push(_work_assignment("w2", 300.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w2", 300.0, "done", Some("passed")));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Done);
     }
@@ -23820,7 +24911,9 @@ mod tests {
         // Empty board → no work yet → not actionable.
         assert!(!app.test_gate_actionable());
         // Add running work → still not actionable.
-        app.data.assignments.push(_work_assignment("w1", 100.0, "running", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "running", None));
         assert!(!app.test_gate_actionable());
         // Work done, no verdict → actionable.
         app.data.assignments[0].status = "done".into();
@@ -23835,7 +24928,9 @@ mod tests {
         // make_pipeline_app (no test gate configured) → never actionable.
         let mut app = make_pipeline_app();
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         assert!(!app.test_gate_actionable());
     }
 
@@ -23844,8 +24939,12 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
         assert_eq!(app.pipeline_selected_work_id(), None);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
-        app.data.assignments.push(_work_assignment("w2", 300.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w2", 300.0, "done", None));
         assert_eq!(app.pipeline_selected_work_id(), Some("w2".to_string()));
     }
 
@@ -23855,7 +24954,9 @@ mod tests {
     fn can_dispatch_review_after_test_done_false_outside_pipeline_view() {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
         // Default view is Board — predicate must refuse.
         assert!(!app.can_dispatch_review_after_test_done());
     }
@@ -23865,7 +24966,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
         // No review assignment yet → Review is Pending → predicate true.
         assert!(app.can_dispatch_review_after_test_done());
     }
@@ -23876,7 +24979,9 @@ mod tests {
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
         // Work done but no verdict → Test=Pending, not Done.
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         assert!(!app.can_dispatch_review_after_test_done());
     }
 
@@ -23885,7 +24990,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("failed")));
         // Test=Failed is the bounce-back-to-Work case, not the Review one.
         assert!(!app.can_dispatch_review_after_test_done());
     }
@@ -23895,9 +25002,13 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
         // Review already done → no need for R=dispatch review affordance.
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "done"));
         assert!(!app.can_dispatch_review_after_test_done());
     }
 
@@ -23921,7 +25032,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("failed")));
         assert!(app.can_bounce_work_after_test_fail());
     }
 
@@ -23930,7 +25043,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
         assert!(!app.can_bounce_work_after_test_fail());
     }
 
@@ -23938,7 +25053,9 @@ mod tests {
     fn can_bounce_work_after_test_fail_false_outside_pipeline_view() {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("failed")));
         // Default view is Board — predicate refuses regardless of state.
         assert!(!app.can_bounce_work_after_test_fail());
     }
@@ -23948,7 +25065,9 @@ mod tests {
         let mut app = make_pipeline_app(); // no "test" in default_gates
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("failed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("failed")));
         // No test stage in the pipeline → predicate refuses (nothing to gate on).
         assert!(!app.can_bounce_work_after_test_fail());
     }
@@ -23965,9 +25084,12 @@ mod tests {
         app.pipeline_sel = Some(0);
         app.pending_force_merge = Some("api".to_string());
 
-        let dialog = app.build_prompt_dialog()
+        let dialog = app
+            .build_prompt_dialog()
             .expect("expected a force-merge dialog");
-        let body_text: String = dialog.body.iter()
+        let body_text: String = dialog
+            .body
+            .iter()
             .flat_map(|b| b.spans.iter())
             .map(|s| s.text.as_str())
             .collect::<Vec<_>>()
@@ -23979,9 +25101,16 @@ mod tests {
         // Status bar still shows the normal Pipeline hint (dialog is the
         // affordance; status bar reverts to prior content).
         let bar = app.status_bar();
-        let hint = bar.right_segments.iter().map(|s| s.text.clone())
-            .collect::<Vec<_>>().join(" ");
-        assert!(!hint.contains("Force-merge"), "force-merge hint should not be in status bar: {hint}");
+        let hint = bar
+            .right_segments
+            .iter()
+            .map(|s| s.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !hint.contains("Force-merge"),
+            "force-merge hint should not be in status bar: {hint}"
+        );
     }
 
     #[test]
@@ -23990,9 +25119,12 @@ mod tests {
         let mut app = make_pipeline_app();
         app.pending_force_merge = Some(String::new());
 
-        let dialog = app.build_prompt_dialog()
+        let dialog = app
+            .build_prompt_dialog()
             .expect("expected a force-merge dialog");
-        let body_text: String = dialog.body.iter()
+        let body_text: String = dialog
+            .body
+            .iter()
             .flat_map(|b| b.spans.iter())
             .map(|s| s.text.as_str())
             .collect::<Vec<_>>()
@@ -24013,12 +25145,25 @@ mod tests {
         app.pipeline_sel = Some(0);
         app.pending_force_merge = Some("api".to_string());
         let bar = app.status_bar();
-        let hint = bar.right_segments.iter().map(|s| s.text.clone())
-            .collect::<Vec<_>>().join(" ");
-        assert!(!hint.contains("Force-merge"), "force-merge prompt leaked into status bar: {hint}");
-        assert!(!hint.contains("y=confirm"), "confirm key hint leaked into status bar: {hint}");
+        let hint = bar
+            .right_segments
+            .iter()
+            .map(|s| s.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !hint.contains("Force-merge"),
+            "force-merge prompt leaked into status bar: {hint}"
+        );
+        assert!(
+            !hint.contains("y=confirm"),
+            "confirm key hint leaked into status bar: {hint}"
+        );
         // A dialog should be buildable.
-        assert!(app.build_prompt_dialog().is_some(), "expected dialog to be Some");
+        assert!(
+            app.build_prompt_dialog().is_some(),
+            "expected dialog to be Some"
+        );
     }
 
     // ── #253: merge-blocked-on-review predicate ────────────────────────────
@@ -24570,7 +25715,9 @@ mod tests {
 
         // Work done, no branch → still false (the user has nothing local
         // to check out).
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         app.active_view = SidebarView::Pipeline;
         assert!(!app.can_trigger_test_build(), "no branch → no B");
 
@@ -24588,7 +25735,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         app.data.assignments[0].branch = Some("issue-42-x".into());
         assert!(app.can_trigger_test_build());
 
@@ -24602,7 +25751,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
         app.data.assignments[0].branch = Some("issue-42-x".into());
         // Verdict recorded → Test stage is Done → gate not actionable → no B.
         assert!(!app.can_trigger_test_build());
@@ -24613,7 +25764,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         app.data.assignments[0].branch = Some("issue-42-x".into());
 
         // Before build: Test is Pending.
@@ -24627,7 +25780,10 @@ mod tests {
 
         // build_pipeline_widget swaps the Test stage label to "Building".
         let view = app.build_pipeline_widget().expect("widget");
-        let test_stage = view.stages.iter().find(|s| s.label == "Building")
+        let test_stage = view
+            .stages
+            .iter()
+            .find(|s| s.label == "Building")
             .expect("Test stage label should be Building while job in flight");
         assert_eq!(test_stage.status, StageStatus::Active);
     }
@@ -24641,7 +25797,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
         app.data.assignments[0].branch = Some("issue-42-x".into());
 
         let issue = &app.pipeline_issues[0];
@@ -24657,7 +25815,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         app.data.assignments[0].branch = Some("issue-42-x".into());
 
         let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
@@ -24665,7 +25825,11 @@ mod tests {
         assert!(app.toasts.is_empty());
 
         // Worker thread reports success.
-        tx.send(TestBuildOutcome { exit_code: 0, first_error: String::new() }).unwrap();
+        tx.send(TestBuildOutcome {
+            exit_code: 0,
+            first_error: String::new(),
+        })
+        .unwrap();
         // Empty channel & non-empty queue: nothing happens until we poll.
         assert!(app.poll_test_build_jobs());
         assert_eq!(app.test_build_jobs.len(), 0);
@@ -24677,7 +25841,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         app.data.assignments[0].branch = Some("issue-42-x".into());
 
         let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
@@ -24707,7 +25873,9 @@ mod tests {
         let mut app = make_pipeline_app_with_test_gate();
         app.pipeline_sel = Some(0);
         app.active_view = SidebarView::Pipeline;
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         app.data.assignments[0].branch = Some("issue-42-x".into());
 
         let tx = _inject_test_build_job(&mut app, "w1", 42, "issue-42-x");
@@ -24858,7 +26026,9 @@ mod tests {
         // synced yet, but the merge_queue entry already says "merged".
         assert!(!app.pipeline_issues[0].is_closed);
         // Work assignment: done.
-        app.data.assignments.push(_stage_assignment("w1", "work", 1.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 1.0, "done"));
         // No review assignment — review ran implicitly as part of the merge PR.
         // Merge queue: merged (the actual coordinator merge completed).
         app.data.merge_queue.push(MergeQueueEntry {
@@ -24905,11 +26075,17 @@ mod tests {
         let mut app = make_pipeline_app();
         app.pipeline_issues[0].is_closed = true;
         // Review done at t=200, based on first work (dispatched at t=100).
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "done"));
         // Work re-dispatched later (t=300) — makes review Stale because
         // upstream_max_dispatched_at("review") = 300 > review.dispatched_at = 200.
-        app.data.assignments.push(_stage_assignment("w2", "work", 300.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w2", "work", 300.0, "done"));
         let issue = &app.pipeline_issues[0];
         // Confirm the stale condition is live (review stage is Stale).
         assert_eq!(app.stage_status_for(issue, "review"), StageStatus::Stale);
@@ -24961,7 +26137,11 @@ mod tests {
         assert_eq!(view.stages[2].status, StageStatus::Skipped);
         // No Go/Retry actions on any stage (issue is closed).
         for s in &view.stages {
-            assert!(s.action.is_none(), "stage {} should have no action", s.label);
+            assert!(
+                s.action.is_none(),
+                "stage {} should have no action",
+                s.label
+            );
         }
     }
 
@@ -25002,7 +26182,10 @@ mod tests {
             "expected closed-without-pipeline message, got: {text:?}"
         );
         // No stage headers (Work / Review / Merge) should appear.
-        assert!(!text.contains("Work"), "Work stage row should be suppressed");
+        assert!(
+            !text.contains("Work"),
+            "Work stage row should be suppressed"
+        );
     }
 
     #[test]
@@ -25217,7 +26400,11 @@ mod tests {
         let view = app.build_pipeline_widget().unwrap();
         // Without a coord_repo, Go is suppressed — we can't dispatch.
         for stage in &view.stages {
-            assert!(stage.action.is_none(), "stage {:?} should have no action", stage.label);
+            assert!(
+                stage.action.is_none(),
+                "stage {:?} should have no action",
+                stage.label
+            );
         }
     }
 
@@ -25256,7 +26443,10 @@ mod tests {
             Some("Go"),
             "Review should now own the Go button"
         );
-        assert!(view.stages[2].action.is_none(), "Merge still gated on review");
+        assert!(
+            view.stages[2].action.is_none(),
+            "Merge still gated on review"
+        );
     }
 
     /// Work + review both done, merge_queue empty → [Go] on Merge stage.
@@ -25424,9 +26614,15 @@ mod tests {
             "flip from clean → failed should toast once",
         );
         let body = app.toasts.last().expect("toast").0.body.to_string();
-        assert!(body.contains("acme/api"), "toast names the repo, got {body:?}");
+        assert!(
+            body.contains("acme/api"),
+            "toast names the repo, got {body:?}"
+        );
         assert!(body.contains("#7"), "toast names the PR, got {body:?}");
-        assert!(body.contains("build"), "toast names the check, got {body:?}");
+        assert!(
+            body.contains("build"),
+            "toast names the check, got {body:?}"
+        );
 
         // Second poll: still failing → no new toast (transition guard).
         let (tx2, rx2) = std::sync::mpsc::channel();
@@ -25490,15 +26686,20 @@ mod tests {
 
         // Put 4 PRs in the merge queue.
         for i in 0..4u64 {
-            app.data.merge_queue.push(make_mq_entry("acme/api", i as i64 + 100, i + 10));
+            app.data
+                .merge_queue
+                .push(make_mq_entry("acme/api", i as i64 + 100, i + 10));
         }
         // Pre-fill the loader map with 4 fake in-flight receivers (the cap).
         for i in 0..4u64 {
             let (_tx, rx) = std::sync::mpsc::channel::<Result<CiCheckSummary, String>>();
-            app.pipeline_ci_loader.insert(("acme/api".to_string(), i as i64 + 100), rx);
+            app.pipeline_ci_loader
+                .insert(("acme/api".to_string(), i as i64 + 100), rx);
         }
         // Add a 5th PR that has no loader yet and is past TTL.
-        app.data.merge_queue.push(make_mq_entry("acme/api", 200, 20));
+        app.data
+            .merge_queue
+            .push(make_mq_entry("acme/api", 200, 20));
 
         let before = app.pipeline_ci_loader.len();
         app.maybe_kick_ci_check_loaders();
@@ -25522,7 +26723,9 @@ mod tests {
         app.data.pipeline_default_gates = vec!["merge".to_string()]; // no "review" stage
         for i in 0..10i64 {
             // Different repos so each gets a distinct key.
-            app.data.merge_queue.push(make_mq_entry(&format!("acme/repo{i}"), i + 1, i as u64 + 1));
+            app.data
+                .merge_queue
+                .push(make_mq_entry(&format!("acme/repo{i}"), i + 1, i as u64 + 1));
         }
 
         app.maybe_kick_ci_check_loaders();
@@ -25618,15 +26821,15 @@ mod tests {
         let terminal_fail = make_ci(0, 0, 1);
 
         // Running CI → tight 30s TTL regardless of eligibility.
-        assert_eq!(ci_stale_secs(Some(&running_ci), true),  Some(30));
+        assert_eq!(ci_stale_secs(Some(&running_ci), true), Some(30));
         assert_eq!(ci_stale_secs(Some(&running_ci), false), Some(30));
 
         // Terminal (all passed) → long 600s TTL.
-        assert_eq!(ci_stale_secs(Some(&terminal_ok),   true),  Some(600));
-        assert_eq!(ci_stale_secs(Some(&terminal_ok),   false), Some(600));
+        assert_eq!(ci_stale_secs(Some(&terminal_ok), true), Some(600));
+        assert_eq!(ci_stale_secs(Some(&terminal_ok), false), Some(600));
 
         // Terminal (some failed) → long 600s TTL (CI won't un-fail).
-        assert_eq!(ci_stale_secs(Some(&terminal_fail), true),  Some(600));
+        assert_eq!(ci_stale_secs(Some(&terminal_fail), true), Some(600));
         assert_eq!(ci_stale_secs(Some(&terminal_fail), false), Some(600));
 
         // No cache, merge-eligible → fetch immediately (Some(0)).
@@ -25648,14 +26851,18 @@ mod tests {
 
         // 45 ineligible PRs: issue numbers 200..244, PR numbers 200..244.
         for i in 0..45i64 {
-            app.data.merge_queue.push(make_mq_entry("acme/api", i + 200, i as u64 + 200));
+            app.data
+                .merge_queue
+                .push(make_mq_entry("acme/api", i + 200, i as u64 + 200));
             // No approved review for these → ineligible.
         }
 
         // 5 eligible PRs: issue numbers 100..104, PR numbers 100..104.
         for i in 0..5i64 {
             let issue_num = i as u64 + 100;
-            app.data.merge_queue.push(make_mq_entry("acme/api", i + 100, issue_num));
+            app.data
+                .merge_queue
+                .push(make_mq_entry("acme/api", i + 100, issue_num));
             app.data.assignments.push(make_approved_review(issue_num));
         }
 
@@ -25698,7 +26905,7 @@ mod tests {
         app.active_view = SidebarView::Pipeline;
 
         // Both PRs are eligible (have approved reviews).
-        let key_running  = ("acme/api".to_string(), 10i64);
+        let key_running = ("acme/api".to_string(), 10i64);
         let key_terminal = ("acme/api".to_string(), 11i64);
 
         app.data.merge_queue.push(make_mq_entry("acme/api", 10, 50));
@@ -25707,20 +26914,30 @@ mod tests {
         app.data.assignments.push(make_approved_review(51));
 
         // PR 10: CI still running — just fetched → fresh within 30s.
-        app.pipeline_ci_checks.insert(key_running.clone(), CiCheckSummary {
-            passed: 0, failed: 0, running: 1,
-            failed_names: vec![],
-            first_failed_url: None,
-            fetched_at: Instant::now(),
-        });
+        app.pipeline_ci_checks.insert(
+            key_running.clone(),
+            CiCheckSummary {
+                passed: 0,
+                failed: 0,
+                running: 1,
+                failed_names: vec![],
+                first_failed_url: None,
+                fetched_at: Instant::now(),
+            },
+        );
 
         // PR 11: terminal state (all passed) — just fetched → fresh within 600s.
-        app.pipeline_ci_checks.insert(key_terminal.clone(), CiCheckSummary {
-            passed: 3, failed: 0, running: 0,
-            failed_names: vec![],
-            first_failed_url: None,
-            fetched_at: Instant::now(),
-        });
+        app.pipeline_ci_checks.insert(
+            key_terminal.clone(),
+            CiCheckSummary {
+                passed: 3,
+                failed: 0,
+                running: 0,
+                failed_names: vec![],
+                first_failed_url: None,
+                fetched_at: Instant::now(),
+            },
+        );
 
         app.maybe_kick_ci_check_loaders();
 
@@ -25736,12 +26953,20 @@ mod tests {
         // Verify the two TTL values are distinct: ci_stale_secs distinguishes
         // running (30s) from terminal (600s).
         let running_s = CiCheckSummary {
-            running: 1, passed: 0, failed: 0,
-            failed_names: vec![], first_failed_url: None, fetched_at: Instant::now(),
+            running: 1,
+            passed: 0,
+            failed: 0,
+            failed_names: vec![],
+            first_failed_url: None,
+            fetched_at: Instant::now(),
         };
         let terminal_s = CiCheckSummary {
-            running: 0, passed: 3, failed: 0,
-            failed_names: vec![], first_failed_url: None, fetched_at: Instant::now(),
+            running: 0,
+            passed: 3,
+            failed: 0,
+            failed_names: vec![],
+            first_failed_url: None,
+            fetched_at: Instant::now(),
         };
         assert_ne!(
             ci_stale_secs(Some(&running_s), true),
@@ -25776,8 +27001,8 @@ mod tests {
                 cost_usd: None,
                 smoke_tests: None,
                 review_findings: None,
-            test_plan: None,
-            test_plan_branch_head: None,
+                test_plan: None,
+                test_plan_branch_head: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -25855,8 +27080,8 @@ mod tests {
                 cost_usd: None,
                 smoke_tests: None,
                 review_findings: None,
-            test_plan: None,
-            test_plan_branch_head: None,
+                test_plan: None,
+                test_plan_branch_head: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -25931,7 +27156,11 @@ mod tests {
         assert!(!app.data.pipeline_require_plan);
         assert_eq!(
             app.pipeline_stage_names(),
-            vec!["work".to_string(), "review".to_string(), "merge".to_string()]
+            vec![
+                "work".to_string(),
+                "review".to_string(),
+                "merge".to_string()
+            ]
         );
     }
 
@@ -26195,18 +27424,18 @@ mod tests {
         // Sanity: load_pipeline_meta returns documented defaults when the
         // DB is missing the keys (or the table is empty).
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        let (gates, labels, repos, require_plan, run_cmds, repo_paths) =
-            load_pipeline_meta(&conn);
+        conn.execute_batch("CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        let (gates, labels, repos, require_plan, run_cmds, repo_paths) = load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["review".to_string(), "merge".to_string()]);
         assert_eq!(labels, vec!["coord".to_string()]);
         assert!(repos.is_empty());
         assert!(!require_plan);
         assert!(run_cmds.is_empty(), "no run_cmds configured → empty map");
-        assert!(repo_paths.is_empty(), "no repo_paths configured → empty map");
+        assert!(
+            repo_paths.is_empty(),
+            "no repo_paths configured → empty map"
+        );
     }
 
     #[test]
@@ -26223,8 +27452,7 @@ mod tests {
               ('pipeline_require_plan', '1');",
         )
         .unwrap();
-        let (gates, labels, repos, require_plan, run_cmds, repo_paths) =
-            load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds, repo_paths) = load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["plan", "work", "smoke"]);
         assert_eq!(labels, vec!["hotfix", "feature"]);
         assert_eq!(repos, vec![("api".to_string(), "acme/api".to_string())]);
@@ -26285,8 +27513,8 @@ mod tests {
     #[test]
     fn count_purgeable_counts_done_rows_older_than_cutoff() {
         let conn = make_purge_db();
-        insert_assignment(&conn, "old", "done", Some(100.0));   // older than cutoff
-        insert_assignment(&conn, "new", "done", Some(500.0));   // newer than cutoff
+        insert_assignment(&conn, "old", "done", Some(100.0)); // older than cutoff
+        insert_assignment(&conn, "new", "done", Some(500.0)); // newer than cutoff
         let (a, i) = count_purgeable_conn(&conn, 300.0).unwrap();
         assert_eq!(a, 1);
         assert_eq!(i, 0);
@@ -26320,10 +27548,10 @@ mod tests {
     #[test]
     fn count_purgeable_counts_closed_issues_older_than_cutoff() {
         let conn = make_purge_db();
-        insert_issue(&conn, 1, "closed", Some(100.0));   // purgeable
-        insert_issue(&conn, 2, "closed", Some(500.0));   // too fresh
-        insert_issue(&conn, 3, "open", Some(50.0));      // open: never purged
-        insert_issue(&conn, 4, "closed", None);          // no synced_at: never purged
+        insert_issue(&conn, 1, "closed", Some(100.0)); // purgeable
+        insert_issue(&conn, 2, "closed", Some(500.0)); // too fresh
+        insert_issue(&conn, 3, "open", Some(50.0)); // open: never purged
+        insert_issue(&conn, 4, "closed", None); // no synced_at: never purged
         let (_, i) = count_purgeable_conn(&conn, 300.0).unwrap();
         assert_eq!(i, 1);
     }
@@ -26338,7 +27566,7 @@ mod tests {
         let conn = make_purge_db();
         insert_assignment(&conn, "a1", "done", Some(100.0));
         insert_assignment(&conn, "a2", "failed", Some(100.0));
-        insert_assignment(&conn, "a3", "done", Some(500.0));  // too fresh
+        insert_assignment(&conn, "a3", "done", Some(500.0)); // too fresh
         insert_issue(&conn, 1, "closed", Some(100.0));
         insert_issue(&conn, 2, "closed", Some(200.0));
         insert_issue(&conn, 3, "open", Some(100.0));
@@ -26375,7 +27603,15 @@ mod tests {
         .unwrap();
     }
 
-    fn read_verdict(conn: &Connection, id: &str) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    fn read_verdict(
+        conn: &Connection,
+        id: &str,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
         conn.query_row(
             "SELECT test_state, test_reason, smoke_test, smoke_test_reason \
              FROM assignments WHERE assignment_id = ?1",
@@ -26394,14 +27630,26 @@ mod tests {
         insert_verdict_row(&conn, "w1");
         record_test_verdict_conn(&conn, "w1", "failed", Some("scroll broken")).unwrap();
         let (test_state, test_reason, smoke_test, smoke_reason) = read_verdict(&conn, "w1");
-        assert_eq!(test_state.as_deref(), Some("failed"), "test_state must be 'failed'");
-        assert_eq!(test_reason.as_deref(), Some("scroll broken"), "test_reason must be stored");
+        assert_eq!(
+            test_state.as_deref(),
+            Some("failed"),
+            "test_state must be 'failed'"
+        );
+        assert_eq!(
+            test_reason.as_deref(),
+            Some("scroll broken"),
+            "test_reason must be stored"
+        );
         assert_eq!(
             smoke_test.as_deref(),
             Some("fail"),
             "smoke_test must be mirrored to 'fail' so coord fix can dispatch",
         );
-        assert_eq!(smoke_reason.as_deref(), Some("scroll broken"), "smoke_test_reason must match");
+        assert_eq!(
+            smoke_reason.as_deref(),
+            Some("scroll broken"),
+            "smoke_test_reason must match"
+        );
     }
 
     #[test]
@@ -26422,7 +27670,10 @@ mod tests {
         record_test_verdict_conn(&conn, "w3", "skipped", None).unwrap();
         let (test_state, _test_reason, smoke_test, _smoke_reason) = read_verdict(&conn, "w3");
         assert_eq!(test_state.as_deref(), Some("skipped"));
-        assert_eq!(smoke_test, None, "smoke_test must not be set for skipped verdict");
+        assert_eq!(
+            smoke_test, None,
+            "smoke_test must not be set for skipped verdict"
+        );
     }
 
     // ── board_selection_in_completed_group ────────────────────────────────────
@@ -26431,7 +27682,10 @@ mod tests {
     /// and has a done assignment, so it lands in the Completed group.
     fn make_app_with_one_completed_issue() -> CoordApp {
         let mut app = make_app_with_assignments(vec![make_assignment_typed(
-            "done", 10, "repo-a", Some("work"),
+            "done",
+            10,
+            "repo-a",
+            Some("work"),
         )]);
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
@@ -26554,8 +27808,16 @@ mod tests {
 
         // Each chunk's text has a trailing `\n` — that's what the agent
         // emits when the source bytes ended at a line boundary.
-        tx.send(SseWatchMsg::Lines { last_id: 100, text: "line one\nline two\n".to_string() }).unwrap();
-        tx.send(SseWatchMsg::Lines { last_id: 200, text: "line three\n".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Lines {
+            last_id: 100,
+            text: "line one\nline two\n".to_string(),
+        })
+        .unwrap();
+        tx.send(SseWatchMsg::Lines {
+            last_id: 200,
+            text: "line three\n".to_string(),
+        })
+        .unwrap();
 
         let changed = app.drain_sse_watch();
         assert!(changed, "new lines should trigger redraw");
@@ -26581,12 +27843,14 @@ mod tests {
         tx.send(SseWatchMsg::Lines {
             last_id: 100,
             text: "{\"type\":\"result\",\"num_turns\":37".to_string(),
-        }).unwrap();
+        })
+        .unwrap();
         // Chunk 2 has the rest plus the terminating newline.
         tx.send(SseWatchMsg::Lines {
             last_id: 200,
             text: ",\"total_cost_usd\":1.75}\n".to_string(),
-        }).unwrap();
+        })
+        .unwrap();
 
         app.drain_sse_watch();
 
@@ -26597,7 +27861,10 @@ mod tests {
             vec!["{\"type\":\"result\",\"num_turns\":37,\"total_cost_usd\":1.75}"],
             "the two chunks must have been joined into one line, not two"
         );
-        assert!(sse.pending_tail.is_empty(), "tail should be flushed after the second chunk");
+        assert!(
+            sse.pending_tail.is_empty(),
+            "tail should be flushed after the second chunk"
+        );
     }
 
     #[test]
@@ -26607,7 +27874,11 @@ mod tests {
         install_watch_ctx(&mut app, state);
 
         // Trailing `\n` so the chunk is complete (no partial line to flush).
-        tx.send(SseWatchMsg::Lines { last_id: 50, text: "some output\n".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Lines {
+            last_id: 50,
+            text: "some output\n".to_string(),
+        })
+        .unwrap();
         tx.send(SseWatchMsg::Done { last_id: 99 }).unwrap();
 
         let changed = app.drain_sse_watch();
@@ -26628,7 +27899,11 @@ mod tests {
         let (state, tx) = make_sse_state_pair();
         install_watch_ctx(&mut app, state);
 
-        tx.send(SseWatchMsg::Lines { last_id: 10, text: "trailing partial".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Lines {
+            last_id: 10,
+            text: "trailing partial".to_string(),
+        })
+        .unwrap();
         tx.send(SseWatchMsg::Done { last_id: 11 }).unwrap();
 
         app.drain_sse_watch();
@@ -26661,7 +27936,8 @@ mod tests {
         install_watch_ctx(&mut app, state);
 
         // One error — should schedule reconnect but not set done.
-        tx.send(SseWatchMsg::Error("connection refused".to_string())).unwrap();
+        tx.send(SseWatchMsg::Error("connection refused".to_string()))
+            .unwrap();
         let changed = app.drain_sse_watch();
         assert!(changed);
 
@@ -26688,7 +27964,8 @@ mod tests {
         if let Some(ctx) = app.watch_pool.get_mut(TEST_AID) {
             ctx.sse.rx = state2.rx;
         }
-        tx2.send(SseWatchMsg::Error("third failure".to_string())).unwrap();
+        tx2.send(SseWatchMsg::Error("third failure".to_string()))
+            .unwrap();
 
         let changed = app.drain_sse_watch();
         assert!(changed);
@@ -26697,7 +27974,10 @@ mod tests {
         assert!(sse.done, "three errors should set done");
         assert_eq!(sse.fail_count, 3);
         // A toast should have been pushed.
-        assert!(!app.toasts.is_empty(), "error toast should be pushed on fail limit");
+        assert!(
+            !app.toasts.is_empty(),
+            "error toast should be pushed on fail limit"
+        );
     }
 
     #[test]
@@ -26708,7 +27988,11 @@ mod tests {
         install_watch_ctx(&mut app, state);
 
         // Send lines — should be ignored because done=true.
-        tx.send(SseWatchMsg::Lines { last_id: 10, text: "ignored".to_string() }).unwrap();
+        tx.send(SseWatchMsg::Lines {
+            last_id: 10,
+            text: "ignored".to_string(),
+        })
+        .unwrap();
         let changed = app.drain_sse_watch();
         assert!(!changed, "done state should not trigger redraw");
         assert!(app.watch_pool[TEST_AID].sse.lines.is_empty());
@@ -26721,12 +28005,21 @@ mod tests {
         let mut app = make_app_default();
         let (state, _tx) = make_sse_state_pair();
         install_watch_ctx(&mut app, state);
-        assert!(app.watch_focused.is_some(), "should be focused after install");
+        assert!(
+            app.watch_focused.is_some(),
+            "should be focused after install"
+        );
 
         app.close_watch();
 
-        assert!(app.watch_focused.is_none(), "watch_focused should be cleared");
-        assert!(app.watch_pool.contains_key(TEST_AID), "pool entry should survive close_watch");
+        assert!(
+            app.watch_focused.is_none(),
+            "watch_focused should be cleared"
+        );
+        assert!(
+            app.watch_pool.contains_key(TEST_AID),
+            "pool entry should survive close_watch"
+        );
     }
 
     #[test]
@@ -26833,7 +28126,9 @@ mod tests {
         install_watch_ctx(&mut app, state);
 
         let list = app.watch_log_list();
-        let first_text: String = list.items.iter()
+        let first_text: String = list
+            .items
+            .iter()
             .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
             .collect::<Vec<_>>()
             .join("");
@@ -26844,13 +28139,17 @@ mod tests {
     fn watch_log_list_shows_stream_ended_when_done() {
         let mut app = make_app_default();
         let (mut state, _tx) = make_sse_state_pair();
-        state.lines.push("STATUS: done → done → confidence: high".to_string());
+        state
+            .lines
+            .push("STATUS: done → done → confidence: high".to_string());
         state.line_times.push(Instant::now());
         state.done = true;
         install_watch_ctx(&mut app, state);
 
         let list = app.watch_log_list();
-        let all_text: String = list.items.iter()
+        let all_text: String = list
+            .items
+            .iter()
             .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
             .collect::<Vec<_>>()
             .join(" ");
@@ -26864,10 +28163,16 @@ mod tests {
         install_watch_ctx(&mut app, state);
 
         let list = app.watch_log_list();
-        let title = list.title.as_ref().map(|t| {
-            t.spans.iter().map(|s| s.text.clone()).collect::<String>()
-        }).unwrap_or_default();
-        assert!(title.contains("R=refresh"), "title should show R=refresh hint, got: {}", title);
+        let title = list
+            .title
+            .as_ref()
+            .map(|t| t.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .unwrap_or_default();
+        assert!(
+            title.contains("R=refresh"),
+            "title should show R=refresh hint, got: {}",
+            title
+        );
     }
 
     // ── Settings: apply_settings_event ────────────────────────────────────────
@@ -26931,7 +28236,10 @@ mod tests {
             selected_idx: ModelPref::Opus.to_idx(),
         };
         assert!(app.apply_settings_event(&ev));
-        assert_eq!(app.settings.machine_model.get("mybox"), Some(&ModelPref::Opus));
+        assert_eq!(
+            app.settings.machine_model.get("mybox"),
+            Some(&ModelPref::Opus)
+        );
     }
 
     #[test]
@@ -26941,7 +28249,10 @@ mod tests {
             id: WidgetId::new("settings:nonexistent"),
             selected_idx: 0,
         };
-        assert!(!app.apply_settings_event(&ev), "unknown ID should return false");
+        assert!(
+            !app.apply_settings_event(&ev),
+            "unknown ID should return false"
+        );
     }
 
     #[test]
@@ -26951,7 +28262,10 @@ mod tests {
             id: WidgetId::new("settings:not-audio"),
             value: true,
         };
-        assert!(!app.apply_settings_event(&ev), "unknown toggle ID should return false");
+        assert!(
+            !app.apply_settings_event(&ev),
+            "unknown toggle ID should return false"
+        );
     }
 
     // ── Settings: settings_change_focused ─────────────────────────────────────
@@ -26968,7 +28282,11 @@ mod tests {
         // Forward from last option → wraps to first.
         let changed = app.settings_change_focused(1);
         assert!(changed, "should change when wrapping");
-        assert_eq!(app.settings.theme, Theme::Dark, "should wrap from HighContrast → Dark");
+        assert_eq!(
+            app.settings.theme,
+            Theme::Dark,
+            "should wrap from HighContrast → Dark"
+        );
     }
 
     #[test]
@@ -26981,7 +28299,11 @@ mod tests {
         // Backward from first option → wraps to last.
         let changed = app.settings_change_focused(-1);
         assert!(changed, "should change when wrapping backward");
-        assert_eq!(app.settings.theme, Theme::HighContrast, "should wrap from Dark → HighContrast");
+        assert_eq!(
+            app.settings.theme,
+            Theme::HighContrast,
+            "should wrap from Dark → HighContrast"
+        );
     }
 
     // ── #237: unified single-form layout ─────────────────────────────────
@@ -26997,8 +28319,13 @@ mod tests {
             .fields
             .iter()
             .filter(|f| matches!(f.kind, FieldKind::Label))
-            .map(|f| f.label.spans.iter().map(|s| s.text.as_str())
-                .collect::<String>())
+            .map(|f| {
+                f.label
+                    .spans
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<String>()
+            })
             .collect();
         // Every previously-separate category must show up as a header.
         for expected in &[
@@ -27048,7 +28375,9 @@ mod tests {
             })
             .collect();
         assert!(
-            !texts.iter().any(|t| t.contains("ready for manual verification")),
+            !texts
+                .iter()
+                .any(|t| t.contains("ready for manual verification")),
             "test guidance must not appear when there's no Work yet; got rows {:?}",
             texts,
         );
@@ -27127,10 +28456,20 @@ mod tests {
         let texts: Vec<String> = summary
             .items
             .iter()
-            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .map(|i| {
+                i.text
+                    .spans
+                    .iter()
+                    .map(|s| s.text.clone())
+                    .collect::<String>()
+            })
             .collect();
         let joined = texts.join("\n");
-        assert!(joined.contains("✗ exit 101"), "exit code missing; got {:?}", texts);
+        assert!(
+            joined.contains("✗ exit 101"),
+            "exit code missing; got {:?}",
+            texts
+        );
         assert!(joined.contains("/tmp/test-build-w2.log"));
         // Failure snippet surfaced.
         assert!(joined.contains("E0432"));
@@ -27192,13 +28531,19 @@ mod tests {
             .collect::<Vec<&str>>()
             .join("\n");
 
-        assert!(joined.contains("Add folder picker primitive"), "PR title missing: {joined}");
+        assert!(
+            joined.contains("Add folder picker primitive"),
+            "PR title missing: {joined}"
+        );
         assert!(
             joined.contains("examples/folder_picker_demo.rs"),
             "sample-app file path missing: {joined}",
         );
         assert!(joined.contains("#123"), "PR number missing");
-        assert!(joined.contains("(2 changed)"), "files-changed count missing");
+        assert!(
+            joined.contains("(2 changed)"),
+            "files-changed count missing"
+        );
     }
 
     #[test]
@@ -27265,7 +28610,10 @@ mod tests {
             .join("\n");
 
         // The verdict surfaces with the green ✓ Approved.
-        assert!(joined.contains("✓ Approved"), "approve verdict missing: {joined}");
+        assert!(
+            joined.contains("✓ Approved"),
+            "approve verdict missing: {joined}"
+        );
         // The body text surfaces so the user can decide if it's safe
         // to merge without clicking out to GitHub.
         assert!(
@@ -27310,7 +28658,8 @@ mod tests {
                 files: vec!["src/lib.rs".to_string()],
                 reviews: vec![FetchedReview {
                     state: "CHANGES_REQUESTED".to_string(),
-                    body: "src/lib.rs:42 — missing null check; add a guard before deref.".to_string(),
+                    body: "src/lib.rs:42 — missing null check; add a guard before deref."
+                        .to_string(),
                 }],
             },
         );
@@ -27415,7 +28764,13 @@ mod tests {
         let texts: Vec<String> = summary
             .items
             .iter()
-            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .map(|i| {
+                i.text
+                    .spans
+                    .iter()
+                    .map(|s| s.text.clone())
+                    .collect::<String>()
+            })
             .collect();
         let joined = texts.join("\n");
         assert!(
@@ -27448,7 +28803,13 @@ mod tests {
         let texts: Vec<String> = summary
             .items
             .iter()
-            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .map(|i| {
+                i.text
+                    .spans
+                    .iter()
+                    .map(|s| s.text.clone())
+                    .collect::<String>()
+            })
             .collect();
         // Guidance block must render (we have actionable Test stage).
         assert!(
@@ -27458,7 +28819,9 @@ mod tests {
         );
         // The "Run" row should not appear because no run_cmd is configured.
         assert!(
-            !texts.iter().any(|t| t.trim_start().starts_with("Run") && !t.contains("Smoke")),
+            !texts
+                .iter()
+                .any(|t| t.trim_start().starts_with("Run") && !t.contains("Smoke")),
             "spurious Run row appeared when no run_cmd is configured; got rows: {:?}",
             texts,
         );
@@ -27491,7 +28854,9 @@ mod tests {
         app.rebuild_board_sidebar();
         app.select_issue("repo-a", 88);
 
-        let bar = app.sidebar_action_bar().expect("Backlog selection → action bar");
+        let bar = app
+            .sidebar_action_bar()
+            .expect("Backlog selection → action bar");
         let labels = toolbar_action_labels(&bar);
         assert!(
             labels.iter().any(|l| l.contains("Refine")),
@@ -27520,7 +28885,9 @@ mod tests {
         app.rebuild_board_sidebar();
         app.select_issue("repo-a", 89);
 
-        let bar = app.sidebar_action_bar().expect("Refining selection → action bar");
+        let bar = app
+            .sidebar_action_bar()
+            .expect("Refining selection → action bar");
         let labels = toolbar_action_labels(&bar);
         assert!(labels.iter().any(|l| l.contains("Mark Refined")));
         assert!(labels.iter().any(|l| l.contains("Drop to Backlog")));
@@ -27605,11 +28972,20 @@ mod tests {
         // toolbar — absent so the content expands to fill the full panel.
         let mut app = make_app_default();
         app.active_view = SidebarView::Settings;
-        assert!(app.panel_toolbar().is_none(), "Settings must have no toolbar");
+        assert!(
+            app.panel_toolbar().is_none(),
+            "Settings must have no toolbar"
+        );
         app.active_view = SidebarView::Machines;
-        assert!(app.panel_toolbar().is_none(), "Machines must have no toolbar");
+        assert!(
+            app.panel_toolbar().is_none(),
+            "Machines must have no toolbar"
+        );
         app.active_view = SidebarView::Pipeline;
-        assert!(app.panel_toolbar().is_none(), "Pipeline must have no toolbar (#438)");
+        assert!(
+            app.panel_toolbar().is_none(),
+            "Pipeline must have no toolbar (#438)"
+        );
     }
 
     #[test]
@@ -27626,11 +29002,9 @@ mod tests {
             .buttons
             .iter()
             .find_map(|b| match b {
-                ToolbarButton::Action { id, label, enabled, .. }
-                    if label.contains("[R]etry") =>
-                {
-                    Some((id.clone(), *enabled))
-                }
+                ToolbarButton::Action {
+                    id, label, enabled, ..
+                } if label.contains("[R]etry") => Some((id.clone(), *enabled)),
                 _ => None,
             })
             .expect("Retry button present");
@@ -27776,10 +29150,7 @@ mod tests {
 
     /// Test helper: build a `BoardRow` target with sensible defaults so
     /// each call site doesn't have to spell out every field.
-    fn board_target(
-        issue_number: Option<u64>,
-        lifecycle: BoardRowLifecycle,
-    ) -> ContextMenuTarget {
+    fn board_target(issue_number: Option<u64>, lifecycle: BoardRowLifecycle) -> ContextMenuTarget {
         ContextMenuTarget::BoardRow {
             issue_number,
             repo_name: Some("repo-a".to_string()),
@@ -27800,10 +29171,8 @@ mod tests {
         // picks the first selectable item as the keyboard focus.
         let mut app = make_app_default();
         let pos = Point::new(10.0, 5.0);
-        let opened = app.open_context_menu(
-            pos,
-            board_target(Some(42), BoardRowLifecycle::InFlight),
-        );
+        let opened =
+            app.open_context_menu(pos, board_target(Some(42), BoardRowLifecycle::InFlight));
         assert!(opened, "context menu should open for a Board row");
         let state = app.pending_context_menu.expect("state set");
         assert!(!state.items.is_empty());
@@ -27839,7 +29208,9 @@ mod tests {
         let state_after = app.pending_context_menu.clone().unwrap();
         assert_ne!(state_before.selected_idx, state_after.selected_idx);
         assert_eq!(
-            state_after.items[state_after.selected_idx].action_id.as_deref(),
+            state_after.items[state_after.selected_idx]
+                .action_id
+                .as_deref(),
             Some("copy-issue-number"),
         );
     }
@@ -27904,12 +29275,11 @@ mod tests {
         // The Refine action is only meaningful for Backlog rows — it'd
         // be misleading on In-flight / Completed.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(
-            Some(42),
-            &BoardRowLifecycle::Backlog,
-        );
+        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Backlog);
         assert!(
-            items.iter().any(|it| it.action_id.as_deref() == Some("refine")),
+            items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("refine")),
             "Backlog menu must include Refine; got {:?}",
             items.iter().map(|it| &it.label).collect::<Vec<_>>(),
         );
@@ -27920,12 +29290,11 @@ mod tests {
         // Adding `status:refining` to an in-flight row would be
         // confusing — refining is upstream of dispatch.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(
-            Some(42),
-            &BoardRowLifecycle::InFlight,
-        );
+        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::InFlight);
         assert!(
-            !items.iter().any(|it| it.action_id.as_deref() == Some("refine")),
+            !items
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("refine")),
             "Refine must not appear on In-flight rows",
         );
     }
@@ -28010,10 +29379,7 @@ mod tests {
     fn refined_row_context_menu_offers_send_to_pipeline() {
         // Send to Pipeline is the canonical Refined-row action.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(
-            Some(99),
-            &BoardRowLifecycle::Refined,
-        );
+        let items = app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::Refined);
         assert!(
             items
                 .iter()
@@ -28028,10 +29394,7 @@ mod tests {
         // Pre-Refined rows still need scoping work — sending them to
         // the Pipeline would dispatch undefined work.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(
-            Some(99),
-            &BoardRowLifecycle::Backlog,
-        );
+        let items = app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::Backlog);
         assert!(
             !items
                 .iter()
@@ -28045,10 +29408,7 @@ mod tests {
         // In-flight rows already carry the `coord` label — the action
         // would be a no-op (and confusing).
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(
-            Some(99),
-            &BoardRowLifecycle::InFlight,
-        );
+        let items = app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::InFlight);
         assert!(
             !items
                 .iter()
@@ -28078,10 +29438,7 @@ mod tests {
         // Refining was a UX dead-end before #266 — users had to shell
         // out to `coord ready`.  Both directions are now in the menu.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(
-            Some(42),
-            &BoardRowLifecycle::Refining,
-        );
+        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Refining);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28103,10 +29460,7 @@ mod tests {
         // Symmetric escape hatch — let the user re-open scoping on a
         // Refined row without dropping all the way to Backlog.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(
-            Some(42),
-            &BoardRowLifecycle::Refined,
-        );
+        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Refined);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28123,10 +29477,7 @@ mod tests {
         // Mark Refined / Drop to Backlog are state-transition actions
         // only meaningful for Refining rows.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(
-            Some(42),
-            &BoardRowLifecycle::Backlog,
-        );
+        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Backlog);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28154,10 +29505,7 @@ mod tests {
     #[test]
     fn pipeline_new_row_context_menu_offers_both_start_variants() {
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(
-            Some(42),
-            &PipelineRowLifecycle::New,
-        );
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28179,10 +29527,8 @@ mod tests {
         // Once work is dispatched, Start is meaningless — Retry / View
         // Log become the relevant actions (filed for future work).
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(
-            Some(42),
-            &PipelineRowLifecycle::InProgress,
-        );
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28194,10 +29540,7 @@ mod tests {
     #[test]
     fn pipeline_done_row_omits_start() {
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(
-            Some(42),
-            &PipelineRowLifecycle::Done,
-        );
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Done);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28211,10 +29554,8 @@ mod tests {
         // Closes the action-bar coverage gap that left In-progress rows
         // with an empty bar (only Copy + Refresh, both filtered out).
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(
-            Some(42),
-            &PipelineRowLifecycle::InProgress,
-        );
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28234,10 +29575,7 @@ mod tests {
     #[test]
     fn pipeline_done_row_offers_open_pr() {
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(
-            Some(42),
-            &PipelineRowLifecycle::Done,
-        );
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Done);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28267,10 +29605,8 @@ mod tests {
         review.review_verdict = Some("request-changes".to_string());
         app.data.assignments.push(review);
 
-        let items = app.context_menu_items_for_pipeline_row(
-            Some(42),
-            &PipelineRowLifecycle::InProgress,
-        );
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28298,10 +29634,8 @@ mod tests {
         review.review_verdict = Some("approve".to_string());
         app.data.assignments.push(review);
 
-        let items = app.context_menu_items_for_pipeline_row(
-            Some(42),
-            &PipelineRowLifecycle::InProgress,
-        );
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -28335,7 +29669,10 @@ mod tests {
 
         let toasts_before = app.toasts.len();
         let acted = app.dispatch_bounce_for_selected_pipeline_row();
-        assert!(acted, "bounce must dispatch when a request-changes review exists");
+        assert!(
+            acted,
+            "bounce must dispatch when a request-changes review exists"
+        );
         assert!(app.toasts.len() > toasts_before);
         let body = app.toasts.last().expect("toast").0.body.to_string();
         assert!(
@@ -28365,7 +29702,9 @@ mod tests {
         let mut app = make_pipeline_app();
         // Put issue #42 into InProgress by attaching a running work
         // assignment.
-        app.data.assignments.push(_work_assignment("w1", 100.0, "running", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "running", None));
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
 
@@ -28470,7 +29809,7 @@ mod tests {
         let mut review = _stage_assignment("rev2", "review", 200.0, "done");
         review.issue_number = 42;
         review.review_verdict = Some("approve".to_string());
-        review.review_findings = None;  // no cache
+        review.review_findings = None; // no cache
         app.data.assignments.push(review);
 
         let rows = app.stage_content_review(&app.pipeline_issues[0].clone());
@@ -28519,8 +29858,12 @@ mod tests {
         // Mark the issue closed and attach done assignments for every stage
         // so all stages are Done/Skipped.
         app.pipeline_issues[0].is_closed = true;
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "done"));
         app.data.merge_queue.push(MergeQueueEntry {
             assignment_id: "w1".to_string(),
             issue_number: Some(42),
@@ -28551,7 +29894,9 @@ mod tests {
         let mut app = make_pipeline_app();
         app.pipeline_sel = Some(0);
         // Work done, review pending → current stage = review (index 1).
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
         let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
         // Confirm stage 1 is "review".
         assert_eq!(stages.get(1).map(|s| s.as_str()), Some("review"));
@@ -28577,9 +29922,8 @@ mod tests {
         review.issue_number = 42;
         review.review_of_assignment_id = Some("w1".to_string());
         review.review_verdict = Some("approve".to_string());
-        review.review_findings = Some(
-            r#"{"verdict":"approve","body":"LGTM — no issues found."}"#.to_string(),
-        );
+        review.review_findings =
+            Some(r#"{"verdict":"approve","body":"LGTM — no issues found."}"#.to_string());
         app.data.assignments.push(review);
         // Explicitly focus the review stage (index 1: work, review, merge).
         app.pipeline_focused_stage = Some(1);
@@ -28609,8 +29953,12 @@ mod tests {
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
         app.pipeline_issues[0].is_closed = true;
-        app.data.assignments.push(_stage_assignment("w1", "work", 100.0, "done"));
-        app.data.assignments.push(_stage_assignment("r1", "review", 200.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("w1", "work", 100.0, "done"));
+        app.data
+            .assignments
+            .push(_stage_assignment("r1", "review", 200.0, "done"));
         app.data.merge_queue.push(MergeQueueEntry {
             assignment_id: "w1".to_string(),
             issue_number: Some(42),
@@ -28647,7 +29995,9 @@ mod tests {
         // post-merge state the user actually sees.
         let mut app = make_pipeline_app();
         app.pipeline_issues[0].is_closed = true;
-        app.data.assignments.push(_work_assignment("w1", 100.0, "done", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", None));
         app.data.merge_queue.push(MergeQueueEntry {
             assignment_id: "w1".to_string(),
             issue_number: Some(42),
@@ -28677,7 +30027,9 @@ mod tests {
         let mut app = make_pipeline_app();
         // Issue #42 in the fixture has coord_repo=Some("api"); add the
         // ready label to put it in the Pipeline:New bucket.
-        app.pipeline_issues[0].all_labels.push("status:ready".to_string());
+        app.pipeline_issues[0]
+            .all_labels
+            .push("status:ready".to_string());
         let issue = app.pipeline_issues[0].clone();
         assert_eq!(
             app.pipeline_row_lifecycle(&issue),
@@ -28688,7 +30040,9 @@ mod tests {
     #[test]
     fn pipeline_row_lifecycle_in_progress_when_has_assignment() {
         let mut app = make_pipeline_app();
-        app.data.assignments.push(_work_assignment("w1", 100.0, "running", None));
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "running", None));
         let issue = app.pipeline_issues[0].clone();
         assert_eq!(
             app.pipeline_row_lifecycle(&issue),
@@ -28706,7 +30060,9 @@ mod tests {
         app.pipeline_issues[0]
             .all_labels
             .retain(|l| !l.starts_with("status:"));
-        app.pipeline_issues[0].all_labels.push("status:refining".to_string());
+        app.pipeline_issues[0]
+            .all_labels
+            .push("status:refining".to_string());
         let issue = app.pipeline_issues[0].clone();
         assert_eq!(
             app.pipeline_row_lifecycle(&issue),
@@ -28807,10 +30163,8 @@ mod tests {
 
     #[test]
     fn parse_review_header_verdict_only() {
-        let h = parse_coord_review_header(
-            "<!-- coord:review verdict=approve -->",
-        )
-        .expect("header present");
+        let h = parse_coord_review_header("<!-- coord:review verdict=approve -->")
+            .expect("header present");
         assert_eq!(h.verdict.as_deref(), Some("approve"));
         assert_eq!(h.blocking, None);
         assert_eq!(h.reviewer, None);
@@ -28821,10 +30175,7 @@ mod tests {
         // A coord:review HTML comment without a verdict token is invalid.
         // Refusing to return a partial header keeps the renderer from
         // showing "verdict: None" badges.
-        assert!(parse_coord_review_header(
-            "<!-- coord:review reviewer=elitebook -->"
-        )
-        .is_none());
+        assert!(parse_coord_review_header("<!-- coord:review reviewer=elitebook -->").is_none());
     }
 
     #[test]
@@ -28835,10 +30186,8 @@ mod tests {
     #[test]
     fn parse_review_header_ignores_unknown_tokens() {
         // Future-token tolerance: unknown keys are skipped, never panic.
-        let h = parse_coord_review_header(
-            "<!-- coord:review verdict=approve cost-usd=0.34 -->",
-        )
-        .expect("header present");
+        let h = parse_coord_review_header("<!-- coord:review verdict=approve cost-usd=0.34 -->")
+            .expect("header present");
         assert_eq!(h.verdict.as_deref(), Some("approve"));
     }
 
@@ -28872,10 +30221,8 @@ mod tests {
         // If the count token can't be parsed (e.g. corrupt header), keep
         // going rather than rejecting the whole header — verdict is still
         // useful on its own.
-        let h = parse_coord_review_header(
-            "<!-- coord:review verdict=approve blocking=many -->",
-        )
-        .expect("header present");
+        let h = parse_coord_review_header("<!-- coord:review verdict=approve blocking=many -->")
+            .expect("header present");
         assert_eq!(h.verdict.as_deref(), Some("approve"));
         assert_eq!(h.blocking, None);
     }
@@ -28885,7 +30232,10 @@ mod tests {
     /// Helper: build a stream-json text line as the worker emits.
     fn stream_text(s: &str) -> String {
         // Escape backslashes and quotes; preserve newlines as \n escapes.
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
         format!(r#"{{"type":"text","text":"{}"}}"#, escaped)
     }
 
@@ -29282,11 +30632,7 @@ mod tests {
 
     /// Build a `PendingChatResume` with arm_unix_secs=0 (floor=-5, all rows
     /// pass the floor filter) so tests focus on the type-match logic only.
-    fn make_pending_resume(
-        old_id: &str,
-        issue: u64,
-        old_type: Option<&str>,
-    ) -> PendingChatResume {
+    fn make_pending_resume(old_id: &str, issue: u64, old_type: Option<&str>) -> PendingChatResume {
         PendingChatResume {
             old_assignment_id: old_id.to_string(),
             issue_number: issue,
@@ -29417,14 +30763,30 @@ mod tests {
         let items = parse_json_events_readable(&line, &mut turn, None, 20);
         // Should have: header + multiple prose lines, each ≤ 20 chars (including
         // the 2-space indent prefix, so raw text ≤ 18).
-        assert!(items.len() > 2, "expected header + multiple wrapped lines, got: {:?}",
-            items.iter().map(|i| i.text.spans[0].text.as_str()).collect::<Vec<_>>());
+        assert!(
+            items.len() > 2,
+            "expected header + multiple wrapped lines, got: {:?}",
+            items
+                .iter()
+                .map(|i| i.text.spans[0].text.as_str())
+                .collect::<Vec<_>>()
+        );
         for item in items.iter().skip(1) {
-            let text = item.text.spans.iter().map(|s| s.text.as_str()).collect::<String>();
+            let text = item
+                .text
+                .spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>();
             // Each prose line starts with 2-space indent.
-            assert!(text.starts_with("  "), "prose line should be indented: {text:?}");
-            assert!(text.chars().count() <= 20,
-                "prose line exceeds wrap_width: {text:?}");
+            assert!(
+                text.starts_with("  "),
+                "prose line should be indented: {text:?}"
+            );
+            assert!(
+                text.chars().count() <= 20,
+                "prose line exceeds wrap_width: {text:?}"
+            );
         }
     }
 
@@ -29458,7 +30820,10 @@ mod tests {
         assert!(text.contains("→"), "should use arrow: {text:?}");
         assert!(text.contains("Bash"), "should name tool: {text:?}");
         assert!(text.contains("ls -la"), "should show command: {text:?}");
-        assert!(!text.contains("[tool]"), "should not use old [tool] prefix: {text:?}");
+        assert!(
+            !text.contains("[tool]"),
+            "should not use old [tool] prefix: {text:?}"
+        );
     }
 
     #[test]
@@ -29501,9 +30866,15 @@ mod tests {
         let items = parse_json_events_readable(line, &mut turn, None, 80);
         assert!(items.len() >= 2, "should have header + prose");
         let header = &items[0].text.spans[0].text;
-        assert!(header.contains("Turn 1"), "header should show turn number: {header:?}");
+        assert!(
+            header.contains("Turn 1"),
+            "header should show turn number: {header:?}"
+        );
         // Header should NOT contain the long prose.
-        assert!(!header.contains("doing the work now"), "prose in header: {header:?}");
+        assert!(
+            !header.contains("doing the work now"),
+            "prose in header: {header:?}"
+        );
     }
 
     #[test]
@@ -29526,10 +30897,16 @@ mod tests {
         assert!(
             items.len() >= 2,
             "thinking-only turn should have header + thinking lines, got: {:?}",
-            items.iter().map(|i| i.text.spans[0].text.as_str()).collect::<Vec<_>>()
+            items
+                .iter()
+                .map(|i| i.text.spans[0].text.as_str())
+                .collect::<Vec<_>>()
         );
         let header = &items[0].text.spans[0].text;
-        assert!(header.contains("Turn 1"), "first item should be turn header: {header:?}");
+        assert!(
+            header.contains("Turn 1"),
+            "first item should be turn header: {header:?}"
+        );
         // Thinking must NOT be glued inline to the header.
         assert!(
             !header.contains("considering options"),
@@ -29566,7 +30943,11 @@ mod tests {
         let line = r#"{"type":"tool_result","content":"ok"}"#;
         let mut turn = 0;
         let items = parse_json_events_readable(line, &mut turn, None, 80);
-        assert!(items.is_empty(), "tool_result should be filtered: {:?}", items);
+        assert!(
+            items.is_empty(),
+            "tool_result should be filtered: {:?}",
+            items
+        );
     }
 
     #[test]
@@ -29594,9 +30975,15 @@ mod tests {
             .iter()
             .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
             .collect();
-        assert!(all_text.contains('→'), "should use arrow format: {all_text:?}");
+        assert!(
+            all_text.contains('→'),
+            "should use arrow format: {all_text:?}"
+        );
         assert!(all_text.contains("Bash"), "should name tool: {all_text:?}");
-        assert!(all_text.contains("ls -la"), "should show command: {all_text:?}");
+        assert!(
+            all_text.contains("ls -la"),
+            "should show command: {all_text:?}"
+        );
         // No bare "Turn 1" without content — the header is dropped for tool-only turns.
         assert!(
             !all_text.contains("Turn 1"),
@@ -29614,16 +31001,31 @@ mod tests {
         assert!(
             items.len() >= 2,
             "multi-tool turn should produce one line per tool, got: {:?}",
-            items.iter().map(|i| i.text.spans[0].text.as_str()).collect::<Vec<_>>()
+            items
+                .iter()
+                .map(|i| i.text.spans[0].text.as_str())
+                .collect::<Vec<_>>()
         );
         let all_text: String = items
             .iter()
             .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
             .collect();
-        assert!(all_text.contains("Read"), "should show Read tool: {all_text:?}");
-        assert!(all_text.contains("src/main.rs"), "should show Read path: {all_text:?}");
-        assert!(all_text.contains("Grep"), "should show Grep tool: {all_text:?}");
-        assert!(all_text.contains("fn main"), "should show Grep pattern: {all_text:?}");
+        assert!(
+            all_text.contains("Read"),
+            "should show Read tool: {all_text:?}"
+        );
+        assert!(
+            all_text.contains("src/main.rs"),
+            "should show Read path: {all_text:?}"
+        );
+        assert!(
+            all_text.contains("Grep"),
+            "should show Grep tool: {all_text:?}"
+        );
+        assert!(
+            all_text.contains("fn main"),
+            "should show Grep pattern: {all_text:?}"
+        );
     }
 
     #[test]
@@ -29698,7 +31100,10 @@ mod tests {
             .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(all_text.contains("Checking the code"), "prose: {all_text:?}");
+        assert!(
+            all_text.contains("Checking the code"),
+            "prose: {all_text:?}"
+        );
         assert!(all_text.contains("Read"), "Read tool: {all_text:?}");
         assert!(all_text.contains("a.rs"), "Read path: {all_text:?}");
         assert!(all_text.contains("Grep"), "Grep tool: {all_text:?}");
@@ -29777,8 +31182,15 @@ mod tests {
         let milestones = app.board_milestones_with_status_for_repo(&cache, "repo-a");
 
         // Should have 3 milestone groups: v0.5 (5), v0.6 (6), No milestone.
-        assert_eq!(milestones.len(), 3, "should have 3 milestone groups: {:?}",
-            milestones.iter().map(|(k, d, _)| format!("{k}={d}")).collect::<Vec<_>>());
+        assert_eq!(
+            milestones.len(),
+            3,
+            "should have 3 milestone groups: {:?}",
+            milestones
+                .iter()
+                .map(|(k, d, _)| format!("{k}={d}"))
+                .collect::<Vec<_>>()
+        );
 
         // Named milestones come first in number order, "No milestone" last.
         assert_eq!(milestones[0].0, "5");
@@ -29790,9 +31202,20 @@ mod tests {
 
         // Each milestone has exactly one issue in the Backlog status group.
         for (key, _, status_groups) in &milestones {
-            assert_eq!(status_groups.len(), 1, "milestone {key} should have 1 status group");
-            assert_eq!(status_groups[0].1, "backlog", "milestone {key}: status should be backlog");
-            assert_eq!(status_groups[0].2.len(), 1, "milestone {key} should have 1 issue");
+            assert_eq!(
+                status_groups.len(),
+                1,
+                "milestone {key} should have 1 status group"
+            );
+            assert_eq!(
+                status_groups[0].1, "backlog",
+                "milestone {key}: status should be backlog"
+            );
+            assert_eq!(
+                status_groups[0].2.len(),
+                1,
+                "milestone {key} should have 1 issue"
+            );
         }
     }
 
@@ -29930,10 +31353,7 @@ mod tests {
     /// `read_git_branch_head` returns None for non-existent repo dirs.
     #[test]
     fn read_git_branch_head_missing_dir_returns_none() {
-        let result = read_git_branch_head(
-            std::path::Path::new("/nonexistent/repo"),
-            "main",
-        );
+        let result = read_git_branch_head(std::path::Path::new("/nonexistent/repo"), "main");
         assert!(result.is_none());
     }
 
@@ -29942,10 +31362,8 @@ mod tests {
     fn read_git_branch_head_reads_loose_ref() {
         // Use the thread ID to make the directory name unique so parallel test
         // runs cannot collide on a shared /tmp path.
-        let tid = format!("{:?}", std::thread::current().id())
-            .replace(['(', ')'], "");
-        let tmp = std::env::temp_dir()
-            .join(format!("coord-tui-test-git-loose-{}", tid));
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-git-loose-{}", tid));
         let refs_dir = tmp.join(".git").join("refs").join("heads");
         std::fs::create_dir_all(&refs_dir).unwrap();
         let sha = "abcdef1234567890abcdef1234567890abcdef12";
@@ -29961,10 +31379,8 @@ mod tests {
     /// `read_git_branch_head` falls back to packed-refs when loose file missing.
     #[test]
     fn read_git_branch_head_reads_packed_refs() {
-        let tid = format!("{:?}", std::thread::current().id())
-            .replace(['(', ')'], "");
-        let tmp = std::env::temp_dir()
-            .join(format!("coord-tui-test-git-packed-{}", tid));
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-git-packed-{}", tid));
         let git_dir = tmp.join(".git");
         std::fs::create_dir_all(&git_dir).unwrap();
         let sha = "1111222233334444555566667777888899990000";
@@ -29989,7 +31405,10 @@ mod tests {
     fn board_row_status_badge_mapping() {
         // Backlog: blank
         assert!(board_row_status_badge("").is_none(), "unknown/empty → None");
-        assert!(board_row_status_badge("backlog").is_none(), "backlog → None");
+        assert!(
+            board_row_status_badge("backlog").is_none(),
+            "backlog → None"
+        );
 
         // Refining / refined → "R"
         let r_badge = board_row_status_badge("refining");
@@ -29998,8 +31417,11 @@ mod tests {
 
         let refined_badge = board_row_status_badge("refined");
         assert!(refined_badge.is_some(), "refined → Some");
-        assert_eq!(refined_badge.unwrap().text, "R",
-            "refined should fold into R just like refining");
+        assert_eq!(
+            refined_badge.unwrap().text,
+            "R",
+            "refined should fold into R just like refining"
+        );
 
         // In-flight → "A"
         let a_badge = board_row_status_badge("in-flight");
@@ -30045,7 +31467,10 @@ mod tests {
         let dispatched = app.dispatch_board_row_direct(&target);
 
         // dispatch_board_row_direct returns true on success.
-        assert!(dispatched, "dispatch_board_row_direct must return true on success");
+        assert!(
+            dispatched,
+            "dispatch_board_row_direct must return true on success"
+        );
 
         // A command was actually spawned (coord assign …).
         assert!(
@@ -30110,20 +31535,14 @@ mod tests {
         // The shell expects CR (\r), NOT LF (\n) — sending LF leaves
         // half-typed lines hanging.  This is the exact gotcha that
         // bit the PTY scrape work (#424 references it).
-        let bytes = key_to_pty_bytes(
-            Key::Named(NamedKey::Enter),
-            quadraui::Modifiers::default(),
-        );
+        let bytes = key_to_pty_bytes(Key::Named(NamedKey::Enter), quadraui::Modifiers::default());
         assert_eq!(bytes.as_deref(), Some(&b"\r"[..]));
     }
 
     #[test]
     fn key_to_pty_bytes_arrow_up_unmodified() {
         // Plain Up arrow → \x1b[A (cursor sequence, no modifier param).
-        let bytes = key_to_pty_bytes(
-            Key::Named(NamedKey::Up),
-            quadraui::Modifiers::default(),
-        );
+        let bytes = key_to_pty_bytes(Key::Named(NamedKey::Up), quadraui::Modifiers::default());
         assert_eq!(bytes.as_deref(), Some(&b"\x1b[A"[..]));
     }
 
@@ -30153,10 +31572,7 @@ mod tests {
         // No session spawned → forward returns false, no panic.
         let mut app = make_app_default();
         assert!(app.terminal_session.is_none());
-        let consumed = app.forward_key_to_pty(
-            &Key::Char('a'),
-            &quadraui::Modifiers::default(),
-        );
+        let consumed = app.forward_key_to_pty(&Key::Char('a'), &quadraui::Modifiers::default());
         assert!(!consumed);
     }
 
@@ -30172,35 +31588,25 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let cwd = std::env::temp_dir();
-        let mut sess = quadraui::terminal_engine::TerminalSession::spawn(
-            80, 24, "/bin/sh", &cwd, 1000,
-        )
-        .expect("spawn /bin/sh");
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
 
         // Type 'echo __coord_marker__' + Enter, then 'exit 0' + Enter.
         // Each char comes through key_to_pty_bytes so we exercise the
         // exact wire format the live pane sends.
         let line = "echo __coord_marker__";
         for ch in line.chars() {
-            let bytes = key_to_pty_bytes(
-                Key::Char(ch),
-                quadraui::Modifiers::default(),
-            )
-            .expect("char must encode");
+            let bytes = key_to_pty_bytes(Key::Char(ch), quadraui::Modifiers::default())
+                .expect("char must encode");
             sess.write_input(&bytes);
         }
-        let enter = key_to_pty_bytes(
-            Key::Named(NamedKey::Enter),
-            quadraui::Modifiers::default(),
-        )
-        .expect("enter must encode");
+        let enter = key_to_pty_bytes(Key::Named(NamedKey::Enter), quadraui::Modifiers::default())
+            .expect("enter must encode");
         sess.write_input(&enter);
         for ch in "exit 0".chars() {
-            let bytes = key_to_pty_bytes(
-                Key::Char(ch),
-                quadraui::Modifiers::default(),
-            )
-            .expect("char must encode");
+            let bytes = key_to_pty_bytes(Key::Char(ch), quadraui::Modifiers::default())
+                .expect("char must encode");
             sess.write_input(&bytes);
         }
         sess.write_input(&enter);
@@ -30240,10 +31646,9 @@ mod tests {
     #[cfg(unix)]
     fn terminal_pane_resize_propagates_to_session() {
         let cwd = std::env::temp_dir();
-        let mut sess = quadraui::terminal_engine::TerminalSession::spawn(
-            80, 24, "/bin/sh", &cwd, 100,
-        )
-        .expect("spawn /bin/sh");
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 100)
+                .expect("spawn /bin/sh");
         assert_eq!(sess.cols(), 80);
         assert_eq!(sess.rows(), 24);
         sess.resize(120, 40);
@@ -30285,7 +31690,10 @@ mod tests {
         let app = make_app_default();
         let bar = app.pipeline_detail_tab_bar();
         let has_terminal = bar.tabs.iter().any(|t| t.label.trim() == "Terminal");
-        assert!(has_terminal, "pipeline detail tab bar must include a Terminal tab (#440)");
+        assert!(
+            has_terminal,
+            "pipeline detail tab bar must include a Terminal tab (#440)"
+        );
     }
 
     #[test]
@@ -30294,7 +31702,10 @@ mod tests {
         // Index 5 (0-based) → Terminal.
         let app = make_app_default();
         let bar = app.pipeline_detail_tab_bar();
-        assert!(bar.tabs.len() >= 6, "expected at least 6 pipeline detail tabs");
+        assert!(
+            bar.tabs.len() >= 6,
+            "expected at least 6 pipeline detail tabs"
+        );
         assert_eq!(
             bar.tabs[5].label.trim(),
             "Terminal",
@@ -30352,10 +31763,8 @@ mod tests {
         }];
         app.pipeline_sel = Some(0);
         assert!(app.detail_terminal_sessions.is_empty());
-        let consumed = app.forward_key_to_detail_terminal(
-            &Key::Char('a'),
-            &quadraui::Modifiers::default(),
-        );
+        let consumed =
+            app.forward_key_to_detail_terminal(&Key::Char('a'), &quadraui::Modifiers::default());
         assert!(!consumed, "no session → should return false");
     }
 
@@ -30389,8 +31798,10 @@ mod tests {
         let mut app = make_app_default();
         // Pretend issue #1 has an active session (use a marker in the error
         // map since we can't easily inject a real TerminalSession here).
-        app.detail_terminal_spawn_errors.insert(1, "test-error".to_string());
-        app.detail_terminal_spawn_errors.insert(2, "test-error-2".to_string());
+        app.detail_terminal_spawn_errors
+            .insert(1, "test-error".to_string());
+        app.detail_terminal_spawn_errors
+            .insert(2, "test-error-2".to_string());
 
         // Simulate a pipeline refresh that drops issue #1 but keeps #2.
         let new_issues = vec![PipelineIssue {
@@ -30407,8 +31818,10 @@ mod tests {
         app.pipeline_issues = new_issues;
         let live_nums: std::collections::HashSet<u64> =
             app.pipeline_issues.iter().map(|i| i.number).collect();
-        app.detail_terminal_sessions.retain(|k, _| live_nums.contains(k));
-        app.detail_terminal_spawn_errors.retain(|k, _| live_nums.contains(k));
+        app.detail_terminal_sessions
+            .retain(|k, _| live_nums.contains(k));
+        app.detail_terminal_spawn_errors
+            .retain(|k, _| live_nums.contains(k));
 
         // Issue #1 should have been pruned; issue #2 should remain.
         assert!(
@@ -30465,32 +31878,37 @@ mod tests {
         // Manually spawn a session into the per-issue map (bypasses the lazy
         // spawn in drive_detail_terminals which needs pending_dims from render).
         let cwd = std::env::temp_dir();
-        let sess = quadraui::terminal_engine::TerminalSession::spawn(
-            80, 24, "/bin/sh", &cwd, 1000,
-        )
-        .expect("spawn /bin/sh");
+        let sess = quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+            .expect("spawn /bin/sh");
         app.detail_terminal_sessions.insert(440, sess);
 
         // Type 'echo __detail_marker__' + Enter via forward_key_to_detail_terminal.
         let line = "echo __detail_marker__";
-        let enter_bytes = key_to_pty_bytes(
-            Key::Named(NamedKey::Enter),
-            quadraui::Modifiers::default(),
-        )
-        .expect("enter must encode");
+        let enter_bytes =
+            key_to_pty_bytes(Key::Named(NamedKey::Enter), quadraui::Modifiers::default())
+                .expect("enter must encode");
         for ch in line.chars() {
             let bytes = key_to_pty_bytes(Key::Char(ch), quadraui::Modifiers::default())
                 .expect("char must encode");
-            app.detail_terminal_sessions.get_mut(&440).unwrap().write_input(&bytes);
+            app.detail_terminal_sessions
+                .get_mut(&440)
+                .unwrap()
+                .write_input(&bytes);
         }
-        app.detail_terminal_sessions.get_mut(&440).unwrap().write_input(&enter_bytes);
+        app.detail_terminal_sessions
+            .get_mut(&440)
+            .unwrap()
+            .write_input(&enter_bytes);
 
         // Poll until marker appears or 5 s elapse.
         let start = Instant::now();
         let mut found = false;
         while start.elapsed() < Duration::from_secs(5) {
             app.detail_terminal_sessions.get_mut(&440).unwrap().poll();
-            if app.detail_terminal_sessions[&440].full_text().contains("__detail_marker__") {
+            if app.detail_terminal_sessions[&440]
+                .full_text()
+                .contains("__detail_marker__")
+            {
                 found = true;
                 break;
             }
@@ -30522,13 +31940,14 @@ mod tests {
         // string verbatim so the local `coord` CLI runs the human-attended
         // interactive launcher.
         let cmd = build_interactive_launch_cmd(
+            "elitebook",
             "claude-coordinator",
             467,
             InteractiveLaunchMode::Work,
         );
         assert_eq!(
             cmd,
-            "coord assign --interactive --no-plan --repo claude-coordinator 467\r",
+            "coord assign --interactive --no-plan elitebook claude-coordinator 467\r",
         );
     }
 
@@ -30537,8 +31956,11 @@ mod tests {
         // Trailing \r submits the launcher line so the PTY actually runs
         // it without a manual Enter.  Without this the line just sits in
         // the shell input buffer.
-        let cmd = build_interactive_launch_cmd("anything", 1, InteractiveLaunchMode::Work);
-        assert!(cmd.ends_with('\r'), "launcher must end with \\r; got: {cmd:?}");
+        let cmd = build_interactive_launch_cmd("m", "anything", 1, InteractiveLaunchMode::Work);
+        assert!(
+            cmd.ends_with('\r'),
+            "launcher must end with \\r; got: {cmd:?}"
+        );
         // No double-Enter — only ONE \r at the end.
         assert_eq!(
             cmd.matches('\r').count(),
@@ -30557,6 +31979,7 @@ mod tests {
         // bracketed-paste-delivered by interactive.py rather than
         // ad-hoc-injected by the TUI.
         let cmd = build_interactive_launch_cmd(
+            "elitebook",
             "claude-coordinator",
             467,
             InteractiveLaunchMode::Work,
@@ -30566,8 +31989,8 @@ mod tests {
             "must invoke `coord assign --interactive`; got: {cmd:?}",
         );
         assert!(
-            cmd.contains("--repo claude-coordinator"),
-            "must pass --repo <repo>; got: {cmd:?}",
+            cmd.contains("elitebook claude-coordinator 467"),
+            "must pass positional machine/repo/issue; got: {cmd:?}",
         );
         // Issue number trails the flags as a positional argument.
         assert!(
@@ -30583,10 +32006,14 @@ mod tests {
     #[test]
     fn build_interactive_launch_cmd_templates_repo_and_issue() {
         // Same shape, different repo + issue → both fields propagate.
-        let cmd = build_interactive_launch_cmd("quadraui", 99, InteractiveLaunchMode::Work);
-        assert_eq!(cmd, "coord assign --interactive --no-plan --repo quadraui 99\r");
-        let cmd2 = build_interactive_launch_cmd("coord-tui", 1234, InteractiveLaunchMode::Work);
-        assert_eq!(cmd2, "coord assign --interactive --no-plan --repo coord-tui 1234\r");
+        let cmd = build_interactive_launch_cmd("m", "quadraui", 99, InteractiveLaunchMode::Work);
+        assert_eq!(cmd, "coord assign --interactive --no-plan m quadraui 99\r");
+        let cmd2 =
+            build_interactive_launch_cmd("m", "coord-tui", 1234, InteractiveLaunchMode::Work);
+        assert_eq!(
+            cmd2,
+            "coord assign --interactive --no-plan m coord-tui 1234\r"
+        );
     }
 
     #[test]
@@ -30595,15 +32022,18 @@ mod tests {
         // briefing via --briefing, so the session plans then implements in one
         // session.
         let cmd = build_interactive_launch_cmd(
+            "elitebook",
             "claude-coordinator",
             467,
             InteractiveLaunchMode::Plan,
         );
         assert!(
-            cmd.starts_with(
-                "coord assign --interactive --no-plan --repo claude-coordinator 467 --briefing "
-            ),
+            cmd.starts_with("coord assign --interactive --no-plan --briefing "),
             "plan mode must force work tools and pass a briefing; got: {cmd:?}",
+        );
+        assert!(
+            cmd.contains(" elitebook claude-coordinator 467\r"),
+            "positional machine/repo/issue trail the briefing; got: {cmd:?}",
         );
         assert!(
             cmd.contains("Plan-then-implement for issue #467"),
@@ -30621,9 +32051,9 @@ mod tests {
         // Defensive: a repo name that contains whitespace must be quoted
         // so the local shell sees it as a single argument.  Single
         // quotes also block shell-metachar interpretation.
-        let cmd = build_interactive_launch_cmd("my repo", 42, InteractiveLaunchMode::Work);
+        let cmd = build_interactive_launch_cmd("m", "my repo", 42, InteractiveLaunchMode::Work);
         assert!(
-            cmd.contains("--repo 'my repo' 42"),
+            cmd.contains("'my repo' 42"),
             "repo with spaces must be single-quoted; got: {cmd:?}",
         );
     }
@@ -30632,15 +32062,16 @@ mod tests {
     fn build_interactive_launch_cmd_quotes_repo_with_shell_metachars() {
         // `$` / `;` / `&` / backticks must not be passed unquoted — they
         // would otherwise be interpreted by the local shell.
-        let cmd = build_interactive_launch_cmd("evil;rm -rf /", 1, InteractiveLaunchMode::Work);
+        let cmd =
+            build_interactive_launch_cmd("m", "evil;rm -rf /", 1, InteractiveLaunchMode::Work);
         assert!(
-            cmd.contains("--repo 'evil;rm -rf /' 1"),
+            cmd.contains("'evil;rm -rf /' 1"),
             "shell metachars must be quoted away; got: {cmd:?}",
         );
         // An embedded single quote is escaped via the standard '\'' trick.
-        let cmd2 = build_interactive_launch_cmd("a'b", 2, InteractiveLaunchMode::Work);
+        let cmd2 = build_interactive_launch_cmd("m", "a'b", 2, InteractiveLaunchMode::Work);
         assert!(
-            cmd2.contains(r"--repo 'a'\''b' 2"),
+            cmd2.contains(r"'a'\''b' 2"),
             "embedded single quotes must be escaped; got: {cmd2:?}",
         );
     }
@@ -30703,10 +32134,7 @@ mod tests {
             all_labels: vec![],
             is_closed: false,
         }];
-        assert_eq!(
-            app.coord_repo_for_issue(1),
-            Some("some-repo".to_string()),
-        );
+        assert_eq!(app.coord_repo_for_issue(1), Some("some-repo".to_string()),);
     }
 
     #[test]
