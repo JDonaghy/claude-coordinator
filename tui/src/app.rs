@@ -2538,10 +2538,14 @@ fn load_data() -> BoardData {
 
     // ── Determine which machine is local ──────────────────────────────────
     // Match the OS hostname against the `host` column in the machines table.
+    // Hostnames are case-insensitive (DNS): the OS hostname is often mixed-case
+    // (e.g. `john-HP-EliteBook-830-G7-Notebook-PC`) while coordinator.yml stores
+    // it lower-case, so a case-sensitive compare never resolves the local
+    // machine (#467 interactive launch broke on exactly this).
     let local_hostname = gethostname::gethostname().into_string().unwrap_or_default();
     let local_machine = machine_rows
         .iter()
-        .find(|(_, host, _)| *host == local_hostname)
+        .find(|(_, host, _)| host.eq_ignore_ascii_case(&local_hostname))
         .map(|(name, _, _)| name.clone())
         .unwrap_or_default();
 
