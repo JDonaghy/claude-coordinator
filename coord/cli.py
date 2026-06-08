@@ -2004,11 +2004,6 @@ def assign(
         effective_plan_only = plan_only or (
             cfg.dispatch.require_plan and not no_plan
         )
-        # The interactive launcher uses the *current* checkout, not a
-        # fresh worktree — `coord agent` worktrees only exist on the
-        # agent-server path.  Treat the resolved repo_path as the
-        # worktree for the git-floor backstop.
-        worktree_path = repo_path
         repo_default_branch = repo_cfg.default_branch or "main"
 
         # ── Claim check.  Without this an operator can spawn two
@@ -2078,10 +2073,44 @@ def assign(
             "press Enter to submit; Ctrl-C / `/exit` to end the session."
         )
         if dry_run:
+            from coord.agent import _slugify as _slugify_dry  # noqa: PLC0415
+            _dry_branch = f"issue-{issue}-{_slugify_dry(issue_title)}"
             click.echo("  (dry run — not launched)")
             click.echo(f"  would exec: {argv}")
-            click.echo(f"  cwd: {repo_path}")
+            click.echo(
+                f"  cwd: worktree for {_dry_branch} "
+                f"(under ~/.coord/worktrees/<assignment_id>)"
+            )
             return
+
+        # Create an isolated worktree + feature branch, mirroring the
+        # agent-dispatched path (#480).  The interactive session must run
+        # in a fresh worktree on a new branch — never in the live checkout
+        # — so the feature branch contract ("you are already on a feature
+        # branch; commit + push here") in WORKER_SYSTEM_PROMPT is accurate,
+        # and finalize_interactive_exit can push + remove the worktree on
+        # exit without touching the main checkout.
+        from coord.agent import (  # noqa: PLC0415
+            _GitError as _AgentGitError,
+            setup_interactive_worktree,
+        )
+        try:
+            _wt_path, _interactive_branch = setup_interactive_worktree(
+                Path(repo_path),
+                issue_number=issue,
+                issue_title=issue_title,
+                assignment_id=assignment_id,
+                default_branch=repo_default_branch,
+            )
+            worktree_path = str(_wt_path)
+        except (_AgentGitError, OSError) as _wt_err:
+            click.echo(
+                f"  error: could not create worktree for interactive session: {_wt_err}",
+                err=True,
+            )
+            sys.exit(1)
+
+        click.echo(f"  worktree: {worktree_path} (branch: {_interactive_branch})")
 
         # State mutations (DB row, env var, board write) ONLY on real
         # dispatch — never in dry-run.  Record up front so:
@@ -2119,7 +2148,7 @@ def assign(
 
         started_at = _time.time()
         exit_code = launch_human_attended_interactive(
-            argv, effective_briefing, cwd=repo_path,
+            argv, effective_briefing, cwd=worktree_path,
         )
         if exit_code != 0:
             click.echo(f"  claude exited with status {exit_code}", err=True)
@@ -2141,6 +2170,7 @@ def assign(
                 exit_code=exit_code,
                 started_at=started_at,
                 log_path=None,
+                repo_path=repo_path,
             )
             if finalize_result.already_recorded:
                 click.echo(
