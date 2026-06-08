@@ -118,6 +118,27 @@ def launch_human_attended_interactive(
     except termios.error:
         orig_attr = None
 
+    # ── #485 human-readable briefing preview ────────────────────────────────
+    # Echo the briefing to the operator's terminal BEFORE pty.fork() while
+    # the terminal is still in cooked mode (before tty.setraw).  This lands
+    # in scrollback just above Claude's TUI so the operator can read the
+    # briefing before pressing Enter to submit the pre-filled chip.
+    #
+    # IMPORTANT: do NOT move this into the relay ``while True`` loop.  At
+    # that point Claude is actively drawing its screen; injecting bytes onto
+    # fd_out there corrupts the display.
+    if briefing.strip():
+        _hdr = (
+            "--- seeded briefing -- review below; "
+            "submit the pre-filled input in Claude to send ---"
+        )
+        _ftr = "-" * len(_hdr)
+        _preview = f"\n{_hdr}\n{briefing.rstrip()}\n{_ftr}\n\n"
+        try:
+            os.write(fd_out, _preview.encode("utf-8"))
+        except OSError:
+            pass
+
     pid, master_fd = pty.fork()
     if pid == 0:
         # child
