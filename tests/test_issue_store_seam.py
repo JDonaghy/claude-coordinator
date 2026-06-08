@@ -503,9 +503,15 @@ class TestInteractiveClaim:
         seam has a row to UPDATE on exit."""
         from coord.interactive import InteractiveFinalizeResult
 
+        # Mock the worktree creation so the test doesn't need a real git
+        # repo at /tmp/api.  Return a fake (Path, branch_name) tuple that
+        # the CLI converts to a string cwd for the launcher.
         with patch(
             "coord.github_ops.get_issue",
             return_value={"title": "fix X", "body": "do the thing"},
+        ), patch(
+            "coord.agent.setup_interactive_worktree",
+            return_value=(Path("/tmp/mock-wt-42"), "issue-42-fix-x"),
         ), patch(
             "coord.interactive.launch_human_attended_interactive",
             return_value=0,

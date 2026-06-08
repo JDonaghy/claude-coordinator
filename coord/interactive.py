@@ -43,6 +43,7 @@ from __future__ import annotations
 import fcntl
 import os
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -50,7 +51,7 @@ import sys
 import termios
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -279,6 +280,52 @@ def launch_human_attended_interactive(
 # ── #466 git-floor backstop ─────────────────────────────────────────────────
 
 
+def _remove_worktree(repo_path: Path, wt_path: Path) -> bool:
+    """Best-effort removal of a git worktree for an interactive session.
+
+    Mirrors :meth:`coord.agent.AgentServer._cleanup_worktree` without pulling
+    in the full AgentServer graph.  Returns ``True`` on success, ``False`` if
+    every removal strategy fails.
+    """
+    removed = False
+    if wt_path.exists():
+        try:
+            result = subprocess.run(
+                ["git", "worktree", "remove", str(wt_path), "--force"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=15.0,
+            )
+            removed = result.returncode == 0
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+        if not removed:
+            try:
+                shutil.rmtree(wt_path, ignore_errors=True)
+                removed = True
+            except OSError:
+                pass
+    else:
+        removed = True  # already gone
+
+    # Prune the stale git admin entry regardless of whether the directory
+    # was physically removed — a stale entry blocks the next dispatch on
+    # the same branch.
+    try:
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=str(repo_path),
+            capture_output=True,
+            timeout=10.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+    return removed
+
+
 @dataclass
 class InteractiveFinalizeResult:
     """What :func:`finalize_interactive_exit` ended up writing.
@@ -305,6 +352,10 @@ class InteractiveFinalizeResult:
         seam_outcome: The :class:`coord.issue_store.StoreOutcome` for
             the seam call (``None`` when the backstop deferred to an
             existing report).
+        worktree_removed: ``True`` when the interactive worktree was
+            successfully removed by the backstop.  ``False`` when no
+            *repo_path* was supplied (the caller owns cleanup) or when
+            the removal failed.
     """
 
     terminal_status: str
@@ -313,6 +364,7 @@ class InteractiveFinalizeResult:
     push_error: str | None
     already_recorded: bool
     seam_outcome: object | None = None  # StoreOutcome | None
+    worktree_removed: bool = field(default=False)
 
 
 def _git_push(wt_path: Path, *, timeout: float = 60.0) -> tuple[bool, str | None]:
@@ -397,11 +449,12 @@ def finalize_interactive_exit(
     exit_code: int,
     started_at: float | None = None,
     log_path: str | None = None,
+    repo_path: str | None = None,
 ) -> InteractiveFinalizeResult:
     """Git-floor backstop for the interactive launcher exit path (#466).
 
     Called AFTER :func:`launch_human_attended_interactive` returns.
-    Performs three steps:
+    Performs three steps, then optionally removes the interactive worktree:
 
     1. Push any local commits with ``git push -u origin HEAD`` (the same
        discipline the agent-side reap uses).  Push errors are surfaced
@@ -418,12 +471,20 @@ def finalize_interactive_exit(
     agent-reported result wins because the backstop's heuristic can't
     distinguish "0 commits because review session" from "0 commits
     because agent did nothing".
+
+    When *repo_path* is supplied (the interactive launcher always provides
+    it after the worktree-per-session fix), the function removes the
+    worktree after recording the terminal state — matching the cleanup
+    discipline of :meth:`coord.agent.AgentServer._cleanup_worktree`.
     """
     # Respect an explicit `coord report-result` from the agent.  Without
     # this check, every review session (which legitimately has 0 commits)
     # would have its agent-reported verdict overwritten with an advisory
     # the instant the human closed the TTY.
     if _assignment_already_recorded(assignment_id):
+        worktree_removed = False
+        if repo_path is not None:
+            worktree_removed = _remove_worktree(Path(repo_path), Path(worktree_path))
         return InteractiveFinalizeResult(
             terminal_status="report-result",  # informational only
             commits_ahead=None,
@@ -431,6 +492,7 @@ def finalize_interactive_exit(
             push_error=None,
             already_recorded=True,
             seam_outcome=None,
+            worktree_removed=worktree_removed,
         )
 
     wt_path = Path(worktree_path)
@@ -480,6 +542,12 @@ def finalize_interactive_exit(
     )
     outcome = post_completion(record)
 
+    # Step 4 — remove the interactive worktree when repo_path is provided.
+    # Matches _cleanup_worktree discipline: always runs, best-effort.
+    worktree_removed = False
+    if repo_path is not None:
+        worktree_removed = _remove_worktree(Path(repo_path), wt_path)
+
     return InteractiveFinalizeResult(
         terminal_status=outcome.status,
         commits_ahead=commits,
@@ -487,4 +555,5 @@ def finalize_interactive_exit(
         push_error=push_error,
         already_recorded=False,
         seam_outcome=outcome,
+        worktree_removed=worktree_removed,
     )

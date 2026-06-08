@@ -637,6 +637,167 @@ def _git_worktree_add(
     _git(repo_path, "worktree", "add", *add_args)
 
 
+def setup_interactive_worktree(
+    repo_path: Path,
+    issue_number: int,
+    issue_title: str,
+    assignment_id: str,
+    *,
+    default_branch: str = "main",
+    state_dir: Path | None = None,
+    log_path: str | None = None,
+) -> tuple[Path, str]:
+    """Set up a git worktree for an interactive ``coord assign --interactive`` session.
+
+    Mirrors :meth:`AgentServer._setup_worktree` so the interactive launcher gets
+    the same branch isolation as agent-dispatched workers: the session runs in a
+    fresh worktree on a feature branch derived from the issue number and title,
+    never in the live checkout.
+
+    The worktree is placed at ``<state_dir>/worktrees/<assignment_id>/`` —
+    the same layout the agent server uses, so
+    :func:`coord.interactive.finalize_interactive_exit` can locate and remove it
+    by ``assignment_id``.
+
+    Args:
+        repo_path: Absolute path to the main repository checkout.
+        issue_number: GitHub issue number (used in the branch name).
+        issue_title: Issue title (slugified into the branch name).
+        assignment_id: Unique ID for this interactive session (used as the
+            worktree directory name).
+        default_branch: The repo's default branch to branch from.  Resolved
+            from ``origin/<default_branch>`` when a remote is configured so
+            local unpushed commits on ``<default_branch>`` can't ride into the
+            worker branch (#255).
+        state_dir: Root state directory; defaults to ``~/.coord``.
+        log_path: Optional log file path for diagnostic comments (same as the
+            ``log_path`` parameter in :meth:`AgentServer._setup_worktree`).
+
+    Returns:
+        ``(worktree_path, branch_name)`` — the :class:`~pathlib.Path` of the
+        newly created worktree directory, and the feature branch name checked
+        out inside it (``issue-{N}-{slug}``).
+
+    Raises:
+        :class:`_GitError`: when the worktree cannot be created (e.g. the
+            remote ref for *default_branch* is unreachable, or a git
+            command fails).
+        :class:`OSError`: when the worktree base directory cannot be created.
+    """
+    if state_dir is None:
+        state_dir = DEFAULT_STATE_DIR
+
+    worktree_base = state_dir / "worktrees"
+    worktree_path = worktree_base / assignment_id
+
+    # Clean up stale worktree if it exists from a prior (crashed) run.
+    if worktree_path.exists():
+        try:
+            _git(repo_path, "worktree", "remove", str(worktree_path), "--force")
+        except (_GitError, FileNotFoundError, OSError):
+            shutil.rmtree(worktree_path, ignore_errors=True)
+
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Prune stale git admin entries so they don't block worktree add (#389).
+    try:
+        _git(repo_path, "worktree", "prune")
+    except _GitError:
+        pass
+
+    # Determine if origin is configured.  In production it always is; only
+    # test fixtures and local-only repos lack a remote.
+    try:
+        _git(repo_path, "remote", "get-url", "origin")
+        has_origin = True
+    except _GitError:
+        has_origin = False
+
+    # Fetch latest only when a remote exists — keeps offline / test path silent.
+    if has_origin:
+        try:
+            _git(repo_path, "fetch", "origin", "--prune")
+        except _GitError:
+            pass
+
+    # Resolve start point (#255): branch from origin/<default> SHA to prevent
+    # unpushed local commits on <default> from riding into the worker's branch.
+    if has_origin:
+        try:
+            start_point = _git(
+                repo_path, "rev-parse", f"origin/{default_branch}",
+            ).strip()
+        except _GitError as exc:
+            raise _GitError(
+                f"setup_interactive_worktree: cannot resolve origin/{default_branch} "
+                f"in {repo_path}. The remote is configured but the ref is missing — "
+                "check network connectivity and that default_branch in coordinator.yml "
+                f"matches the actual branch on origin. ({exc})"
+            ) from exc
+    else:
+        start_point = default_branch
+
+    branch_name = f"issue-{issue_number}-{_slugify(issue_title)}"
+
+    # Check whether origin or local already has this branch (retry / continuation).
+    origin_has_branch = False
+    local_has_branch = False
+    if has_origin:
+        try:
+            _git(repo_path, "rev-parse", "--verify", f"refs/remotes/origin/{branch_name}")
+            origin_has_branch = True
+        except _GitError:
+            pass
+        # #412 guard: confirm the remote-tracking ref is still live on the actual remote.
+        if origin_has_branch:
+            try:
+                remote_heads = _git(
+                    repo_path, "ls-remote", "--heads", "origin", branch_name
+                )
+                if not remote_heads.strip():
+                    origin_has_branch = False
+            except _GitError:
+                pass  # network hiccup — trust the (pruned) local ref
+    try:
+        _git(repo_path, "rev-parse", "--verify", f"refs/heads/{branch_name}")
+        local_has_branch = True
+    except _GitError:
+        pass
+
+    # Evict any conflicting worktree that already has branch_name checked out.
+    _free_branch_in_worktrees(repo_path, branch_name, str(worktree_path), log_path=log_path)
+
+    if origin_has_branch:
+        # Continuation / retry — force the worktree's branch to the remote tip
+        # (#389), discarding any divergent local copy.
+        _git_worktree_add(
+            repo_path,
+            ["-B", branch_name, str(worktree_path), f"origin/{branch_name}"],
+            log_path=log_path,
+        )
+    elif local_has_branch and not has_origin:
+        # Local-only repo (no remote) — reuse the local branch.
+        _git_worktree_add(
+            repo_path,
+            [str(worktree_path), branch_name],
+            log_path=log_path,
+        )
+    else:
+        # Fresh branch, or an untrusted local-only leftover in a repo that has a
+        # remote (#389).  Delete any colliding local branch first.
+        try:
+            _git(repo_path, "branch", "-D", branch_name)
+        except _GitError:
+            pass
+        _git_worktree_add(
+            repo_path,
+            ["-b", branch_name, str(worktree_path), start_point],
+            log_path=log_path,
+        )
+
+    return worktree_path, branch_name
+
+
 @dataclass
 class AgentAssignment:
     """Server-side record. Carries the spec plus runtime metadata."""
