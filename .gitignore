@@ -11,3 +11,5 @@ coordinator.yml
 
 # Rust build artifacts (coord-tui)
 tui/target/
+tui/*.err
+tui/*.out
