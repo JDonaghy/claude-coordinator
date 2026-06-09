@@ -273,45 +273,47 @@ class TestDispatchedTransition:
         mock_dispatch.assert_not_called()
         assert completed_work.review_state == "dispatched"
 
-    # ── #200: Test gate blocks review auto-dispatch ──
+    # ── #465: review fires immediately regardless of smoke/test verdict ──
 
-    def test_review_held_when_test_gate_pending(
+    def test_review_dispatches_immediately_despite_missing_smoke(
         self, two_machine_config: Config
     ) -> None:
-        """With "test" in default_gates, a work assignment without a test_state
-        verdict must NOT auto-dispatch review."""
+        """#465: review auto-dispatches even when test_state is None (no smoke
+        verdict recorded yet). The smoke gate was moved to merge."""
         completed_work = _work_assignment(
             status="done", branch="issue-1-fix",
             review_state="pending", test_state=None,
         )
         board = Board(completed=[completed_work])
-        mock_dispatch = MagicMock(return_value=None)
+        review_result = self._make_review_assignment()
 
         with patch("coord.reconcile._query_agent", return_value={"active": [], "completed": []}), \
-             patch("coord.review.dispatch_review", mock_dispatch):
+             patch("coord.review.dispatch_review", return_value=review_result):
             reconcile(board, two_machine_config)
 
-        mock_dispatch.assert_not_called()
-        # Still pending — once a verdict is set, the next reconcile will dispatch.
-        assert completed_work.review_state == "pending"
+        assert completed_work.review_state == "dispatched", (
+            "review must dispatch immediately on work completion regardless of "
+            "test_state (#465: smoke gate moved to coord merge)"
+        )
 
-    def test_review_held_when_test_gate_failed(
+    def test_review_dispatches_immediately_despite_failed_smoke(
         self, two_machine_config: Config
     ) -> None:
-        """A failed Test verdict blocks review until Work is redispatched."""
+        """#465: review auto-dispatches even when test_state is 'failed'."""
         completed_work = _work_assignment(
             status="done", branch="issue-1-fix",
             review_state="pending", test_state="failed",
         )
         board = Board(completed=[completed_work])
-        mock_dispatch = MagicMock(return_value=None)
+        review_result = self._make_review_assignment()
 
         with patch("coord.reconcile._query_agent", return_value={"active": [], "completed": []}), \
-             patch("coord.review.dispatch_review", mock_dispatch):
+             patch("coord.review.dispatch_review", return_value=review_result):
             reconcile(board, two_machine_config)
 
-        mock_dispatch.assert_not_called()
-        assert completed_work.review_state == "pending"
+        assert completed_work.review_state == "dispatched", (
+            "review must dispatch even when smoke failed (#465)"
+        )
 
     def test_review_dispatches_when_test_gate_skipped(
         self, two_machine_config: Config

@@ -525,6 +525,248 @@ class TestReviewGate:
         assert items[0].state == PENDING  # dry-run: state untouched
 
 
+class TestSmokeGate:
+    """#465: process() must refuse to merge when interactive smoke is required
+    and no passing/skipped verdict is recorded on the work assignment.
+
+    The smoke gate is the second gate (after review, before CI).  It mirrors
+    the review gate in structure: skip-not-halt, same legacy-caller semantics,
+    dry-run applies it.
+    """
+
+    @staticmethod
+    def _config(*, gates: list[str] | None = None):
+        """Build a minimal config-like object that includes the smoke gate."""
+        from dataclasses import dataclass, field as dc_field
+        @dataclass
+        class _Reviews:
+            enabled: bool = False  # review gate off by default in smoke tests
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+        cfg = _Cfg()
+        cfg.pipeline.default_gates = gates if gates is not None else ["test", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(completed=None, active=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, test_state: str | None = None) -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=aid,
+            type="work",
+            status="done",
+            branch=f"worker/{aid}",
+            test_state=test_state,
+        )
+
+    # ── requires_smoke / has_smoke_verdict helpers ──
+
+    def test_requires_smoke_honours_config(self) -> None:
+        cfg_with = self._config(gates=["test", "merge"])
+        assert mq.requires_smoke(_q("a"), cfg_with) is True
+
+    def test_requires_smoke_false_when_test_not_in_gates(self) -> None:
+        cfg_without = self._config(gates=["review", "merge"])
+        assert mq.requires_smoke(_q("a"), cfg_without) is False
+
+    def test_requires_smoke_false_when_no_pipeline(self) -> None:
+        from dataclasses import dataclass
+        @dataclass
+        class _NoPipelineCfg:
+            pass
+        assert mq.requires_smoke(_q("a"), _NoPipelineCfg()) is False
+
+    def test_has_smoke_verdict_passed(self) -> None:
+        work = self._work("w1", test_state="passed")
+        board = self._board(completed=[work])
+        assert mq.has_smoke_verdict(_q("w1"), board) is True
+
+    def test_has_smoke_verdict_skipped(self) -> None:
+        work = self._work("w1", test_state="skipped")
+        board = self._board(completed=[work])
+        assert mq.has_smoke_verdict(_q("w1"), board) is True
+
+    def test_has_smoke_verdict_none_returns_false(self) -> None:
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        assert mq.has_smoke_verdict(_q("w1"), board) is False
+
+    def test_has_smoke_verdict_failed_returns_false(self) -> None:
+        work = self._work("w1", test_state="failed")
+        board = self._board(completed=[work])
+        assert mq.has_smoke_verdict(_q("w1"), board) is False
+
+    def test_has_smoke_verdict_no_matching_work_fails_open(self) -> None:
+        """When no work assignment for the branch is found on the board, the
+        gate fails open (returns True) — can't block without evidence."""
+        # Work on a different branch — does not count for entry w1.
+        unrelated = Assignment(
+            machine_name="m1", repo_name="api", issue_number=2, issue_title="t",
+            assignment_id="w99", type="work", status="done",
+            branch="worker/w99", test_state="passed",
+        )
+        board = self._board(completed=[unrelated])
+        # No work for "w1"'s branch on the board → fail open.
+        assert mq.has_smoke_verdict(_q("w1"), board) is True
+
+    def test_has_smoke_verdict_empty_board_fails_open(self) -> None:
+        """Empty board → fail open."""
+        board = self._board()
+        assert mq.has_smoke_verdict(_q("w1"), board) is True
+
+    def test_has_smoke_verdict_bounce_fix_counts(self) -> None:
+        """Fix-work on the same branch with a passing test_state satisfies the gate."""
+        orig_work = self._work("orig", test_state=None)
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="[fix] t",
+            assignment_id="fix1", type="work", status="done",
+            branch="worker/orig",  # same branch as orig_work
+            test_state="passed",
+        )
+        board = self._board(completed=[orig_work, fix_work])
+        entry = _q("orig", branch="worker/orig")
+        assert mq.has_smoke_verdict(entry, board) is True
+
+    # ── process() smoke gate ──
+
+    def test_process_emits_smoke_required_when_no_verdict(self) -> None:
+        """No smoke verdict → PR is opened but merge is blocked."""
+        cfg = self._config()
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "opened" in kinds
+        assert "smoke_required" in kinds
+        assert "merged" not in kinds
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+        assert items[0].error == "smoke test required but no verdict recorded"
+
+    def test_process_proceeds_when_smoke_passed(self) -> None:
+        """Smoke passed → merge proceeds (no smoke_required event)."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        assert any(e.kind == "merged" for e in events)
+        assert not any(e.kind == "smoke_required" for e in events)
+        assert items[0].state == MERGED
+
+    def test_process_proceeds_when_smoke_skipped(self) -> None:
+        """Smoke skipped → merge proceeds."""
+        cfg = self._config()
+        work = self._work("w1", test_state="skipped")
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        assert any(e.kind == "merged" for e in events)
+        assert items[0].state == MERGED
+
+    def test_process_skip_smoke_bypasses_gate(self) -> None:
+        """--skip-smoke must let a no-verdict merge proceed."""
+        cfg = self._config()
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, skip_smoke=True)
+
+        kinds = [e.kind for e in events]
+        assert "smoke_required" not in kinds
+        assert "merged" in kinds
+        assert items[0].state == MERGED
+
+    def test_process_smoke_gate_off_when_test_not_in_gates(self) -> None:
+        """When 'test' is not in default_gates the smoke gate is disabled."""
+        cfg = self._config(gates=["review", "merge"])  # no "test"
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "smoke_required" not in kinds
+        assert "merged" in kinds
+
+    def test_process_legacy_callers_without_config_unaffected(self) -> None:
+        """Legacy callers that don't pass config/board still work."""
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh)
+        assert any(e.kind == "merged" for e in events)
+
+    def test_process_smoke_gate_does_not_block_sibling(self) -> None:
+        """An unsmoked entry must not halt the group — its sibling with a
+        verdict should still merge."""
+        cfg = self._config()
+        unsmoked = self._work("unsmoked", test_state=None)
+        smoked = self._work("smoked", test_state="passed")
+        board = self._board(completed=[unsmoked, smoked])
+        items = [
+            _q("unsmoked", branch="worker/unsmoked", size=10),
+            _q("smoked", branch="worker/smoked", size=20),
+        ]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "smoke_required" in kinds
+        assert "merged" in kinds
+        states = {x.assignment_id: x.state for x in items}
+        assert states["unsmoked"] == PENDING
+        assert states["smoked"] == MERGED
+
+    def test_dry_run_shows_smoke_required_for_no_verdict(self) -> None:
+        """dry-run must surface smoke_required, not 'would merge'."""
+        cfg = self._config()
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        kinds = [e.kind for e in events]
+        assert "smoke_required" in kinds
+        assert "merged" not in kinds
+        assert items[0].state == PENDING  # dry-run never mutates state
+
+    def test_dry_run_shows_merged_for_passed_smoke(self) -> None:
+        """dry-run with passed smoke verdict → would-merge event."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        kinds = [e.kind for e in events]
+        assert "merged" in kinds
+        assert "smoke_required" not in kinds
+        assert items[0].state == PENDING  # dry-run: state untouched
+
+
 class TestRefreshEntryAssignment:
     """#292: refresh_entry_assignment creates or updates queue entries."""
 

@@ -940,3 +940,86 @@ class TestSmokeTestsCapture:
         ).fetchone()
         assert row is not None
         assert _json.loads(row["smoke_tests"]) == []
+
+
+# ── #465: review dispatch fires without a smoke verdict ──────────────────────
+
+
+class TestDispatchBoardPendingReviewsNoSmokeGate:
+    """#465: _dispatch_board_pending_reviews must fire review dispatch even when
+    test_state is None or 'failed' — the smoke gate was moved to coord merge."""
+
+    @staticmethod
+    def _config_with_test_gate() -> Config:
+        """Config whose pipeline.default_gates includes 'test' — formerly
+        blocked review dispatch; must now be irrelevant to review."""
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        )
+        # default_gates already includes "test" by default — be explicit.
+        cfg.pipeline.default_gates = ["test", "review", "merge"]
+        return cfg
+
+    @staticmethod
+    def _done_work(aid: str, *, test_state: str | None) -> "Assignment":
+        from coord.models import Assignment
+        return Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=11, issue_title="t",
+            assignment_id=aid, type="work",
+            status="done", review_state="pending",
+            test_state=test_state,
+        )
+
+    def test_review_dispatches_without_test_state(
+        self, coord_dir: Path
+    ) -> None:
+        """review fires when test_state is None (no smoke verdict yet)."""
+        from coord.models import Board
+        from coord import state as state_mod
+
+        work = self._done_work("no-smoke-work", test_state=None)
+        state_mod.save_board(Board(completed=[work]))
+
+        cfg = self._config_with_test_gate()
+
+        dispatch_calls: list[str] = []
+
+        def _fake_dispatch(completed, board, config, **kwargs):
+            dispatch_calls.append(completed.assignment_id)
+            return None
+
+        with patch("coord.review.dispatch_review", _fake_dispatch):
+            notify_mod._dispatch_board_pending_reviews(cfg)
+
+        assert "no-smoke-work" in dispatch_calls, (
+            "_dispatch_board_pending_reviews must call dispatch_review even "
+            "when test_state is NULL (#465: smoke gate moved to merge)"
+        )
+
+    def test_review_dispatches_when_smoke_failed(
+        self, coord_dir: Path
+    ) -> None:
+        """review fires even when test_state is 'failed'."""
+        from coord.models import Board
+        from coord import state as state_mod
+
+        work = self._done_work("failed-smoke-work", test_state="failed")
+        state_mod.save_board(Board(completed=[work]))
+
+        cfg = self._config_with_test_gate()
+
+        dispatch_calls: list[str] = []
+
+        def _fake_dispatch(completed, board, config, **kwargs):
+            dispatch_calls.append(completed.assignment_id)
+            return None
+
+        with patch("coord.review.dispatch_review", _fake_dispatch):
+            notify_mod._dispatch_board_pending_reviews(cfg)
+
+        assert "failed-smoke-work" in dispatch_calls, (
+            "_dispatch_board_pending_reviews must call dispatch_review even "
+            "when test_state='failed' (#465)"
+        )

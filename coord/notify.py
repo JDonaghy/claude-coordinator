@@ -907,18 +907,14 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
     if board is None:
         return
 
-    # Match the gating in reconcile() exactly so notify and reconcile agree
-    # on whether a review should be dispatched.  See coord/reconcile.py.
-    test_gate_active = "test" in (config.pipeline.default_gates or [])
-
+    # #465: review fires immediately on work completion — no manual smoke
+    # prerequisite.  Mirrors the gate removal in reconcile().
     changed = False
     for completed in board.completed:
         # NULL counts as "pending" — see comment in reconcile().
         if completed.review_state not in (None, "pending"):
             continue
         if completed.type != "work":
-            continue
-        if test_gate_active and completed.test_state not in ("passed", "skipped"):
             continue
         review = dispatch_review(completed, board, config)
         if review is not None:
