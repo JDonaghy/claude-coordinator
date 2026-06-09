@@ -1982,6 +1982,9 @@ def assign(
         from coord.interactive import (  # noqa: PLC0415
             finalize_interactive_exit,
             launch_human_attended_interactive,
+            tmux_available as _tmux_avail,
+            tmux_session_alive as _tmux_alive,
+            tmux_session_name as _tmux_name,
         )
 
         provider = ClaudePtyProvider()
@@ -2160,9 +2163,6 @@ def assign(
         # still running.  Tell the operator how to reattach and let them
         # close the session themselves (at which point coord report-result
         # or coord reattach will record the terminal state).
-        from coord.interactive import tmux_available as _tmux_avail  # noqa: PLC0415
-        from coord.interactive import tmux_session_alive as _tmux_alive  # noqa: PLC0415
-        from coord.interactive import tmux_session_name as _tmux_name  # noqa: PLC0415
         _sname = _tmux_name(assignment_id) if _tmux_avail() else None
         if _sname and _tmux_alive(_sname):
             click.echo(
@@ -4980,9 +4980,17 @@ def sessions_cmd(output_json: bool) -> None:
         list_coord_tmux_sessions,
         TMUX_SESSION_PREFIX,
     )
+    from coord.state import get_connection  # noqa: PLC0415
 
     raw = list_coord_tmux_sessions()
     enriched: list[dict] = []
+
+    # Acquire the DB connection once before the loop — get_connection() is a
+    # module-level singleton and should not be re-imported per iteration.
+    try:
+        _db_conn = get_connection()
+    except Exception:  # noqa: BLE001
+        _db_conn = None
 
     for s in raw:
         session_name = s["session_name"]
@@ -4991,20 +4999,19 @@ def sessions_cmd(output_json: bool) -> None:
         repo_name: str | None = None
         issue_title: str | None = None
 
-        try:
-            from coord.state import get_connection  # noqa: PLC0415
-            conn = get_connection()
-            row = conn.execute(
-                "SELECT issue_number, repo_name, issue_title "
-                "FROM assignments WHERE assignment_id=?",
-                (assignment_id,),
-            ).fetchone()
-            if row is not None:
-                issue_number = row["issue_number"] if hasattr(row, "keys") else row[0]
-                repo_name = row["repo_name"] if hasattr(row, "keys") else row[1]
-                issue_title = row["issue_title"] if hasattr(row, "keys") else row[2]
-        except Exception:  # noqa: BLE001
-            pass
+        if _db_conn is not None:
+            try:
+                row = _db_conn.execute(
+                    "SELECT issue_number, repo_name, issue_title "
+                    "FROM assignments WHERE assignment_id=?",
+                    (assignment_id,),
+                ).fetchone()
+                if row is not None:
+                    issue_number = row["issue_number"] if hasattr(row, "keys") else row[0]
+                    repo_name = row["repo_name"] if hasattr(row, "keys") else row[1]
+                    issue_title = row["issue_title"] if hasattr(row, "keys") else row[2]
+            except Exception:  # noqa: BLE001
+                pass
 
         enriched.append(
             {
