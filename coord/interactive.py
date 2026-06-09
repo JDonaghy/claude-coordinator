@@ -72,7 +72,6 @@ import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import termios
 import time
 import tty
@@ -91,6 +90,7 @@ __all__ = [
     "finalize_interactive_exit",
     "InteractiveFinalizeResult",
     "TMUX_SESSION_PREFIX",
+    "TmuxHost",
     "tmux_session_name",
     "tmux_available",
     "tmux_session_alive",
@@ -106,6 +106,43 @@ __all__ = [
 TMUX_SESSION_PREFIX = "coord-"
 
 
+@dataclass(frozen=True)
+class TmuxHost:
+    """Seam that resolves tmux subprocess commands for local or remote hosts.
+
+    ``ssh_target=None`` (the default) means the local machine; subprocess
+    calls are plain ``["tmux", ...]``.  When ``ssh_target`` is set, calls
+    become ``["ssh", ssh_target, "tmux", ...]`` — optionally with ``-t``
+    for commands that need a TTY (e.g. ``attach-session``).
+
+    This seam is introduced in #493 to unblock #486b (remote tmux).  No
+    remote callers exist yet; all production call-sites use the default
+    ``TmuxHost(None)`` which preserves the exact same subprocess argv as
+    before.
+    """
+
+    ssh_target: str | None  # None => local
+
+    def cmd(self, tmux_args: list[str], *, tty: bool = False) -> list[str]:
+        """Build the full subprocess argv for a tmux invocation.
+
+        Args:
+            tmux_args: The tmux sub-command and its arguments, *without*
+                the leading ``"tmux"`` token.
+            tty: When ``True`` and the host is remote, ``-t`` is inserted
+                after ``"ssh"`` so the remote side allocates a pseudo-TTY.
+                Use ``True`` only for interactive commands like
+                ``attach-session``; leave ``False`` (the default) for all
+                control commands (has-session, ls, capture-pane, etc.).
+
+        Returns:
+            A complete ``subprocess.run``-ready command list.
+        """
+        if self.ssh_target is None:
+            return ["tmux", *tmux_args]
+        return ["ssh", *(["-t"] if tty else []), self.ssh_target, "tmux", *tmux_args]
+
+
 def tmux_session_name(assignment_id: str) -> str:
     """Return the canonical tmux session name for *assignment_id*."""
     return f"{TMUX_SESSION_PREFIX}{assignment_id}"
@@ -116,16 +153,24 @@ def tmux_available() -> bool:
     return shutil.which("tmux") is not None
 
 
-def tmux_session_alive(session_name: str) -> bool:
+def tmux_session_alive(
+    session_name: str,
+    *,
+    host: TmuxHost = TmuxHost(None),
+) -> bool:
     """Return ``True`` when the named tmux session exists and is running.
 
     Uses ``tmux has-session`` which exits 0 when the session is alive and 1
     when it does not exist.  Subprocess / OS errors are treated as
     "not alive" so callers don't need try/except.
+
+    Args:
+        session_name: The tmux session name to probe.
+        host: Target host.  Defaults to ``TmuxHost(None)`` (local).
     """
     try:
         result = subprocess.run(
-            ["tmux", "has-session", "-t", session_name],
+            host.cmd(["has-session", "-t", session_name]),
             capture_output=True,
             timeout=5.0,
         )
@@ -134,12 +179,18 @@ def tmux_session_alive(session_name: str) -> bool:
         return False
 
 
-def list_coord_tmux_sessions() -> list[dict[str, str]]:
+def list_coord_tmux_sessions(
+    *,
+    host: TmuxHost = TmuxHost(None),
+) -> list[dict[str, str]]:
     """Return a list of live ``coord-*`` tmux sessions.
 
     Each entry is a ``dict`` with at least the key ``"session_name"``.
     Returns an empty list when tmux is not available, not running, or has
     no matching sessions.
+
+    Args:
+        host: Target host.  Defaults to ``TmuxHost(None)`` (local).
 
     Example::
 
@@ -147,7 +198,7 @@ def list_coord_tmux_sessions() -> list[dict[str, str]]:
     """
     try:
         result = subprocess.run(
-            ["tmux", "ls", "-F", "#{session_name}"],
+            host.cmd(["ls", "-F", "#{session_name}"]),
             capture_output=True,
             text=True,
             timeout=5.0,
@@ -169,6 +220,7 @@ def _inject_briefing_into_tmux_session(
     briefing: str,
     *,
     timeout: float = 12.0,
+    host: TmuxHost = TmuxHost(None),
 ) -> bool:
     """Wait for the tmux pane to stabilise then inject *briefing* via bracketed paste.
 
@@ -178,29 +230,30 @@ def _inject_briefing_into_tmux_session(
     2. Once the pane has been non-empty AND stable for
        :data:`_READY_QUIESCE_S` seconds (or the overall *timeout* lapses),
        load the briefing text into a tmux named buffer (``coord-brief``)
-       and invoke ``tmux paste-buffer -p``.
+       via **stdin** (``tmux load-buffer -b coord-brief -``) and invoke
+       ``tmux paste-buffer -p``.
     3. The ``-p`` flag makes tmux send the content wrapped in bracketed-paste
        markers (``ESC[200~`` … ``ESC[201~``) **if** the target application
        has requested bracketed-paste mode.  Since ``claude``'s TUI always
        enables bracketed paste, this is equivalent to the PTY relay's
        manual bracketed-paste block.
 
-    Returns ``True`` when the briefing was injected, ``False`` on timeout
-    or subprocess error.
+    The stdin-based ``load-buffer -`` approach avoids creating a local
+    temporary file, which is important for the remote-host path (#486b):
+    no ``scp`` or ``ssh`` file-transfer is needed.
+
+    Args:
+        session_name: The tmux session to inject into.
+        briefing: Text to pre-fill in the TUI input box.
+        timeout: Quiescence-wait deadline in seconds.
+        host: Target host.  Defaults to ``TmuxHost(None)`` (local).
+
+    Returns:
+        ``True`` when the briefing was injected, ``False`` on timeout
+        or subprocess error.
     """
     if not briefing.strip():
         return True  # nothing to inject — trivially OK
-
-    # Write the briefing (without trailing newline) to a temp file so that
-    # ``tmux load-buffer`` can read it cleanly.
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        ) as tf:
-            tf.write(briefing.rstrip("\n"))
-            tf_path = tf.name
-    except OSError:
-        return False
 
     try:
         deadline = time.monotonic() + timeout
@@ -211,7 +264,7 @@ def _inject_briefing_into_tmux_session(
             time.sleep(0.05)
             try:
                 cap = subprocess.run(
-                    ["tmux", "capture-pane", "-p", "-t", session_name],
+                    host.cmd(["capture-pane", "-p", "-t", session_name]),
                     capture_output=True,
                     text=True,
                     timeout=2.0,
@@ -230,30 +283,25 @@ def _inject_briefing_into_tmux_session(
                 if now - quiescent_since >= _READY_QUIESCE_S:
                     break  # stable and non-empty — inject
 
-        # Load briefing into a named tmux buffer.
+        # Load briefing into a named tmux buffer via stdin.
+        # Using "-" as the source tells tmux to read from stdin, which
+        # works for both local and remote hosts without temporary files.
         subprocess.run(
-            ["tmux", "load-buffer", "-b", "coord-brief", tf_path],
+            host.cmd(["load-buffer", "-b", "coord-brief", "-"]),
+            input=briefing.rstrip("\n"),
+            text=True,
             capture_output=True,
             timeout=5.0,
         )
         # Paste with bracketed-paste enabled (``-p``).
         subprocess.run(
-            [
-                "tmux", "paste-buffer", "-p",
-                "-t", session_name,
-                "-b", "coord-brief",
-            ],
+            host.cmd(["paste-buffer", "-p", "-t", session_name, "-b", "coord-brief"]),
             capture_output=True,
             timeout=5.0,
         )
         return True
     except (subprocess.SubprocessError, OSError):
         return False
-    finally:
-        try:
-            os.unlink(tf_path)
-        except OSError:
-            pass
 
 
 def _launch_via_tmux(
@@ -262,6 +310,7 @@ def _launch_via_tmux(
     session_name: str,
     *,
     cwd: str | None = None,
+    host: TmuxHost = TmuxHost(None),
 ) -> int | None:
     """Create (or reuse) a named tmux session running *argv* and attach.
 
@@ -294,7 +343,7 @@ def _launch_via_tmux(
     except (OSError, AttributeError, ValueError):
         cols, rows = 220, 50
 
-    already_alive = tmux_session_alive(session_name)
+    already_alive = tmux_session_alive(session_name, host=host)
 
     if not already_alive:
         # Build the shell-command string tmux will execute in the new window.
@@ -303,12 +352,12 @@ def _launch_via_tmux(
         # ``shlex.join`` so paths / flags with spaces are quoted correctly.
         shell_cmd = shlex.join(list(argv))
 
-        create_cmd = [
-            "tmux", "new-session", "-d",
+        create_cmd = host.cmd([
+            "new-session", "-d",
             "-s", session_name,
             "-x", str(max(cols, 40)),
             "-y", str(max(rows, 10)),
-        ]
+        ])
         if cwd:
             create_cmd += ["-c", cwd]
         create_cmd.append(shell_cmd)
@@ -329,15 +378,17 @@ def _launch_via_tmux(
 
         # Inject briefing (best-effort; a failure here is non-fatal).
         if briefing.strip():
-            _inject_briefing_into_tmux_session(session_name, briefing)
+            _inject_briefing_into_tmux_session(session_name, briefing, host=host)
 
     # Attach.  ``subprocess.run`` (not ``os.execvp``) is intentional: we
     # need this process to continue after the operator detaches so that
     # the CLI caller (``coord assign``) can check whether the session is
     # still alive and decide whether to run ``finalize_interactive_exit``.
+    # The attach-session call uses tty=True because it needs a pseudo-TTY
+    # on the remote side when the host is remote.
     try:
         attach_result = subprocess.run(
-            ["tmux", "attach-session", "-t", session_name],
+            host.cmd(["attach-session", "-t", session_name], tty=True),
         )
         return attach_result.returncode
     except (subprocess.SubprocessError, OSError):
