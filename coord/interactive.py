@@ -311,6 +311,7 @@ def _launch_via_tmux(
     *,
     cwd: str | None = None,
     host: TmuxHost = TmuxHost(None),
+    raw_shell_cmd: str | None = None,
 ) -> int | None:
     """Create (or reuse) a named tmux session running *argv* and attach.
 
@@ -336,6 +337,23 @@ def _launch_via_tmux(
     Returns ``None`` when session creation fails so that the caller
     (:func:`launch_human_attended_interactive`) can fall back to the
     PTY relay without double-echoing the briefing.
+
+    Args:
+        argv: Worker command.  Used as-is when *raw_shell_cmd* is ``None``.
+        briefing: Text to pre-fill in the TUI input box.
+        session_name: tmux session name (``coord-<assignment_id>``).
+        cwd: Starting directory for the session (local) or the tmux ``-c``
+            start-directory (remote).  For remote worktree launches
+            (#486b) this is typically ``None`` because the *raw_shell_cmd*
+            itself ``cd``s into the worktree.
+        host: Target host.  ``TmuxHost(None)`` means local; a non-``None``
+            ``ssh_target`` triggers the remote-safe single-string SSH path.
+        raw_shell_cmd: When provided, use this string verbatim as the
+            tmux session command instead of ``shlex.join(argv)``.  Intended
+            for the remote launch path (#486b) where the command includes
+            ``$HOME`` paths and shell operators (``&&``, ``||``) that must
+            survive round-tripping through SSH and the remote shell without
+            being re-split or having ``~`` masked by single-quoting.
     """
     # Determine terminal dimensions for the new session.
     try:
@@ -346,21 +364,50 @@ def _launch_via_tmux(
     already_alive = tmux_session_alive(session_name, host=host)
 
     if not already_alive:
-        # Build the shell-command string tmux will execute in the new window.
-        # ``tmux new-session`` interprets its trailing argument as a single
-        # shell command string (passed to the shell with ``-c``).  Use
-        # ``shlex.join`` so paths / flags with spaces are quoted correctly.
-        shell_cmd = shlex.join(list(argv))
+        # ``raw_shell_cmd`` is used by the remote launch path (#486b) so that
+        # paths containing ``$HOME`` / ``~`` and shell operators are passed
+        # verbatim to the remote shell rather than being re-quoted by
+        # ``shlex.join``.  When not provided, fall back to the default
+        # behaviour: quote the argv list.
+        shell_cmd = raw_shell_cmd if raw_shell_cmd is not None else shlex.join(list(argv))
 
-        create_cmd = host.cmd([
-            "new-session", "-d",
-            "-s", session_name,
-            "-x", str(max(cols, 40)),
-            "-y", str(max(rows, 10)),
-        ])
-        if cwd:
-            create_cmd += ["-c", cwd]
-        create_cmd.append(shell_cmd)
+        if host.ssh_target is not None:
+            # Remote: build the entire ``tmux new-session`` invocation as a
+            # single shell string and pass it to SSH as ONE argument.  If we
+            # used ``host.cmd([..., shell_cmd])`` (multiple list elements),
+            # SSH would concatenate everything after the hostname with spaces
+            # and the remote shell would split ``shell_cmd`` at operator
+            # tokens (``&&``, ``||``, …), breaking the intended multi-step
+            # command.  Sending the whole tmux invocation as one string
+            # preserves quoting and lets the remote shell hand the
+            # properly-quoted ``shell_cmd`` to tmux as a single argument.
+            # Tmux then runs ``$SHELL -c <shell_cmd>`` where ``$HOME`` and
+            # other shell expansions work correctly.
+            _parts: list[str] = [
+                "tmux", "new-session", "-d",
+                "-s", shlex.quote(session_name),
+                "-x", str(max(cols, 40)),
+                "-y", str(max(rows, 10)),
+            ]
+            if cwd:
+                _parts += ["-c", shlex.quote(cwd)]
+            # shlex.quote wraps shell_cmd so the remote shell treats it as
+            # exactly one argument to tmux new-session.
+            _parts.append(shlex.quote(shell_cmd))
+            create_cmd = ["ssh", host.ssh_target, " ".join(_parts)]
+        else:
+            # Local: pass args directly to tmux via subprocess list form.
+            # No shell is involved, so shell_cmd is passed as ONE argument
+            # without any re-quoting or special-character issues.
+            create_cmd = host.cmd([
+                "new-session", "-d",
+                "-s", session_name,
+                "-x", str(max(cols, 40)),
+                "-y", str(max(rows, 10)),
+            ])
+            if cwd:
+                create_cmd += ["-c", cwd]
+            create_cmd.append(shell_cmd)
 
         try:
             result = subprocess.run(

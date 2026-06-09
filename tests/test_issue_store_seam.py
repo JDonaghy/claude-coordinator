@@ -506,9 +506,15 @@ class TestInteractiveClaim:
         # Mock the worktree creation so the test doesn't need a real git
         # repo at /tmp/api.  Return a fake (Path, branch_name) tuple that
         # the CLI converts to a string cwd for the launcher.
+        # Patch gethostname so the 'laptop' machine is detected as local
+        # regardless of what machine the tests run on (#494 added
+        # local/remote detection keyed off the hostname).
         with patch(
             "coord.github_ops.get_issue",
             return_value={"title": "fix X", "body": "do the thing"},
+        ), patch(
+            "socket.gethostname",
+            return_value="laptop",
         ), patch(
             "coord.agent.setup_interactive_worktree",
             return_value=(Path("/tmp/mock-wt-42"), "issue-42-fix-x"),
