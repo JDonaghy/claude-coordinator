@@ -294,6 +294,7 @@ class TestMergeCommand:
             machine_name="laptop", repo_name="api", issue_number=234,
             issue_title="#234", assignment_id="w234", type="work",
             status="done", branch="issue-234-fix",
+            test_state="passed",  # smoke gate satisfied (#465)
         )
         save_board(Board(active=[], completed=[work]))
         _seed_queue([_entry("w234")])
@@ -327,6 +328,7 @@ class TestMergeCommand:
             machine_name="laptop", repo_name="api", issue_number=235,
             issue_title="#235", assignment_id="w235", type="work",
             status="done", branch="issue-235-fix",
+            test_state="passed",  # smoke gate satisfied (#465)
         )
         review = Assignment(
             machine_name="other", repo_name="api", issue_number=235,
@@ -406,6 +408,7 @@ class TestMergeAutoEnqueue:
             status="done",
             branch=branch,
             type="work",
+            test_state="passed",  # smoke gate satisfied (#465)
         )
         save_board(Board(active=[], completed=[a]))
 

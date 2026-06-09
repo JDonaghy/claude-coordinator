@@ -4144,6 +4144,11 @@ def _load_issue_states() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
     is_flag=True,
     help="Skip the review-approval gate — merge even when no approved review is on the board (#253).",
 )
+@click.option(
+    "--skip-smoke",
+    is_flag=True,
+    help="Skip the interactive smoke-test gate — merge even when no smoke verdict is recorded (#465).",
+)
 def merge(
     config_path: Path,
     dry_run: bool,
@@ -4152,6 +4157,7 @@ def merge(
     method: str,
     force_merge: bool,
     skip_review: bool,
+    skip_smoke: bool,
 ) -> None:
     from coord import github_ops as gh_ops
     from coord import merge_queue as mq
@@ -4275,11 +4281,13 @@ def merge(
     ci_store = build_ci_store(cfg.ci_store.type)
     if skip_review:
         click.echo("  --skip-review: review-approval gate bypassed (#253)")
+    if skip_smoke:
+        click.echo("  --skip-smoke: interactive smoke-test gate bypassed (#465)")
     events = mq.process(
         items, gh_ops,
         method=method, dry_run=dry_run, presorted=presorted,
         ci_store=ci_store, force_merge=force_merge,
-        config=cfg, board=board, skip_review=skip_review,
+        config=cfg, board=board, skip_review=skip_review, skip_smoke=skip_smoke,
     )
 
     for ev in events:
@@ -4556,7 +4564,7 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
         if verdict == "fail" and reason:
             click.echo(f"  reason: {reason}")
         elif verdict == "pass":
-            click.echo(f"  Run: coord pr {assignment_id} to create the PR")
+            click.echo("  Run: coord merge to proceed")
 
         # #271 part 1: restore the local checkout to `default_branch`
         # after a pass/skip verdict — local testing is done, the user

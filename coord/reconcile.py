@@ -279,11 +279,9 @@ def reconcile(board: Board, config: Config) -> list[str]:
     from coord.review import dispatch_review
     from coord.claim import has_active_work_followup
 
-    # #200: gate review auto-dispatch on the Test stage verdict. If the pipeline
-    # includes a "test" gate, hold off on review until the user records a
-    # passed/skipped verdict (test_state). A failed verdict blocks review until
-    # the user redispatches Work to produce a new candidate.
-    test_gate_active = "test" in (config.pipeline.default_gates or [])
+    # #465: review fires immediately on work completion — no manual smoke
+    # prerequisite.  The interactive smoke gate now lives on merge
+    # (see coord/merge_queue.requires_smoke / has_smoke_verdict).
 
     for completed in board.completed:
         # Treat NULL the same as "pending" — a done-work assignment whose
@@ -295,10 +293,6 @@ def reconcile(board: Board, config: Config) -> list[str]:
             continue
         # Only work assignments get reviewed.
         if completed.type != "work":
-            continue
-        if test_gate_active and completed.test_state not in ("passed", "skipped"):
-            # Either no verdict yet, or verdict was "failed" — either way the
-            # work is not ready for review. The next reconcile pass will re-check.
             continue
         # #459: skip review dispatch when a work or conflict-fix is actively
         # rewriting this issue's branch (e.g. a coord-bounce fix iteration).

@@ -170,7 +170,8 @@ def test_reconcile_skips_review_when_active_work_for_same_issue(config: Config) 
         machine_name="laptop", repo_name="api", issue_number=42,
         issue_title="t", status="done", branch="issue-42-fix",
         assignment_id="work-old", type="work", review_state="pending",
-        test_state="passed",  # satisfy the default test gate
+        # No test_state — #465 moved the smoke gate to merge, so review fires
+        # regardless of smoke verdict.
     )
     active_fix = Assignment(
         machine_name="laptop", repo_name="api", issue_number=42,
@@ -216,7 +217,8 @@ def test_reconcile_dispatches_review_when_no_active_work(config: Config) -> None
         machine_name="laptop", repo_name="api", issue_number=42,
         issue_title="t", status="done", branch="issue-42-fix",
         assignment_id="work-done", type="work", review_state="pending",
-        test_state="passed",  # satisfy the default test gate
+        # No test_state — #465 moved the smoke gate to merge, so review fires
+        # regardless of smoke verdict.
     )
     board = Board(
         repos=[Repo(name="api", github="acme/api")],
@@ -242,6 +244,98 @@ def test_reconcile_dispatches_review_when_no_active_work(config: Config) -> None
 
     assert review_dispatches == ["work-done"], (
         "dispatch_review should be called when there's no active work for the issue"
+    )
+    assert completed_work.review_state == "dispatched"
+
+
+# ── #465: review fires without a smoke/test verdict ──────────────────────────
+
+
+def test_reconcile_dispatches_review_without_smoke_verdict(config: Config) -> None:
+    """#465: review must dispatch even when test_state is None (no smoke verdict).
+    The smoke gate was moved to coord merge; review should fire immediately on
+    work completion regardless of the interactive smoke outcome."""
+    cfg_with_reviews = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"],
+                          repo_paths={"api": "/w"})],
+        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+    )
+
+    completed_work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=99,
+        issue_title="t", status="done", branch="issue-99-feat",
+        assignment_id="work-no-smoke", type="work", review_state="pending",
+        # test_state deliberately left None — no smoke verdict recorded yet.
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        active=[],
+        completed=[completed_work],
+    )
+
+    review_dispatches: list[str] = []
+
+    def _fake_dispatch_review(completed, board, config, **kwargs):
+        review_dispatches.append(completed.assignment_id)
+        return Assignment(
+            machine_name="laptop", repo_name="api", issue_number=99,
+            issue_title="[review] t", status="running",
+            assignment_id="rev-no-smoke", type="review",
+        )
+
+    fake_status = {"active": [], "completed": []}
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.review.dispatch_review", _fake_dispatch_review):
+        reconcile(board, cfg_with_reviews)
+
+    assert review_dispatches == ["work-no-smoke"], (
+        "dispatch_review must fire even when test_state is None (#465: smoke "
+        "gate moved to merge, not review)"
+    )
+    assert completed_work.review_state == "dispatched"
+
+
+def test_reconcile_dispatches_review_when_smoke_failed(config: Config) -> None:
+    """#465: review must still dispatch when the smoke test failed (test_state='failed').
+    A failed smoke is not a reason to withhold code review — the reviewer
+    may surface the same issue or provide independent feedback."""
+    cfg_with_reviews = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"],
+                          repo_paths={"api": "/w"})],
+        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+    )
+
+    completed_work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=77,
+        issue_title="t", status="done", branch="issue-77-feat",
+        assignment_id="work-smoke-failed", type="work", review_state="pending",
+        test_state="failed",  # smoke explicitly failed — review should still fire
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        active=[],
+        completed=[completed_work],
+    )
+
+    review_dispatches: list[str] = []
+
+    def _fake_dispatch_review(completed, board, config, **kwargs):
+        review_dispatches.append(completed.assignment_id)
+        return Assignment(
+            machine_name="laptop", repo_name="api", issue_number=77,
+            issue_title="[review] t", status="running",
+            assignment_id="rev-smoke-failed", type="review",
+        )
+
+    fake_status = {"active": [], "completed": []}
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.review.dispatch_review", _fake_dispatch_review):
+        reconcile(board, cfg_with_reviews)
+
+    assert review_dispatches == ["work-smoke-failed"], (
+        "dispatch_review must fire even when test_state='failed' (#465)"
     )
     assert completed_work.review_state == "dispatched"
 
