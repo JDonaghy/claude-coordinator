@@ -57,6 +57,13 @@ class ReviewsConfig:
         "Check for platform-specific code in shared/cross-platform paths",
     ])
     repo_overrides: dict[str, list[str]] = field(default_factory=dict)
+    # Flood guard (incident 2026-06-08): bound *bulk* review dispatch so a
+    # backlog "unmasking" (e.g. removing a gate that had been suppressing
+    # reviews) can't fire hundreds of metered `claude -p` reviews in one pass.
+    # See coord.review.dispatch_pending_reviews.
+    max_auto_dispatch_per_pass: int = 5  # cap reviews dispatched per reconcile/notify pass (0 = unbounded)
+    flood_threshold: int = 12  # if more rows than this are pending review in one pass, refuse all (0 = no surge gate)
+    allow_review_flood: bool = False  # override the surge gate (or set env COORD_ALLOW_REVIEW_FLOOD=1)
 
 
 @dataclass
@@ -611,12 +618,21 @@ def _parse_reviews(raw: Any, repo_names: set[str]) -> ReviewsConfig:
         raise ConfigError("'reviews' must be a mapping")
 
     cfg = ReviewsConfig()
-    for bool_field in ("enabled", "auto_dispatch", "require_approval"):
+    for bool_field in ("enabled", "auto_dispatch", "require_approval", "allow_review_flood"):
         if bool_field in raw:
             value = raw[bool_field]
             if not isinstance(value, bool):
                 raise ConfigError(f"reviews.{bool_field} must be a boolean")
             setattr(cfg, bool_field, value)
+
+    for int_field in ("max_auto_dispatch_per_pass", "flood_threshold"):
+        if int_field in raw:
+            value = raw[int_field]
+            # bool is a subclass of int — reject it explicitly so a stray
+            # `flood_threshold: true` doesn't silently become 1.
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ConfigError(f"reviews.{int_field} must be a non-negative integer")
+            setattr(cfg, int_field, value)
 
     if "reviewer_prompt" in raw:
         value = raw["reviewer_prompt"]

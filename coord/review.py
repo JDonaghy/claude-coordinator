@@ -763,6 +763,94 @@ def dispatch_review(
     return review_assignment
 
 
+def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, now=None):
+    """Bounded bulk review dispatch — the flood guard (incident 2026-06-08).
+
+    Gather every completed-work row eligible for a review, then dispatch
+    reviews subject to two limits that prevent the review-flood failure mode —
+    a backlog "unmasking" firing hundreds of metered ``claude -p`` reviews in a
+    single reconcile/notify pass:
+
+    1. **Surge gate.** If the number of eligible rows exceeds
+       ``reviews.flood_threshold`` (and the threshold is > 0), dispatch
+       *nothing* and log loudly. A sudden surge is the unmasking signature, so
+       we halt and require a human to either clear the stale backlog (mark it
+       reviewed/skipped) or opt in via ``reviews.allow_review_flood: true`` /
+       ``COORD_ALLOW_REVIEW_FLOOD=1``.
+    2. **Per-pass cap.** Otherwise dispatch at most
+       ``reviews.max_auto_dispatch_per_pass`` reviews this pass (0 = unbounded);
+       the remainder stay ``"pending"`` and are picked up next pass, so even a
+       moderate batch bleeds out at a bounded rate instead of all at once.
+
+    A row is eligible when its ``review_state`` is ``None``/``"pending"``, it is
+    a ``"work"`` assignment, the (optional) test gate is satisfied, and #459's
+    ``has_active_work_followup`` is False (don't review code a live fix is
+    rewriting). Both ``reconcile()`` and ``coord notify`` route bulk dispatch
+    through here so the cap, surge gate, and #459 dedupe are enforced on every
+    automatic path. Sets ``review_state="dispatched"`` on each row it
+    dispatches and returns the dispatched review ``Assignment``s. The caller
+    persists the board.
+    """
+    import logging
+    import os
+
+    from coord.claim import has_active_work_followup
+
+    logger = logging.getLogger("coord.review")
+
+    eligible = [
+        c
+        for c in board.completed
+        if c.review_state in (None, "pending")
+        and c.type == "work"
+        and (not test_gate_active or c.test_state in ("passed", "skipped"))
+        and not has_active_work_followup(
+            board, repo_name=c.repo_name, issue_number=c.issue_number
+        )
+    ]
+    if not eligible:
+        return []
+
+    threshold = config.reviews.flood_threshold
+    override = (
+        config.reviews.allow_review_flood
+        or os.environ.get("COORD_ALLOW_REVIEW_FLOOD") == "1"
+    )
+    if threshold and len(eligible) > threshold and not override:
+        logger.warning(
+            "review flood guard: %d work rows are pending review (> "
+            "reviews.flood_threshold=%d). Refusing bulk dispatch to avoid a "
+            "metered review flood. Clear the stale backlog (mark reviewed/"
+            "skipped), or set reviews.allow_review_flood: true (or "
+            "COORD_ALLOW_REVIEW_FLOOD=1) to override.",
+            len(eligible),
+            threshold,
+        )
+        return []
+
+    cap = config.reviews.max_auto_dispatch_per_pass
+    dispatched: list = []
+    for completed in eligible:
+        if cap and len(dispatched) >= cap:
+            break
+        review = dispatch_review(completed, board, config, now=now)
+        if review is not None:
+            completed.review_state = "dispatched"
+            dispatched.append(review)
+        # On failure leave review_state as "pending" so the next pass retries.
+
+    held = sum(1 for c in eligible if c.review_state in (None, "pending"))
+    if held:
+        logger.info(
+            "review dispatch cap: dispatched %d this pass, %d held for next "
+            "pass (reviews.max_auto_dispatch_per_pass=%d).",
+            len(dispatched),
+            held,
+            cap,
+        )
+    return dispatched
+
+
 def _fetch_issue_body(repo_github: str, issue_number: int) -> str:
     """Best-effort fetch of the issue body for context. Empty on failure."""
     try:

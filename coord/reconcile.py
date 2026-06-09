@@ -276,42 +276,17 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # Dispatch pending reviews for all completed work assignments.
     # We iterate board.completed (not just newly-done) so that a failed
     # dispatch on a previous reconcile pass is retried here automatically.
-    from coord.review import dispatch_review
-    from coord.claim import has_active_work_followup
-
+    #
     # #465: review fires immediately on work completion — no manual smoke
-    # prerequisite.  The interactive smoke gate now lives on merge
-    # (see coord/merge_queue.requires_smoke / has_smoke_verdict).
+    # prerequisite (the interactive smoke gate now lives on merge).
+    # dispatch_pending_reviews() bounds this with a per-pass cap + surge gate
+    # (flood guard, incident 2026-06-08) and applies the #459 active-fix
+    # dedupe, so a backlog unmasking can't flood metered reviews.
+    from coord.review import dispatch_pending_reviews
 
-    for completed in board.completed:
-        # Treat NULL the same as "pending" — a done-work assignment whose
-        # review_state was never set (e.g. because the done-transition was
-        # picked up by notify rather than reconcile) is still un-reviewed
-        # and should be dispatched.  Without this, work that reaches "done"
-        # outside this loop's transition path stays forever un-reviewed.
-        if completed.review_state not in (None, "pending"):
-            continue
-        # Only work assignments get reviewed.
-        if completed.type != "work":
-            continue
-        # #459: skip review dispatch when a work or conflict-fix is actively
-        # rewriting this issue's branch (e.g. a coord-bounce fix iteration).
-        # Reviewing stale code now produces a verdict on code that's about to
-        # change. Leave review_state as "pending" so the next reconcile pass
-        # retries once the active fix finishes.
-        if has_active_work_followup(
-            board,
-            repo_name=completed.repo_name,
-            issue_number=completed.issue_number,
-        ):
-            continue
-        review = dispatch_review(completed, board, config)
-        if review is not None:
-            completed.review_state = "dispatched"
-            if review.assignment_id is not None:
-                changed.append(review.assignment_id)
-        # If review is None (auto_dispatch off, machine unreachable, no branch,
-        # etc.) leave review_state as "pending" so the next reconcile retries.
+    for review in dispatch_pending_reviews(board, config):
+        if review.assignment_id is not None:
+            changed.append(review.assignment_id)
 
     # Auto-queue smoke tests for any work assignments that just finished.
     # Independent of review dispatch — both can fire for the same completion.

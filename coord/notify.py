@@ -900,7 +900,7 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
     also triggers review dispatch — not just ``coord status --reconcile``.
     Safe to call even when the board file doesn't exist.
     """
-    from coord.review import dispatch_review
+    from coord.review import dispatch_pending_reviews
     from coord.state import load_board, save_board
 
     board = load_board()
@@ -908,21 +908,11 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
         return
 
     # #465: review fires immediately on work completion — no manual smoke
-    # prerequisite.  Mirrors the gate removal in reconcile().
-    changed = False
-    for completed in board.completed:
-        # NULL counts as "pending" — see comment in reconcile().
-        if completed.review_state not in (None, "pending"):
-            continue
-        if completed.type != "work":
-            continue
-        review = dispatch_review(completed, board, config)
-        if review is not None:
-            completed.review_state = "dispatched"
-            changed = True
-        # On failure leave as "pending" so the next notify call retries.
-
-    if changed:
+    # prerequisite.  Mirrors reconcile().  dispatch_pending_reviews() enforces
+    # the bulk-dispatch flood guard (per-pass cap + surge gate, incident
+    # 2026-06-08) and the #459 active-fix dedupe, so notify can't flood either.
+    dispatched = dispatch_pending_reviews(board, config)
+    if dispatched:
         save_board(board)
 
 

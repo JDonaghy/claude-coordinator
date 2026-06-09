@@ -14,6 +14,7 @@ from coord.review import (
     REVIEWER_SYSTEM_PROMPT,
     ReviewFindings,
     build_review_briefing,
+    dispatch_pending_reviews,
     dispatch_review,
     parse_review_from_log,
     pick_reviewer_machine,
@@ -995,3 +996,205 @@ class TestReviewHeader:
         assert b == 0
         assert nb is None
         assert nits == 1
+
+
+# ── Flood guard: dispatch_pending_reviews (incident 2026-06-08) ──────────────
+
+
+def _pending_work(n: int) -> list[Assignment]:
+    """n completed work rows, all eligible for review (review_state=None)."""
+    return [
+        Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=i + 1,
+            issue_title=f"work {i + 1}",
+            assignment_id=f"w{i + 1}",
+            status="done",
+            branch=f"issue-{i + 1}-x",
+            type="work",
+            review_state=None,
+            dispatched_at=0.0,
+            finished_at=1.0,
+        )
+        for i in range(n)
+    ]
+
+
+def _flood_config(**review_kw) -> Config:
+    return Config(repos=[], machines=[], reviews=ReviewsConfig(**review_kw))
+
+
+@pytest.fixture
+def fake_dispatch(monkeypatch):
+    """Replace the real (network) dispatch_review with a recording stub.
+
+    Returns the list of assignment_ids that got a review dispatched.
+    """
+    calls: list[str] = []
+
+    def _fake(completed, board, config, *, now=None, **kw):
+        calls.append(completed.assignment_id)
+        review = Assignment(
+            machine_name="server",
+            repo_name=completed.repo_name,
+            issue_number=completed.issue_number,
+            issue_title=f"[review] {completed.issue_title}",
+            assignment_id=f"rev-{completed.assignment_id}",
+            status="running",
+            type="review",
+            review_of_assignment_id=completed.assignment_id,
+            dispatched_at=0.0,
+        )
+        board.active.append(review)
+        return review
+
+    monkeypatch.setattr("coord.review.dispatch_review", _fake)
+    return calls
+
+
+def test_flood_guard_dispatches_all_below_cap(fake_dispatch) -> None:
+    board = Board(completed=_pending_work(3))
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    out = dispatch_pending_reviews(board, cfg)
+    assert len(out) == 3
+    assert len(fake_dispatch) == 3
+    assert all(c.review_state == "dispatched" for c in board.completed)
+
+
+def test_flood_guard_caps_per_pass(fake_dispatch) -> None:
+    board = Board(completed=_pending_work(10))
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    out = dispatch_pending_reviews(board, cfg)
+    assert len(out) == 5  # capped this pass
+    pending = [c for c in board.completed if c.review_state in (None, "pending")]
+    assert len(pending) == 5  # remainder held for the next pass
+    # A second pass drains the rest (still under threshold).
+    out2 = dispatch_pending_reviews(board, cfg)
+    assert len(out2) == 5
+    assert all(c.review_state == "dispatched" for c in board.completed)
+
+
+def test_flood_guard_surge_gate_refuses_all(fake_dispatch) -> None:
+    board = Board(completed=_pending_work(20))  # > flood_threshold
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    out = dispatch_pending_reviews(board, cfg)
+    assert out == []
+    assert fake_dispatch == []  # nothing dispatched
+    assert all(c.review_state is None for c in board.completed)  # board untouched
+
+
+def test_flood_guard_surge_gate_config_override(fake_dispatch) -> None:
+    board = Board(completed=_pending_work(20))
+    cfg = _flood_config(
+        max_auto_dispatch_per_pass=5, flood_threshold=12, allow_review_flood=True
+    )
+    out = dispatch_pending_reviews(board, cfg)
+    assert len(out) == 5  # surge gate overridden, per-pass cap still applies
+
+
+def test_flood_guard_surge_gate_env_override(fake_dispatch, monkeypatch) -> None:
+    monkeypatch.setenv("COORD_ALLOW_REVIEW_FLOOD", "1")
+    board = Board(completed=_pending_work(20))
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    out = dispatch_pending_reviews(board, cfg)
+    assert len(out) == 5
+
+
+def test_flood_guard_threshold_zero_disables_surge_gate(fake_dispatch) -> None:
+    board = Board(completed=_pending_work(50))
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=0)
+    out = dispatch_pending_reviews(board, cfg)
+    assert len(out) == 5  # no surge gate, but cap still bounds the pass
+
+
+def test_flood_guard_skips_active_fix_followup(fake_dispatch) -> None:
+    # #459: a row whose issue has a live work/conflict-fix is not eligible.
+    rows = _pending_work(2)
+    board = Board(
+        completed=rows,
+        active=[
+            Assignment(
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=1,  # matches rows[0]
+                issue_title="[fix-1] work 1",
+                assignment_id="fix1",
+                status="running",
+                type="work",
+            )
+        ],
+    )
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    out = dispatch_pending_reviews(board, cfg)
+    assert len(out) == 1  # only issue #2 (issue #1 has an active fix)
+    assert fake_dispatch == ["w2"]
+
+
+def test_flood_guard_respects_test_gate(fake_dispatch) -> None:
+    rows = _pending_work(4)
+    rows[0].test_state = "passed"
+    rows[1].test_state = "skipped"
+    # rows[2], rows[3] have test_state=None → not eligible under an active gate
+    board = Board(completed=rows)
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    out = dispatch_pending_reviews(board, cfg, test_gate_active=True)
+    assert len(out) == 2
+    assert sorted(fake_dispatch) == ["w1", "w2"]
+
+
+# ── Flood guard: config parsing ──────────────────────────────────────────────
+
+
+def test_reviews_config_flood_guard_defaults(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.max_auto_dispatch_per_pass == 5
+    assert cfg.reviews.flood_threshold == 12
+    assert cfg.reviews.allow_review_flood is False
+
+
+def test_reviews_config_flood_guard_custom(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "reviews:\n"
+        "  max_auto_dispatch_per_pass: 3\n"
+        "  flood_threshold: 25\n"
+        "  allow_review_flood: true\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.max_auto_dispatch_per_pass == 3
+    assert cfg.reviews.flood_threshold == 25
+    assert cfg.reviews.allow_review_flood is True
+
+
+def test_reviews_config_rejects_negative_flood_threshold(tmp_path: Path) -> None:
+    from coord.config import ConfigError
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "reviews:\n  flood_threshold: -1\n"
+    )
+    with pytest.raises(ConfigError, match="flood_threshold must be a non-negative integer"):
+        load(p)
+
+
+def test_reviews_config_rejects_bool_for_int_field(tmp_path: Path) -> None:
+    from coord.config import ConfigError
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "reviews:\n  max_auto_dispatch_per_pass: true\n"
+    )
+    with pytest.raises(ConfigError, match="max_auto_dispatch_per_pass must be a non-negative integer"):
+        load(p)

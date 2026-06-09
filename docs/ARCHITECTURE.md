@@ -183,7 +183,7 @@ The CLI and the TUI are peer clients of the same state. They re-implement the sa
 | `coord/auto_loop.py` | Review → fix dispatch (#243), fix → review dispatch (#278). |
 | `coord/notify.py` | Polls agents, posts GH comments, triggers the auto-loop. |
 | `coord/conflict_fix.py` | Rebase-on-merge-failure worker dispatch (#241). |
-| `coord/review.py` | Adversarial review dispatch + verdict parsing. |
+| `coord/review.py` | Adversarial review dispatch + verdict parsing. `dispatch_pending_reviews()` is the **bulk** path used by `reconcile()` and `coord notify`: it bounds dispatch with a per-pass cap (`reviews.max_auto_dispatch_per_pass`, default 5) and a **surge gate** (`reviews.flood_threshold`, default 12 — above it, refuse all and require `reviews.allow_review_flood: true` / `COORD_ALLOW_REVIEW_FLOOD=1`). This is the flood guard: a backlog "unmasking" (e.g. dropping a gate that had suppressed reviews) can't fire hundreds of metered reviews at once. See the 2026-06-08 incident. |
 | `coord/state.py`, `coord/db.py` | SQLite schema and access helpers. |
 | `coord/dashboard/` | The web dashboard (`coord web`). Optional. |
 | `tui/src/app.rs` | The Rust TUI. Big monolithic file by design; uses quadraui primitives. |
