@@ -2846,6 +2846,74 @@ fn start_data_load() -> std::sync::mpsc::Receiver<BoardData> {
     rx
 }
 
+// ── #487: live tmux session discovery ────────────────────────────────────────
+
+/// One running interactive session discovered from `coord sessions --json`.
+///
+/// Sessions are named `coord-<assignment_id>` and survive TUI crashes;
+/// the operator can reattach via `coord reattach <assignment_id>` or by
+/// opening the Pipeline Terminal tab for the matching issue.
+#[derive(Clone, Debug)]
+struct LiveTmuxSession {
+    /// The coordinator assignment ID extracted from the session name.
+    assignment_id: String,
+    /// GitHub issue number, if the assignment record is in the local DB.
+    issue_number: Option<u64>,
+    /// Coordinator-local repo name, if known.
+    repo_name: Option<String>,
+    /// Issue title, if known (for display purposes).  Shown in the startup
+    /// toast so the operator recognises which work was in progress.
+    #[allow(dead_code)]
+    issue_title: Option<String>,
+}
+
+/// Fetch live `coord-*` tmux sessions by running `coord sessions --json`.
+///
+/// Returns an empty `Vec` when tmux is not running, `coord` is not on PATH,
+/// or parsing fails.  This is called once at startup — it's cheap but
+/// synchronous so it runs before the TUI is visible.
+fn fetch_live_tmux_sessions() -> Vec<LiveTmuxSession> {
+    let out = std::process::Command::new("coord")
+        .args(["sessions", "--json"])
+        .output()
+        .ok();
+    let out = match out {
+        Some(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match v.get("sessions").and_then(|s| s.as_array()) {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let assignment_id = entry.get("assignment_id")?.as_str()?.to_string();
+            let issue_number = entry
+                .get("issue_number")
+                .and_then(|n| n.as_u64());
+            let repo_name = entry
+                .get("repo_name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string());
+            let issue_title = entry
+                .get("issue_title")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string());
+            Some(LiveTmuxSession {
+                assignment_id,
+                issue_number,
+                repo_name,
+                issue_title,
+            })
+        })
+        .collect()
+}
+
 /// Return the version string of the local `coord` binary by running
 /// `coord --version` synchronously.  Parses the last whitespace-separated
 /// token from the first output line (e.g. "coord 0.4.1" → "0.4.1").
@@ -4168,6 +4236,15 @@ pub struct CoordApp {
     /// When the last `/metrics` poll round was kicked.  The next round fires
     /// after [`METRICS_CADENCE`] has elapsed and the Machines panel is visible.
     metrics_last_polled: Instant,
+
+    // ── #487: live tmux session discovery ──────────────────────────────────
+    /// Running `coord-*` tmux sessions discovered at startup via
+    /// `coord sessions --json`.  Each entry represents an interactive
+    /// session that survived a previous TUI run (or is still active in
+    /// the background).  Displayed as a startup toast and used by
+    /// `launch_interactive_session_for_selected_issue` to offer reattach
+    /// instead of starting a fresh session when one already exists.
+    live_tmux_sessions: Vec<LiveTmuxSession>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4379,11 +4456,39 @@ impl CoordApp {
             machine_metrics: std::collections::HashMap::new(),
             pending_metrics: Vec::new(),
             metrics_last_polled: Instant::now(),
+            // #487: live tmux session discovery.
+            live_tmux_sessions: fetch_live_tmux_sessions(),
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
         // Sync issues from GitHub on startup so the board backlog is fresh.
         app.kick_issue_sync();
+        // #487: notify the operator about any live sessions from a previous run.
+        if !app.live_tmux_sessions.is_empty() {
+            let n = app.live_tmux_sessions.len();
+            let ids: Vec<String> = app
+                .live_tmux_sessions
+                .iter()
+                .map(|s| {
+                    if let (Some(repo), Some(num)) = (&s.repo_name, s.issue_number) {
+                        format!("{} #{}", repo, num)
+                    } else {
+                        s.assignment_id.clone()
+                    }
+                })
+                .collect();
+            let summary = ids.join(", ");
+            let title = format!(
+                "{} running interactive session{}",
+                n,
+                if n == 1 { "" } else { "s" }
+            );
+            let body = format!(
+                "{} — open Terminal tab to reattach, or: coord reattach <id>",
+                summary
+            );
+            app.push_toast(&title, &body, ToastSeverity::Info);
+        }
         app
     }
 
@@ -18887,6 +18992,17 @@ impl CoordApp {
         let cwd = self.detail_terminal_cwd(&issue_key);
         let shell = quadraui::terminal_engine::default_shell();
 
+        // #487: if there is already a live tmux session for this issue,
+        // send `tmux attach-session` instead of a fresh `coord assign`.
+        let maybe_live_session = self
+            .live_tmux_sessions
+            .iter()
+            .find(|s| {
+                s.issue_number == Some(issue_num)
+                    && s.repo_name.as_deref() == Some(repo.as_str())
+            })
+            .map(|s| s.assignment_id.clone());
+
         match quadraui::terminal_engine::TerminalSession::spawn(
             cols.max(20),
             rows.max(5),
@@ -18895,31 +19011,45 @@ impl CoordApp {
             10_000,
         ) {
             Ok(mut sess) => {
-                // Auto-run the launcher line.  Re-pressing `s` while a previous
-                // interactive session is still alive replaces the old PTY.
-                let launch_line = build_interactive_launch_cmd(
-                    cfg_path.as_deref(),
-                    &machine,
-                    &repo,
-                    issue_num,
-                    mode,
-                );
+                let launch_line = if let Some(assignment_id) = &maybe_live_session {
+                    // Reattach path: a running session exists from a previous TUI
+                    // run.  Run `coord reattach` which attaches and finalizes on exit.
+                    let cfg = match cfg_path.as_deref() {
+                        Some(p) if !p.is_empty() => {
+                            format!("--config {} ", shell_quote_arg(p))
+                        }
+                        _ => String::new(),
+                    };
+                    format!("coord {}reattach {}\r", cfg, shell_quote_arg(assignment_id))
+                } else {
+                    // Fresh launch path.  Re-pressing the launch key while a
+                    // previous interactive session is still alive replaces the PTY.
+                    build_interactive_launch_cmd(
+                        cfg_path.as_deref(),
+                        &machine,
+                        &repo,
+                        issue_num,
+                        mode,
+                    )
+                };
                 sess.send_str(&launch_line);
 
                 self.detail_terminal_sessions.insert(issue_key.clone(), sess);
                 self.detail_terminal_spawn_errors.remove(&issue_key);
 
-                let verb = match mode {
-                    InteractiveLaunchMode::Work => "work",
-                    InteractiveLaunchMode::Plan => "plan→work",
-                };
-                self.pipeline_status = Some((
+                let status_msg = if maybe_live_session.is_some() {
+                    format!("Reattaching to running session for {} #{} …", repo, issue_num)
+                } else {
+                    let verb = match mode {
+                        InteractiveLaunchMode::Work => "work",
+                        InteractiveLaunchMode::Plan => "plan→work",
+                    };
                     format!(
                         "Launching interactive {} session for {} #{} …",
                         verb, repo, issue_num,
-                    ),
-                    Instant::now(),
-                ));
+                    )
+                };
+                self.pipeline_status = Some((status_msg, Instant::now()));
 
                 // Auto-focus so the user can type immediately.
                 self.detail_terminal_focused = true;
@@ -23314,6 +23444,8 @@ mod tests {
             machine_metrics: std::collections::HashMap::new(),
             pending_metrics: Vec::new(),
             metrics_last_polled: Instant::now(),
+            // #487
+            live_tmux_sessions: Vec::new(),
         }
     }
 
