@@ -162,10 +162,10 @@ class TestTestOutputCapture:
 
 
 class TestTestPassedHint:
-    def test_passed_prints_pr_hint(
+    def test_passed_prints_merge_hint(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        """--passed prints the coord pr hint."""
+        """--passed prints the coord merge hint (review already ran; next step is merge)."""
         assignment = _done_assignment()
         board = _make_board(assignment)
         state_mod.save_board(board)
@@ -180,8 +180,7 @@ class TestTestPassedHint:
         )
         assert result.exit_code == 0, result.output
         assert "PASSED" in result.output
-        assert "coord pr" in result.output
-        assert "abc-123" in result.output
+        assert "coord merge" in result.output
 
 
 # ── coord pr ─────────────────────────────────────────────────────────────

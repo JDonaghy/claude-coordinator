@@ -4545,7 +4545,7 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
         if verdict == "fail" and reason:
             click.echo(f"  reason: {reason}")
         elif verdict == "pass":
-            click.echo(f"  Run: coord pr {assignment_id} to create the PR")
+            click.echo("  Run: coord merge to proceed")
 
         # #271 part 1: restore the local checkout to `default_branch`
         # after a pass/skip verdict — local testing is done, the user
