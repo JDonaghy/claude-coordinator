@@ -1026,6 +1026,46 @@ def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:
     assert _sanitize_branch("refs/heads/main") == "refs-heads-main"
 
 
+def test_sanitize_branch_agrees_with_rust() -> None:
+    """Pin Python _sanitize_branch against every case tested in tui/src/app.rs.
+
+    The Python sanitizer (agent stash path) and the Rust sanitizer (TUI manifest
+    lookup) must produce identical output for the same input; a divergence means
+    the TUI fetches the wrong URL and the [a] badge never appears (#433).
+    """
+    from coord.agent import _sanitize_branch
+
+    cases = [
+        # clean inputs — no change
+        ("issue-305", "issue-305"),
+        ("feature_foo.bar", "feature_foo.bar"),
+        ("abc123", "abc123"),
+        # slashes → dashes (single per run)
+        ("feature/my-thing", "feature-my-thing"),
+        ("a//b", "a-b"),
+        # refs/heads/<name> — the typical fallback branch name
+        ("refs/heads/main", "refs-heads-main"),
+        # leading/trailing separators stripped
+        ("/leading", "leading"),
+        ("trailing/", "trailing"),
+        ("/both/", "both"),
+        # spaces
+        ("my branch name", "my-branch-name"),
+        # long real-world name — all allowed chars, unchanged
+        (
+            "issue-305-artifact-pull-rsync-built-binaries-from",
+            "issue-305-artifact-pull-rsync-built-binaries-from",
+        ),
+    ]
+    for raw, expected in cases:
+        result = _sanitize_branch(raw)
+        assert result == expected, (
+            f"_sanitize_branch({raw!r}) == {result!r}, want {expected!r} "
+            "(Rust and Python sanitizers disagree — tui/src/app.rs sanitize_branch "
+            "has a matching test; fix both together)"
+        )
+
+
 # ── #324: Provider-layer routing and capability gates ─────────────────────────
 
 
