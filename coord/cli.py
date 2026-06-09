@@ -1982,6 +1982,9 @@ def assign(
         from coord.interactive import (  # noqa: PLC0415
             finalize_interactive_exit,
             launch_human_attended_interactive,
+            tmux_available as _tmux_avail,
+            tmux_session_alive as _tmux_alive,
+            tmux_session_name as _tmux_name,
         )
 
         provider = ClaudePtyProvider()
@@ -2147,11 +2150,27 @@ def assign(
         save_board(build_board())
 
         started_at = _time.time()
+        # #487: pass assignment_id so the tmux path names the session
+        # coord-<assignment_id>, enabling reattach after a TUI crash.
         exit_code = launch_human_attended_interactive(
-            argv, effective_briefing, cwd=worktree_path,
+            argv, effective_briefing, assignment_id=assignment_id, cwd=worktree_path,
         )
         if exit_code != 0:
             click.echo(f"  claude exited with status {exit_code}", err=True)
+
+        # #487: if the tmux session is still alive the user just detached
+        # (Ctrl-b d) or the TUI crashed.  Skip finalize — the session is
+        # still running.  Tell the operator how to reattach and let them
+        # close the session themselves (at which point coord report-result
+        # or coord reattach will record the terminal state).
+        _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+        if _sname and _tmux_alive(_sname):
+            click.echo(
+                f"  session still running in tmux: {_sname}\n"
+                f"  reattach with:  coord reattach {assignment_id}\n"
+                f"  or from shell:  tmux attach-session -t {_sname}"
+            )
+            sys.exit(0)
 
         # #466 — git-floor backstop.  ALWAYS write a terminal state for
         # this assignment through the issue_store seam, regardless of
@@ -4934,6 +4953,250 @@ def session() -> None:
         click.echo(f"Session in progress (started {started})")
         click.echo(f"  clean_shutdown: false (crash recovery may be needed)")
         click.echo(f"  Run: coord resume")
+
+
+# ── #487: tmux session management ────────────────────────────────────────────
+
+
+@main.command(
+    "sessions",
+    help=(
+        "List running interactive sessions hosted in tmux (coord-* named sessions). "
+        "Use --json for machine-readable output (consumed by coord-tui on startup)."
+    ),
+)
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    default=False,
+    help="Output as JSON (consumed by coord-tui startup check).",
+)
+def sessions_cmd(output_json: bool) -> None:
+    """List live coord-* tmux sessions with their assignment metadata."""
+    import json as _json  # noqa: PLC0415
+
+    from coord.interactive import (  # noqa: PLC0415
+        list_coord_tmux_sessions,
+        TMUX_SESSION_PREFIX,
+    )
+    from coord.state import get_connection  # noqa: PLC0415
+
+    raw = list_coord_tmux_sessions()
+    enriched: list[dict] = []
+
+    # Acquire the DB connection once before the loop — get_connection() is a
+    # module-level singleton and should not be re-imported per iteration.
+    try:
+        _db_conn = get_connection()
+    except Exception:  # noqa: BLE001
+        _db_conn = None
+
+    for s in raw:
+        session_name = s["session_name"]
+        assignment_id = session_name[len(TMUX_SESSION_PREFIX):]
+        issue_number: int | None = None
+        repo_name: str | None = None
+        issue_title: str | None = None
+
+        if _db_conn is not None:
+            try:
+                row = _db_conn.execute(
+                    "SELECT issue_number, repo_name, issue_title "
+                    "FROM assignments WHERE assignment_id=?",
+                    (assignment_id,),
+                ).fetchone()
+                if row is not None:
+                    issue_number = row["issue_number"] if hasattr(row, "keys") else row[0]
+                    repo_name = row["repo_name"] if hasattr(row, "keys") else row[1]
+                    issue_title = row["issue_title"] if hasattr(row, "keys") else row[2]
+            except Exception:  # noqa: BLE001
+                pass
+
+        enriched.append(
+            {
+                "session_name": session_name,
+                "assignment_id": assignment_id,
+                "issue_number": issue_number,
+                "repo_name": repo_name,
+                "issue_title": issue_title,
+            }
+        )
+
+    if output_json:
+        click.echo(_json.dumps({"sessions": enriched}))
+        return
+
+    if not enriched:
+        click.echo("No running interactive sessions.")
+        return
+
+    for s in enriched:
+        issue_part = f"#{s['issue_number']}" if s["issue_number"] else "(unknown issue)"
+        repo_part = s["repo_name"] or "(unknown repo)"
+        title_part = f" — {s['issue_title']}" if s["issue_title"] else ""
+        click.echo(
+            f"  {s['session_name']}  {repo_part} {issue_part}{title_part}"
+        )
+        click.echo(
+            f"    reattach: coord reattach {s['assignment_id']}"
+            f"  |  tmux attach-session -t {s['session_name']}"
+        )
+
+
+@main.command(
+    "reattach",
+    help=(
+        "Reattach to a running interactive session (tmux) and finalize when done. "
+        "The session must have been started with --interactive (tmux required)."
+    ),
+)
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+def reattach(assignment_id: str, config_path: Path) -> None:
+    """Reattach to a live coord-* tmux session.
+
+    When the session ends (operator closes ``claude`` or types ``/exit``),
+    the #466 git-floor backstop runs — same as after a normal interactive
+    session exit — so the board always gets a terminal state recorded.
+
+    If the session is no longer alive, prints a message and exits without
+    error.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord.interactive import (  # noqa: PLC0415
+        finalize_interactive_exit,
+        tmux_available,
+        tmux_session_alive,
+        tmux_session_name,
+    )
+
+    if not tmux_available():
+        click.echo("  error: tmux is not available on this machine.", err=True)
+        sys.exit(1)
+
+    sname = tmux_session_name(assignment_id)
+    if not tmux_session_alive(sname):
+        click.echo(f"  session {sname!r} is not alive.")
+        click.echo("  (it may have ended while you were away)")
+        sys.exit(0)
+
+    # Look up assignment metadata so we can run finalize after detach.
+    repo_name_val: str | None = None
+    repo_github_val: str | None = None
+    issue_number_val: int | None = None
+    machine_name_val: str | None = None
+    base_branch_val: str = "main"
+
+    try:
+        from coord.state import get_connection as _gc  # noqa: PLC0415
+        conn = _gc()
+        row = conn.execute(
+            "SELECT issue_number, repo_name, repo_github, machine_name "
+            "FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        if row is not None:
+            def _col(r: object, key: str, idx: int) -> object:  # noqa: ANN001
+                return r[key] if hasattr(r, "keys") else r[idx]  # type: ignore[index]
+
+            issue_number_val = _col(row, "issue_number", 0)  # type: ignore[assignment]
+            repo_name_val = str(_col(row, "repo_name", 1))
+            repo_github_val = str(_col(row, "repo_github", 2))
+            machine_name_val = str(_col(row, "machine_name", 3))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Reconstruct the worktree path and repo_path from coordinator.yml.
+    # worktree_path is always ~/.coord/worktrees/<assignment_id> per agent.py.
+    from coord.state import COORD_DIR as _COORD_DIR  # noqa: PLC0415
+    worktree_path = str(_COORD_DIR / "worktrees" / assignment_id)
+
+    repo_path_val: str | None = None
+    try:
+        cfg = _load_config(config_path)
+        # Get default_branch from the repo config.
+        if repo_name_val:
+            repo_cfg_obj = next(
+                (r for r in cfg.repos if r.name == repo_name_val), None
+            )
+            if repo_cfg_obj:
+                base_branch_val = repo_cfg_obj.default_branch or "main"
+        # Get repo_path from machine config.
+        if machine_name_val and repo_name_val:
+            machine_obj = next(
+                (m for m in cfg.machines if m.name == machine_name_val), None
+            )
+            if machine_obj:
+                rp = machine_obj.repo_path(repo_name_val)
+                if rp:
+                    repo_path_val = str(Path(rp).expanduser())
+    except Exception:  # noqa: BLE001
+        pass
+
+    click.echo(f"  Attaching to {sname} …")
+    click.echo("  (detach with Ctrl-b d to leave the session running)")
+
+    started_at = _time.time()
+    try:
+        import subprocess as _sp  # noqa: PLC0415
+        result = _sp.run(["tmux", "attach-session", "-t", sname])
+        exit_code = result.returncode
+    except (Exception, KeyboardInterrupt):  # noqa: BLE001
+        exit_code = 1
+
+    # After attach returns: check if session ended or user detached.
+    if tmux_session_alive(sname):
+        click.echo(
+            f"\n  Session is still running.  "
+            f"Reattach later with: coord reattach {assignment_id}"
+        )
+        sys.exit(0)
+
+    # Session ended — run the finalize backstop.
+    if repo_name_val and repo_github_val and issue_number_val:
+        try:
+            finalize_result = finalize_interactive_exit(
+                assignment_id=assignment_id,
+                repo_name=repo_name_val,
+                repo_github=repo_github_val,
+                issue_number=int(issue_number_val),  # type: ignore[arg-type]
+                machine_name=machine_name_val or "unknown",
+                worktree_path=worktree_path,
+                base_branch=base_branch_val,
+                exit_code=exit_code,
+                started_at=started_at,
+                log_path=None,
+                repo_path=repo_path_val,
+            )
+            if finalize_result.already_recorded:
+                click.echo(
+                    "  result already recorded via `coord report-result`; "
+                    "backstop did not overwrite",
+                )
+            else:
+                click.echo(
+                    f"  backstop: status={finalize_result.terminal_status} "
+                    f"commits_ahead={finalize_result.commits_ahead}"
+                )
+                if not finalize_result.push_ok:
+                    click.echo(
+                        f"  warning: git push failed: {finalize_result.push_error}",
+                        err=True,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            click.echo(
+                f"  warning: backstop failed to record completion: {exc}",
+                err=True,
+            )
+    else:
+        click.echo(
+            "  (assignment metadata not found — skipping git-floor backstop)",
+            err=True,
+        )
+
+    sys.exit(exit_code)
 
 
 @main.command(help="Show per-assignment and per-model cost breakdown with burn rate.")

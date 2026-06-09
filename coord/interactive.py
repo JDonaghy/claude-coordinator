@@ -4,7 +4,9 @@ This module owns the **only** path that may launch a provider whose
 :attr:`~coord.providers.base.Capabilities.human_attended_only` flag is
 ``True`` — interactive Claude Code on a Max/Pro subscription.  It is
 invoked from ``coord assign --interactive`` and attaches the child to
-the operator's local TTY:
+the operator's local TTY via one of two strategies:
+
+**PTY relay (fallback, no tmux)**
 
 * A new pty pair is opened; the child execs ``claude`` with the slave fd
   as its stdin/stdout/stderr.
@@ -19,11 +21,26 @@ the operator's local TTY:
   ``TIOCSWINSZ`` so the TUI re-flows correctly when the operator
   resizes their terminal.
 
-The session is HUMAN-CLOSED — the relay loop exits when the child exits
-and the launcher reports the child's exit code to the caller.  This
-module deliberately contains **no** content-based completion detection
-and **no** TTY scraper.  The structural ToS-compliance posture the
-abandoned #426 was missing.
+**tmux session (preferred, when tmux is available and assignment_id is
+provided — #487)**
+
+* A named tmux session ``coord-<assignment_id>`` is created (or reused).
+* ``claude`` runs directly inside the tmux session; tmux provides the pty.
+* The briefing is injected via :func:`_inject_briefing_into_tmux_session`:
+  a quiescence-based poll on the pane output followed by
+  ``tmux paste-buffer -p`` (bracketed-paste mode).
+* The operator's terminal ATTACHES to the tmux session
+  (``tmux attach-session -t coord-<aid>``); if the TUI crashes the
+  attachment disconnects but **the tmux session and claude keep running**.
+* On TUI restart the user can reattach with ``coord reattach <aid>`` or
+  via the TUI's Pipeline→Terminal tab (which checks for a live
+  ``coord-*`` session for the open issue and offers reattach).
+
+The session is HUMAN-CLOSED — the relay loop / tmux session exits when
+the child exits and the launcher reports the child's exit code to the
+caller.  This module deliberately contains **no** content-based
+completion detection and **no** TTY scraper.  The structural
+ToS-compliance posture the abandoned #426 was missing.
 
 After exit, the CLI caller invokes :func:`finalize_interactive_exit`
 (the #466 git-floor backstop) which computes the worktree's
@@ -32,6 +49,12 @@ local commits, and writes the terminal completion through the
 :mod:`coord.issue_store` seam.  That guarantees the board always gets a
 recorded completion regardless of whether the interactive agent
 remembered to call ``coord report-result`` first.
+
+When the tmux path is used and the TUI crashes (the attach disconnects
+while the session is still live), the CLI caller skips
+``finalize_interactive_exit`` and instead shows a reattach hint.
+Finalize runs when the user reattaches via ``coord reattach`` and the
+session eventually ends.
 
 Imports are deferred / Unix-only — the stdlib ``pty`` / ``termios`` /
 ``fcntl`` modules are not present on Windows, but agent machines are
@@ -43,11 +66,13 @@ from __future__ import annotations
 import fcntl
 import os
 import select
+import shlex
 import shutil
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import tty
@@ -65,8 +90,261 @@ __all__ = [
     "launch_human_attended_interactive",
     "finalize_interactive_exit",
     "InteractiveFinalizeResult",
+    "TMUX_SESSION_PREFIX",
+    "tmux_session_name",
+    "tmux_available",
+    "tmux_session_alive",
+    "list_coord_tmux_sessions",
 ]
 
+
+# ── tmux session management (#487) ───────────────────────────────────────────
+
+#: Prefix for all coordinator-managed tmux sessions.  The session name is
+#: ``coord-<assignment_id>`` so that a ``tmux ls`` output can be filtered
+#: cheaply and the assignment_id is directly recoverable.
+TMUX_SESSION_PREFIX = "coord-"
+
+
+def tmux_session_name(assignment_id: str) -> str:
+    """Return the canonical tmux session name for *assignment_id*."""
+    return f"{TMUX_SESSION_PREFIX}{assignment_id}"
+
+
+def tmux_available() -> bool:
+    """Return ``True`` when ``tmux`` is on the current ``PATH``."""
+    return shutil.which("tmux") is not None
+
+
+def tmux_session_alive(session_name: str) -> bool:
+    """Return ``True`` when the named tmux session exists and is running.
+
+    Uses ``tmux has-session`` which exits 0 when the session is alive and 1
+    when it does not exist.  Subprocess / OS errors are treated as
+    "not alive" so callers don't need try/except.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", session_name],
+            capture_output=True,
+            timeout=5.0,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def list_coord_tmux_sessions() -> list[dict[str, str]]:
+    """Return a list of live ``coord-*`` tmux sessions.
+
+    Each entry is a ``dict`` with at least the key ``"session_name"``.
+    Returns an empty list when tmux is not available, not running, or has
+    no matching sessions.
+
+    Example::
+
+        [{"session_name": "coord-abc123def456"}]
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "ls", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode != 0:
+            return []
+        sessions: list[dict[str, str]] = []
+        for name in result.stdout.splitlines():
+            name = name.strip()
+            if name.startswith(TMUX_SESSION_PREFIX):
+                sessions.append({"session_name": name})
+        return sessions
+    except (subprocess.SubprocessError, OSError):
+        return []
+
+
+def _inject_briefing_into_tmux_session(
+    session_name: str,
+    briefing: str,
+    *,
+    timeout: float = 12.0,
+) -> bool:
+    """Wait for the tmux pane to stabilise then inject *briefing* via bracketed paste.
+
+    The injection strategy mirrors the PTY-relay path:
+
+    1. Poll ``tmux capture-pane -p`` every 50 ms.
+    2. Once the pane has been non-empty AND stable for
+       :data:`_READY_QUIESCE_S` seconds (or the overall *timeout* lapses),
+       load the briefing text into a tmux named buffer (``coord-brief``)
+       and invoke ``tmux paste-buffer -p``.
+    3. The ``-p`` flag makes tmux send the content wrapped in bracketed-paste
+       markers (``ESC[200~`` … ``ESC[201~``) **if** the target application
+       has requested bracketed-paste mode.  Since ``claude``'s TUI always
+       enables bracketed paste, this is equivalent to the PTY relay's
+       manual bracketed-paste block.
+
+    Returns ``True`` when the briefing was injected, ``False`` on timeout
+    or subprocess error.
+    """
+    if not briefing.strip():
+        return True  # nothing to inject — trivially OK
+
+    # Write the briefing (without trailing newline) to a temp file so that
+    # ``tmux load-buffer`` can read it cleanly.
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write(briefing.rstrip("\n"))
+            tf_path = tf.name
+    except OSError:
+        return False
+
+    try:
+        deadline = time.monotonic() + timeout
+        prev_content: str | None = None
+        quiescent_since: float | None = None
+
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            try:
+                cap = subprocess.run(
+                    ["tmux", "capture-pane", "-p", "-t", session_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                )
+            except (subprocess.SubprocessError, OSError):
+                break
+            if cap.returncode != 0:
+                break  # session gone
+
+            content = cap.stdout
+            now = time.monotonic()
+            if content != prev_content:
+                prev_content = content
+                quiescent_since = now if content.strip() else None
+            elif content.strip() and quiescent_since is not None:
+                if now - quiescent_since >= _READY_QUIESCE_S:
+                    break  # stable and non-empty — inject
+
+        # Load briefing into a named tmux buffer.
+        subprocess.run(
+            ["tmux", "load-buffer", "-b", "coord-brief", tf_path],
+            capture_output=True,
+            timeout=5.0,
+        )
+        # Paste with bracketed-paste enabled (``-p``).
+        subprocess.run(
+            [
+                "tmux", "paste-buffer", "-p",
+                "-t", session_name,
+                "-b", "coord-brief",
+            ],
+            capture_output=True,
+            timeout=5.0,
+        )
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
+    finally:
+        try:
+            os.unlink(tf_path)
+        except OSError:
+            pass
+
+
+def _launch_via_tmux(
+    argv: Sequence[str],
+    briefing: str,
+    session_name: str,
+    *,
+    cwd: str | None = None,
+) -> int | None:
+    """Create (or reuse) a named tmux session running *argv* and attach.
+
+    This is the preferred path when ``tmux`` is available and
+    *session_name* is provided (#487).  The strategy:
+
+    1. If the session does not already exist, create it with
+       ``tmux new-session -d`` running ``argv`` as the session command.
+       The briefing is then injected via
+       :func:`_inject_briefing_into_tmux_session`.
+    2. If the session already exists (reattach after TUI crash), skip
+       creation and injection — the session is already running.
+    3. Attach the current terminal with
+       ``tmux attach-session -t <session_name>``.  If the TUI process is
+       killed (e.g. SIGHUP on TUI crash), only the *attach* subprocess
+       dies; the tmux session and ``claude`` inside it keep running.
+
+    Returns ``tmux attach-session``'s exit code (typically ``0`` for both
+    clean exits and user-initiated detach with ``Ctrl-b d``).  Callers
+    should check :func:`tmux_session_alive` after this returns to
+    distinguish "session ended" from "user detached — session still live".
+
+    Returns ``None`` when session creation fails so that the caller
+    (:func:`launch_human_attended_interactive`) can fall back to the
+    PTY relay without double-echoing the briefing.
+    """
+    # Determine terminal dimensions for the new session.
+    try:
+        cols, rows = os.get_terminal_size(sys.stdout.fileno())
+    except (OSError, AttributeError, ValueError):
+        cols, rows = 220, 50
+
+    already_alive = tmux_session_alive(session_name)
+
+    if not already_alive:
+        # Build the shell-command string tmux will execute in the new window.
+        # ``tmux new-session`` interprets its trailing argument as a single
+        # shell command string (passed to the shell with ``-c``).  Use
+        # ``shlex.join`` so paths / flags with spaces are quoted correctly.
+        shell_cmd = shlex.join(list(argv))
+
+        create_cmd = [
+            "tmux", "new-session", "-d",
+            "-s", session_name,
+            "-x", str(max(cols, 40)),
+            "-y", str(max(rows, 10)),
+        ]
+        if cwd:
+            create_cmd += ["-c", cwd]
+        create_cmd.append(shell_cmd)
+
+        try:
+            result = subprocess.run(
+                create_cmd,
+                capture_output=True,
+                text=True,
+                timeout=15.0,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None  # signal caller to fall back to PTY relay
+
+        if result.returncode != 0:
+            # Session creation failed (name collision, tmux daemon error, …).
+            return None  # signal caller to fall back to PTY relay
+
+        # Inject briefing (best-effort; a failure here is non-fatal).
+        if briefing.strip():
+            _inject_briefing_into_tmux_session(session_name, briefing)
+
+    # Attach.  ``subprocess.run`` (not ``os.execvp``) is intentional: we
+    # need this process to continue after the operator detaches so that
+    # the CLI caller (``coord assign``) can check whether the session is
+    # still alive and decide whether to run ``finalize_interactive_exit``.
+    try:
+        attach_result = subprocess.run(
+            ["tmux", "attach-session", "-t", session_name],
+        )
+        return attach_result.returncode
+    except (subprocess.SubprocessError, OSError):
+        return 1
+
+
+# ── Quiescence constants for the PTY relay path ───────────────────────────────
 
 # Match the agent-side readiness constants so the operator-launched path
 # behaves the same way as the agent-spawned one once #437 lands the
@@ -82,6 +360,7 @@ def launch_human_attended_interactive(
     argv: Sequence[str],
     briefing: str,
     *,
+    assignment_id: str | None = None,
     cwd: str | None = None,
 ) -> int:
     """Run *argv* attached to the current TTY with *briefing* pre-filled.
@@ -91,18 +370,70 @@ def launch_human_attended_interactive(
     to record on the board.  No GitHub comments are posted from inside
     this function — the human owns the session lifecycle.
 
+    When *assignment_id* is provided and ``tmux`` is available, the session
+    is hosted in a named tmux session ``coord-<assignment_id>`` (#487).
+    This means the session survives a TUI crash — the operator can reattach
+    later with ``coord reattach <assignment_id>``.  If tmux is not available
+    or *assignment_id* is omitted, falls back to the PTY relay path.
+
     Args:
         argv: The worker command (typically built via
             :meth:`ClaudePtyProvider.build_command`).
         briefing: The text to PRE-FILL in the TUI's input box.  Wrapped
             in a bracketed-paste block; the operator presses Enter to
             submit.  An empty string disables the pre-fill entirely.
+        assignment_id: Optional coordinator assignment ID.  When provided
+            and tmux is available, the session runs inside a persistent
+            tmux session named ``coord-<assignment_id>``.
         cwd: Working directory for the child.  ``None`` keeps the
             parent's cwd.
 
     Returns:
         The child's exit status (``0`` on clean exit; ``128 + signum``
-        on termination by signal).
+        on termination by signal).  For the tmux path, returns
+        ``tmux attach-session``'s exit code — callers should check
+        :func:`tmux_session_alive` afterwards to distinguish
+        "session ended" from "user detached with Ctrl-b d".
+    """
+    # #487 — prefer the tmux path when assignment_id is available.
+    if assignment_id and tmux_available():
+        sname = tmux_session_name(assignment_id)
+        # Echo briefing BEFORE the tmux session starts (same as PTY path).
+        # Important: only echo here on the tmux path.  _launch_via_pty()
+        # handles its own echo so that it works correctly when called
+        # stand-alone (no assignment_id / no tmux).
+        if briefing.strip():
+            _hdr = (
+                "--- seeded briefing -- review below; "
+                "submit the pre-filled input in Claude to send ---"
+            )
+            _ftr = "-" * len(_hdr)
+            _preview = f"\n{_hdr}\n{briefing.rstrip()}\n{_ftr}\n\n"
+            try:
+                os.write(sys.stdout.fileno(), _preview.encode("utf-8"))
+            except OSError:
+                pass
+        rc = _launch_via_tmux(argv, briefing, sname, cwd=cwd)
+        if rc is not None:
+            return rc
+        # tmux session creation failed — fall back to the PTY relay.
+        # Note: _launch_via_pty will echo the briefing again; that is
+        # acceptable for this rare fallback case.
+
+    return _launch_via_pty(argv, briefing, cwd=cwd)
+
+
+def _launch_via_pty(
+    argv: Sequence[str],
+    briefing: str,
+    *,
+    cwd: str | None = None,
+) -> int:
+    """PTY relay implementation — the original pty.fork() path.
+
+    Kept as a separate function so :func:`launch_human_attended_interactive`
+    can delegate to it both directly (no tmux) and as a fallback from the
+    tmux path.
     """
     import pty  # stdlib, Unix-only — deferred for platform safety  # noqa: PLC0415
 
