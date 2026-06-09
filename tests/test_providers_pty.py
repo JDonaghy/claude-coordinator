@@ -132,11 +132,22 @@ def test_pty_build_command_no_model_suppresses_flag() -> None:
 
 
 def test_pty_build_command_system_prompt_override() -> None:
-    """Explicit system_prompt kwarg wins over computed one."""
+    """Explicit system_prompt kwarg wins over computed one.
+
+    Note: for autonomous spec types (#426) the PTY provider appends the
+    completion-sentinel instruction to whatever the operator supplied
+    so the watcher has a signal to key on.  Asserting ``startswith``
+    captures both invariants — the override wins AND the sentinel
+    instruction is still appended.
+    """
+    from coord.providers.claude_pty import COMPLETION_SENTINEL
+
     argv = ClaudePtyProvider().build_command(
         _make_spec(type="work"), system_prompt="custom"
     )
-    assert argv[argv.index("--system-prompt") + 1] == "custom"
+    rendered = argv[argv.index("--system-prompt") + 1]
+    assert rendered.startswith("custom")
+    assert COMPLETION_SENTINEL in rendered
 
 
 def test_pty_build_command_allowed_tools_override() -> None:
@@ -162,7 +173,16 @@ def test_pty_build_command_custom_binary() -> None:
 
 
 def test_pty_build_command_branches_match_claude_for_plan_type() -> None:
-    """spec.type=plan still gets the plan system prompt + Read,Bash tools."""
+    """spec.type=plan still gets the plan system prompt + Read,Bash tools.
+
+    #426: for autonomous spec types the PTY provider appends the completion
+    sentinel instruction so the watcher has a signal to key on — the legacy
+    ``claude -p`` path does not (its workers exit cleanly on result).  We
+    therefore assert ``startswith`` on the system prompt and equality on
+    the allowed-tools value.
+    """
+    from coord.providers.claude_pty import COMPLETION_SENTINEL
+
     spec = _make_spec(type="plan")
     argv = ClaudePtyProvider().build_command(spec)
     # Same spec-type branch logic as ClaudeProvider — easiest cross-check
@@ -170,7 +190,9 @@ def test_pty_build_command_branches_match_claude_for_plan_type() -> None:
     legacy = default_worker_command(spec)
     legacy_sp = legacy[legacy.index("--system-prompt") + 1]
     legacy_at = legacy[legacy.index("--allowedTools") + 1]
-    assert argv[argv.index("--system-prompt") + 1] == legacy_sp
+    pty_sp = argv[argv.index("--system-prompt") + 1]
+    assert pty_sp.startswith(legacy_sp)
+    assert COMPLETION_SENTINEL in pty_sp
     assert argv[argv.index("--allowedTools") + 1] == legacy_at
 
 

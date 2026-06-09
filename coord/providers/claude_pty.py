@@ -36,6 +36,7 @@ the import cycle latent, matching the pattern in
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -78,6 +79,237 @@ BRACKETED_PASTE_END = b"\x1b[201~"
 # ~0.85s after first output, while the TUI is still drawing; pasting then is
 # silently dropped).
 BRACKETED_PASTE_ENABLE = b"\x1b[?2004h"
+
+
+# #426 — Completion sentinel.
+#
+# Interactive ``claude`` is a REPL: it returns to an idle prompt after each
+# turn and does NOT exit, so ``proc.wait()`` would block until the
+# ``_REAP_MAX_WAIT`` (2 h) safety net fires.  To detect logical turn
+# completion, autonomous PTY workers (plan / work / review / smoke /
+# conflict-fix) are instructed via their system prompt to emit this
+# string on its own line as the LAST thing they output.  The
+# :func:`coord.agent._pty_completion_watcher` thread polls the
+# ANSI-stripped log for it and force-kills the process group on detection,
+# which closes the PTY → ``_pump`` stamps :data:`PTY_RESULT_MARKER` →
+# ``_reap`` completes and pushes the worker's branch.
+#
+# The sentinel is INJECTED INTO THE SYSTEM PROMPT, not the briefing — a
+# briefing pasted into the TUI is echoed in the input area and would
+# trigger the watcher prematurely on its own text.  System prompts arrive
+# via ``--system-prompt`` and are NEVER rendered in the TTY output.  This
+# distinction was verified live against interactive ``claude`` v2.1.160
+# (#426 smoke).
+COMPLETION_SENTINEL = "COORD_PTY_DONE"
+
+# Spec types whose system prompt is augmented with the completion sentinel
+# instruction.  Chat-style sessions (refinement / test-chat /
+# new-issue-chat) are interactive with the developer and end via
+# :meth:`coord.agent.AgentServer.cancel`, not via a self-emitted
+# sentinel, so they are NOT augmented and the completion watcher does
+# not run for them.
+_AUTONOMOUS_SPEC_TYPES: frozenset[str] = frozenset({
+    "plan",
+    "work",
+    "review",
+    "smoke",
+    "conflict-fix",
+})
+
+
+def _completion_instruction(spec_type: str) -> str:
+    """Build the completion-sentinel instruction appended to the system prompt.
+
+    For ``review`` workers, also instructs emission of a short
+    ``VERDICT: approve|request-changes`` line right before the sentinel so
+    :func:`coord.providers.claude_pty._parse_pty_log` can pick up the
+    review verdict directly from the TTY-rendered output.
+    """
+    lines: list[str] = [
+        "",
+        "",
+        f"#426 — PTY worker completion protocol (you are running interactive claude in a pseudo-terminal).",
+        f"When you have COMPLETELY finished the assignment, on a NEW line emit EXACTLY this string and nothing else after it:",
+        f"  {COMPLETION_SENTINEL}",
+        "Do not surround it with backticks, quotes, or commentary.  After this line, end your turn.",
+        "The coordinator's PTY watcher will detect this line, terminate the session, push your branch, and notify the human.",
+        "If you cannot finish (you are stuck and need guidance), still emit a STUCK: line as your final progress signal and STOP — do not emit the sentinel.",
+    ]
+    if spec_type == "review":
+        lines.extend([
+            "",
+            "Because this is a REVIEW assignment, immediately BEFORE the sentinel line, emit one of:",
+            "  VERDICT: approve",
+            "  VERDICT: request-changes",
+            "Then emit the sentinel on its own line.  Reuse the same verdict in any REVIEW_VERDICT block you also produce.",
+        ])
+    return "\n".join(lines)
+
+
+# ── #426 ANSI / TTY stripping helpers ────────────────────────────────────────
+#
+# Interactive ``claude`` writes raw TTY bytes to its PTY: ANSI/CSI escapes,
+# kitty-keyboard sequences (``ESC[>1u``), bracketed-paste markers
+# (``ESC[?2004h``), and full TUI frames.  ``_strip_ansi`` removes the four
+# most common families so the log can be regex-searched for plain content
+# (the completion sentinel, ``STUCK:``, ``VERDICT:``, ``Total cost: $...``).
+# We deliberately do NOT bring in a full vt100 emulator — the issue's
+# review explicitly forbids adding a dependency for this — and stdlib
+# regex is enough for the markers we care about (verified against the
+# live #426 capture).
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*\x07")
+_ANSI_OTHER_RE = re.compile(r"\x1b[()][0-9A-Za-z]")
+_ANSI_ESC_RE = re.compile(r"\x1b[=>78]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove the four common ANSI escape families from *text*.
+
+    Strips OSC first (they may contain ``[`` characters that the CSI
+    pattern would otherwise mis-anchor on), then CSI, then SS2/SS3 / charset
+    selection (``ESC(``/``ESC)``), then single-character escapes (``ESC=``,
+    ``ESC>``, ``ESC7``/``ESC8`` for save/restore cursor).  Returns plain
+    text suitable for substring / regex search.
+    """
+    text = _ANSI_OSC_RE.sub("", text)
+    text = _ANSI_CSI_RE.sub("", text)
+    text = _ANSI_OTHER_RE.sub("", text)
+    text = _ANSI_ESC_RE.sub("", text)
+    return text
+
+
+def _sentinel_in_worker_output(text: str, sentinel: str) -> bool:
+    """Return True iff *sentinel* appears on a non-comment line in *text*.
+
+    The agent writes a ``# agent=... argv=...`` header to the log before
+    spawning the worker, and the ``argv`` contains the worker's full
+    ``--system-prompt`` — which now (per #426) literally contains the
+    sentinel string.  A bare ``sentinel in text`` substring search would
+    therefore false-positive on the spawn header itself before the worker
+    has produced any output.  Restricting matches to lines that don't
+    start with ``#`` skips the agent-authored comments (header, reap
+    notes, ``# pty: worker exited`` marker, ``# pty-watcher: ...``
+    diagnostics) without losing legitimate worker output — the
+    interactive TUI never renders a line that begins with ``#`` in
+    column zero.
+    """
+    if sentinel not in text:
+        return False
+    for line in text.splitlines():
+        if sentinel in line and not line.lstrip().startswith("#"):
+            return True
+    return False
+
+
+# Cost-line patterns.  The PTY captures two forms in the wild:
+#   * ``Total cost: $0.1516`` from the ``/cost`` slash-command summary
+#     (verified in #426 live capture).
+#   * ``Cost: $.09`` from the status line in some configurations (note the
+#     missing leading zero — ``$.09`` not ``$0.09``).  Also seen alongside
+#     stale ``Cost: $0.00`` placeholders earlier in the same frame, so the
+#     extractor picks the LATEST non-zero figure.
+_PTY_COST_RE = re.compile(
+    r"(?i)(?:total\s+)?cost\s*[:=]?\s*\$(\.?\d+(?:\.\d+)?)"
+)
+
+# Status / progress line patterns reused from coord.progress so the PTY
+# log surfaces the same STATUS / STUCK signals workers emit on the
+# ``claude -p`` path.  ``re.MULTILINE`` lets the regex anchor on the start
+# of any line in the ANSI-stripped text.
+_PTY_STATUS_RE = re.compile(r"^STATUS:\s*(.+)$", re.MULTILINE)
+_PTY_STUCK_RE = re.compile(r"^STUCK:\s*(.+)$", re.MULTILINE)
+
+# Review verdict line — the simplified ``VERDICT: approve|request-changes``
+# form #426 introduces (see :func:`_completion_instruction`).  The
+# existing ``REVIEW_VERDICT: ... REVIEW_BODY: ... END_REVIEW`` block is
+# also still respected by :func:`coord.review.parse_review_from_log`
+# — this is the lightweight machine-readable signal used by the PTY
+# watcher and by the WorkerSummary.stop_reason mapping.
+_PTY_VERDICT_RE = re.compile(
+    r"^VERDICT:\s*(approve|request-changes)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _parse_pty_log(
+    log_path: str | Path,
+    *,
+    sentinel: str = COMPLETION_SENTINEL,
+    tail_bytes: int = 65536,
+) -> WorkerSummary:
+    """Parse an interactive-``claude`` PTY log into a :class:`WorkerSummary`.
+
+    The PTY log is raw TTY bytes — not stream-json — so the rich field set
+    populated by :func:`coord.worker_events.parse_log` (session_id,
+    per-tool tracking, etc.) is largely unavailable.  This function fills
+    the fields whose values can be reliably extracted from the
+    ANSI-stripped TTY stream:
+
+    * ``stop_reason`` — set to ``"approve"`` / ``"request-changes"`` when
+      a ``VERDICT:`` line is present (reviews), ``"stuck"`` when a
+      ``STUCK:`` line is present, ``"end_turn"`` when the completion
+      sentinel is present, otherwise ``None``.
+    * ``total_cost_usd`` — extracted from ``Total cost: $X.XX`` or
+      ``Cost: $.0X`` lines.  Stays ``0.0`` (the WorkerSummary default,
+      meaning "n/a") when no cost line is present; this matches
+      ``capabilities().cost_reporting=False`` for the PTY provider.
+
+    All other WorkerSummary fields stay at their dataclass defaults — the
+    interactive TUI doesn't expose them as machine-readable text.
+    Returning the same WorkerSummary shape as the ``claude -p`` path lets
+    downstream consumers (``coord.agent.AgentServer.list_assignments``,
+    ``coord.notify._capture_cost``, etc.) treat both providers uniformly.
+    """
+    summary = WorkerSummary()
+    p = Path(log_path)
+    if not p.exists():
+        return summary
+    try:
+        # Read the tail (cheap for live polling) or the whole file when
+        # tail_bytes is 0.  We use binary mode so the ANSI strip can run
+        # over predictable bytes; decode to str only after stripping.
+        size = p.stat().st_size
+        with open(p, "rb") as fh:
+            if tail_bytes and size > tail_bytes:
+                fh.seek(size - tail_bytes)
+            raw = fh.read()
+    except OSError:
+        return summary
+    text = _strip_ansi(raw.decode("utf-8", errors="replace"))
+
+    # Stop reason precedence: VERDICT (most specific for reviews) > STUCK
+    # (worker explicitly bailed) > sentinel (clean finish).  We prefer
+    # VERDICT over the sentinel because a review worker emits BOTH, and
+    # downstream code keys off the verdict to decide approve/request-changes.
+    verdict_matches = list(_PTY_VERDICT_RE.finditer(text))
+    if verdict_matches:
+        summary.stop_reason = verdict_matches[-1].group(1).lower()
+    elif _PTY_STUCK_RE.search(text):
+        summary.stop_reason = "stuck"
+    elif _sentinel_in_worker_output(text, sentinel):
+        # ``_sentinel_in_worker_output`` skips ``#``-comment lines so the
+        # spawn header (whose argv now contains the literal sentinel) does
+        # not cause a false-positive "end_turn" verdict on a worker that
+        # crashed before producing any real output.
+        summary.stop_reason = "end_turn"
+
+    # Cost extraction — pick the latest non-zero figure to skip the
+    # stale ``Cost: $0.00`` placeholder mentioned in the #426 issue body.
+    latest_nonzero: float | None = None
+    for m in _PTY_COST_RE.finditer(text):
+        raw_value = m.group(1)
+        # ``$.09`` form has no leading digit; ``float(".09")`` works.
+        try:
+            value = float(raw_value)
+        except ValueError:
+            continue
+        if value > 0:
+            latest_nonzero = value
+    if latest_nonzero is not None:
+        summary.total_cost_usd = latest_nonzero
+
+    return summary
 
 
 class ClaudePtyProvider(Provider):
@@ -227,6 +459,19 @@ class ClaudePtyProvider(Provider):
             if allowed_tools is None:
                 allowed_tools = _at
 
+        # #426: append the completion-sentinel instruction to the system
+        # prompt for AUTONOMOUS spec types.  Chat-style sessions
+        # (refinement / test-chat / new-issue-chat) are interactive with
+        # the developer and end via :meth:`AgentServer.cancel`, not via
+        # a self-emitted sentinel — augmenting their prompt would
+        # confuse them into prematurely emitting the sentinel.  Always
+        # append when an explicit system_prompt override was supplied
+        # AND the spec type is autonomous (the override pathway is used
+        # by review.py to install the reviewer prompt — that worker
+        # still needs the sentinel to flag completion).
+        if spec.type in _AUTONOMOUS_SPEC_TYPES:
+            system_prompt = system_prompt + _completion_instruction(spec.type)
+
         # NOTE: no -p, no stream-json flags.  --system-prompt /
         # --allowedTools / --permission-mode are still passed as a safety
         # hedge even though enforcement is unverified in the PTY path
@@ -282,15 +527,21 @@ class ClaudePtyProvider(Provider):
     def parse_log(
         self, log_path: str | Path, tail_bytes: int = 65536
     ) -> WorkerSummary:
-        """Best-effort parse of the worker log.
+        """Parse a PTY worker log into a :class:`WorkerSummary` (#426).
 
-        Delegates to :func:`coord.worker_events.parse_log`, which silently
-        skips non-JSON lines.  Interactive ``claude`` writes raw TTY bytes
-        (ANSI escape sequences, prompts, model text) rather than
-        stream-json, so the returned :class:`WorkerSummary` will usually be
-        mostly blank — that is the correct minimal-tail-parser behaviour
-        for this provider until the PTY format gets its own structured
-        log channel.
+        Delegates to :func:`_parse_pty_log` which ANSI-strips the raw TTY
+        bytes and extracts the fields recoverable from the interactive
+        ``claude`` output stream: ``stop_reason`` (from the
+        :data:`COMPLETION_SENTINEL`, ``STUCK:``, or ``VERDICT:`` lines)
+        and ``total_cost_usd`` (from ``Total cost: $X.XX`` / ``Cost:
+        $.0X`` lines).  Other WorkerSummary fields stay at their
+        dataclass defaults — they have no plain-text representation in
+        the TUI.
+
+        The returned shape is the SAME :class:`WorkerSummary` that the
+        ``claude -p`` path returns, so downstream consumers
+        (:meth:`coord.agent.AgentServer.list_assignments`,
+        :func:`coord.notify._capture_cost`, etc.) treat both providers
+        uniformly.
         """
-        from coord.worker_events import parse_log  # noqa: PLC0415
-        return parse_log(log_path, tail_bytes=tail_bytes)
+        return _parse_pty_log(log_path, tail_bytes=tail_bytes)

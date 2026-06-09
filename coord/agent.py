@@ -118,6 +118,69 @@ _PTY_RESULT_LINE_MARKER = b"# pty: worker exited"
 _PTY_READY_QUIESCE_S = 0.8
 _PTY_READY_QUIESCE_CAP_S = 8.0
 
+# #426 PTY completion watcher tuning.
+#
+# Interactive ``claude`` is a REPL — it does NOT exit after finishing a turn,
+# it returns to an idle prompt and waits.  ``proc.wait()`` therefore blocks
+# until the existing ``_REAP_MAX_WAIT`` (2 h) safety net.  The completion
+# watcher polls the ANSI-stripped log for the
+# :data:`coord.providers.claude_pty.COMPLETION_SENTINEL`, a ``STUCK:``
+# marker, or an idle-prompt-with-output-quiescence backstop, and force-kills
+# the process group on detection (which closes the PTY → ``_pump`` stamps
+# :data:`_PTY_RESULT_LINE_MARKER` → the existing reap path runs unchanged).
+#
+# Defaults:
+#  * ``_PTY_COMPLETION_POLL_S`` — poll interval.  1 s is well below the
+#    cost of a wall-clock turn (typically tens of seconds) but cheap.
+#  * ``_PTY_IDLE_QUIESCE_S`` — log byte-size stable for this many seconds
+#    AND idle-prompt glyph visible in the tail → fire backstop.  15 s is
+#    long enough that a slow tool call doesn't trip it.
+#  * ``_PTY_IDLE_MIN_POST_SUBMIT_S`` — minimum elapsed before the backstop
+#    can fire.  Protects against the TUI's render quiescing momentarily
+#    during initial setup BEFORE the worker has even started its first turn.
+#  * ``_PTY_COMPLETION_MAX_WAIT_S`` — absolute cap (1 h) so a misbehaving
+#    worker still gets killed even when no sentinel / STUCK / idle-prompt
+#    backstop ever triggers.  The outer ``_REAP_MAX_WAIT`` (2 h) is still
+#    in effect as the ultimate safety net.
+_PTY_COMPLETION_POLL_S = 1.0
+_PTY_IDLE_QUIESCE_S = 15.0
+_PTY_IDLE_MIN_POST_SUBMIT_S = 20.0
+_PTY_COMPLETION_MAX_WAIT_S = 60 * 60.0
+
+# Bytes-form of the idle-prompt indicator (``❯``, U+276F).  Re-renders of
+# the input area print this glyph at the start of the empty input line so
+# the watcher uses its presence in the tail of the ANSI-stripped log as
+# evidence that the TUI is back to idle.  Verified live against
+# interactive ``claude`` v2.1.160 (#426 smoke: ``❯`` reappears after each
+# ``✻ Sautéed for Ns`` / ``✻ Worked for Ns`` / ``✻ Cooked for Ns`` line).
+_PTY_IDLE_PROMPT_GLYPH = "❯"
+
+# Bytes-form sentinel the watcher writes to the log when it kills the worker
+# for "logical completion" reasons (sentinel detection or VERDICT detection).
+# :meth:`_reap` reads the log after :func:`_wait_for_proc_or_result` returns
+# and OVERRIDES the SIGTERM-derived exit code to 0 when this marker is
+# present, so the assignment status flips to DONE (rather than FAILED) and
+# the existing branch-push code path runs.  ``STUCK``, idle-backstop, and
+# max-wait kills do NOT write this marker, so those workers stay FAILED.
+_PTY_SUCCESS_LINE_MARKER = b"# pty-watcher: success"
+
+
+def _log_has_pty_success(log_path: str) -> bool:
+    """Return True iff the log contains :data:`_PTY_SUCCESS_LINE_MARKER`.
+
+    The marker is written by :func:`_pty_completion_watcher` immediately
+    before it SIGTERMs the worker when the termination reason is a
+    "logical completion" (sentinel detected).  :meth:`AgentServer._reap`
+    uses it to decide whether to override the SIGTERM exit code with 0 —
+    a worker that emitted the completion sentinel did its work even if
+    the runtime had to be force-killed afterwards.
+    """
+    try:
+        with open(log_path, "rb") as f:
+            return _PTY_SUCCESS_LINE_MARKER in f.read()
+    except OSError:
+        return False
+
 # First-output (TTFT) watchdog default and the distinct exit code used when it
 # fires, so `_reap` records the assignment as FAILED (any non-zero exit) and the
 # `concurrency.auto_reassign` path re-dispatches it. See #299 and the upstream
@@ -333,6 +396,165 @@ def _wait_for_proc_or_result(
             except subprocess.TimeoutExpired:
                 pass
             return 137  # SIGKILL convention
+
+
+def _pty_completion_watcher(
+    proc: subprocess.Popen,
+    log_path: str,
+    sentinel: str,
+    *,
+    poll_interval: float = _PTY_COMPLETION_POLL_S,
+    idle_quiesce: float = _PTY_IDLE_QUIESCE_S,
+    idle_min_post_submit: float = _PTY_IDLE_MIN_POST_SUBMIT_S,
+    max_wait: float = _PTY_COMPLETION_MAX_WAIT_S,
+    cost_capture_fd: int | None = None,
+    cost_capture_settle_s: float = 2.5,
+    killpg: Callable[[int, int], None] = _killpg_safe,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """Watch a PTY worker's log for logical completion and terminate it (#426).
+
+    Interactive ``claude`` is a REPL — it does NOT exit after finishing a
+    turn.  Without an external signal, ``proc.wait()`` would block until
+    :data:`_REAP_MAX_WAIT` (2 h) fires.  This watcher polls the
+    ANSI-stripped log and force-kills the worker's process group as soon
+    as one of the following completion signals appears, which closes the
+    PTY → :func:`_pump` stamps :data:`_PTY_RESULT_LINE_MARKER` → the
+    existing :func:`_reap` path runs unchanged and pushes the worker's
+    branch.
+
+    Signals (precedence order):
+
+    * ``sentinel`` in the ANSI-stripped log — the primary signal.
+      Workers are instructed to emit it via the system prompt (see
+      :func:`coord.providers.claude_pty._completion_instruction`).
+    * ``STUCK:`` line — the worker explicitly bailed; surface as a
+      completion that downstream parsers map to ``stop_reason="stuck"``.
+    * Idle backstop: log byte-size stable for *idle_quiesce* seconds AND
+      the ``❯`` idle-prompt glyph visible in the tail AND elapsed time
+      since start is at least *idle_min_post_submit* seconds.  This
+      catches the "worker forgot to emit the sentinel" failure mode.
+    * Absolute cap *max_wait* seconds elapsed (default 1 h) — safety net
+      below the outer 2 h ``_REAP_MAX_WAIT``.
+
+    Returns the reason string written to the log for observability and
+    test assertions; callers may ignore it.  Keyword-only parameters
+    exist for tests to inject short timeouts and mock kill / clock /
+    sleep behaviour without driving a real PTY.
+
+    When *cost_capture_fd* is provided, the watcher writes ``/cost\\r``
+    to that file descriptor right before SIGTERM and waits
+    *cost_capture_settle_s* seconds so the TUI has time to render the
+    ``Total cost: $X.XX`` line into the log.  The PTY's master fd is the
+    intended argument.  Failures (write to a closed fd) are swallowed —
+    cost capture is best-effort.
+    """
+    # Late import to avoid the circular import with coord.providers, which
+    # itself imports from coord.agent at runtime.
+    from coord.providers.claude_pty import (  # noqa: PLC0415
+        _sentinel_in_worker_output,
+        _strip_ansi,
+    )
+
+    start = clock()
+    last_log_size = -1
+    last_growth = clock()
+    reason: str | None = None
+
+    def _terminate(why: str, *, success: bool) -> None:
+        _append_log_line(log_path, f"# pty-watcher: {why} → SIGTERM\n")
+        # #426: write the success marker BEFORE the SIGTERM and the
+        # /cost capture so :meth:`AgentServer._reap` sees it after
+        # ``_wait_for_proc_or_result`` returns and overrides the
+        # SIGTERM-derived exit code to 0.  STUCK/idle/max_wait paths
+        # pass ``success=False`` so the SIGTERM exit code (143) survives
+        # → assignment status flips to FAILED → no branch push.
+        if success:
+            _append_log_line(
+                log_path,
+                _PTY_SUCCESS_LINE_MARKER.decode("utf-8") + "\n",
+            )
+        # Best-effort cost capture: ask the TUI to render `/cost` before
+        # we kill it.  The render takes a few hundred ms; we wait
+        # `cost_capture_settle_s` so the line appears in the log before
+        # the pump sees EOF and stops appending.
+        if cost_capture_fd is not None:
+            try:
+                os.write(cost_capture_fd, b"/cost\r")
+            except OSError:
+                pass
+            else:
+                sleep(cost_capture_settle_s)
+        killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _append_log_line(
+                log_path,
+                "# pty-watcher: SIGKILL process group (SIGTERM ignored)\n",
+            )
+            killpg(proc.pid, signal.SIGKILL)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    while True:
+        # Already exited (cancel path, crash, etc.) — nothing for us to do.
+        if proc.poll() is not None:
+            return reason or "process already exited"
+        elapsed = clock() - start
+        try:
+            with open(log_path, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            sleep(poll_interval)
+            continue
+        text = _strip_ansi(raw.decode("utf-8", errors="replace"))
+
+        # Primary signal: completion sentinel.  Use the comment-aware
+        # helper so the spawn header — whose argv now literally contains
+        # the sentinel string as part of ``--system-prompt`` — does NOT
+        # false-positive before the worker has produced any output.
+        if _sentinel_in_worker_output(text, sentinel):
+            reason = f"sentinel {sentinel!r} detected"
+            _terminate(reason, success=True)
+            return reason
+
+        # Explicit stuck marker.  This counts as a "the worker reached a
+        # graceful stopping point" — failure from the assignment's
+        # perspective (no commits to push) but not a runtime error.
+        if re.search(r"^STUCK:", text, re.MULTILINE):
+            reason = "STUCK: marker detected"
+            _terminate(reason, success=False)
+            return reason
+
+        # Idle backstop: no log growth + idle prompt + post-submit grace.
+        size = len(raw)
+        if size > last_log_size:
+            last_log_size = size
+            last_growth = clock()
+        else:
+            quiet_for = clock() - last_growth
+            if (
+                elapsed >= idle_min_post_submit
+                and quiet_for >= idle_quiesce
+                and _PTY_IDLE_PROMPT_GLYPH in text[-4096:]
+            ):
+                reason = (
+                    f"idle backstop ({quiet_for:.1f}s no log growth + "
+                    f"idle prompt visible)"
+                )
+                _terminate(reason, success=False)
+                return reason
+
+        if elapsed >= max_wait:
+            reason = f"max_wait {max_wait:.0f}s exceeded without completion signal"
+            _terminate(reason, success=False)
+            return reason
+
+        sleep(poll_interval)
 
 
 @dataclass
@@ -2640,6 +2862,35 @@ class AgentServer:
             assignment.started_at = time.time()
             self._processes[assignment.id] = proc
 
+        # #426: start the completion watcher for AUTONOMOUS spec types.
+        # Interactive ``claude`` is a REPL and never exits on its own, so
+        # without this the existing ``_reap`` loop spins until
+        # ``_REAP_MAX_WAIT`` (2 h).  The watcher polls the ANSI-stripped
+        # log for the sentinel / STUCK: / idle-prompt backstop and
+        # force-kills the process group, which closes the PTY → ``_pump``
+        # stamps :data:`_PTY_RESULT_LINE_MARKER` → existing reap path
+        # runs unchanged and pushes the worker's branch.
+        #
+        # Chat-style spec types (refinement / test-chat / new-issue-chat)
+        # are interactive with the developer and end via ``cancel``;
+        # running the watcher for them would cut a live conversation off
+        # at the idle prompt.  Gated on
+        # :data:`coord.providers.claude_pty._AUTONOMOUS_SPEC_TYPES` for
+        # exactly this reason.
+        from coord.providers.claude_pty import (  # noqa: PLC0415
+            COMPLETION_SENTINEL,
+            _AUTONOMOUS_SPEC_TYPES,
+        )
+        if spec.type in _AUTONOMOUS_SPEC_TYPES:
+            watcher_thread = threading.Thread(
+                target=_pty_completion_watcher,
+                args=(proc, assignment.log_path, COMPLETION_SENTINEL),
+                kwargs={"cost_capture_fd": master_fd},
+                daemon=True,
+                name=f"agent-pty-watch-{assignment.id}",
+            )
+            watcher_thread.start()
+
         thread = threading.Thread(
             target=self._reap,
             args=(assignment.id, proc, log_fh, assignment.log_path),
@@ -2719,6 +2970,23 @@ class AgentServer:
             log_has_result=_log_has_result_fn,
         )
         log_fh.close()
+
+        # #426: a PTY worker that the completion watcher killed AFTER
+        # detecting the success sentinel is logically DONE — override the
+        # SIGTERM-derived exit code (typically 143) to 0 so the existing
+        # branch-push code path runs and the assignment ends as DONE.
+        # The marker is written ONLY by
+        # :func:`_pty_completion_watcher` in the sentinel-detected case;
+        # STUCK / idle-backstop / max-wait kills do not write it, so
+        # those workers stay FAILED.  The ``claude -p`` (legacy) path
+        # never writes the marker either, so its semantics are unchanged.
+        if exit_code != 0 and _log_has_pty_success(log_path):
+            _append_log_line(
+                log_path,
+                f"# reap: PTY success marker present — overriding exit_code "
+                f"{exit_code} → 0 (worker emitted completion sentinel before SIGTERM)\n",
+            )
+            exit_code = 0
 
         # Capture the branch the worker left the repo on. For worktree-based
         # assignments we read from the worktree; for legacy assignments (no
