@@ -623,13 +623,36 @@ class TestInjectBriefingIntoTmuxSession:
 
     # -- Subprocess errors -----------------------------------------------------
 
-    def test_returns_false_when_temp_file_creation_fails(self) -> None:
-        """``False`` is returned when NamedTemporaryFile raises OSError."""
+    def test_load_buffer_reads_from_stdin(self) -> None:
+        """``tmux load-buffer`` is called with ``"-"`` and ``input=briefing``."""
         from coord.interactive import _inject_briefing_into_tmux_session
 
-        with patch("tempfile.NamedTemporaryFile", side_effect=OSError("disk full")):
-            result = _inject_briefing_into_tmux_session("coord-ses", "hello")
-        assert result is False
+        calls: list[dict[str, Any]] = []
+
+        def _mock(cmd: list[str], **kwargs: Any) -> MagicMock:
+            calls.append({"cmd": list(cmd), "kwargs": kwargs})
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            return m
+
+        with patch("subprocess.run", side_effect=_mock), patch("time.sleep"):
+            result = _inject_briefing_into_tmux_session(
+                "coord-ses", "my briefing text", timeout=0.0
+            )
+
+        assert result is True
+        load_calls = [c for c in calls if "load-buffer" in c["cmd"]]
+        assert load_calls, "load-buffer was not called"
+        lc = load_calls[0]
+        # The source argument must be "-" (stdin), NOT a temp file path.
+        assert lc["cmd"][-1] == "-", (
+            f"load-buffer last arg should be '-', got {lc['cmd'][-1]!r}"
+        )
+        # The briefing must be passed via the ``input`` kwarg, not a file.
+        assert lc["kwargs"].get("input") == "my briefing text", (
+            f"expected input='my briefing text', got {lc['kwargs'].get('input')!r}"
+        )
 
     def test_capture_pane_error_breaks_loop_but_still_injects(self) -> None:
         """SubprocessError from capture-pane breaks the quiescence loop but injection still runs."""
@@ -661,11 +684,19 @@ class TestInjectBriefingIntoTmuxSession:
 
     # -- Temp file cleanup -----------------------------------------------------
 
-    def test_temp_file_deleted_after_successful_injection(self) -> None:
-        """The temp file written by load-buffer is deleted in the finally block."""
+    def test_no_temp_file_created_on_injection(self) -> None:
+        """Briefing injection does NOT create any temporary files (stdin-only path)."""
+        import tempfile as _tempfile
+
         from coord.interactive import _inject_briefing_into_tmux_session
 
-        unlinked: list[str] = []
+        created_temp_files: list[str] = []
+        original_ntf = _tempfile.NamedTemporaryFile
+
+        def _spy_ntf(*args: Any, **kwargs: Any) -> Any:
+            result = original_ntf(*args, **kwargs)
+            created_temp_files.append(result.name)
+            return result
 
         def _mock_run(cmd: list[str], **kwargs: Any) -> MagicMock:
             m = MagicMock()
@@ -675,37 +706,31 @@ class TestInjectBriefingIntoTmuxSession:
 
         with patch("subprocess.run", side_effect=_mock_run), \
              patch("time.sleep"), \
-             patch("os.unlink", side_effect=lambda p: unlinked.append(p)):
+             patch("tempfile.NamedTemporaryFile", side_effect=_spy_ntf):
             _inject_briefing_into_tmux_session("coord-clean", "hello world", timeout=0.0)
 
-        assert len(unlinked) == 1, f"expected one unlink, got {unlinked!r}"
-        assert unlinked[0].endswith(".txt"), (
-            f"expected a .txt temp file path, got {unlinked[0]!r}"
+        assert created_temp_files == [], (
+            f"stdin path must not create temp files; got: {created_temp_files!r}"
         )
 
-    def test_temp_file_deleted_even_when_subprocess_raises(self) -> None:
-        """Cleanup runs even if subprocess.run raises during injection."""
+    def test_load_buffer_input_strips_trailing_newline(self) -> None:
+        """``input`` passed to load-buffer has trailing newline stripped."""
         from coord.interactive import _inject_briefing_into_tmux_session
 
-        unlinked: list[str] = []
+        calls: list[dict[str, Any]] = []
 
-        import subprocess as _sp
-
-        call_count = [0]
-
-        def _mock_run(cmd: list[str], **kwargs: Any) -> MagicMock:
-            call_count[0] += 1
-            if call_count[0] >= 2:  # fail on load-buffer / paste-buffer
-                raise _sp.SubprocessError("network error")
+        def _mock(cmd: list[str], **kwargs: Any) -> MagicMock:
+            calls.append({"cmd": list(cmd), "kwargs": kwargs})
             m = MagicMock()
             m.returncode = 0
             m.stdout = ""
             return m
 
-        with patch("subprocess.run", side_effect=_mock_run), \
-             patch("time.sleep"), \
-             patch("os.unlink", side_effect=lambda p: unlinked.append(p)):
-            _inject_briefing_into_tmux_session("coord-clean2", "hello", timeout=0.0)
+        briefing = "some text\n\n"
+        with patch("subprocess.run", side_effect=_mock), patch("time.sleep"):
+            _inject_briefing_into_tmux_session("coord-nl", briefing, timeout=0.0)
 
-        # unlink should have run (finally block always executes)
-        assert len(unlinked) >= 1
+        load_calls = [c for c in calls if "load-buffer" in c["cmd"]]
+        assert load_calls
+        # rstrip("\n") removes trailing newlines — matches briefing.rstrip("\n")
+        assert load_calls[0]["kwargs"]["input"] == briefing.rstrip("\n")
