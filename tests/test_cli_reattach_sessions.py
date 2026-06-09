@@ -23,6 +23,8 @@ from click.testing import CliRunner
 
 from coord.cli import main
 
+from .conftest import output_and_stderr
+
 
 # ── Shared fixtures ────────────────────────────────────────────────────────────
 
@@ -199,16 +201,11 @@ class TestReattachCmd:
     def test_tmux_not_available_exits_1(self, config_file: Path) -> None:
         """Exit code 1 and error message when tmux is absent."""
         with patch("coord.interactive.tmux_available", return_value=False):
-            result = CliRunner(mix_stderr=False).invoke(
+            result = CliRunner().invoke(
                 main, ["reattach", "aid-123", "--config", str(config_file)]
             )
         assert result.exit_code == 1
-        try:
-            stderr = result.stderr or ""
-        except ValueError:
-            stderr = ""
-        combined = result.output + stderr
-        assert "tmux is not available" in combined
+        assert "tmux is not available" in output_and_stderr(result)
 
     def test_session_not_alive_before_attach_exits_0(self, config_file: Path) -> None:
         """When the session is already dead, exit 0 with an informative message."""
@@ -397,16 +394,12 @@ class TestReattachCmd:
              patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("coord.interactive.finalize_interactive_exit") as mock_fin:
-            result = CliRunner(mix_stderr=False).invoke(
+            result = CliRunner().invoke(
                 main, ["reattach", "aid-missing", "--config", str(config_file)]
             )
 
         mock_fin.assert_not_called()
-        try:
-            stderr = result.stderr or ""
-        except ValueError:
-            stderr = ""
-        combined = result.output + stderr
+        combined = output_and_stderr(result)
         # The "metadata not found" message must surface in some output stream
         assert "metadata not found" in combined or "skipping" in combined
 
@@ -416,7 +409,7 @@ class TestReattachCmd:
         """The 'metadata not found' message is emitted (may be on stderr)."""
         alive_seq = iter([True, False])
 
-        runner = CliRunner(mix_stderr=False)
+        runner = CliRunner()
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
@@ -425,11 +418,7 @@ class TestReattachCmd:
                 main, ["reattach", "aid-ghost", "--config", str(config_file)]
             )
 
-        try:
-            stderr = result.stderr or ""
-        except ValueError:
-            stderr = ""
-        combined = result.output + stderr
+        combined = output_and_stderr(result)
         assert "metadata not found" in combined or "skipping" in combined
 
     # -- DB exception swallowing -----------------------------------------------
@@ -437,19 +426,32 @@ class TestReattachCmd:
     def test_db_exception_does_not_crash_reattach(
         self, config_file: Path, coord_db: Any
     ) -> None:
-        """A DB error in the metadata lookup is swallowed — reattach still runs."""
-        alive_seq = iter([True, True])  # alive → user detaches
+        """A DB error in the metadata lookup is swallowed — reattach still runs.
+
+        ``cli.reattach`` does a deferred ``from coord.state import get_connection``
+        inside the try-block, so the patch target must be
+        ``coord.state.get_connection`` (where the function actually lives in the
+        module namespace at lookup time), NOT ``coord.db.get_connection``
+        (which the deferred import bypasses entirely).
+        """
+        alive_seq = iter([True, False])  # alive before, dead after attach
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, True)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
-             patch("coord.db.get_connection", side_effect=RuntimeError("DB down")):
+             patch("coord.state.get_connection", side_effect=RuntimeError("DB down")), \
+             patch("coord.interactive.finalize_interactive_exit") as mock_fin:
             result = CliRunner().invoke(
                 main, ["reattach", "aid-dberr", "--config", str(config_file)]
             )
 
-        # Should not crash — exit 0 (session still alive after detach)
+        # The DB exception is swallowed; metadata stays None so finalize is
+        # NOT called (the `if repo_name_val and …` guard fails) and a
+        # "metadata not found" warning is emitted instead.
         assert result.exit_code == 0
+        mock_fin.assert_not_called()
+        combined = output_and_stderr(result)
+        assert "metadata not found" in combined or "skipping" in combined
 
 
 # ── _inject_briefing_into_tmux_session ─────────────────────────────────────────
