@@ -77,7 +77,11 @@ import time
 import tty
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING:
+    from coord.config import Config
+    from coord.models import Board
 
 from coord.providers.claude_pty import (
     BRACKETED_PASTE_ENABLE,
@@ -88,6 +92,7 @@ from coord.providers.claude_pty import (
 __all__ = [
     "launch_human_attended_interactive",
     "finalize_interactive_exit",
+    "reap_stale_interactive_sessions",
     "InteractiveFinalizeResult",
     "TMUX_SESSION_PREFIX",
     "TmuxHost",
@@ -960,3 +965,120 @@ def finalize_interactive_exit(
         seam_outcome=outcome,
         worktree_removed=worktree_removed,
     )
+
+
+# ── Stale interactive-session reaper ─────────────────────────────────────────
+
+
+def reap_stale_interactive_sessions(
+    board: "Board",
+    config: "Config",
+    *,
+    worktrees_dir: Path | None = None,
+) -> list[str]:
+    """Sweep *board.active* for dead interactive sessions and release their claims.
+
+    Called from :func:`coord.reconcile.reconcile` on every pass so that
+    ``coord resume`` / ``coord notify`` automatically clean up orphaned
+    worktrees and stale ``running`` DB rows for interactive assignments whose
+    tmux session died without going through the normal ``/exit`` → finalize
+    path.
+
+    **Detection strategy**: an assignment is stale when ALL of:
+
+    * ``provider_name == "claude-pty"`` (i.e. dispatched via ``--interactive``)
+    * ``status`` is ``"running"`` or ``"pending"`` in the in-memory board
+    * tmux is available on the local machine AND ``coord-<assignment_id>``
+      is NOT alive
+
+    When tmux is NOT available the function returns immediately — the PTY
+    relay is handled synchronously inside ``coord assign``, so no orphan
+    accumulates there.
+
+    For each stale session the function:
+
+    1. Removes the interactive worktree at
+       ``~/.coord/worktrees/<assignment_id>`` (best-effort via
+       :func:`_remove_worktree`; falls back to ``shutil.rmtree``).
+    2. Marks the assignment ``failed`` in the SQLite DB (only when the row
+       is still ``running`` / ``pending`` — a ``coord report-result`` that
+       raced the reaper is left untouched).
+    3. Moves the assignment from ``board.active`` to ``board.completed``
+       via :meth:`~coord.models.Board.mark_failed_by_id`.
+
+    Returns the assignment IDs that were reaped.  The caller should include
+    these in its ``changed`` list so ``save_board`` is triggered.
+    """
+    if not tmux_available():
+        return []
+
+    from coord.state import COORD_DIR, get_connection  # noqa: PLC0415
+
+    if worktrees_dir is None:
+        worktrees_dir = COORD_DIR / "worktrees"
+
+    machines_by_name = {m.name: m for m in config.machines}
+    reaped: list[str] = []
+    now = time.time()
+
+    for a in board.active[:]:  # iterate a copy — we mutate board mid-loop
+        if a.provider_name != "claude-pty":
+            continue
+        if a.status not in ("running", "pending"):
+            continue
+        if not a.assignment_id:
+            continue
+
+        sname = tmux_session_name(a.assignment_id)
+        if tmux_session_alive(sname):
+            continue  # session is live — leave it alone
+
+        # ── Session is dead: clean up the orphaned state ──────────────────
+
+        wt_path = worktrees_dir / a.assignment_id
+
+        # Reconstruct the repo root so ``git worktree remove`` can run
+        # relative to it; fall back to shutil.rmtree when unavailable.
+        repo_path_val: str | None = None
+        machine = machines_by_name.get(a.machine_name or "")
+        if machine is not None and a.repo_name:
+            rp = machine.repo_path(a.repo_name)
+            if rp:
+                repo_path_val = str(Path(rp).expanduser())
+
+        # 1. Remove worktree (best-effort).
+        if wt_path.exists():
+            if repo_path_val is not None:
+                try:
+                    _remove_worktree(Path(repo_path_val), wt_path)
+                except Exception:  # noqa: BLE001
+                    # Fall back to a plain directory removal so we always
+                    # make progress even when git is unavailable.
+                    try:
+                        shutil.rmtree(wt_path, ignore_errors=True)
+                    except OSError:
+                        pass
+            else:
+                try:
+                    shutil.rmtree(wt_path, ignore_errors=True)
+                except OSError:
+                    pass
+
+        # 2. Mark ``failed`` in the DB if the row is still in a running state.
+        try:
+            conn = get_connection()
+            conn.execute(
+                "UPDATE assignments SET status='failed', finished_at=? "
+                "WHERE assignment_id=? AND status IN ('running', 'pending')",
+                (now, a.assignment_id),
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            pass  # non-fatal — the board update below still releases the claim
+
+        # 3. Update in-memory board so the claim is released immediately
+        #    (without waiting for the next build_board() call).
+        board.mark_failed_by_id(a.assignment_id, finished_at=now)
+        reaped.append(a.assignment_id)
+
+    return reaped
