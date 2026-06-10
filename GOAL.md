@@ -38,6 +38,7 @@ Once the local interactive lifecycle is solid, the direction is **coord-tui as a
 
 - **#486** — remote interactive sessions (revives #446): launch/drive `claude` on a selected remote machine, PTY into the TUI pane.
 - **#487** — resilience: host sessions in tmux named sessions so they **survive a control-center crash and are reattachable** (today's local `pty.fork` dies with the TUI).
+- **#517 + #518** — pipeline supervisor (stage-end triage + bounded autonomy) + control-center decision UX (quadrant tabs, decision cards): the brain auto-advances the clear transitions and **surfaces only the judgment calls with a recommendation**, so one developer triages a decision queue across many sessions instead of babysitting each. Absorbs #476, builds on #477 + the quadraui tab-groups primitive (#144/#349).
 
 Enabled by #478 (result-out) + #480 (worktree isolation). Possibly a multi-tenant service later (monetization TBD). **Not a June-15 blocker** — the local MVP (#467) is the escape hatch; this is the scale-up. See `project_fleet_control_center_vision` in coordinator memory.
 
