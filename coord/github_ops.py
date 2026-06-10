@@ -34,6 +34,46 @@ def get_issue(repo: str, issue_number: int) -> dict:
     return json.loads(raw)
 
 
+def issue_is_closed(repo: str, issue_number: int) -> bool:
+    """True when issue ``issue_number`` is closed on GitHub.
+
+    Best-effort and **fail-open**: any ``gh`` error returns ``False`` so a
+    transient GitHub/CLI failure never silently blocks a legitimate dispatch.
+    """
+    try:
+        return get_issue(repo, issue_number).get("state", "").upper() == "CLOSED"
+    except (RuntimeError, json.JSONDecodeError):
+        return False
+
+
+def pr_is_merged(repo: str, branch: str) -> bool:
+    """True when a PR whose head is ``branch`` has been merged on ``repo``.
+
+    Uses ``gh pr list --head <branch> --state all`` rather than ``pr view`` so
+    the result survives **branch deletion after merge** and the quadraui case
+    where a PR merged into ``develop`` leaves its linked issue OPEN (so
+    :func:`issue_is_closed` would miss it).  Best-effort and **fail-open**:
+    returns ``False`` when there is no PR, the PR is still open, or ``gh``
+    errors — never blocks a legitimate dispatch on a transient failure.
+    """
+    if not branch:
+        return False
+    try:
+        raw = _gh(
+            "pr", "list", "--repo", repo, "--head", branch,
+            "--state", "all", "--json", "number,state,mergedAt", "--limit", "10",
+        )
+    except RuntimeError:
+        return False
+    try:
+        prs = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    return any(
+        p.get("mergedAt") or p.get("state", "").upper() == "MERGED" for p in prs
+    )
+
+
 def post_issue_comment(repo: str, issue_number: int, body: str):
     _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
 

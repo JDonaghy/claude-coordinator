@@ -146,6 +146,17 @@ def _request_changes_findings() -> ReviewFindings:
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_terminal_state(monkeypatch):
+    """#522 terminal-state guard: default ALL work to non-terminal so the
+    existing dispatch tests never shell out to ``gh``.  Tests that exercise
+    the guard re-patch ``coord.github_ops.issue_is_closed`` / ``pr_is_merged``
+    to opt in.  ``_work_is_terminal`` itself stays real.
+    """
+    monkeypatch.setattr("coord.github_ops.issue_is_closed", lambda *a, **k: False)
+    monkeypatch.setattr("coord.github_ops.pr_is_merged", lambda *a, **k: False)
+
+
 # ── Unit tests: process_review_completion ───────────────────────────────────
 
 
@@ -377,6 +388,147 @@ class TestProcessReviewCompletion:
 
 
 # ── Unit tests: _build_fix_briefing ─────────────────────────────────────────
+
+
+class TestTerminalGuard522:
+    """#522: never dispatch a fix / re-review for work whose issue is already
+    closed or whose PR is already merged — root cause of the 2026-06-09 launch
+    flood (#349 ×4, #194).  The guard is fail-open, so these tests opt in by
+    patching the github_ops helpers (stubbed non-terminal by default)."""
+
+    def _request_changes_log(self, tmp_path):
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\nMissing tests.\nEND_REVIEW\n"
+        )
+        return log_file
+
+    def test_skips_fix_when_issue_closed(
+        self, config: Config, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("coord.github_ops.issue_is_closed", lambda *a, **k: True)
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        actions = process_review_completion(
+            review, board, config,
+            log_path=str(self._request_changes_log(tmp_path)),
+            http_client=mock_http,
+        )
+
+        assert [a.kind for a in actions] == ["terminal_skip"]
+        assert board.active == []                  # nothing dispatched
+        mock_http.post.assert_not_called()         # no agent /assign POST
+        assert work.review_state == "done"         # review marked resolved
+
+    def test_skips_fix_when_pr_merged_even_if_issue_open(
+        self, config: Config, tmp_path, monkeypatch
+    ) -> None:
+        # issue stays OPEN (default stub); only the PR is merged — the quadraui
+        # develop-merge case where merging does NOT auto-close the issue.
+        monkeypatch.setattr("coord.github_ops.pr_is_merged", lambda *a, **k: True)
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        actions = process_review_completion(
+            review, board, config,
+            log_path=str(self._request_changes_log(tmp_path)),
+            http_client=mock_http,
+        )
+
+        assert [a.kind for a in actions] == ["terminal_skip"]
+        assert board.active == []
+        mock_http.post.assert_not_called()
+
+    def test_dispatches_fix_when_not_terminal(
+        self, config: Config, tmp_path
+    ) -> None:
+        # Default stub → non-terminal → the normal fix dispatch still fires.
+        # Regression guard: the #522 check must not block legitimate fixes.
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-001"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(self._request_changes_log(tmp_path)),
+                http_client=mock_http,
+            )
+
+        assert any(a.kind == "fix_dispatched" for a in actions)
+        assert len(board.active) == 1
+        mock_http.post.assert_called_once()
+
+    def test_fix_completion_skips_rereview_when_terminal(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import load_board, save_board
+
+        monkeypatch.setattr("coord.github_ops.pr_is_merged", lambda *a, **k: True)
+
+        fix = _work_assignment(assignment_id="fix-1", review_iteration=1)
+        fix.issue_title = "[fix-1] Fix the thing"
+        fix.review_of_assignment_id = "work-abc"
+        fix.review_state = "pending"
+        save_board(Board(completed=[fix]))
+
+        dispatched: dict = {}
+
+        def fake_dispatch_review(*a, **k):
+            dispatched["called"] = True
+            return None
+
+        monkeypatch.setattr("coord.auto_loop.dispatch_review", fake_dispatch_review)
+
+        actions = run_for_fix_transition("fix-1", config)
+
+        assert [a.kind for a in actions] == ["terminal_skip"]
+        assert "called" not in dispatched          # dispatch_review never called
+        loaded = load_board()
+        assert loaded is not None
+        reloaded = loaded.find_by_id("fix-1")
+        assert reloaded is not None
+        assert reloaded.review_state == "done"     # persisted to the board
+
+    def test_terminal_cache_collapses_repeat_gh_calls(
+        self, config: Config, tmp_path
+    ) -> None:
+        # The #349 ×4 case: a shared cache means the same merged issue costs
+        # ONE issue_is_closed call across many transitions, not one per call.
+        calls = {"n": 0}
+
+        def counting_closed(*a, **k):
+            calls["n"] += 1
+            return True
+
+        import coord.github_ops as go
+        original = go.issue_is_closed
+        go.issue_is_closed = counting_closed  # patched past the autouse stub
+        try:
+            cache: dict = {}
+            for _ in range(4):
+                review = _review_assignment()
+                work = _work_assignment(review_iteration=0)
+                board = _board_with(work, review)
+                process_review_completion(
+                    review, board, config,
+                    log_path=str(self._request_changes_log(tmp_path)),
+                    http_client=MagicMock(),
+                    terminal_cache=cache,
+                )
+        finally:
+            go.issue_is_closed = original
+
+        assert calls["n"] == 1, "shared cache must collapse repeat gh lookups"
 
 
 class TestBuildFixBriefing:

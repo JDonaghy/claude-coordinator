@@ -71,9 +71,65 @@ class LoopAction:
     - ``"review_dispatched"``  — a re-review was dispatched after a fix worker completed
     - ``"iteration_cap_hit"``  — fix.review_iteration >= max_review_iterations;
                                  not dispatching another review
+    - ``"terminal_skip"``      — the work's issue is already closed or its PR is
+                                 already merged; no fix/review dispatched (#522)
     """
     assignment_id: str | None
     detail: str = ""
+
+
+# ── Terminal-state guard (#522) ───────────────────────────────────────────────
+
+def _work_is_terminal(
+    work: Assignment,
+    config: Config,
+    *,
+    cache: dict | None = None,
+) -> bool:
+    """True when *work* is already done on GitHub and must not be re-dispatched.
+
+    Terminal means the work's **issue is closed** OR its **PR is merged**.
+    This is the root-cause guard for the 2026-06-09 launch flood (#522): the
+    auto-loop would otherwise re-dispatch fix/review workers for already-merged
+    issues (#349 ×4, #194) because nothing in the dispatch path consulted
+    GitHub state.
+
+    **Fail-open:** any ``gh`` error resolves to ``False`` so a transient
+    GitHub/CLI failure never blocks a legitimate dispatch.
+
+    *cache* — optional ``dict`` shared across a single ``notify`` run, keyed by
+    ``(repo_github, issue_number, branch)``, so a burst of transitions for the
+    same merged issue costs **one** ``gh`` round-trip, not one per transition.
+    """
+    repo = config.repo(work.repo_name)
+    if repo is None or not repo.github:
+        return False
+
+    key = (repo.github, work.issue_number, work.branch)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    from coord import github_ops  # noqa: PLC0415
+
+    terminal = False
+    try:
+        if work.issue_number and github_ops.issue_is_closed(
+            repo.github, work.issue_number
+        ):
+            terminal = True
+        elif work.branch and github_ops.pr_is_merged(repo.github, work.branch):
+            terminal = True
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        log.warning(
+            "auto_loop: terminal-state check errored for %s (issue #%s) — "
+            "treating as non-terminal: %s",
+            work.assignment_id, work.issue_number, exc,
+        )
+        terminal = False
+
+    if cache is not None:
+        cache[key] = terminal
+    return terminal
 
 
 # ── Core logic ────────────────────────────────────────────────────────────────
@@ -138,6 +194,7 @@ def process_review_completion(
     log_path: str | None = None,
     machine_host: str | None = None,
     http_client: httpx.Client | None = None,
+    terminal_cache: dict | None = None,
 ) -> list[LoopAction]:
     """Process a completed review assignment through the auto-loop.
 
@@ -208,7 +265,8 @@ def process_review_completion(
 
     # verdict == "request-changes" → try to dispatch a fix worker.
     return _dispatch_fix_for_review(
-        review, findings, board, config, http_client=http_client
+        review, findings, board, config,
+        http_client=http_client, terminal_cache=terminal_cache,
     )
 
 
@@ -247,6 +305,7 @@ def _dispatch_fix_for_review(
     config: Config,
     *,
     http_client: httpx.Client | None = None,
+    terminal_cache: dict | None = None,
 ) -> list[LoopAction]:
     """Find the reviewed work assignment and dispatch a fix worker for it."""
     # Locate the work assignment that was reviewed.
@@ -266,6 +325,27 @@ def _dispatch_fix_for_review(
             assignment_id=review.assignment_id,
             detail=(
                 f"work assignment {review.review_of_assignment_id!r} not on board"
+            ),
+        )]
+
+    # #522: never dispatch a fix for work that is already done on GitHub.
+    # A merged PR / closed issue must not re-enter the review→fix loop — this
+    # is the root cause of the 2026-06-09 launch flood (#349 ×4, #194).
+    if _work_is_terminal(work, config, cache=terminal_cache):
+        log.info(
+            "auto_loop: NOT dispatching fix for %s — issue #%s is terminal "
+            "(merged/closed)",
+            work.assignment_id, work.issue_number,
+        )
+        # The review of merged work is moot; mark it resolved so the board /
+        # merge gate stop treating it as needing another round.
+        work.review_state = "done"
+        return [LoopAction(
+            kind="terminal_skip",
+            assignment_id=review.assignment_id,
+            detail=(
+                f"issue #{work.issue_number} already merged/closed — "
+                "no fix dispatched"
             ),
         )]
 
@@ -532,6 +612,8 @@ def _post_max_iterations_notice(work: Assignment, config: Config) -> None:
 def run_for_fix_transition(
     assignment_id: str,
     config: Config,
+    *,
+    terminal_cache: dict | None = None,
 ) -> list[LoopAction]:
     """Entry point called from ``notify.run()`` for each completed fix worker.
 
@@ -577,6 +659,26 @@ def run_for_fix_transition(
             assignment_id,
         )
         return []
+
+    # #522: a fix worker that finished against already-merged/closed work must
+    # not trigger another review. Guards the second flood vector (re-review
+    # dispatch) the same way the fix-dispatch path is guarded above.
+    if _work_is_terminal(fix, config, cache=terminal_cache):
+        log.info(
+            "auto_loop: NOT dispatching re-review for %s — issue #%s is "
+            "terminal (merged/closed)",
+            assignment_id, fix.issue_number,
+        )
+        fix.review_state = "done"
+        save_board(board)
+        return [LoopAction(
+            kind="terminal_skip",
+            assignment_id=assignment_id,
+            detail=(
+                f"issue #{fix.issue_number} already merged/closed — "
+                "no re-review dispatched"
+            ),
+        )]
 
     max_iter = config.pipeline.max_review_iterations
     if fix.review_iteration >= max_iter:
@@ -635,6 +737,8 @@ def run_for_review_transition(
     record: dict,
     entry: dict,
     config: Config,
+    *,
+    terminal_cache: dict | None = None,
 ) -> list[LoopAction]:
     """Entry point called from ``notify.run()`` for each completed review.
 
@@ -690,11 +794,13 @@ def run_for_review_transition(
         config,
         log_path=log_path,
         machine_host=machine_host,
+        terminal_cache=terminal_cache,
     )
 
-    # Save when a fix was dispatched (new assignment) OR an approve was parsed
-    # (so review_verdict is persisted for the merge gate, #253).
-    if any(a.kind in ("fix_dispatched", "approved") for a in actions):
+    # Save when a fix was dispatched (new assignment), an approve was parsed
+    # (so review_verdict is persisted for the merge gate, #253), or the work
+    # was found terminal (so review_state="done" persists — #522).
+    if any(a.kind in ("fix_dispatched", "approved", "terminal_skip") for a in actions):
         save_board(board)
 
     return actions
