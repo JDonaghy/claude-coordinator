@@ -477,7 +477,8 @@ class TestRemoteDryRun:
         self, remote_config_file: Path, coord_dir: Path
     ) -> None:
         with patch("coord.github_ops.get_issue",
-                   return_value={"title": "Add feature X"}):
+                   return_value={"title": "Add feature X"}), \
+             patch("coord.claim.find_work_claim", return_value=None):
             result = CliRunner().invoke(
                 main,
                 [
@@ -495,7 +496,8 @@ class TestRemoteDryRun:
         self, remote_config_file: Path, coord_dir: Path
     ) -> None:
         with patch("coord.github_ops.get_issue",
-                   return_value={"title": "Add feature X"}):
+                   return_value={"title": "Add feature X"}), \
+             patch("coord.claim.find_work_claim", return_value=None):
             result = CliRunner().invoke(
                 main,
                 [
