@@ -1184,6 +1184,53 @@ class TestCoordBounceCommand:
         assert result.exit_code != 0
         assert "not found" in result.output
 
+    def test_bounce_exits_cleanly_for_terminal_work(
+        self, config_path, monkeypatch
+    ) -> None:
+        """#522: `coord bounce` on a request-changes review whose work is
+        already merged/closed must skip the fix, exit **0** (not 1), and
+        persist review_state="done". Regression for the gap the adversarial
+        review of PR #523 caught."""
+        from click.testing import CliRunner
+        from coord.cli import main as cli_main
+        from coord.models import Assignment, Board
+        from coord.review import ReviewFindings
+        from coord.state import load_board, save_board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="t", briefing="b",
+            assignment_id="work-term", status="done",
+            type="work", branch="issue-42-t",
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="t", briefing="",
+            assignment_id="review-term", status="done",
+            type="review", review_of_assignment_id="work-term",
+            review_verdict="request-changes",
+        )
+        save_board(Board(completed=[work, review]))
+
+        # Findings say request-changes, but the work is already terminal.
+        monkeypatch.setattr(
+            "coord.auto_loop.parse_review_from_agent",
+            lambda *a, **kw: ReviewFindings(verdict="request-changes", body="x"),
+        )
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+        # A fix must NOT be dispatched for terminal work.
+        def _no_fix(*a, **k):
+            raise AssertionError("must not dispatch a fix for terminal work")
+        monkeypatch.setattr("coord.auto_loop._dispatch_fix", _no_fix)
+
+        result = CliRunner().invoke(cli_main, [
+            "bounce", "review-term", "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "terminal_skip" in result.output
+        reloaded = load_board().find_by_id("work-term")
+        assert reloaded is not None and reloaded.review_state == "done"
+
 
 class TestReviewFindingsDbCache:
     """The DB cache layer for review findings.  notify populates it on
