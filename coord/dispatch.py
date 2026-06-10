@@ -331,6 +331,7 @@ def post_advisory(
     duration_seconds: float | None = None,
     log_path: str | None = None,
     reason: str = "",
+    assignment_type: str = "work",
 ) -> None:
     body = format_advisory(
         assignment_id=assignment_id,
@@ -340,5 +341,6 @@ def post_advisory(
         duration_seconds=duration_seconds,
         log_path=log_path,
         reason=reason,
+        assignment_type=assignment_type,
     )
     github_ops.post_issue_comment(repo_github, issue_number, body)

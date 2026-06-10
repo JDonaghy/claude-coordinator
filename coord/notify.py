@@ -710,12 +710,39 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             transition.event,
             branch=entry.get("branch"),
         )
+    elif transition.event == EVENT_ADVISORY and assignment_type == "conflict-fix":
+        # #448 fix-iter-2: a 0-commit conflict-fix means the automated rebase
+        # could not resolve the conflict. Post the advisory comment AND notify
+        # the merge queue (parent merge → HUMAN_REQUIRED) so `coord merge`
+        # doesn't retry the same failing merge. Mirrors the EVENT_COMPLETION /
+        # conflict-fix branch (line 688) — whichever runs first (reconcile or
+        # notify) wins.
+        post_advisory(
+            reason=entry.get("zero_commit_reason") or "",
+            assignment_type=assignment_type,
+            **common,
+        )
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+        parent_id = record.get("review_of_assignment_id")
+        if parent_id:
+            from coord.reconcile import on_conflict_fix_done  # noqa: PLC0415
+            on_conflict_fix_done(
+                parent_assignment_id=parent_id,
+                fix_assignment_id=transition.assignment_id,
+                machine_name=transition.machine_name,
+                succeeded=False,
+            )
     elif transition.event == EVENT_ADVISORY:
         # #448: 0-commit clean exit — post a distinctive advisory comment.
         # No ❌ emoji, no re-dispatch suggestion; just surfaces the advisory
         # state on GitHub so operators not watching coord status are informed.
         post_advisory(
             reason=entry.get("zero_commit_reason") or "",
+            assignment_type=assignment_type,
             **common,
         )
         mark_notified(

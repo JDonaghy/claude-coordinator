@@ -340,3 +340,167 @@ def test_cli_status_reconcile_advisory_sets_status_and_review_state(
         f"{done.review_state!r}); leaving it as None lets the notify "
         "review-dispatch loop fire a spurious review for a 0-commit branch"
     )
+
+
+# ── #448 fix iter 2: conflict-fix advisory must flip merge entry to HUMAN_REQUIRED ──
+
+
+def _enqueue_pending_merge(parent_id: str = "parent-merge") -> None:
+    """Drop a PENDING merge queue entry pointing at *parent_id* into the DB.
+
+    The conflict-fix worker's ``review_of_assignment_id`` references this
+    entry; ``_on_conflict_fix_done`` looks it up by that id to flip its
+    state to HUMAN_REQUIRED.
+    """
+    from coord import merge_queue as mq
+    mq.save_queue([
+        mq.QueuedMerge(
+            assignment_id=parent_id,
+            repo_name="api",
+            repo_github="acme/api",
+            branch="issue-42-fix",
+            target_branch="main",
+            issue_number=42,
+            issue_title="t",
+            state=mq.CONFLICT,
+            error="Merge conflict in foo.py",
+        )
+    ])
+
+
+def test_advisory_conflict_fix_marks_merge_entry_human_required(
+    config: Config,
+) -> None:
+    """A conflict-fix worker that finishes with 0 commits did not resolve
+    anything — the parent merge queue entry must be flipped to
+    HUMAN_REQUIRED so the next ``coord merge`` does not silently retry the
+    same broken rebase forever.
+
+    Regression for the elif branch in reconcile.py:
+        elif done.type == "conflict-fix":
+            _on_conflict_fix_done(done, succeeded=False)
+    """
+    from coord import merge_queue as mq
+
+    _enqueue_pending_merge(parent_id="parent-merge")
+
+    fix_assignment = Assignment(
+        machine_name="laptop", repo_name="api",
+        issue_number=42, issue_title="t",
+        status="running", assignment_id="cf-1",
+        type="conflict-fix",
+        review_of_assignment_id="parent-merge",
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[],
+        active=[fix_assignment],
+    )
+    fake_status = {
+        "active": [],
+        "completed": [{"id": "cf-1", "status": "advisory", "finished_at": 1.0}],
+    }
+
+    # Patch the GitHub post so the test doesn't try to reach the network when
+    # the failure path emits the HUMAN_REQUIRED comment.
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.github_ops.post_issue_comment"):
+        reconcile(board, config)
+
+    # The fix assignment itself is moved to completed with status="advisory".
+    assert board.completed[0].status == "advisory"
+
+    # The parent merge queue entry must be flipped to HUMAN_REQUIRED so the
+    # next `coord merge` does not retry the same broken rebase.
+    entries = mq.load_queue()
+    assert len(entries) == 1
+    assert entries[0].state == mq.HUMAN_REQUIRED, (
+        f"expected HUMAN_REQUIRED, got {entries[0].state!r} — "
+        "reconcile() advisory branch must call _on_conflict_fix_done(succeeded=False) "
+        "for conflict-fix workers that pushed 0 commits"
+    )
+    assert "Manual rebase required" in (entries[0].error or "")
+
+
+def test_cli_status_reconcile_advisory_conflict_fix_marks_human_required(
+    tmp_path, coord_db
+) -> None:
+    """Regression for fix-iter-2 of #448: the inline reconcile inside
+    ``coord status`` must also call ``_on_conflict_fix_done(succeeded=False)``
+    when an advisory conflict-fix entry is observed.
+
+    Without this fix, ``coord status`` is the first command to reconcile a
+    conflict-fix worker's advisory exit, the parent merge queue entry stays
+    PENDING, and the next ``coord merge`` re-tries the same broken rebase
+    forever. The full ``reconcile()`` path eventually catches it, but the
+    window of inconsistency is the gap the reviewer flagged in iter-2.
+    """
+    from click.testing import CliRunner
+
+    from coord import merge_queue as mq
+    from coord import state as state_mod
+    from coord.cli import main
+
+    config_file = tmp_path / "coordinator.yml"
+    config_file.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+    )
+
+    # Pre-seed the merge queue with a parent entry the conflict-fix worker
+    # references via review_of_assignment_id.
+    _enqueue_pending_merge(parent_id="parent-merge")
+
+    active = Assignment(
+        machine_name="laptop", repo_name="api",
+        issue_number=42, issue_title="Fix conflict",
+        status="running", assignment_id="cf-cli-1",
+        type="conflict-fix",
+        review_of_assignment_id="parent-merge",
+    )
+    state_mod.save_board(Board(active=[active]))
+
+    from coord.network import MachineStatus, StatusResult, ONLINE
+
+    status_data = {
+        "active": [],
+        "completed": [{
+            "id": "cf-cli-1",
+            "status": "advisory",
+            "finished_at": 100.0,
+            "branch": "issue-42-fix",
+            "zero_commit_reason": "worker exited cleanly but pushed 0 commits",
+            "spec": {
+                "type": "conflict-fix",
+                "issue_number": 42,
+                "issue_title": "Fix conflict",
+                "repo_name": "api",
+            },
+        }],
+        "version": "0.0.0",
+    }
+
+    fake_machine_status = MachineStatus(
+        machine=Machine(name="laptop", host="laptop.tail", repos=["api"]),
+        state=ONLINE,
+        latency_ms=1.0,
+    )
+
+    with patch("coord.network.check_all", return_value=[fake_machine_status]), \
+         patch("coord.network.fetch_status", return_value=StatusResult(data=status_data)), \
+         patch("coord.github_ops.post_issue_comment"):
+        result = CliRunner().invoke(
+            main, ["status", "--config", str(config_file), "--timeout", "0.1"],
+        )
+
+    assert result.exit_code == 0, result.output
+
+    # The parent merge queue entry must be HUMAN_REQUIRED after cli.py's
+    # inline reconcile observes the advisory conflict-fix exit.
+    entries = mq.load_queue()
+    assert len(entries) == 1
+    assert entries[0].state == mq.HUMAN_REQUIRED, (
+        f"expected HUMAN_REQUIRED, got {entries[0].state!r} — "
+        "cli.py's inline reconcile must mirror reconcile.py's advisory "
+        "branch for type='conflict-fix' workers"
+    )

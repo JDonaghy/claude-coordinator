@@ -224,12 +224,18 @@ def format_advisory(
     duration_seconds: float | None = None,
     log_path: str | None = None,
     reason: str = "",
+    assignment_type: str = "work",
 ) -> str:
     """Format an advisory comment for a 0-commit clean exit.
 
     Distinct from both completion (no code was produced) and failure (the
     worker exited cleanly — exit_code 0 — so no error occurred).  Human
     review is needed to decide next steps.
+
+    The default-case explanation assumes a ``work`` task ("already implemented
+    or no change was needed").  For ``conflict-fix`` and other assignment
+    types, the message is rewritten to match what 0 commits actually means
+    for that flow (the rebase did not resolve anything).
     """
     marker = _marker(
         EVENT_ADVISORY,
@@ -248,11 +254,22 @@ def format_advisory(
     if log_path:
         lines.append(f"**Log:** `{log_path}`")
     lines.append("")
-    lines.append(
-        "The worker exited cleanly (exit code 0) but pushed **no commits**. "
-        "This typically means the feature was already implemented or no change "
-        "was needed. Human review is required to decide the next step."
-    )
+    # #448 fix-iter-2: the default explanation only fits work tasks.  Pick a
+    # message that matches the assignment type so a conflict-fix advisory
+    # isn't mis-described as "feature already implemented".
+    if assignment_type == "conflict-fix":
+        lines.append(
+            "The conflict-fix worker exited cleanly (exit code 0) but pushed "
+            "**no commits**. The automated rebase did not resolve the conflict, "
+            "so the parent merge has been flagged as requiring manual "
+            "resolution. Human review is required to rebase the branch by hand."
+        )
+    else:
+        lines.append(
+            "The worker exited cleanly (exit code 0) but pushed **no commits**. "
+            "This typically means the feature was already implemented or no "
+            "change was needed. Human review is required to decide the next step."
+        )
     if reason.strip():
         lines.append("")
         lines.append("### Worker note")

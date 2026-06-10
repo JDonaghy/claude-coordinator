@@ -249,6 +249,139 @@ class TestAdvisoryNotify:
         assert reason in body, "zero_commit_reason must appear in advisory comment"
 
 
+# ── #448 fix-iter-2: conflict-fix advisory must also notify the merge queue ──
+
+
+class TestConflictFixAdvisoryNotify:
+    """A conflict-fix worker that finishes with 0 commits must trigger
+    ``on_conflict_fix_done(succeeded=False)`` from notify, mirroring the
+    EVENT_COMPLETION conflict-fix branch.  Without this, ``coord notify``
+    posts the advisory comment but the parent merge queue entry is left
+    in its prior (PENDING/CONFLICT) state forever.
+    """
+
+    def _record_conflict_fix(self, assignment_id: str, parent_id: str) -> None:
+        """Record a conflict-fix assignment directly in the DB (Proposal has no
+        review_of_assignment_id field, so go through record_dispatched_assignment).
+        """
+        from coord.models import Assignment as _Assignment
+
+        a = _Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="conflict fix",
+            status="running",
+            assignment_id=assignment_id,
+            type="conflict-fix",
+            review_of_assignment_id=parent_id,
+        )
+        state_mod.record_dispatched_assignment(
+            assignment=a, repo_github="acme/api",
+        )
+
+    def test_conflict_fix_advisory_posts_comment_and_flips_merge_entry(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        from coord import merge_queue as mq
+
+        # Seed parent merge queue entry.
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="parent-mq",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-42-fix",
+                target_branch="main",
+                issue_number=42,
+                issue_title="t",
+                state=mq.CONFLICT,
+                error="Merge conflict in foo.py",
+            )
+        ])
+
+        self._record_conflict_fix("cf-adv-1", parent_id="parent-mq")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("cf-adv-1", "advisory")],
+        }
+        # `coord.dispatch.github_ops.post_issue_comment` and
+        # `coord.github_ops.post_issue_comment` resolve to the SAME attribute,
+        # so a single patch captures both the advisory post (from notify) and
+        # the HUMAN_REQUIRED post (from reconcile.on_conflict_fix_done).
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.github_ops.post_issue_comment") as mock_post:
+            posted, _ = notify_mod.run(config)
+        assert len(posted) == 1
+        # The advisory comment must be in the posted comments (the merge-queue
+        # HUMAN_REQUIRED branch may emit a second comment via reconcile; the
+        # advisory is the one posted from notify.post_transition).
+        bodies = [c.args[2] for c in mock_post.call_args_list]
+        advisory_bodies = [b for b in bodies if "Advisory" in b]
+        assert advisory_bodies, (
+            f"advisory comment missing from posts: {bodies!r}"
+        )
+        body = advisory_bodies[0]
+        assert "conflict-fix" in body.lower() or "rebase" in body.lower(), (
+            "conflict-fix advisory body must explain the rebase didn't resolve"
+        )
+        # Parent merge queue entry is flipped to HUMAN_REQUIRED.
+        entries = mq.load_queue()
+        assert len(entries) == 1
+        assert entries[0].state == mq.HUMAN_REQUIRED, (
+            f"notify must call on_conflict_fix_done(succeeded=False); "
+            f"got {entries[0].state!r}"
+        )
+
+    def test_work_advisory_does_not_touch_merge_queue(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        """The conflict-fix branch must NOT fire for a regular work advisory."""
+        from coord import merge_queue as mq
+
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="parent-mq",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-42-fix",
+                target_branch="main",
+                issue_number=42,
+                issue_title="t",
+                state=mq.PENDING,
+                error=None,
+            )
+        ])
+        _record("work-adv-1")  # type="work"
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("work-adv-1", "advisory")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        # Merge queue entry is untouched.
+        entries = mq.load_queue()
+        assert entries[0].state == mq.PENDING
+
+    def test_work_advisory_uses_work_wording(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        """A regular work advisory still uses the 'already implemented' wording."""
+        _record("work-adv-2")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("work-adv-2", "advisory")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "already implemented" in body or "no change was needed" in body, (
+            "work advisory must keep the original wording"
+        )
+
+
 class TestBranchCapture:
     def test_branch_stored_in_notified_ledger(self, coord_dir: Path, config: Config) -> None:
         _record("abc")

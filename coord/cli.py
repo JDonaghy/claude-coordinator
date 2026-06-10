@@ -1355,6 +1355,16 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     done.status = "advisory"
                     if done.type == "work":
                         done.review_state = "advisory"
+                    elif done.type == "conflict-fix":
+                        # #448 fix-iter-2: a conflict-fix worker that
+                        # exits with 0 commits did not resolve anything,
+                        # so the parent merge queue entry must be flipped
+                        # to HUMAN_REQUIRED — otherwise it sits PENDING
+                        # and the next `coord merge` re-tries the same
+                        # broken rebase forever.  Mirror reconcile.py's
+                        # advisory branch (lines 253–255).
+                        from coord.reconcile import _on_conflict_fix_done
+                        _on_conflict_fix_done(done, succeeded=False)
             else:
                 board.mark_failed_by_id(
                     a.assignment_id,

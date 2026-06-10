@@ -417,6 +417,17 @@ function connectSSE() {
     loadBoard();
   });
 
+  // #448 fix-iter-2: advisory assignments (0-commit clean exit) need a
+  // distinct toast — not green ✓ DONE (no commits pushed) and not red ✗
+  // FAILED (the worker exited cleanly). 'stuck' style is reused to draw
+  // attention without claiming a hard failure.
+  _sse.addEventListener('assignment_advisory', e => {
+    const d = JSON.parse(e.data || '{}');
+    const reason = d.zero_commit_reason ? `: ${d.zero_commit_reason}` : '';
+    showToast(`⚠ #${d.issue_number} ${d.repo_name} on ${d.machine_name}: ADVISORY (0 commits)${reason}`, 'stuck');
+    loadBoard();
+  });
+
   _sse.addEventListener('board_updated', e => {
     const d = JSON.parse(e.data || '{}');
     if (Array.isArray(d.possibly_stuck)) updatePossiblyStuck(d.possibly_stuck);
