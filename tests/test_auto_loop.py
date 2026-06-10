@@ -146,6 +146,11 @@ def _request_changes_findings() -> ReviewFindings:
     )
 
 
+# Default non-terminal stub for the #522 guard is provided by the autouse
+# `_non_terminal_work` fixture in conftest.py — tests below opt into terminal
+# behaviour by patching `coord.github_ops.work_is_terminal`.
+
+
 # ── Unit tests: process_review_completion ───────────────────────────────────
 
 
@@ -377,6 +382,122 @@ class TestProcessReviewCompletion:
 
 
 # ── Unit tests: _build_fix_briefing ─────────────────────────────────────────
+
+
+class TestTerminalGuard522:
+    """#522: never dispatch a fix / re-review for work whose issue is already
+    closed or whose PR is already merged — root cause of the 2026-06-09 launch
+    flood (#349 ×4, #194).  The guard is fail-open, so these tests opt in by
+    patching the github_ops helpers (stubbed non-terminal by default)."""
+
+    def _request_changes_log(self, tmp_path):
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\nMissing tests.\nEND_REVIEW\n"
+        )
+        return log_file
+
+    def test_skips_fix_when_issue_closed(
+        self, config: Config, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        actions = process_review_completion(
+            review, board, config,
+            log_path=str(self._request_changes_log(tmp_path)),
+            http_client=mock_http,
+        )
+
+        assert [a.kind for a in actions] == ["terminal_skip"]
+        assert board.active == []                  # nothing dispatched
+        mock_http.post.assert_not_called()         # no agent /assign POST
+        assert work.review_state == "done"         # review marked resolved
+
+    def test_skips_fix_when_pr_merged_even_if_issue_open(
+        self, config: Config, tmp_path, monkeypatch
+    ) -> None:
+        # issue stays OPEN (default stub); only the PR is merged — the quadraui
+        # develop-merge case where merging does NOT auto-close the issue.
+        # (work_is_terminal collapses both signals; the github_ops unit tests
+        # cover the issue-open/PR-merged split directly.)
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        actions = process_review_completion(
+            review, board, config,
+            log_path=str(self._request_changes_log(tmp_path)),
+            http_client=mock_http,
+        )
+
+        assert [a.kind for a in actions] == ["terminal_skip"]
+        assert board.active == []
+        mock_http.post.assert_not_called()
+
+    def test_dispatches_fix_when_not_terminal(
+        self, config: Config, tmp_path
+    ) -> None:
+        # Default stub → non-terminal → the normal fix dispatch still fires.
+        # Regression guard: the #522 check must not block legitimate fixes.
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-001"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(self._request_changes_log(tmp_path)),
+                http_client=mock_http,
+            )
+
+        assert any(a.kind == "fix_dispatched" for a in actions)
+        assert len(board.active) == 1
+        mock_http.post.assert_called_once()
+
+    def test_fix_completion_skips_rereview_when_terminal(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import load_board, save_board
+
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+
+        fix = _work_assignment(assignment_id="fix-1", review_iteration=1)
+        fix.issue_title = "[fix-1] Fix the thing"
+        fix.review_of_assignment_id = "work-abc"
+        fix.review_state = "pending"
+        save_board(Board(completed=[fix]))
+
+        dispatched: dict = {}
+
+        def fake_dispatch_review(*a, **k):
+            dispatched["called"] = True
+            return None
+
+        monkeypatch.setattr("coord.auto_loop.dispatch_review", fake_dispatch_review)
+
+        actions = run_for_fix_transition("fix-1", config)
+
+        assert [a.kind for a in actions] == ["terminal_skip"]
+        assert "called" not in dispatched          # dispatch_review never called
+        loaded = load_board()
+        assert loaded is not None
+        reloaded = loaded.find_by_id("fix-1")
+        assert reloaded is not None
+        assert reloaded.review_state == "done"     # persisted to the board
+
+    # The #349-×4 cache-collapse behaviour now lives in
+    # coord.github_ops.work_is_terminal and is covered by
+    # tests/test_github_ops.py::TestWorkIsTerminal::test_cache_collapses_repeat_calls.
 
 
 class TestBuildFixBriefing:
@@ -1062,6 +1183,53 @@ class TestCoordBounceCommand:
         ])
         assert result.exit_code != 0
         assert "not found" in result.output
+
+    def test_bounce_exits_cleanly_for_terminal_work(
+        self, config_path, monkeypatch
+    ) -> None:
+        """#522: `coord bounce` on a request-changes review whose work is
+        already merged/closed must skip the fix, exit **0** (not 1), and
+        persist review_state="done". Regression for the gap the adversarial
+        review of PR #523 caught."""
+        from click.testing import CliRunner
+        from coord.cli import main as cli_main
+        from coord.models import Assignment, Board
+        from coord.review import ReviewFindings
+        from coord.state import load_board, save_board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="t", briefing="b",
+            assignment_id="work-term", status="done",
+            type="work", branch="issue-42-t",
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="t", briefing="",
+            assignment_id="review-term", status="done",
+            type="review", review_of_assignment_id="work-term",
+            review_verdict="request-changes",
+        )
+        save_board(Board(completed=[work, review]))
+
+        # Findings say request-changes, but the work is already terminal.
+        monkeypatch.setattr(
+            "coord.auto_loop.parse_review_from_agent",
+            lambda *a, **kw: ReviewFindings(verdict="request-changes", body="x"),
+        )
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+        # A fix must NOT be dispatched for terminal work.
+        def _no_fix(*a, **k):
+            raise AssertionError("must not dispatch a fix for terminal work")
+        monkeypatch.setattr("coord.auto_loop._dispatch_fix", _no_fix)
+
+        result = CliRunner().invoke(cli_main, [
+            "bounce", "review-term", "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "terminal_skip" in result.output
+        reloaded = load_board().find_by_id("work-term")
+        assert reloaded is not None and reloaded.review_state == "done"
 
 
 class TestReviewFindingsDbCache:

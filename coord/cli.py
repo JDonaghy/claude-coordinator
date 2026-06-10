@@ -3483,15 +3483,20 @@ def bounce(review_assignment_id: str, config_path: Path) -> None:
     )
 
     dispatched = any(a.kind == "fix_dispatched" for a in actions)
-    if dispatched:
+    # #522: terminal_skip mutates work.review_state="done" in
+    # process_review_completion — persist it (same as the notify path) so the
+    # row doesn't get re-evaluated, and treat it as a clean (not failed) exit.
+    terminal = any(a.kind == "terminal_skip" for a in actions)
+    if dispatched or terminal:
         save_board(board)
 
     for a in actions:
         click.echo(f"{a.kind}: {a.detail}")
 
     if not dispatched:
-        # Distinguish "approve" (clean exit) from genuine failure modes.
-        if any(a.kind == "approved" for a in actions):
+        # Distinguish clean outcomes (approve / already-merged-or-closed) from
+        # genuine failure modes.
+        if any(a.kind in ("approved", "terminal_skip") for a in actions):
             sys.exit(0)
         sys.exit(1)
 

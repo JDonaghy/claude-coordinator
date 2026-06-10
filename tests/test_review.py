@@ -369,6 +369,51 @@ def test_dispatch_review_skipped_for_review_type(two_machine_config: Config) -> 
     assert result is None
 
 
+def test_dispatch_review_skipped_when_work_terminal(
+    two_machine_config: Config, monkeypatch
+) -> None:
+    """#522 chokepoint: a completed work whose issue is closed / PR merged must
+    not be reviewed — the second flood vector (reviews of already-merged
+    #349/#194). Short-circuits before opening a PR and marks the row done."""
+    monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+    completed = _completed_assignment()
+    board = Board()
+    pr_calls = {"n": 0}
+
+    def _pr_lookup(repo_github, **kw):
+        pr_calls["n"] += 1
+        return {"number": 1, "url": "u", "existed": True}
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "x"}),
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+    )
+    assert result is None
+    assert board.active == []
+    assert pr_calls["n"] == 0, "must short-circuit before opening a PR"
+    assert completed.review_state == "done"
+
+
+def test_dispatch_pending_reviews_skips_terminal_rows(
+    two_machine_config: Config, monkeypatch
+) -> None:
+    """#522: the bulk pending-review loop never dispatches a review for an
+    already-merged row — it marks it done so it drops out of `eligible`."""
+    from coord.review import dispatch_pending_reviews
+
+    monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+    completed = replace(_completed_assignment(), review_state="pending")
+    board = Board(completed=[completed])
+
+    dispatched = dispatch_pending_reviews(board, two_machine_config)
+
+    assert dispatched == []
+    assert completed.review_state == "done"
+
+
 def test_dispatch_review_sends_to_different_machine_and_appends_to_board(
     two_machine_config: Config,
 ) -> None:

@@ -596,6 +596,7 @@ def dispatch_review(
     claude_md_reader=_read_repo_claude_md,
     issue_body_fetcher=None,
     now: float | None = None,
+    terminal_cache: dict | None = None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -638,6 +639,18 @@ def dispatch_review(
 
     repo = config.repo(completed.repo_name)
     if repo is None:
+        return None
+
+    # #522: the review chokepoint. Never (re)dispatch a review for work that
+    # is already done on GitHub — issue closed OR PR merged. This is the second
+    # flood vector (reviews of already-merged #349/#194) that the auto-loop
+    # fix-dispatch guard alone didn't cover. Mark the row done so the pending-
+    # review loop stops treating it as eligible. Fail-open inside
+    # work_is_terminal, so a transient gh error never blocks a real review.
+    if github_ops.work_is_terminal(
+        repo.github, completed.issue_number, completed.branch, cache=terminal_cache
+    ):
+        completed.review_state = "done"
         return None
 
     # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-dispatched reviews are
@@ -829,15 +842,23 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         return []
 
     cap = config.reviews.max_auto_dispatch_per_pass
+    # #522: one terminal-state cache for this whole pass, so a backlog full of
+    # already-merged rows (the #349 ×4 case) costs one gh lookup per issue, not
+    # one per row revisited.
+    terminal_cache: dict = {}
     dispatched: list = []
     for completed in eligible:
         if cap and len(dispatched) >= cap:
             break
-        review = dispatch_review(completed, board, config, now=now)
+        review = dispatch_review(
+            completed, board, config, now=now, terminal_cache=terminal_cache
+        )
         if review is not None:
             completed.review_state = "dispatched"
             dispatched.append(review)
         # On failure leave review_state as "pending" so the next pass retries.
+        # Terminal rows are marked review_state="done" inside dispatch_review
+        # (#522), dropping them from `eligible` on the next pass.
 
     held = sum(1 for c in eligible if c.review_state in (None, "pending"))
     if held:

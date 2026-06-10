@@ -34,6 +34,87 @@ def get_issue(repo: str, issue_number: int) -> dict:
     return json.loads(raw)
 
 
+def issue_is_closed(repo: str, issue_number: int) -> bool:
+    """True when issue ``issue_number`` is closed on GitHub.
+
+    Best-effort and **fail-open**: any ``gh`` error returns ``False`` so a
+    transient GitHub/CLI failure never silently blocks a legitimate dispatch.
+    """
+    try:
+        return get_issue(repo, issue_number).get("state", "").upper() == "CLOSED"
+    except (RuntimeError, json.JSONDecodeError):
+        return False
+
+
+def pr_is_merged(repo: str, branch: str) -> bool:
+    """True when a PR whose head is ``branch`` has been merged on ``repo``.
+
+    Uses ``gh pr list --head <branch> --state all`` rather than ``pr view`` so
+    the result survives **branch deletion after merge** and the quadraui case
+    where a PR merged into ``develop`` leaves its linked issue OPEN (so
+    :func:`issue_is_closed` would miss it).  Best-effort and **fail-open**:
+    returns ``False`` when there is no PR, the PR is still open, or ``gh``
+    errors — never blocks a legitimate dispatch on a transient failure.
+    """
+    if not branch:
+        return False
+    try:
+        raw = _gh(
+            "pr", "list", "--repo", repo, "--head", branch,
+            "--state", "all", "--json", "number,state,mergedAt", "--limit", "10",
+        )
+    except RuntimeError:
+        return False
+    try:
+        prs = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    return any(
+        p.get("mergedAt") or p.get("state", "").upper() == "MERGED" for p in prs
+    )
+
+
+def work_is_terminal(
+    repo_github: str,
+    issue_number: int | None,
+    branch: str | None,
+    *,
+    cache: dict | None = None,
+) -> bool:
+    """True when work is already done on GitHub: **issue closed OR PR merged**.
+
+    The single chokepoint guard (#522) consulted before any fix/review
+    dispatch, so already-merged/closed work can never re-enter the loop (the
+    root cause of the 2026-06-09 launch flood: #349 ×4, #194).
+
+    Best-effort and **fail-open**: any error resolves to ``False`` so a
+    transient GitHub/CLI failure never blocks a legitimate dispatch.
+
+    *cache* — optional ``dict`` shared across a single ``notify`` run, keyed by
+    ``(repo_github, issue_number, branch)``, so a burst of transitions for the
+    same merged issue costs **one** ``gh`` round-trip, not one per call.
+    """
+    if not repo_github:
+        return False
+
+    key = (repo_github, issue_number, branch)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    terminal = False
+    try:
+        if issue_number and issue_is_closed(repo_github, issue_number):
+            terminal = True
+        elif branch and pr_is_merged(repo_github, branch):
+            terminal = True
+    except Exception:  # noqa: BLE001 — fail-open: never block a dispatch
+        terminal = False
+
+    if cache is not None:
+        cache[key] = terminal
+    return terminal
+
+
 def post_issue_comment(repo: str, issue_number: int, body: str):
     _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
 

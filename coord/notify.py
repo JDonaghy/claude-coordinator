@@ -988,13 +988,18 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
     # Auto-loop: for each completed review, optionally dispatch a fix worker.
     # Runs after notify posts the completion comment so GitHub has the full
     # review body before any fix briefing references "previous findings".
+    # #522: one terminal-state cache shared across every auto-loop call in this
+    # notify run, so a burst of transitions for the same merged/closed issue
+    # (the #349 ×4 case) costs a single `gh` round-trip, not one per transition.
+    terminal_cache: dict = {}
     if review_completions:
         try:
             from coord.auto_loop import run_for_review_transition  # noqa: PLC0415
             for transition, record, entry in review_completions:
                 try:
                     actions = run_for_review_transition(
-                        transition.assignment_id, record, entry, config
+                        transition.assignment_id, record, entry, config,
+                        terminal_cache=terminal_cache,
                     )
                     for action in actions:
                         log.info(
@@ -1019,7 +1024,8 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
             for transition, _record in fix_completions:
                 try:
                     actions = run_for_fix_transition(
-                        transition.assignment_id, config
+                        transition.assignment_id, config,
+                        terminal_cache=terminal_cache,
                     )
                     for action in actions:
                         log.info(
