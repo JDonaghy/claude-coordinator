@@ -8,6 +8,18 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _non_terminal_work(monkeypatch):
+    """#522: default ALL work to NON-terminal so any test that dispatches a
+    review/fix never shells out to ``gh`` through the chokepoint guard
+    (``dispatch_review`` / the auto-loop).  Tests exercising the guard re-patch
+    ``coord.github_ops.work_is_terminal`` (or ``issue_is_closed`` /
+    ``pr_is_merged``) to opt in.  ``test_github_ops`` tests the real helpers
+    via captured references, so this module-attr stub does not affect them.
+    """
+    monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: False)
+
+
 def output_and_stderr(result) -> str:
     """CLI text across click versions: newer click separates stderr; older
     mixes it into .output and raises on .stderr access."""

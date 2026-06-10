@@ -74,6 +74,47 @@ def pr_is_merged(repo: str, branch: str) -> bool:
     )
 
 
+def work_is_terminal(
+    repo_github: str,
+    issue_number: int | None,
+    branch: str | None,
+    *,
+    cache: dict | None = None,
+) -> bool:
+    """True when work is already done on GitHub: **issue closed OR PR merged**.
+
+    The single chokepoint guard (#522) consulted before any fix/review
+    dispatch, so already-merged/closed work can never re-enter the loop (the
+    root cause of the 2026-06-09 launch flood: #349 ×4, #194).
+
+    Best-effort and **fail-open**: any error resolves to ``False`` so a
+    transient GitHub/CLI failure never blocks a legitimate dispatch.
+
+    *cache* — optional ``dict`` shared across a single ``notify`` run, keyed by
+    ``(repo_github, issue_number, branch)``, so a burst of transitions for the
+    same merged issue costs **one** ``gh`` round-trip, not one per call.
+    """
+    if not repo_github:
+        return False
+
+    key = (repo_github, issue_number, branch)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    terminal = False
+    try:
+        if issue_number and issue_is_closed(repo_github, issue_number):
+            terminal = True
+        elif branch and pr_is_merged(repo_github, branch):
+            terminal = True
+    except Exception:  # noqa: BLE001 — fail-open: never block a dispatch
+        terminal = False
+
+    if cache is not None:
+        cache[key] = terminal
+    return terminal
+
+
 def post_issue_comment(repo: str, issue_number: int, body: str):
     _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
 

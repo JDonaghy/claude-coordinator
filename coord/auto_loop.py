@@ -88,48 +88,19 @@ def _work_is_terminal(
 ) -> bool:
     """True when *work* is already done on GitHub and must not be re-dispatched.
 
-    Terminal means the work's **issue is closed** OR its **PR is merged**.
-    This is the root-cause guard for the 2026-06-09 launch flood (#522): the
-    auto-loop would otherwise re-dispatch fix/review workers for already-merged
-    issues (#349 ×4, #194) because nothing in the dispatch path consulted
-    GitHub state.
-
-    **Fail-open:** any ``gh`` error resolves to ``False`` so a transient
-    GitHub/CLI failure never blocks a legitimate dispatch.
-
-    *cache* — optional ``dict`` shared across a single ``notify`` run, keyed by
-    ``(repo_github, issue_number, branch)``, so a burst of transitions for the
-    same merged issue costs **one** ``gh`` round-trip, not one per transition.
+    Thin Assignment/Config-shaped wrapper over
+    :func:`coord.github_ops.work_is_terminal` (the shared chokepoint guard,
+    #522) — resolves the repo's GitHub slug and delegates.  Fail-open.
     """
     repo = config.repo(work.repo_name)
     if repo is None or not repo.github:
         return False
 
-    key = (repo.github, work.issue_number, work.branch)
-    if cache is not None and key in cache:
-        return cache[key]
-
     from coord import github_ops  # noqa: PLC0415
 
-    terminal = False
-    try:
-        if work.issue_number and github_ops.issue_is_closed(
-            repo.github, work.issue_number
-        ):
-            terminal = True
-        elif work.branch and github_ops.pr_is_merged(repo.github, work.branch):
-            terminal = True
-    except Exception as exc:  # noqa: BLE001 — fail-open
-        log.warning(
-            "auto_loop: terminal-state check errored for %s (issue #%s) — "
-            "treating as non-terminal: %s",
-            work.assignment_id, work.issue_number, exc,
-        )
-        terminal = False
-
-    if cache is not None:
-        cache[key] = terminal
-    return terminal
+    return github_ops.work_is_terminal(
+        repo.github, work.issue_number, work.branch, cache=cache
+    )
 
 
 # ── Core logic ────────────────────────────────────────────────────────────────

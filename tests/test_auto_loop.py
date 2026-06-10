@@ -146,15 +146,9 @@ def _request_changes_findings() -> ReviewFindings:
     )
 
 
-@pytest.fixture(autouse=True)
-def _stub_terminal_state(monkeypatch):
-    """#522 terminal-state guard: default ALL work to non-terminal so the
-    existing dispatch tests never shell out to ``gh``.  Tests that exercise
-    the guard re-patch ``coord.github_ops.issue_is_closed`` / ``pr_is_merged``
-    to opt in.  ``_work_is_terminal`` itself stays real.
-    """
-    monkeypatch.setattr("coord.github_ops.issue_is_closed", lambda *a, **k: False)
-    monkeypatch.setattr("coord.github_ops.pr_is_merged", lambda *a, **k: False)
+# Default non-terminal stub for the #522 guard is provided by the autouse
+# `_non_terminal_work` fixture in conftest.py — tests below opt into terminal
+# behaviour by patching `coord.github_ops.work_is_terminal`.
 
 
 # ── Unit tests: process_review_completion ───────────────────────────────────
@@ -407,7 +401,7 @@ class TestTerminalGuard522:
     def test_skips_fix_when_issue_closed(
         self, config: Config, tmp_path, monkeypatch
     ) -> None:
-        monkeypatch.setattr("coord.github_ops.issue_is_closed", lambda *a, **k: True)
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
         review = _review_assignment()
         work = _work_assignment(review_iteration=0)
         board = _board_with(work, review)
@@ -429,7 +423,9 @@ class TestTerminalGuard522:
     ) -> None:
         # issue stays OPEN (default stub); only the PR is merged — the quadraui
         # develop-merge case where merging does NOT auto-close the issue.
-        monkeypatch.setattr("coord.github_ops.pr_is_merged", lambda *a, **k: True)
+        # (work_is_terminal collapses both signals; the github_ops unit tests
+        # cover the issue-open/PR-merged split directly.)
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
         review = _review_assignment()
         work = _work_assignment(review_iteration=0)
         board = _board_with(work, review)
@@ -473,7 +469,7 @@ class TestTerminalGuard522:
     ) -> None:
         from coord.state import load_board, save_board
 
-        monkeypatch.setattr("coord.github_ops.pr_is_merged", lambda *a, **k: True)
+        monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
 
         fix = _work_assignment(assignment_id="fix-1", review_iteration=1)
         fix.issue_title = "[fix-1] Fix the thing"
@@ -499,36 +495,9 @@ class TestTerminalGuard522:
         assert reloaded is not None
         assert reloaded.review_state == "done"     # persisted to the board
 
-    def test_terminal_cache_collapses_repeat_gh_calls(
-        self, config: Config, tmp_path
-    ) -> None:
-        # The #349 ×4 case: a shared cache means the same merged issue costs
-        # ONE issue_is_closed call across many transitions, not one per call.
-        calls = {"n": 0}
-
-        def counting_closed(*a, **k):
-            calls["n"] += 1
-            return True
-
-        import coord.github_ops as go
-        original = go.issue_is_closed
-        go.issue_is_closed = counting_closed  # patched past the autouse stub
-        try:
-            cache: dict = {}
-            for _ in range(4):
-                review = _review_assignment()
-                work = _work_assignment(review_iteration=0)
-                board = _board_with(work, review)
-                process_review_completion(
-                    review, board, config,
-                    log_path=str(self._request_changes_log(tmp_path)),
-                    http_client=MagicMock(),
-                    terminal_cache=cache,
-                )
-        finally:
-            go.issue_is_closed = original
-
-        assert calls["n"] == 1, "shared cache must collapse repeat gh lookups"
+    # The #349-×4 cache-collapse behaviour now lives in
+    # coord.github_ops.work_is_terminal and is covered by
+    # tests/test_github_ops.py::TestWorkIsTerminal::test_cache_collapses_repeat_calls.
 
 
 class TestBuildFixBriefing:
