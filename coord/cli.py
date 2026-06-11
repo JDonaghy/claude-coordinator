@@ -1980,6 +1980,8 @@ def assign(
 
         from coord.providers import ClaudePtyProvider  # noqa: PLC0415
         from coord.interactive import (  # noqa: PLC0415
+            TmuxHost,
+            _launch_via_tmux as _tmux_launch,
             finalize_interactive_exit,
             launch_human_attended_interactive,
             tmux_available as _tmux_avail,
@@ -1998,11 +2000,29 @@ def assign(
                 "NOT report human_attended_only=True; refusing to launch."
             )
 
-        # Expand `~` — repo_paths in coordinator.yml use `~/src/...`, and unlike
-        # the agent (which expands everywhere) this local interactive launch
-        # passes the path straight to the child's cwd, so a literal `~` would
-        # fail with "No such file or directory".  Local launch ⇒ local home.
-        repo_path = str(Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser())
+        # Detect whether the target machine is the local machine so we can
+        # choose the local TTY path vs the remote SSH+tmux path (#494).
+        # Mirrors the hostname-matching logic in _save_config_snapshot.
+        _local_hn = socket.gethostname().split(".")[0].lower()
+        _is_local = (
+            machine_obj.name.lower() == _local_hn
+            or machine_obj.host.split(".")[0].lower() == _local_hn
+        )
+
+        if _is_local:
+            # Expand `~` — repo_paths in coordinator.yml use `~/src/...`,
+            # and unlike the agent (which expands everywhere) this local
+            # interactive launch passes the path straight to the child's cwd,
+            # so a literal `~` would fail with "No such file or directory".
+            # Local launch ⇒ local home.
+            repo_path = str(
+                Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+            )
+        else:
+            # Remote: keep the raw path from coordinator.yml so the remote
+            # shell can expand `~` itself.  Fall back to ~/src/<repo> when no
+            # repo_path is configured (common for new machines).
+            repo_path = machine_obj.repo_path(repo) or f"~/src/{repo}"
 
         effective_plan_only = plan_only or (
             cfg.dispatch.require_plan and not no_plan
@@ -2066,9 +2086,16 @@ def assign(
 
         argv = provider.build_command(spec, resolved_model=resolved_model)
 
-        click.echo(
-            f"{machine} (local TTY) → {repo} #{issue}: {issue_title}"
-        )
+        # For remote: replace the binary (argv[0]) with the absolute path
+        # to claude on the remote machine.  A bare "claude" is not on the
+        # SSH login PATH (#424/#425); ~/.local/bin/claude is the canonical
+        # location installed by `claude` setup on Linux.
+        _REMOTE_CLAUDE_BIN = "~/.local/bin/claude"
+        if not _is_local:
+            argv = [_REMOTE_CLAUDE_BIN] + list(argv)[1:]
+
+        _location = "local TTY" if _is_local else f"{machine_obj.host} (remote tmux)"
+        click.echo(f"{machine} ({_location}) → {repo} #{issue}: {issue_title}")
         click.echo("  mode: HUMAN-ATTENDED interactive launch (#437)")
         click.echo(f"  assignment id: {assignment_id}")
         click.echo(
@@ -2080,139 +2107,287 @@ def assign(
             _dry_branch = f"issue-{issue}-{_slugify_dry(issue_title)}"
             click.echo("  (dry run — not launched)")
             click.echo(f"  would exec: {argv}")
-            click.echo(
-                f"  cwd: worktree for {_dry_branch} "
-                f"(under ~/.coord/worktrees/<assignment_id>)"
-            )
-            return
-
-        # Create an isolated worktree + feature branch, mirroring the
-        # agent-dispatched path (#480).  The interactive session must run
-        # in a fresh worktree on a new branch — never in the live checkout
-        # — so the feature branch contract ("you are already on a feature
-        # branch; commit + push here") in WORKER_SYSTEM_PROMPT is accurate,
-        # and finalize_interactive_exit can push + remove the worktree on
-        # exit without touching the main checkout.
-        from coord.agent import (  # noqa: PLC0415
-            _GitError as _AgentGitError,
-            setup_interactive_worktree,
-        )
-        try:
-            _wt_path, _interactive_branch = setup_interactive_worktree(
-                Path(repo_path),
-                issue_number=issue,
-                issue_title=issue_title,
-                assignment_id=assignment_id,
-                default_branch=repo_default_branch,
-            )
-            worktree_path = str(_wt_path)
-        except (_AgentGitError, OSError) as _wt_err:
-            click.echo(
-                f"  error: could not create worktree for interactive session: {_wt_err}",
-                err=True,
-            )
-            sys.exit(1)
-
-        click.echo(f"  worktree: {worktree_path} (branch: {_interactive_branch})")
-
-        # State mutations (DB row, env var, board write) ONLY on real
-        # dispatch — never in dry-run.  Record up front so:
-        #   * claim detection refuses a duplicate the second the human
-        #     hits Enter on a parallel `coord assign --interactive`,
-        #   * the board shows the in-flight interactive session,
-        #   * the issue_store seam has a row to UPDATE on exit.
-        record_dispatched(
-            assignment_id=assignment_id,
-            proposal=proposal,
-            repo_github=repo_cfg.github,
-            provider_name="claude-pty",
-        )
-
-        # #466: Inject the assignment id into the agent's process env so
-        # the interactive Claude session can run
-        # `coord report-result --assignment $COORD_ASSIGNMENT_ID …` to
-        # report a structured result before exiting.  Also prepend a
-        # short reminder to the briefing so the operator notices.
-        os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
-        report_reminder = (
-            f"[Coordinator assignment {assignment_id}] "
-            "Before you exit, please run `coord report-result "
-            f"--assignment {assignment_id} --status <done|blocked|"
-            "already-implemented> [--verdict approve|request-changes] "
-            "--summary <text>` so the coordinator records the result.\n\n"
-        )
-        effective_briefing = report_reminder + briefing
-
-        # Update board metadata (round_number / board_initialized).
-        # `record_dispatched` already wrote the assignment row, so the
-        # build_board → save_board round-trip is a no-op for the
-        # assignments table; the useful side-effect is board_meta.
-        save_board(build_board())
-
-        started_at = _time.time()
-        # #487: pass assignment_id so the tmux path names the session
-        # coord-<assignment_id>, enabling reattach after a TUI crash.
-        exit_code = launch_human_attended_interactive(
-            argv, effective_briefing, assignment_id=assignment_id, cwd=worktree_path,
-        )
-        if exit_code != 0:
-            click.echo(f"  claude exited with status {exit_code}", err=True)
-
-        # #487: if the tmux session is still alive the user just detached
-        # (Ctrl-b d) or the TUI crashed.  Skip finalize — the session is
-        # still running.  Tell the operator how to reattach and let them
-        # close the session themselves (at which point coord report-result
-        # or coord reattach will record the terminal state).
-        _sname = _tmux_name(assignment_id) if _tmux_avail() else None
-        if _sname and _tmux_alive(_sname):
-            click.echo(
-                f"  session still running in tmux: {_sname}\n"
-                f"  reattach with:  coord reattach {assignment_id}\n"
-                f"  or from shell:  tmux attach-session -t {_sname}"
-            )
-            sys.exit(0)
-
-        # #466 — git-floor backstop.  ALWAYS write a terminal state for
-        # this assignment through the issue_store seam, regardless of
-        # whether the agent typed `coord report-result` first.  The
-        # finalizer respects an existing report (it checks the DB row's
-        # status before clobbering).
-        try:
-            finalize_result = finalize_interactive_exit(
-                assignment_id=assignment_id,
-                repo_name=repo,
-                repo_github=repo_cfg.github,
-                issue_number=issue,
-                machine_name=machine,
-                worktree_path=worktree_path,
-                base_branch=repo_default_branch,
-                exit_code=exit_code,
-                started_at=started_at,
-                log_path=None,
-                repo_path=repo_path,
-            )
-            if finalize_result.already_recorded:
+            if _is_local:
                 click.echo(
-                    "  result already recorded via `coord report-result`; "
-                    "backstop did not overwrite",
+                    f"  cwd: worktree for {_dry_branch} "
+                    f"(under ~/.coord/worktrees/<assignment_id>)"
                 )
             else:
+                _dry_wt = f"~/.coord/worktrees/{assignment_id}"
                 click.echo(
-                    f"  backstop: status={finalize_result.terminal_status} "
-                    f"commits_ahead={finalize_result.commits_ahead}"
+                    f"  remote worktree: {_dry_wt} on {machine_obj.host}"
+                    f" (branch: {_dry_branch})"
                 )
-                if not finalize_result.push_ok:
-                    click.echo(
-                        f"  warning: git push failed: {finalize_result.push_error}",
-                        err=True,
-                    )
-        except Exception as exc:  # noqa: BLE001 — best-effort backstop
-            click.echo(
-                f"  warning: backstop failed to record completion: {exc}",
-                err=True,
+            return
+
+        if _is_local:
+            # ── LOCAL PATH ────────────────────────────────────────────────
+            # Byte-identical to the pre-#494 behaviour: create an isolated
+            # worktree + feature branch locally via setup_interactive_worktree,
+            # then attach the current terminal directly via
+            # launch_human_attended_interactive.
+            from coord.agent import (  # noqa: PLC0415
+                _GitError as _AgentGitError,
+                setup_interactive_worktree,
+            )
+            try:
+                _wt_path, _interactive_branch = setup_interactive_worktree(
+                    Path(repo_path),
+                    issue_number=issue,
+                    issue_title=issue_title,
+                    assignment_id=assignment_id,
+                    default_branch=repo_default_branch,
+                )
+                worktree_path = str(_wt_path)
+            except (_AgentGitError, OSError) as _wt_err:
+                click.echo(
+                    f"  error: could not create worktree for interactive session: {_wt_err}",
+                    err=True,
+                )
+                sys.exit(1)
+
+            click.echo(f"  worktree: {worktree_path} (branch: {_interactive_branch})")
+
+            # State mutations (DB row, env var, board write) ONLY on real
+            # dispatch — never in dry-run.  Record up front so:
+            #   * claim detection refuses a duplicate the second the human
+            #     hits Enter on a parallel `coord assign --interactive`,
+            #   * the board shows the in-flight interactive session,
+            #   * the issue_store seam has a row to UPDATE on exit.
+            record_dispatched(
+                assignment_id=assignment_id,
+                proposal=proposal,
+                repo_github=repo_cfg.github,
+                provider_name="claude-pty",
             )
 
-        sys.exit(exit_code)
+            # #466: Inject the assignment id into the agent's process env so
+            # the interactive Claude session can run
+            # `coord report-result --assignment $COORD_ASSIGNMENT_ID …` to
+            # report a structured result before exiting.  Also prepend a
+            # short reminder to the briefing so the operator notices.
+            os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+            report_reminder = (
+                f"[Coordinator assignment {assignment_id}] "
+                "Before you exit, please run `coord report-result "
+                f"--assignment {assignment_id} --status <done|blocked|"
+                "already-implemented> [--verdict approve|request-changes] "
+                "--summary <text>` so the coordinator records the result.\n\n"
+            )
+            effective_briefing = report_reminder + briefing
+
+            # Update board metadata (round_number / board_initialized).
+            # `record_dispatched` already wrote the assignment row, so the
+            # build_board → save_board round-trip is a no-op for the
+            # assignments table; the useful side-effect is board_meta.
+            save_board(build_board())
+
+            started_at = _time.time()
+            # #487: pass assignment_id so the tmux path names the session
+            # coord-<assignment_id>, enabling reattach after a TUI crash.
+            exit_code = launch_human_attended_interactive(
+                argv, effective_briefing, assignment_id=assignment_id, cwd=worktree_path,
+            )
+            if exit_code != 0:
+                click.echo(f"  claude exited with status {exit_code}", err=True)
+
+            # #487: if the tmux session is still alive the user just detached
+            # (Ctrl-b d) or the TUI crashed.  Skip finalize — the session is
+            # still running.  Tell the operator how to reattach and let them
+            # close the session themselves (at which point coord report-result
+            # or coord reattach will record the terminal state).
+            _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+            if _sname and _tmux_alive(_sname):
+                click.echo(
+                    f"  session still running in tmux: {_sname}\n"
+                    f"  reattach with:  coord reattach {assignment_id}\n"
+                    f"  or from shell:  tmux attach-session -t {_sname}"
+                )
+                sys.exit(0)
+
+            # #466 — git-floor backstop.  ALWAYS write a terminal state for
+            # this assignment through the issue_store seam, regardless of
+            # whether the agent typed `coord report-result` first.  The
+            # finalizer respects an existing report (it checks the DB row's
+            # status before clobbering).
+            try:
+                finalize_result = finalize_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    worktree_path=worktree_path,
+                    base_branch=repo_default_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    log_path=None,
+                    repo_path=repo_path,
+                )
+                if finalize_result.already_recorded:
+                    click.echo(
+                        "  result already recorded via `coord report-result`; "
+                        "backstop did not overwrite",
+                    )
+                else:
+                    click.echo(
+                        f"  backstop: status={finalize_result.terminal_status} "
+                        f"commits_ahead={finalize_result.commits_ahead}"
+                    )
+                    if not finalize_result.push_ok:
+                        click.echo(
+                            f"  warning: git push failed: {finalize_result.push_error}",
+                            err=True,
+                        )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: backstop failed to record completion: {exc}",
+                    err=True,
+                )
+
+            sys.exit(exit_code)
+
+        else:
+            # ── REMOTE PATH (#494 / #486b) ────────────────────────────────
+            # The target machine is not the local host.  We create a named
+            # tmux session ON THE REMOTE machine that:
+            #   1. cd's into the remote repo checkout,
+            #   2. fetches origin + prunes worktrees,
+            #   3. creates a feature-branch worktree at
+            #      ~/.coord/worktrees/<assignment_id>,
+            #   4. cd's into the worktree,
+            #   5. launches claude with COORD_ASSIGNMENT_ID set inline.
+            #
+            # The local terminal ATTACHES to the remote tmux session so the
+            # operator can drive it as if it were a local session.
+            #
+            # We use $HOME in the shell command (not ~) so that the paths
+            # survive single-quote wrapping during remote transmission.
+            # (~ inside single quotes is NOT expanded; $HOME inside a
+            # tmux-run shell command IS expanded by the final shell.)
+            import shlex as _shlex  # noqa: PLC0415
+
+            from coord.agent import _slugify as _remote_slugify  # noqa: PLC0415
+
+            # Mirror setup_interactive_worktree branch/worktree naming.
+            _remote_branch = f"issue-{issue}-{_remote_slugify(issue_title)}"
+            _remote_wt = "$HOME/.coord/worktrees/" + assignment_id
+
+            # repo_path may be ~/src/repo or an absolute path; replace
+            # leading ~/ with $HOME/ so the shell expands it correctly.
+            _rp_sh = (
+                "$HOME/" + repo_path[2:]
+                if repo_path.startswith("~/")
+                else ("$HOME" if repo_path == "~" else repo_path)
+            )
+
+            # Build the shell command the remote tmux session will run.
+            # Tries fresh -b first (new branch from origin/default), falls
+            # back to -B (force-reset) from origin/<branch> (retry case),
+            # then from origin/<default> as a last resort.
+            _claude_args = _shlex.join(list(argv)[1:])
+            _remote_cmd = (
+                f"mkdir -p $HOME/.coord/worktrees"
+                f" && cd {_rp_sh}"
+                f" && git fetch origin --prune 2>/dev/null || true"
+                f" && git worktree prune 2>/dev/null || true"
+                f" && (git worktree add -b {_remote_branch} {_remote_wt}"
+                f" origin/{repo_default_branch} 2>/dev/null"
+                f" || git worktree add -B {_remote_branch} {_remote_wt}"
+                f" origin/{_remote_branch} 2>/dev/null"
+                f" || git worktree add -B {_remote_branch} {_remote_wt}"
+                f" origin/{repo_default_branch})"
+                f" && cd {_remote_wt}"
+                f" && COORD_ASSIGNMENT_ID={assignment_id}"
+                f" {argv[0]} {_claude_args}"
+            )
+
+            _tmux_host = TmuxHost(ssh_target=machine_obj.host)
+            _sname = _tmux_name(assignment_id)
+
+            click.echo(
+                f"  remote worktree: $HOME/.coord/worktrees/{assignment_id}"
+                f" on {machine_obj.host} (branch: {_remote_branch})"
+            )
+
+            # State mutations (DB row, env var, board write) — same as local.
+            record_dispatched(
+                assignment_id=assignment_id,
+                proposal=proposal,
+                repo_github=repo_cfg.github,
+                provider_name="claude-pty",
+            )
+
+            # Set COORD_ASSIGNMENT_ID in the local coordinator env as well
+            # (for symmetry with local path; the remote process gets it
+            # inline via the shell command).
+            os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+            report_reminder = (
+                f"[Coordinator assignment {assignment_id}] "
+                "Before you exit, please run `coord report-result "
+                f"--assignment {assignment_id} --status <done|blocked|"
+                "already-implemented> [--verdict approve|request-changes] "
+                "--summary <text>` so the coordinator records the result.\n\n"
+            )
+            effective_briefing = report_reminder + briefing
+
+            save_board(build_board())
+
+            # Echo briefing to the LOCAL terminal before connecting to the
+            # remote session, so the operator can read it before pressing
+            # Enter (mirrors the tmux path in launch_human_attended_interactive).
+            if effective_briefing.strip():
+                _hdr = (
+                    "--- seeded briefing -- review below; "
+                    "submit the pre-filled input in Claude to send ---"
+                )
+                _ftr = "-" * len(_hdr)
+                _preview = f"\n{_hdr}\n{effective_briefing.rstrip()}\n{_ftr}\n\n"
+                try:
+                    os.write(sys.stdout.fileno(), _preview.encode("utf-8"))
+                except OSError:
+                    pass
+
+            # Launch the remote tmux session and attach to it.  Pass
+            # raw_shell_cmd so _launch_via_tmux uses the verbatim shell
+            # command (with $HOME paths and && operators) rather than
+            # re-quoting argv through shlex.join.
+            _rc = _tmux_launch(
+                argv,
+                effective_briefing,
+                _sname,
+                cwd=None,
+                host=_tmux_host,
+                raw_shell_cmd=_remote_cmd,
+            )
+            if _rc is None:
+                click.echo(
+                    f"  error: could not create remote tmux session on"
+                    f" {machine_obj.host}",
+                    err=True,
+                )
+                sys.exit(1)
+            exit_code = _rc
+            if exit_code != 0:
+                click.echo(f"  claude exited with status {exit_code}", err=True)
+
+            # Check if the remote session is still alive (user detached).
+            if _tmux_alive(_sname, host=_tmux_host):
+                click.echo(
+                    f"  session still running in remote tmux: {_sname}\n"
+                    f"  reattach with:  ssh -t {machine_obj.host}"
+                    f" tmux attach-session -t {_sname}"
+                )
+                sys.exit(0)
+
+            # Remote finalize (push + completion record) is deferred to
+            # #486d.  For now we note that the session ended and exit.
+            click.echo(
+                "  remote session ended; "
+                "run `coord report-result` on the remote or wait for #486d "
+                "finalize to land."
+            )
+            sys.exit(exit_code)
 
     # Build a Proposal inline
     from coord.models import Proposal
