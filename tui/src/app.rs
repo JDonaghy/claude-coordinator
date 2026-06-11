@@ -17657,6 +17657,7 @@ impl CoordApp {
             || self.pending_test_fail.is_some()
             || self.pending_report_fix.is_some()
             || self.pending_refinement_close_prompt.is_some()
+            || self.artifact_pull_dialog.is_some()
         {
             return None;
         }
@@ -32192,6 +32193,30 @@ mod tests {
         let dlg = app.artifact_pull_dialog.as_ref().unwrap();
         assert!(dlg.path.is_none(), "failure dialog must not carry a path");
         assert!(dlg.body.contains("Pull failed"));
+    }
+
+    /// While the artifact-pull dialog is open it consumes every keystroke, so
+    /// the panel toolbar (a clickable affordance) must be suppressed — matching
+    /// every other modal prompt (`pending_purge`, `pending_force_merge`, …).
+    /// Calls the real `panel_toolbar()` so a regression in the guard is caught.
+    #[test]
+    fn artifact_pull_dialog_suppresses_panel_toolbar() {
+        let mut app = make_app_for_artifact_tests();
+        // Board view has a toolbar; pin the view + confirm that precondition so
+        // the assertion below proves suppression, not just an always-None toolbar.
+        app.active_view = SidebarView::Board;
+        assert!(
+            app.panel_toolbar().is_some(),
+            "precondition: Board view should have a toolbar when no dialog is open",
+        );
+        app.artifact_pull_dialog = Some(ArtifactPullDialog {
+            path: Some("/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string()),
+            body: "Saved to:\n/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string(),
+        });
+        assert!(
+            app.panel_toolbar().is_none(),
+            "panel toolbar must be suppressed while the artifact-pull dialog is open",
+        );
     }
 
     /// `build_prompt_dialog` returns `Some` when `artifact_pull_dialog` is set.
