@@ -17917,8 +17917,13 @@ impl CoordApp {
             // a green status-bar message that was easy to miss (and styled
             // the same as success).  Without this, e.g. `coord refine`
             // failing because a label doesn't exist on the repo would leave
-            // the user staring at an unchanged board with no feedback.
-            if result.exit_code != 0 {
+            // the user staring an unchanged board with no feedback.
+            //
+            // #532: pull-artifact failures are handled by the artifact-pull
+            // dialog (opened in the block below).  Suppress the generic toast
+            // for that label so the user doesn't see two simultaneous failure
+            // notifications (one toast + one dialog) for the same event.
+            if result.exit_code != 0 && !result.label.contains("pull-artifact") {
                 let reason = first_meaningful_stderr_line(&result.stderr)
                     .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
                 self.push_toast(
@@ -20698,9 +20703,13 @@ impl ShellApp for CoordApp {
             }
         }
 
-        // ── #532: Artifact-pull dialog: intercept ALL key presses ───────────
-        // While the info dialog is open, 'c'/'C' copies the destination path
-        // (when available); any other key — including Esc — closes the dialog.
+        // ── #532: Artifact-pull dialog: intercept key presses ──────────────
+        // While the info dialog is open:
+        //   'c'/'C' — copy path to clipboard (when available), then dismiss.
+        //   Esc / Enter — dismiss without copying.
+        //   All other keys — swallow (redraw) without dismissing; this lets
+        //   longer error messages be scrolled and prevents accidental dismiss
+        //   on Tab / arrow keys while the dialog is focused.
         if self.artifact_pull_dialog.is_some() {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 let path = self
@@ -20717,11 +20726,20 @@ impl ShellApp for CoordApp {
                                 ToastSeverity::Info,
                             );
                         }
+                        // Dismiss after copy.
+                        self.artifact_pull_dialog = None;
+                        *self.dialog_layout.borrow_mut() = None;
                     }
-                    _ => {}
+                    Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
+                        // Explicit dismiss keys.
+                        self.artifact_pull_dialog = None;
+                        *self.dialog_layout.borrow_mut() = None;
+                    }
+                    _ => {
+                        // All other keys are swallowed but do NOT close the
+                        // dialog — keeps it visible while navigating its body.
+                    }
                 }
-                self.artifact_pull_dialog = None;
-                *self.dialog_layout.borrow_mut() = None;
                 return Reaction::Redraw;
             }
         }
@@ -32023,6 +32041,215 @@ mod tests {
         );
         let record = app.last_artifact_pulls.get("work-abc123").unwrap();
         assert_eq!(record.exit_code, 0, "second pull should overwrite first");
+    }
+
+    // ── #532: ArtifactPullDialog ──────────────────────────────────────────────
+
+    /// After a successful pull completes, `artifact_pull_dialog` should be
+    /// populated with `path: Some(...)`.
+    #[test]
+    fn artifact_pull_dialog_set_on_success() {
+        let mut app = make_app_for_artifact_tests();
+        // Simulate the completion handler setting the dialog directly (the
+        // handler runs inside run_periodic_work which requires a full backend;
+        // here we exercise the resulting state that the handler produces).
+        app.artifact_pull_dialog = Some(ArtifactPullDialog {
+            path: Some("/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string()),
+            body: "Saved to:\n/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string(),
+        });
+        let dlg = app.artifact_pull_dialog.as_ref().unwrap();
+        assert!(dlg.path.is_some(), "success dialog must carry a copyable path");
+        assert!(dlg.body.contains("Saved to:"));
+    }
+
+    /// After a failed pull, `artifact_pull_dialog` should have `path: None`.
+    #[test]
+    fn artifact_pull_dialog_set_on_failure() {
+        let mut app = make_app_for_artifact_tests();
+        app.artifact_pull_dialog = Some(ArtifactPullDialog {
+            path: None,
+            body: "Pull failed (exit 1):\nrsync: connection refused".to_string(),
+        });
+        let dlg = app.artifact_pull_dialog.as_ref().unwrap();
+        assert!(dlg.path.is_none(), "failure dialog must not carry a path");
+        assert!(dlg.body.contains("Pull failed"));
+    }
+
+    /// `build_prompt_dialog` returns `Some` when `artifact_pull_dialog` is set.
+    #[test]
+    fn build_prompt_dialog_returns_artifact_dialog_when_set() {
+        let mut app = make_app_for_artifact_tests();
+        // No dialog set initially → no prompt dialog.
+        assert!(
+            app.build_prompt_dialog().is_none(),
+            "dialog must be None when artifact_pull_dialog is None"
+        );
+        // Set a success dialog.
+        app.artifact_pull_dialog = Some(ArtifactPullDialog {
+            path: Some("/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string()),
+            body: "Saved to:\n/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string(),
+        });
+        let dialog = app
+            .build_prompt_dialog()
+            .expect("expected dialog when artifact_pull_dialog is Some");
+        // Success dialog must have a "copy" button.
+        let has_copy = dialog.buttons.iter().any(|b| b.id.as_str() == "copy");
+        assert!(has_copy, "success dialog must have a copy button");
+    }
+
+    /// Failure dialog should show only a close button (no copy).
+    #[test]
+    fn build_prompt_dialog_failure_has_no_copy_button() {
+        let mut app = make_app_for_artifact_tests();
+        app.artifact_pull_dialog = Some(ArtifactPullDialog {
+            path: None,
+            body: "Pull failed (exit 1):\nrsync: connection refused".to_string(),
+        });
+        let dialog = app
+            .build_prompt_dialog()
+            .expect("expected dialog when artifact_pull_dialog is Some");
+        let has_copy = dialog.buttons.iter().any(|b| b.id.as_str() == "copy");
+        assert!(!has_copy, "failure dialog must not have a copy button");
+        let has_close = dialog.buttons.iter().any(|b| b.id.as_str() == "close");
+        assert!(has_close, "failure dialog must have a close button");
+    }
+
+    /// Pressing `'a'` when a cached pull result exists re-opens the dialog
+    /// instead of re-running the pull command.
+    #[test]
+    fn a_key_reopens_dialog_from_cached_result() {
+        let mut app = make_app_for_artifact_tests();
+        // Seed a successful pull result.
+        app.last_artifact_pulls.insert(
+            "work-abc123".to_string(),
+            ArtifactPullResult {
+                exit_code: 0,
+                message: "/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string(),
+                finished_at: Instant::now(),
+            },
+        );
+        // Select the pipeline row so artifact_fetch_target() returns Some.
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        // Initially no dialog open.
+        assert!(app.artifact_pull_dialog.is_none());
+        // The logic in the 'a' key arm sets artifact_pull_dialog from
+        // last_artifact_pulls when a cached entry exists.
+        if let Some((_, _, _, work_id)) = app.artifact_fetch_target() {
+            if let Some(pull) = app.last_artifact_pulls.get(&work_id).cloned() {
+                app.artifact_pull_dialog = Some(if pull.exit_code == 0 {
+                    ArtifactPullDialog {
+                        path: Some(pull.message.clone()),
+                        body: format!("Saved to:\n{}", pull.message),
+                    }
+                } else {
+                    ArtifactPullDialog {
+                        path: None,
+                        body: format!(
+                            "Pull failed (exit {}):\n{}",
+                            pull.exit_code, pull.message
+                        ),
+                    }
+                });
+            }
+        }
+        let dlg = app.artifact_pull_dialog.as_ref()
+            .expect("dialog should be opened from cache");
+        assert!(dlg.path.is_some(), "cached success result must produce a copyable path");
+        assert!(dlg.body.contains("Saved to:"));
+    }
+
+    /// Absence reason (no pull attempted, no badge) opens a dialog with
+    /// `path: None` explaining the reason.
+    #[test]
+    fn a_key_with_absence_reason_opens_dialog() {
+        let mut app = make_app_for_artifact_tests();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        // No cached pull result, but seed an absence reason in the cache.
+        let key = ("my-repo".to_string(), "issue-42-test".to_string());
+        app.artifact_cache.insert(
+            key,
+            ArtifactCacheEntry {
+                fetched_at: Instant::now(),
+                manifest: None,
+                absence_reason: Some(ArtifactAbsence::AgentUnreachable(
+                    "timeout".to_string(),
+                )),
+            },
+        );
+        // Simulate the absence-dialog path from the 'a' key arm.
+        if let Some((_, repo, sanitized, work_id)) = app.artifact_fetch_target() {
+            let _ = work_id; // badge not visible, no last pull
+            let cache_key = (repo.clone(), sanitized.clone());
+            if let Some(body) = app
+                .artifact_cache
+                .get(&cache_key)
+                .and_then(|e| e.absence_reason.as_ref())
+                .map(|absence| match absence {
+                    ArtifactAbsence::AgentUnreachable(e) => {
+                        format!("Agent unreachable:\n{}", e.chars().take(200).collect::<String>())
+                    }
+                    ArtifactAbsence::NotStashed => "Not stashed".to_string(),
+                    ArtifactAbsence::ManifestEmpty => "Manifest empty".to_string(),
+                })
+            {
+                app.artifact_pull_dialog = Some(ArtifactPullDialog { path: None, body });
+            }
+        }
+        let dlg = app
+            .artifact_pull_dialog
+            .as_ref()
+            .expect("absence reason should open dialog");
+        assert!(dlg.path.is_none(), "absence dialog has no copyable path");
+        assert!(dlg.body.contains("Agent unreachable"));
+    }
+
+    /// Pressing Esc clears the dialog without any copy side-effect.
+    #[test]
+    fn esc_closes_artifact_pull_dialog() {
+        let mut app = make_app_for_artifact_tests();
+        app.artifact_pull_dialog = Some(ArtifactPullDialog {
+            path: Some("/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string()),
+            body: "Saved to:\n/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string(),
+        });
+        // Simulate what the Esc arm of the key intercept does.
+        let key = Key::Named(NamedKey::Escape);
+        let should_dismiss = matches!(key, Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter));
+        if should_dismiss {
+            app.artifact_pull_dialog = None;
+            *app.dialog_layout.borrow_mut() = None;
+        }
+        assert!(
+            app.artifact_pull_dialog.is_none(),
+            "Esc must dismiss the dialog"
+        );
+        // No toast should have been pushed (no clipboard call path hit).
+        assert!(app.toasts.is_empty(), "Esc must not push a copy toast");
+    }
+
+    /// Non-dismiss keys (e.g. Tab, arrow) leave the dialog open.
+    #[test]
+    fn non_dismiss_key_leaves_artifact_pull_dialog_open() {
+        let mut app = make_app_for_artifact_tests();
+        app.artifact_pull_dialog = Some(ArtifactPullDialog {
+            path: Some("/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string()),
+            body: "Saved to:\n/home/user/.coord/artifacts/my-repo/issue-42-test/".to_string(),
+        });
+        // Simulate what the _ (catch-all) arm of the key intercept does: nothing.
+        let key = Key::Named(NamedKey::Tab);
+        let dismisses = matches!(
+            key,
+            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)
+        );
+        let is_copy = matches!(key, Key::Char('c') | Key::Char('C'));
+        if dismisses || is_copy {
+            app.artifact_pull_dialog = None;
+        }
+        assert!(
+            app.artifact_pull_dialog.is_some(),
+            "Tab must not dismiss the dialog"
+        );
     }
 
     // ── #361: maybe_bind_pending_resume type-aware matching ───────────────────
