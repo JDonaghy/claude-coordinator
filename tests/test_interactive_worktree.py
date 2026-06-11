@@ -350,6 +350,36 @@ class TestFinalizeRemovesWorktree:
         assert result.worktree_removed is True
         assert not wt_path.exists(), "worktree directory should have been removed"
 
+    def test_review_finalize_with_no_worktree(self, tmp_path: Path) -> None:
+        """A1: an interactive REVIEW finalizes with worktree_path=None — there
+        is no session worktree (the review runs read-only in the live
+        checkout).  The backstop must not crash, must not push or remove
+        anything, and records a terminal state with commits_ahead=None."""
+        from coord.interactive import finalize_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("rev01")
+        with patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.interactive._git_push") as mock_push:
+            result = finalize_interactive_exit(
+                assignment_id="rev01",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=30,
+                machine_name="laptop",
+                worktree_path=None,   # review: no session worktree
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                repo_path=None,
+            )
+
+        assert result.worktree_removed is False
+        assert result.commits_ahead is None
+        assert result.push_ok is True, "push must be skipped (defaults to ok) when there is no worktree"
+        assert result.already_recorded is False
+        mock_push.assert_not_called()
+
     def test_worktree_not_removed_when_repo_path_omitted(
         self, repo_with_remote: tuple[Path, Path], tmp_path: Path
     ) -> None:

@@ -909,7 +909,7 @@ def finalize_interactive_exit(
     repo_github: str,
     issue_number: int,
     machine_name: str,
-    worktree_path: str,
+    worktree_path: str | None = None,
     base_branch: str,
     exit_code: int,
     started_at: float | None = None,
@@ -948,7 +948,7 @@ def finalize_interactive_exit(
     # the instant the human closed the TTY.
     if _assignment_already_recorded(assignment_id):
         worktree_removed = False
-        if repo_path is not None:
+        if repo_path is not None and worktree_path is not None:
             worktree_removed = _remove_worktree(Path(repo_path), Path(worktree_path))
         return InteractiveFinalizeResult(
             terminal_status="report-result",  # informational only
@@ -960,14 +960,19 @@ def finalize_interactive_exit(
             worktree_removed=worktree_removed,
         )
 
-    wt_path = Path(worktree_path)
+    # worktree_path is None for a human-attended REVIEW (migration A1): the
+    # review runs read-only in the LIVE checkout, so there is no session
+    # worktree to push from, count commits in, or remove.  Guard every git
+    # step on a real worktree path so the review backstop still records a
+    # terminal state (commits_ahead=None) without ever touching the checkout.
+    wt_path = Path(worktree_path) if worktree_path else None
 
     # Step 1 — push.  Failure is non-fatal but recorded.  Skip the push
-    # entirely when the worktree directory doesn't exist (extremely
-    # rare, but possible if the operator nuked it).
+    # entirely when there is no worktree (review) or its directory doesn't
+    # exist (extremely rare, but possible if the operator nuked it).
     push_ok = True
     push_error: str | None = None
-    if wt_path.exists():
+    if wt_path is not None and wt_path.exists():
         push_ok, push_error = _git_push(wt_path)
 
     # Step 2 — count commits ahead of the base.  None = git failed; the
@@ -978,10 +983,14 @@ def finalize_interactive_exit(
     # AgentServer graph at module load time.
     from coord.agent import _commits_ahead  # noqa: PLC0415
     commits = None
-    if wt_path.exists():
+    if wt_path is not None and wt_path.exists():
         commits = _commits_ahead(wt_path, base_branch)
 
-    branch_now = _current_branch(wt_path) if wt_path.exists() else None
+    branch_now = (
+        _current_branch(wt_path)
+        if wt_path is not None and wt_path.exists()
+        else None
+    )
 
     duration: float | None = None
     if started_at is not None:
@@ -1010,7 +1019,7 @@ def finalize_interactive_exit(
     # Step 4 — remove the interactive worktree when repo_path is provided.
     # Matches _cleanup_worktree discipline: always runs, best-effort.
     worktree_removed = False
-    if repo_path is not None:
+    if repo_path is not None and wt_path is not None:
         worktree_removed = _remove_worktree(Path(repo_path), wt_path)
 
     return InteractiveFinalizeResult(
