@@ -339,9 +339,9 @@ def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
         "  - name: m\n    host: h\n    repos: [api]\n"
     )
     cfg = load(p)
-    # Default default_gates: Test gate sits between Work and Review (#200).
-    assert cfg.pipeline.gates_for_label("coord") == ["test", "review", "merge"]
-    assert cfg.pipeline.gates_for_label(None) == ["test", "review", "merge"]
+    # Default default_gates: Review comes before Test in the default order (#520).
+    assert cfg.pipeline.gates_for_label("coord") == ["review", "test", "merge"]
+    assert cfg.pipeline.gates_for_label(None) == ["review", "test", "merge"]
 
 
 # ── concurrency: daemon-spawn stall mitigations (#299) ───────────────────────
