@@ -538,6 +538,19 @@ struct ArtifactPullResult {
     finished_at: Instant,
 }
 
+/// #532: State for the re-openable artifact-pull info dialog.
+///
+/// Shown after `coord pull-artifact` completes (success or failure), and
+/// re-openable at any time by pressing `a` again on the same pipeline row.
+#[derive(Clone)]
+struct ArtifactPullDialog {
+    /// The local destination path on success, or `None` on failure / absence.
+    /// Only `Some` when a copy-to-clipboard action is meaningful.
+    path: Option<String>,
+    /// Human-readable body text rendered in the dialog.
+    body: String,
+}
+
 /// #349: One step in a generated smoke-test plan.  Parsed from the JSON stored
 /// in `assignments.test_plan` when the DB row is loaded.
 #[derive(Clone, Debug)]
@@ -4157,13 +4170,16 @@ pub struct CoordApp {
     )>,
     /// #336: Tracks a pending `coord pull-artifact` dispatch.
     /// Contains `(work_id, repo, sanitized_branch)` so we can show the
-    /// destination path in a completion toast.
+    /// destination path in a completion dialog.
     pending_artifact_pull: Option<(String, String, String)>,
     /// #434: Durable record of the last `coord pull-artifact` per work-id.
     /// Keyed by `work_id`.  Drives the persistent "Last pull: …" line in the
-    /// Pipeline detail panel so the user who missed the 4 s toast can still
+    /// Pipeline detail panel so the user who missed the initial dialog can still
     /// see the result.
     last_artifact_pulls: std::collections::HashMap<String, ArtifactPullResult>,
+    /// #532: Open artifact-pull info dialog.  `Some` while the dialog is
+    /// visible.  Cleared on dismiss (Esc / outside click / 'c' copy action).
+    artifact_pull_dialog: Option<ArtifactPullDialog>,
     /// #399: Cache for parsed/wrapped log content items.
     ///
     /// Avoids the full O(n) re-parse of every log line on every render tick
@@ -4464,6 +4480,7 @@ impl CoordApp {
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
             last_artifact_pulls: std::collections::HashMap::new(),
+            artifact_pull_dialog: None,
             log_items_cache: std::cell::RefCell::new(None),
             test_plan_pending: std::collections::HashSet::new(),
             test_plan_staleness_checked_for: None,
@@ -12507,7 +12524,7 @@ impl CoordApp {
                 // #369/#329: an open prompt dialog intercepts all clicks
                 // first (highest z-order) — outside → dismiss; on a
                 // button → fire action; inside body → swallow.
-                if let Some(handled) = self.handle_dialog_click(pos) {
+                if let Some(handled) = self.handle_dialog_click(pos, backend) {
                     return handled;
                 }
                 // #259: an open context menu intercepts all clicks next
@@ -14823,6 +14840,52 @@ impl CoordApp {
             });
         }
 
+        // ── Artifact-pull result (#532) ─────────────────────────────────────
+        // Info dialog shown after `coord pull-artifact` completes, and
+        // re-openable at any time by pressing `a` on the same pipeline row.
+        if let Some(ref dlg) = self.artifact_pull_dialog {
+            let buttons = if dlg.path.is_some() {
+                vec![
+                    DialogButton {
+                        id: WidgetId::new("copy"),
+                        label: "c  Copy path".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: Some(Color::rgb(60, 200, 80)),
+                    },
+                    DialogButton {
+                        id: WidgetId::new("close"),
+                        label: "Esc  Close".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ]
+            } else {
+                vec![DialogButton {
+                    id: WidgetId::new("close"),
+                    label: "Esc  Close".into(),
+                    is_default: true,
+                    is_cancel: true,
+                    tint: None,
+                }]
+            };
+            let severity = if dlg.path.is_some() {
+                Some(DialogSeverity::Info)
+            } else {
+                Some(DialogSeverity::Warning)
+            };
+            return Some(Dialog {
+                id: WidgetId::new("dialog:artifact-pull"),
+                title: StyledText::plain("Artifacts"),
+                body: vec![StyledText::plain(dlg.body.clone())],
+                buttons,
+                severity,
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         None
     }
 
@@ -14905,7 +14968,7 @@ impl CoordApp {
     /// swallowed inside the dialog body), `Some(false)` when no dialog
     /// layout is cached (no dialog showing), and the outside-click case
     /// dismisses the dialog and returns `Some(true)`.
-    fn handle_dialog_click(&mut self, pos: Point) -> Option<bool> {
+    fn handle_dialog_click(&mut self, pos: Point, backend: &mut dyn Backend) -> Option<bool> {
         let layout = self.dialog_layout.borrow().clone()?;
         match layout.hit_test(pos.x, pos.y) {
             DialogHit::Outside => {
@@ -14919,7 +14982,7 @@ impl CoordApp {
             }
             DialogHit::Button(id) => {
                 let id_str = id.as_str().to_string();
-                self.fire_dialog_button(&id_str);
+                self.fire_dialog_button(&id_str, backend);
                 Some(true)
             }
         }
@@ -14946,13 +15009,15 @@ impl CoordApp {
             self.pending_restart = None;
         } else if self.pending_purge.is_some() {
             self.pending_purge = None;
+        } else if self.artifact_pull_dialog.is_some() {
+            self.artifact_pull_dialog = None;
         }
         *self.dialog_layout.borrow_mut() = None;
     }
 
     /// Fire the action associated with a dialog button id.
     /// Button ids mirror those set in `build_prompt_dialog`.
-    fn fire_dialog_button(&mut self, id: &str) {
+    fn fire_dialog_button(&mut self, id: &str, backend: &mut dyn Backend) {
         // ── Repo picker ──────────────────────────────────────────────────
         if self.pending_repo_picker.is_some() {
             if id == "cancel" {
@@ -15197,6 +15262,23 @@ impl CoordApp {
                     self.pending_purge = None;
                 }
             }
+            *self.dialog_layout.borrow_mut() = None;
+        }
+
+        // ── Artifact-pull result (#532) ─────────────────────────────────────
+        if self.artifact_pull_dialog.is_some() {
+            if id == "copy" {
+                if let Some(path) = self
+                    .artifact_pull_dialog
+                    .as_ref()
+                    .and_then(|d| d.path.clone())
+                {
+                    backend.services().clipboard().write_text(&path);
+                    self.push_toast("Copied", "Path copied to clipboard", ToastSeverity::Info);
+                }
+            }
+            // Both "copy" and "close" dismiss the dialog.
+            self.artifact_pull_dialog = None;
             *self.dialog_layout.borrow_mut() = None;
         }
     }
@@ -17936,9 +18018,10 @@ impl CoordApp {
                     }
                 }
             }
-            // #336 / #434: pull-artifact completion — show the local
-            // destination path and persist a durable record so it survives
-            // the 4-second toast.
+            // #336 / #434 / #532: pull-artifact completion — open an info
+            // dialog showing the full destination path (success) or the
+            // error message (failure).  Replaces the 4-second toast with a
+            // re-openable, copyable dialog; the durable panel line remains.
             if let Some((work_id, repo, sanitized)) = &self.pending_artifact_pull.clone() {
                 if result.label.contains(&format!("pull-artifact {}", work_id)) {
                     self.pending_artifact_pull = None;
@@ -17947,22 +18030,30 @@ impl CoordApp {
                         let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
                         let path = format!("{home}/.coord/artifacts/{repo}/{sanitized}/");
                         pull_message = path.clone();
-                        self.push_toast(
-                            "Artifacts ready",
-                            &format!("Saved to {path}"),
-                            ToastSeverity::Info,
-                        );
+                        // #532: open dialog instead of ephemeral toast.
+                        self.artifact_pull_dialog = Some(ArtifactPullDialog {
+                            path: Some(path.clone()),
+                            body: format!("Saved to:\n{}", path),
+                        });
                     } else {
-                        // Generic failure toast already fired from
-                        // command_runner.poll() above — just capture the
-                        // error text for the durable panel line.
+                        // Capture the error text for the dialog and the
+                        // durable panel line.
                         pull_message =
                             first_meaningful_stderr_line(&result.stderr).unwrap_or_else(|| {
                                 format!("exit {} — no stderr captured", result.exit_code)
                             });
+                        // #532: open dialog showing the failure reason.
+                        self.artifact_pull_dialog = Some(ArtifactPullDialog {
+                            path: None,
+                            body: format!(
+                                "Pull failed (exit {}):\n{}",
+                                result.exit_code, pull_message
+                            ),
+                        });
                     }
                     // #434: persist the result so it remains visible after
-                    // the toast dismisses.
+                    // the dialog dismisses (drives the "Last pull: …" panel
+                    // line and lets `a` re-open the dialog).
                     self.last_artifact_pulls.insert(
                         work_id.clone(),
                         ArtifactPullResult {
@@ -20607,6 +20698,34 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── #532: Artifact-pull dialog: intercept ALL key presses ───────────
+        // While the info dialog is open, 'c'/'C' copies the destination path
+        // (when available); any other key — including Esc — closes the dialog.
+        if self.artifact_pull_dialog.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                let path = self
+                    .artifact_pull_dialog
+                    .as_ref()
+                    .and_then(|d| d.path.clone());
+                match key {
+                    Key::Char('c') | Key::Char('C') if path.is_some() => {
+                        if let Some(p) = path {
+                            backend.services().clipboard().write_text(&p);
+                            self.push_toast(
+                                "Copied",
+                                "Path copied to clipboard",
+                                ToastSeverity::Info,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                self.artifact_pull_dialog = None;
+                *self.dialog_layout.borrow_mut() = None;
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #245: Pending --force-merge confirmation: intercept ALL keys ──
         // The user has pressed `m` while the "Checks failed" hint was visible.
         // We refuse to bypass the CI gate without an explicit y/Y so a
@@ -21977,28 +22096,83 @@ impl ShellApp for CoordApp {
                         }
                     }
 
-                    // ── #336: a — pull artifacts from agent machine ────────
-                    // Only fires when the artifact badge is visible (non-empty
-                    // manifest in the 30 s TTL cache) — guards against a stale
-                    // `a` press when no artifacts have been stashed.
+                    // ── #336 / #532: a — pull artifacts or re-open dialog ──
+                    // Priority order:
+                    //   1. Cached pull result → re-open the info dialog.
+                    //   2. Non-empty manifest (badge visible) → start the pull.
+                    //   3. Known absence reason → open dialog explaining why.
+                    // No-op when the fetch is still in-flight or no work
+                    // assignment is visible.
                     Key::Char('a')
-                        if self.active_view == SidebarView::Pipeline
-                            && self.artifact_badge_visible() =>
+                        if self.active_view == SidebarView::Pipeline =>
                     {
-                        use crate::commands::SpawnQueuedOutcome;
-                        if let Some((_, repo, sanitized, work_id)) = self.artifact_fetch_target() {
-                            let outcome = self
-                                .command_runner
-                                .spawn_queued(&["pull-artifact", &work_id]);
-                            if outcome != SpawnQueuedOutcome::Deduped {
-                                self.pending_artifact_pull =
-                                    Some((work_id.clone(), repo, sanitized));
-                                let status_msg = if outcome == SpawnQueuedOutcome::Queued {
-                                    "Pull artifacts queued…"
+                        if let Some((_, repo, sanitized, work_id)) =
+                            self.artifact_fetch_target()
+                        {
+                            // 1. Existing pull result → re-open the dialog.
+                            if let Some(pull) =
+                                self.last_artifact_pulls.get(&work_id).cloned()
+                            {
+                                self.artifact_pull_dialog = Some(if pull.exit_code == 0 {
+                                    ArtifactPullDialog {
+                                        path: Some(pull.message.clone()),
+                                        body: format!("Saved to:\n{}", pull.message),
+                                    }
                                 } else {
-                                    "Pulling artifacts…"
-                                };
-                                self.pipeline_status = Some((status_msg.into(), Instant::now()));
+                                    ArtifactPullDialog {
+                                        path: None,
+                                        body: format!(
+                                            "Pull failed (exit {}):\n{}",
+                                            pull.exit_code, pull.message
+                                        ),
+                                    }
+                                });
+                            } else if self.artifact_badge_visible() {
+                                // 2. Badge visible → start the pull.
+                                use crate::commands::SpawnQueuedOutcome;
+                                let outcome = self
+                                    .command_runner
+                                    .spawn_queued(&["pull-artifact", &work_id]);
+                                if outcome != SpawnQueuedOutcome::Deduped {
+                                    self.pending_artifact_pull =
+                                        Some((work_id.clone(), repo.clone(), sanitized.clone()));
+                                    let status_msg = if outcome == SpawnQueuedOutcome::Queued {
+                                        "Pull artifacts queued…"
+                                    } else {
+                                        "Pulling artifacts…"
+                                    };
+                                    self.pipeline_status =
+                                        Some((status_msg.into(), Instant::now()));
+                                }
+                            } else {
+                                // 3. Known absence → open dialog with reason.
+                                let key = (repo.clone(), sanitized.clone());
+                                if let Some(body) = self
+                                    .artifact_cache
+                                    .get(&key)
+                                    .and_then(|e| e.absence_reason.as_ref())
+                                    .map(|absence| match absence {
+                                        ArtifactAbsence::NotStashed => format!(
+                                            "No artifacts stashed (branch {}).\n\
+                                             Worker produced no files matching the \
+                                             configured globs, or artifact_paths is not \
+                                             set in coordinator.yml.",
+                                            sanitized
+                                        ),
+                                        ArtifactAbsence::ManifestEmpty => {
+                                            "Artifact manifest is empty — \
+                                             no files were stashed."
+                                                .to_string()
+                                        }
+                                        ArtifactAbsence::AgentUnreachable(e) => {
+                                            let msg: String = e.chars().take(200).collect();
+                                            format!("Agent unreachable:\n{}", msg)
+                                        }
+                                    })
+                                {
+                                    self.artifact_pull_dialog =
+                                        Some(ArtifactPullDialog { path: None, body });
+                                }
                             }
                         }
                         needs_redraw = true;
@@ -23561,6 +23735,7 @@ mod tests {
             artifact_fetch_rx: None,
             pending_artifact_pull: None,
             last_artifact_pulls: std::collections::HashMap::new(),
+            artifact_pull_dialog: None,
             log_items_cache: std::cell::RefCell::new(None),
             test_plan_pending: std::collections::HashSet::new(),
             test_plan_staleness_checked_for: None,
