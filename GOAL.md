@@ -3,7 +3,7 @@
 > **The living, cross-repo / cross-machine objective for the coordinator and every agent it dispatches.**
 > This is *meta-level*: above any single issue, repo, or session (and broader than Claude's own per-session goal feature). Both humans and agents may edit it as priorities evolve — keep it short, current, and re-date the Status line. `coordinator.yml` is the source of truth for *topology*; **this file is the source of truth for *intent*.**
 >
-> _Last updated: 2026-06-08_
+> _Last updated: 2026-06-11_
 
 ## 🎯 North star
 
@@ -13,24 +13,34 @@
 
 On **2026-06-15** Anthropic begins billing `claude -p` / Agent SDK at full API rates, which kills the "free subscription" worker model. **Human-attended interactive sessions are the ToS-compliant escape hatch** — interactive means a human is attending; automation stays on metered API-key `claude -p`. So this must work *before* June 15. (See #322, #437; no TTY scraping — #426 closed on ToS.)
 
-## Critical path
+## Critical path — the interactive-mode migration (target June 12)
+
+The active plan is **migrate the metered pipeline stages to human-attended
+interactive sessions** (Claude Max, subscription) launched from the board, with
+auto-dispatched `claude -p` kept as a **#524-capped fallback** (not a hard
+cutover). The big design insight: interactive Review/Smoke report verdicts via
+the already-merged `coord report-result` path — **the #478 MCP server is NOT on
+the critical path** (demoted to Horizon).
 
 | Leg | State | Issues |
 |---|---|---|
-| **Launch from the board** — Work/Plan interactive session, right repo, isolated worktree | 🟢 merged | #467, #480 |
-| **Paste fallback** | 🟢 merged | #468 |
-| **Terminal feel** — selection, mouse/wheel, paste, scrollback | 🟢 merged | #464, #454/#455, #283 |
-| **Result out — basic** — git-floor backstop + `coord report-result` through the IssueStore seam | 🟢 merged | #466, #448 |
-| **Result out — MCP handoff** — agent → hosted MCP server → IssueStore, so each stage's result drives the next (e.g. an interactive review session updates the issue → the rework session knows what to fix). The eventual form of result-out; agent still never touches `gh`. | 🔴 **NEXT** | #478, #183 |
-| **Gate: manual smoke after review-approve** — reorder to Work→Review→**Smoke**→Merge, with a fail→fix→re-review loop | ⚪ designed | #465 |
-| **Reliability — artifact-pull `[a]` badge intermittently missing** | 🔴 bug | #433 |
+| **Launch Work/Plan from the board** — right repo, isolated worktree | 🟢 merged | #467, #480 |
+| **Paste fallback / terminal feel** — selection, mouse/wheel, paste, scrollback | 🟢 merged | #468, #464, #454/#455, #283 |
+| **Result out** — git-floor backstop + `coord report-result` through the IssueStore seam | 🟢 merged | #466, #448 |
+| **Session resilience** — survive a TUI crash, reattachable (tmux named sessions) | 🟢 merged | #487, #490 |
+| **Two-tier test gate** — automated build/test before review, human smoke after approve | 🟢 merged | #465 |
+| **A1 — interactive Review dispatch** (`coord assign --interactive --review-of`) | 🟡 **PR #538, needs real-terminal smoke** | — |
+| **A2 — TUI "Review (interactive)" board action** | 🔴 **NEXT** | — |
+| **A3 — interactive Smoke** (`--smoke-of`) | ⚪ designed | — |
+| **Track B — remote fleet** (ssh+tmux; Review/Smoke read-only first) | ⚪ designed | #486, #493/#499 |
 
-## Status (2026-06-08)
+## Status (2026-06-11)
 
-- ✅ **The board can now LAUNCH interactive Work/Plan sessions safely** — #467 (launch) + Bug A (resolve repo from the selected row, not by number) + #480 (isolated worktree per session) merged to `main`, adversarially reviewed; #464 selection in; `coord-tui` rebuilt + installed.
-- 📋 **Next, in order:** **#478 MCP result-out** — the stage-to-stage handoff; the prerequisite for driving the *full* pipeline (not just single sessions) through the board → **#465 two-tier test gate** (manual smoke after review-approve) → **#433** artifact-pull fix.
-- 🧭 **Open design Q — where do automated tests gate?** Recommendation: keep automated tests a *work-stage* expectation (workers already run build+test) enforced by **CI on the PR** — but **CI is pytest-only**, so Rust repos (tui/quadraui/vimcode) have no automated gate today; they need an explicit `cargo build && cargo test` gate (extend CI, or a pre-merge verify step) rather than a separate pre-PR stage for Python. The distinct lifecycle **Test/Smoke** stage is the *human* smoke after review-approve (#465).
-- 🛡 **Open reliability:** precision agent unreachable (paused — needs an AGENT_OPERATIONS look); a PyPI release + `coord agent update` still pending to propagate agent-side #480/#448/#466 bits to the fleet.
+- ✅ **Board launches interactive Work/Plan safely**; result-out, tmux resilience, and the two-tier test gate are all merged (#465/#433/#487 now **closed** — GOAL's old "NEXT: #478" was stale).
+- ✅ **A1 (interactive Review dispatch) implemented** — `coord assign --interactive --review-of <work_aid>`: review-shaped dispatch (`type=review` linked to the work so the merge gate finds the verdict), diff-only briefing, read-only in the live checkout (no worktree), `finalize(worktree_path=None)`. PR #538, **2044 tests pass** — **awaiting a real-terminal smoke** before merge (the #425 lesson: PTY behavior isn't unit-testable).
+- 🛡 **Flood control landed today** — the #476 decision gate (request-changes with 0 blocking → advance, don't re-dispatch a fix) + incremental re-reviews are live on `main`, validated in the wild on #436 (a `blocking=0 nonblocking=5` review auto-advanced instead of churning). Follow-up persist fix (#537) shipped.
+- 📋 **Next, in order:** smoke + merge **A1 (#538)** → **A2** TUI "Review (interactive)" action → **A3** interactive Smoke → **Track B** remote (start with dellserver, read-only Review/Smoke).
+- 🧭 **Open design Q — where do automated tests gate?** CI is pytest-only, so Rust repos (tui/quadraui/vimcode) still have no automated gate; they need an explicit `cargo build && cargo test` gate (extend CI, or a pre-merge verify step).
 
 ## Horizon (beyond the deadline)
 
