@@ -453,8 +453,16 @@ def build_review_briefing(
     reviews_cfg: ReviewsConfig,
     repo_claude_md: str | None,
     default_branch: str = "main",
+    review_iteration: int = 0,
 ) -> str:
-    """Assemble the reviewer's prompt. Pure function — easy to test."""
+    """Assemble the reviewer's prompt. Pure function — easy to test.
+
+    When *review_iteration* > 0 the work is a re-review of a fix worker's
+    commits (a prior round requested changes). The "What to do" section is
+    then scoped to the fix delta instead of the whole PR (#476): re-reviewing
+    the entire PR every round repeats work, wastes tokens, and surfaces fresh
+    non-blocking nits that bounce an already-correct PR into another fix cycle.
+    """
 
     lines: list[str] = []
     lines.append(f"# Review assignment: {repo_github} PR #{pr_number}")
@@ -515,7 +523,39 @@ def build_review_briefing(
     lines.append("")
     lines.append("## What to do")
     lines.append("")
-    if pr_number is not None:
+    if review_iteration > 0:
+        # #476: re-review. A prior round requested changes and the worker
+        # pushed fix commits. Scope to the fix delta — do NOT re-review the
+        # whole PR from scratch, and do NOT raise NEW non-blocking nits on
+        # already-accepted code. Only a genuine bug or an unaddressed
+        # previously-requested change should block.
+        lines.append(
+            f"**This is re-review iteration {review_iteration}.** A previous "
+            "review requested changes and the worker has pushed fix commits "
+            "since then. Scope your review to those fixes — do NOT re-review "
+            "the entire PR from scratch."
+        )
+        lines.append("")
+        lines.append(
+            "1. See what changed since the last review: "
+            f"`git fetch origin && git log --oneline origin/{default_branch}..."
+            f"origin/{branch or 'HEAD'}`. The most recent commit(s) are the fix "
+            "for the last review round — concentrate there."
+        )
+        lines.append(
+            "2. Verify the previously-requested changes were correctly made and "
+            "that the fix commits introduce no regressions."
+        )
+        lines.append(
+            "3. **Do NOT raise new non-blocking nits on unchanged, "
+            "already-reviewed code.** Block (`request-changes`) ONLY for a "
+            "genuine bug or a previously-requested change that was not "
+            "addressed. If the fix is correct and you only have minor polish "
+            "suggestions, **approve** and list them as non-blocking notes — "
+            "the coordinator will not dispatch another fix round for "
+            "non-blocking findings."
+        )
+    elif pr_number is not None:
         lines.append(
             f"1. Get the diff: `git fetch origin && git diff origin/{default_branch}..."
             f"origin/{branch or 'HEAD'}` or ask the coordinator for the diff."
@@ -710,6 +750,9 @@ def dispatch_review(
         reviews_cfg=config.reviews,
         repo_claude_md=claude_md,
         default_branch=repo.default_branch,
+        # #476: a fix worker carries review_iteration > 0; its re-review is
+        # scoped to the fix delta rather than re-reviewing the whole PR.
+        review_iteration=getattr(completed, "review_iteration", 0) or 0,
     )
 
     # Pin the reviewer's model.  Without this the payload omits `model`

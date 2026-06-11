@@ -46,6 +46,7 @@ from coord.models import Assignment, Board
 from coord.review import (
     ReviewFindings,
     dispatch_review,
+    estimate_review_counts,
     parse_review_from_agent,
     parse_review_from_log,
 )
@@ -64,6 +65,9 @@ class LoopAction:
     """One of:
     - ``"fix_dispatched"``     — a fix worker was dispatched
     - ``"approved"``           — review approved; no further action needed
+    - ``"approved_with_nits"`` — review said request-changes but flagged no
+                                 blocking findings (#476); pipeline advanced and
+                                 no fix dispatched
     - ``"max_iterations"``     — loop stopped; user intervention required
     - ``"no_findings"``        — log had no structured REVIEW_VERDICT block
     - ``"no_work_found"``      — could not locate the work assignment on the board
@@ -203,42 +207,139 @@ def process_review_completion(
     review.review_verdict = findings.verdict
 
     if findings.verdict == "approve":
-        # Mark the work assignment's review as done for board consistency.
-        if review.review_of_assignment_id:
-            work = board.find_by_id(review.review_of_assignment_id)
-            if work is not None:
-                work.review_state = "done"
-                # #292 (Defect 2): proactively enqueue/refresh the merge queue
-                # entry so the TUI shows the Merge stage as ready without
-                # requiring a manual `coord merge` run first.  If the entry was
-                # keyed to an earlier work assignment (the original pre-bounce
-                # assignment), refresh_entry_assignment updates its
-                # assignment_id so has_approved_review can find this approval.
-                try:
-                    from coord import merge_queue as mq  # noqa: PLC0415
-                    repo_cfg = config.repo(work.repo_name)
-                    if repo_cfg is not None and work.branch:
-                        mq.refresh_entry_assignment(
-                            work,
-                            repo_github=repo_cfg.github,
-                            target_branch=repo_cfg.default_branch,
-                        )
-                except Exception as exc:  # noqa: BLE001 — best-effort; merge gate still works
-                    log.warning(
-                        "auto_loop: refresh_entry_assignment failed for %s: %s",
-                        work.assignment_id, exc,
-                    )
-        return [LoopAction(
+        return _advance_pipeline(
+            review, board, config,
             kind="approved",
-            assignment_id=review.assignment_id,
             detail="Review verdict: approve — pipeline advancing",
-        )]
+        )
 
-    # verdict == "request-changes" → try to dispatch a fix worker.
+    # verdict == "request-changes". #476 decision gate: a request-changes
+    # verdict that flags NO blocking findings — only non-blocking observations
+    # or nits — must NOT trigger another fix+review cycle. Doing so churns an
+    # already-correct PR over cosmetic suggestions and burns the session budget
+    # (the 2026-06-11 #532 incident: 3 real fix rounds, then a 4th round
+    # dispatched over a single cosmetic one-liner the reviewer itself counted
+    # as non-blocking). Treat advisory-only request-changes as approve-with-
+    # nits: advance the pipeline, surface the nits, and do not dispatch a fix.
+    blocking, nonblocking, nits = estimate_review_counts(findings.body)
+    parsed_any = any(c is not None for c in (blocking, nonblocking, nits))
+    has_blocking = bool(blocking)  # None or 0 → no blocking findings detected
+    if parsed_any and not has_blocking:
+        log.info(
+            "auto_loop: request-changes with no blocking findings for review %s "
+            "(blocking=%r nonblocking=%r nits=%r) — advancing as approve-with-"
+            "nits, not dispatching a fix",
+            review.assignment_id, blocking, nonblocking, nits,
+        )
+        # The merge gate keys off review_verdict; record approve so the nits
+        # don't block the merge. The nits remain visible in the review comment
+        # already posted to the PR, plus the advisory notice below.
+        review.review_verdict = "approve"
+        _post_advisory_nits_notice(review, board, config, nonblocking, nits)
+        return _advance_pipeline(
+            review, board, config,
+            kind="approved_with_nits",
+            detail=(
+                "Review requested changes but flagged no blocking issues "
+                f"(nonblocking={nonblocking}, nits={nits}) — advancing as "
+                "approve-with-nits; no fix dispatched"
+            ),
+        )
+
+    # Genuine blocking findings (or counts unparseable) → dispatch a fix worker.
     return _dispatch_fix_for_review(
         review, findings, board, config,
         http_client=http_client, terminal_cache=terminal_cache,
     )
+
+
+def _advance_pipeline(
+    review: Assignment,
+    board: Board,
+    config: Config,
+    *,
+    kind: str,
+    detail: str,
+) -> list[LoopAction]:
+    """Mark the reviewed work approved and refresh its merge-queue entry.
+
+    Shared by the plain ``approve`` path and the #476 approve-with-nits path so
+    both advance the pipeline identically (the only difference is the action
+    ``kind``/``detail`` reported back to the caller).
+    """
+    if review.review_of_assignment_id:
+        work = board.find_by_id(review.review_of_assignment_id)
+        if work is not None:
+            work.review_state = "done"
+            # #292 (Defect 2): proactively enqueue/refresh the merge queue
+            # entry so the TUI shows the Merge stage as ready without requiring
+            # a manual `coord merge` run first. If the entry was keyed to an
+            # earlier work assignment (the original pre-bounce assignment),
+            # refresh_entry_assignment updates its assignment_id so
+            # has_approved_review can find this approval.
+            try:
+                from coord import merge_queue as mq  # noqa: PLC0415
+                repo_cfg = config.repo(work.repo_name)
+                if repo_cfg is not None and work.branch:
+                    mq.refresh_entry_assignment(
+                        work,
+                        repo_github=repo_cfg.github,
+                        target_branch=repo_cfg.default_branch,
+                    )
+            except Exception as exc:  # noqa: BLE001 — best-effort; merge gate still works
+                log.warning(
+                    "auto_loop: refresh_entry_assignment failed for %s: %s",
+                    work.assignment_id, exc,
+                )
+    return [LoopAction(kind=kind, assignment_id=review.assignment_id, detail=detail)]
+
+
+def _post_advisory_nits_notice(
+    review: Assignment,
+    board: Board,
+    config: Config,
+    nonblocking: int | None,
+    nits: int | None,
+) -> None:
+    """Post a short audit-trail comment when the loop auto-advances past an
+    advisory-only request-changes verdict (#476).
+
+    Keeps the auto-advance *visible* — the user was previously burned by silent
+    auto-loop behaviour. Best-effort: a gh failure must never block the
+    pipeline. The full findings are already on the PR via the review comment;
+    this just records the decision not to dispatch another fix round.
+    """
+    work = (
+        board.find_by_id(review.review_of_assignment_id)
+        if review.review_of_assignment_id
+        else None
+    )
+    if work is None:
+        return
+    repo = config.repo(work.repo_name)
+    if repo is None:
+        return
+    from coord import github_ops  # noqa: PLC0415
+
+    body = (
+        f"<!-- coord:event=auto_loop_advisory_advance assignment={work.assignment_id} -->\n"
+        f"## ✅ Auto-advanced past advisory review (no blocking findings)\n\n"
+        f"The latest review of issue **#{work.issue_number}** returned "
+        f"`request-changes` but flagged **no blocking findings** "
+        f"(non-blocking={nonblocking}, nits={nits}). Per the #476 decision "
+        f"gate, the coordinator is **not** dispatching another fix round over "
+        f"non-blocking suggestions — the PR advances to the merge gate.\n\n"
+        f"The reviewer's notes remain in the review comment above. If any nit "
+        f"is in fact a must-fix, dispatch a fix manually with `coord assign` "
+        f"or bounce it before merging.\n"
+    )
+    try:
+        github_ops.post_issue_comment(repo.github, work.issue_number, body)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "auto_loop: failed to post advisory-advance notice for %s: %s",
+            work.assignment_id, exc,
+        )
 
 
 def _fix_model_for_iteration(config: Config, iteration: int) -> str | None:
