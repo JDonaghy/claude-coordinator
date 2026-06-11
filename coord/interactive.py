@@ -69,6 +69,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -109,6 +110,15 @@ __all__ = [
 #: ``coord-<assignment_id>`` so that a ``tmux ls`` output can be filtered
 #: cheaply and the assignment_id is directly recoverable.
 TMUX_SESSION_PREFIX = "coord-"
+
+
+def _get_local_short_hostname() -> str:
+    """Return the short hostname of the local machine (split on '.' and lowercased).
+
+    Isolated into a helper so tests can patch ``coord.interactive._get_local_short_hostname``
+    without monkey-patching the global ``socket`` module.
+    """
+    return socket.gethostname().split(".")[0].lower()
 
 
 @dataclass(frozen=True)
@@ -995,16 +1005,33 @@ def reap_stale_interactive_sessions(
     relay is handled synchronously inside ``coord assign``, so no orphan
     accumulates there.
 
-    For each stale session the function:
+    **Remote sessions are skipped.** :func:`tmux_session_alive` probes only the
+    local tmux server; a remote interactive session launched via ``coord assign
+    --interactive <remote>`` stores ``machine_name=<remote>`` in the DB and
+    runs its tmux session on that host.  If the reaper were allowed to proceed,
+    it would see ``tmux_session_alive() == False`` (no local session) and
+    falsely stamp the remote session ``failed`` while it is still live.  The
+    reaper therefore skips any assignment whose machine does not resolve to the
+    local host.
 
-    1. Removes the interactive worktree at
+    For each stale **local** session the function:
+
+    1. Counts commits the worktree is ahead of the base branch (before
+       removing the worktree, so git can still run).
+    2. Removes the interactive worktree at
        ``~/.coord/worktrees/<assignment_id>`` (best-effort via
        :func:`_remove_worktree`; falls back to ``shutil.rmtree``).
-    2. Marks the assignment ``failed`` in the SQLite DB (only when the row
-       is still ``running`` / ``pending`` — a ``coord report-result`` that
-       raced the reaper is left untouched).
-    3. Moves the assignment from ``board.active`` to ``board.completed``
-       via :meth:`~coord.models.Board.mark_failed_by_id`.
+    3. Marks the assignment in the SQLite DB (only when the row is still
+       ``running`` / ``pending`` — a ``coord report-result`` that raced the
+       reaper is left untouched):
+
+       - ``advisory`` when the worktree had 0 commits ahead of the base branch
+         (the operator killed the session before producing any work).
+       - ``failed`` otherwise (commits ≥ 1 or the count is unknown because the
+         worktree was absent when the reaper ran).
+
+    4. Moves the assignment from ``board.active`` to ``board.completed``
+       and sets the in-memory status to match the DB value.
 
     Returns the assignment IDs that were reaped.  The caller should include
     these in its ``changed`` list so ``save_board`` is triggered.
@@ -1018,6 +1045,8 @@ def reap_stale_interactive_sessions(
         worktrees_dir = COORD_DIR / "worktrees"
 
     machines_by_name = {m.name: m for m in config.machines}
+    repos_by_name = {r.name: r for r in config.repos}
+    _local_hn = _get_local_short_hostname()
     reaped: list[str] = []
     now = time.time()
 
@@ -1033,18 +1062,51 @@ def reap_stale_interactive_sessions(
         if tmux_session_alive(sname):
             continue  # session is live — leave it alone
 
-        # ── Session is dead: clean up the orphaned state ──────────────────
+        # ── Session is dead locally: check it's actually a LOCAL session ──
 
-        wt_path = worktrees_dir / a.assignment_id
+        # Reconstruct machine info for locality check and repo path lookup.
+        machine = machines_by_name.get(a.machine_name or "")
+
+        # Remote-machine guard (#515 follow-up): tmux_session_alive() only
+        # checks the coordinator's local tmux server.  A remote session (coord
+        # assign --interactive <remote_host>) runs on a different machine and
+        # will always appear "not alive" locally even while it's running.
+        # Skip the reap entirely so we don't falsely stamp a live remote
+        # session as failed and release its dispatch claim.
+        if machine is not None:
+            _is_local = (
+                machine.name.lower() == _local_hn
+                or machine.host.split(".")[0].lower() == _local_hn
+            )
+            if not _is_local:
+                continue  # remote session — leave it alone
+        elif a.machine_name:
+            # machine_name is set but not found in config — unknown host;
+            # skip rather than risk a false-positive reap.
+            continue
+        # else: machine_name is None/empty → coordinator-local session, proceed
 
         # Reconstruct the repo root so ``git worktree remove`` can run
         # relative to it; fall back to shutil.rmtree when unavailable.
         repo_path_val: str | None = None
-        machine = machines_by_name.get(a.machine_name or "")
         if machine is not None and a.repo_name:
             rp = machine.repo_path(a.repo_name)
             if rp:
                 repo_path_val = str(Path(rp).expanduser())
+
+        # ── Determine terminal status from commit count ────────────────────
+        # Count commits ahead of the base branch BEFORE removing the worktree
+        # so that git can still run against it.
+        #   advisory: 0 commits — session died before producing any work.
+        #   failed:   ≥1 commits or unknown — abandoned work-in-progress.
+        wt_path = worktrees_dir / a.assignment_id
+        commits: int | None = None
+        if wt_path.exists():
+            repo = repos_by_name.get(a.repo_name or "")
+            base_branch = repo.default_branch if repo is not None else "main"
+            from coord.agent import _commits_ahead  # noqa: PLC0415
+            commits = _commits_ahead(wt_path, base_branch)
+        terminal_status = "advisory" if commits == 0 else "failed"
 
         # 1. Remove worktree (best-effort).
         if wt_path.exists():
@@ -1064,13 +1126,13 @@ def reap_stale_interactive_sessions(
                 except OSError:
                     pass
 
-        # 2. Mark ``failed`` in the DB if the row is still in a running state.
+        # 2. Mark ``terminal_status`` in the DB if the row is still live.
         try:
             conn = get_connection()
             conn.execute(
-                "UPDATE assignments SET status='failed', finished_at=? "
+                "UPDATE assignments SET status=?, finished_at=? "
                 "WHERE assignment_id=? AND status IN ('running', 'pending')",
-                (now, a.assignment_id),
+                (terminal_status, now, a.assignment_id),
             )
             conn.commit()
         except Exception:  # noqa: BLE001
@@ -1078,7 +1140,11 @@ def reap_stale_interactive_sessions(
 
         # 3. Update in-memory board so the claim is released immediately
         #    (without waiting for the next build_board() call).
-        board.mark_failed_by_id(a.assignment_id, finished_at=now)
+        moved = board.mark_failed_by_id(a.assignment_id, finished_at=now)
+        # mark_failed_by_id always sets status="failed"; upgrade to advisory
+        # when the commit count shows no work was produced.
+        if moved is not None and terminal_status == "advisory":
+            moved.status = "advisory"
         reaped.append(a.assignment_id)
 
     return reaped

@@ -42,6 +42,35 @@ machines:
       myrepo: /tmp/myrepo
 """
 
+#: Config variant with a second, clearly-remote machine entry.
+_CONFIG_YAML_WITH_REMOTE = """\
+repos:
+  - name: myrepo
+    github: acme/myrepo
+    default_branch: main
+machines:
+  - name: mymachine
+    host: mymachine.tailnet
+    repos: [myrepo]
+    repo_paths:
+      myrepo: /tmp/myrepo
+  - name: remotemachine
+    host: remotemachine.tailnet
+    repos: [myrepo]
+    repo_paths:
+      myrepo: /tmp/myrepo
+"""
+
+
+def _minimal_config_with_remote() -> Any:
+    """Load the config variant that includes the remote machine."""
+    import tempfile
+    from coord.config import load as _load_cfg
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        f.write(_CONFIG_YAML_WITH_REMOTE)
+        f.flush()
+        return _load_cfg(f.name)
+
 
 @pytest.fixture
 def config_file(tmp_path: Path) -> Path:
@@ -139,6 +168,7 @@ class TestReapStaleInteractiveSessions:
         cfg = _minimal_config()
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reaped = reap_stale_interactive_sessions(board, cfg)
         assert aid in reaped
@@ -147,15 +177,17 @@ class TestReapStaleInteractiveSessions:
         assert any(a.assignment_id == aid for a in board.completed)
 
     def test_dead_session_marked_failed_in_board(self, coord_db: Any) -> None:
-        """The reaped assignment has status=='failed' on the in-memory board."""
+        """The reaped assignment has status=='failed' on the in-memory board (no commits)."""
         from coord.interactive import reap_stale_interactive_sessions
 
         aid = "aid-dead-status"
         _insert_assignment(coord_db, aid, issue_number=42, status="running")
         board = _make_board(assignment_id=aid)
         cfg = _minimal_config()
+        # When the worktree does not exist, commits is None → terminal_status="failed"
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reap_stale_interactive_sessions(board, cfg)
         done = next((a for a in board.completed if a.assignment_id == aid), None)
@@ -163,15 +195,17 @@ class TestReapStaleInteractiveSessions:
         assert done.status == "failed"
 
     def test_dead_session_marked_failed_in_db(self, coord_db: Any) -> None:
-        """The DB row is updated to status='failed' after reaping."""
+        """The DB row is updated to status='failed' after reaping (no commits)."""
         from coord.interactive import reap_stale_interactive_sessions
 
         aid = "aid-db-update"
         _insert_assignment(coord_db, aid, issue_number=42, status="running")
         board = _make_board(assignment_id=aid)
         cfg = _minimal_config()
+        # When the worktree does not exist, commits is None → terminal_status="failed"
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reap_stale_interactive_sessions(board, cfg)
         row = coord_db.execute(
@@ -215,6 +249,7 @@ class TestReapStaleInteractiveSessions:
         cfg = _minimal_config()
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reap_stale_interactive_sessions(board, cfg)
         # DB status must not be changed back to failed
@@ -244,9 +279,90 @@ class TestReapStaleInteractiveSessions:
         cfg = _minimal_config()
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reaped = reap_stale_interactive_sessions(board, cfg)
         assert set(reaped) == set(aids)
+
+    def test_remote_machine_session_not_reaped(self, coord_db: Any) -> None:
+        """A dead-looking session on a REMOTE machine must not be reaped.
+
+        tmux_session_alive() probes the LOCAL tmux server — a remote session
+        will always appear 'not alive' locally even when it is running.  The
+        reaper must skip it to avoid a false-positive failed stamp.
+        """
+        from coord.interactive import reap_stale_interactive_sessions
+
+        aid = "aid-remote"
+        _insert_assignment(coord_db, aid, issue_number=50, status="running",
+                           machine_name="remotemachine")
+        board = _make_board(assignment_id=aid, machine_name="remotemachine")
+        cfg = _minimal_config_with_remote()
+
+        # Local host is "localmachine"; config has "remotemachine.tailnet"
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="localmachine"):
+            reaped = reap_stale_interactive_sessions(board, cfg)
+
+        assert reaped == [], "remote session must not be reaped"
+        assert len(board.active) == 1, "board must be untouched"
+        # DB row must remain 'running'
+        row = coord_db.execute(
+            "SELECT status FROM assignments WHERE assignment_id=?", (aid,)
+        ).fetchone()
+        db_status = row["status"] if hasattr(row, "keys") else row[0]
+        assert db_status == "running"
+
+    def test_unknown_machine_not_reaped(self, coord_db: Any) -> None:
+        """Assignment on a machine not in config is skipped (conservative)."""
+        from coord.interactive import reap_stale_interactive_sessions
+
+        aid = "aid-unknown-machine"
+        _insert_assignment(coord_db, aid, issue_number=51, status="running",
+                           machine_name="ghostmachine")
+        board = _make_board(assignment_id=aid, machine_name="ghostmachine")
+        cfg = _minimal_config()  # has only "mymachine"
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"):
+            reaped = reap_stale_interactive_sessions(board, cfg)
+
+        assert reaped == [], "unknown-machine session must not be reaped"
+        assert len(board.active) == 1
+
+    def test_dead_session_zero_commits_marked_advisory(self, coord_db: Any, tmp_path: Any) -> None:
+        """When worktree exists and has 0 commits ahead, status becomes 'advisory'."""
+        from coord.interactive import reap_stale_interactive_sessions
+
+        aid = "aid-advisory"
+        _insert_assignment(coord_db, aid, issue_number=55, status="running")
+        board = _make_board(assignment_id=aid, issue_number=55)
+        cfg = _minimal_config()
+
+        # Create a fake worktree dir so wt_path.exists() returns True
+        wt_dir = tmp_path / aid
+        wt_dir.mkdir()
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.interactive._remove_worktree"), \
+             patch("coord.agent._commits_ahead", return_value=0):
+            reaped = reap_stale_interactive_sessions(board, cfg, worktrees_dir=tmp_path)
+
+        assert aid in reaped
+        # In-memory board status must be advisory
+        done = next((a for a in board.completed if a.assignment_id == aid), None)
+        assert done is not None
+        assert done.status == "advisory"
+        # DB must also reflect advisory
+        row = coord_db.execute(
+            "SELECT status FROM assignments WHERE assignment_id=?", (aid,)
+        ).fetchone()
+        db_status = row["status"] if hasattr(row, "keys") else row[0]
+        assert db_status == "advisory"
 
 
 # ── Claim release after reap ──────────────────────────────────────────────────
@@ -272,6 +388,7 @@ class TestClaimReleasedAfterReap:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"):
             reap_stale_interactive_sessions(board, cfg)
 
@@ -291,6 +408,7 @@ class TestClaimReleasedAfterReap:
 
         with patch("coord.interactive.tmux_available", return_value=True), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
              patch("coord.interactive._remove_worktree"), \
              patch("coord.reconcile._query_agent", return_value=None):
             changed = reconcile(board, cfg)
