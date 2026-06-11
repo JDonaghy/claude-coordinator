@@ -29,17 +29,18 @@ the critical path** (demoted to Horizon).
 | **Result out** — git-floor backstop + `coord report-result` through the IssueStore seam | 🟢 merged | #466, #448 |
 | **Session resilience** — survive a TUI crash, reattachable (tmux named sessions) | 🟢 merged | #487, #490 |
 | **Two-tier test gate** — automated build/test before review, human smoke after approve | 🟢 merged | #465 |
-| **A1 — interactive Review dispatch** (`coord assign --interactive --review-of`) | 🟡 **PR #538, needs real-terminal smoke** | — |
-| **A2 — TUI "Review (interactive)" board action** | 🔴 **NEXT** | — |
-| **A3 — interactive Smoke** (`--smoke-of`) | ⚪ designed | — |
+| **A1 — interactive Review dispatch** (`coord assign --interactive --review-of`) | 🟢 merged | PR #538 |
+| **In-TUI render** — scrub `$TMUX` from the embedded terminal so interactive sessions render in the pane | 🟢 merged | quadraui PR #360 |
+| **A2 — TUI "Review (interactive)" board action** | 🟢 merged | PR #540 |
+| **A3 — interactive Smoke** (`--smoke-of`) | 🔴 **NEXT** | — |
 | **Track B — remote fleet** (ssh+tmux; Review/Smoke read-only first) | ⚪ designed | #486, #493/#499 |
 
 ## Status (2026-06-11)
 
 - ✅ **Board launches interactive Work/Plan safely**; result-out, tmux resilience, and the two-tier test gate are all merged (#465/#433/#487 now **closed** — GOAL's old "NEXT: #478" was stale).
-- ✅ **A1 (interactive Review dispatch) implemented** — `coord assign --interactive --review-of <work_aid>`: review-shaped dispatch (`type=review` linked to the work so the merge gate finds the verdict), diff-only briefing, read-only in the live checkout (no worktree), `finalize(worktree_path=None)`. PR #538, **2044 tests pass** — **awaiting a real-terminal smoke** before merge (the #425 lesson: PTY behavior isn't unit-testable).
-- 🛡 **Flood control landed today** — the #476 decision gate (request-changes with 0 blocking → advance, don't re-dispatch a fix) + incremental re-reviews are live on `main`, validated in the wild on #436 (a `blocking=0 nonblocking=5` review auto-advanced instead of churning). Follow-up persist fix (#537) shipped.
-- 📋 **Next, in order:** smoke + merge **A1 (#538)** → **A2** TUI "Review (interactive)" action → **A3** interactive Smoke → **Track B** remote (start with dellserver, read-only Review/Smoke).
+- ✅ **The interactive Review leg is DONE end-to-end** — A1 (`coord assign --interactive --review-of`, PR #538) + the embedded-terminal `$TMUX` scrub (quadraui PR #360) + A2 (TUI "Start review (interactive)" board action, PR #540) are all **merged**. Proven in the wild: a review launched from coord-tui's Terminal tab renders the Claude Max session **in the pane** (no tmux hijack), reviews the diff, reports via `coord report-result`. A2 verified with `cargo build` + `cargo test` (570 pass) before merge. coord-tui rebuilt + reinstalled.
+- 🛡 **Flood control landed** — the #476 decision gate (request-changes with 0 blocking → advance, don't re-dispatch a fix) + incremental re-reviews are live on `main`, validated in the wild on #436. Follow-up persist fix (#537) shipped.
+- 📋 **Next, in order:** **A3** interactive Smoke (`--smoke-of`, mirror A1/A2) → **Track B** remote (start with dellserver, read-only Review/Smoke). A1 follow-ups to fold in: the briefing emits both the `REVIEW_VERDICT` block and the report-result reminder (claude used the block); `coord report-result` needs a `--body-file` for full review bodies (see `project_a1_interactive_review`).
 - 🧭 **Open design Q — where do automated tests gate?** CI is pytest-only, so Rust repos (tui/quadraui/vimcode) still have no automated gate; they need an explicit `cargo build && cargo test` gate (extend CI, or a pre-merge verify step).
 
 ## Horizon (beyond the deadline)
