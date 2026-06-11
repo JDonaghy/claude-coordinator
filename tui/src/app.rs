@@ -2989,6 +2989,36 @@ struct LiveTmuxSession {
     issue_title: Option<String>,
 }
 
+/// Leg 2 (#517): an interactive Work/Plan session the TUI launched this run,
+/// armed to auto-advance to Review once the board shows it finished.
+///
+/// The trigger is strictly **board-driven**, never terminal-scraped (ToS
+/// §3.7 / #437): the embedded shell does NOT exit when the interactive
+/// `claude` session ends — it returns to the prompt and
+/// `finalize_interactive_exit` records the work assignment as `done` + a
+/// branch.  So we watch the board for a NEW done-with-branch work assignment
+/// (one whose id was not already done at arm time) and then prompt.
+struct ArmedAutoReview {
+    /// Coordinator-local repo name (matches `Assignment.repo`).
+    coord_repo: String,
+    /// GitHub repo slug (the `pipeline_issues` key half), for row selection.
+    repo_slug: String,
+    /// GitHub issue number.
+    issue_num: u64,
+    /// Work assignment ids already `done` + branch when we armed.  The prompt
+    /// fires only when a work aid appears that is NOT in this set — i.e. the
+    /// freshly-launched interactive work, not a pre-existing completion.
+    prior_done_ids: std::collections::HashSet<String>,
+}
+
+/// Leg 2 (#517): the issue whose interactive work just finished, awaiting the
+/// operator's one-key confirm to launch the human-attended review.
+struct PendingAutoReview {
+    coord_repo: String,
+    repo_slug: String,
+    issue_num: u64,
+}
+
 /// Fetch live `coord-*` tmux sessions by running `coord sessions --json`.
 ///
 /// Returns an empty `Vec` when tmux is not running, `coord` is not on PATH,
@@ -4370,6 +4400,17 @@ pub struct CoordApp {
     /// `launch_interactive_session_for_selected_issue` to offer reattach
     /// instead of starting a fresh session when one already exists.
     live_tmux_sessions: Vec<LiveTmuxSession>,
+
+    // ── Leg 2 (#517): auto-advance Work → Review ───────────────────────────
+    /// Interactive Work/Plan sessions launched this run, keyed by
+    /// `(repo_slug, issue_number)`, armed to prompt for a review once the
+    /// board shows the work finished.  Entry removed when the prompt fires
+    /// or a Review is launched for the issue.  See [`ArmedAutoReview`].
+    armed_for_auto_review: std::collections::HashMap<(String, u64), ArmedAutoReview>,
+    /// When `Some`, an inline confirm prompt is up asking whether to launch
+    /// the interactive review for a just-finished work session.  Enter
+    /// confirms; Esc/n dismisses.  See [`PendingAutoReview`].
+    pending_auto_review: Option<PendingAutoReview>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4584,6 +4625,9 @@ impl CoordApp {
             metrics_last_polled: Instant::now(),
             // #487: live tmux session discovery.
             live_tmux_sessions: fetch_live_tmux_sessions(),
+            // Leg 2 (#517): auto-advance Work → Review.
+            armed_for_auto_review: std::collections::HashMap::new(),
+            pending_auto_review: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -14897,6 +14941,42 @@ impl CoordApp {
             });
         }
 
+        // ── Leg 2 (#517): auto-advance Work → Review confirm ─────────────
+        if let Some(ref p) = self.pending_auto_review {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:auto-review"),
+                title: StyledText::plain("Work complete — start review?"),
+                body: vec![
+                    StyledText::plain(format!(
+                        "Interactive work for {} #{} finished and pushed a branch.",
+                        p.coord_repo, p.issue_num,
+                    )),
+                    StyledText::plain(
+                        "Start the human-attended interactive review now?".to_string(),
+                    ),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("review"),
+                        label: "⏎  Start review".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Not now".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Force-merge confirm ──────────────────────────────────────────
         if let Some(ref repo) = self.pending_force_merge {
             let scope_line = if repo.is_empty() {
@@ -15158,7 +15238,9 @@ impl CoordApp {
 
     /// Dismiss whatever prompt dialog is currently showing (Esc / outside click).
     fn dismiss_prompt_dialog(&mut self) {
-        if self.pending_repo_picker.is_some() {
+        if self.pending_auto_review.is_some() {
+            self.pending_auto_review = None;
+        } else if self.pending_repo_picker.is_some() {
             self.pending_repo_picker = None;
         } else if self.pending_refinement_close_prompt.is_some() {
             self.pending_refinement_close_prompt = None;
@@ -15186,6 +15268,17 @@ impl CoordApp {
     /// Fire the action associated with a dialog button id.
     /// Button ids mirror those set in `build_prompt_dialog`.
     fn fire_dialog_button(&mut self, id: &str, backend: &mut dyn Backend) {
+        // ── Leg 2 (#517): auto-advance Work → Review ─────────────────────
+        if self.pending_auto_review.is_some() {
+            if id == "review" {
+                self.confirm_auto_review();
+            } else {
+                self.pending_auto_review = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
         // ── Repo picker ──────────────────────────────────────────────────
         if self.pending_repo_picker.is_some() {
             if id == "cancel" {
@@ -17693,6 +17786,7 @@ impl CoordApp {
             || self.pending_test_fail.is_some()
             || self.pending_report_fix.is_some()
             || self.pending_refinement_close_prompt.is_some()
+            || self.pending_auto_review.is_some()
             || self.artifact_pull_dialog.is_some()
         {
             return None;
@@ -19386,12 +19480,19 @@ impl CoordApp {
     /// to supply the `--review-of <work_aid>` argument when the action fires.
     fn selected_completed_work_aid(&self) -> Option<String> {
         let (repo, issue_key) = self.selected_issue_repo_and_key()?;
-        let issue_num = issue_key.1;
+        self.completed_work_aid_for(&repo, issue_key.1)
+    }
+
+    /// Leg 2 (#517): the most-recent `done` `type="work"` assignment id with a
+    /// non-empty branch for `(coord_repo, issue_num)`, or `None`.  Generalises
+    /// [`selected_completed_work_aid`] to an arbitrary issue so the auto-advance
+    /// detector can check issues other than the selected row.
+    fn completed_work_aid_for(&self, coord_repo: &str, issue_num: u64) -> Option<String> {
         self.data
             .assignments
             .iter()
             .filter(|a| a.issue_number == issue_num)
-            .filter(|a| a.repo == repo)
+            .filter(|a| a.repo == coord_repo)
             .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
             .filter(|a| a.status == "done")
             .filter(|a| a.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false))
@@ -19401,6 +19502,100 @@ impl CoordApp {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|a| a.id.clone())
+    }
+
+    /// Leg 2 (#517): all `done` `type="work"` assignment ids with a branch for
+    /// `(coord_repo, issue_num)` — the arm-time snapshot used to edge-trigger
+    /// the auto-advance prompt only on a *new* completion.
+    fn done_work_aids_for(
+        &self,
+        coord_repo: &str,
+        issue_num: u64,
+    ) -> std::collections::HashSet<String> {
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num)
+            .filter(|a| a.repo == coord_repo)
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .filter(|a| a.status == "done")
+            .filter(|a| a.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false))
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
+    /// Leg 2 (#517): true when any `type="review"` assignment already exists for
+    /// `(coord_repo, issue_num)`.  Gates the auto-advance prompt so it only ever
+    /// fires for the first Work → Review hop (verdict-driven re-review is leg 3).
+    fn review_exists_for(&self, coord_repo: &str, issue_num: u64) -> bool {
+        self.data.assignments.iter().any(|a| {
+            a.issue_number == issue_num
+                && a.repo == coord_repo
+                && a.assignment_type.as_deref() == Some("review")
+        })
+    }
+
+    /// Leg 2 (#517): scan armed interactive-work sessions for one the board now
+    /// shows finished (a new done-with-branch work aid, no review yet) and, if
+    /// found, raise the confirm prompt.  Strictly board-driven — never reads the
+    /// session TTY (ToS §3.7 / #437).  Returns `true` when a prompt was raised.
+    fn detect_completed_interactive_work(&mut self) -> bool {
+        // One prompt at a time; don't stack over an open one.
+        if self.pending_auto_review.is_some() || self.armed_for_auto_review.is_empty() {
+            return false;
+        }
+        let fire = self.armed_for_auto_review.iter().find_map(|(key, armed)| {
+            if self.review_exists_for(&armed.coord_repo, armed.issue_num) {
+                return None;
+            }
+            let aid = self.completed_work_aid_for(&armed.coord_repo, armed.issue_num)?;
+            if armed.prior_done_ids.contains(&aid) {
+                return None;
+            }
+            Some(key.clone())
+        });
+        if let Some(key) = fire {
+            if let Some(armed) = self.armed_for_auto_review.remove(&key) {
+                // Drop terminal focus so the confirm prompt owns Enter rather
+                // than the live shell that ran `coord assign`.
+                self.detail_terminal_focused = false;
+                self.pending_auto_review = Some(PendingAutoReview {
+                    coord_repo: armed.coord_repo,
+                    repo_slug: armed.repo_slug,
+                    issue_num: armed.issue_num,
+                });
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Leg 2 (#517): the operator confirmed the auto-advance prompt — select the
+    /// issue's pipeline row, open its Terminal tab, and launch the interactive
+    /// review (reuses the manual `--review-of` launch path).
+    fn confirm_auto_review(&mut self) {
+        let Some(p) = self.pending_auto_review.take() else {
+            return;
+        };
+        let idx = self
+            .pipeline_issues
+            .iter()
+            .position(|iss| iss.repo_slug == p.repo_slug && iss.number == p.issue_num);
+        let Some(idx) = idx else {
+            self.push_toast(
+                "Start review",
+                &format!(
+                    "Could not find {} #{} in the pipeline to start its review.",
+                    p.coord_repo, p.issue_num,
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+        self.pipeline_sel = Some(idx);
+        self.active_view = SidebarView::Pipeline;
+        self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Review);
     }
 
     /// Launch a local human-attended `claude` session for the selected
@@ -19511,6 +19706,27 @@ impl CoordApp {
 
                 self.detail_terminal_sessions.insert(issue_key.clone(), sess);
                 self.detail_terminal_spawn_errors.remove(&issue_key);
+
+                // Leg 2 (#517): arm a Work/Plan launch for auto-advance to
+                // Review; a Review launch disarms (a review now exists, so the
+                // board-driven detector must not also prompt for one).
+                match mode {
+                    InteractiveLaunchMode::Work | InteractiveLaunchMode::Plan => {
+                        let prior_done_ids = self.done_work_aids_for(&repo, issue_num);
+                        self.armed_for_auto_review.insert(
+                            issue_key.clone(),
+                            ArmedAutoReview {
+                                coord_repo: repo.clone(),
+                                repo_slug: issue_key.0.clone(),
+                                issue_num,
+                                prior_done_ids,
+                            },
+                        );
+                    }
+                    InteractiveLaunchMode::Review => {
+                        self.armed_for_auto_review.remove(&issue_key);
+                    }
+                }
 
                 let status_msg = if maybe_live_session.is_some() {
                     format!("Reattaching to running session for {} #{} …", repo, issue_num)
@@ -20421,6 +20637,34 @@ impl ShellApp for CoordApp {
                 if let UiEvent::ClipboardPaste(text) = &event {
                     let _ = self.forward_paste_to_pty(text);
                     return Reaction::Redraw;
+                }
+            }
+        }
+
+        // ── Leg 2 (#517): auto-advance Work → Review confirm ─────────────
+        // When interactive work finishes (board-driven, never scraped) the
+        // detector raises `pending_auto_review`.  Own Enter (confirm →
+        // launch the interactive review) and Esc/n (dismiss) here, BEFORE
+        // the detail-terminal focus block — otherwise a still-focused shell
+        // (the one that ran `coord assign`) would eat the Enter.  Other keys
+        // fall through so the shell stays usable if the operator ignores it.
+        if self.pending_auto_review.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.confirm_auto_review();
+                        return Reaction::Redraw;
+                    }
+                    Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        self.pending_auto_review = None;
+                        self.push_toast(
+                            "Review deferred",
+                            "Start it any time from the row's right-click menu.",
+                            ToastSeverity::Info,
+                        );
+                        return Reaction::Redraw;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -22486,6 +22730,12 @@ impl ShellApp for CoordApp {
         // resize and poll all sessions on every tick so background issues'
         // shells keep accumulating output.
         needs_redraw |= self.drive_detail_terminals();
+        // ── Leg 2 (#517): auto-advance Work → Review ────────────────────
+        // After the board has been refreshed (apply_pending_data above),
+        // check whether any interactive work we launched this run has
+        // finished (board-driven — never scrapes the session TTY) and, if
+        // so, raise the one-key confirm prompt to start its review.
+        needs_redraw |= self.detect_completed_interactive_work();
         // After data has been applied, the Log tab's preferred assignment may
         // have changed (e.g. auto_loop dispatched a new review/fix). Re-attach
         // SSE so we don't fall back to the polling 'Loading log…' flicker.
@@ -24005,6 +24255,9 @@ mod tests {
             metrics_last_polled: Instant::now(),
             // #487
             live_tmux_sessions: Vec::new(),
+            // Leg 2 (#517)
+            armed_for_auto_review: std::collections::HashMap::new(),
+            pending_auto_review: None,
         }
     }
 
@@ -24177,6 +24430,164 @@ mod tests {
         // Two repos, one issue each.
         let total_issues: usize = grouped.iter().map(|(_, issues)| issues.len()).sum();
         assert_eq!(total_issues, 2);
+    }
+
+    // ── Leg 2 (#517): auto-advance Work → Review ─────────────────────────
+
+    fn done_work_with_branch(issue: u64, repo: &str) -> Assignment {
+        let mut a = make_assignment_typed("done", issue, repo, Some("work"));
+        a.branch = Some(format!("issue-{}-work", issue));
+        a
+    }
+
+    fn arm_auto_review(app: &mut CoordApp, repo: &str, issue: u64, prior: &[&str]) {
+        app.armed_for_auto_review.insert(
+            (repo.to_string(), issue),
+            ArmedAutoReview {
+                coord_repo: repo.to_string(),
+                repo_slug: repo.to_string(),
+                issue_num: issue,
+                prior_done_ids: prior.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+    }
+
+    fn mk_pending_auto_review(repo: &str, issue: u64) -> PendingAutoReview {
+        PendingAutoReview {
+            coord_repo: repo.to_string(),
+            repo_slug: repo.to_string(),
+            issue_num: issue,
+        }
+    }
+
+    #[test]
+    fn detect_completed_interactive_work_fires_on_new_done_work() {
+        let mut app = make_app_with_assignments(vec![done_work_with_branch(10, "repo-a")]);
+        arm_auto_review(&mut app, "repo-a", 10, &[]);
+        assert!(app.detect_completed_interactive_work());
+        let p = app.pending_auto_review.as_ref().expect("prompt raised");
+        assert_eq!(p.issue_num, 10);
+        assert_eq!(p.coord_repo, "repo-a");
+        // Armed entry consumed so the prompt doesn't re-fire next tick.
+        assert!(app.armed_for_auto_review.is_empty());
+    }
+
+    #[test]
+    fn detect_ignores_preexisting_completion() {
+        // The done work aid was ALREADY done at arm time → not a new finish,
+        // so a redo that hasn't completed yet must not auto-prompt.
+        let mut app = make_app_with_assignments(vec![done_work_with_branch(10, "repo-a")]);
+        arm_auto_review(&mut app, "repo-a", 10, &["id-10-done"]);
+        assert!(!app.detect_completed_interactive_work());
+        assert!(app.pending_auto_review.is_none());
+        // Stays armed, waiting for a genuinely new completion.
+        assert!(app
+            .armed_for_auto_review
+            .contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    #[test]
+    fn detect_skips_when_review_already_exists() {
+        // First Work → Review hop only; once any review exists the detector
+        // bows out (verdict-driven re-review is leg 3, not this prompt).
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"),
+            make_assignment_typed("running", 10, "repo-a", Some("review")),
+        ]);
+        arm_auto_review(&mut app, "repo-a", 10, &[]);
+        assert!(!app.detect_completed_interactive_work());
+        assert!(app.pending_auto_review.is_none());
+    }
+
+    #[test]
+    fn detect_no_fire_while_work_still_running() {
+        let mut app = make_app_with_assignments(vec![make_assignment_typed(
+            "running",
+            10,
+            "repo-a",
+            Some("work"),
+        )]);
+        arm_auto_review(&mut app, "repo-a", 10, &[]);
+        assert!(!app.detect_completed_interactive_work());
+        assert!(app.pending_auto_review.is_none());
+    }
+
+    #[test]
+    fn detect_no_fire_when_done_work_has_no_branch() {
+        // Done but no branch (aborted, no commits) → nothing to review.
+        let mut app = make_app_with_assignments(vec![make_assignment_typed(
+            "done",
+            10,
+            "repo-a",
+            Some("work"),
+        )]);
+        arm_auto_review(&mut app, "repo-a", 10, &[]);
+        assert!(!app.detect_completed_interactive_work());
+    }
+
+    #[test]
+    fn detect_no_fire_when_a_prompt_is_already_open() {
+        let mut app = make_app_with_assignments(vec![done_work_with_branch(10, "repo-a")]);
+        arm_auto_review(&mut app, "repo-a", 10, &[]);
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-b", 99));
+        assert!(!app.detect_completed_interactive_work());
+        // The unrelated open prompt is left untouched (one at a time).
+        assert_eq!(app.pending_auto_review.as_ref().unwrap().issue_num, 99);
+        // …and the armed entry survives for the next tick.
+        assert!(app
+            .armed_for_auto_review
+            .contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    #[test]
+    fn auto_review_prompt_suppresses_panel_toolbar() {
+        let mut app = make_app_default();
+        assert!(app.panel_toolbar().is_some());
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+        assert!(app.panel_toolbar().is_none());
+    }
+
+    #[test]
+    fn build_prompt_dialog_returns_auto_review_dialog() {
+        let mut app = make_app_default();
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 42));
+        let dialog = app.build_prompt_dialog().expect("auto-review dialog");
+        assert_eq!(dialog.id, WidgetId::new("dialog:auto-review"));
+        assert!(dialog
+            .buttons
+            .iter()
+            .any(|b| b.id == WidgetId::new("review")));
+        // Body names the issue so the operator knows which review this is.
+        let body_text: String = dialog
+            .body
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            body_text.contains("#42"),
+            "dialog body should name the issue, got: {body_text}",
+        );
+    }
+
+    #[test]
+    fn dismiss_prompt_dialog_clears_auto_review() {
+        let mut app = make_app_default();
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+        app.dismiss_prompt_dialog();
+        assert!(app.pending_auto_review.is_none());
+    }
+
+    #[test]
+    fn confirm_auto_review_without_matching_row_is_noop() {
+        // Empty pipeline_issues → no row to select; confirm consumes the
+        // prompt, toasts, and spawns no terminal session (no panic).
+        let mut app = make_app_default();
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+        app.confirm_auto_review();
+        assert!(app.pending_auto_review.is_none());
+        assert!(app.detail_terminal_sessions.is_empty());
     }
 
     #[test]
