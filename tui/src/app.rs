@@ -17917,7 +17917,7 @@ impl CoordApp {
             // a green status-bar message that was easy to miss (and styled
             // the same as success).  Without this, e.g. `coord refine`
             // failing because a label doesn't exist on the repo would leave
-            // the user staring an unchanged board with no feedback.
+            // the user staring at an unchanged board with no feedback.
             //
             // #532: pull-artifact failures are handled by the artifact-pull
             // dialog (opened in the block below).  Suppress the generic toast
@@ -20703,47 +20703,6 @@ impl ShellApp for CoordApp {
             }
         }
 
-        // ── #532: Artifact-pull dialog: intercept key presses ──────────────
-        // While the info dialog is open:
-        //   'c'/'C' — copy path to clipboard (when available), then dismiss.
-        //   Esc / Enter — dismiss without copying.
-        //   All other keys — swallow (redraw) without dismissing; this lets
-        //   longer error messages be scrolled and prevents accidental dismiss
-        //   on Tab / arrow keys while the dialog is focused.
-        if self.artifact_pull_dialog.is_some() {
-            if let UiEvent::KeyPressed { key, .. } = &event {
-                let path = self
-                    .artifact_pull_dialog
-                    .as_ref()
-                    .and_then(|d| d.path.clone());
-                match key {
-                    Key::Char('c') | Key::Char('C') if path.is_some() => {
-                        if let Some(p) = path {
-                            backend.services().clipboard().write_text(&p);
-                            self.push_toast(
-                                "Copied",
-                                "Path copied to clipboard",
-                                ToastSeverity::Info,
-                            );
-                        }
-                        // Dismiss after copy.
-                        self.artifact_pull_dialog = None;
-                        *self.dialog_layout.borrow_mut() = None;
-                    }
-                    Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
-                        // Explicit dismiss keys.
-                        self.artifact_pull_dialog = None;
-                        *self.dialog_layout.borrow_mut() = None;
-                    }
-                    _ => {
-                        // All other keys are swallowed but do NOT close the
-                        // dialog — keeps it visible while navigating its body.
-                    }
-                }
-                return Reaction::Redraw;
-            }
-        }
-
         // ── #245: Pending --force-merge confirmation: intercept ALL keys ──
         // The user has pressed `m` while the "Checks failed" hint was visible.
         // We refuse to bypass the CI gate without an explicit y/Y so a
@@ -20794,6 +20753,54 @@ impl ShellApp for CoordApp {
                             "CI gate stays in place",
                             ToastSeverity::Info,
                         );
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #532: Artifact-pull dialog: intercept key presses ──────────────
+        // While the info dialog is open:
+        //   'c'/'C' — copy path to clipboard (when available), then dismiss.
+        //   Esc / Enter — dismiss without copying.
+        //   All other keys — swallow (redraw) without dismissing; this lets
+        //   longer error messages be scrolled and prevents accidental dismiss
+        //   on Tab / arrow keys while the dialog is focused.
+        //
+        // This block intentionally runs AFTER the destructive-confirmation
+        // intercepts (pending_purge, pending_force_merge, pending_restart) so
+        // that if both an artifact dialog and a confirmation prompt are alive
+        // at the same time, the confirmation prompt wins — matching the
+        // rendering priority in build_prompt_dialog and avoiding silently
+        // swallowed `y` keystrokes against a hidden artifact dialog.
+        if self.artifact_pull_dialog.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                let path = self
+                    .artifact_pull_dialog
+                    .as_ref()
+                    .and_then(|d| d.path.clone());
+                match key {
+                    Key::Char('c') | Key::Char('C') if path.is_some() => {
+                        if let Some(p) = path {
+                            backend.services().clipboard().write_text(&p);
+                            self.push_toast(
+                                "Copied",
+                                "Path copied to clipboard",
+                                ToastSeverity::Info,
+                            );
+                        }
+                        // Dismiss after copy.
+                        self.artifact_pull_dialog = None;
+                        *self.dialog_layout.borrow_mut() = None;
+                    }
+                    Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
+                        // Explicit dismiss keys.
+                        self.artifact_pull_dialog = None;
+                        *self.dialog_layout.borrow_mut() = None;
+                    }
+                    _ => {
+                        // All other keys are swallowed but do NOT close the
+                        // dialog — keeps it visible while navigating its body.
                     }
                 }
                 return Reaction::Redraw;
