@@ -504,6 +504,24 @@ def _sanitize_branch(branch: str) -> str:
 # worktree.  The captured group is the conflicting worktree's path.
 _WT_COLLISION_RE = re.compile(r"already used by worktree at '([^']+)'")
 
+# Build-intermediate file suffixes that are never useful stash artifacts.
+# Cargo produces dozens of *.rcgu.o incremental-codegen objects per build
+# (e.g. `tui_selection-<hash>.<unit>.rcgu.o`) — Path.suffix on these returns
+# ".o", which is caught by the ".o" entry.  ".rcgu" catches any bare codegen
+# unit files.  All of these would inflate the stash with hundreds of MB of
+# throwaway data.  ".d" was already skipped by the original loop; it is
+# included here so the full skip-set lives in one place.
+_STASH_SKIP_SUFFIXES: frozenset[str] = frozenset(
+    {".d", ".o", ".rlib", ".rmeta", ".rcgu"}
+)
+
+# Matches Cargo's hash-stamped duplicate binaries: `<name>-<16 lowercase hex>`.
+# Cargo emits both the canonical `tui_app` AND `tui_app-abcdef0123456789`
+# (build-id stamped).  A glob like `tui_*` matches both, so every binary would
+# be stashed twice.  When the canonical sibling is present we skip the
+# hash-suffixed copy; when ONLY the hash-suffixed form exists we keep it.
+_BUILD_HASH_SUFFIX_RE = re.compile(r"^(.+)-[0-9a-f]{16}$")
+
 
 def _parse_worktree_porcelain(output: str) -> list[dict[str, str]]:
     """Parse ``git worktree list --porcelain`` output into a list of dicts.
@@ -1351,6 +1369,10 @@ class AgentServer:
             return
 
         copied = 0
+        # Collect every candidate path up-front so we can identify which
+        # canonical names are present before deciding whether to skip
+        # hash-suffixed duplicates.
+        candidates: list[Path] = []
         for pattern in patterns:
             # Reject patterns containing ".." — Path.glob("../foo") succeeds
             # in Python 3.12+ and can reach outside the worktree.  The
@@ -1363,24 +1385,45 @@ class AgentServer:
             except (ValueError, OSError):
                 continue
             for src in matches:
-                if not src.is_file():
+                if src.is_file():
+                    candidates.append(src)
+
+        # Build the set of canonical file names: files whose stem does NOT
+        # look like `<name>-<16 hex>`.  Used below to identify the canonical
+        # sibling when deciding whether to skip a hash-stamped duplicate.
+        canonical_names: set[str] = {
+            src.name
+            for src in candidates
+            if _BUILD_HASH_SUFFIX_RE.match(src.stem) is None
+        }
+
+        for src in candidates:
+            # Skip build-intermediate files (.d, .o, .rlib, .rmeta, .rcgu).
+            if src.suffix in _STASH_SKIP_SUFFIXES:
+                continue
+            try:
+                st = src.stat()
+            except OSError:
+                continue
+            # Skip tiny files (< 100 bytes — not a real binary)
+            if st.st_size < 100:
+                continue
+            # De-duplicate hash-suffixed binaries: Cargo emits both
+            # `tui_app` and `tui_app-<16 hex>`.  Skip the hash-stamped copy
+            # when the canonical sibling is also present in the match set.
+            # If ONLY the hash-suffixed form exists (no canonical sibling),
+            # keep it — never drop the only copy of a binary.
+            m = _BUILD_HASH_SUFFIX_RE.match(src.stem)
+            if m is not None:
+                canonical_name = m.group(1) + src.suffix
+                if canonical_name in canonical_names:
                     continue
-                # Skip by suffix (.d = compiler dependency files)
-                if src.suffix == ".d":
-                    continue
-                try:
-                    st = src.stat()
-                except OSError:
-                    continue
-                # Skip tiny files (< 100 bytes — not a real binary)
-                if st.st_size < 100:
-                    continue
-                dst = stash_dir / src.name
-                try:
-                    shutil.copy2(src, dst)
-                    copied += 1
-                except (OSError, shutil.Error):
-                    pass
+            dst = stash_dir / src.name
+            try:
+                shutil.copy2(src, dst)
+                copied += 1
+            except (OSError, shutil.Error):
+                pass
 
         # Touch the stash directory so its mtime reflects this stash run.
         # mkdir(exist_ok=True) is a no-op when the directory already exists,

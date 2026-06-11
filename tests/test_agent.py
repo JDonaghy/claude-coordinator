@@ -928,6 +928,110 @@ def test_stash_artifacts_falls_back_to_server_config_when_spec_empty(
     )
 
 
+def test_stash_artifacts_skips_build_intermediates_and_dedupes_hash_copies(
+    tmp_path: Path,
+) -> None:
+    """#436: object files, rlibs, rmeta, and hash-stamped duplicate binaries
+    must be excluded from the stash.  Only the canonical binary survives."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = state_dir / "worktrees" / "asgn-436"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    examples_dir = wt_path / "target" / "debug" / "examples"
+    examples_dir.mkdir(parents=True)
+
+    payload = b"\x7fELF" + b"\x00" * 200  # fake ELF, 204 bytes
+
+    # Canonical binary — should be kept
+    (examples_dir / "tui_app").write_bytes(payload)
+    # Hash-stamped duplicate — should be skipped (canonical sibling present)
+    (examples_dir / "tui_app-abcdef0123456789").write_bytes(payload)
+    # Incremental-codegen object — should be skipped (.o suffix)
+    (examples_dir / "tui_app-abc123.rcgu.o").write_bytes(payload)
+    # Compiler dependency file — should be skipped (.d suffix)
+    (examples_dir / "tui_app.d").write_bytes(payload)
+    # Tiny file — should be skipped (< 100 bytes)
+    (examples_dir / "tui_app-tiny").write_bytes(b"hi")
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["quadraui"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"quadraui": str(tmp_path / "repo")},
+        artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
+    )
+    spec = AssignmentSpec(
+        repo_name="quadraui",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=436,
+        issue_title="artifact stash junk",
+        briefing="b",
+        branch="main",
+    )
+    a = AgentAssignment(id="asgn-436", spec=spec, status=DONE, branch="issue-436-fix")
+    a.worktree_path = str(wt_path)
+
+    server._stash_artifacts(a)
+
+    stash_dir = state_dir / "artifacts" / "quadraui" / "issue-436-fix"
+    stashed = {p.name for p in stash_dir.iterdir() if not p.name.startswith(".")}
+
+    assert stashed == {"tui_app"}, (
+        f"expected only the canonical binary; got {stashed!r}"
+    )
+
+
+def test_stash_artifacts_keeps_lone_hash_suffixed_binary(tmp_path: Path) -> None:
+    """#436: when ONLY the hash-stamped form exists (no canonical sibling),
+    it must be kept — never silently drop the only copy of a binary."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = state_dir / "worktrees" / "asgn-436b"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    examples_dir = wt_path / "target" / "debug" / "examples"
+    examples_dir.mkdir(parents=True)
+
+    payload = b"\x7fELF" + b"\x00" * 200
+
+    # Only the hash-stamped form exists — no canonical sibling
+    (examples_dir / "tui_app-abcdef0123456789").write_bytes(payload)
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["quadraui"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"quadraui": str(tmp_path / "repo")},
+        artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
+    )
+    spec = AssignmentSpec(
+        repo_name="quadraui",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=436,
+        issue_title="lone hash binary",
+        briefing="b",
+        branch="main",
+    )
+    a = AgentAssignment(id="asgn-436b", spec=spec, status=DONE, branch="issue-436b-fix")
+    a.worktree_path = str(wt_path)
+
+    server._stash_artifacts(a)
+
+    stash_dir = state_dir / "artifacts" / "quadraui" / "issue-436b-fix"
+    stashed = {p.name for p in stash_dir.iterdir() if not p.name.startswith(".")}
+
+    assert "tui_app-abcdef0123456789" in stashed, (
+        "lone hash-stamped binary must be kept when no canonical sibling exists"
+    )
+
+
 def test_gc_artifacts_removes_old_directories(tmp_path: Path) -> None:
     """_gc_artifacts should remove stash dirs older than ttl_days."""
     import os
