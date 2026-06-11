@@ -289,6 +289,37 @@ def test_briefing_falls_back_to_branch_diff_when_no_pr() -> None:
     assert "gh pr review" not in briefing
 
 
+def test_briefing_first_review_is_full_scope() -> None:
+    """review_iteration=0 (default) reviews the whole PR — no incremental
+    language."""
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+    )
+    assert "re-review iteration" not in briefing
+    assert "Run the project's test suite." in briefing
+
+
+def test_briefing_re_review_is_incremental_and_nit_suppressing() -> None:
+    """review_iteration>0 scopes the review to the fix delta and tells the
+    reviewer not to raise new non-blocking nits on already-reviewed code
+    (#476)."""
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        default_branch="main", review_iteration=3,
+    )
+    assert "re-review iteration 3" in briefing
+    assert "do NOT re-review" in briefing.lower() or "not re-review" in briefing.lower()
+    assert "Do NOT raise new non-blocking nits" in briefing
+    # Points the reviewer at the fix delta, not the full PR diff.
+    assert "git log --oneline origin/main...origin/my-branch" in briefing
+
+
 # ── dispatch_review (integration with mocked agent HTTP) ────────────────────
 
 

@@ -380,6 +380,111 @@ class TestProcessReviewCompletion:
         fix_3 = board.active[0]
         assert fix_3.review_iteration == 3
 
+    # ── #476 decision gate: advisory-only request-changes ────────────────────
+
+    def test_request_changes_no_blocking_advances_with_nits(
+        self, config: Config, tmp_path
+    ) -> None:
+        """request-changes with only non-blocking findings must NOT dispatch a
+        fix — it advances the pipeline as approve-with-nits (#476)."""
+        # Body has a recognised non-blocking section and no blocking section,
+        # mirroring the #532 review (nonblocking=4, blocking absent).
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Minor observations (not blocking)\n"
+            "- Low-value test could exercise the real handler\n"
+            "- Pre-existing issue in main, not this PR\n"
+            "- Spec-wording nuance\n"
+            "END_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=2)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()  # must NOT be used — no dispatch expected
+        with patch("coord.auto_loop._post_advisory_nits_notice") as mock_notice:
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert actions[0].kind == "approved_with_nits"
+        # No fix worker dispatched.
+        assert len(board.active) == 0
+        mock_http.post.assert_not_called()
+        # Pipeline advanced: work marked review-done, verdict recorded as approve
+        # so the merge gate lets it through.
+        assert work.review_state == "done"
+        assert review.review_verdict == "approve"
+        mock_notice.assert_called_once()
+
+    def test_request_changes_with_blocking_still_dispatches_fix(
+        self, config: Config, tmp_path
+    ) -> None:
+        """A real blocking finding (alongside nits) must still dispatch a fix —
+        the #476 gate only suppresses advisory-only reviews."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Blocking\n"
+            "- Silent failure: toast suppression hides the error\n"
+            "## Minor observations (not blocking)\n"
+            "- Comment is slightly misleading\n"
+            "END_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-001"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+        assert len(board.active) == 1
+        assert board.active[0].review_iteration == 1
+
+    def test_request_changes_unparseable_counts_dispatches_fix(
+        self, config: Config, tmp_path
+    ) -> None:
+        """When the body has no recognisable section headings, the gate cannot
+        prove there are zero blocking findings → fall back to dispatching a fix
+        (preserves pre-#476 behaviour, fail-safe)."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "This is broken, please fix the parser.\n"
+            "END_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-001"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+
 
 # ── Unit tests: _build_fix_briefing ─────────────────────────────────────────
 
