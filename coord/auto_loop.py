@@ -870,9 +870,13 @@ def run_for_review_transition(
     )
 
     # Save when a fix was dispatched (new assignment), an approve was parsed
-    # (so review_verdict is persisted for the merge gate, #253), or the work
-    # was found terminal (so review_state="done" persists — #522).
-    if any(a.kind in ("fix_dispatched", "approved", "terminal_skip") for a in actions):
+    # (so review_verdict is persisted for the merge gate, #253), an
+    # advisory-only review advanced the pipeline (#476 — review_verdict flips to
+    # approve + review_state="done" so the merge gate unblocks; without this the
+    # gate suppresses the fix but the advance is never persisted and the PR
+    # silently can't merge), or the work was found terminal (#522).
+    _persist_kinds = ("fix_dispatched", "approved", "approved_with_nits", "terminal_skip")
+    if any(a.kind in _persist_kinds for a in actions):
         save_board(board)
 
     return actions

@@ -1074,6 +1074,49 @@ class TestRunForReviewTransition:
         # The fix was added to board.active before save
         assert any(a.assignment_id == "fix-new" for a in loaded.active)
 
+    def test_advisory_advance_persists_to_db(
+        self, config: Config, tmp_path, coord_db
+    ) -> None:
+        """#476 follow-up: a request-changes review with no blocking findings
+        advances the pipeline (approved_with_nits) — and that advance MUST be
+        persisted (review_state="done" + review_verdict="approve") so the merge
+        gate unblocks.  Regression guard for the save-condition gap that left
+        an advisory-advanced PR silently un-mergeable."""
+        from coord.state import load_board, save_board
+
+        review_log = tmp_path / "review.log"
+        # Body has a recognised non-blocking section and no blocking section.
+        review_log.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Minor observations (not blocking)\n"
+            "- nit one\n- nit two\n"
+            "END_REVIEW\n"
+        )
+        work = _work_assignment()
+        review = _review_assignment()
+        board = Board(completed=[work, review])
+        save_board(board)
+
+        record = {"type": "review", "review_of_assignment_id": "work-abc"}
+        entry = {"log_path": str(review_log)}
+
+        with patch("coord.auto_loop._post_advisory_nits_notice"):
+            actions = run_for_review_transition("review-xyz", record, entry, config)
+
+        assert any(a.kind == "approved_with_nits" for a in actions)
+        # The advance must have been SAVED — reload from DB and check.
+        loaded = load_board()
+        assert loaded is not None
+        work_loaded = loaded.find_by_id("work-abc")
+        assert work_loaded is not None
+        assert work_loaded.review_state == "done", (
+            "advisory-advance must persist review_state=done so the merge gate unblocks"
+        )
+        review_loaded = loaded.find_by_id("review-xyz")
+        assert review_loaded is not None
+        assert review_loaded.review_verdict == "approve"
+
     def test_review_not_on_board_returns_empty(
         self, config: Config, tmp_path, coord_db
     ) -> None:
