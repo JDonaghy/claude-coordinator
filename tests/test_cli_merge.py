@@ -545,6 +545,67 @@ class TestMergeAutoEnqueue:
         # turns out to have only the merged entry.
         assert "merged" in result.output.lower() or "no" in result.output.lower()
 
+    def test_terminal_work_not_enqueued(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#525: done-work whose issue is closed OR PR is already merged on
+        GitHub must be skipped in the auto-enqueue loop.  work_is_terminal
+        returning True → no enqueue, no PR opened."""
+        self._seed_board_with_done_work(
+            coord_db, issue_number=525, assignment_id="w525",
+            branch="issue-525-fix",
+        )
+        self._seed_issue_state(coord_db, number=525, state="open")
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "issue-525-fix"},
+        ), patch(
+            "coord.github_ops.work_is_terminal",
+            return_value=True,
+        ) as terminal_fn, patch(
+            "coord.github_ops.create_pr",
+        ) as create:
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" not in result.output
+        create.assert_not_called()
+        terminal_fn.assert_called_once()
+
+    def test_non_terminal_work_is_enqueued(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#525 counterpart: when work_is_terminal returns False the item
+        passes the guard and is auto-enqueued normally."""
+        self._seed_board_with_done_work(
+            coord_db, issue_number=526, assignment_id="w526",
+            branch="issue-526-fix",
+        )
+        self._seed_issue_state(coord_db, number=526, state="open")
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "issue-526-fix"},
+        ), patch(
+            "coord.github_ops.work_is_terminal",
+            return_value=False,
+        ), patch(
+            "coord.github_ops.create_pr",
+            return_value={"number": 999, "url": "u/999", "existed": False},
+        ), patch(
+            "coord.github_ops.merge_pr",
+            return_value=(True, "ok"),
+        ), patch(
+            "coord.github_ops.get_pr_size",
+            return_value=10,
+        ):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" in result.output
+        assert "#526" in result.output
+
 
 class TestStatusMergeQueue:
     def test_status_shows_queue_section(
