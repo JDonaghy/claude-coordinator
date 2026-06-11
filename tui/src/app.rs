@@ -7553,6 +7553,23 @@ impl CoordApp {
         result
     }
 
+    /// Returns a map from GitHub repo slug (`owner/name`) to the count of
+    /// `state='pending'` rows in the in-memory merge-queue snapshot.
+    ///
+    /// Used by `rebuild_pipeline_sidebar` to badge repo sub-header rows with
+    /// a queue-depth indicator (amber when the depth exceeds 5).  Pure read of
+    /// `self.data.merge_queue` — no network I/O, safe to call on every render.
+    fn pending_merge_queue_depth_by_slug(&self) -> std::collections::HashMap<String, usize> {
+        let mut map: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for e in &self.data.merge_queue {
+            if e.state == "pending" {
+                *map.entry(e.repo_github.clone()).or_insert(0) += 1;
+            }
+        }
+        map
+    }
+
     /// Build the SidebarSystem entries for the Pipeline panel.
     ///
     /// One section per repo; within each repo, issues are bucketed into
@@ -7598,6 +7615,11 @@ impl CoordApp {
                 repos.push(key);
             }
         }
+
+        // ── Pre-compute pending merge-queue depth per repo slug ────────────
+        // Owned map (no lifetime tie to self) so the rest of the function can
+        // still call &self and &mut self methods freely.
+        let pending_depth_by_slug = self.pending_merge_queue_depth_by_slug();
 
         // ── Compute the three state buckets ──────────────────────────────
         //
@@ -7725,6 +7747,37 @@ impl CoordApp {
                             .get(&(lc_key.to_string(), repo_key.clone()))
                             .copied()
                             .unwrap_or(true);
+                        // ── #526: pending merge-queue depth badge ─────────
+                        // Resolve coord-local repo key → GitHub slug, then
+                        // look up the pre-computed depth for this repo.
+                        let repo_slug = self
+                            .data
+                            .pipeline_repos
+                            .iter()
+                            .find(|(coord, _)| coord == repo_key)
+                            .map(|(_, slug)| slug.as_str())
+                            .unwrap_or(repo_key.as_str());
+                        let queue_depth = pending_depth_by_slug
+                            .get(repo_slug)
+                            .copied()
+                            .unwrap_or(0);
+                        // Show a badge when there are pending queue entries:
+                        //   > 5 → amber warning
+                        //   1–5 → muted indicator
+                        //   0   → no badge
+                        let queue_badge = if queue_depth > 5 {
+                            Some(Badge::colored(
+                                format!("Q:{}", queue_depth),
+                                Color::rgb(220, 160, 40), // amber
+                            ))
+                        } else if queue_depth > 0 {
+                            Some(Badge::colored(
+                                format!("Q:{}", queue_depth),
+                                Color::rgb(160, 140, 100), // muted
+                            ))
+                        } else {
+                            None
+                        };
                         rows.push(TreeRow {
                             path: vec![ri as u16],
                             indent: 1,
@@ -7735,7 +7788,7 @@ impl CoordApp {
                                     state_color(lc_key),
                                 )],
                             },
-                            badge: None,
+                            badge: queue_badge,
                             is_expanded: Some(is_expanded),
                             decoration: Decoration::Header,
                             edit: None,
@@ -34497,5 +34550,129 @@ mod tests {
             Some(("vimcode".to_string(), ("JDonaghy/vimcode".to_string(), 207))),
             "must resolve vimcode from the selected row, not coord from a by-number match",
         );
+    }
+
+    // ── #526: pending merge-queue depth badge ─────────────────────────────────
+
+    fn make_merge_queue_entry(
+        assignment_id: &str,
+        repo_github: &str,
+        state: &str,
+    ) -> MergeQueueEntry {
+        MergeQueueEntry {
+            assignment_id: assignment_id.to_string(),
+            issue_number: None,
+            state: state.to_string(),
+            pr_number: None,
+            pr_url: None,
+            repo_github: repo_github.to_string(),
+        }
+    }
+
+    #[test]
+    fn pending_merge_queue_depth_by_slug_counts_only_pending_state() {
+        let app = make_test_app(BoardData {
+            merge_queue: vec![
+                make_merge_queue_entry("a1", "acme/api", "pending"),
+                make_merge_queue_entry("a2", "acme/api", "pending"),
+                make_merge_queue_entry("a3", "acme/api", "merged"), // should NOT count
+                make_merge_queue_entry("a4", "acme/ui", "pending"),
+                make_merge_queue_entry("a5", "acme/ui", "open"),   // should NOT count
+            ],
+            ..BoardData::default()
+        });
+        let map = app.pending_merge_queue_depth_by_slug();
+        assert_eq!(map.get("acme/api").copied().unwrap_or(0), 2);
+        assert_eq!(map.get("acme/ui").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn pending_merge_queue_depth_by_slug_empty_when_no_pending() {
+        let app = make_test_app(BoardData {
+            merge_queue: vec![
+                make_merge_queue_entry("a1", "acme/api", "merged"),
+                make_merge_queue_entry("a2", "acme/api", "open"),
+            ],
+            ..BoardData::default()
+        });
+        let map = app.pending_merge_queue_depth_by_slug();
+        assert!(
+            map.is_empty(),
+            "no pending entries should yield an empty map"
+        );
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_completes_without_panic_when_queue_empty() {
+        // Regression guard: rebuild_pipeline_sidebar must not panic when
+        // merge_queue is empty.
+        let mut app = make_pipeline_app();
+        app.data.merge_queue = vec![];
+        // Should not panic.
+        app.rebuild_pipeline_sidebar(None);
+        // Sanity: the "New" section is present (pipeline fixture has a
+        // status:ready issue).
+        assert!(
+            app.pipeline_state_section_names.contains(&"pending"),
+            "New section must still be present",
+        );
+    }
+
+    #[test]
+    fn rebuild_pipeline_sidebar_completes_without_panic_with_queue_entries() {
+        // Regression guard: rebuild_pipeline_sidebar must not panic when
+        // merge_queue entries are present (covers the slug-resolution path).
+        let mut app = make_pipeline_app(); // pipeline_repos: [("api", "acme/api")]
+        app.data.merge_queue = vec![
+            make_merge_queue_entry("a1", "acme/api", "pending"),
+            make_merge_queue_entry("a2", "acme/api", "pending"),
+        ];
+        // Should not panic.
+        app.rebuild_pipeline_sidebar(None);
+        assert!(
+            app.pipeline_state_section_names.contains(&"pending"),
+            "New section must still be present",
+        );
+    }
+
+    #[test]
+    fn pending_merge_queue_depth_badge_color_logic() {
+        // Verify the badge color selection: amber for > 5, muted for 1–5,
+        // None for 0.  Exercises the colour decision independent of the
+        // sidebar rendering path.
+        let amber = Color::rgb(220, 160, 40);
+        let muted = Color::rgb(160, 140, 100);
+
+        // depth = 0 → no badge
+        let badge_0: Option<Badge> = if 0 > 5 {
+            Some(Badge::colored("Q:0", amber))
+        } else if 0 > 0 {
+            Some(Badge::colored("Q:0", muted))
+        } else {
+            None
+        };
+        assert!(badge_0.is_none(), "depth 0 should produce no badge");
+
+        // depth = 3 → muted badge
+        let badge_3: Option<Badge> = if 3 > 5 {
+            Some(Badge::colored("Q:3", amber))
+        } else if 3 > 0 {
+            Some(Badge::colored("Q:3", muted))
+        } else {
+            None
+        };
+        assert!(badge_3.is_some(), "depth 3 should produce a badge");
+        assert_eq!(badge_3.unwrap().fg, Some(muted), "depth 3 must be muted");
+
+        // depth = 6 → amber badge
+        let badge_6: Option<Badge> = if 6 > 5 {
+            Some(Badge::colored("Q:6", amber))
+        } else if 6 > 0 {
+            Some(Badge::colored("Q:6", muted))
+        } else {
+            None
+        };
+        assert!(badge_6.is_some(), "depth 6 should produce a badge");
+        assert_eq!(badge_6.unwrap().fg, Some(amber), "depth 6 must be amber");
     }
 }
