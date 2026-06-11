@@ -510,3 +510,42 @@ class TestReattachDeadBeforeAttach:
 
         assert result.exit_code == 0
         assert "backstop" in result.output
+
+
+class TestLaunchViaTmuxNested:
+    """_launch_via_tmux must use `switch-client` (not nested `attach-session`)
+    when the operator is already inside a tmux session ($TMUX set) — the bug
+    that left A1 interactive reviews orphaned with no terminal."""
+
+    def _run(self, monkeypatch, tmux_value: str | None) -> list[list[str]]:
+        from coord.interactive import _launch_via_tmux
+
+        if tmux_value is None:
+            monkeypatch.delenv("TMUX", raising=False)
+        else:
+            monkeypatch.setenv("TMUX", tmux_value)
+
+        captured: list[list[str]] = []
+
+        def _mock_run(cmd: Any, **kwargs: Any) -> MagicMock:
+            captured.append(list(cmd))
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        # Session already alive → skip creation + briefing inject, go straight
+        # to the attach branch we want to assert.
+        with patch("coord.interactive.tmux_session_alive", return_value=True), \
+             patch("subprocess.run", side_effect=_mock_run):
+            _launch_via_tmux(["claude"], "", "coord-aid-xyz")
+        return captured
+
+    def test_nested_uses_switch_client(self, monkeypatch) -> None:
+        captured = self._run(monkeypatch, "/tmp/tmux-1000/default,9,0")
+        assert ["tmux", "switch-client", "-t", "coord-aid-xyz"] in captured
+        assert not any("attach-session" in c for c in captured)
+
+    def test_non_nested_uses_attach_session(self, monkeypatch) -> None:
+        captured = self._run(monkeypatch, None)
+        assert any("attach-session" in c and "coord-aid-xyz" in c for c in captured)
+        assert not any("switch-client" in c for c in captured)

@@ -1880,6 +1880,21 @@ def approve(
         "shell."
     ),
 )
+@click.option(
+    "--review-of",
+    "review_of",
+    default=None,
+    help=(
+        "Launch a human-attended interactive REVIEW of completed work "
+        "assignment <ID> (the work id from `coord status`). Implies a "
+        "review-shaped dispatch: type=review linked to the work (so the merge "
+        "gate's has_approved_review can find the verdict), the diff-only "
+        "review briefing, and NO isolated worktree (read-only in the live "
+        "checkout). Report your verdict with `coord report-result --verdict "
+        "approve|request-changes`. Requires --interactive; local-only for now "
+        "(remote review is Track B / #486)."
+    ),
+)
 def assign(
     machine: str,
     repo: str,
@@ -1894,6 +1909,7 @@ def assign(
     no_pull: bool,
     skip_freshness: bool,
     interactive: bool,
+    review_of: str | None,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -1954,6 +1970,12 @@ def assign(
         if issue_body:
             briefing = f"Issue #{issue}: {issue_title}\n\n{issue_body}"
 
+    # A1 (interactive-mode migration): --review-of is a flavour of the
+    # human-attended interactive launcher, so it requires --interactive.
+    if review_of is not None and not interactive:
+        click.echo("error: --review-of requires --interactive", err=True)
+        sys.exit(2)
+
     # #437: HUMAN-ATTENDED branch.  When --interactive is set, we run
     # interactive `claude` as a child of THIS shell with the briefing
     # PRE-FILLED in the input box.  No HTTP agent, no Proposal, no
@@ -2008,6 +2030,210 @@ def assign(
             machine_obj.name.lower() == _local_hn
             or machine_obj.host.split(".")[0].lower() == _local_hn
         )
+
+        # ── A1 (interactive-mode migration, Track A): INTERACTIVE REVIEW ────
+        # `--review-of <work_aid>` launches a human-attended REVIEW of an
+        # already-completed work assignment, not a fresh work session.  It
+        # differs from the work/plan path in four ways (per the migration
+        # plan):
+        #   1. type="review" + review_of_assignment_id set, so
+        #      merge_queue.has_approved_review can find the verdict;
+        #   2. the diff-only build_review_briefing (not a work briefing);
+        #   3. NO isolated worktree — the review is read-only (git fetch +
+        #      diff), run in the LIVE checkout;
+        #   4. finalize with worktree_path=None so the git-floor backstop
+        #      never pushes or removes the live checkout.
+        # The verdict is reported via `coord report-result --verdict`.  This
+        # path is self-contained and returns, leaving the work/plan launch
+        # below byte-for-byte unchanged.
+        if review_of is not None:
+            from coord.review import (  # noqa: PLC0415
+                REVIEWER_SYSTEM_PROMPT,
+                _read_repo_claude_md,
+                build_review_briefing,
+            )
+            from coord.models import Assignment  # noqa: PLC0415
+            from coord.state import (  # noqa: PLC0415
+                build_board as _build_board_rv,
+                record_dispatched_assignment,
+                save_board as _save_board_rv,
+            )
+            from coord.agent import AssignmentSpec as _AssignmentSpecRv  # noqa: PLC0415
+
+            _rv_board = _build_board_rv()
+            work = _rv_board.find_by_id(review_of)
+            if work is None:
+                click.echo(
+                    f"error: --review-of {review_of}: no such assignment on the "
+                    "board (use the work id from `coord status`).",
+                    err=True,
+                )
+                sys.exit(2)
+            if not work.branch:
+                click.echo(
+                    f"error: work assignment {review_of} has no branch to review.",
+                    err=True,
+                )
+                sys.exit(2)
+
+            if not _is_local:
+                click.echo(
+                    "error: --review-of is local-only for now; run it on the "
+                    "machine that holds the checkout (remote interactive review "
+                    "is Track B / #486).",
+                    err=True,
+                )
+                sys.exit(2)
+
+            review_repo_path = str(
+                Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+            )
+            review_default_branch = repo_cfg.default_branch or "main"
+            resolved_model = model if model else cfg.models.default
+            assignment_id = _uuid.uuid4().hex[:12]
+
+            claude_md = _read_repo_claude_md(Path(review_repo_path))
+            review_briefing = build_review_briefing(
+                pr_number=None,
+                pr_url=None,
+                repo_github=repo_cfg.github,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=issue_title,
+                issue_body=issue_data.get("body", ""),
+                branch=work.branch,
+                worker_machine=work.machine_name or machine,
+                same_as_worker=False,
+                reviews_cfg=cfg.reviews,
+                repo_claude_md=claude_md,
+                default_branch=review_default_branch,
+                review_iteration=getattr(work, "review_iteration", 0) or 0,
+            )
+            # Interactive reviewer reports via report-result, not the
+            # REVIEW_VERDICT block the briefing's tail describes.
+            report_reminder = (
+                f"[Coordinator review assignment {assignment_id}] This is a "
+                "HUMAN-ATTENDED interactive review. When you finish, instead of "
+                "the REVIEW_VERDICT block, run:\n"
+                f"  coord report-result --assignment {assignment_id} "
+                "--status done --verdict approve|request-changes "
+                "--summary <one-line summary>\n"
+                "Do NOT run any `gh` commands; the coordinator posts the "
+                "verdict for you.\n\n"
+            )
+            effective_briefing = report_reminder + review_briefing
+
+            spec = _AssignmentSpecRv(
+                repo_name=repo,
+                repo_path=review_repo_path,
+                issue_number=issue,
+                issue_title=f"[review] {issue_title}",
+                briefing=effective_briefing,
+                model=resolved_model,
+                type="review",
+                provider="claude-pty",
+            )
+            # A review is READ-ONLY: use the reviewer system prompt (not the
+            # worker default build_command would otherwise apply for an
+            # unrecognised type) and drop Edit/Write from the tool set so the
+            # session can't mutate the live checkout.  Bash stays for
+            # git fetch/diff/log; Read/Grep/Glob for inspecting the code.
+            argv = provider.build_command(
+                spec,
+                resolved_model=resolved_model,
+                system_prompt=REVIEWER_SYSTEM_PROMPT,
+                allowed_tools="Read,Bash,Grep,Glob",
+            )
+
+            click.echo(
+                f"{machine} (local TTY) → REVIEW of #{issue} "
+                f"on branch {work.branch}: {issue_title}"
+            )
+            click.echo("  mode: HUMAN-ATTENDED interactive review (migration A1)")
+            click.echo(
+                f"  assignment id: {assignment_id}  (review_of={review_of})"
+            )
+            click.echo(
+                f"  cwd: {review_repo_path} (live checkout — read-only, no worktree)"
+            )
+            if dry_run:
+                click.echo("  (dry run — not launched)")
+                click.echo(f"  would exec: {argv}")
+                return
+
+            review_assignment = Assignment(
+                machine_name=machine,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=f"[review] {issue_title}",
+                briefing=effective_briefing,
+                assignment_id=assignment_id,
+                status="running",
+                branch=work.branch,
+                dispatched_at=_time.time(),
+                type="review",
+                review_of_assignment_id=review_of,
+                review_target=work.branch,
+                model=resolved_model,
+                provider_name="claude-pty",
+            )
+            record_dispatched_assignment(
+                assignment=review_assignment, repo_github=repo_cfg.github
+            )
+            _save_board_rv(_build_board_rv())
+            os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+
+            started_at = _time.time()
+            exit_code = launch_human_attended_interactive(
+                argv,
+                effective_briefing,
+                assignment_id=assignment_id,
+                cwd=review_repo_path,
+            )
+            if exit_code != 0:
+                click.echo(f"  claude exited with status {exit_code}", err=True)
+
+            _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+            if _sname and _tmux_alive(_sname):
+                click.echo(
+                    f"  session still running in tmux: {_sname}\n"
+                    f"  reattach with:  coord reattach {assignment_id}"
+                )
+                sys.exit(0)
+
+            # finalize with worktree_path=None — the backstop must never push
+            # or remove the live checkout.  If the reviewer ran
+            # `coord report-result --verdict`, finalize sees the terminal row
+            # and leaves the verdict untouched.
+            try:
+                finalize_result = finalize_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    worktree_path=None,
+                    base_branch=review_default_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    log_path=None,
+                    repo_path=None,
+                )
+                if finalize_result.already_recorded:
+                    click.echo("  verdict recorded via `coord report-result`")
+                else:
+                    click.echo(
+                        "  review session ended with no verdict reported "
+                        "(status="
+                        f"{finalize_result.terminal_status}) — the merge gate "
+                        "stays blocked until a verdict is reported."
+                    )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: backstop failed to record review exit: {exc}",
+                    err=True,
+                )
+            return
 
         if _is_local:
             # Expand `~` — repo_paths in coordinator.yml use `~/src/...`,
@@ -5394,7 +5620,14 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     started_at = _time.time()
     try:
         import subprocess as _sp  # noqa: PLC0415
-        result = _sp.run(["tmux", "attach-session", "-t", sname])
+        # When the operator is already inside tmux, `attach-session` refuses to
+        # nest ("sessions should be nested with care") and exits 1; use
+        # `switch-client` to move the current client to the session instead.
+        if os.environ.get("TMUX"):
+            _reattach_cmd = ["tmux", "switch-client", "-t", sname]
+        else:
+            _reattach_cmd = ["tmux", "attach-session", "-t", sname]
+        result = _sp.run(_reattach_cmd)
         exit_code = result.returncode
     except (Exception, KeyboardInterrupt):  # noqa: BLE001
         exit_code = 1
