@@ -4380,6 +4380,10 @@ def merge(
     # gh pr merge, manual) uniformly.  Fail OPEN on lookup failure.
     from coord import github_ops as _gho
     branch_cache: dict[str, set[str]] = {}
+    # #525: per-run cache for work_is_terminal; shared across the whole
+    # auto-enqueue loop so one gh round-trip covers every repeated
+    # (repo, issue, branch) triple.
+    terminal_cache: dict = {}
     if board is not None:
         for a in board.completed:
             if a.type != "work" or a.status != "done":
@@ -4414,6 +4418,15 @@ def merge(
                 origin_branches = _gho.list_remote_branch_names(repo_cfg.github)
                 branch_cache[a.repo_name] = origin_branches
             if origin_branches and a.branch not in origin_branches:
+                continue
+            # #525: never enqueue work that is already done on GitHub —
+            # issue closed OR PR merged.  Mirrors the #522 guard in
+            # review.dispatch_review.  Fail OPEN: a transient gh error
+            # must never block a real enqueue.
+            if _gho.work_is_terminal(
+                repo_cfg.github, a.issue_number, a.branch,
+                cache=terminal_cache,
+            ):
                 continue
             entry = mq.enqueue(
                 a,
