@@ -957,8 +957,8 @@ class TestDispatchBoardPendingReviewsNoSmokeGate:
             repos=[Repo(name="api", github="acme/api")],
             machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
         )
-        # default_gates already includes "test" by default — be explicit.
-        cfg.pipeline.default_gates = ["test", "review", "merge"]
+        # default_gates includes "test" by default (#520 reordered to review-first) — be explicit.
+        cfg.pipeline.default_gates = ["review", "test", "merge"]
         return cfg
 
     @staticmethod

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from coord import db as db_mod
-from coord.db import _ensure_schema, override_connection, close
+from coord.db import _ensure_schema, override_connection, close, _migrate_gate_order
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -278,3 +278,123 @@ class TestJsonMigration:
         assert len(rows) == 0, (
             "Migration re-triggered after marker was set; stale data was imported"
         )
+
+
+# ── Gate-order migration (#520) ───────────────────────────────────────────────
+
+class TestMigrateGateOrder:
+    """_migrate_gate_order rewrites the old default gate JSON in stored rows."""
+
+    _OLD = '["test", "review", "merge"]'
+    _NEW = '["review", "test", "merge"]'
+    _CUSTOM = '["review", "merge"]'  # should never be touched
+
+    def _insert_assignment(
+        self,
+        conn: sqlite3.Connection,
+        aid: str,
+        required_gates: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO assignments "
+            "(assignment_id, machine_name, repo_name, issue_number, issue_title, required_gates) "
+            "VALUES (?, 'm', 'r', 1, 't', ?)",
+            (aid, required_gates),
+        )
+        conn.commit()
+
+    def _insert_proposal(
+        self,
+        conn: sqlite3.Connection,
+        pid: int,
+        required_gates: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO proposals "
+            "(id, machine_name, repo_name, issue_number, issue_title, required_gates) "
+            "VALUES (?, 'm', 'r', 1, 't', ?)",
+            (pid, required_gates),
+        )
+        conn.commit()
+
+    def _set_board_meta(self, conn: sqlite3.Connection, value: str) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('pipeline_default_gates', ?)",
+            (value,),
+        )
+        conn.commit()
+
+    def test_rewrites_old_default_in_assignments(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """Assignments storing the old default gate order are rewritten."""
+        self._insert_assignment(isolated_conn, "a1", self._OLD)
+        _migrate_gate_order(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM assignments WHERE assignment_id='a1'"
+        ).fetchone()
+        assert row["required_gates"] == self._NEW
+
+    def test_rewrites_old_default_in_proposals(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """Proposals storing the old default gate order are rewritten."""
+        self._insert_proposal(isolated_conn, 1, self._OLD)
+        _migrate_gate_order(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM proposals WHERE id=1"
+        ).fetchone()
+        assert row["required_gates"] == self._NEW
+
+    def test_rewrites_board_meta_pipeline_default_gates(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """board_meta['pipeline_default_gates'] is updated when it holds the old value."""
+        self._set_board_meta(isolated_conn, self._OLD)
+        _migrate_gate_order(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT value FROM board_meta WHERE key='pipeline_default_gates'"
+        ).fetchone()
+        assert row["value"] == self._NEW
+
+    def test_does_not_touch_custom_gate_lists(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """Assignments with user-customised gate lists are left unchanged."""
+        self._insert_assignment(isolated_conn, "a2", self._CUSTOM)
+        _migrate_gate_order(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM assignments WHERE assignment_id='a2'"
+        ).fetchone()
+        assert row["required_gates"] == self._CUSTOM
+
+    def test_idempotent(self, isolated_conn: sqlite3.Connection) -> None:
+        """Running the migration twice produces the same result."""
+        self._insert_assignment(isolated_conn, "a3", self._OLD)
+        _migrate_gate_order(isolated_conn)
+        _migrate_gate_order(isolated_conn)  # second call — no-op
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM assignments WHERE assignment_id='a3'"
+        ).fetchone()
+        assert row["required_gates"] == self._NEW
+
+    def test_noop_when_already_new_order(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """Rows already storing the new order are not affected."""
+        self._insert_assignment(isolated_conn, "a4", self._NEW)
+        _migrate_gate_order(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM assignments WHERE assignment_id='a4'"
+        ).fetchone()
+        assert row["required_gates"] == self._NEW
+
+    def test_board_meta_absent_is_noop(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """If pipeline_default_gates is absent from board_meta, migration is a no-op."""
+        _migrate_gate_order(isolated_conn)  # no board_meta row — must not raise
+        row = isolated_conn.execute(
+            "SELECT value FROM board_meta WHERE key='pipeline_default_gates'"
+        ).fetchone()
+        assert row is None

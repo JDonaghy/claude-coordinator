@@ -39,6 +39,7 @@ def _open(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
     _maybe_migrate_json(conn)
+    _migrate_gate_order(conn)
     return conn
 
 
@@ -537,3 +538,38 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
                     f.rename(f.with_suffix(f.suffix + ".bak"))
                 except Exception:  # noqa: BLE001
                     pass
+
+
+# ── Gate-order migration (#520) ───────────────────────────────────────────────
+
+def _migrate_gate_order(conn: sqlite3.Connection) -> None:
+    """#520: rewrite the stale default gate order in stored rows.
+
+    The default changed from ``["test", "review", "merge"]`` to
+    ``["review", "test", "merge"]``.  Any assignment or proposal that was
+    dispatched with the old implicit default is updated so the pipeline display
+    shows the corrected order.  Only the exact old-default JSON string is
+    touched — user-customised gate lists (anything else) are left unchanged.
+
+    The ``board_meta`` entry ``pipeline_default_gates`` is similarly rewritten
+    so the TUI/dashboard picks up the new order without waiting for the next
+    full ``_save_config_snapshot`` call.
+
+    This function is idempotent: if the old string is absent, no rows change.
+    """
+    _OLD = '["test", "review", "merge"]'
+    _NEW = '["review", "test", "merge"]'
+    conn.execute(
+        "UPDATE assignments SET required_gates = ? WHERE required_gates = ?",
+        (_NEW, _OLD),
+    )
+    conn.execute(
+        "UPDATE proposals SET required_gates = ? WHERE required_gates = ?",
+        (_NEW, _OLD),
+    )
+    conn.execute(
+        "UPDATE board_meta SET value = ? "
+        "WHERE key = 'pipeline_default_gates' AND value = ?",
+        (_NEW, _OLD),
+    )
+    conn.commit()
