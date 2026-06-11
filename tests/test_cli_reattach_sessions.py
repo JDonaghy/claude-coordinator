@@ -219,8 +219,11 @@ class TestReattachCmd:
 
     # -- Attach subprocess -----------------------------------------------------
 
-    def test_attach_calls_correct_tmux_command(self, config_file: Path) -> None:
-        """subprocess.run is invoked with ``tmux attach-session -t coord-<id>``."""
+    def test_attach_calls_correct_tmux_command(
+        self, config_file: Path, monkeypatch
+    ) -> None:
+        """Outside tmux, subprocess.run gets ``tmux attach-session -t coord-<id>``."""
+        monkeypatch.delenv("TMUX", raising=False)  # ensure the non-nested path
         captured: list[list[str]] = []
 
         def _mock_run(cmd: list[str], **kwargs: Any) -> MagicMock:
@@ -244,6 +247,37 @@ class TestReattachCmd:
         assert cmd[0] == "tmux"
         assert "attach-session" in cmd
         assert "coord-aid-xyz" in cmd
+
+    def test_attach_uses_switch_client_when_nested_in_tmux(
+        self, config_file: Path, monkeypatch
+    ) -> None:
+        """Inside tmux ($TMUX set), reattach must use ``switch-client`` — a
+        nested ``attach-session`` refuses ("sessions should be nested with
+        care") and orphans the session."""
+        monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1234,0")
+        captured: list[list[str]] = []
+
+        def _mock_run(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured.append(list(cmd))
+            m = MagicMock()
+            m.returncode = 0
+            return m
+
+        alive_seq = iter([True, True])
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, True)), \
+             patch("subprocess.run", side_effect=_mock_run):
+            CliRunner().invoke(
+                main, ["reattach", "aid-xyz", "--config", str(config_file)]
+            )
+
+        switch_cmds = [c for c in captured if "switch-client" in c]
+        assert switch_cmds, f"expected a switch-client call when nested; got {captured}"
+        assert switch_cmds[0][0] == "tmux"
+        assert "coord-aid-xyz" in switch_cmds[0]
+        # And it must NOT have tried a nested attach-session.
+        assert not [c for c in captured if "attach-session" in c]
 
     # -- Session still alive after detach (Ctrl-b d) ---------------------------
 

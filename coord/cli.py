@@ -2048,6 +2048,7 @@ def assign(
         # below byte-for-byte unchanged.
         if review_of is not None:
             from coord.review import (  # noqa: PLC0415
+                REVIEWER_SYSTEM_PROMPT,
                 _read_repo_claude_md,
                 build_review_briefing,
             )
@@ -2132,7 +2133,17 @@ def assign(
                 type="review",
                 provider="claude-pty",
             )
-            argv = provider.build_command(spec, resolved_model=resolved_model)
+            # A review is READ-ONLY: use the reviewer system prompt (not the
+            # worker default build_command would otherwise apply for an
+            # unrecognised type) and drop Edit/Write from the tool set so the
+            # session can't mutate the live checkout.  Bash stays for
+            # git fetch/diff/log; Read/Grep/Glob for inspecting the code.
+            argv = provider.build_command(
+                spec,
+                resolved_model=resolved_model,
+                system_prompt=REVIEWER_SYSTEM_PROMPT,
+                allowed_tools="Read,Bash,Grep,Glob",
+            )
 
             click.echo(
                 f"{machine} (local TTY) → REVIEW of #{issue} "
@@ -5609,7 +5620,14 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     started_at = _time.time()
     try:
         import subprocess as _sp  # noqa: PLC0415
-        result = _sp.run(["tmux", "attach-session", "-t", sname])
+        # When the operator is already inside tmux, `attach-session` refuses to
+        # nest ("sessions should be nested with care") and exits 1; use
+        # `switch-client` to move the current client to the session instead.
+        if os.environ.get("TMUX"):
+            _reattach_cmd = ["tmux", "switch-client", "-t", sname]
+        else:
+            _reattach_cmd = ["tmux", "attach-session", "-t", sname]
+        result = _sp.run(_reattach_cmd)
         exit_code = result.returncode
     except (Exception, KeyboardInterrupt):  # noqa: BLE001
         exit_code = 1

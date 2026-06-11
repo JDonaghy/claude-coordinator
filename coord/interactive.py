@@ -449,9 +449,20 @@ def _launch_via_tmux(
     # The attach-session call uses tty=True because it needs a pseudo-TTY
     # on the remote side when the host is remote.
     try:
-        attach_result = subprocess.run(
-            host.cmd(["attach-session", "-t", session_name], tty=True),
-        )
+        if host.ssh_target is None and os.environ.get("TMUX"):
+            # The operator is already inside a tmux client (nested).
+            # ``attach-session`` refuses to nest ("sessions should be nested
+            # with care, unset $TMUX to force") and exits 1, orphaning the
+            # session so the terminal never opens.  ``switch-client`` switches
+            # the current client to the new session instead — it works from
+            # inside tmux and lands the operator in the claude session.  It
+            # returns immediately (unlike ``attach-session`` it does not block
+            # until detach), so the caller's ``tmux_session_alive`` check then
+            # treats the live session as "operator is now in it".
+            cmd: list[str] = ["tmux", "switch-client", "-t", session_name]
+        else:
+            cmd = list(host.cmd(["attach-session", "-t", session_name], tty=True))
+        attach_result = subprocess.run(cmd)
         return attach_result.returncode
     except (subprocess.SubprocessError, OSError):
         return 1
