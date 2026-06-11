@@ -14521,6 +14521,8 @@ impl CoordApp {
         // #467: human-attended interactive launchers — always available for a
         // real issue row.  Work implements directly; Plan plans then implements
         // in the SAME session.
+        // #539: Review is added here too, gated on a completed work assignment
+        // with a branch existing for this issue.
         if issue_number.is_some() {
             items.push(ContextMenuItem::action(
                 "start-work-interactive",
@@ -14530,6 +14532,10 @@ impl CoordApp {
                 "start-plan-interactive",
                 "Start plan (interactive)",
             ));
+            let mut review_item =
+                ContextMenuItem::action("start-review-interactive", "Start review (interactive)");
+            review_item.disabled = self.selected_completed_work_aid().is_none();
+            items.push(review_item);
             items.push(ContextMenuItem::separator());
         }
         match lifecycle {
@@ -17226,6 +17232,12 @@ impl CoordApp {
                 self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Plan);
                 true
             }
+            // #539: human-attended interactive review launcher.
+            "start-review-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Review);
+                true
+            }
             "start-with-plan" => {
                 let dispatched = self.dispatch_pipeline_plan();
                 if !dispatched {
@@ -17987,6 +17999,7 @@ fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "drop-to-refining" => Some("↶"),
         "start-work-interactive" => Some("⌨"),
         "start-plan-interactive" => Some("⌨"),
+        "start-review-interactive" => Some("⌨"),
         "start-with-plan" => Some("☰"),
         "start-skip-plan" => Some("▶"),
         "watch" => Some("◉"),
@@ -19339,6 +19352,31 @@ impl CoordApp {
         Some((repo, (issue.repo_slug.clone(), issue.number)))
     }
 
+    /// #539: Return the `id` of the most-recent completed `type="work"`
+    /// assignment that has a non-empty branch for the currently-selected
+    /// pipeline issue, or `None` when no such assignment exists.
+    ///
+    /// Used to gate the "Start review (interactive)" context-menu action and
+    /// to supply the `--review-of <work_aid>` argument when the action fires.
+    fn selected_completed_work_aid(&self) -> Option<String> {
+        let (repo, issue_key) = self.selected_issue_repo_and_key()?;
+        let issue_num = issue_key.1;
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num)
+            .filter(|a| a.repo == repo)
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .filter(|a| a.status == "done")
+            .filter(|a| a.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|a| a.id.clone())
+    }
+
     /// Launch a local human-attended `claude` session for the selected
     /// pipeline issue (#467; supersedes the ssh+tmux launcher previously
     /// built for #446).
@@ -19370,6 +19408,25 @@ impl CoordApp {
             ));
             return;
         }
+
+        // #539: For Review mode, resolve the most-recent completed work
+        // assignment id that has a branch.  If none exists, surface a toast
+        // and bail — no point spawning a session with a broken command.
+        let work_aid: Option<String> = if matches!(mode, InteractiveLaunchMode::Review) {
+            match self.selected_completed_work_aid() {
+                Some(aid) => Some(aid),
+                None => {
+                    self.push_toast(
+                        "Start review (interactive)",
+                        "No completed work assignment with a branch found — cannot start review.",
+                        ToastSeverity::Warning,
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         // Pass the TUI's resolved coordinator.yml path so `coord assign` finds
         // it regardless of the embedded terminal's cwd (the issue's repo dir).
@@ -19421,6 +19478,7 @@ impl CoordApp {
                         &repo,
                         issue_num,
                         mode,
+                        work_aid.as_deref(),
                     )
                 };
                 sess.send_str(&launch_line);
@@ -19434,6 +19492,7 @@ impl CoordApp {
                     let verb = match mode {
                         InteractiveLaunchMode::Work => "work",
                         InteractiveLaunchMode::Plan => "plan→work",
+                        InteractiveLaunchMode::Review => "review",
                     };
                     format!(
                         "Launching interactive {} session for {} #{} …",
@@ -19540,6 +19599,9 @@ enum InteractiveLaunchMode {
     /// (`--no-plan`, so the session can code after planning) seeded with a
     /// plan-then-work briefing.
     Plan,
+    /// Human-attended adversarial review of a completed work assignment (#539).
+    /// Emits `coord assign --interactive --review-of <work_aid> …`.
+    Review,
 }
 
 /// #467: briefing seeded into a `Plan` interactive session — plan first, get
@@ -19577,6 +19639,7 @@ fn build_interactive_launch_cmd(
     repo: &str,
     issue_num: u64,
     mode: InteractiveLaunchMode,
+    work_aid: Option<&str>,
 ) -> String {
     // `coord` finds `coordinator.yml` in its cwd by default, but the embedded
     // terminal's cwd is the issue's repo (which usually isn't the coordinator
@@ -19606,6 +19669,16 @@ fn build_interactive_launch_cmd(
             r,
             issue_num,
         ),
+        InteractiveLaunchMode::Review => {
+            // #539: `coord assign --interactive --review-of <work_aid>` routes
+            // to the reviewer role; the session is human-attended, same as Work/Plan.
+            // work_aid is always Some when Review is reached (caller guards it).
+            let aid = shell_quote_arg(work_aid.unwrap_or(""));
+            format!(
+                "coord assign {}--interactive --review-of {} {} {} {}\r",
+                cfg, aid, m, r, issue_num,
+            )
+        }
     }
 }
 
@@ -35035,6 +35108,7 @@ mod tests {
             "claude-coordinator",
             467,
             InteractiveLaunchMode::Work,
+            None,
         );
         assert_eq!(
             cmd,
@@ -35052,6 +35126,7 @@ mod tests {
             "claude-coordinator",
             467,
             InteractiveLaunchMode::Work,
+            None,
         );
         assert_eq!(
             cmd,
@@ -35065,7 +35140,7 @@ mod tests {
         // it without a manual Enter.  Without this the line just sits in
         // the shell input buffer.
         let cmd =
-            build_interactive_launch_cmd(None, "m", "anything", 1, InteractiveLaunchMode::Work);
+            build_interactive_launch_cmd(None, "m", "anything", 1, InteractiveLaunchMode::Work, None);
         assert!(
             cmd.ends_with('\r'),
             "launcher must end with \\r; got: {cmd:?}"
@@ -35093,6 +35168,7 @@ mod tests {
             "claude-coordinator",
             467,
             InteractiveLaunchMode::Work,
+            None,
         );
         assert!(
             cmd.starts_with("coord assign --interactive "),
@@ -35117,10 +35193,10 @@ mod tests {
     fn build_interactive_launch_cmd_templates_repo_and_issue() {
         // Same shape, different repo + issue → both fields propagate.
         let cmd =
-            build_interactive_launch_cmd(None, "m", "quadraui", 99, InteractiveLaunchMode::Work);
+            build_interactive_launch_cmd(None, "m", "quadraui", 99, InteractiveLaunchMode::Work, None);
         assert_eq!(cmd, "coord assign --interactive --no-plan m quadraui 99\r");
         let cmd2 =
-            build_interactive_launch_cmd(None, "m", "coord-tui", 1234, InteractiveLaunchMode::Work);
+            build_interactive_launch_cmd(None, "m", "coord-tui", 1234, InteractiveLaunchMode::Work, None);
         assert_eq!(
             cmd2,
             "coord assign --interactive --no-plan m coord-tui 1234\r"
@@ -35138,6 +35214,7 @@ mod tests {
             "claude-coordinator",
             467,
             InteractiveLaunchMode::Plan,
+            None,
         );
         assert!(
             cmd.starts_with("coord assign --interactive --no-plan --briefing "),
@@ -35159,12 +35236,60 @@ mod tests {
     }
 
     #[test]
+    fn build_interactive_launch_cmd_review_mode_emits_review_of() {
+        // #539: Review mode must emit `--review-of <work_aid>` and NOT
+        // `--no-plan` — the reviewer role, not the implementer role.
+        let cmd = build_interactive_launch_cmd(
+            None,
+            "elitebook",
+            "claude-coordinator",
+            539,
+            InteractiveLaunchMode::Review,
+            Some("abc-123"),
+        );
+        assert!(
+            cmd.starts_with("coord assign --interactive "),
+            "must invoke `coord assign --interactive`; got: {cmd:?}",
+        );
+        assert!(
+            cmd.contains("--review-of abc-123"),
+            "must pass --review-of <work_aid>; got: {cmd:?}",
+        );
+        assert!(
+            cmd.contains("elitebook claude-coordinator 539"),
+            "must pass positional machine/repo/issue; got: {cmd:?}",
+        );
+        assert!(
+            !cmd.contains("--no-plan"),
+            "review mode must NOT pass --no-plan; got: {cmd:?}",
+        );
+        assert!(cmd.ends_with('\r'), "must auto-run; got: {cmd:?}");
+    }
+
+    #[test]
+    fn build_interactive_launch_cmd_review_mode_with_config_path() {
+        // #539: Review mode with a config path injects --config before the flags.
+        let cmd = build_interactive_launch_cmd(
+            Some("/home/john/src/claude-coordinator/coordinator.yml"),
+            "elitebook",
+            "claude-coordinator",
+            539,
+            InteractiveLaunchMode::Review,
+            Some("xyz-456"),
+        );
+        assert_eq!(
+            cmd,
+            "coord assign --config /home/john/src/claude-coordinator/coordinator.yml --interactive --review-of xyz-456 elitebook claude-coordinator 539\r",
+        );
+    }
+
+    #[test]
     fn build_interactive_launch_cmd_quotes_repo_with_spaces() {
         // Defensive: a repo name that contains whitespace must be quoted
         // so the local shell sees it as a single argument.  Single
         // quotes also block shell-metachar interpretation.
         let cmd =
-            build_interactive_launch_cmd(None, "m", "my repo", 42, InteractiveLaunchMode::Work);
+            build_interactive_launch_cmd(None, "m", "my repo", 42, InteractiveLaunchMode::Work, None);
         assert!(
             cmd.contains("'my repo' 42"),
             "repo with spaces must be single-quoted; got: {cmd:?}",
@@ -35181,13 +35306,14 @@ mod tests {
             "evil;rm -rf /",
             1,
             InteractiveLaunchMode::Work,
+            None,
         );
         assert!(
             cmd.contains("'evil;rm -rf /' 1"),
             "shell metachars must be quoted away; got: {cmd:?}",
         );
         // An embedded single quote is escaped via the standard '\'' trick.
-        let cmd2 = build_interactive_launch_cmd(None, "m", "a'b", 2, InteractiveLaunchMode::Work);
+        let cmd2 = build_interactive_launch_cmd(None, "m", "a'b", 2, InteractiveLaunchMode::Work, None);
         assert!(
             cmd2.contains(r"'a'\''b' 2"),
             "embedded single quotes must be escaped; got: {cmd2:?}",
