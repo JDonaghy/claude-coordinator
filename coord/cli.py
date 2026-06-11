@@ -5248,8 +5248,10 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     the #466 git-floor backstop runs — same as after a normal interactive
     session exit — so the board always gets a terminal state recorded.
 
-    If the session is no longer alive, prints a message and exits without
-    error.
+    When the session is **already dead** before the user attempts to reattach
+    (e.g. the tmux session was killed externally), the backstop also runs to
+    release the claim and garbage-collect the orphaned worktree, unblocking a
+    subsequent ``coord assign --interactive`` on the same issue.
     """
     import time as _time  # noqa: PLC0415
 
@@ -5265,12 +5267,10 @@ def reattach(assignment_id: str, config_path: Path) -> None:
         sys.exit(1)
 
     sname = tmux_session_name(assignment_id)
-    if not tmux_session_alive(sname):
-        click.echo(f"  session {sname!r} is not alive.")
-        click.echo("  (it may have ended while you were away)")
-        sys.exit(0)
 
-    # Look up assignment metadata so we can run finalize after detach.
+    # ── Look up assignment metadata (needed for both live and dead paths) ────
+    # Done BEFORE the alive check so the dead-before-attach path can also
+    # run finalize_interactive_exit and release the claim.
     repo_name_val: str | None = None
     repo_github_val: str | None = None
     issue_number_val: int | None = None
@@ -5323,6 +5323,58 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     except Exception:  # noqa: BLE001
         pass
 
+    # ── Shared helper: run finalize backstop and echo results ────────────────
+    def _run_finalize(exit_code: int, started_at: float | None = None) -> None:
+        if repo_name_val and repo_github_val and issue_number_val:
+            try:
+                finalize_result = finalize_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo_name_val,
+                    repo_github=repo_github_val,
+                    issue_number=int(issue_number_val),  # type: ignore[arg-type]
+                    machine_name=machine_name_val or "unknown",
+                    worktree_path=worktree_path,
+                    base_branch=base_branch_val,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    log_path=None,
+                    repo_path=repo_path_val,
+                )
+                if finalize_result.already_recorded:
+                    click.echo(
+                        "  result already recorded via `coord report-result`; "
+                        "backstop did not overwrite",
+                    )
+                else:
+                    click.echo(
+                        f"  backstop: status={finalize_result.terminal_status} "
+                        f"commits_ahead={finalize_result.commits_ahead}"
+                    )
+                    if not finalize_result.push_ok:
+                        click.echo(
+                            f"  warning: git push failed: {finalize_result.push_error}",
+                            err=True,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                click.echo(
+                    f"  warning: backstop failed to record completion: {exc}",
+                    err=True,
+                )
+        else:
+            click.echo(
+                "  (assignment metadata not found — skipping git-floor backstop)",
+                err=True,
+            )
+
+    # ── Dead-before-attach: session was killed externally ────────────────────
+    # Run finalize here to release the claim and remove the orphaned worktree
+    # so the operator can immediately re-dispatch with --interactive.
+    if not tmux_session_alive(sname):
+        click.echo(f"  session {sname!r} is not alive (it may have ended while you were away).")
+        _run_finalize(exit_code=1)
+        sys.exit(0)
+
+    # ── Attach ───────────────────────────────────────────────────────────────
     click.echo(f"  Attaching to {sname} …")
     click.echo("  (detach with Ctrl-b d to leave the session running)")
 
@@ -5342,48 +5394,8 @@ def reattach(assignment_id: str, config_path: Path) -> None:
         )
         sys.exit(0)
 
-    # Session ended — run the finalize backstop.
-    if repo_name_val and repo_github_val and issue_number_val:
-        try:
-            finalize_result = finalize_interactive_exit(
-                assignment_id=assignment_id,
-                repo_name=repo_name_val,
-                repo_github=repo_github_val,
-                issue_number=int(issue_number_val),  # type: ignore[arg-type]
-                machine_name=machine_name_val or "unknown",
-                worktree_path=worktree_path,
-                base_branch=base_branch_val,
-                exit_code=exit_code,
-                started_at=started_at,
-                log_path=None,
-                repo_path=repo_path_val,
-            )
-            if finalize_result.already_recorded:
-                click.echo(
-                    "  result already recorded via `coord report-result`; "
-                    "backstop did not overwrite",
-                )
-            else:
-                click.echo(
-                    f"  backstop: status={finalize_result.terminal_status} "
-                    f"commits_ahead={finalize_result.commits_ahead}"
-                )
-                if not finalize_result.push_ok:
-                    click.echo(
-                        f"  warning: git push failed: {finalize_result.push_error}",
-                        err=True,
-                    )
-        except Exception as exc:  # noqa: BLE001
-            click.echo(
-                f"  warning: backstop failed to record completion: {exc}",
-                err=True,
-            )
-    else:
-        click.echo(
-            "  (assignment metadata not found — skipping git-floor backstop)",
-            err=True,
-        )
-
+    # ── Session ended — run the finalize backstop ─────────────────────────
+    _run_finalize(exit_code=exit_code, started_at=started_at)
     sys.exit(exit_code)
 
 

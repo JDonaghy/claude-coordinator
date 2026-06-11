@@ -180,6 +180,16 @@ def reconcile(board: Board, config: Config) -> list[str]:
     newly_done_work: list = []  # assignments that just transitioned work → done
     newly_failed: list = []  # assignments that just transitioned to failed
 
+    # Sweep for dead interactive (--interactive / claude-pty) sessions before
+    # processing agent-based assignments.  A killed tmux session leaves a
+    # stale "running" board row + orphaned worktree that blocks relaunch.
+    # Reaping here ensures ``coord resume`` / ``coord notify`` clean up
+    # without requiring the user to first run ``coord reattach``.
+    from coord.interactive import reap_stale_interactive_sessions  # noqa: PLC0415
+
+    reaped = reap_stale_interactive_sessions(board, config)
+    changed.extend(reaped)
+
     # Pass 1: transition active assignments that have finished.
     for a in board.active[:]:
         if a.assignment_id is None:
