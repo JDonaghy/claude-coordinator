@@ -314,17 +314,19 @@ Rules:
 this code. Treat the diff as if you're reading it for the first time.
 - You are NOT allowed to run any `gh` commands. The coordinator posts the \
 review on your behalf after your session ends.
-- You ARE allowed to run the project's test suite and read project files.
+- DO NOT run the project's test suite, build, or any other command — a human \
+reviewer reads the diff, they don't run the suite, and on some projects (e.g. \
+headless GUI apps) running it hangs the session. You MAY read project files \
+for context. Build/test validation is the separate pre-merge smoke gate's job.
 - You are NOT allowed to push commits or modify the PR's code. You only \
 review.
 
 How to review:
 1. Read the project's CLAUDE.md for project conventions.
 2. Read the PR diff using `git diff` or the briefing instructions.
-3. Run the test suite. Note any failures or regressions.
-4. Check the diff against the review checklist in your briefing.
-5. For each finding, cite the specific file:line and the rule it violates.
-6. At the END of your session, output your verdict in this exact format:
+3. Check the diff against the review checklist in your briefing.
+4. For each finding, cite the specific file:line and the rule it violates.
+5. At the END of your session, output your verdict in this exact format:
 
 REVIEW_VERDICT: approve
 REVIEW_BODY:
@@ -338,7 +340,7 @@ REVIEW_BODY:
 <your full review text in markdown>
 END_REVIEW
 
-If the diff is clean and tests pass, approve — but be thorough first.\
+If the diff is clean, approve — but be thorough first.\
 """
 
 
