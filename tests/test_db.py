@@ -278,3 +278,128 @@ class TestJsonMigration:
         assert len(rows) == 0, (
             "Migration re-triggered after marker was set; stale data was imported"
         )
+
+
+# ── Gate-order migration (#520) ───────────────────────────────────────────────
+
+class TestGateOrderMigrationV520:
+    """_migrate_gate_order_v520 rewrites the pre-#465 default gate list."""
+
+    _OLD = '["test", "review", "merge"]'
+    _NEW = '["review", "test", "merge"]'
+
+    def _insert_assignment(
+        self,
+        conn: sqlite3.Connection,
+        aid: str,
+        gates: str,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO assignments
+               (assignment_id, machine_name, repo_name, issue_number,
+                issue_title, status, required_gates)
+               VALUES (?, 'laptop', 'api', 1, 't', 'done', ?)""",
+            (aid, gates),
+        )
+        conn.commit()
+
+    def _insert_proposal(
+        self,
+        conn: sqlite3.Connection,
+        machine: str,
+        gates: str,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO proposals
+               (machine_name, repo_name, issue_number, issue_title, required_gates)
+               VALUES (?, 'api', 1, 't', ?)""",
+            (machine, gates),
+        )
+        conn.commit()
+
+    def test_rewrites_old_assignment_gates(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """assignment.required_gates with the old default is rewritten to new order."""
+        self._insert_assignment(isolated_conn, "a1", self._OLD)
+        db_mod._migrate_gate_order_v520(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM assignments WHERE assignment_id='a1'"
+        ).fetchone()
+        assert row["required_gates"] == self._NEW
+
+    def test_rewrites_old_proposal_gates(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """proposals.required_gates with the old default is rewritten."""
+        self._insert_proposal(isolated_conn, "laptop", self._OLD)
+        db_mod._migrate_gate_order_v520(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM proposals WHERE machine_name='laptop'"
+        ).fetchone()
+        assert row["required_gates"] == self._NEW
+
+    def test_rewrites_board_meta_pipeline_default_gates(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """board_meta['pipeline_default_gates'] with the old value is updated."""
+        isolated_conn.execute(
+            "INSERT INTO board_meta (key, value) VALUES ('pipeline_default_gates', ?)",
+            (self._OLD,),
+        )
+        isolated_conn.commit()
+        db_mod._migrate_gate_order_v520(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT value FROM board_meta WHERE key='pipeline_default_gates'"
+        ).fetchone()
+        assert row["value"] == self._NEW
+
+    def test_does_not_touch_non_default_gates(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """Assignments with custom gate lists are left untouched."""
+        custom = '["merge"]'
+        self._insert_assignment(isolated_conn, "a2", custom)
+        db_mod._migrate_gate_order_v520(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM assignments WHERE assignment_id='a2'"
+        ).fetchone()
+        assert row["required_gates"] == custom
+
+    def test_writes_marker(self, isolated_conn: sqlite3.Connection) -> None:
+        """After migration the gate_order_v520 marker is written."""
+        db_mod._migrate_gate_order_v520(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT value FROM board_meta WHERE key='gate_order_v520'"
+        ).fetchone()
+        assert row is not None
+
+    def test_idempotent_on_second_call(self, isolated_conn: sqlite3.Connection) -> None:
+        """Second call is a no-op: already-migrated rows are not double-migrated."""
+        self._insert_assignment(isolated_conn, "a3", self._OLD)
+        db_mod._migrate_gate_order_v520(isolated_conn)
+        # Manually revert to simulate a row appearing after migration
+        isolated_conn.execute(
+            "UPDATE assignments SET required_gates=? WHERE assignment_id='a3'",
+            (self._OLD,),
+        )
+        isolated_conn.commit()
+        # Second call must not change the row again (marker present → skip)
+        db_mod._migrate_gate_order_v520(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM assignments WHERE assignment_id='a3'"
+        ).fetchone()
+        assert row["required_gates"] == self._OLD, (
+            "Migration ran again after marker was set"
+        )
+
+    def test_new_order_already_present_is_unchanged(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """Rows already carrying the new gate order pass through unchanged."""
+        self._insert_assignment(isolated_conn, "a4", self._NEW)
+        db_mod._migrate_gate_order_v520(isolated_conn)
+        row = isolated_conn.execute(
+            "SELECT required_gates FROM assignments WHERE assignment_id='a4'"
+        ).fetchone()
+        assert row["required_gates"] == self._NEW

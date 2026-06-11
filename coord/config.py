@@ -219,7 +219,7 @@ class PipelineConfig:
     agent falls back to ``claude -p``'s default).
     """
 
-    default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
+    default_gates: list[str] = field(default_factory=lambda: ["review", "test", "merge"])
     labels: dict[str, list[str]] = field(default_factory=dict)
     auto_loop: bool = True
     max_review_iterations: int = 5

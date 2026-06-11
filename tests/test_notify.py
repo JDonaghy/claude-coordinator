@@ -957,7 +957,8 @@ class TestDispatchBoardPendingReviewsNoSmokeGate:
             repos=[Repo(name="api", github="acme/api")],
             machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
         )
-        # default_gates already includes "test" by default — be explicit.
+        # Explicitly set a gate list that includes "test" (verifies the test
+        # gate no longer blocks review dispatch regardless of gate order).
         cfg.pipeline.default_gates = ["test", "review", "merge"]
         return cfg
 

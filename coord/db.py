@@ -39,6 +39,7 @@ def _open(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
     _maybe_migrate_json(conn)
+    _migrate_gate_order_v520(conn)
     return conn
 
 
@@ -537,3 +538,57 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
                     f.rename(f.with_suffix(f.suffix + ".bak"))
                 except Exception:  # noqa: BLE001
                     pass
+
+
+# ── Gate-order migration (#520) ────────────────────────────────────────────────
+
+_OLD_GATES = '["test", "review", "merge"]'
+_NEW_GATES = '["review", "test", "merge"]'
+
+
+def _migrate_gate_order_v520(conn: sqlite3.Connection) -> None:
+    """One-shot migration: reorder the baked-in gate list from the pre-#465 default.
+
+    Before #465 the default gate order was ``["test", "review", "merge"]``.
+    Post-#465 the correct display order is ``["review", "test", "merge"]``
+    (review first, then test/smoke, then merge).
+
+    This migration rewrites every assignment and proposal row whose
+    ``required_gates`` still carries the old default, and patches the cached
+    ``board_meta['pipeline_default_gates']`` value so running dashboards pick
+    up the corrected order without requiring a coordinator restart.
+
+    The ``gate_order_v520`` marker in ``board_meta`` ensures the migration runs
+    exactly once, even across process restarts.
+    """
+    cursor = conn.execute(
+        "SELECT value FROM board_meta WHERE key='gate_order_v520'"
+    )
+    if cursor.fetchone() is not None:
+        return
+
+    try:
+        with conn:  # single transaction
+            # 1. assignments.required_gates
+            conn.execute(
+                "UPDATE assignments SET required_gates = ? WHERE required_gates = ?",
+                (_NEW_GATES, _OLD_GATES),
+            )
+            # 2. proposals.required_gates
+            conn.execute(
+                "UPDATE proposals SET required_gates = ? WHERE required_gates = ?",
+                (_NEW_GATES, _OLD_GATES),
+            )
+            # 3. board_meta cache (written by _save_config_snapshot; update
+            #    so dashboards reflect the new order without a CLI restart).
+            conn.execute(
+                "UPDATE board_meta SET value = ? WHERE key = 'pipeline_default_gates' AND value = ?",
+                (_NEW_GATES, _OLD_GATES),
+            )
+            # 4. Persist migration marker so this never re-runs.
+            conn.execute(
+                "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('gate_order_v520', '1')",
+            )
+    except Exception:  # noqa: BLE001 — migration is best-effort
+        import sys
+        print("coord: warning: gate-order migration (#520) failed", file=sys.stderr)
