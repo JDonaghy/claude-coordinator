@@ -923,11 +923,31 @@ struct ArtifactManifest {
     built_by_assignment_id: Option<String>,
 }
 
+/// Reason why no artifact manifest is available after a completed fetch.
+/// Used to surface a human-readable explanation in the TUI rather than
+/// silently hiding the `[a]` badge when artifacts are absent.
+#[derive(Debug, Clone)]
+enum ArtifactAbsence {
+    /// HTTP 404 — worker did not stash any artifacts.  Likely causes: no
+    /// `artifact_paths` configured for this repo in `coordinator.yml`, or the
+    /// build produced no files matching the configured globs.
+    NotStashed,
+    /// HTTP 200 but the `files` array in the manifest was empty.
+    ManifestEmpty,
+    /// Could not reach the agent at all (connection refused, timeout, DNS
+    /// failure, or a JSON-parse error on the response body).
+    AgentUnreachable(String),
+}
+
 /// A cached manifest entry with a fetch timestamp for 30-second TTL eviction.
 struct ArtifactCacheEntry {
     fetched_at: Instant,
-    /// `None` = 404 response (no stash for this branch on the agent).
+    /// `Some` = stash present and non-empty.  `None` = fetch completed but no
+    /// artifacts are available; see `absence_reason` for the specific cause.
     manifest: Option<ArtifactManifest>,
+    /// Explains why `manifest` is `None` when set.  Always `Some` when the
+    /// fetch has completed without finding a non-empty manifest.
+    absence_reason: Option<ArtifactAbsence>,
 }
 
 /// #336: Sanitize a git branch name for use as a URL path component.
@@ -1024,16 +1044,30 @@ fn read_git_branch_head(repo_dir: &std::path::Path, branch: &str) -> Option<Stri
     None
 }
 
+/// Outcome of a single `GET /artifact/<repo>/<branch>` request to a remote
+/// agent.  Returned via channel from `spawn_artifact_fetch` so the TUI can
+/// surface a specific reason when the `[a]` badge is absent rather than
+/// silently hiding it.
+enum ArtifactFetchOutcome {
+    /// HTTP 200 with at least one file — the artifact badge should be shown.
+    Found(ArtifactManifest),
+    /// HTTP 404 — no stash exists for this (repo, branch) pair on the agent.
+    NotStashed,
+    /// HTTP 200 but the `files` array in the manifest was empty.
+    Empty,
+    /// Network / parse error — the agent could not be reached or returned
+    /// an unexpected response.
+    Unreachable(String),
+}
+
 /// #336: Spawn a background thread that queries `GET /artifact/<repo>/<branch>`
-/// on a remote agent.  Returns a channel that delivers:
-/// - `Ok(Some(manifest))` — 200 with at least one file
-/// - `Ok(None)` — 404 (no stash for this branch) or 200 with empty files
-/// - `Err(msg)` — network / JSON error
+/// on a remote agent.  Returns a channel that delivers an [`ArtifactFetchOutcome`]
+/// so the caller can distinguish 404, empty manifest, and network errors.
 fn spawn_artifact_fetch(
     host: &str,
     repo: &str,
     branch: &str,
-) -> std::sync::mpsc::Receiver<Result<Option<ArtifactManifest>, String>> {
+) -> std::sync::mpsc::Receiver<ArtifactFetchOutcome> {
     let url = format!("http://{}:7433/artifact/{}/{}", host, repo, branch);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1041,13 +1075,13 @@ fn spawn_artifact_fetch(
             .timeout_connect(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
             .build();
-        let result = match agent.get(&url).call() {
-            Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(e.to_string()),
+        let outcome = match agent.get(&url).call() {
+            Err(ureq::Error::Status(404, _)) => ArtifactFetchOutcome::NotStashed,
+            Err(e) => ArtifactFetchOutcome::Unreachable(e.to_string()),
             Ok(resp) => match resp.into_string() {
-                Err(e) => Err(e.to_string()),
+                Err(e) => ArtifactFetchOutcome::Unreachable(e.to_string()),
                 Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
-                    Err(e) => Err(format!("json: {e}")),
+                    Err(e) => ArtifactFetchOutcome::Unreachable(format!("json: {e}")),
                     Ok(v) => {
                         let files: Vec<ArtifactFile> = v
                             .get("files")
@@ -1070,19 +1104,19 @@ fn spawn_artifact_fetch(
                             .and_then(|b| b.as_str())
                             .map(|s| s.to_string());
                         if files.is_empty() {
-                            Ok(None)
+                            ArtifactFetchOutcome::Empty
                         } else {
-                            Ok(Some(ArtifactManifest {
+                            ArtifactFetchOutcome::Found(ArtifactManifest {
                                 files,
                                 total_bytes,
                                 built_by_assignment_id,
-                            }))
+                            })
                         }
                     }
                 },
             },
         };
-        let _ = tx.send(result);
+        let _ = tx.send(outcome);
     });
     rx
 }
@@ -4119,7 +4153,7 @@ pub struct CoordApp {
     /// #336: In-flight artifact manifest fetch.  `None` when idle.
     artifact_fetch_rx: Option<(
         (String, String),
-        std::sync::mpsc::Receiver<Result<Option<ArtifactManifest>, String>>,
+        std::sync::mpsc::Receiver<ArtifactFetchOutcome>,
     )>,
     /// #336: Tracks a pending `coord pull-artifact` dispatch.
     /// Contains `(work_id, repo, sanitized_branch)` so we can show the
@@ -11183,19 +11217,25 @@ impl CoordApp {
             }
         }
 
-        // #336: Artifact badge — show when the manifest is cached and non-empty
-        // for this branch.  The `a` keybind pulls when the badge is visible.
+        // #336/#433: Artifact badge — show when the manifest is cached and
+        // non-empty for this branch.  When the fetch has completed but no
+        // artifacts are available, surface the specific reason rather than
+        // silently hiding the badge (intermittency was invisible before #433).
         if let Some(branch) = &latest.branch {
             let sanitized = sanitize_branch(branch);
             let key = (latest.repo.clone(), sanitized.clone());
-            if let Some(entry) = self.artifact_cache.get(&key) {
-                if let Some(manifest) = &entry.manifest {
-                    let file_count = manifest.files.len();
-                    let total_mb = manifest.total_bytes as f64 / 1_048_576.0;
-                    // Warn when the stash was built by a different assignment —
-                    // e.g. the branch was re-pushed and a newer worker ran.
-                    let built_by_note =
-                        if manifest.built_by_assignment_id.as_deref() != Some(latest.id.as_str()) {
+            match self.artifact_cache.get(&key) {
+                Some(entry) => {
+                    if let Some(manifest) = &entry.manifest {
+                        // ── Artifact stash found — show the download badge ────
+                        let file_count = manifest.files.len();
+                        let total_mb = manifest.total_bytes as f64 / 1_048_576.0;
+                        // Warn when the stash was built by a different
+                        // assignment — e.g. the branch was re-pushed and a
+                        // newer worker ran.
+                        let built_by_note = if manifest.built_by_assignment_id.as_deref()
+                            != Some(latest.id.as_str())
+                        {
                             if let Some(id) = &manifest.built_by_assignment_id {
                                 let id_short: String = id.chars().take(8).collect();
                                 format!(" [built by {}]", id_short)
@@ -11205,18 +11245,53 @@ impl CoordApp {
                         } else {
                             String::new()
                         };
+                        items.push(kv_item("", "", None));
+                        items.push(kv_item(
+                            "  Artifacts",
+                            &format!(
+                                "📦 {} file{}, {:.1} MB on {}{} — press a to pull",
+                                file_count,
+                                if file_count == 1 { "" } else { "s" },
+                                total_mb,
+                                latest.machine,
+                                built_by_note,
+                            ),
+                            Some(Color::rgb(200, 180, 100)),
+                        ));
+                    } else {
+                        // ── Fetch completed but no artifacts available ────────
+                        // Surface why, so intermittent absences are diagnosable.
+                        let reason = match &entry.absence_reason {
+                            Some(ArtifactAbsence::NotStashed) => format!(
+                                "no artifacts stashed (branch {} on {}): 404",
+                                sanitized, latest.machine
+                            ),
+                            Some(ArtifactAbsence::ManifestEmpty) => {
+                                "manifest empty".to_string()
+                            }
+                            Some(ArtifactAbsence::AgentUnreachable(e)) => {
+                                let msg: String = e.chars().take(80).collect();
+                                let ellipsis = if e.chars().count() > 80 { "…" } else { "" };
+                                format!("agent unreachable: {}{}", msg, ellipsis)
+                            }
+                            None => "(fetch result unknown)".to_string(),
+                        };
+                        items.push(kv_item("", "", None));
+                        items.push(kv_item(
+                            "  Artifacts",
+                            &format!("[a] unavailable — {}", reason),
+                            Some(Color::rgb(160, 140, 100)),
+                        ));
+                    }
+                }
+                None => {
+                    // No cache entry yet — fetch is in-flight (triggered by
+                    // the tick handler as soon as the Pipeline view is active).
                     items.push(kv_item("", "", None));
                     items.push(kv_item(
                         "  Artifacts",
-                        &format!(
-                            "📦 {} file{}, {:.1} MB on {}{} — press a to pull",
-                            file_count,
-                            if file_count == 1 { "" } else { "s" },
-                            total_mb,
-                            latest.machine,
-                            built_by_note,
-                        ),
-                        Some(Color::rgb(200, 180, 100)),
+                        "(checking agent…)",
+                        Some(Color::rgb(140, 140, 160)),
                     ));
                 }
             }
@@ -18016,10 +18091,23 @@ impl CoordApp {
         // #336: Poll the in-flight artifact manifest fetch and populate cache.
         if let Some((key, rx)) = &self.artifact_fetch_rx {
             match rx.try_recv() {
-                Ok(result) => {
+                Ok(outcome) => {
+                    let (manifest, absence_reason) = match outcome {
+                        ArtifactFetchOutcome::Found(m) => (Some(m), None),
+                        ArtifactFetchOutcome::NotStashed => {
+                            (None, Some(ArtifactAbsence::NotStashed))
+                        }
+                        ArtifactFetchOutcome::Empty => {
+                            (None, Some(ArtifactAbsence::ManifestEmpty))
+                        }
+                        ArtifactFetchOutcome::Unreachable(e) => {
+                            (None, Some(ArtifactAbsence::AgentUnreachable(e)))
+                        }
+                    };
                     let entry = ArtifactCacheEntry {
                         fetched_at: Instant::now(),
-                        manifest: result.ok().flatten(),
+                        manifest,
+                        absence_reason,
                     };
                     let key_clone = key.clone();
                     self.artifact_cache.insert(key_clone, entry);
@@ -31473,6 +31561,10 @@ mod tests {
         assert_eq!(sanitize_branch(branch), branch);
         // A branch with spaces (unusual but handled)
         assert_eq!(sanitize_branch("my branch name"), "my-branch-name");
+        // refs/heads/<name> — two slashes → two dashes collapsed to one each.
+        // Pinned against Python's `_sanitize_branch("refs/heads/main") == "refs-heads-main"`
+        // so the agent stash path and TUI manifest lookup always agree.
+        assert_eq!(sanitize_branch("refs/heads/main"), "refs-heads-main");
     }
 
     // ── #336: artifact_badge_visible ──────────────────────────────────────
@@ -31554,6 +31646,7 @@ mod tests {
                     total_bytes: 5_000_000,
                     built_by_assignment_id: Some("work-abc123".to_string()),
                 }),
+                absence_reason: None,
             },
         );
         assert!(app.artifact_badge_visible());
@@ -31569,6 +31662,58 @@ mod tests {
             ArtifactCacheEntry {
                 fetched_at: Instant::now(),
                 manifest: None,
+                absence_reason: Some(ArtifactAbsence::NotStashed),
+            },
+        );
+        assert!(!app.artifact_badge_visible());
+    }
+
+    // ── #433: ArtifactAbsence — absence reason is stored and badge stays hidden ─
+
+    #[test]
+    fn artifact_absence_not_stashed_badge_hidden() {
+        // When the agent returns 404 the cache entry has NotStashed.
+        // The badge must not appear regardless of absence_reason variant.
+        let mut app = make_app_for_artifact_tests();
+        let key = ("my-repo".to_string(), "issue-42-test".to_string());
+        app.artifact_cache.insert(
+            key,
+            ArtifactCacheEntry {
+                fetched_at: Instant::now(),
+                manifest: None,
+                absence_reason: Some(ArtifactAbsence::NotStashed),
+            },
+        );
+        assert!(!app.artifact_badge_visible());
+    }
+
+    #[test]
+    fn artifact_absence_unreachable_badge_hidden() {
+        let mut app = make_app_for_artifact_tests();
+        let key = ("my-repo".to_string(), "issue-42-test".to_string());
+        app.artifact_cache.insert(
+            key,
+            ArtifactCacheEntry {
+                fetched_at: Instant::now(),
+                manifest: None,
+                absence_reason: Some(ArtifactAbsence::AgentUnreachable(
+                    "connection refused".to_string(),
+                )),
+            },
+        );
+        assert!(!app.artifact_badge_visible());
+    }
+
+    #[test]
+    fn artifact_absence_empty_badge_hidden() {
+        let mut app = make_app_for_artifact_tests();
+        let key = ("my-repo".to_string(), "issue-42-test".to_string());
+        app.artifact_cache.insert(
+            key,
+            ArtifactCacheEntry {
+                fetched_at: Instant::now(),
+                manifest: None,
+                absence_reason: Some(ArtifactAbsence::ManifestEmpty),
             },
         );
         assert!(!app.artifact_badge_visible());
