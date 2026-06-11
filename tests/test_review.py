@@ -577,6 +577,16 @@ def test_reviewer_system_prompt_instructs_structured_output() -> None:
     assert "END_REVIEW" in REVIEWER_SYSTEM_PROMPT
 
 
+def test_reviewer_system_prompt_forbids_running_the_test_suite() -> None:
+    """A reviewer reads the diff; it must NOT run the test suite. Running it
+    on a headless GUI project (e.g. vimcode) hangs the session, and build/test
+    is the separate pre-merge smoke gate's job. Regression for that hang."""
+    assert "DO NOT run the project's test suite" in REVIEWER_SYSTEM_PROMPT
+    # the old mandate must be gone
+    assert "Run the test suite" not in REVIEWER_SYSTEM_PROMPT
+    assert "allowed to run the project's test suite" not in REVIEWER_SYSTEM_PROMPT
+
+
 # ── Briefing: structured output instructions ────────────────────────────────
 
 
