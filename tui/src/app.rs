@@ -14551,19 +14551,24 @@ impl CoordApp {
             review_item.disabled = self.selected_completed_work_aid().is_none();
             items.push(review_item);
             items.push(ContextMenuItem::separator());
+            // #leg1: the non-interactive (claude -p) dispatch path — the
+            // metered/automated peer to the interactive launchers above.
+            // Always offered for a real issue row; dispatch_pipeline_work/plan
+            // claim-check, so a duplicate on an already-active issue is refused
+            // gracefully. `start-skip-plan` = work directly; `start-with-plan`
+            // = plan-then-work.
+            items.push(ContextMenuItem::action(
+                "start-skip-plan",
+                "Start work (non-interactive)",
+            ));
+            items.push(ContextMenuItem::action(
+                "start-with-plan",
+                "Start plan (non-interactive)",
+            ));
+            items.push(ContextMenuItem::separator());
         }
         match lifecycle {
-            PipelineRowLifecycle::New => {
-                items.push(ContextMenuItem::action(
-                    "start-with-plan",
-                    "Start with Plan",
-                ));
-                items.push(ContextMenuItem::action(
-                    "start-skip-plan",
-                    "Skip Plan, start Work",
-                ));
-                items.push(ContextMenuItem::separator());
-            }
+            PipelineRowLifecycle::New => {}
             PipelineRowLifecycle::InProgress => {
                 // Watch is also reachable via Enter on the row; surfacing
                 // it here gives the no-right-click / Android-over-SSH
@@ -31117,9 +31122,10 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_in_progress_row_omits_start() {
-        // Once work is dispatched, Start is meaningless — Retry / View
-        // Log become the relevant actions (filed for future work).
+    fn pipeline_in_progress_row_offers_noninteractive_start() {
+        // #leg1: the non-interactive dispatch is now a peer of the interactive
+        // launchers and offered for any real issue row (the claim check refuses
+        // a duplicate on an already-active issue).
         let app = make_app_default();
         let items =
             app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
@@ -31127,20 +31133,22 @@ mod tests {
             .iter()
             .filter_map(|it| it.action_id.as_deref())
             .collect();
-        assert!(!action_ids.contains(&"start-with-plan"));
-        assert!(!action_ids.contains(&"start-skip-plan"));
+        assert!(action_ids.contains(&"start-with-plan"));
+        assert!(action_ids.contains(&"start-skip-plan"));
     }
 
     #[test]
-    fn pipeline_done_row_omits_start() {
+    fn pipeline_done_row_offers_noninteractive_start() {
+        // #leg1: also offered on Done rows — a non-interactive re-dispatch
+        // (rework) peer to "Start work (interactive)".
         let app = make_app_default();
         let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Done);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
             .collect();
-        assert!(!action_ids.contains(&"start-with-plan"));
-        assert!(!action_ids.contains(&"start-skip-plan"));
+        assert!(action_ids.contains(&"start-with-plan"));
+        assert!(action_ids.contains(&"start-skip-plan"));
     }
 
     #[test]
