@@ -14845,13 +14845,9 @@ impl CoordApp {
             });
         }
 
-        // ── #486 Leg 4: Machine picker (remote Review/Fix) ───────────────
+        // ── #486 Leg 4: Machine picker (Work / Plan / Review / Fix) ──────
         if let Some(ref picker) = self.pending_machine_picker {
-            let verb = match picker.mode {
-                InteractiveLaunchMode::Review => "review",
-                InteractiveLaunchMode::Fix => "fix",
-                _ => "session",
-            };
+            let verb = interactive_mode_verb(picker.mode);
             let mut buttons: Vec<DialogButton> = picker
                 .machines
                 .iter()
@@ -19990,14 +19986,14 @@ impl CoordApp {
 
     /// #467/#486: front door for an interactive launch from a board card.
     ///
-    /// Work/Plan always launch on the LOCAL machine (the remote-work push-back
-    /// is deferred — #494/#486d — so a remote work session would strand its
-    /// commits).  Review and Fix are the two proven remote paths (read-only
-    /// review; fix on the existing branch with `finalize_remote_interactive_exit`
-    /// push-back), so when more than one fleet machine can run the repo they
-    /// arm the machine picker; the operator's pick then dispatches over
-    /// ssh+tmux via `coord assign <machine> --interactive …`.  With a single
-    /// capable machine there is no choice to make, so it launches directly.
+    /// ALL four modes (Work / Plan / Review / Fix) can target any fleet
+    /// machine: when more than one machine can run the issue's repo, arm the
+    /// machine picker; the operator's pick then dispatches over ssh+tmux via
+    /// `coord assign <machine> --interactive …`.  Remote Work/Plan/Fix run in a
+    /// remote worktree whose commits are pushed back on exit
+    /// (`finalize_remote_interactive_exit`, #486d); remote Review is read-only.
+    /// With a single capable machine there is no choice, so it launches
+    /// directly (local TTY when that machine is this one).
     fn launch_interactive_session_for_selected_issue(&mut self, mode: InteractiveLaunchMode) {
         // Resolve the repo up front so we can decide which machines qualify.
         let Some((repo, _key)) = self.selected_issue_repo_and_key() else {
@@ -20009,38 +20005,26 @@ impl CoordApp {
             return;
         };
 
-        let offer_fleet = matches!(
-            mode,
-            InteractiveLaunchMode::Review | InteractiveLaunchMode::Fix
-        );
-        if offer_fleet {
-            let candidates = self.fleet_machines_for_repo(&repo);
-            if candidates.len() >= 2 {
-                let verb = match mode {
-                    InteractiveLaunchMode::Review => "review",
-                    InteractiveLaunchMode::Fix => "fix",
-                    _ => "session",
-                };
-                self.pipeline_status = Some((
-                    format!("Pick a machine for the interactive {verb} (1–{} / Esc)…", candidates.len()),
-                    Instant::now(),
-                ));
-                self.pending_machine_picker =
-                    Some(PendingMachinePicker { mode, machines: candidates });
-                return;
-            }
-            // 0 or 1 capable machine: no choice — launch directly, preferring
-            // the single candidate, falling back to the local machine.
-            let machine = candidates
-                .first()
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| self.data.local_machine.clone());
-            self.launch_interactive_session_on_machine(mode, machine);
+        let candidates = self.fleet_machines_for_repo(&repo);
+        if candidates.len() >= 2 {
+            self.pipeline_status = Some((
+                format!(
+                    "Pick a machine for the interactive {} (1–{} / Esc)…",
+                    interactive_mode_verb(mode),
+                    candidates.len(),
+                ),
+                Instant::now(),
+            ));
+            self.pending_machine_picker =
+                Some(PendingMachinePicker { mode, machines: candidates });
             return;
         }
-
-        // Work/Plan: local only.
-        let machine = self.data.local_machine.clone();
+        // 0 or 1 capable machine: no choice — launch directly, preferring the
+        // single candidate, falling back to the local machine.
+        let machine = candidates
+            .first()
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| self.data.local_machine.clone());
         self.launch_interactive_session_on_machine(mode, machine);
     }
 
@@ -20334,6 +20318,17 @@ enum InteractiveLaunchMode {
     /// the reviewed work's branch; emits `coord assign --interactive --fix-of
     /// <review_aid> …`.  `work_aid` carries the REVIEW assignment id here.
     Fix,
+}
+
+/// #486: short verb for an interactive launch mode — used in the machine-picker
+/// prompt and dialog title.
+fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str {
+    match mode {
+        InteractiveLaunchMode::Work => "work",
+        InteractiveLaunchMode::Plan => "plan",
+        InteractiveLaunchMode::Review => "review",
+        InteractiveLaunchMode::Fix => "fix",
+    }
 }
 
 /// #467: briefing seeded into a `Plan` interactive session — plan first, get
@@ -32134,6 +32129,41 @@ mod tests {
             "pending",
             "open+ready cc#276 must be Pending, not Done from quadraui#276",
         );
+    }
+
+    #[test]
+    fn interactive_mode_verb_covers_all_modes() {
+        assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Work), "work");
+        assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Plan), "plan");
+        assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Review), "review");
+        assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Fix), "fix");
+    }
+
+    #[test]
+    fn machine_picker_dialog_works_for_work_mode() {
+        // #486d: the picker is now offered for Work too (remote initial work).
+        let mut app = make_app_default();
+        app.pending_machine_picker = Some(PendingMachinePicker {
+            mode: InteractiveLaunchMode::Work,
+            machines: vec![
+                MachinePickEntry {
+                    name: "eb".to_string(),
+                    host: "eb.tail".to_string(),
+                    reachable: true,
+                    is_local: true,
+                },
+                MachinePickEntry {
+                    name: "dell".to_string(),
+                    host: "dell.tail".to_string(),
+                    reachable: true,
+                    is_local: false,
+                },
+            ],
+        });
+        let dlg = app.build_prompt_dialog().expect("dialog for Work mode");
+        let title: String = dlg.title.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(title.contains("work"), "Work-mode picker title shows 'work': {title}");
+        assert_eq!(dlg.buttons.len(), 3); // 2 machines + cancel
     }
 
     #[test]
