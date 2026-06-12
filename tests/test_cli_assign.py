@@ -583,3 +583,134 @@ class TestAssignInteractiveReview:
             if a.type == "review" and a.review_of_assignment_id == "work-abc"
         ]
         assert review_rows == [], "dry-run must not persist a review assignment"
+
+
+def _seed_review_and_work(
+    work_id: str,
+    review_id: str,
+    branch: str,
+    *,
+    verdict: str = "request-changes",
+    review_iteration: int = 0,
+) -> None:
+    """Persist a done work assignment + a linked review (with verdict) so the
+    `--fix-of` path can resolve review → work → branch."""
+    from coord.models import Assignment, Board, Repo
+    from coord.state import save_board
+
+    work = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1,
+        issue_title="Fix bug",
+        assignment_id=work_id,
+        status="done",
+        branch=branch,
+        type="work",
+        review_iteration=review_iteration,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    review = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1,
+        issue_title="[review] Fix bug",
+        assignment_id=review_id,
+        status="done",
+        branch=branch,
+        type="review",
+        review_of_assignment_id=work_id,
+        review_verdict=verdict,
+        dispatched_at=2.0,
+        finished_at=3.0,
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[],
+        active=[],
+        completed=[work, review],
+    )
+    save_board(board)
+
+
+class TestAssignInteractiveFix:
+    """Leg 3 (#517): `coord assign --interactive --fix-of <review_aid>` —
+    a human-attended fix continuing the reviewed work's branch."""
+
+    def test_fix_of_requires_interactive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--fix-of", "rev-123"],
+            )
+        assert result.exit_code == 2
+        assert "--fix-of requires --interactive" in result.output
+
+    def test_fix_of_mutually_exclusive_with_review_of(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--fix-of", "rev-1", "--review-of", "work-1"],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_fix_of_unknown_review_errors(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--fix-of", "nope", "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "no such assignment" in result.output
+
+    def test_fix_of_on_non_review_id_errors(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        # Passing the WORK id (type=work) instead of the review id must error.
+        _seed_review_and_work("work-x", "rev-x", "issue-1-fix-bug")
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--fix-of", "work-x", "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "not 'review'" in result.output
+
+    def test_fix_of_dry_run_continues_existing_branch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        _seed_review_and_work("work-y", "rev-y", "issue-1-fix-bug")
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--fix-of", "rev-y", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        # Fix-shaped, iteration 1, continuing the work's branch.
+        assert "FIX of #1" in result.output
+        assert "iteration 1/" in result.output
+        assert "would continue branch: issue-1-fix-bug" in result.output
+        assert "(dry run — not launched)" in result.output
+        # Dry-run must NOT persist a fix row.
+        from coord.state import build_board
+        b = build_board()
+        fix_rows = [a for a in b.active + b.completed if a.review_iteration == 1]
+        assert fix_rows == [], "dry-run must not persist a fix assignment"

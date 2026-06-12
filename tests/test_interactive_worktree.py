@@ -308,6 +308,63 @@ class TestWorktreeCreationWithRemote:
         assert actual_branch == branch
 
 
+class TestExistingBranchOverride:
+    """Leg 3 (#517): an explicit ``existing_branch`` (used by --fix-of) must
+    override the derived ``issue-{N}-{slug}`` name so the fix continues the
+    reviewed work's branch and updates the same PR."""
+
+    def test_existing_branch_overrides_derived_name(
+        self, bare_repo: Path, tmp_path: Path
+    ) -> None:
+        state_dir = tmp_path / "state"
+        wt_path, branch = setup_interactive_worktree(
+            bare_repo,
+            issue_number=7,
+            issue_title="A totally different title",
+            assignment_id="fx001",
+            default_branch="main",
+            state_dir=state_dir,
+            existing_branch="issue-7-original-work",
+        )
+        # The branch is the one we passed, NOT issue-7-a-totally-different-title.
+        assert branch == "issue-7-original-work"
+        actual = _git(wt_path, "rev-parse", "--abbrev-ref", "HEAD")
+        assert actual == "issue-7-original-work"
+
+    def test_existing_branch_continues_origin_branch(
+        self, repo_with_remote: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """When the existing branch is on origin, the worktree checks it out at
+        the remote tip — regardless of the (unrelated) issue title/number."""
+        local, _ = repo_with_remote
+        # Seed a branch on origin via a first interactive session.
+        wt1, orig_branch = setup_interactive_worktree(
+            local,
+            issue_number=42,
+            issue_title="Add widget",
+            assignment_id="seed01",
+            default_branch="main",
+            state_dir=tmp_path / "s1",
+        )
+        _git(wt1, "push", "-u", "origin", "HEAD")
+        _git(local, "worktree", "remove", str(wt1), "--force")
+
+        # A fix with a DIFFERENT title/number but existing_branch=orig_branch
+        # must continue orig_branch, not derive issue-99-fix-something.
+        wt2, branch2 = setup_interactive_worktree(
+            local,
+            issue_number=99,
+            issue_title="fix something else",
+            assignment_id="fx002",
+            default_branch="main",
+            state_dir=tmp_path / "s2",
+            existing_branch=orig_branch,
+        )
+        assert branch2 == orig_branch
+        actual = _git(wt2, "rev-parse", "--abbrev-ref", "HEAD")
+        assert actual == orig_branch
+
+
 # ── Worktree removal via finalize_interactive_exit ──────────────────────────
 
 

@@ -1895,6 +1895,19 @@ def approve(
         "(remote review is Track B / #486)."
     ),
 )
+@click.option(
+    "--fix-of",
+    "fix_of",
+    default=None,
+    help=(
+        "Leg 3 (#517): launch a human-attended interactive FIX for a review "
+        "assignment <ID> whose verdict was request-changes. Continues on the "
+        "reviewed work's EXISTING branch (so the same PR is updated, not a new "
+        "orphan branch), is briefed with the reviewer's findings, and bumps "
+        "review_iteration so the next review can scope to just the fix delta. "
+        "Requires --interactive; local-only for now (remote is Track B / #486)."
+    ),
+)
 def assign(
     machine: str,
     repo: str,
@@ -1910,6 +1923,7 @@ def assign(
     skip_freshness: bool,
     interactive: bool,
     review_of: str | None,
+    fix_of: str | None,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -1974,6 +1988,16 @@ def assign(
     # human-attended interactive launcher, so it requires --interactive.
     if review_of is not None and not interactive:
         click.echo("error: --review-of requires --interactive", err=True)
+        sys.exit(2)
+
+    # Leg 3 (#517): --fix-of is a sibling flavour — a human-attended fix of a
+    # request-changes review.  Same interactive requirement; mutually exclusive
+    # with --review-of (a dispatch is one shape or the other).
+    if fix_of is not None and not interactive:
+        click.echo("error: --fix-of requires --interactive", err=True)
+        sys.exit(2)
+    if fix_of is not None and review_of is not None:
+        click.echo("error: --fix-of and --review-of are mutually exclusive", err=True)
         sys.exit(2)
 
     # #437: HUMAN-ATTENDED branch.  When --interactive is set, we run
@@ -2234,6 +2258,252 @@ def assign(
                     err=True,
                 )
             return
+
+        # ── Leg 3 (#517): --fix-of <review_aid> ──────────────────────────
+        # A human-attended FIX of a request-changes review.  Continues on the
+        # reviewed work's EXISTING branch (updates the same PR, never an orphan
+        # branch — the fix-retry-new-branch trap), is briefed with the
+        # reviewer's findings, and bumps review_iteration so the next review can
+        # scope to just the fix delta.  Self-contained and returns, leaving the
+        # work/plan launch below unchanged.  Local-only for now (Track B / #486).
+        if fix_of is not None:
+            from coord.auto_loop import (  # noqa: PLC0415
+                _build_fix_briefing,
+                _load_review_findings,
+            )
+            from coord.agent import (  # noqa: PLC0415
+                AssignmentSpec as _AssignmentSpecFx,
+                _GitError as _AgentGitErrorFx,
+                setup_interactive_worktree as _setup_wt_fx,
+            )
+            from coord.models import Assignment as _AssignmentFx  # noqa: PLC0415
+            from coord.state import (  # noqa: PLC0415
+                COORD_DIR as _COORD_DIR_FX,
+                build_board as _build_board_fx,
+                record_dispatched_assignment as _record_fx,
+                save_board as _save_board_fx,
+            )
+
+            if not _is_local:
+                click.echo(
+                    "error: --fix-of is local-only for now; run it on the "
+                    "machine that holds the checkout (remote interactive fix "
+                    "is Track B / #486).",
+                    err=True,
+                )
+                sys.exit(2)
+
+            _fx_board = _build_board_fx()
+            review = _fx_board.find_by_id(fix_of)
+            if review is None:
+                click.echo(
+                    f"error: --fix-of {fix_of}: no such assignment on the board.",
+                    err=True,
+                )
+                sys.exit(2)
+            if review.type != "review":
+                click.echo(
+                    f"error: --fix-of {fix_of} is type={review.type!r}, not "
+                    "'review'. Pass the REVIEW assignment id (the one whose "
+                    "verdict was request-changes).",
+                    err=True,
+                )
+                sys.exit(2)
+            work = (
+                _fx_board.find_by_id(review.review_of_assignment_id)
+                if review.review_of_assignment_id
+                else None
+            )
+            if work is None:
+                click.echo(
+                    f"error: review {fix_of} has no linked work assignment "
+                    "(review_of_assignment_id is unset).",
+                    err=True,
+                )
+                sys.exit(2)
+            if not work.branch:
+                click.echo(
+                    f"error: work assignment {work.assignment_id} has no branch "
+                    "to fix.",
+                    err=True,
+                )
+                sys.exit(2)
+
+            # Iteration accounting mirrors the auto-loop fix path so the merge
+            # gate and the next review see an identical work→fix→review chain.
+            next_iteration = (work.review_iteration or 0) + 1
+            max_iter = cfg.pipeline.max_review_iterations
+            if next_iteration > max_iter:
+                click.echo(
+                    f"error: max_review_iterations ({max_iter}) reached for "
+                    f"work {work.assignment_id}; not dispatching another fix. "
+                    "Resolve manually or bump pipeline.max_review_iterations.",
+                    err=True,
+                )
+                sys.exit(2)
+
+            # Findings: reuse the SAME loader the claude -p fix path uses (DB
+            # cache → log → agent).  Local-only ⇒ no machine_host.  Fall back to
+            # a pointer-to-the-review brief when nothing structured was captured
+            # (interactive reviews may report only a one-line verdict summary).
+            _fx_log = _COORD_DIR_FX / "logs" / f"{fix_of}.log"
+            _fx_log_path = str(_fx_log) if _fx_log.exists() else None
+            try:
+                findings = _load_review_findings(review, _fx_log_path, None)
+            except Exception:  # noqa: BLE001 — best-effort; fall back below
+                findings = None
+            if findings is not None and (getattr(findings, "body", "") or "").strip():
+                _findings_body = findings.body.strip()
+            else:
+                _findings_body = (
+                    f"(No structured findings were captured for review {fix_of}.) "
+                    f"The review verdict was {review.review_verdict or 'request-changes'!r}. "
+                    "Read the reviewer's feedback on the PR / issue and address "
+                    "every blocking item before pushing."
+                )
+            from types import SimpleNamespace as _SNS  # noqa: PLC0415
+            fix_briefing = _build_fix_briefing(
+                work, _SNS(body=_findings_body), next_iteration, max_iter,
+            )
+
+            resolved_model = model if model else cfg.models.default
+            assignment_id = _uuid.uuid4().hex[:12]
+            fix_repo_path = str(
+                Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+            )
+            fix_default_branch = repo_cfg.default_branch or "main"
+
+            os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+            report_reminder = (
+                f"[Coordinator fix assignment {assignment_id}] HUMAN-ATTENDED "
+                f"fix iteration {next_iteration}/{max_iter} on branch "
+                f"{work.branch}. Before you exit, run `coord report-result "
+                f"--assignment {assignment_id} --status done --summary <text>` "
+                "so the coordinator records the result and can re-review.\n\n"
+            )
+            effective_briefing = report_reminder + fix_briefing
+
+            spec = _AssignmentSpecFx(
+                repo_name=repo,
+                repo_path=fix_repo_path,
+                issue_number=issue,
+                issue_title=f"[fix-{next_iteration}] {issue_title}",
+                briefing=effective_briefing,
+                model=resolved_model,
+                type="work",
+                provider="claude-pty",
+            )
+            # type="work" ⇒ default worker tool set (Read/Edit/Write/Bash): the
+            # fix session must be able to mutate the checkout, unlike --review-of.
+            argv = provider.build_command(spec, resolved_model=resolved_model)
+
+            click.echo(
+                f"{machine} (local TTY) → FIX of #{issue} "
+                f"(iteration {next_iteration}/{max_iter}) on branch {work.branch}"
+            )
+            click.echo("  mode: HUMAN-ATTENDED interactive fix (migration leg 3)")
+            click.echo(
+                f"  assignment id: {assignment_id}  (fix_of={fix_of}, "
+                f"work={work.assignment_id})"
+            )
+            if dry_run:
+                click.echo("  (dry run — not launched)")
+                click.echo(f"  would continue branch: {work.branch}")
+                click.echo(f"  would exec: {argv}")
+                return
+
+            try:
+                _wt_path, _ = _setup_wt_fx(
+                    Path(fix_repo_path),
+                    issue_number=issue,
+                    issue_title=issue_title,
+                    assignment_id=assignment_id,
+                    default_branch=fix_default_branch,
+                    existing_branch=work.branch,
+                )
+                worktree_path = str(_wt_path)
+            except (_AgentGitErrorFx, OSError) as _wt_err:
+                click.echo(
+                    f"  error: could not create fix worktree on branch "
+                    f"{work.branch}: {_wt_err}",
+                    err=True,
+                )
+                sys.exit(1)
+            click.echo(f"  worktree: {worktree_path} (branch: {work.branch})")
+
+            fix_assignment = _AssignmentFx(
+                machine_name=machine,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=f"[fix-{next_iteration}] {issue_title}",
+                briefing=effective_briefing,
+                assignment_id=assignment_id,
+                status="running",
+                branch=work.branch,
+                pr_url=work.pr_url,
+                dispatched_at=_time.time(),
+                type="work",
+                review_of_assignment_id=work.assignment_id,
+                review_iteration=next_iteration,
+                model=resolved_model,
+                provider_name="claude-pty",
+            )
+            _record_fx(assignment=fix_assignment, repo_github=repo_cfg.github)
+            _save_board_fx(_build_board_fx())
+
+            started_at = _time.time()
+            exit_code = launch_human_attended_interactive(
+                argv,
+                effective_briefing,
+                assignment_id=assignment_id,
+                cwd=worktree_path,
+            )
+            if exit_code != 0:
+                click.echo(f"  claude exited with status {exit_code}", err=True)
+
+            _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+            if _sname and _tmux_alive(_sname):
+                click.echo(
+                    f"  session still running in tmux: {_sname}\n"
+                    f"  reattach with:  coord reattach {assignment_id}"
+                )
+                sys.exit(0)
+
+            try:
+                finalize_result = finalize_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    worktree_path=worktree_path,
+                    base_branch=fix_default_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    log_path=None,
+                    repo_path=fix_repo_path,
+                )
+                if finalize_result.already_recorded:
+                    click.echo(
+                        "  result recorded via `coord report-result`; backstop "
+                        "did not overwrite"
+                    )
+                else:
+                    click.echo(
+                        f"  backstop: status={finalize_result.terminal_status} "
+                        f"commits_ahead={finalize_result.commits_ahead}"
+                    )
+                    if not finalize_result.push_ok:
+                        click.echo(
+                            f"  warning: git push failed: {finalize_result.push_error}",
+                            err=True,
+                        )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: backstop failed to record fix exit: {exc}",
+                    err=True,
+                )
+            sys.exit(exit_code)
 
         if _is_local:
             # Expand `~` — repo_paths in coordinator.yml use `~/src/...`,

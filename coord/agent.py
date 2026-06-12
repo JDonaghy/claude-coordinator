@@ -646,6 +646,7 @@ def setup_interactive_worktree(
     default_branch: str = "main",
     state_dir: Path | None = None,
     log_path: str | None = None,
+    existing_branch: str | None = None,
 ) -> tuple[Path, str]:
     """Set up a git worktree for an interactive ``coord assign --interactive`` session.
 
@@ -737,7 +738,11 @@ def setup_interactive_worktree(
     else:
         start_point = default_branch
 
-    branch_name = f"issue-{issue_number}-{_slugify(issue_title)}"
+    # Leg 3 (#517): an explicit existing_branch (e.g. --fix-of continuing the
+    # reviewed work's branch) overrides the derived name so the fix lands on the
+    # SAME branch and updates the same PR.  When it already exists on origin the
+    # continuation path below checks it out at the remote tip.
+    branch_name = existing_branch or f"issue-{issue_number}-{_slugify(issue_title)}"
 
     # Check whether origin or local already has this branch (retry / continuation).
     origin_has_branch = False
