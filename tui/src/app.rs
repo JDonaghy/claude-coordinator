@@ -20086,23 +20086,47 @@ impl CoordApp {
     fn selected_issue_live_session_id(&self) -> Option<String> {
         let (repo, issue_key) = self.selected_issue_repo_and_key()?;
         let issue_num = issue_key.1;
-        self.live_tmux_sessions
+        let aid = self
+            .live_tmux_sessions
             .iter()
             .find(|s| {
                 s.issue_number == Some(issue_num)
                     && s.repo_name.as_deref() == Some(repo.as_str())
             })
-            .map(|s| s.assignment_id.clone())
+            .map(|s| s.assignment_id.clone())?;
+        // #514: only reattachable while the board still considers the session
+        // running.  A finalized assignment means the session was torn down;
+        // a stale live_tmux_sessions entry must NOT drive a dead reattach.
+        if self.session_assignment_is_running(&aid) {
+            Some(aid)
+        } else {
+            None
+        }
     }
 
-    /// Whether any discovered live interactive session matches `issue_number`.
-    /// Used only to relabel the right-click menu item ("Reattach" vs "Start");
-    /// the actual reattach decision matches repo + issue precisely via
+    /// True when the session identified by `assignment_id` is still
+    /// *reattachable* — the board has its assignment as `running`.  A
+    /// finalized assignment (done/merged/advisory/failed) means the tmux
+    /// session was torn down on finalize, so a lingering `live_tmux_sessions`
+    /// entry (the discovery sweep refreshes only periodically) must not drive
+    /// a `coord reattach` against a dead session → "session not alive" (#514).
+    fn session_assignment_is_running(&self, assignment_id: &str) -> bool {
+        self.data
+            .assignments
+            .iter()
+            .any(|a| a.id == assignment_id && a.status == "running")
+    }
+
+    /// Whether `issue_number` has a *reattachable* live session (a discovered
+    /// tmux session whose board assignment is still running).  Used only to
+    /// relabel the right-click menu item ("Reattach" vs "Start"); the actual
+    /// reattach decision matches repo + issue precisely via
     /// [`Self::selected_issue_live_session_id`].
     fn issue_has_live_session(&self, issue_number: u64) -> bool {
         self.live_tmux_sessions
             .iter()
-            .any(|s| s.issue_number == Some(issue_number))
+            .filter(|s| s.issue_number == Some(issue_number))
+            .any(|s| self.session_assignment_is_running(&s.assignment_id))
     }
 
     fn launch_interactive_session_for_selected_issue(&mut self, mode: InteractiveLaunchMode) {
@@ -20246,6 +20270,12 @@ impl CoordApp {
                     && s.repo_name.as_deref() == Some(repo.as_str())
             })
             .map(|s| s.assignment_id.clone());
+        // #514: only reattach when the board still has the session running.
+        // Otherwise (finalized work whose tmux session is gone, but the
+        // discovery sweep hasn't refreshed yet) fall through to a fresh launch
+        // instead of reattaching to a dead session ("session not alive").
+        let maybe_live_session =
+            maybe_live_session.filter(|aid| self.session_assignment_is_running(aid));
 
         match quadraui::terminal_engine::TerminalSession::spawn(
             cols.max(20),
@@ -32393,9 +32423,24 @@ mod tests {
         // No live session → None.
         assert!(app.selected_issue_live_session_id().is_none());
 
-        // Same number, WRONG repo → must not match.
+        // A live session whose work assignment is still RUNNING → reattachable.
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 514, "vimcode", Some("work")));
         app.live_tmux_sessions = vec![LiveTmuxSession {
-            assignment_id: "aaa".to_string(),
+            assignment_id: "id-514-running".to_string(),
+            issue_number: Some(514),
+            repo_name: Some("vimcode".to_string()),
+            issue_title: None,
+        }];
+        assert_eq!(
+            app.selected_issue_live_session_id().as_deref(),
+            Some("id-514-running")
+        );
+
+        // Same number, WRONG repo → must not match (#480 cross-repo guard).
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "id-514-running".to_string(),
             issue_number: Some(514),
             repo_name: Some("claude-coordinator".to_string()),
             issue_title: None,
@@ -32404,20 +32449,51 @@ mod tests {
             app.selected_issue_live_session_id().is_none(),
             "cross-repo same-number session must not match"
         );
+    }
 
-        // Right repo + issue → the assignment id.
+    #[test]
+    fn finalized_session_is_not_reattachable() {
+        // #514: a live_tmux_sessions entry left over after a session finalized
+        // (board assignment status != running) must NOT be treated as
+        // reattachable — else a stale entry drives a dead `coord reattach`
+        // ("session not alive") when the user advances to review.
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 514,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/vimcode".to_string(),
+            coord_repo: Some("vimcode".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+        // Work DONE (finalized) + a stale live-session entry pointing at it.
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 514, "vimcode", Some("work")));
         app.live_tmux_sessions = vec![LiveTmuxSession {
-            assignment_id: "bbb".to_string(),
+            assignment_id: "id-514-done".to_string(),
             issue_number: Some(514),
             repo_name: Some("vimcode".to_string()),
             issue_title: None,
         }];
-        assert_eq!(app.selected_issue_live_session_id().as_deref(), Some("bbb"));
+
+        assert!(
+            app.selected_issue_live_session_id().is_none(),
+            "a finalized session must not be reattachable"
+        );
+        // The menu offers Start (advance to review), not Reattach.
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(514), &PipelineRowLifecycle::InProgress);
+        assert!(items.iter().any(|i| i.label == "Start work (interactive)"));
+        assert!(!items.iter().any(|i| i.label == "Reattach to live session"));
     }
 
     #[test]
     fn pipeline_context_menu_offers_reattach_when_session_live() {
-        // #486 Leg 4 UX: a live session for the issue collapses the four
+        // #486 Leg 4 UX: a RUNNING live session for the issue collapses the four
         // interactive Start items into a single "Reattach to live session".
         let mut app = make_app_default();
         let lifecycle = PipelineRowLifecycle::New;
@@ -32427,9 +32503,12 @@ mod tests {
         assert!(items.iter().any(|i| i.label == "Start work (interactive)"));
         assert!(!items.iter().any(|i| i.label == "Reattach to live session"));
 
-        // Live session for #514 → single Reattach item, Start variants gone.
+        // Live session backed by a RUNNING assignment → single Reattach item.
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 514, "vimcode", Some("work")));
         app.live_tmux_sessions = vec![LiveTmuxSession {
-            assignment_id: "bbb".to_string(),
+            assignment_id: "id-514-running".to_string(),
             issue_number: Some(514),
             repo_name: Some("vimcode".to_string()),
             issue_title: None,
