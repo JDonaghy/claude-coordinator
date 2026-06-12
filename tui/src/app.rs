@@ -7510,27 +7510,28 @@ impl CoordApp {
 
     /// Group pipeline issues under a repo into non-empty lifecycle sections.
     ///
-    /// #225 / #256: the Pipeline panel only displays the three sections
-    /// that actually carry pipeline state — **New** (`coord +
-    /// status:ready`, no assignments), **In-progress**, and **Done**.
-    /// Pre-pipeline states (`backlog` = no `status:*` label / `refining`
-    /// = `status:refining`) live on the Board's sidebar; the Pipeline
-    /// hides them so the panel stays focused on execution.
-    ///
-    /// The internal classifier key for "New" is still the legacy
-    /// `"pending"` — renaming the key would churn every consumer; the
-    /// display label is handled in `LIFECYCLE_META` instead.
+    /// #194: the Pipeline panel displays all **five lifecycle sections** —
+    /// **New** (no `status:*` label), **Refining** (`status:refining`),
+    /// **Pending** (`status:ready`, no work assignments), **In-progress**
+    /// (active work assignment), and **Done** (closed / merged).  The
+    /// classifier keys returned by `pipeline_lifecycle_section` map 1:1
+    /// to the display labels — the Pipeline sidebar surfaces the full
+    /// lifecycle so the TUI can drive every stage.
     ///
     /// Returns `(lifecycle_key, Vec<pipeline_issues index>)` in display
-    /// order (New → In-progress → Done), skipping empty sections.
-    /// Issues that the user has dismissed via 'D' are excluded.
+    /// order (New → Refining → Pending → In-progress → Done), skipping
+    /// empty sections.  Issues that the user has dismissed via 'D' are
+    /// excluded.
     ///
     /// Note: used in tests to verify per-repo lifecycle grouping; the
     /// production sidebar uses `pipeline_active_issues` and
     /// `pipeline_repos_for_state` directly.
     #[cfg(test)]
     fn pipeline_groups_for_repo(&self, repo_key: &str) -> Vec<(&'static str, Vec<usize>)> {
-        const VISIBLE_LIFECYCLE: [&str; 3] = ["pending", "in-progress", "done"];
+        // #194: full five-section lifecycle — New / Refining / Pending /
+        // In-progress / Done — surfaced in display order.
+        const VISIBLE_LIFECYCLE: [&str; 5] =
+            ["new", "refining", "pending", "in-progress", "done"];
 
         // #290: deduplicate by (repo_slug, issue_number) — keep the *last*
         // occurrence so that a newer closed entry (from the gh --state=closed
@@ -7836,23 +7837,40 @@ impl CoordApp {
         // still call &self and &mut self methods freely.
         let pending_depth_by_slug = self.pending_merge_queue_depth_by_slug();
 
-        // ── Compute the three state buckets ──────────────────────────────
+        // ── Compute the five state buckets ──────────────────────────────
         //
-        // Display order: Active (in-progress) → New (pending) → Done.
+        // #194: lifecycle-driven board — display order matches the issue
+        // spec: New → Refining → Pending → In-progress → Done.
+        // Active issues stay in a flat list (one node per work assignment).
+        // The other four states are grouped by repo with expandable sub-
+        // headers, since they routinely accumulate multiple items per repo.
         // Each bucket is computed once here and reused for rows + restore.
         let active_flat: Vec<usize> = self.pipeline_active_issues();
+        // main: Live/Idle grouping for the in-progress section (#473/Live-Idle).
         let active_by_liveness: Vec<(String, Vec<usize>)> = self.pipeline_active_by_liveness();
-        let new_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("pending");
+        // #194: the non-Active states split into New / Refining / Pending,
+        // each repo-grouped (Pending = the old single "New"/status:ready bucket).
+        let new_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("new");
+        let refining_by_repo: Vec<(String, Vec<usize>)> =
+            self.pipeline_repos_for_state("refining");
+        let pending_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("pending");
         let done_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("done");
 
         // Build the list of non-empty state sections in display order.
-        // Each entry: (classifier_key, display_label).
+        // Each entry: (classifier_key, display_label).  Order matches the
+        // #194 spec: New → Refining → Pending → In-progress → Done.
         let mut state_sections: Vec<(&'static str, &'static str)> = Vec::new();
-        if !active_flat.is_empty() {
-            state_sections.push(("in-progress", "Active"));
-        }
         if !new_by_repo.is_empty() {
-            state_sections.push(("pending", "New"));
+            state_sections.push(("new", "New"));
+        }
+        if !refining_by_repo.is_empty() {
+            state_sections.push(("refining", "Refining"));
+        }
+        if !pending_by_repo.is_empty() {
+            state_sections.push(("pending", "Pending"));
+        }
+        if !active_flat.is_empty() {
+            state_sections.push(("in-progress", "In-progress"));
         }
         if !done_by_repo.is_empty() {
             state_sections.push(("done", "Done"));
@@ -7882,11 +7900,14 @@ impl CoordApp {
         );
 
         // Colour palette per lifecycle state — mirrors the Board's
-        // In-flight / Completed / Refined palette for visual consistency.
+        // Backlog / Refining / Refined / In-flight / Completed palette
+        // for visual consistency between the Board and Pipeline panels.
         let state_color = |lc: &str| match lc {
             "in-progress" => Color::rgb(80, 220, 80),
             "done" => Color::rgb(120, 180, 120),
-            "pending" => Color::rgb(140, 180, 240), // "New"
+            "pending" => Color::rgb(140, 180, 240),
+            "refining" => Color::rgb(200, 170, 90), // amber — refinement in flight
+            "new" => Color::rgb(160, 160, 200),     // muted — pre-pipeline / no label
             _ => Color::rgb(140, 140, 160),
         };
 
@@ -7975,11 +7996,17 @@ impl CoordApp {
                     }
                 }
                 _ => {
-                    // New / Done: grouped by repo with expandable repo sub-headers.
-                    let repo_groups: &Vec<(String, Vec<usize>)> = if lc_key == "pending" {
-                        &new_by_repo
-                    } else {
-                        &done_by_repo
+                    // New / Refining / Pending / Done: grouped by repo with
+                    // expandable repo sub-headers.  #194 expanded this from
+                    // the original three sections to all four non-Active
+                    // lifecycle states.
+                    let repo_groups: &Vec<(String, Vec<usize>)> = match lc_key {
+                        "new" => &new_by_repo,
+                        "refining" => &refining_by_repo,
+                        "pending" => &pending_by_repo,
+                        "done" => &done_by_repo,
+                        // Fallback: unrecognised lifecycle key — empty.
+                        _ => &done_by_repo,
                     };
                     let total: usize = repo_groups.iter().map(|(_, v)| v.len()).sum();
                     sidebar.set_section_badge(
@@ -8132,10 +8159,13 @@ impl CoordApp {
                         }
                     }
                 } else {
-                    let repo_groups: &Vec<(String, Vec<usize>)> = if state_key == "pending" {
-                        &new_by_repo
-                    } else {
-                        &done_by_repo
+                    let repo_groups: &Vec<(String, Vec<usize>)> = match state_key {
+                        "new" => &new_by_repo,
+                        "refining" => &refining_by_repo,
+                        "pending" => &pending_by_repo,
+                        "done" => &done_by_repo,
+                        // Unknown state key — skip selection restore.
+                        _ => continue,
                     };
                     for (ri, (_, issue_idxs)) in repo_groups.iter().enumerate() {
                         for (ii, &idx) in issue_idxs.iter().enumerate() {
@@ -26615,14 +26645,14 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_groups_for_repo_filters_out_pre_pipeline_sections() {
-        // #225: Pipeline shows only New (status:ready+no assignments),
-        // In-progress (has assignments), and Done (closed+assignments).
-        // Unlabelled (`new`) and `status:refining` rows belong on the
-        // Board, not the Pipeline.
+    fn pipeline_groups_for_repo_includes_all_five_lifecycle_sections() {
+        // #194: the Pipeline surfaces the **five lifecycle sections** —
+        // New / Refining / Pending / In-progress / Done.  Pre-pipeline
+        // states (no `status:*` label / `status:refining`) MUST be
+        // visible so the TUI can drive every stage.
         let mut app = make_pipeline_app();
-        // Issue #42 has status:ready → New (visible).
-        // Add issue #43 with no labels → "new" classifier → HIDDEN.
+        // Issue #42 has status:ready → Pending (already visible).
+        // Add issue #43 with no labels → "new" classifier → New section.
         app.pipeline_issues.push(PipelineIssue {
             number: 43,
             title: "Backlog".to_string(),
@@ -26633,7 +26663,7 @@ mod tests {
             all_labels: vec!["coord".to_string()],
             is_closed: false,
         });
-        // Issue #44 with status:refining → "refining" classifier → HIDDEN.
+        // Issue #44 with status:refining → Refining section.
         app.pipeline_issues.push(PipelineIssue {
             number: 44,
             title: "Refining".to_string(),
@@ -26646,23 +26676,29 @@ mod tests {
         });
 
         let groups = app.pipeline_groups_for_repo("api");
-        // Only the `pending` (= New) section visible — #43 and #44 hidden.
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].0, "pending");
-        // Issue #42 is the only one in the New section.
-        assert_eq!(groups[0].1.len(), 1);
-        let visible_numbers: Vec<u64> = groups[0]
-            .1
-            .iter()
-            .map(|i| app.pipeline_issues[*i].number)
-            .collect();
-        assert_eq!(visible_numbers, vec![42]);
+        // Three non-empty sections in display order: new → refining → pending.
+        let keys: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec!["new", "refining", "pending"]);
+        // Each section holds exactly the right issue.
+        let issue_num_in = |sec_idx: usize| -> Vec<u64> {
+            groups[sec_idx]
+                .1
+                .iter()
+                .map(|i| app.pipeline_issues[*i].number)
+                .collect()
+        };
+        assert_eq!(issue_num_in(0), vec![43]); // New
+        assert_eq!(issue_num_in(1), vec![44]); // Refining
+        assert_eq!(issue_num_in(2), vec![42]); // Pending
     }
 
     #[test]
     fn pipeline_groups_for_repo_visible_section_order() {
-        // #225 / #256: visible sections render in the order New →
-        // In-progress → Done.  Set up one of each.
+        // #194: visible sections render in display order
+        // New → Refining → Pending → In-progress → Done.
+        // This test seeds Pending + In-progress + Done; the other two
+        // states are covered by
+        // `pipeline_groups_for_repo_includes_all_five_lifecycle_sections`.
         let mut app = make_pipeline_app();
         // #42 already has status:ready → New.
         // Add #43 with status:ready + an assignment → In-progress.
@@ -26697,6 +26733,74 @@ mod tests {
         let groups = app.pipeline_groups_for_repo("api");
         let order: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
         assert_eq!(order, vec!["pending", "in-progress", "done"]);
+    }
+
+    /// #194: when issues span all five lifecycle states the production
+    /// `rebuild_pipeline_sidebar` path must expose every section, in the
+    /// canonical display order New → Refining → Pending → In-progress →
+    /// Done.  Earlier behavior (#225/#256) filtered out New and Refining;
+    /// the regression guard below pins the lifecycle-driven board down.
+    #[test]
+    fn rebuild_pipeline_sidebar_exposes_all_five_lifecycle_sections() {
+        let mut app = make_pipeline_app();
+        // The fixture starts with two issues, both `status:ready`
+        // (Pending).  Add one issue per remaining state.
+        // New: no `status:*` label.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 101,
+            title: "Brand new".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        // Refining: `status:refining` label.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 102,
+            title: "Being refined".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:refining".to_string()],
+            is_closed: false,
+        });
+        // In-progress: status:ready + active work assignment.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 103,
+            title: "Actively working".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        });
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 103, "api", Some("work")));
+        // Done: closed.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 104,
+            title: "Closed".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: true,
+        });
+
+        app.rebuild_pipeline_sidebar(None);
+
+        // The sidebar must surface every lifecycle state in display order.
+        assert_eq!(
+            app.pipeline_state_section_names,
+            vec!["new", "refining", "pending", "in-progress", "done"],
+            "all five lifecycle sections must appear in the canonical order",
+        );
     }
 
     #[test]
@@ -27292,8 +27396,9 @@ mod tests {
     #[test]
     fn rebuild_pipeline_sidebar_preserves_section_collapsed_state() {
         let mut app = make_pipeline_app();
-        // Add a closed (Done) issue so we have both "New" (section 1) and
-        // "Done" (section 2) state sections.
+        // Add a closed (Done) issue so we have both "Pending" (state idx 0)
+        // and "Done" (state idx 1) sections — the pipeline fixture already
+        // seeds a `status:ready` issue (Pending).
         app.pipeline_issues.push(PipelineIssue {
             number: 55,
             title: "Finished task".to_string(),
@@ -27307,7 +27412,10 @@ mod tests {
         // Need an assignment so the closed issue is visible in Done
         // (pipeline_lifecycle_section returns "done" for is_closed=true).
         app.rebuild_pipeline_sidebar(None);
-        // Section 0 = FILTER, 1 = "New", 2 = "Done".
+        // Section 0 = FILTER, 1 = "Pending", 2 = "Done" — per #194 order:
+        // New → Refining → Pending → In-progress → Done (only Pending +
+        // Done are non-empty here).
+        assert_eq!(app.pipeline_state_section_names, vec!["pending", "done"]);
         app.pipeline_sidebar.set_collapsed(1, true);
         assert!(app.pipeline_sidebar.is_collapsed(1));
         assert!(!app.pipeline_sidebar.is_collapsed(2));
@@ -27317,7 +27425,7 @@ mod tests {
 
         assert!(
             app.pipeline_sidebar.is_collapsed(1),
-            "New section collapse state must survive rebuild",
+            "Pending section collapse state must survive rebuild",
         );
         assert!(
             !app.pipeline_sidebar.is_collapsed(2),
@@ -27326,49 +27434,48 @@ mod tests {
     }
 
     /// Collapse state is keyed by state name, not section index — when the
-    /// section order changes (e.g. the "Active" section appears), existing
-    /// sections' collapse state must follow them to their new indices.
+    /// section order changes (e.g. a section appears earlier in the display
+    /// order), existing sections' collapse state must follow them to their
+    /// new indices.
     #[test]
     fn rebuild_pipeline_sidebar_collapse_state_follows_state_through_reorder() {
         let mut app = make_pipeline_app();
-        // Initially only pending issues → "New" is state section 0 → sidebar
-        // section 1.
+        // Initially only pending issues → "Pending" is state section 0 →
+        // sidebar section 1.  Collapse the Pending section.
         assert_eq!(app.pipeline_state_section_names, vec!["pending"]);
         app.pipeline_sidebar.set_collapsed(1, true);
         assert!(app.pipeline_sidebar.is_collapsed(1));
 
-        // Add an in-progress issue — "Active" will appear at section 1,
-        // pushing "New" to section 2.
+        // Add a refining issue — per #194 display order "Refining" sits
+        // before "Pending", so the refining section will appear at sidebar
+        // section 1 and push "Pending" to sidebar section 2.
         app.pipeline_issues.push(PipelineIssue {
             number: 77,
-            title: "Active work".to_string(),
+            title: "Refining work".to_string(),
             body: String::new(),
             repo_slug: "acme/api".to_string(),
             coord_repo: Some("api".to_string()),
             matched_labels: vec!["coord".to_string()],
-            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            all_labels: vec!["coord".to_string(), "status:refining".to_string()],
             is_closed: false,
         });
-        app.data
-            .assignments
-            .push(make_assignment_typed("running", 77, "api", Some("work")));
 
         app.rebuild_pipeline_sidebar(None);
 
-        // After rebuild: state sections = ["in-progress", "pending"].
-        // sidebar section 1 = "Active" (new, should be expanded by default),
-        // sidebar section 2 = "New" (was section 1, still collapsed).
+        // After rebuild: state sections = ["refining", "pending"].
+        // sidebar section 1 = "Refining" (new, expanded by default),
+        // sidebar section 2 = "Pending" (was section 1, still collapsed).
         assert_eq!(
             app.pipeline_state_section_names,
-            vec!["in-progress", "pending"],
+            vec!["refining", "pending"],
         );
         assert!(
             !app.pipeline_sidebar.is_collapsed(1),
-            "Active section (new) must not be retroactively collapsed",
+            "Refining section (new) must not be retroactively collapsed",
         );
         assert!(
             app.pipeline_sidebar.is_collapsed(2),
-            "New section collapse state followed from section 1 to section 2",
+            "Pending section collapse state followed from section 1 to section 2",
         );
     }
 
@@ -27608,8 +27715,9 @@ mod tests {
 
     #[test]
     fn pipeline_active_section_rows_have_repo_tag_badge_and_flat_path() {
-        // Active (in-progress) issues must appear as flat rows with a
-        // single-letter repo tag badge.  New/Done rows use path [ri, ii].
+        // In-progress issues must appear as flat rows with a single-letter
+        // repo tag badge.  New / Refining / Pending / Done rows use path
+        // [ri, ii].
         let mut app = make_pipeline_app();
         // Make issue #42 active (add an assignment).
         app.data
@@ -27617,11 +27725,11 @@ mod tests {
             .push(make_assignment_typed("running", 42, "api", Some("work")));
         app.rebuild_pipeline_sidebar(None);
 
-        // "Active" section must now be section 1.
-        assert_eq!(
-            app.pipeline_state_section_names.first(),
-            Some(&"in-progress"),
-            "Active must be the first state section",
+        // The In-progress section must be present (per #194 ordering it sits
+        // between Pending and Done, not necessarily first).
+        assert!(
+            app.pipeline_state_section_names.contains(&"in-progress"),
+            "In-progress section must be present when a work assignment exists",
         );
         // The selected issue resolves correctly via the flat path.
         let idx = app.pipeline_active_issues();
