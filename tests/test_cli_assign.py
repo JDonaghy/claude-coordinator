@@ -621,6 +621,65 @@ class TestAssignInteractiveReview:
         ]
         assert review_rows == [], "dry-run must not persist a review assignment"
 
+    def test_review_of_remote_session_ended_finalizes(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Track B / #486: when the remote review tmux session has ENDED, the
+        coordinator must record a terminal state via finalize_interactive_exit
+        (worktree_path=None, repo_path=None) — otherwise the review row lingers
+        as a phantom 'running' worker holding the claim forever.  Read-only
+        review ⇒ no worktree/no repo_path so the backstop only writes the DB."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-abc", "issue-1-fix-bug")
+        fake_result = MagicMock(already_recorded=False, terminal_status="advisory")
+        finalize_spy = MagicMock(return_value=fake_result)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_interactive_exit", finalize_spy):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--review-of", "work-abc"],
+            )
+        assert result.exit_code == 0, result.output
+        # The backstop fired with the read-only (no-worktree) signature.
+        assert finalize_spy.call_count == 1, "finalize must run on session-end"
+        kwargs = finalize_spy.call_args.kwargs
+        assert kwargs["worktree_path"] is None
+        assert kwargs["repo_path"] is None
+        assert kwargs["assignment_id"]  # the recorded review id
+        assert "review session ended with no verdict" in result.output
+
+    def test_review_of_remote_session_alive_skips_finalize(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """When the remote review session is still DETACHED in tmux, finalize
+        must NOT run (the row stays running deliberately, awaiting reattach +
+        the operator's `coord report-result`)."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-abc", "issue-1-fix-bug")
+        finalize_spy = MagicMock()
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.tmux_session_alive", return_value=True), \
+             patch("coord.interactive.finalize_interactive_exit", finalize_spy):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--review-of", "work-abc"],
+            )
+        assert result.exit_code == 0, result.output
+        assert finalize_spy.call_count == 0, "alive session must not finalize"
+        assert "session still running in remote tmux" in result.output
+        assert "coord report-result" in result.output
+
 
 def _seed_review_and_work(
     work_id: str,

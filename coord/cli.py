@@ -2365,22 +2365,63 @@ def assign(
                 click.echo(f"  claude exited with status {exit_code}", err=True)
 
             _still_alive = _tmux_alive(_sname, host=_tmux_host)
+            # Verdict-out (#486d): the verdict is recorded on THIS coordinator,
+            # where the assignment row lives and the merge gate reads
+            # `review_verdict` — never on the remote machine's DB.
+            _verdict_cmd = (
+                f"    coord report-result --assignment {assignment_id} "
+                "--status done --verdict approve|request-changes "
+                "--summary <one-line summary>"
+            )
             if _still_alive:
                 click.echo(
                     f"  session still running in remote tmux: {_sname}\n"
                     f"  reattach with:  ssh -t {machine_obj.host}"
                     f" tmux attach-session -t {_sname}"
                 )
-            # Verdict-out (#486d): record on THIS coordinator, where the
-            # assignment row lives and the merge gate reads `review_verdict`.
-            click.echo(
-                "  to record the verdict (the merge gate keys on it), run ON "
-                "THIS coordinator:\n"
-                f"    coord report-result --assignment {assignment_id} "
-                "--status done --verdict approve|request-changes "
-                "--summary <one-line summary>"
-            )
-            sys.exit(0 if _still_alive else exit_code)
+                click.echo(
+                    "  to record the verdict (the merge gate keys on it), run ON "
+                    f"THIS coordinator:\n{_verdict_cmd}"
+                )
+                sys.exit(0)
+
+            # Session ended.  Record a terminal state so the review row does NOT
+            # linger as a phantom 'running' worker that holds the issue claim
+            # forever — the bug this path used to have (it printed the verdict
+            # reminder and exited, never going terminal).  A review is
+            # read-only, so finalize with worktree_path=None / repo_path=None:
+            # the backstop only writes the coordinator DB (no push, no worktree
+            # touch), identical to the local review path above.  An operator
+            # `coord report-result` is respected (already_recorded → no clobber).
+            try:
+                finalize_result = finalize_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    worktree_path=None,
+                    base_branch=review_default_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    log_path=None,
+                    repo_path=None,
+                )
+                if finalize_result.already_recorded:
+                    click.echo("  verdict recorded via `coord report-result`")
+                else:
+                    click.echo(
+                        "  review session ended with no verdict reported "
+                        f"(status={finalize_result.terminal_status}) — the merge "
+                        "gate stays blocked until a verdict is reported. To record "
+                        f"it, run ON THIS coordinator:\n{_verdict_cmd}"
+                    )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: backstop failed to record review exit: {exc}",
+                    err=True,
+                )
+            sys.exit(exit_code)
 
         # ── Leg 3 (#517): --fix-of <review_aid> ──────────────────────────
         # A human-attended FIX of a request-changes review.  Continues on the
