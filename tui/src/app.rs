@@ -8285,7 +8285,7 @@ impl CoordApp {
                 .data
                 .merge_queue
                 .iter()
-                .any(|m| m.issue_number == Some(issue.number));
+                .any(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug);
             if !has_real_entry {
                 return StageStatus::Active;
             }
@@ -8294,7 +8294,7 @@ impl CoordApp {
             .data
             .merge_queue
             .iter()
-            .find(|m| m.issue_number == Some(issue.number));
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug);
         match entry.map(|e| e.state.as_str()) {
             Some("merged") => StageStatus::Done,
             Some("open") | Some("queued") => StageStatus::Active,
@@ -10275,7 +10275,7 @@ impl CoordApp {
             .data
             .merge_queue
             .iter()
-            .find(|m| m.issue_number == Some(issue.number));
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug);
         let Some(entry) = entry else {
             return false;
         };
@@ -10381,7 +10381,7 @@ impl CoordApp {
             .data
             .merge_queue
             .iter()
-            .find(|m| m.issue_number == Some(issue.number))
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug)
         else {
             // #292 (Defect 2): no queue entry yet — this is normal when
             // notify/auto_loop haven't had a chance to create the entry.
@@ -10566,7 +10566,7 @@ impl CoordApp {
             .data
             .merge_queue
             .iter()
-            .find(|m| m.issue_number == Some(issue.number))?;
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug)?;
         let work_id = entry.assignment_id.clone();
         // Most-recent review (highest dispatched_at) paired with this
         // work and carrying a request-changes verdict.
@@ -10640,7 +10640,7 @@ impl CoordApp {
             .data
             .merge_queue
             .iter()
-            .find(|m| m.issue_number == Some(issue.number))?;
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug)?;
         let pr = entry.pr_number?;
         self.pipeline_ci_checks
             .get(&(entry.repo_github.clone(), pr))
@@ -12038,7 +12038,7 @@ impl CoordApp {
             .data
             .merge_queue
             .iter()
-            .find(|m| m.issue_number == Some(issue.number));
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug);
         let Some(entry) = entry else {
             return Vec::new();
         };
@@ -12613,7 +12613,7 @@ impl CoordApp {
             .data
             .merge_queue
             .iter()
-            .filter(|m| m.issue_number == Some(issue.number))
+            .filter(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug)
             .collect();
         if entries.is_empty() {
             items.push(kv_item(
@@ -14457,7 +14457,7 @@ impl CoordApp {
         self.data
             .merge_queue
             .iter()
-            .find(|m| m.issue_number == Some(issue.number))
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug)
             .and_then(|m| m.pr_number)
     }
 
@@ -32099,6 +32099,41 @@ mod tests {
         assert!(pis[0].matched_labels.contains(&"coord".to_string()));
         assert!(!pis[0].is_closed);
         assert!(pis[1].is_closed, "#3 is closed → Done section");
+    }
+
+    #[test]
+    fn merge_stage_ignores_same_number_issue_in_another_repo() {
+        // #486: cc#276 (open, ready) must NOT inherit quadraui#276's merged
+        // merge_queue state — matching merge entries by issue number alone made
+        // an open issue get pinned to "Done" by a closed sibling in another
+        // repo (the cross-repo issue-number collision).
+        let app = make_test_app(BoardData {
+            merge_queue: vec![MergeQueueEntry {
+                assignment_id: "q".to_string(),
+                issue_number: Some(276),
+                state: "merged".to_string(),
+                pr_number: None,
+                pr_url: None,
+                repo_github: "JDonaghy/quadraui".to_string(),
+            }],
+            ..BoardData::default()
+        });
+        let cc276 = PipelineIssue {
+            number: 276,
+            title: "cc".to_string(),
+            body: String::new(),
+            repo_slug: "JDonaghy/claude-coordinator".to_string(),
+            coord_repo: Some("claude-coordinator".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        };
+        assert_ne!(app.merge_stage_status_for(&cc276), StageStatus::Done);
+        assert_eq!(
+            app.pipeline_lifecycle_section(&cc276),
+            "pending",
+            "open+ready cc#276 must be Pending, not Done from quadraui#276",
+        );
     }
 
     #[test]
