@@ -843,3 +843,58 @@ class TestAssignInteractiveFix:
         b = build_board()
         fix_rows = [a for a in b.active + b.completed if a.review_iteration == 1]
         assert fix_rows == [], "dry-run must not persist a fix assignment"
+
+
+class TestAssignInteractiveRemoteWork:
+    """#486d: a remote interactive WORK session pushes its commits back on
+    session-end via finalize_remote_interactive_exit (was a deferred no-op)."""
+
+    def test_remote_work_session_ended_pushes_back(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        fake = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=2, push_ok=True, push_error=None,
+        )
+        spy = MagicMock(return_value=fake)
+        # gethostname=laptop ⇒ machine "server" resolves as REMOTE.
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_remote_interactive_exit", spy):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--no-plan", "--force"],
+            )
+        assert result.exit_code == 0, result.output
+        spy.assert_called_once()
+        kwargs = spy.call_args.kwargs
+        assert kwargs["ssh_target"]  # the remote machine's host
+        assert "issue-1" in kwargs["branch"], "pushes the fresh work branch"
+        assert "remote backstop" in result.output
+
+    def test_remote_work_session_alive_skips_finalize(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        spy = MagicMock()
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.tmux_session_alive", return_value=True), \
+             patch("coord.interactive.finalize_remote_interactive_exit", spy):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--no-plan", "--force"],
+            )
+        assert result.exit_code == 0, result.output
+        spy.assert_not_called()
+        assert "coord reattach" in result.output

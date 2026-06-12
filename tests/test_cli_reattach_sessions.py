@@ -666,6 +666,39 @@ class TestReattachRemote:
         assert kwargs["remote_repo_sh"]  # resolved from repo_paths
         assert "remote backstop" in result.output
 
+    def test_remote_work_pushes_back_via_remote_finalize(
+        self, config_file: Path, coord_db: Any
+    ) -> None:
+        """#486d: reattaching to a remote WORK session (not just fix) must push
+        its commits back on session-end, using the recorded branch."""
+        _insert_assignment(
+            coord_db, "aid-work",
+            type="work", branch="issue-42-classify-fix", machine_name="mymachine",
+        )
+        alive_seq = iter([True, False])
+        fake_remote = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=3, push_ok=True, push_error=None,
+        )
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive",
+                   side_effect=lambda _n, host=None: next(alive_seq, False)), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("coord.interactive.finalize_interactive_exit") as mock_fin, \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=fake_remote) as mock_remote_fin:
+            result = CliRunner().invoke(
+                main, ["reattach", "aid-work", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, output_and_stderr(result)
+        mock_fin.assert_not_called()
+        mock_remote_fin.assert_called_once()
+        kwargs = mock_remote_fin.call_args[1]
+        assert kwargs["branch"] == "issue-42-classify-fix"
+        assert kwargs["ssh_target"] == "mymachine.tailnet"
+
 
 # ── _inject_briefing_into_tmux_session ─────────────────────────────────────────
 

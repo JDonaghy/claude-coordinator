@@ -3124,6 +3124,19 @@ def assign(
                 repo_github=repo_cfg.github,
                 provider_name="claude-pty",
             )
+            # #486d: record the remote feature branch on the assignment so a
+            # later `coord reattach` can push it back (record_dispatched writes
+            # from the Proposal, which carries no branch).
+            try:
+                from coord.state import get_connection as _gc_wb  # noqa: PLC0415
+                _conn_wb = _gc_wb()
+                _conn_wb.execute(
+                    "UPDATE assignments SET branch=? WHERE assignment_id=?",
+                    (_remote_branch, assignment_id),
+                )
+                _conn_wb.commit()
+            except Exception:  # noqa: BLE001
+                pass
 
             # Set COORD_ASSIGNMENT_ID in the local coordinator env as well
             # (for symmetry with local path; the remote process gets it
@@ -3159,6 +3172,7 @@ def assign(
             # raw_shell_cmd so _launch_via_tmux uses the verbatim shell
             # command (with $HOME paths and && operators) rather than
             # re-quoting argv through shlex.join.
+            started_at = _time.time()
             _rc = _tmux_launch(
                 argv,
                 effective_briefing,
@@ -3182,18 +3196,57 @@ def assign(
             if _tmux_alive(_sname, host=_tmux_host):
                 click.echo(
                     f"  session still running in remote tmux: {_sname}\n"
-                    f"  reattach with:  ssh -t {machine_obj.host}"
-                    f" tmux attach-session -t {_sname}"
+                    f"  reattach with:  coord reattach {assignment_id}\n"
+                    "  (work commits are pushed when the session ends and the "
+                    "coordinator finalizes)"
                 )
                 sys.exit(0)
 
-            # Remote finalize (push + completion record) is deferred to
-            # #486d.  For now we note that the session ended and exit.
-            click.echo(
-                "  remote session ended; "
-                "run `coord report-result` on the remote or wait for #486d "
-                "finalize to land."
-            )
+            # Remote finalize (#486d): push the work commits to origin/<branch>,
+            # record the completion (so the pipeline advances + a re-review can
+            # fire), and clean up the remote worktree.  Mirrors the remote-FIX
+            # path; the only difference is the branch is the fresh feature
+            # branch this work session created, not an existing one.
+            try:
+                _fr = finalize_remote_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    ssh_target=machine_obj.host,
+                    remote_worktree_sh=_remote_wt,
+                    remote_repo_sh=_rp_sh,
+                    branch=_remote_branch,
+                    base_branch=repo_default_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                )
+                if _fr.already_recorded:
+                    click.echo(
+                        "  result recorded via `coord report-result`; remote "
+                        "backstop did not overwrite"
+                    )
+                else:
+                    click.echo(
+                        f"  remote backstop: status={_fr.terminal_status} "
+                        f"commits_ahead={_fr.commits_ahead} pushed={_fr.push_ok}"
+                    )
+                    if not _fr.push_ok:
+                        click.echo(
+                            f"  warning: remote push failed: {_fr.push_error}",
+                            err=True,
+                        )
+                        click.echo(
+                            f"  work commits preserved in {_remote_wt} on "
+                            f"{machine_obj.host} (worktree NOT removed)",
+                            err=True,
+                        )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: remote backstop failed to record work exit: {exc}",
+                    err=True,
+                )
             sys.exit(exit_code)
 
     # Build a Proposal inline
@@ -6273,8 +6326,11 @@ def reattach(assignment_id: str, config_path: Path) -> None:
             # records a DB-only terminal state (a review is read-only; remote
             # non-review push-back is deferred — #494/#486d).
             if not is_local_session:
+                # A fix/work/plan session wrote commits in a remote worktree on
+                # a known branch → push them back (#486d).  (A review is
+                # read-only and falls through to the DB-only branch below.)
                 if (
-                    assignment_type_val == "fix"
+                    assignment_type_val in ("fix", "work", "plan")
                     and branch_val
                     and remote_repo_sh
                     and ssh_target_val
@@ -6341,8 +6397,9 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                     )
                     if assignment_type_val not in ("review", None):
                         click.echo(
-                            "  note: remote non-review push-back is deferred — "
-                            "any commits remain on the remote worktree.",
+                            "  note: no branch recorded for this remote session "
+                            "— any commits remain on its remote worktree; push "
+                            "them manually.",
                             err=True,
                         )
                 return

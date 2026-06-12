@@ -515,10 +515,10 @@ class TestRemoteDryRun:
 
 
 class TestRemoteSessionAlive:
-    """When the remote session is still alive after attach returns, print a
-    reattach hint referencing ssh -t ... tmux attach-session."""
+    """Remote interactive WORK: a still-alive session prints a `coord reattach`
+    hint; an ended session pushes its commits back (#486d)."""
 
-    def test_still_alive_shows_ssh_reattach_hint(
+    def test_still_alive_shows_coord_reattach_hint(
         self, remote_config_file: Path, coord_dir: Path
     ) -> None:
         def _fake_tmux_launch(argv: Any, briefing: Any, sname: Any, **kw: Any) -> int:
@@ -542,22 +542,26 @@ class TestRemoteSessionAlive:
                 ],
             )
         assert result.exit_code == 0, result.output
-        assert "ssh -t" in result.output or "tmux attach-session" in result.output, (
-            f"Expected reattach hint in output; got: {result.output!r}"
-        )
-        assert "precision.tailnet" in result.output, (
-            f"Expected remote host in reattach hint; got: {result.output!r}"
+        # #486d: reattach is now driven by `coord reattach` (which finalizes +
+        # pushes back), not a raw ssh attach the operator has to finalize.
+        assert "coord reattach" in result.output, (
+            f"Expected `coord reattach` hint in output; got: {result.output!r}"
         )
 
-    def test_session_ended_shows_finalize_note(
+    def test_session_ended_pushes_back(
         self, remote_config_file: Path, coord_dir: Path
     ) -> None:
-        """When the remote session ends (not alive), the output should mention
-        that remote finalize is deferred."""
+        """#486d: an ended remote WORK session pushes its commits back via
+        finalize_remote_interactive_exit (was a deferred no-op)."""
 
         def _fake_tmux_launch(argv: Any, briefing: Any, sname: Any, **kw: Any) -> int:
             return 0
 
+        fake = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=1, push_ok=True, push_error=None,
+        )
+        spy = MagicMock(return_value=fake)
         with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
              patch("coord.claim.find_work_claim", return_value=None), \
              patch("coord.state.record_dispatched"), \
@@ -565,7 +569,8 @@ class TestRemoteSessionAlive:
              patch("coord.state.build_board", return_value=MagicMock(active=[], completed=[])), \
              patch("coord.interactive._launch_via_tmux",
                    side_effect=_fake_tmux_launch), \
-             patch("coord.interactive.tmux_session_alive", return_value=False):
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_remote_interactive_exit", spy):
             result = CliRunner().invoke(
                 main,
                 [
@@ -575,7 +580,9 @@ class TestRemoteSessionAlive:
                 ],
             )
         assert result.exit_code == 0, result.output
-        assert "remote session ended" in result.output or "report-result" in result.output
+        spy.assert_called_once()
+        assert "issue-1" in spy.call_args.kwargs["branch"]
+        assert "remote backstop" in result.output
 
 
 # ── Launch failure handling ───────────────────────────────────────────────────
