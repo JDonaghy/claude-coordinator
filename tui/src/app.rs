@@ -20187,13 +20187,16 @@ impl CoordApp {
                 let launch_line = if let Some(assignment_id) = &maybe_live_session {
                     // Reattach path: a running session exists from a previous TUI
                     // run.  Run `coord reattach` which attaches and finalizes on exit.
+                    // `--config` is a per-SUBCOMMAND option (the top-level `coord`
+                    // group rejects it), so it must come AFTER `reattach`, not
+                    // before it — `coord reattach --config <path> <aid>`.
                     let cfg = match cfg_path.as_deref() {
                         Some(p) if !p.is_empty() => {
                             format!("--config {} ", shell_quote_arg(p))
                         }
                         _ => String::new(),
                     };
-                    format!("coord {}reattach {}\r", cfg, shell_quote_arg(assignment_id))
+                    format!("coord reattach {}{}\r", cfg, shell_quote_arg(assignment_id))
                 } else {
                     // Fresh launch path.  Re-pressing the launch key while a
                     // previous interactive session is still alive replaces the PTY.
