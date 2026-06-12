@@ -4348,6 +4348,14 @@ pub struct CoordApp {
     /// Review/Fix launch.  Intercepts numeric keys (1, 2, …) to pick the
     /// target machine, or Esc to cancel.  Cleared when a machine is chosen.
     pending_machine_picker: Option<PendingMachinePicker>,
+    /// Force-quit confirmation.  Set when Esc/q is pressed while an
+    /// interactive session is live in the Terminal tab — instead of silently
+    /// swallowing the keypress (a dead end), we show a dialog so the operator
+    /// can confirm quitting (the session keeps running in tmux) or cancel.
+    pending_quit_confirm: bool,
+    /// Set by the force-quit dialog's mouse button (the click path can't
+    /// return `Reaction::Exit` directly); checked after mouse handling.
+    quit_requested: bool,
     /// #316 Phase B: file-issue edit modal.  Shown after the user chooses
     /// to file the issue drafted in a new-issue-chat.  Intercepts all
     /// keyboard input while open.
@@ -4695,6 +4703,8 @@ impl CoordApp {
             pending_board_chat: None,
             pending_repo_picker: None,
             pending_machine_picker: None,
+            pending_quit_confirm: false,
+            quit_requested: false,
             file_issue_modal: None,
             file_issue_post_rx: None,
             artifact_cache: std::collections::HashMap::new(),
@@ -14945,6 +14955,37 @@ impl CoordApp {
     /// active, following the same priority order as `status_bar()`.
     /// Returns `None` when no prompt is pending.
     fn build_prompt_dialog(&self) -> Option<Dialog> {
+        // ── Force-quit confirmation (interactive session live) ───────────
+        if self.pending_quit_confirm {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:quit-confirm"),
+                title: StyledText::plain("Quit — interactive session live?"),
+                body: vec![StyledText::plain(
+                    "An interactive session is still running in the Terminal tab. \
+                     It keeps running in tmux — you can reattach later. Quit anyway?",
+                )],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Cancel — stay".into(),
+                        is_default: true,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("force-quit"),
+                        label: "Q  Force quit (session stays in tmux)".into(),
+                        is_default: false,
+                        is_cancel: false,
+                        tint: Some(Color::rgb(220, 120, 60)),
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: true,
+                input: None,
+            });
+        }
+
         // ── #486 Leg 4: Machine picker (remote Review/Fix) ───────────────
         if let Some(ref picker) = self.pending_machine_picker {
             let verb = match picker.mode {
@@ -15468,7 +15509,9 @@ impl CoordApp {
 
     /// Dismiss whatever prompt dialog is currently showing (Esc / outside click).
     fn dismiss_prompt_dialog(&mut self) {
-        if self.pending_auto_review.is_some() {
+        if self.pending_quit_confirm {
+            self.pending_quit_confirm = false;
+        } else if self.pending_auto_review.is_some() {
             self.pending_auto_review = None;
         } else if self.pending_rework.is_some() {
             self.pending_rework = None;
@@ -15502,6 +15545,19 @@ impl CoordApp {
     /// Fire the action associated with a dialog button id.
     /// Button ids mirror those set in `build_prompt_dialog`.
     fn fire_dialog_button(&mut self, id: &str, backend: &mut dyn Backend) {
+        // ── Force-quit confirmation ──────────────────────────────────────
+        // The click path can't return Reaction::Exit, so set a flag the event
+        // handler checks right after mouse dispatch.
+        if self.pending_quit_confirm {
+            if id == "force-quit" {
+                self.quit_requested = true;
+            } else {
+                self.pending_quit_confirm = false;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
         // ── Leg 2 (#517): auto-advance Work → Review ─────────────────────
         if self.pending_auto_review.is_some() {
             if id == "review" {
@@ -21576,6 +21632,32 @@ impl ShellApp for CoordApp {
 
         // ── Mouse / scroll dispatch (before consuming the event) ─────────────
         needs_redraw |= self.handle_mouse(&event, backend, ctx);
+        // A mouse click on the force-quit dialog's confirm button sets this
+        // (the click path can't return Reaction::Exit itself).
+        if self.quit_requested {
+            return Reaction::Exit;
+        }
+
+        // ── Force-quit confirmation (interactive session live) ─────────────────
+        // Shown when Esc/q is pressed with a live Terminal-tab session.  q / Q /
+        // y / Enter confirms (the session keeps running in tmux); Esc / n
+        // cancels.  Intercepts all keys so nothing leaks to the chrome beneath.
+        if self.pending_quit_confirm {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('q') | Key::Char('Q') | Key::Char('y') | Key::Char('Y')
+                    | Key::Named(NamedKey::Enter) => {
+                        return Reaction::Exit;
+                    }
+                    Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        self.pending_quit_confirm = false;
+                        *self.dialog_layout.borrow_mut() = None;
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
 
         // ── Pre-compute panel bounds for keyboard visible-row estimates ───────
         let list_b = ctx.sidebar_bounds().unwrap_or(ctx.main_bounds());
@@ -22114,22 +22196,17 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // Guard the global quit: an unfocused Esc/q must NEVER
-                    // exit the app while an interactive session is live in the
-                    // Terminal tab.  Pressing Esc with the PTY unfocused used
-                    // to kill the TUI mid-session (the running claude survives
-                    // in tmux, but the operator loses the attached view and it
-                    // reads as "the session is gone").  Swallow it and tell
-                    // them how to proceed.
+                    // Guard the global quit: an unfocused Esc/q must not
+                    // silently exit while an interactive session is live in the
+                    // Terminal tab (the running claude survives in tmux, but the
+                    // operator loses the attached view — it reads as "gone").
+                    // Instead of dead-ending with a toast (no way to override),
+                    // show a force-quit confirmation dialog.
                     Key::Char('q') | Key::Named(NamedKey::Escape)
-                        if self.terminal_tab_has_live_session() =>
+                        if self.terminal_tab_has_live_session()
+                            && !self.pending_quit_confirm =>
                     {
-                        self.push_toast(
-                            "Session live — not quitting",
-                            "Esc/q is ignored while an interactive session runs here. \
-                             F12 to type into it, or switch views (1/2/3) to quit.",
-                            ToastSeverity::Info,
-                        );
+                        self.pending_quit_confirm = true;
                         needs_redraw = true;
                     }
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
@@ -24889,6 +24966,8 @@ mod tests {
             pending_board_chat: None,
             pending_repo_picker: None,
             pending_machine_picker: None,
+            pending_quit_confirm: false,
+            quit_requested: false,
             file_issue_modal: None,
             file_issue_post_rx: None,
             artifact_cache: std::collections::HashMap::new(),
@@ -32119,6 +32198,27 @@ mod tests {
         // Nothing sent yet → no update, receiver retained for a later poll.
         assert!(!app.poll_remote_sessions());
         assert!(app.pending_remote_sessions.is_some());
+    }
+
+    #[test]
+    fn force_quit_dialog_renders_when_armed() {
+        let mut app = make_app_default();
+        assert!(app.build_prompt_dialog().is_none(), "no dialog by default");
+        app.pending_quit_confirm = true;
+        let dlg = app.build_prompt_dialog().expect("quit-confirm dialog");
+        assert_eq!(dlg.id, WidgetId::new("dialog:quit-confirm"));
+        let ids: Vec<String> =
+            dlg.buttons.iter().map(|b| b.id.as_str().to_string()).collect();
+        assert!(ids.contains(&"force-quit".to_string()), "has a force-quit button");
+        assert!(ids.contains(&"cancel".to_string()), "has a cancel button");
+    }
+
+    #[test]
+    fn dismiss_prompt_dialog_clears_quit_confirm() {
+        let mut app = make_app_default();
+        app.pending_quit_confirm = true;
+        app.dismiss_prompt_dialog();
+        assert!(!app.pending_quit_confirm);
     }
 
     #[test]
