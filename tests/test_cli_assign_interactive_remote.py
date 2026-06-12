@@ -771,3 +771,81 @@ class TestLaunchViaTmuxRawShellCmd:
             f"shlex.quote(raw_shell_cmd) not found in ssh cmd string.\n"
             f"Expected: {quoted_raw!r}\nIn: {cmd_str!r}"
         )
+
+
+class TestRemoteReviewVerdictRelay:
+    """#486d: a remote review's verdict is relayed on the coordinator when the
+    session exits, instead of being left as a manual `coord report-result`."""
+
+    def test_non_tty_skips_prompt_and_does_not_post(self, monkeypatch) -> None:
+        from coord.cli import _prompt_and_relay_remote_review_verdict
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        posted: dict = {}
+        monkeypatch.setattr(
+            "coord.issue_store.post_result",
+            lambda rec: posted.setdefault("rec", rec),
+        )
+        ok = _prompt_and_relay_remote_review_verdict(
+            assignment_id="rev1",
+            repo_name="vimcode",
+            repo_github="JDonaghy/vimcode",
+            issue_number=514,
+            machine_name="precision",
+            verdict_cmd_hint="HINT",
+        )
+        assert ok is False
+        assert "rec" not in posted  # headless → no inline relay
+
+    def test_tty_request_changes_relays_verdict(self, monkeypatch) -> None:
+        from coord.cli import _prompt_and_relay_remote_review_verdict
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        answers = iter(["r", ""])  # verdict choice, then summary
+        monkeypatch.setattr("click.prompt", lambda *a, **k: next(answers))
+
+        captured: dict = {}
+
+        class _Out:
+            posted = True
+            error = None
+
+        monkeypatch.setattr(
+            "coord.issue_store.post_result",
+            lambda rec: (captured.setdefault("rec", rec), _Out())[1],
+        )
+        ok = _prompt_and_relay_remote_review_verdict(
+            assignment_id="rev1",
+            repo_name="vimcode",
+            repo_github="JDonaghy/vimcode",
+            issue_number=514,
+            machine_name="precision",
+            verdict_cmd_hint="HINT",
+        )
+        assert ok is True
+        rec = captured["rec"]
+        assert rec.verdict == "request-changes"
+        assert rec.status == "done"
+        assert rec.assignment_id == "rev1"
+        assert rec.repo_github == "JDonaghy/vimcode"
+
+    def test_tty_skip_does_not_post(self, monkeypatch) -> None:
+        from coord.cli import _prompt_and_relay_remote_review_verdict
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("click.prompt", lambda *a, **k: "s")
+        posted: dict = {}
+        monkeypatch.setattr(
+            "coord.issue_store.post_result",
+            lambda rec: posted.setdefault("rec", rec),
+        )
+        ok = _prompt_and_relay_remote_review_verdict(
+            assignment_id="rev1",
+            repo_name="vimcode",
+            repo_github="JDonaghy/vimcode",
+            issue_number=514,
+            machine_name="precision",
+            verdict_cmd_hint="HINT",
+        )
+        assert ok is False
+        assert "rec" not in posted

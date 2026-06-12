@@ -652,7 +652,10 @@ class TestAssignInteractiveReview:
         assert kwargs["worktree_path"] is None
         assert kwargs["repo_path"] is None
         assert kwargs["assignment_id"]  # the recorded review id
-        assert "review session ended with no verdict" in result.output
+        # #486d: non-TTY (CliRunner) → the inline verdict prompt is skipped and
+        # the manual `coord report-result` hint is printed instead.
+        assert "no verdict reported" in result.output
+        assert "coord report-result" in result.output
 
     def test_review_of_remote_session_alive_skips_finalize(
         self, config_file: Path, coord_dir: Path

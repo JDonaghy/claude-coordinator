@@ -1814,6 +1814,73 @@ def approve(
             write_session_start()
 
 
+def _prompt_and_relay_remote_review_verdict(
+    *,
+    assignment_id: str,
+    repo_name: str,
+    repo_github: str,
+    issue_number: int,
+    machine_name: str,
+    verdict_cmd_hint: str,
+) -> bool:
+    """#486d: relay a *remote* review's verdict on the coordinator.
+
+    A remote review session can't write this DB (its `coord report-result`
+    would hit the remote machine's DB), and the reattach/assign finalize is
+    DB-only — so the verdict silently never reaches the merge gate and the
+    Work→Review→Fix flow stalls.  After the session ends, prompt the operator
+    here (the embedded terminal is a TTY) and relay the verdict through the
+    same `issue_store` seam `coord report-result` uses.
+
+    No-op that prints the manual hint when stdin isn't a TTY (tests/headless).
+    Returns True when a verdict was recorded.
+    """
+    if not sys.stdin.isatty():
+        click.echo(f"  no verdict reported — record it with:\n{verdict_cmd_hint}")
+        return False
+    ans = click.prompt(
+        "  Remote review verdict — [a]pprove / [r]equest-changes / [s]kip",
+        type=click.Choice(["a", "r", "s"], case_sensitive=False),
+        default="s",
+        show_choices=True,
+    )
+    verdict = {"a": "approve", "r": "request-changes"}.get(ans.lower())
+    if verdict is None:
+        click.echo(f"  skipped — record the verdict later with:\n{verdict_cmd_hint}")
+        return False
+    summary = click.prompt(
+        "  one-line summary (optional, Enter to skip)", default="", show_default=False
+    )
+    try:
+        from coord import issue_store  # noqa: PLC0415
+
+        outcome = issue_store.post_result(
+            issue_store.ResultRecord(
+                assignment_id=assignment_id,
+                machine_name=machine_name,
+                repo_name=repo_name,
+                repo_github=repo_github,
+                issue_number=int(issue_number),
+                status="done",
+                verdict=verdict,  # type: ignore[arg-type]  # narrowed to approve/request-changes above
+                summary=summary,
+                branch=None,
+            )
+        )
+        click.echo(
+            f"  verdict '{verdict}' recorded (posted_to_github={outcome.posted})."
+        )
+        if outcome.error:
+            click.echo(f"  github post warning: {outcome.error}", err=True)
+        return True
+    except Exception as exc:  # noqa: BLE001 — best-effort; fall back to the hint
+        click.echo(
+            f"  warning: failed to record verdict inline: {exc}\n{verdict_cmd_hint}",
+            err=True,
+        )
+        return False
+
+
 @main.command(help="Directly assign an issue to a machine, bypassing coord plan.")
 @click.argument("machine")
 @click.argument("repo")
@@ -2410,11 +2477,16 @@ def assign(
                 if finalize_result.already_recorded:
                     click.echo("  verdict recorded via `coord report-result`")
                 else:
-                    click.echo(
-                        "  review session ended with no verdict reported "
-                        f"(status={finalize_result.terminal_status}) — the merge "
-                        "gate stays blocked until a verdict is reported. To record "
-                        f"it, run ON THIS coordinator:\n{_verdict_cmd}"
+                    # #486d: don't leave the verdict as a manual step — prompt the
+                    # operator here (on the coordinator, where the row lives) and
+                    # relay it, so the merge gate / leg-3 Fix routing sees it.
+                    _prompt_and_relay_remote_review_verdict(
+                        assignment_id=assignment_id,
+                        repo_name=repo,
+                        repo_github=repo_cfg.github,
+                        issue_number=issue,
+                        machine_name=machine,
+                        verdict_cmd_hint=_verdict_cmd,
                     )
             except Exception as exc:  # noqa: BLE001 — best-effort backstop
                 click.echo(
@@ -6395,7 +6467,23 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                     click.echo(
                         f"  backstop: status={fr2.terminal_status} (remote, DB-only)"
                     )
-                    if assignment_type_val not in ("review", None):
+                    if assignment_type_val == "review":
+                        # #486d: relay the review verdict here — the remote
+                        # session can't write this DB — instead of leaving it
+                        # a manual `coord report-result` step.
+                        _prompt_and_relay_remote_review_verdict(
+                            assignment_id=assignment_id,
+                            repo_name=repo_name_val,
+                            repo_github=repo_github_val,
+                            issue_number=int(issue_number_val),  # type: ignore[arg-type]
+                            machine_name=machine_name_val or "unknown",
+                            verdict_cmd_hint=(
+                                f"    coord report-result --assignment "
+                                f"{assignment_id} --status done "
+                                "--verdict approve|request-changes"
+                            ),
+                        )
+                    elif assignment_type_val is not None:
                         click.echo(
                             "  note: no branch recorded for this remote session "
                             "— any commits remain on its remote worktree; push "
