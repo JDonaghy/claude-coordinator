@@ -32,8 +32,9 @@ the critical path** (demoted to Horizon).
 | **A1 — interactive Review dispatch** (`coord assign --interactive --review-of`) | 🟢 merged | PR #538 |
 | **In-TUI render** — scrub `$TMUX` from the embedded terminal so interactive sessions render in the pane | 🟢 merged | quadraui PR #360 |
 | **A2 — TUI "Review (interactive)" board action** | 🟢 merged | PR #540 |
-| **A3 — interactive Smoke** (`--smoke-of`) | 🔴 **NEXT** | — |
-| **Track B — remote fleet** (ssh+tmux; Review/Smoke read-only first) | ⚪ designed | #486, #493/#499 |
+| **A3 — interactive Smoke** (`--smoke-of`) | 🔴 local NEXT | — |
+| **Track B — remote Review** (`--review-of` over ssh+tmux, read-only) | 🟢 merged | #486 (`9e0c5d2`) |
+| **Track B — remote Fix / Smoke + TUI machine picker** | ⚪ next | #486, #493/#499 |
 
 ## Status (2026-06-11)
 
@@ -47,7 +48,8 @@ the critical path** (demoted to Horizon).
   - **leg 3b** — TUI verdict-routing (`58b06b1`): an interactive review's verdict routes — **request-changes → one-key fix prompt** (→ leg-3a `--fix-of`); **approve → smoke/merge notice**. The re-review gate now fires after a fix, so the **next review is incremental** (the token-waste fix the user flagged). + a "Start fix (interactive)" menu item.
   - All on `main`; coord-tui rebuilt + installed; coord suite 2059 + tui 593 pass.
   - **✅ SMOKED END-TO-END in the wild (2026-06-12, quadraui #287 rounded corners):** interactive Work → interactive Review (approved) → smoke gate → **merged to develop (PR #361)**, driven from the board. Session resilience proven (an accidental Esc didn't lose the work — tmux #487 survived; recovered via `coord reattach`). Smoke fixed the **Esc-quits** bug (`f184726`) and filed 8 follow-ups: #541 (issue fuzzy-finder), #542 (auto-advance resilience across TUI restarts — refs #517), #543 (finalize must record branch), #544 (coord ready add coord label), #545 (refinement leaves work-shaped branch), #546 (cost-per-issue reporting), #547 (briefing readability), #548 (review verdict misrouted to work row → merge gate blind). The manual board nudges needed (record branch, relocate verdict, smoke pass) all map to #543/#548 — once those land the flow is hands-off.
-  - **Next: leg 3c** — guided approve → pull-artifact + smoke → merge (vs the current notice); **leg 4** — all of it over SSH (Track B).
+  - **leg 4 (Track B) — remote interactive Review is LANDED + smoked e2e (2026-06-11).** `coord assign --interactive --review-of <work_aid> <remote>` ungated from local-only (`9e0c5d2`): read-only in the remote's LIVE checkout (no worktree — it's the worker-worktree base), reviewer prompt + read-only tools, recorded in the coordinator DB. Verdict relay is operator-on-coordinator (a remote `report-result` writes the wrong DB — the #486d gap), zero release needed. **Proven on dellserver against quadraui #287:** 1-prompt launch → in-pane render → real `git fetch`+diff → a genuinely good independent `REVIEW_VERDICT` (cross-backend Before/After table, macOS Core-Graphics correctness check, caught a real run-on-doc nit). Also shipped a needed SSH `ControlMaster` multiplex fix (`f40f632`): one remote launch fired ~5 unmultiplexed ssh auths → a wall of passphrase prompts; now one connection per launch (smoked: 5 prompts → 1).
+  - **Next: leg 4 cont. — remote Fix** (`--fix-of`: same ungate but it WRITES → remote worktree + finalize/push-back, the deferred #486d piece) → **TUI machine picker** (drive remote Review/Fix from a board card). **leg 3c** — guided approve → pull-artifact + smoke → merge — remains open on the local track.
 - 📋 **Next, in order:** **A3** interactive Smoke (`--smoke-of`, mirror A1/A2) → **Track B** remote (start with dellserver, read-only Review/Smoke). A1 follow-ups to fold in: the briefing emits both the `REVIEW_VERDICT` block and the report-result reminder (claude used the block); `coord report-result` needs a `--body-file` for full review bodies (see `project_a1_interactive_review`).
 - 🧭 **Open design Q — where do automated tests gate?** CI is pytest-only, so Rust repos (tui/quadraui/vimcode) still have no automated gate; they need an explicit `cargo build && cargo test` gate (extend CI, or a pre-merge verify step).
 
