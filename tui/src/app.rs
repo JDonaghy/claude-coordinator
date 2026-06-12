@@ -728,6 +728,34 @@ struct PendingRepoPicker {
     opened_at: Instant,
 }
 
+/// #486 Leg 4: pending fleet-machine picker for an interactive launch.
+///
+/// Armed by `launch_interactive_session_for_selected_issue` (Review/Fix only)
+/// when more than one fleet machine can run the selected issue's repo, so the
+/// operator can dispatch a remote review/fix over ssh+tmux from a board card
+/// instead of always launching locally.  A numeric key (1, 2, …) picks the
+/// machine and immediately launches; Esc cancels.  Mirrors `PendingRepoPicker`.
+#[derive(Clone)]
+struct PendingMachinePicker {
+    /// Which interactive flavour to launch once a machine is chosen.
+    mode: InteractiveLaunchMode,
+    /// Candidate machines, local first, then reachable, then by name.
+    machines: Vec<MachinePickEntry>,
+}
+
+/// One selectable machine in `PendingMachinePicker`.
+#[derive(Clone)]
+struct MachinePickEntry {
+    /// Coordinator machine NAME (the `coord assign` positional, not the host).
+    name: String,
+    /// Tailscale FQDN — shown so the operator knows where the ssh lands.
+    host: String,
+    /// Live agent reachability (TCP/health probe) at board-build time.
+    reachable: bool,
+    /// True when this is the coordinator's own machine (launches on the TTY).
+    is_local: bool,
+}
+
 /// #316 Phase B: state for the file-issue finaliser modal.
 /// Shown when the user confirms filing a new issue drafted by a new-issue-chat.
 ///
@@ -3056,8 +3084,13 @@ fn fetch_live_tmux_sessions() -> Vec<LiveTmuxSession> {
         Some(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = match serde_json::from_str(&text) {
+    parse_sessions_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the `{"sessions": [...]}` JSON emitted by `coord sessions --json`.
+/// Shared by the synchronous local fetch and the background remote fetch.
+fn parse_sessions_json(text: &str) -> Vec<LiveTmuxSession> {
+    let v: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -3087,6 +3120,35 @@ fn fetch_live_tmux_sessions() -> Vec<LiveTmuxSession> {
             })
         })
         .collect()
+}
+
+/// #486 Leg 4: fetch local + REMOTE coord-* sessions in the background.
+///
+/// Runs `coord sessions --json --remote` (which ssh-probes the fleet) off the
+/// startup path so the TUI appears immediately; the result REPLACES the
+/// local-only startup snapshot when it arrives (it is a superset).  A missing
+/// config path lets `coord` fall back to its own discovery.
+fn spawn_remote_tmux_sessions_fetch(
+    config_path: Option<std::path::PathBuf>,
+) -> std::sync::mpsc::Receiver<Vec<LiveTmuxSession>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut args: Vec<String> =
+            vec!["sessions".into(), "--json".into(), "--remote".into()];
+        if let Some(cfg) = config_path {
+            args.push("--config".into());
+            args.push(cfg.to_string_lossy().into_owned());
+        }
+        let out = std::process::Command::new("coord").args(&args).output().ok();
+        let sessions = match out {
+            Some(o) if o.status.success() => {
+                parse_sessions_json(&String::from_utf8_lossy(&o.stdout))
+            }
+            _ => Vec::new(),
+        };
+        let _ = tx.send(sessions);
+    });
+    rx
 }
 
 /// Return the version string of the local `coord` binary by running
@@ -4282,6 +4344,10 @@ pub struct CoordApp {
     /// intercepts numeric keys (1, 2, …) to select a repo, or Esc to cancel.
     /// Cleared when a repo is selected or the picker times out.
     pending_repo_picker: Option<PendingRepoPicker>,
+    /// #486 Leg 4: pending fleet-machine picker for a remote interactive
+    /// Review/Fix launch.  Intercepts numeric keys (1, 2, …) to pick the
+    /// target machine, or Esc to cancel.  Cleared when a machine is chosen.
+    pending_machine_picker: Option<PendingMachinePicker>,
     /// #316 Phase B: file-issue edit modal.  Shown after the user chooses
     /// to file the issue drafted in a new-issue-chat.  Intercepts all
     /// keyboard input while open.
@@ -4423,6 +4489,11 @@ pub struct CoordApp {
     /// `launch_interactive_session_for_selected_issue` to offer reattach
     /// instead of starting a fresh session when one already exists.
     live_tmux_sessions: Vec<LiveTmuxSession>,
+    /// #486 Leg 4: background fetch of local + REMOTE sessions (ssh-probes the
+    /// fleet).  When it lands, it REPLACES `live_tmux_sessions` (a superset of
+    /// the local-only startup snapshot) so reattach can target remote sessions.
+    pending_remote_sessions:
+        Option<std::sync::mpsc::Receiver<Vec<LiveTmuxSession>>>,
 
     // ── Leg 2 (#517): auto-advance Work → Review ───────────────────────────
     /// Interactive Work/Plan sessions launched this run, keyed by
@@ -4623,6 +4694,7 @@ impl CoordApp {
             finalise_after_notes_post: false,
             pending_board_chat: None,
             pending_repo_picker: None,
+            pending_machine_picker: None,
             file_issue_modal: None,
             file_issue_post_rx: None,
             artifact_cache: std::collections::HashMap::new(),
@@ -4658,6 +4730,9 @@ impl CoordApp {
             metrics_last_polled: Instant::now(),
             // #487: live tmux session discovery.
             live_tmux_sessions: fetch_live_tmux_sessions(),
+            pending_remote_sessions: Some(spawn_remote_tmux_sessions_fetch(
+                crate::commands::find_config(),
+            )),
             // Leg 2 (#517): auto-advance Work → Review.
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
@@ -10666,6 +10741,28 @@ impl CoordApp {
 
     /// Drain the in-flight poll channel without blocking. Returns `true`
     /// when results were received and the issue list/sidebar changed.
+    /// #486 Leg 4: drain the background local+remote session fetch.  When it
+    /// completes it REPLACES the local-only startup snapshot so the reattach
+    /// detection in `launch_interactive_session_for_selected_issue` can target
+    /// sessions running on remote fleet machines.  Returns true on update.
+    fn poll_remote_sessions(&mut self) -> bool {
+        let Some(rx) = self.pending_remote_sessions.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(sessions) => {
+                self.live_tmux_sessions = sessions;
+                self.pending_remote_sessions = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_remote_sessions = None;
+                false
+            }
+        }
+    }
+
     fn poll_pipeline_loader(&mut self) -> bool {
         let rx = match &self.pipeline_loader {
             Some(rx) => rx,
@@ -14848,6 +14945,56 @@ impl CoordApp {
     /// active, following the same priority order as `status_bar()`.
     /// Returns `None` when no prompt is pending.
     fn build_prompt_dialog(&self) -> Option<Dialog> {
+        // ── #486 Leg 4: Machine picker (remote Review/Fix) ───────────────
+        if let Some(ref picker) = self.pending_machine_picker {
+            let verb = match picker.mode {
+                InteractiveLaunchMode::Review => "review",
+                InteractiveLaunchMode::Fix => "fix",
+                _ => "session",
+            };
+            let mut buttons: Vec<DialogButton> = picker
+                .machines
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let where_tag = if m.is_local { "local" } else { "remote" };
+                    let reach = if m.reachable { "●" } else { "○ offline?" };
+                    DialogButton {
+                        id: WidgetId::new(format!("machine:{i}")),
+                        label: format!(
+                            "{}  {} ({}) {}  {}",
+                            i + 1,
+                            m.name,
+                            where_tag,
+                            reach,
+                            m.host
+                        ),
+                        is_default: i == 0,
+                        is_cancel: false,
+                        tint: None,
+                    }
+                })
+                .collect();
+            buttons.push(DialogButton {
+                id: WidgetId::new("cancel"),
+                label: "Esc  Cancel".into(),
+                is_default: false,
+                is_cancel: true,
+                tint: None,
+            });
+            return Some(Dialog {
+                id: WidgetId::new("dialog:machine-picker"),
+                title: StyledText::plain(format!("Select machine for interactive {verb}")),
+                body: vec![StyledText::plain(
+                    "Local runs on this TTY; a remote machine dispatches over ssh+tmux.",
+                )],
+                buttons,
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: true,
+                input: None,
+            });
+        }
+
         // ── Repo picker ──────────────────────────────────────────────────
         if let Some(ref picker) = self.pending_repo_picker {
             let mut buttons: Vec<DialogButton> = picker
@@ -15325,6 +15472,8 @@ impl CoordApp {
             self.pending_auto_review = None;
         } else if self.pending_rework.is_some() {
             self.pending_rework = None;
+        } else if self.pending_machine_picker.is_some() {
+            self.pending_machine_picker = None;
         } else if self.pending_repo_picker.is_some() {
             self.pending_repo_picker = None;
         } else if self.pending_refinement_close_prompt.is_some() {
@@ -15370,6 +15519,25 @@ impl CoordApp {
                 self.confirm_rework();
             } else {
                 self.pending_rework = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #486 Leg 4: Machine picker (remote Review/Fix) ───────────────
+        if self.pending_machine_picker.is_some() {
+            if id == "cancel" {
+                self.pending_machine_picker = None;
+            } else if let Some(idx_str) = id.strip_prefix("machine:") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if let Some(picker) = self.pending_machine_picker.take() {
+                        if let Some(entry) = picker.machines.get(idx) {
+                            let mode = picker.mode;
+                            let machine = entry.name.clone();
+                            self.launch_interactive_session_on_machine(mode, machine);
+                        }
+                    }
+                }
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -18524,6 +18692,10 @@ impl CoordApp {
         if self.file_issue_post_rx.is_some() && self.poll_file_issue_post() {
             needs_redraw = true;
         }
+        // #486 Leg 4: drain the background local+remote session fetch.
+        if self.pending_remote_sessions.is_some() && self.poll_remote_sessions() {
+            needs_redraw = true;
+        }
 
         // #315: drain InjectFallback signals from `spawn_inject_post`.
         // These fire when /inject/{id} returned 409/410 — the worker
@@ -19883,9 +20055,95 @@ impl CoordApp {
         self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
     }
 
-    /// Launch a local human-attended `claude` session for the selected
-    /// pipeline issue (#467; supersedes the ssh+tmux launcher previously
-    /// built for #446).
+    /// #486 Leg 4: fleet machines that can run `repo`, ordered local-first,
+    /// then reachable, then by name.  Drives the machine picker: a machine
+    /// qualifies when the repo is in its configured `repos` list (the static
+    /// coordinator.yml mirror — populated even for currently-unreachable
+    /// machines, so a momentarily-down agent is still offered).
+    fn fleet_machines_for_repo(&self, repo: &str) -> Vec<MachinePickEntry> {
+        let local = self.data.local_machine.clone();
+        let mut v: Vec<MachinePickEntry> = self
+            .data
+            .machines
+            .iter()
+            .filter(|m| m.repos.iter().any(|r| r == repo))
+            .map(|m| MachinePickEntry {
+                name: m.name.clone(),
+                host: m.host.clone(),
+                reachable: m.reachable,
+                is_local: m.name == local,
+            })
+            .collect();
+        v.sort_by(|a, b| {
+            b.is_local
+                .cmp(&a.is_local)
+                .then(b.reachable.cmp(&a.reachable))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        v
+    }
+
+    /// #467/#486: front door for an interactive launch from a board card.
+    ///
+    /// Work/Plan always launch on the LOCAL machine (the remote-work push-back
+    /// is deferred — #494/#486d — so a remote work session would strand its
+    /// commits).  Review and Fix are the two proven remote paths (read-only
+    /// review; fix on the existing branch with `finalize_remote_interactive_exit`
+    /// push-back), so when more than one fleet machine can run the repo they
+    /// arm the machine picker; the operator's pick then dispatches over
+    /// ssh+tmux via `coord assign <machine> --interactive …`.  With a single
+    /// capable machine there is no choice to make, so it launches directly.
+    fn launch_interactive_session_for_selected_issue(&mut self, mode: InteractiveLaunchMode) {
+        // Resolve the repo up front so we can decide which machines qualify.
+        let Some((repo, _key)) = self.selected_issue_repo_and_key() else {
+            self.pipeline_status = Some((
+                "Cannot resolve repo for this issue — interactive session not launched"
+                    .to_string(),
+                Instant::now(),
+            ));
+            return;
+        };
+
+        let offer_fleet = matches!(
+            mode,
+            InteractiveLaunchMode::Review | InteractiveLaunchMode::Fix
+        );
+        if offer_fleet {
+            let candidates = self.fleet_machines_for_repo(&repo);
+            if candidates.len() >= 2 {
+                let verb = match mode {
+                    InteractiveLaunchMode::Review => "review",
+                    InteractiveLaunchMode::Fix => "fix",
+                    _ => "session",
+                };
+                self.pipeline_status = Some((
+                    format!("Pick a machine for the interactive {verb} (1–{} / Esc)…", candidates.len()),
+                    Instant::now(),
+                ));
+                self.pending_machine_picker =
+                    Some(PendingMachinePicker { mode, machines: candidates });
+                return;
+            }
+            // 0 or 1 capable machine: no choice — launch directly, preferring
+            // the single candidate, falling back to the local machine.
+            let machine = candidates
+                .first()
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| self.data.local_machine.clone());
+            self.launch_interactive_session_on_machine(mode, machine);
+            return;
+        }
+
+        // Work/Plan: local only.
+        let machine = self.data.local_machine.clone();
+        self.launch_interactive_session_on_machine(mode, machine);
+    }
+
+    /// Launch a human-attended `claude` session for the selected pipeline
+    /// issue on `machine` (#467; supersedes the ssh+tmux launcher previously
+    /// built for #446).  When `machine` is the local machine the session runs
+    /// on this TTY; when it is a remote fleet machine, `coord assign <machine>
+    /// --interactive` drives the ssh+tmux dispatch (#486 Leg 4).
     ///
     /// Spawns a local shell session (`TerminalSession::spawn`) into the
     /// per-issue map and auto-runs `coord assign --interactive …` (the
@@ -19893,7 +20151,11 @@ impl CoordApp {
     /// session stays strictly human-attended — the TUI never parses the
     /// session TTY for completion/verdict and never auto-advances the
     /// pipeline (Anthropic ToS §3.7 / #437).
-    fn launch_interactive_session_for_selected_issue(&mut self, mode: InteractiveLaunchMode) {
+    fn launch_interactive_session_on_machine(
+        &mut self,
+        mode: InteractiveLaunchMode,
+        machine: String,
+    ) {
         let Some((repo, issue_key)) = self.selected_issue_repo_and_key() else {
             self.pipeline_status = Some((
                 "Cannot resolve repo for this issue — interactive session not launched".to_string(),
@@ -19903,12 +20165,12 @@ impl CoordApp {
         };
         let issue_num = issue_key.1;
 
-        // `coord assign` needs a MACHINE positional; for a local human-attended
-        // launch that's this machine (hostname-matched into coordinator.yml).
-        let machine = self.data.local_machine.clone();
+        // `coord assign` needs a MACHINE positional.  `machine` is chosen by
+        // the caller: the local machine for Work/Plan (and single-machine
+        // fleets), or the operator's pick for a remote Review/Fix (#486 Leg 4).
         if machine.is_empty() {
             self.pipeline_status = Some((
-                "Cannot resolve the local machine (hostname not in coordinator.yml) — interactive session not launched"
+                "Cannot resolve the target machine (not in coordinator.yml) — interactive session not launched"
                     .to_string(),
                 Instant::now(),
             ));
@@ -21318,6 +21580,33 @@ impl ShellApp for CoordApp {
         // ── Pre-compute panel bounds for keyboard visible-row estimates ───────
         let list_b = ctx.sidebar_bounds().unwrap_or(ctx.main_bounds());
         let lh = backend.line_height();
+
+        // ── #486 Leg 4: Pending fleet-machine picker ───────────────────────────
+        // Armed for a remote Review/Fix launch when >1 machine can run the repo.
+        // Numeric keys (1, 2, …) pick the machine and launch; Esc cancels.
+        if self.pending_machine_picker.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char(ch) if ch.is_ascii_digit() && *ch != '0' => {
+                        let digit = (*ch as u32 - '1' as u32) as usize;
+                        if let Some(picker) = self.pending_machine_picker.as_ref() {
+                            if digit < picker.machines.len() {
+                                let mode = picker.mode;
+                                let machine = picker.machines[digit].name.clone();
+                                self.pending_machine_picker = None;
+                                self.launch_interactive_session_on_machine(mode, machine);
+                                return Reaction::Redraw;
+                            }
+                        }
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_machine_picker = None;
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
 
         // ── #353: Pending repo picker for [Add] button ─────────────────────────
         // When multiple repos exist, this shows a numeric picker (1, 2, …).
@@ -24599,6 +24888,7 @@ mod tests {
             finalise_after_notes_post: false,
             pending_board_chat: None,
             pending_repo_picker: None,
+            pending_machine_picker: None,
             file_issue_modal: None,
             file_issue_post_rx: None,
             artifact_cache: std::collections::HashMap::new(),
@@ -24632,6 +24922,7 @@ mod tests {
             metrics_last_polled: Instant::now(),
             // #487
             live_tmux_sessions: Vec::new(),
+            pending_remote_sessions: None,
             // Leg 2 (#517)
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
@@ -31707,6 +31998,143 @@ mod tests {
         assert_eq!(app.toasts.len(), toast_before + 1);
         assert!(app.pending_board_chat.is_none());
         assert!(app.pending_repo_picker.is_none());
+    }
+
+    // ── #486 Leg 4: fleet machine picker ─────────────────────────────────
+    fn mk_machine(name: &str, host: &str, reachable: bool, repos: &[&str]) -> Machine {
+        Machine {
+            name: name.to_string(),
+            host: host.to_string(),
+            reachable,
+            active_count: 0,
+            repos: repos.iter().map(|s| s.to_string()).collect(),
+            version: None,
+            worktree_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn fleet_machines_for_repo_filters_and_orders_local_first() {
+        // Local machine first, then reachable remotes (by name), then
+        // unreachable; machines that don't serve the repo are excluded.
+        let app = CoordApp {
+            data: BoardData {
+                machines: vec![
+                    mk_machine("remote-b", "b.tail", true, &["api"]),
+                    mk_machine("eb", "eb.tail", true, &["api"]),
+                    mk_machine("remote-down", "d.tail", false, &["api"]),
+                    mk_machine("wrong", "w.tail", true, &["other"]),
+                ],
+                local_machine: "eb".to_string(),
+                ..BoardData::default()
+            },
+            ..make_test_app(BoardData::default())
+        };
+        let picks = app.fleet_machines_for_repo("api");
+        let names: Vec<&str> = picks.iter().map(|m| m.name.as_str()).collect();
+        // "wrong" excluded (serves only "other"); local first, reachable
+        // remote before the offline one.
+        assert_eq!(names, vec!["eb", "remote-b", "remote-down"]);
+        assert!(picks[0].is_local);
+        assert!(!picks[1].is_local);
+        assert!(picks[1].reachable);
+        assert!(!picks[2].reachable);
+    }
+
+    #[test]
+    fn machine_picker_dialog_lists_each_machine_plus_cancel() {
+        let mut app = make_app_default();
+        app.pending_machine_picker = Some(PendingMachinePicker {
+            mode: InteractiveLaunchMode::Review,
+            machines: vec![
+                MachinePickEntry {
+                    name: "eb".to_string(),
+                    host: "eb.tail".to_string(),
+                    reachable: true,
+                    is_local: true,
+                },
+                MachinePickEntry {
+                    name: "dell".to_string(),
+                    host: "dell.tail".to_string(),
+                    reachable: true,
+                    is_local: false,
+                },
+            ],
+        });
+        let dlg = app.build_prompt_dialog().expect("dialog built");
+        // 2 machines + a cancel button.
+        assert_eq!(dlg.buttons.len(), 3);
+        assert_eq!(dlg.buttons[0].id, WidgetId::new("machine:0"));
+        assert_eq!(dlg.buttons[1].id, WidgetId::new("machine:1"));
+        assert!(dlg.buttons[2].is_cancel);
+        // The verb reflects the launch mode.
+        let title_text: String = dlg.title.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(title_text.contains("review"));
+        // Local/remote tags surface in the labels.
+        assert!(dlg.buttons[0].label.contains("(local)"));
+        assert!(dlg.buttons[1].label.contains("(remote)"));
+    }
+
+    #[test]
+    fn parse_sessions_json_extracts_fields() {
+        let json = r#"{"sessions":[
+            {"session_name":"coord-aid1","assignment_id":"aid1",
+             "issue_number":7,"repo_name":"api","issue_title":"T","machine":"server"}
+        ]}"#;
+        let got = parse_sessions_json(json);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].assignment_id, "aid1");
+        assert_eq!(got[0].issue_number, Some(7));
+        assert_eq!(got[0].repo_name.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn poll_remote_sessions_replaces_snapshot_when_ready() {
+        let mut app = make_app_default();
+        // Startup local-only snapshot is empty; a remote fetch then lands.
+        assert!(app.live_tmux_sessions.is_empty());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![LiveTmuxSession {
+            assignment_id: "aid-remote".to_string(),
+            issue_number: Some(9),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+        }])
+        .unwrap();
+        app.pending_remote_sessions = Some(rx);
+
+        assert!(app.poll_remote_sessions(), "should report an update");
+        assert_eq!(app.live_tmux_sessions.len(), 1);
+        assert_eq!(app.live_tmux_sessions[0].assignment_id, "aid-remote");
+        // The receiver is consumed — no repeat updates.
+        assert!(app.pending_remote_sessions.is_none());
+        assert!(!app.poll_remote_sessions());
+    }
+
+    #[test]
+    fn poll_remote_sessions_noop_while_empty() {
+        let mut app = make_app_default();
+        let (_tx, rx) = std::sync::mpsc::channel::<Vec<LiveTmuxSession>>();
+        app.pending_remote_sessions = Some(rx);
+        // Nothing sent yet → no update, receiver retained for a later poll.
+        assert!(!app.poll_remote_sessions());
+        assert!(app.pending_remote_sessions.is_some());
+    }
+
+    #[test]
+    fn machine_picker_dismiss_clears_it() {
+        let mut app = make_app_default();
+        app.pending_machine_picker = Some(PendingMachinePicker {
+            mode: InteractiveLaunchMode::Fix,
+            machines: vec![MachinePickEntry {
+                name: "eb".to_string(),
+                host: "eb.tail".to_string(),
+                reachable: true,
+                is_local: true,
+            }],
+        });
+        app.dismiss_prompt_dialog();
+        assert!(app.pending_machine_picker.is_none());
     }
 
     #[test]

@@ -76,7 +76,7 @@ pub struct CommandRunner {
 ///    users with a single primary config.
 ///
 /// Returns `None` only when none of the three resolve.
-fn find_config() -> Option<PathBuf> {
+pub(crate) fn find_config() -> Option<PathBuf> {
     find_config_with(
         std::env::var_os("COORD_CONFIG").map(PathBuf::from),
         std::env::current_dir().ok(),
