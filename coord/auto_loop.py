@@ -77,6 +77,9 @@ class LoopAction:
                                  not dispatching another review
     - ``"terminal_skip"``      — the work's issue is already closed or its PR is
                                  already merged; no fix/review dispatched (#522)
+    - ``"interactive_skip"``   — the fix was an interactive (claude-pty) session;
+                                 its re-review is human-attended, so no headless
+                                 review was dispatched (#555)
     """
     assignment_id: str | None
     detail: str = ""
@@ -731,6 +734,25 @@ def run_for_fix_transition(
             assignment_id,
         )
         return []
+
+    # #555: an *interactive* fix (provider_name="claude-pty") gets its re-review
+    # from the human-attended TUI flow (leg 3 #517), never a headless metered
+    # `claude -p` review. Skip the automatic re-review dispatch — mirrors the
+    # dispatch_pending_reviews guard for the same interactive-blindness gap.
+    if fix.provider_name == "claude-pty":
+        log.info(
+            "auto_loop: NOT dispatching headless re-review for %s — interactive "
+            "fix (provider_name=claude-pty); re-review is human-attended",
+            assignment_id,
+        )
+        return [LoopAction(
+            kind="interactive_skip",
+            assignment_id=assignment_id,
+            detail=(
+                "interactive fix — re-review is human-attended; "
+                "no headless review dispatched"
+            ),
+        )]
 
     # #522: a fix worker that finished against already-merged/closed work must
     # not trigger another review. Guards the second flood vector (re-review

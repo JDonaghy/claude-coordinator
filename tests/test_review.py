@@ -1148,6 +1148,49 @@ def test_flood_guard_dispatches_all_below_cap(fake_dispatch) -> None:
     assert all(c.review_state == "dispatched" for c in board.completed)
 
 
+def test_dispatch_pending_reviews_skips_interactive_work(fake_dispatch) -> None:
+    """#555: an *interactive* (provider_name='claude-pty') work completion must
+    NOT get a headless auto-review — its review is human-attended. An
+    otherwise-identical non-interactive row still dispatches one."""
+    interactive = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=541,
+        issue_title="interactive work",
+        assignment_id="w-interactive",
+        status="done",
+        branch="issue-541-x",
+        type="work",
+        review_state=None,
+        provider_name="claude-pty",
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    headless = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=542,
+        issue_title="headless work",
+        assignment_id="w-headless",
+        status="done",
+        branch="issue-542-x",
+        type="work",
+        review_state=None,
+        provider_name=None,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    board = Board(completed=[interactive, headless])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert len(out) == 1
+    assert fake_dispatch == ["w-headless"]  # only the non-interactive row
+    assert interactive.review_state is None  # never eligible → untouched
+    assert headless.review_state == "dispatched"
+
+
 def test_flood_guard_caps_per_pass(fake_dispatch) -> None:
     board = Board(completed=_pending_work(10))
     cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)

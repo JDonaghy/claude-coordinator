@@ -600,6 +600,35 @@ class TestTerminalGuard522:
         assert reloaded is not None
         assert reloaded.review_state == "done"     # persisted to the board
 
+    def test_fix_completion_skips_rereview_when_interactive(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        """#555: an *interactive* (provider_name='claude-pty') fix gets its
+        re-review from the human-attended TUI flow, never a headless
+        `claude -p` review — so the auto-loop dispatches nothing for it."""
+        from coord.state import load_board, save_board
+
+        fix = _work_assignment(assignment_id="fix-1", review_iteration=1)
+        fix.issue_title = "[fix-1] Fix the thing"
+        fix.review_of_assignment_id = "work-abc"
+        fix.review_state = "pending"
+        fix.provider_name = "claude-pty"
+        save_board(Board(completed=[fix]))
+
+        dispatched: dict = {}
+
+        def fake_dispatch_review(*a, **k):
+            dispatched["called"] = True
+            return None
+
+        monkeypatch.setattr("coord.auto_loop.dispatch_review", fake_dispatch_review)
+
+        actions = run_for_fix_transition("fix-1", config)
+
+        assert [a.kind for a in actions] == ["interactive_skip"]
+        assert "called" not in dispatched          # no headless review dispatched
+        _ = load_board()
+
     # The #349-×4 cache-collapse behaviour now lives in
     # coord.github_ops.work_is_terminal and is covered by
     # tests/test_github_ops.py::TestWorkIsTerminal::test_cache_collapses_repeat_calls.

@@ -861,6 +861,14 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         for c in board.completed
         if c.review_state in (None, "pending")
         and c.type == "work"
+        # #555: NEVER auto-dispatch a headless `claude -p` review for an
+        # *interactive* (`provider_name="claude-pty"`) work completion. The
+        # interactive Work→Review handoff is human-attended (TUI confirm →
+        # interactive review); a metered headless review must not silently
+        # follow it. This guard lives only in the automatic bulk path — the
+        # explicit `coord review <id>` escape hatch (→ dispatch_review) still
+        # lets a human deliberately request a headless review if they want one.
+        and c.provider_name != "claude-pty"
         and (not test_gate_active or c.test_state in ("passed", "skipped"))
         and not has_active_work_followup(
             board, repo_name=c.repo_name, issue_number=c.issue_number
