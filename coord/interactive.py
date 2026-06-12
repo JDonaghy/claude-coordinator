@@ -187,6 +187,17 @@ class TmuxHost:
         batch_opts = (
             ["-o", "BatchMode=yes", "-o", "ConnectTimeout=4"] if self.batch else []
         )
+        # ssh space-joins the remote command args (NO escaping) and runs the
+        # result through the remote LOGIN SHELL.  Passing a tmux format like
+        # ``#{session_name}`` as a bare token means that shell sees ``#`` — a
+        # comment marker — and silently truncates the command
+        # (``tmux ls -F #{session_name}`` → ``tmux ls -F``, which errors and
+        # returns nothing).  This broke remote session discovery for `coord
+        # sessions --remote` and the TUI reattach sweep.  Shell-quote each tmux
+        # arg so the remote shell receives it verbatim.  Plain tokens (``ls``,
+        # ``-t``, ``coord-<id>``) quote to themselves, so the launch/attach
+        # argv is byte-for-byte unchanged; only shell-special chars (``#{}``,
+        # spaces) get protected.
         return [
             "ssh",
             *(["-t"] if tty else []),
@@ -194,7 +205,7 @@ class TmuxHost:
             *_SSH_MUX_OPTS,
             self.ssh_target,
             "tmux",
-            *tmux_args,
+            *(shlex.quote(a) for a in tmux_args),
         ]
 
 

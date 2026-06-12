@@ -94,10 +94,29 @@ class TestTmuxHostCmd:
         ]
 
     def test_remote_ls_format(self) -> None:
+        # The tmux format `#{session_name}` MUST be shell-quoted: ssh space-joins
+        # the args and runs them through the remote login shell, where a bare
+        # `#` starts a comment and would truncate the command to `tmux ls -F`.
         result = TmuxHost("myhost").cmd(["ls", "-F", "#{session_name}"])
         assert result == [
-            "ssh", *_SSH_MUX_OPTS, "myhost", "tmux", "ls", "-F", "#{session_name}",
+            "ssh", *_SSH_MUX_OPTS, "myhost", "tmux", "ls", "-F", "'#{session_name}'",
         ]
+
+    def test_remote_format_survives_remote_shell_join(self) -> None:
+        """Regression: the space-joined remote command (what ssh actually sends
+        to the remote shell) must keep the `#{...}` format intact — i.e. NOT be
+        swallowed as a comment.  Reproduces the bug that made `coord sessions
+        --remote` / the TUI reattach sweep find zero remote sessions."""
+        import shlex
+
+        result = TmuxHost("myhost").cmd(["ls", "-F", "#{session_name}"])
+        # Everything after the host is the remote command ssh space-joins.
+        remote_part = result[result.index("myhost") + 1:]
+        joined = " ".join(remote_part)
+        # The remote shell re-tokenises `joined`; the format must come back whole.
+        assert shlex.split(joined) == ["tmux", "ls", "-F", "#{session_name}"]
+        # And the raw string must not expose a bare ` #` (comment) before it.
+        assert " #{session_name}" not in joined
 
     def test_remote_load_buffer_stdin(self) -> None:
         result = TmuxHost("myhost").cmd(["load-buffer", "-b", "coord-brief", "-"])
