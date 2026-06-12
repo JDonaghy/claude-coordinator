@@ -3576,177 +3576,6 @@ fn stage_badge(stage: &str) -> (String, Color) {
     }
 }
 
-/// Fetch open GitHub issues with at least one of `labels`, via `gh search
-/// issues`.  Results are mapped back to coord-local repo names using
-/// `repos` (coord_name → owner/repo slug).
-///
-/// Implementation note: the function shells out to `gh`, parses the JSON
-/// blob it emits, and constructs a `PipelineLoaderResult`.  It runs in a
-/// background thread spawned from `maybe_kick_pipeline_loader` so the UI
-/// thread is never blocked on `gh`.
-fn fetch_pipeline_issues(labels: &[String], repos: &[(String, String)]) -> PipelineLoaderResult {
-    if labels.is_empty() {
-        return PipelineLoaderResult::Ok(Vec::new());
-    }
-
-    // Build inverse lookup: github slug → coord-local repo name.
-    let mut slug_to_local: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for (local, slug) in repos {
-        slug_to_local.insert(slug.clone(), local.clone());
-    }
-
-    // Use --label and --state flags (not a query string — gh search issues
-    // ignores label:/state: qualifiers in the positional query argument).
-    // Scope to the configured repos to avoid noise from unrelated repos that
-    // happen to share the same label name (e.g. gcc-postcommit-ci uses "coord").
-    //
-    // `gh search issues --state` only accepts "open" or "closed" (not "all"
-    // — that's a `gh issue list` flag). To populate the Done lifecycle
-    // section we have to query both states and merge.
-    let label_set: std::collections::HashSet<&str> = labels.iter().map(|s| s.as_str()).collect();
-    let mut issues: Vec<PipelineIssue> = Vec::new();
-    for state in ["open", "closed"] {
-        let mut args: Vec<String> = vec![
-            "search".into(),
-            "issues".into(),
-            "--state".into(),
-            state.into(),
-            "--json".into(),
-            "number,title,body,labels,repository,url,state".into(),
-            "--limit".into(),
-            "200".into(),
-        ];
-        for label in labels {
-            args.push("--label".into());
-            args.push(label.clone());
-        }
-        for (_local, slug) in repos {
-            args.push("--repo".into());
-            args.push(slug.clone());
-        }
-
-        // `gh search` hits GitHub's Search API: 30 req/min and
-        // eventually-consistent.  A burst of refreshes (or other concurrent
-        // `gh search` usage) trips a transient rate-limit / "submitted too
-        // quickly" error.  Retry a few times with a short backoff before
-        // giving up, so a single refresh isn't lost to a blip and silently
-        // leaves the stale list in place.  This runs in a background thread,
-        // so sleeping here never blocks the UI.
-        let mut attempt = 0u32;
-        let stdout = loop {
-            attempt += 1;
-            match std::process::Command::new("gh").args(&args).output() {
-                Ok(o) if o.status.success() => break o.stdout,
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    let lc = stderr.to_lowercase();
-                    let transient = lc.contains("rate limit")
-                        || lc.contains("rate-limit")
-                        || lc.contains("submitted too quickly")
-                        || lc.contains("http 403")
-                        || lc.contains("http 429");
-                    if transient && attempt < 3 {
-                        std::thread::sleep(Duration::from_secs(2 * attempt as u64));
-                        continue;
-                    }
-                    return PipelineLoaderResult::Err(stderr);
-                }
-                Err(e) => {
-                    return PipelineLoaderResult::Err(format!("could not run gh: {}", e))
-                }
-            }
-        };
-
-        let value: serde_json::Value = match serde_json::from_slice(&stdout) {
-            Ok(v) => v,
-            Err(e) => return PipelineLoaderResult::Err(format!("gh JSON parse: {}", e)),
-        };
-
-        let arr = match value.as_array() {
-            Some(a) => a.clone(),
-            None => continue,
-        };
-
-        for item in &arr {
-            let number = item.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
-            if number == 0 {
-                continue;
-            }
-            let title = item
-                .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string();
-            let repo_slug = item
-                .get("repository")
-                .and_then(|r| r.get("nameWithOwner"))
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    // `gh search issues` sometimes returns the repo as a string url-tail.
-                    item.get("url").and_then(|u| u.as_str()).and_then(|u| {
-                        // https://<host>/owner/name/issues/123 — strip scheme+host,
-                        // then take the first two path segments as owner/repo.
-                        let path = u.splitn(4, "//").nth(1).unwrap_or(u);
-                        let mut parts = path.splitn(4, '/');
-                        parts.next(); // skip host
-                        let owner = parts.next()?;
-                        let repo = parts.next()?;
-                        if owner.is_empty() || repo.is_empty() {
-                            None
-                        } else {
-                            Some(format!("{}/{}", owner, repo))
-                        }
-                    })
-                })
-                .unwrap_or_default();
-            let issue_labels: Vec<String> = item
-                .get("labels")
-                .and_then(|l| l.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| {
-                            x.get("name")
-                                .and_then(|n| n.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let matched_labels: Vec<String> = issue_labels
-                .iter()
-                .filter(|l| label_set.contains(l.as_str()))
-                .cloned()
-                .collect();
-            let body = item
-                .get("body")
-                .and_then(|b| b.as_str())
-                .unwrap_or("")
-                .to_string();
-            let coord_repo = slug_to_local.get(&repo_slug).cloned();
-            let is_closed = item
-                .get("state")
-                .and_then(|s| s.as_str())
-                .map(|s| s == "closed")
-                .unwrap_or(false);
-            let all_labels = issue_labels;
-            issues.push(PipelineIssue {
-                number,
-                title,
-                body,
-                repo_slug,
-                coord_repo,
-                matched_labels,
-                all_labels,
-                is_closed,
-            });
-        }
-    }
-    // Stable order: by repo, then by issue number.
-    issues.sort_by(|a, b| a.repo_slug.cmp(&b.repo_slug).then(a.number.cmp(&b.number)));
-    PipelineLoaderResult::Ok(issues)
-}
 
 /// Compute the cache TTL (seconds) for a CI-check entry, based on the
 /// current CI state and whether the PR is merge-eligible.
@@ -4029,10 +3858,6 @@ pub struct CoordApp {
     pipeline_issues: Vec<PipelineIssue>,
     /// Selected issue index into `pipeline_issues`, if any.
     pipeline_sel: Option<usize>,
-    /// In-flight `gh search issues` poll (None when idle).
-    pipeline_loader: Option<std::sync::mpsc::Receiver<PipelineLoaderResult>>,
-    /// When `gh` was last queried — bounds refresh rate.
-    pipeline_last_load: Option<Instant>,
     /// Status message shown when a dispatch is queued/skipped due to no
     /// available machine. Cleared after a short TTL.
     pipeline_status: Option<(String, Instant)>,
@@ -4545,14 +4370,6 @@ pub struct CoordApp {
     pending_rework: Option<PendingRework>,
 }
 
-/// Result returned by the background `gh search issues` poll.
-enum PipelineLoaderResult {
-    /// Successfully parsed issues from gh output.
-    Ok(Vec<PipelineIssue>),
-    /// gh failed (missing CLI, network error, auth issue, etc.).
-    Err(String),
-}
-
 impl Default for CoordApp {
     fn default() -> Self {
         Self::new()
@@ -4653,8 +4470,6 @@ impl CoordApp {
             pipeline_lifecycle_expanded: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
-            pipeline_loader: None,
-            pipeline_last_load: None,
             pipeline_status: None,
             toasts: Vec::new(),
             next_toast_id: 0,
@@ -5812,6 +5627,65 @@ impl CoordApp {
     /// Drain any completed background data load, applying results to
     /// `self.data`.  Returns `true` if data was updated (caller should
     /// trigger a redraw).
+    /// #486: build the Pipeline issue list from the local DB cache
+    /// (`data.open_issues`, kept fresh by the background `coord sync`) instead
+    /// of a live `gh search`.  Same source the Board uses — instant, no Search
+    /// API rate limit (30/min), no eventually-consistent index lag.  An issue
+    /// is in the Pipeline iff it carries one of the tracked labels (e.g.
+    /// `coord`); classification into New/Active/Done is done downstream by
+    /// `pipeline_lifecycle_section` against `data.assignments` / `merge_queue`.
+    fn pipeline_issues_from_cache(&self) -> Vec<PipelineIssue> {
+        let tracked: std::collections::HashSet<&str> = self
+            .data
+            .pipeline_tracked_labels
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        if tracked.is_empty() {
+            return Vec::new();
+        }
+        // coord-local repo name → github slug (for PipelineIssue.repo_slug).
+        let slug_of: std::collections::HashMap<&str, &str> = self
+            .data
+            .pipeline_repos
+            .iter()
+            .map(|(local, slug)| (local.as_str(), slug.as_str()))
+            .collect();
+        let mut issues: Vec<PipelineIssue> = self
+            .data
+            .open_issues
+            .iter()
+            .filter_map(|oi| {
+                let matched: Vec<String> = oi
+                    .labels
+                    .iter()
+                    .filter(|l| tracked.contains(l.as_str()))
+                    .cloned()
+                    .collect();
+                if matched.is_empty() {
+                    return None; // not tracked → not in the Pipeline
+                }
+                let repo_slug = slug_of
+                    .get(oi.repo_name.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| oi.repo_name.clone());
+                Some(PipelineIssue {
+                    number: oi.number,
+                    title: oi.title.clone(),
+                    body: oi.body.clone(),
+                    repo_slug,
+                    coord_repo: Some(oi.repo_name.clone()),
+                    matched_labels: matched,
+                    all_labels: oi.labels.clone(),
+                    is_closed: oi.state == "closed",
+                })
+            })
+            .collect();
+        // Stable order: by repo, then issue number (mirrors the old loader).
+        issues.sort_by(|a, b| a.repo_slug.cmp(&b.repo_slug).then(a.number.cmp(&b.number)));
+        issues
+    }
+
     fn apply_pending_data(&mut self) -> bool {
         let rx = match &self.pending_data {
             Some(rx) => rx,
@@ -5858,9 +5732,22 @@ impl CoordApp {
                     }
                 }
                 self.rebuild_board_sidebar();
-                // apply_pending_data doesn't touch pipeline_issues — the
-                // internal capture in rebuild is correct here.  Pass None.
-                self.rebuild_pipeline_sidebar(None);
+                // #486: the Pipeline now sources its issue list from the same
+                // DB cache the Board uses (data.open_issues), rebuilt on every
+                // data tick — no live gh search.  Capture the selection first so
+                // replacing pipeline_issues doesn't jump the cursor to row 0.
+                let prev_pl_sel = self.capture_pipeline_selection_id();
+                self.pipeline_issues = self.pipeline_issues_from_cache();
+                // Prune terminal sessions / spawn errors for issues no longer
+                // in the pipeline (mirrors the old loader's cleanup).
+                let live_keys: std::collections::HashSet<(String, u64)> = self
+                    .pipeline_issues
+                    .iter()
+                    .map(|i| (i.repo_slug.clone(), i.number))
+                    .collect();
+                self.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
+                self.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
+                self.rebuild_pipeline_sidebar(prev_pl_sel);
 
                 // Ring the terminal bell (BEL) when an assignment that was
                 // running is now done or failed, if the user enabled audio.
@@ -10206,29 +10093,19 @@ impl CoordApp {
         )
     }
 
-    /// Kick off a background `gh search issues` poll (no-op if one is
-    /// already in flight or we polled less than 60 s ago).
+    /// #486: refresh the Pipeline's data source.
+    ///
+    /// The Pipeline now reads from the local DB cache (`data.open_issues`,
+    /// rebuilt into `pipeline_issues` in `apply_pending_data`), the SAME source
+    /// the Board uses.  So "refresh" means: kick a background `coord sync` (gh
+    /// `issue list` — core API, 5000/hr, consistent; throttled) to update the
+    /// cache, then reload `data` from the DB so the rebuilt pipeline reflects
+    /// it.  No live `gh search` (the old 30/min, eventually-consistent, several-
+    /// seconds path) — the pipeline now renders instantly from already-loaded
+    /// data and never silently goes stale on a Search-API rate-limit.
     fn maybe_kick_pipeline_loader(&mut self) {
-        if self.pipeline_loader.is_some() {
-            return;
-        }
-        if let Some(t) = self.pipeline_last_load {
-            if t.elapsed() < Duration::from_secs(60) {
-                return;
-            }
-        }
-        if self.data.pipeline_tracked_labels.is_empty() {
-            return;
-        }
-        let labels = self.data.pipeline_tracked_labels.clone();
-        let repos = self.data.pipeline_repos.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = fetch_pipeline_issues(&labels, &repos);
-            let _ = tx.send(result);
-        });
-        self.pipeline_loader = Some(rx);
-        self.pipeline_last_load = Some(Instant::now());
+        self.kick_issue_sync();
+        self.refresh();
     }
 
     /// Kick off background `gh pr checks` polls for any PR in the merge
@@ -10793,62 +10670,14 @@ impl CoordApp {
         }
     }
 
-    fn poll_pipeline_loader(&mut self) -> bool {
-        let rx = match &self.pipeline_loader {
-            Some(rx) => rx,
-            None => return false,
-        };
-        match rx.try_recv() {
-            Ok(PipelineLoaderResult::Ok(issues)) => {
-                // Capture the currently-selected issue's identity BEFORE
-                // we replace pipeline_issues — otherwise the old pipeline_sel
-                // index is looked up against the new list and resolves to
-                // the wrong issue (or None), defaulting the selection back
-                // to issue #0 on every 15s refresh.
-                let prev_sel = self.capture_pipeline_selection_id();
-                self.pipeline_issues = issues;
-                // #440: prune terminal sessions for issues that are no
-                // longer in the pipeline so we don't keep stale PTYs.
-                // #455: key by (repo_slug, number) to avoid collisions across repos.
-                let live_keys: std::collections::HashSet<(String, u64)> =
-                    self.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
-                self.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
-                self.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
-                self.pipeline_loader = None;
-                self.rebuild_pipeline_sidebar(prev_sel);
-                true
-            }
-            Ok(PipelineLoaderResult::Err(msg)) => {
-                // Loud, not silent: a failed refresh used to leave only a tiny
-                // status line, so the stale list looked authoritative.  Surface
-                // a toast; the 60s throttle auto-retries.
-                self.pipeline_status =
-                    Some((format!("Pipeline refresh failed (gh): {}", msg), Instant::now()));
-                self.push_toast(
-                    "Pipeline refresh failed",
-                    "GitHub query failed (rate limit?). The list may be STALE — \
-                     auto-retries within 60s; press Refresh to retry now.",
-                    ToastSeverity::Warning,
-                );
-                self.pipeline_loader = None;
-                true
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.pipeline_loader = None;
-                false
-            }
-        }
-    }
-
     /// Pipeline panel detail-side: list-style fallback when no PipelineView
     /// can be drawn yet (no issue selected / still loading).
     fn pipeline_placeholder_list(&self) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
-        if self.pipeline_loader.is_some() && self.pipeline_issues.is_empty() {
+        if self.pending_data.is_some() && self.pipeline_issues.is_empty() {
             items.push(kv_item(
                 "",
-                "  Loading tracked issues from GitHub...",
+                "  Loading tracked issues…",
                 Some(Color::rgb(180, 180, 100)),
             ));
         } else if self.pipeline_issues.is_empty() {
@@ -17523,7 +17352,6 @@ impl CoordApp {
                 );
                 // Kick the pipeline loader so the issue appears in Pipeline:New
                 // (and then In-progress) without waiting for the 60 s refresh.
-                self.pipeline_last_load = None;
                 self.maybe_kick_pipeline_loader();
             }
             SpawnQueuedOutcome::Queued => {
@@ -17650,7 +17478,6 @@ impl CoordApp {
                     // coord track adds the coord label on GitHub; kick the
                     // pipeline loader so the issue appears in New without
                     // waiting for the 60 s auto-refresh.
-                    self.pipeline_last_load = None;
                     self.maybe_kick_pipeline_loader();
                 }
                 dispatched
@@ -18650,7 +18477,6 @@ impl CoordApp {
                                 }
                                 SpawnQueuedOutcome::Deduped => {}
                             }
-                            self.pipeline_last_load = None;
                             self.maybe_kick_pipeline_loader();
                         } else {
                             self.push_toast(
@@ -18726,19 +18552,12 @@ impl CoordApp {
                     .iter()
                     .any(|m| m.issue_number == Some(*issue_number))
             });
+            // A coord command just finished — most mutate labels (track,
+            // refine, ready, backlog, bounce) or assignment state, all written
+            // to the DB cache.  refresh() reloads `data` from the DB, which
+            // rebuilds the Pipeline from the cache in apply_pending_data, so the
+            // user sees the result on the next tick (no gh search).
             self.refresh();
-            // A coord command just finished — most of them mutate labels
-            // (track, refine, ready, backlog, bounce) or assignment state.
-            // Invalidate the 60s pipeline-loader throttle so the next tick
-            // re-polls gh immediately and the user sees the result in
-            // seconds, not up to a minute.  An extra gh search per user
-            // action is cheap.
-            self.pipeline_last_load = None;
-            needs_redraw = true;
-        }
-
-        // Poll background gh issue loader
-        if self.poll_pipeline_loader() {
             needs_redraw = true;
         }
 
@@ -22072,7 +21891,6 @@ impl ShellApp for CoordApp {
             if let Some(action) = self.action_for_key(key, modifiers) {
                 match action {
                     ACTION_PIPELINE_REFRESH => {
-                        self.pipeline_last_load = None;
                         self.maybe_kick_pipeline_loader();
                         self.push_toast(
                             "Pipeline",
@@ -23232,7 +23050,6 @@ impl ShellApp for CoordApp {
                                 // maybe_kick_pipeline_loader() bypasses the 60 s
                                 // guard. This matches the `R=refresh` hint
                                 // shown in the Pipeline status bar.
-                                self.pipeline_last_load = None;
                                 self.maybe_kick_pipeline_loader();
                             }
                             needs_redraw = true;
@@ -24926,8 +24743,6 @@ mod tests {
             pipeline_lifecycle_expanded: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
-            pipeline_loader: None,
-            pipeline_last_load: None,
             pipeline_status: None,
             toasts: Vec::new(),
             next_toast_id: 0,
@@ -32249,6 +32064,41 @@ mod tests {
         app.pending_quit_confirm = true;
         app.dismiss_prompt_dialog();
         assert!(!app.pending_quit_confirm);
+    }
+
+    #[test]
+    fn pipeline_issues_from_cache_filters_maps_and_marks_closed() {
+        // #486: the Pipeline now derives from the DB cache (data.open_issues),
+        // not a live gh search.  Only tracked-labelled issues appear; repo
+        // name maps to slug; closed issues are flagged for the Done section.
+        let mk = |n: u64, state: &str, labels: &[&str]| OpenIssue {
+            repo_name: "api".to_string(),
+            number: n,
+            title: format!("issue {n}"),
+            body: String::new(),
+            state: state.to_string(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            milestone_number: None,
+            milestone_title: None,
+        };
+        let app = make_test_app(BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![
+                mk(1, "open", &["coord", "status:ready"]),
+                mk(2, "open", &["bug"]), // untracked → excluded
+                mk(3, "closed", &["coord"]),
+            ],
+            ..BoardData::default()
+        });
+        let pis = app.pipeline_issues_from_cache();
+        let nums: Vec<u64> = pis.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![1, 3], "only coord issues; #2 (untracked) excluded");
+        assert_eq!(pis[0].repo_slug, "acme/api");
+        assert_eq!(pis[0].coord_repo.as_deref(), Some("api"));
+        assert!(pis[0].matched_labels.contains(&"coord".to_string()));
+        assert!(!pis[0].is_closed);
+        assert!(pis[1].is_closed, "#3 is closed → Done section");
     }
 
     #[test]
