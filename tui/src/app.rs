@@ -3841,7 +3841,7 @@ pub struct CoordApp {
     /// sections.  Section index N in the sidebar maps to
     /// `pipeline_state_section_names[N - 1]` (section 0 is always FILTER).
     /// Only non-empty state sections appear.  Values are one of:
-    /// `"in-progress"` / `"pending"` / `"done"`.
+    /// `"new"` / `"refining"` / `"pending"` / `"in-progress"` / `"done"`.
     /// Rebuilt on each `rebuild_pipeline_sidebar()`.
     pipeline_state_section_names: Vec<&'static str>,
     /// Filter state (query / cursor / focus) for the Pipeline sidebar's FILTER box.
@@ -7725,8 +7725,8 @@ impl CoordApp {
 
     /// Return issues for a lifecycle state, grouped by repo, in stable repo
     /// order (same order as `pipeline_repo_names`).  Only intended for
-    /// `"pending"` and `"done"` — Active issues are handled by
-    /// `pipeline_active_issues` / `pipeline_active_by_liveness` instead.
+    /// `"new"`, `"refining"`, `"pending"`, and `"done"` — Active issues are
+    /// handled by `pipeline_active_issues` / `pipeline_active_by_liveness` instead.
     ///
     /// Applies dedup, search filter, and dismissal filter.  Empty repos are
     /// omitted.
@@ -8005,8 +8005,10 @@ impl CoordApp {
                         "refining" => &refining_by_repo,
                         "pending" => &pending_by_repo,
                         "done" => &done_by_repo,
-                        // Fallback: unrecognised lifecycle key — empty.
-                        _ => &done_by_repo,
+                        // `state_sections` is built in this function and only
+                        // ever contains the five known keys above — this arm
+                        // is unreachable.
+                        _ => unreachable!("invalid lifecycle key in state_sections"),
                     };
                     let total: usize = repo_groups.iter().map(|(_, v)| v.len()).sum();
                     sidebar.set_section_badge(
