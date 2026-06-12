@@ -14584,26 +14584,40 @@ impl CoordApp {
         // #539: Review is added here too, gated on a completed work assignment
         // with a branch existing for this issue.
         if issue_number.is_some() {
-            items.push(ContextMenuItem::action(
-                "start-work-interactive",
-                "Start work (interactive)",
-            ));
-            items.push(ContextMenuItem::action(
-                "start-plan-interactive",
-                "Start plan (interactive)",
-            ));
-            let mut review_item =
-                ContextMenuItem::action("start-review-interactive", "Start review (interactive)");
-            review_item.disabled = self.selected_completed_work_aid().is_none();
-            items.push(review_item);
-            // Leg 3 (#517): interactive peer of `bounce` — a human-attended
-            // fix continuing the reviewed branch.  Only when a request-changes
-            // review exists for this issue (else there's nothing to fix).
-            if self.selected_row_has_request_changes_for(issue_number) {
+            // #486 Leg 4 UX: when a live interactive session already exists for
+            // this issue, the only sensible interactive action is to reattach —
+            // every mode would attach to the same session, and you can't start a
+            // review/fix while the work session is still live.  Offer one clear
+            // "Reattach" item (routed through the reattach-aware launcher) and
+            // hide the Start variants.
+            let has_live = issue_number.map(|n| self.issue_has_live_session(n)).unwrap_or(false);
+            if has_live {
                 items.push(ContextMenuItem::action(
-                    "start-fix-interactive",
-                    "Start fix (interactive)",
+                    "start-work-interactive",
+                    "Reattach to live session",
                 ));
+            } else {
+                items.push(ContextMenuItem::action(
+                    "start-work-interactive",
+                    "Start work (interactive)",
+                ));
+                items.push(ContextMenuItem::action(
+                    "start-plan-interactive",
+                    "Start plan (interactive)",
+                ));
+                let mut review_item =
+                    ContextMenuItem::action("start-review-interactive", "Start review (interactive)");
+                review_item.disabled = self.selected_completed_work_aid().is_none();
+                items.push(review_item);
+                // Leg 3 (#517): interactive peer of `bounce` — a human-attended
+                // fix continuing the reviewed branch.  Only when a request-changes
+                // review exists for this issue (else there's nothing to fix).
+                if self.selected_row_has_request_changes_for(issue_number) {
+                    items.push(ContextMenuItem::action(
+                        "start-fix-interactive",
+                        "Start fix (interactive)",
+                    ));
+                }
             }
             items.push(ContextMenuItem::separator());
             // #leg1: the non-interactive (claude -p) dispatch path — the
@@ -19994,6 +20008,32 @@ impl CoordApp {
     /// (`finalize_remote_interactive_exit`, #486d); remote Review is read-only.
     /// With a single capable machine there is no choice, so it launches
     /// directly (local TTY when that machine is this one).
+    /// Assignment id of a live interactive tmux session for the
+    /// currently-selected issue (matched precisely by repo + issue number),
+    /// if one exists.  When present, the launch action reattaches rather than
+    /// starting fresh — see [`Self::launch_interactive_session_for_selected_issue`].
+    fn selected_issue_live_session_id(&self) -> Option<String> {
+        let (repo, issue_key) = self.selected_issue_repo_and_key()?;
+        let issue_num = issue_key.1;
+        self.live_tmux_sessions
+            .iter()
+            .find(|s| {
+                s.issue_number == Some(issue_num)
+                    && s.repo_name.as_deref() == Some(repo.as_str())
+            })
+            .map(|s| s.assignment_id.clone())
+    }
+
+    /// Whether any discovered live interactive session matches `issue_number`.
+    /// Used only to relabel the right-click menu item ("Reattach" vs "Start");
+    /// the actual reattach decision matches repo + issue precisely via
+    /// [`Self::selected_issue_live_session_id`].
+    fn issue_has_live_session(&self, issue_number: u64) -> bool {
+        self.live_tmux_sessions
+            .iter()
+            .any(|s| s.issue_number == Some(issue_number))
+    }
+
     fn launch_interactive_session_for_selected_issue(&mut self, mode: InteractiveLaunchMode) {
         // Resolve the repo up front so we can decide which machines qualify.
         let Some((repo, _key)) = self.selected_issue_repo_and_key() else {
@@ -20004,6 +20044,23 @@ impl CoordApp {
             ));
             return;
         };
+
+        // #486 Leg 4 UX: reattach short-circuit.  If a live interactive session
+        // already exists for this issue, attach to it directly and SKIP the
+        // machine picker — the machine choice is meaningless for a reattach
+        // (`coord reattach` targets the existing session wherever it runs).
+        // `launch_interactive_session_on_machine` detects the same live session
+        // and runs `coord reattach` instead of a fresh `coord assign`; the
+        // machine arg is ignored on that path, so pass the local one.
+        if self.selected_issue_live_session_id().is_some() {
+            self.pipeline_status = Some((
+                "Reattaching to the live interactive session for this issue…".to_string(),
+                Instant::now(),
+            ));
+            let machine = self.data.local_machine.clone();
+            self.launch_interactive_session_on_machine(mode, machine);
+            return;
+        }
 
         let candidates = self.fleet_machines_for_repo(&repo);
         if candidates.len() >= 2 {
@@ -32180,6 +32237,74 @@ mod tests {
         });
         app.dismiss_prompt_dialog();
         assert!(app.pending_machine_picker.is_none());
+    }
+
+    #[test]
+    fn selected_issue_live_session_id_matches_repo_and_issue() {
+        // #486 Leg 4 UX: the reattach short-circuit must match the live session
+        // PRECISELY by repo + issue number — a same-number session in a DIFFERENT
+        // repo (vimcode #514 vs claude-coordinator #514) must NOT match (#480).
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 514,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/vimcode".to_string(),
+            coord_repo: Some("vimcode".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+
+        // No live session → None.
+        assert!(app.selected_issue_live_session_id().is_none());
+
+        // Same number, WRONG repo → must not match.
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aaa".to_string(),
+            issue_number: Some(514),
+            repo_name: Some("claude-coordinator".to_string()),
+            issue_title: None,
+        }];
+        assert!(
+            app.selected_issue_live_session_id().is_none(),
+            "cross-repo same-number session must not match"
+        );
+
+        // Right repo + issue → the assignment id.
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "bbb".to_string(),
+            issue_number: Some(514),
+            repo_name: Some("vimcode".to_string()),
+            issue_title: None,
+        }];
+        assert_eq!(app.selected_issue_live_session_id().as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn pipeline_context_menu_offers_reattach_when_session_live() {
+        // #486 Leg 4 UX: a live session for the issue collapses the four
+        // interactive Start items into a single "Reattach to live session".
+        let mut app = make_app_default();
+        let lifecycle = PipelineRowLifecycle::New;
+
+        // No live session → the normal Start items are present.
+        let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle);
+        assert!(items.iter().any(|i| i.label == "Start work (interactive)"));
+        assert!(!items.iter().any(|i| i.label == "Reattach to live session"));
+
+        // Live session for #514 → single Reattach item, Start variants gone.
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "bbb".to_string(),
+            issue_number: Some(514),
+            repo_name: Some("vimcode".to_string()),
+            issue_title: None,
+        }];
+        let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle);
+        assert!(items.iter().any(|i| i.label == "Reattach to live session"));
+        assert!(!items.iter().any(|i| i.label == "Start work (interactive)"));
+        assert!(!items.iter().any(|i| i.label == "Start plan (interactive)"));
     }
 
     #[test]
