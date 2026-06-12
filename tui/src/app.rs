@@ -2023,20 +2023,23 @@ fn trunc(s: &str, max_chars: usize) -> &str {
 /// #541: Fuzzy subsequence match scorer used by the global issue finder.
 ///
 /// Returns `None` when not every character of `query` appears in `haystack`
-/// in order (case-insensitive).  Returns `Some(score)` otherwise, where each
-/// matched character contributes +1 and each *consecutive* match pair earns an
-/// additional +2 bonus, so tighter matches rank higher.  An empty query always
-/// matches with score 0.
-fn fuzzy_score(query: &str, haystack: &str) -> Option<u32> {
+/// in order (case-insensitive).  Returns `Some((score, positions))` otherwise,
+/// where `positions` is the list of matched character indices in `haystack`
+/// (char indices, not byte offsets), each matched character contributes +1 to
+/// score, and each *consecutive* match pair earns an additional +2 bonus so
+/// tighter matches rank higher.  An empty query always matches with score 0
+/// and an empty positions list.
+fn fuzzy_score(query: &str, haystack: &str) -> Option<(u32, Vec<usize>)> {
     if query.is_empty() {
-        return Some(0);
+        return Some((0, Vec::new()));
     }
     let q: Vec<char> = query.to_lowercase().chars().collect();
     let h: Vec<char> = haystack.to_lowercase().chars().collect();
     let mut qi = 0usize;
     let mut score: u32 = 0;
     let mut prev_matched = false;
-    for hc in &h {
+    let mut positions: Vec<usize> = Vec::new();
+    for (hi, hc) in h.iter().enumerate() {
         if qi < q.len() && *hc == q[qi] {
             qi += 1;
             score += 1;
@@ -2044,11 +2047,61 @@ fn fuzzy_score(query: &str, haystack: &str) -> Option<u32> {
                 score += 2; // consecutive-run bonus
             }
             prev_matched = true;
+            positions.push(hi);
         } else {
             prev_matched = false;
         }
     }
-    if qi == q.len() { Some(score) } else { None }
+    if qi == q.len() { Some((score, positions)) } else { None }
+}
+
+/// #541: Build styled spans for `text` with per-character fuzzy-match highlights.
+///
+/// Characters at positions returned by `fuzzy_score(query, text)` are coloured
+/// with `match_fg`; all other characters use `normal_fg`.  Returns a single
+/// span in `normal_fg` when the query is empty, the text is empty, or no
+/// subsequence match exists (fall-back: caller already filtered to matches).
+fn styled_match_spans(
+    query: &str,
+    text: &str,
+    normal_fg: Color,
+    match_fg: Color,
+) -> Vec<StyledSpan> {
+    if query.is_empty() || text.is_empty() {
+        return vec![StyledSpan::with_fg(text, normal_fg)];
+    }
+    let Some((_score, positions)) = fuzzy_score(query, text) else {
+        // No match in this sub-string (possible when query matched across
+        // the number+title boundary but not in title alone).  Fall back to
+        // uniform colouring.
+        return vec![StyledSpan::with_fg(text, normal_fg)];
+    };
+    if positions.is_empty() {
+        return vec![StyledSpan::with_fg(text, normal_fg)];
+    }
+    // Build a set of matched char positions for O(1) lookup.
+    let pos_set: std::collections::HashSet<usize> = positions.into_iter().collect();
+    let mut spans: Vec<StyledSpan> = Vec::new();
+    let mut current = String::new();
+    let mut current_is_match = false;
+    for (i, c) in text.chars().enumerate() {
+        let is_match = pos_set.contains(&i);
+        if is_match != current_is_match && !current.is_empty() {
+            spans.push(StyledSpan::with_fg(
+                std::mem::take(&mut current),
+                if current_is_match { match_fg } else { normal_fg },
+            ));
+        }
+        current_is_match = is_match;
+        current.push(c);
+    }
+    if !current.is_empty() {
+        spans.push(StyledSpan::with_fg(
+            current,
+            if current_is_match { match_fg } else { normal_fg },
+        ));
+    }
+    spans
 }
 
 /// Build a key-value `ListItem` for the detail panel.
@@ -17070,7 +17123,7 @@ impl CoordApp {
             .iter()
             .filter_map(|oi| {
                 let haystack = format!("#{} {}", oi.number, oi.title);
-                let score = fuzzy_score(query, &haystack)?;
+                let (score, _) = fuzzy_score(query, &haystack)?;
                 Some((score, oi.repo_name.clone(), oi.number, oi.title.clone()))
             })
             .collect();
@@ -17193,11 +17246,13 @@ impl CoordApp {
             decoration: Decoration::Normal,
         });
 
-        // Separator.
+        // Separator — width tracks the rendered box so it fills the column
+        // on both narrow and wide terminals.
+        let sep_chars = (box_w / lh) as usize;
         items.push(ListItem {
             text: StyledText {
                 spans: vec![StyledSpan::with_fg(
-                    "─".repeat(60),
+                    "─".repeat(sep_chars),
                     Color::rgb(70, 70, 90),
                 )],
             },
@@ -17222,6 +17277,8 @@ impl CoordApp {
             .take(visible_rows)
             .collect();
 
+        // Per-character match highlight colour (matches theme.rs `match_fg`).
+        let match_fg_color = Color::rgb(255, 200, 80);
         if visible_matches.is_empty() {
             items.push(ListItem {
                 text: StyledText {
@@ -17244,19 +17301,30 @@ impl CoordApp {
                 let prefix = if is_selected { "▶ " } else { "  " };
                 let repo_short = trunc(repo, 18);
                 let title_short = trunc(title, 45);
-                let row_text = format!(
-                    "{}#{:<5}  {:18}  {}",
-                    prefix, number, repo_short, title_short
-                );
-                let row_color = if is_selected {
+                let normal_fg = if is_selected {
                     Color::rgb(230, 240, 255)
                 } else {
                     Color::rgb(200, 200, 210)
                 };
+                // Build the row as multiple spans: a fixed prefix (arrow,
+                // number, repo) followed by per-character highlighted title.
+                // The prefix columns are not in the search haystack (repo)
+                // or use a fixed format (#number); only the title carries
+                // enough free text for per-char highlights to be useful.
+                // `Decoration::Header` is used for the selected row because
+                // quadraui's Decoration enum has no `Selected` variant; the
+                // Header variant applies the closest available background.
+                let prefix_text =
+                    format!("{}#{:<5}  {:18}  ", prefix, number, repo_short);
+                let mut spans = vec![StyledSpan::with_fg(prefix_text, normal_fg)];
+                spans.extend(styled_match_spans(
+                    &finder.query,
+                    title_short,
+                    normal_fg,
+                    match_fg_color,
+                ));
                 items.push(ListItem {
-                    text: StyledText {
-                        spans: vec![StyledSpan::with_fg(row_text, row_color)],
-                    },
+                    text: StyledText { spans },
                     icon: None,
                     detail: None,
                     decoration: if is_selected {
@@ -17268,11 +17336,11 @@ impl CoordApp {
             }
         }
 
-        // Footer separator + hint line.
+        // Footer separator (same dynamic width as the header separator).
         items.push(ListItem {
             text: StyledText {
                 spans: vec![StyledSpan::with_fg(
-                    "─".repeat(60),
+                    "─".repeat(sep_chars),
                     Color::rgb(70, 70, 90),
                 )],
             },
@@ -18299,6 +18367,31 @@ impl CoordApp {
     /// view, or `None` for views where no panel-level verbs apply.
     ///
     /// Backed by the quadraui [`Toolbar`] primitive — each button carries
+    /// Returns `true` when any modal dialog that owns ALL keyboard input is
+    /// currently active.
+    ///
+    /// Used to prevent the Ctrl+P issue-finder (and any future global
+    /// shortcut) from opening on top of a modal that already holds focus.
+    /// The design contract: one modal at a time — each modal "owns ALL input
+    /// while open" (see handle() for each individual guard).
+    fn any_blocking_modal_active(&self) -> bool {
+        self.watch_focused.is_some()
+            || self.pending_purge.is_some()
+            || self.pending_force_merge.is_some()
+            || self.pending_test_fail.is_some()
+            || self.pending_report_fix.is_some()
+            || self.pending_refinement_close_prompt.is_some()
+            || self.pending_auto_review.is_some()
+            || self.pending_rework.is_some()
+            || self.artifact_pull_dialog.is_some()
+            || self.pending_machine_picker.is_some()
+            || self.pending_repo_picker.is_some()
+            || self.refinement_notes_modal.is_some()
+            || self.pending_refinement_notes_synth.is_some()
+            || self.file_issue_modal.is_some()
+            || self.pending_restart.is_some()
+    }
+
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by
     /// [`dispatch_toolbar_action`].  Disabled buttons set
     /// [`ToolbarButton::Action::enabled = false`] so the primitive dims
@@ -21597,10 +21690,13 @@ impl ShellApp for CoordApp {
         }
 
         // ── #541: global issue fuzzy-finder — Ctrl+P toggle ────────────────
-        // Open / close the Telescope-style overlay with Ctrl+P from any view
-        // except when a PTY is capturing all keystrokes.  No guard for other
-        // modals: the finder self-closes with Esc and its open check below
-        // prevents any modal from layering on top of it.
+        // Open / close the Telescope-style overlay with Ctrl+P from any view,
+        // unless:
+        //   (a) a PTY is capturing all keystrokes, or
+        //   (b) any other modal dialog is currently holding focus.
+        // The existing codebase invariant is "one modal owns ALL input while
+        // open"; opening the finder on top of another modal breaks that
+        // contract and leaves the user unable to reach the modal underneath.
         if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
             let pty_active = (self.active_view == SidebarView::Terminal
                 && self.terminal_focused)
@@ -21611,6 +21707,7 @@ impl ShellApp for CoordApp {
                 && modifiers.ctrl
                 && !modifiers.alt
                 && !pty_active
+                && !self.any_blocking_modal_active()
             {
                 if self.issue_finder.is_none() {
                     self.issue_finder = Some(IssueFinder::default());
@@ -37535,8 +37632,8 @@ mod tests {
 
     #[test]
     fn fuzzy_score_empty_query_always_matches() {
-        assert_eq!(fuzzy_score("", "anything"), Some(0));
-        assert_eq!(fuzzy_score("", ""), Some(0));
+        assert_eq!(fuzzy_score("", "anything"), Some((0, Vec::new())));
+        assert_eq!(fuzzy_score("", ""), Some((0, Vec::new())));
     }
 
     #[test]
@@ -37546,9 +37643,16 @@ mod tests {
         // "cf" does NOT match in that order
         assert!(fuzzy_score("cf", "FuzzyComplex").is_none());
         // Consecutive characters score higher than non-consecutive.
-        let consec = fuzzy_score("ab", "ab").unwrap();
-        let non_consec = fuzzy_score("ab", "axb").unwrap();
+        let consec = fuzzy_score("ab", "ab").unwrap().0;
+        let non_consec = fuzzy_score("ab", "axb").unwrap().0;
         assert!(consec > non_consec, "consecutive run should score higher");
+        // Matched positions are returned.
+        let (_, positions) = fuzzy_score("fc", "FuzzyComplex").unwrap();
+        assert!(!positions.is_empty(), "positions must be non-empty for a match");
+        // Empty query always matches with no positions.
+        let (score, positions) = fuzzy_score("", "anything").unwrap();
+        assert_eq!(score, 0);
+        assert!(positions.is_empty());
     }
 
     #[test]
@@ -37625,6 +37729,47 @@ mod tests {
             app.active_view,
             SidebarView::Board,
             "should switch to Board when issue is not in pipeline"
+        );
+    }
+
+    #[test]
+    fn finder_confirm_navigates_to_pipeline_when_issue_is_tracked() {
+        let mut app = make_app_default();
+        // Seed the same issue in both open_issues and pipeline_issues so that
+        // `confirm_issue_finder` takes the Pipeline path.
+        app.data.open_issues = vec![OpenIssue {
+            repo_name: "my-repo".to_string(),
+            number: 42,
+            title: "Add telescope fuzzy finder".to_string(),
+            body: String::new(),
+            labels: Vec::new(),
+            state: "open".to_string(),
+            milestone_number: None,
+            milestone_title: None,
+        }];
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Add telescope fuzzy finder".to_string(),
+            body: String::new(),
+            repo_slug: "owner/my-repo".to_string(),
+            // coord_repo matches open_issues[0].repo_name so the find() succeeds.
+            coord_repo: Some("my-repo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.issue_finder = Some(IssueFinder {
+            query: "telescope".to_string(),
+            cursor: 9,
+            selected_idx: 0,
+        });
+        app.confirm_issue_finder();
+        assert!(app.issue_finder.is_none(), "finder should be closed after confirm");
+        assert_eq!(
+            app.active_view,
+            SidebarView::Pipeline,
+            "should switch to Pipeline when issue carries a tracked label"
         );
     }
 }
