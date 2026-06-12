@@ -19789,6 +19789,25 @@ impl CoordApp {
         self.pending_auto_review.is_some() || self.pending_rework.is_some()
     }
 
+    /// True when the Pipeline detail Terminal tab is showing a LIVE (not
+    /// exited) session for the selected issue.  Guards the global Esc/q quit
+    /// so an accidental keystroke can't kill the TUI out from under a running
+    /// interactive `claude` session.
+    fn terminal_tab_has_live_session(&self) -> bool {
+        if self.active_view != SidebarView::Pipeline
+            || self.pipeline_detail_tab != PipelineDetailTab::Terminal
+        {
+            return false;
+        }
+        let Some(key) = self.selected_issue_key() else {
+            return false;
+        };
+        self.detail_terminal_sessions
+            .get(&key)
+            .map(|s| !s.is_exited())
+            .unwrap_or(false)
+    }
+
     /// Leg 3 (#517): scan armed interactive reviews for a freshly-reported
     /// verdict and route it.  request-changes → raise the rework confirm
     /// prompt; approve → surface a notice pointing at the smoke/merge gate.
@@ -21806,6 +21825,24 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // Guard the global quit: an unfocused Esc/q must NEVER
+                    // exit the app while an interactive session is live in the
+                    // Terminal tab.  Pressing Esc with the PTY unfocused used
+                    // to kill the TUI mid-session (the running claude survives
+                    // in tmux, but the operator loses the attached view and it
+                    // reads as "the session is gone").  Swallow it and tell
+                    // them how to proceed.
+                    Key::Char('q') | Key::Named(NamedKey::Escape)
+                        if self.terminal_tab_has_live_session() =>
+                    {
+                        self.push_toast(
+                            "Session live — not quitting",
+                            "Esc/q is ignored while an interactive session runs here. \
+                             F12 to type into it, or switch views (1/2/3) to quit.",
+                            ToastSeverity::Info,
+                        );
+                        needs_redraw = true;
+                    }
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
 
                     // ── Switch sidebar views ─────────────────────────────
@@ -34837,6 +34874,53 @@ mod tests {
         }];
         app.pipeline_sel = Some(0);
         assert_eq!(app.selected_issue_number(), Some(99));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_tab_has_live_session_guards_quit() {
+        // Regression: an unfocused Esc/q must not quit the app while an
+        // interactive session is live in the Terminal tab.  This helper is the
+        // guard; assert its three conditions (view, tab, live session).
+        let mut app = make_app_default();
+        let issue_key = ("o/r".to_string(), 99u64);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 99,
+            title: "t".to_string(),
+            body: String::new(),
+            repo_slug: "o/r".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+
+        // Terminal tab, but no session yet → quit NOT guarded.
+        assert!(
+            !app.terminal_tab_has_live_session(),
+            "no session → guard false (quit allowed)"
+        );
+
+        // Spawn a live shell for the selected issue.
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 100)
+                .expect("spawn /bin/sh");
+        app.detail_terminal_sessions.insert(issue_key, sess);
+        assert!(
+            app.terminal_tab_has_live_session(),
+            "live session on the Terminal tab → guard true (quit suppressed)"
+        );
+
+        // Leaving the Pipeline view → guard false (quit allowed again).
+        app.active_view = SidebarView::Board;
+        assert!(
+            !app.terminal_tab_has_live_session(),
+            "non-Pipeline view → guard false even with a live session"
+        );
     }
 
     #[test]
