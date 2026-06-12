@@ -7677,10 +7677,55 @@ impl CoordApp {
         idxs
     }
 
+    /// Whether a live `coord-<id>` tmux session currently exists for `issue`
+    /// (local OR remote, via `live_tmux_sessions`).  Matched precisely by
+    /// coord-local repo + issue number so a same-number session in another
+    /// repo doesn't false-positive (#480).  A session counts as live whether
+    /// or not a human is attached — it's running in tmux either way.
+    fn issue_session_is_live(&self, issue: &PipelineIssue) -> bool {
+        let repo = Self::pipeline_repo_key(issue);
+        self.live_tmux_sessions.iter().any(|s| {
+            s.issue_number == Some(issue.number) && s.repo_name.as_deref() == Some(repo)
+        })
+    }
+
+    /// Split the in-progress ("Active") issues into two ordered groups by
+    /// whether a live claude session exists: `"live"` then `"idle"`.  Only
+    /// non-empty groups are returned — mirroring `pipeline_repos_for_state`'s
+    /// `(group_key, issue_indices)` shape so the nested `[group, child]` path
+    /// handling is identical for every Pipeline section.
+    fn pipeline_active_by_liveness(&self) -> Vec<(String, Vec<usize>)> {
+        let mut live: Vec<usize> = Vec::new();
+        let mut idle: Vec<usize> = Vec::new();
+        for idx in self.pipeline_active_issues() {
+            if self.issue_session_is_live(&self.pipeline_issues[idx]) {
+                live.push(idx);
+            } else {
+                idle.push(idx);
+            }
+        }
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        if !live.is_empty() {
+            groups.push(("live".to_string(), live));
+        }
+        if !idle.is_empty() {
+            groups.push(("idle".to_string(), idle));
+        }
+        groups
+    }
+
+    /// Display label for an Active liveness group key (`"live"` → "Live").
+    fn liveness_group_label(key: &str) -> &'static str {
+        match key {
+            "live" => "Live",
+            _ => "Idle",
+        }
+    }
+
     /// Return issues for a lifecycle state, grouped by repo, in stable repo
     /// order (same order as `pipeline_repo_names`).  Only intended for
     /// `"pending"` and `"done"` — Active issues are handled by
-    /// `pipeline_active_issues` instead.
+    /// `pipeline_active_issues` / `pipeline_active_by_liveness` instead.
     ///
     /// Applies dedup, search filter, and dismissal filter.  Empty repos are
     /// omitted.
@@ -7796,6 +7841,7 @@ impl CoordApp {
         // Display order: Active (in-progress) → New (pending) → Done.
         // Each bucket is computed once here and reused for rows + restore.
         let active_flat: Vec<usize> = self.pipeline_active_issues();
+        let active_by_liveness: Vec<(String, Vec<usize>)> = self.pipeline_active_by_liveness();
         let new_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("pending");
         let done_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("done");
 
@@ -7851,49 +7897,81 @@ impl CoordApp {
 
             match lc_key {
                 "in-progress" => {
-                    // Active: flat list across all repos — no repo sub-headers.
-                    // Each row shows a right-aligned single-letter repo tag as
-                    // the badge; the stage badge is implicit (detail pane).
+                    // Active: two collapsible groups — **Live** (a claude
+                    // session is running in tmux, local or remote) and **Idle**
+                    // (in-progress, no session — waiting on you).  Mirrors the
+                    // repo-grouped tree the New/Done sections use; the group key
+                    // is the liveness bucket instead of a repo.  Each issue row
+                    // keeps the single-letter repo tag so the repo is still
+                    // legible when repos are mixed within a group.
                     sidebar.set_section_badge(
                         section_idx,
                         Some(StyledText::plain(format!("({})", active_flat.len()))),
                     );
-                    for (ii, &issue_idx) in active_flat.iter().enumerate() {
-                        let issue = &self.pipeline_issues[issue_idx];
-                        let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
-                        let tag_color = Color::rgb(180, 140, 240);
-                        let title_color = if issue.coord_repo.is_some() {
-                            Color::rgb(210, 210, 210)
+                    for (gi, (group_key, issue_idxs)) in active_by_liveness.iter().enumerate() {
+                        let is_expanded = self
+                            .pipeline_lifecycle_expanded
+                            .get(&("in-progress".to_string(), group_key.clone()))
+                            .copied()
+                            .unwrap_or(true);
+                        let header_color = if group_key == "live" {
+                            Color::rgb(80, 220, 80) // green = live
                         } else {
-                            Color::rgb(140, 140, 140)
+                            Color::rgb(150, 150, 160) // dim = idle
                         };
-                        let has_live_stream = self
-                            .watch_pool
-                            .values()
-                            .any(|ctx| ctx.state.issue_number == issue.number && !ctx.sse.done);
-                        let mut spans = vec![
-                            StyledSpan::with_fg(
-                                format!("#{:<5}", issue.number),
-                                Color::rgb(150, 150, 240),
-                            ),
-                            StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
-                        ];
-                        if has_live_stream {
-                            spans.push(StyledSpan::with_fg(
-                                " ▶".to_string(),
-                                Color::rgb(60, 200, 80),
-                            ));
-                        }
                         rows.push(TreeRow {
-                            path: vec![ii as u16],
+                            path: vec![gi as u16],
                             indent: 1,
                             icon: None,
-                            text: StyledText { spans },
-                            badge: Some(Badge::colored(tag, tag_color)),
-                            is_expanded: None,
-                            decoration: Decoration::Normal,
+                            text: StyledText {
+                                spans: vec![StyledSpan::with_fg(
+                                    format!(
+                                        "{} ({})",
+                                        Self::liveness_group_label(group_key),
+                                        issue_idxs.len()
+                                    ),
+                                    header_color,
+                                )],
+                            },
+                            badge: None,
+                            is_expanded: Some(is_expanded),
+                            decoration: Decoration::Header,
                             edit: None,
                         });
+                        if !is_expanded {
+                            continue;
+                        }
+                        for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
+                            let issue = &self.pipeline_issues[issue_idx];
+                            let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
+                            let tag_color = Color::rgb(180, 140, 240);
+                            let title_color = if issue.coord_repo.is_some() {
+                                Color::rgb(210, 210, 210)
+                            } else {
+                                Color::rgb(140, 140, 140)
+                            };
+                            rows.push(TreeRow {
+                                path: vec![gi as u16, ii as u16],
+                                indent: 2,
+                                icon: None,
+                                text: StyledText {
+                                    spans: vec![
+                                        StyledSpan::with_fg(
+                                            format!("#{:<5}", issue.number),
+                                            Color::rgb(150, 150, 240),
+                                        ),
+                                        StyledSpan::with_fg(
+                                            trunc(&issue.title, 20),
+                                            title_color,
+                                        ),
+                                    ],
+                                },
+                                badge: Some(Badge::colored(tag, tag_color)),
+                                is_expanded: None,
+                                decoration: Decoration::Normal,
+                                edit: None,
+                            });
+                        }
                     }
                 }
                 _ => {
@@ -8013,14 +8091,9 @@ impl CoordApp {
         if sidebar.active_section().is_none() && !state_sections.is_empty() {
             let section_idx = search_offset; // first state section
             sidebar.set_active_section(Some(section_idx));
-            // Active: path [0] = first issue (flat list, no sub-headers).
-            // New/Done: path [0, 0] = first repo sub-header → first issue.
-            let first_path = if state_sections[0].0 == "in-progress" {
-                vec![0u16]
-            } else {
-                vec![0u16, 0u16]
-            };
-            sidebar.set_selected_path(section_idx, Some(first_path));
+            // Every section is now sub-header grouped (Active by liveness;
+            // New/Done by repo), so path [0, 0] = first sub-header → first issue.
+            sidebar.set_selected_path(section_idx, Some(vec![0u16, 0u16]));
         }
 
         self.pipeline_repo_names = repos;
@@ -8043,14 +8116,19 @@ impl CoordApp {
             {
                 let section_idx = state_idx + search_offset;
                 if state_key == "in-progress" {
-                    for (ii, &idx) in active_flat.iter().enumerate() {
-                        let issue = &self.pipeline_issues[idx];
-                        if issue.repo_slug == repo && issue.number == num {
-                            self.pipeline_sel = Some(idx);
-                            self.pipeline_sidebar.set_active_section(Some(section_idx));
-                            self.pipeline_sidebar
-                                .set_selected_path(section_idx, Some(vec![ii as u16]));
-                            break 'outer;
+                    // Active: liveness-grouped — path = [group_idx, issue_idx].
+                    for (gi, (_gk, issue_idxs)) in active_by_liveness.iter().enumerate() {
+                        for (ii, &idx) in issue_idxs.iter().enumerate() {
+                            let issue = &self.pipeline_issues[idx];
+                            if issue.repo_slug == repo && issue.number == num {
+                                self.pipeline_sel = Some(idx);
+                                self.pipeline_sidebar.set_active_section(Some(section_idx));
+                                self.pipeline_sidebar.set_selected_path(
+                                    section_idx,
+                                    Some(vec![gi as u16, ii as u16]),
+                                );
+                                break 'outer;
+                            }
                         }
                     }
                 } else {
@@ -8113,12 +8191,9 @@ impl CoordApp {
     /// Resolve the SidebarSystem's current selection to a `pipeline_issues`
     /// index.
     ///
-    /// The path interpretation depends on the section type:
-    /// - **Active** (`"in-progress"`): path = `[ii]` — flat issue index.
-    /// - **New/Done**: path = `[ri, ii]` — repo sub-header index + issue
-    ///   index within that repo.
-    /// A one-level path in a New/Done section (repo header selected) returns
-    /// `None`.
+    /// Every section is sub-header grouped, so path = `[group_idx, issue_idx]`:
+    /// Active groups by liveness (Live/Idle), New/Done group by repo.  A
+    /// one-level path (a group/repo sub-header selected) returns `None`.
     fn selected_pipeline_index(&self) -> Option<usize> {
         // Section 0 is the FILTER form; state sections start at search_offset.
         let search_offset = 1usize;
@@ -8130,25 +8205,18 @@ impl CoordApp {
         let &state_key = self.pipeline_state_section_names.get(state_idx)?;
         let path = self.pipeline_sidebar.selected_path(section)?;
 
-        if state_key == "in-progress" {
-            // Active: flat list — path = [ii]
-            if path.is_empty() {
-                return None;
-            }
-            let ii = path[0] as usize;
-            let flat = self.pipeline_active_issues();
-            flat.get(ii).copied()
-        } else {
-            // New / Done: repo-grouped — path = [ri, ii]
-            if path.len() < 2 {
-                return None; // repo sub-header selected
-            }
-            let ri = path[0] as usize;
-            let ii = path[1] as usize;
-            let repo_groups = self.pipeline_repos_for_state(state_key);
-            let (_, issue_idxs) = repo_groups.get(ri)?;
-            issue_idxs.get(ii).copied()
+        if path.len() < 2 {
+            return None; // a group / repo sub-header is selected
         }
+        let gi = path[0] as usize;
+        let ii = path[1] as usize;
+        let groups = if state_key == "in-progress" {
+            self.pipeline_active_by_liveness()
+        } else {
+            self.pipeline_repos_for_state(state_key)
+        };
+        let (_, issue_idxs) = groups.get(gi)?;
+        issue_idxs.get(ii).copied()
     }
 
     /// Resolve the per-stage status of an issue from existing assignments.
@@ -13321,26 +13389,29 @@ impl CoordApp {
                         true
                     }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
-                        // A one-level path in a New/Done state section means
-                        // a repo sub-header was toggled.  Active has no
-                        // sub-headers, so we only act on New/Done.
+                        // A one-level path = a sub-header was toggled.  New/Done
+                        // group by repo; Active groups by liveness (Live/Idle).
+                        // Both persist expand state in pipeline_lifecycle_expanded
+                        // keyed by (lc_key, group_key).
                         let search_offset = 1usize;
                         if section >= search_offset {
                             let state_idx = section - search_offset;
                             if let Some(&lc_key) = self.pipeline_state_section_names.get(state_idx)
                             {
-                                if lc_key != "in-progress" {
-                                    let ri = path[0] as usize;
-                                    let repo_groups = self.pipeline_repos_for_state(lc_key);
-                                    if let Some((repo_key, _)) = repo_groups.get(ri) {
-                                        let repo_key = repo_key.clone();
-                                        let entry = self
-                                            .pipeline_lifecycle_expanded
-                                            .entry((lc_key.to_string(), repo_key))
-                                            .or_insert(true);
-                                        *entry = !*entry;
-                                        self.rebuild_pipeline_sidebar(None);
-                                    }
+                                let groups = if lc_key == "in-progress" {
+                                    self.pipeline_active_by_liveness()
+                                } else {
+                                    self.pipeline_repos_for_state(lc_key)
+                                };
+                                let gi = path[0] as usize;
+                                if let Some((group_key, _)) = groups.get(gi) {
+                                    let group_key = group_key.clone();
+                                    let entry = self
+                                        .pipeline_lifecycle_expanded
+                                        .entry((lc_key.to_string(), group_key))
+                                        .or_insert(true);
+                                    *entry = !*entry;
+                                    self.rebuild_pipeline_sidebar(None);
                                 }
                             }
                         }
@@ -26651,6 +26722,65 @@ mod tests {
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "in-progress");
+    }
+
+    #[test]
+    fn pipeline_active_by_liveness_splits_on_live_session() {
+        let mut app = make_pipeline_app();
+        // #42 → in-progress (a running work assignment).
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 42, "api", Some("work")));
+
+        // No live session → the one Active issue is Idle.
+        let groups = app.pipeline_active_by_liveness();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "idle");
+        assert_eq!(groups[0].1.len(), 1);
+
+        // A live tmux session for api#42 → it moves to the Live group.
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "x".to_string(),
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+        }];
+        let groups = app.pipeline_active_by_liveness();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "live");
+
+        // Cross-repo guard (#480): a same-number session in another repo must
+        // NOT mark api#42 live.
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "y".to_string(),
+            issue_number: Some(42),
+            repo_name: Some("other".to_string()),
+            issue_title: None,
+        }];
+        let groups = app.pipeline_active_by_liveness();
+        assert_eq!(groups[0].0, "idle", "cross-repo session must not mark it live");
+    }
+
+    #[test]
+    fn active_liveness_selection_resolves_through_nested_path() {
+        // End-to-end: the new [group, issue] path for Active resolves back to
+        // the right pipeline_issues index via selected_pipeline_index().
+        let mut app = make_pipeline_app();
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 42, "api", Some("work")));
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "x".to_string(),
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        // Default selection is [0, 0] = first group (Live) → #42.
+        let idx = app
+            .selected_pipeline_index()
+            .expect("Active selection resolves through the nested path");
+        assert_eq!(app.pipeline_issues[idx].number, 42);
     }
 
     #[test]
