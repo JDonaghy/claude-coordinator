@@ -200,6 +200,57 @@ impl SidebarFilter {
     }
 }
 
+// ─── Issue fuzzy finder ───────────────────────────────────────────────────────
+
+/// #541: State for the global Telescope-style issue fuzzy-finder overlay.
+///
+/// Opened with Ctrl+P from any view.  The user types to fuzzy-search across
+/// all issues in `data.open_issues`; j/k (or Up/Down) navigates; Enter jumps
+/// to the selected issue (Pipeline if tracked, otherwise Board); Esc closes.
+#[derive(Default)]
+struct IssueFinder {
+    /// Current search query (as-typed, not lowercased).
+    query: String,
+    /// Byte offset of the text cursor inside `query` (on a char boundary).
+    cursor: usize,
+    /// Index of the highlighted result row within the current match list.
+    selected_idx: usize,
+}
+
+impl IssueFinder {
+    /// Insert a printable character at the cursor position.
+    fn insert_char(&mut self, c: char) {
+        self.query.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+        self.selected_idx = 0; // reset selection on every query change
+    }
+
+    /// Delete the character before the cursor (UTF-8 safe).
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let mut prev = self.cursor - 1;
+            while prev > 0 && !self.query.is_char_boundary(prev) {
+                prev -= 1;
+            }
+            self.query.remove(prev);
+            self.cursor = prev;
+            self.selected_idx = 0;
+        }
+    }
+
+    /// Move the highlight down by one row (wraps at the end of `max`).
+    fn move_down(&mut self, max: usize) {
+        if max > 0 {
+            self.selected_idx = (self.selected_idx + 1).min(max - 1);
+        }
+    }
+
+    /// Move the highlight up by one row (clamps at 0).
+    fn move_up(&mut self) {
+        self.selected_idx = self.selected_idx.saturating_sub(1);
+    }
+}
+
 // ─── Detail panel tabs ────────────────────────────────────────────────────────
 
 /// Per-assignment context for the live watch overlay (Pipeline > Stages
@@ -1967,6 +2018,37 @@ fn trunc(s: &str, max_chars: usize) -> &str {
         Some((byte_idx, _)) => &s[..byte_idx],
         None => s,
     }
+}
+
+/// #541: Fuzzy subsequence match scorer used by the global issue finder.
+///
+/// Returns `None` when not every character of `query` appears in `haystack`
+/// in order (case-insensitive).  Returns `Some(score)` otherwise, where each
+/// matched character contributes +1 and each *consecutive* match pair earns an
+/// additional +2 bonus, so tighter matches rank higher.  An empty query always
+/// matches with score 0.
+fn fuzzy_score(query: &str, haystack: &str) -> Option<u32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let h: Vec<char> = haystack.to_lowercase().chars().collect();
+    let mut qi = 0usize;
+    let mut score: u32 = 0;
+    let mut prev_matched = false;
+    for hc in &h {
+        if qi < q.len() && *hc == q[qi] {
+            qi += 1;
+            score += 1;
+            if prev_matched {
+                score += 2; // consecutive-run bonus
+            }
+            prev_matched = true;
+        } else {
+            prev_matched = false;
+        }
+    }
+    if qi == q.len() { Some(score) } else { None }
 }
 
 /// Build a key-value `ListItem` for the detail panel.
@@ -4368,6 +4450,12 @@ pub struct CoordApp {
     /// interactive `--fix-of` session for a request-changes verdict.  Enter
     /// confirms; Esc/n dismisses.  See [`PendingRework`].
     pending_rework: Option<PendingRework>,
+
+    // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
+    /// Active state of the issue fuzzy-finder overlay.  `None` when the
+    /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
+    /// with Esc or Enter (Enter also navigates to the selected issue).
+    issue_finder: Option<IssueFinder>,
 }
 
 impl Default for CoordApp {
@@ -4584,6 +4672,8 @@ impl CoordApp {
             // Leg 3 (#517): verdict-driven routing.
             armed_for_verdict: std::collections::HashMap::new(),
             pending_rework: None,
+            // #541: global issue fuzzy finder — closed by default.
+            issue_finder: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -17091,6 +17181,266 @@ impl CoordApp {
         );
     }
 
+    // ── #541: global issue fuzzy finder ──────────────────────────────────────
+
+    /// Compute a score-sorted match list for the current finder query.
+    ///
+    /// Searches all `data.open_issues` (both `open` and `closed` state — the
+    /// backlog contains historical issues too, and the finder is a navigation
+    /// tool, not a work-queue filter).  Matches are scored by [`fuzzy_score`]
+    /// against the combined string `"#N title"` so typing a bare number or a
+    /// word fragment from the title both work naturally.
+    ///
+    /// Returns at most 50 results (enough to cover any reasonable viewport
+    /// without unbounded allocation on large backlogs).
+    fn finder_matches(&self, query: &str) -> Vec<(String, u64, String)> {
+        const MAX_RESULTS: usize = 50;
+        let mut scored: Vec<(u32, String, u64, String)> = self
+            .data
+            .open_issues
+            .iter()
+            .filter_map(|oi| {
+                let haystack = format!("#{} {}", oi.number, oi.title);
+                let score = fuzzy_score(query, &haystack)?;
+                Some((score, oi.repo_name.clone(), oi.number, oi.title.clone()))
+            })
+            .collect();
+        // Higher score first; tie-break by repo then number for stable ordering.
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+        });
+        scored
+            .into_iter()
+            .take(MAX_RESULTS)
+            .map(|(_, repo, num, title)| (repo, num, title))
+            .collect()
+    }
+
+    /// Called when the user presses Enter in the issue finder.
+    ///
+    /// Navigates to the selected issue:
+    /// * If the issue appears in `pipeline_issues` (i.e. it carries a tracked
+    ///   label), switch to the Pipeline view and set the selection there.
+    /// * Otherwise switch to the Board view and call the existing
+    ///   `select_issue()` helper.
+    ///
+    /// Clears `issue_finder` in all cases.
+    fn confirm_issue_finder(&mut self) {
+        let query = match &self.issue_finder {
+            Some(f) => f.query.clone(),
+            None => return,
+        };
+        let sel = self.issue_finder.as_ref().map(|f| f.selected_idx).unwrap_or(0);
+        let matches = self.finder_matches(&query);
+        let Some((repo, number, _title)) = matches.into_iter().nth(sel) else {
+            self.issue_finder = None;
+            return;
+        };
+        self.issue_finder = None;
+
+        // Navigate to Pipeline if the issue appears there (tracked label).
+        // Match by coord_repo (local name) since `finder_matches` uses oi.repo_name.
+        let pipeline_entry = self.pipeline_issues.iter().find(|pi| {
+            pi.number == number
+                && pi.coord_repo.as_deref().unwrap_or(&pi.repo_slug) == repo
+        });
+        if let Some(pi) = pipeline_entry {
+            let repo_slug = pi.repo_slug.clone();
+            self.active_view = SidebarView::Pipeline;
+            // `rebuild_pipeline_sidebar` with prev_sel_override wires up the
+            // sidebar selection highlight and syncs `pipeline_sel` for us.
+            self.rebuild_pipeline_sidebar(Some((repo_slug, number)));
+            self.pipeline_focused_stage =
+                self.default_focused_stage_for_selected_issue();
+            self.pipeline_stage_content_scroll = 0;
+        } else {
+            // Fall back to the Board view.
+            self.active_view = SidebarView::Board;
+            self.select_issue(&repo, number);
+            self.detail_scroll = 0;
+        }
+    }
+
+    /// Render the Telescope-style issue finder overlay.
+    ///
+    /// Draws a centered box (~70 % wide, ~60 % tall) over `viewport` that shows:
+    /// * A search input line at the top (the typed query with a blinking cursor).
+    /// * Up to 15 scrolled result rows, the highlighted one inverted.
+    /// * A footer with the match count and key hints.
+    fn render_issue_finder(&self, backend: &mut dyn Backend, viewport: Rect) {
+        let Some(finder) = &self.issue_finder else {
+            return;
+        };
+        let lh = backend.line_height();
+
+        // ── Size + position ──────────────────────────────────────────────────
+        let box_w = (viewport.width * 0.72).clamp(40.0 * lh, 90.0 * lh);
+        let box_h = (viewport.height * 0.65).clamp(10.0 * lh, 32.0 * lh);
+        let box_x = viewport.x + (viewport.width - box_w) * 0.5;
+        let box_y = viewport.y + (viewport.height - box_h) * 0.3;
+        let finder_rect = Rect::new(box_x, box_y, box_w, box_h);
+
+        // Outer bordered box (background + border).
+        backend.draw_list(
+            finder_rect,
+            &ListView {
+                id: WidgetId::new("issue-finder-bg"),
+                title: None,
+                items: Vec::new(),
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: true,
+                bordered: true,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: false,
+            },
+        );
+
+        let inner = shrink_rect(finder_rect, lh * 0.5);
+
+        // ── Build items ──────────────────────────────────────────────────────
+        let matches = self.finder_matches(&finder.query);
+        let match_count = matches.len();
+
+        // Header: query input line.
+        // Show a block-cursor glyph (▌) at the byte offset stored in
+        // `finder.cursor`.  The cursor is always on a valid UTF-8 char boundary
+        // so the byte-slices are safe.
+        let cursor_display = {
+            let before = &finder.query[..finder.cursor.min(finder.query.len())];
+            let after = &finder.query[finder.cursor.min(finder.query.len())..];
+            format!("  ▶  {}▌{}", before, after)
+        };
+        let mut items: Vec<ListItem> = Vec::new();
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(cursor_display, Color::rgb(120, 220, 120))],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+
+        // Separator.
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(
+                    "─".repeat(60),
+                    Color::rgb(70, 70, 90),
+                )],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+
+        // ── Result rows ──────────────────────────────────────────────────────
+        // Visible window: keep selected_idx in view.
+        let visible_rows: usize = ((box_h / lh) as usize).saturating_sub(4).max(1);
+        let scroll_offset = if finder.selected_idx >= visible_rows {
+            finder.selected_idx + 1 - visible_rows
+        } else {
+            0
+        };
+
+        let visible_matches: Vec<_> = matches
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible_rows)
+            .collect();
+
+        if visible_matches.is_empty() {
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        if finder.query.is_empty() {
+                            "  (type to search across all issues)".to_string()
+                        } else {
+                            "  No matching issues".to_string()
+                        },
+                        Color::rgb(100, 100, 120),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+        } else {
+            for (abs_idx, (repo, number, title)) in &visible_matches {
+                let is_selected = *abs_idx == finder.selected_idx;
+                let prefix = if is_selected { "▶ " } else { "  " };
+                let repo_short = trunc(repo, 18);
+                let title_short = trunc(title, 45);
+                let row_text = format!(
+                    "{}#{:<5}  {:18}  {}",
+                    prefix, number, repo_short, title_short
+                );
+                let row_color = if is_selected {
+                    Color::rgb(230, 240, 255)
+                } else {
+                    Color::rgb(200, 200, 210)
+                };
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(row_text, row_color)],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: if is_selected {
+                        Decoration::Header
+                    } else {
+                        Decoration::Normal
+                    },
+                });
+            }
+        }
+
+        // Footer separator + hint line.
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(
+                    "─".repeat(60),
+                    Color::rgb(70, 70, 90),
+                )],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+        let hint = format!(
+            "  {} matches  ·  j/k ↑↓ navigate  ·  Enter jump  ·  Esc close",
+            match_count
+        );
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(hint, Color::rgb(100, 100, 120))],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+
+        backend.draw_list(
+            inner,
+            &ListView {
+                id: WidgetId::new("issue-finder"),
+                title: None,
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: true,
+                bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: false,
+            },
+        );
+    }
+
     /// #316 Phase A: render the Board Chat tab content.
     /// Shows the chat when a board chat is live, or an empty state with
     /// "Refine" and "New Issue" CTAs when no chat is active.
@@ -21249,6 +21599,13 @@ impl ShellApp for CoordApp {
         let dialog_viewport =
             union_rects(layout.sidebar_content_bounds, layout.main_content_bounds);
         self.render_prompt_dialog(backend, dialog_viewport);
+
+        // ── #541: issue fuzzy finder (topmost overlay) ─────────────────
+        // Rendered last so it sits above all other content including
+        // prompt dialogs.  When the finder is closed this is a no-op.
+        if self.issue_finder.is_some() {
+            self.render_issue_finder(backend, dialog_viewport);
+        }
     }
 
     fn handle(
@@ -21444,6 +21801,82 @@ impl ShellApp for CoordApp {
                     return Reaction::Redraw;
                 }
             }
+        }
+
+        // ── #541: global issue fuzzy-finder — Ctrl+P toggle ────────────────
+        // Open / close the Telescope-style overlay with Ctrl+P from any view
+        // except when a PTY is capturing all keystrokes.  No guard for other
+        // modals: the finder self-closes with Esc and its open check below
+        // prevents any modal from layering on top of it.
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            let pty_active = (self.active_view == SidebarView::Terminal
+                && self.terminal_focused)
+                || (self.active_view == SidebarView::Pipeline
+                    && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                    && self.detail_terminal_focused);
+            if matches!(key, Key::Char('p') | Key::Char('P'))
+                && modifiers.ctrl
+                && !modifiers.alt
+                && !pty_active
+            {
+                if self.issue_finder.is_none() {
+                    self.issue_finder = Some(IssueFinder::default());
+                } else {
+                    self.issue_finder = None;
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #541: issue finder owns ALL input while open ─────────────────────
+        // Esc=close, Enter=jump, j/k/↑/↓=navigate, Backspace=delete,
+        // printable chars=type.  Every other key is swallowed so board/pipeline
+        // shortcuts can't fire while the overlay is up.
+        if self.issue_finder.is_some() {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Escape) => {
+                        self.issue_finder = None;
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        self.confirm_issue_finder();
+                    }
+                    Key::Named(NamedKey::Down) | Key::Char('j')
+                        if !modifiers.ctrl && !modifiers.alt =>
+                    {
+                        let count = {
+                            let q = self
+                                .issue_finder
+                                .as_ref()
+                                .map(|f| f.query.clone())
+                                .unwrap_or_default();
+                            self.finder_matches(&q).len()
+                        };
+                        if let Some(f) = &mut self.issue_finder {
+                            f.move_down(count);
+                        }
+                    }
+                    Key::Named(NamedKey::Up) | Key::Char('k')
+                        if !modifiers.ctrl && !modifiers.alt =>
+                    {
+                        if let Some(f) = &mut self.issue_finder {
+                            f.move_up();
+                        }
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(f) = &mut self.issue_finder {
+                            f.backspace();
+                        }
+                    }
+                    Key::Char(ch) if !modifiers.ctrl && !modifiers.alt => {
+                        if let Some(f) = &mut self.issue_finder {
+                            f.insert_char(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Reaction::Redraw;
         }
 
         // ── #316 Phase B: file-issue modal owns ALL input while open ───
@@ -25055,6 +25488,8 @@ mod tests {
             // Leg 3 (#517)
             armed_for_verdict: std::collections::HashMap::new(),
             pending_rework: None,
+            // #541
+            issue_finder: None,
         }
     }
 
@@ -37611,5 +38046,102 @@ mod tests {
         };
         assert!(badge_6.is_some(), "depth 6 should produce a badge");
         assert_eq!(badge_6.unwrap().fg, Some(amber), "depth 6 must be amber");
+    }
+
+    // ── #541: issue fuzzy finder ──────────────────────────────────────────────
+
+    #[test]
+    fn fuzzy_score_empty_query_always_matches() {
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+        assert_eq!(fuzzy_score("", ""), Some(0));
+    }
+
+    #[test]
+    fn fuzzy_score_subsequence_match() {
+        // "fc" matches "FuzzyComplex" in order (case-insensitive)
+        assert!(fuzzy_score("fc", "FuzzyComplex").is_some());
+        // "cf" does NOT match in that order
+        assert!(fuzzy_score("cf", "FuzzyComplex").is_none());
+        // Consecutive characters score higher than non-consecutive.
+        let consec = fuzzy_score("ab", "ab").unwrap();
+        let non_consec = fuzzy_score("ab", "axb").unwrap();
+        assert!(consec > non_consec, "consecutive run should score higher");
+    }
+
+    #[test]
+    fn finder_matches_returns_correct_issues() {
+        let mut app = make_app_default();
+        app.data.open_issues = vec![
+            OpenIssue {
+                repo_name: "repo-a".to_string(),
+                number: 42,
+                title: "Add telescope fuzzy finder".to_string(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            },
+            OpenIssue {
+                repo_name: "repo-b".to_string(),
+                number: 99,
+                title: "Unrelated bug fix".to_string(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            },
+        ];
+        let matches = app.finder_matches("telescope");
+        assert_eq!(matches.len(), 1, "only issue #42 should match 'telescope'");
+        assert_eq!(matches[0].1, 42);
+
+        let all = app.finder_matches("");
+        assert_eq!(all.len(), 2, "empty query matches all issues");
+    }
+
+    #[test]
+    fn finder_selection_clamped_after_query_change() {
+        // After typing a query that returns fewer results than the current
+        // selected_idx, move_down should clamp at the last valid index.
+        let mut f = IssueFinder::default();
+        f.selected_idx = 0;
+        // With 3 matches, move down twice.
+        f.move_down(3);
+        f.move_down(3);
+        assert_eq!(f.selected_idx, 2);
+        // Now restrict matches to 1; move_down should clamp.
+        f.move_down(1);
+        assert_eq!(f.selected_idx, 0, "clamped to 0 when max=1");
+    }
+
+    #[test]
+    fn finder_confirm_navigates_to_board_when_not_in_pipeline() {
+        let mut app = make_app_default();
+        // Seed one open issue (not in pipeline_issues).
+        app.data.open_issues = vec![OpenIssue {
+            repo_name: "my-repo".to_string(),
+            number: 7,
+            title: "Some issue".to_string(),
+            body: String::new(),
+            labels: Vec::new(),
+            state: "open".to_string(),
+            milestone_number: None,
+            milestone_title: None,
+        }];
+        app.rebuild_board_sidebar();
+        app.issue_finder = Some(IssueFinder {
+            query: "7".to_string(),
+            cursor: 1,
+            selected_idx: 0,
+        });
+        app.confirm_issue_finder();
+        assert!(app.issue_finder.is_none(), "finder should be closed after confirm");
+        assert_eq!(
+            app.active_view,
+            SidebarView::Board,
+            "should switch to Board when issue is not in pipeline"
+        );
     }
 }
