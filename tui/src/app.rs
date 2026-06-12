@@ -3626,16 +3626,36 @@ fn fetch_pipeline_issues(labels: &[String], repos: &[(String, String)]) -> Pipel
             args.push(slug.clone());
         }
 
-        let output = std::process::Command::new("gh").args(&args).output();
-
-        let stdout = match output {
-            Ok(o) if o.status.success() => o.stdout,
-            Ok(o) => {
-                return PipelineLoaderResult::Err(
-                    String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                );
+        // `gh search` hits GitHub's Search API: 30 req/min and
+        // eventually-consistent.  A burst of refreshes (or other concurrent
+        // `gh search` usage) trips a transient rate-limit / "submitted too
+        // quickly" error.  Retry a few times with a short backoff before
+        // giving up, so a single refresh isn't lost to a blip and silently
+        // leaves the stale list in place.  This runs in a background thread,
+        // so sleeping here never blocks the UI.
+        let mut attempt = 0u32;
+        let stdout = loop {
+            attempt += 1;
+            match std::process::Command::new("gh").args(&args).output() {
+                Ok(o) if o.status.success() => break o.stdout,
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    let lc = stderr.to_lowercase();
+                    let transient = lc.contains("rate limit")
+                        || lc.contains("rate-limit")
+                        || lc.contains("submitted too quickly")
+                        || lc.contains("http 403")
+                        || lc.contains("http 429");
+                    if transient && attempt < 3 {
+                        std::thread::sleep(Duration::from_secs(2 * attempt as u64));
+                        continue;
+                    }
+                    return PipelineLoaderResult::Err(stderr);
+                }
+                Err(e) => {
+                    return PipelineLoaderResult::Err(format!("could not run gh: {}", e))
+                }
             }
-            Err(e) => return PipelineLoaderResult::Err(format!("could not run gh: {}", e)),
         };
 
         let value: serde_json::Value = match serde_json::from_slice(&stdout) {
@@ -10799,7 +10819,17 @@ impl CoordApp {
                 true
             }
             Ok(PipelineLoaderResult::Err(msg)) => {
-                self.pipeline_status = Some((format!("gh: {}", msg), Instant::now()));
+                // Loud, not silent: a failed refresh used to leave only a tiny
+                // status line, so the stale list looked authoritative.  Surface
+                // a toast; the 60s throttle auto-retries.
+                self.pipeline_status =
+                    Some((format!("Pipeline refresh failed (gh): {}", msg), Instant::now()));
+                self.push_toast(
+                    "Pipeline refresh failed",
+                    "GitHub query failed (rate limit?). The list may be STALE — \
+                     auto-retries within 60s; press Refresh to retry now.",
+                    ToastSeverity::Warning,
+                );
                 self.pipeline_loader = None;
                 true
             }
