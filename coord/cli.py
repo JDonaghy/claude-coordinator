@@ -4922,12 +4922,16 @@ def refine(repo: str, issue: int, config_path: Path) -> None:
 
 @main.command(
     help=(
-        "Send a refined issue to the Pipeline by tagging it with the "
-        "`coord` label on GitHub.\n\n"
-        "Symmetric with `coord refine` / `coord ready` — once the `coord` "
-        "label is present, the issue appears in the Pipeline panel's New "
-        "section and right-click → Start (or `coord assign`) can dispatch "
-        "it.\n\n"
+        "Send an issue to the Pipeline as DISPATCHABLE by tagging it with "
+        "both the `coord` and `status:ready` labels on GitHub.\n\n"
+        "A dispatchable Pipeline:New card needs BOTH labels.  Coordinator "
+        "issues are often *created* with `coord` already, so adding only "
+        "`coord` was a no-op that left them stuck without `status:ready` "
+        "(#486 Leg 4 bug).  This now ensures both — idempotent: in the normal "
+        "Refining → Refined (`coord ready`) → Send flow the issue already has "
+        "`status:ready`, so only `coord` is added.  Any pre-Pipeline "
+        "`status:refining` / `status:backlog` label is cleared, mirroring "
+        "`coord ready`.\n\n"
         "REPO is the local repo name from coordinator.yml; ISSUE is the "
         "GH issue number."
     )
@@ -4936,17 +4940,22 @@ def refine(repo: str, issue: int, config_path: Path) -> None:
 @click.argument("issue", type=int)
 @_CONFIG_OPTION
 def track(repo: str, issue: int, config_path: Path) -> None:
-    """#261: TUI right-click 'Send to Pipeline' fires this command to
-    add the `coord` label so the issue enters the Pipeline."""
+    """#261/#486: TUI right-click 'Send to Pipeline' fires this command to
+    make the issue a dispatchable Pipeline:New card (`coord` + `status:ready`)."""
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
     slug = repo_entry.github if repo_entry else repo
     _apply_label_change(
         repo, issue, config_path,
-        add={"coord"},
-        remove_if_present=set(),
-        success_message=f"#{issue} ({slug}) sent to Pipeline (coord label added)",
-        no_op_message=f"#{issue} ({slug}) already on the Pipeline (coord label present)",
+        add={"coord", "status:ready"},
+        remove_if_present={"status:refining", "status:backlog"},
+        success_message=(
+            f"#{issue} ({slug}) sent to Pipeline (coord + status:ready)"
+        ),
+        no_op_message=(
+            f"#{issue} ({slug}) already dispatchable "
+            "(coord + status:ready present)"
+        ),
     )
 
 
