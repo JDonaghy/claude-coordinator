@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from coord.interactive import (
+    _SSH_MUX_OPTS,
     TmuxHost,
     _inject_briefing_into_tmux_session,
     list_coord_tmux_sessions,
@@ -80,23 +81,30 @@ class TestTmuxHostCmd:
 
     def test_remote_no_tmux_args(self) -> None:
         result = TmuxHost("myhost").cmd([])
-        assert result == ["ssh", "myhost", "tmux"]
+        assert result == ["ssh", *_SSH_MUX_OPTS, "myhost", "tmux"]
 
     def test_remote_single_arg(self) -> None:
         result = TmuxHost("myhost").cmd(["ls"])
-        assert result == ["ssh", "myhost", "tmux", "ls"]
+        assert result == ["ssh", *_SSH_MUX_OPTS, "myhost", "tmux", "ls"]
 
     def test_remote_has_session(self) -> None:
         result = TmuxHost("myhost").cmd(["has-session", "-t", "coord-abc"])
-        assert result == ["ssh", "myhost", "tmux", "has-session", "-t", "coord-abc"]
+        assert result == [
+            "ssh", *_SSH_MUX_OPTS, "myhost", "tmux", "has-session", "-t", "coord-abc",
+        ]
 
     def test_remote_ls_format(self) -> None:
         result = TmuxHost("myhost").cmd(["ls", "-F", "#{session_name}"])
-        assert result == ["ssh", "myhost", "tmux", "ls", "-F", "#{session_name}"]
+        assert result == [
+            "ssh", *_SSH_MUX_OPTS, "myhost", "tmux", "ls", "-F", "#{session_name}",
+        ]
 
     def test_remote_load_buffer_stdin(self) -> None:
         result = TmuxHost("myhost").cmd(["load-buffer", "-b", "coord-brief", "-"])
-        assert result == ["ssh", "myhost", "tmux", "load-buffer", "-b", "coord-brief", "-"]
+        assert result == [
+            "ssh", *_SSH_MUX_OPTS, "myhost", "tmux",
+            "load-buffer", "-b", "coord-brief", "-",
+        ]
 
     def test_remote_no_dash_t_by_default(self) -> None:
         result = TmuxHost("myhost").cmd(["has-session", "-t", "s"])
@@ -109,23 +117,28 @@ class TestTmuxHostCmd:
     def test_remote_ssh_is_first_element(self) -> None:
         assert TmuxHost("remote.host").cmd(["ls"])[0] == "ssh"
 
-    def test_remote_host_is_second_element(self) -> None:
+    def test_remote_host_precedes_tmux(self) -> None:
+        # ControlMaster -o opts sit between ssh and the host, so the host is no
+        # longer index 1 — but it must still be the token right before "tmux".
         result = TmuxHost("remote.host").cmd(["ls"])
-        assert result[1] == "remote.host"
+        assert result[result.index("tmux") - 1] == "remote.host"
 
-    def test_remote_tmux_is_third_element(self) -> None:
+    def test_remote_tmux_follows_host(self) -> None:
         result = TmuxHost("remote.host").cmd(["ls"])
-        assert result[2] == "tmux"
+        assert result[result.index("remote.host") + 1] == "tmux"
 
     def test_remote_user_at_host(self) -> None:
         result = TmuxHost("user@myhost").cmd(["ls"])
-        assert result == ["ssh", "user@myhost", "tmux", "ls"]
+        assert result == ["ssh", *_SSH_MUX_OPTS, "user@myhost", "tmux", "ls"]
 
     # -- remote with tty=True --------------------------------------------------
 
     def test_remote_tty_true_inserts_dash_t(self) -> None:
         result = TmuxHost("myhost").cmd(["attach-session", "-t", "s"], tty=True)
-        assert result == ["ssh", "-t", "myhost", "tmux", "attach-session", "-t", "s"]
+        assert result == [
+            "ssh", "-t", *_SSH_MUX_OPTS, "myhost",
+            "tmux", "attach-session", "-t", "s",
+        ]
 
     def test_remote_tty_true_dash_t_before_host(self) -> None:
         result = TmuxHost("myhost").cmd(["attach-session", "-t", "s"], tty=True)
@@ -140,9 +153,10 @@ class TestTmuxHostCmd:
 
     def test_remote_tty_false_no_dash_t_before_host(self) -> None:
         result = TmuxHost("myhost").cmd(["has-session"], tty=False)
-        # ssh block is ["ssh", "myhost", "tmux", ...]
         assert result[0] == "ssh"
-        assert result[1] == "myhost"  # no -t between ssh and host
+        # No ssh -t flag for control commands (the only -t is the tmux target,
+        # which comes after the host); the mux -o opts carry no -t.
+        assert "-t" not in result[: result.index("myhost")]
 
     # -- frozen / immutable ----------------------------------------------------
 

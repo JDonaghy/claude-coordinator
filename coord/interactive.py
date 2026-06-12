@@ -111,6 +111,22 @@ __all__ = [
 #: cheaply and the assignment_id is directly recoverable.
 TMUX_SESSION_PREFIX = "coord-"
 
+#: SSH connection-multiplexing options for remote (#486/#494) tmux calls.
+#: One interactive launch fires ~5+ separate ssh invocations (has-session →
+#: new-session → a 50 ms ``capture-pane`` readiness poll → load/paste-buffer →
+#: attach → alive-check).  Without multiplexing each is a fresh SSH auth, so a
+#: passphrase-protected key prompts once *per call* — a wall of prompts the
+#: operator has to clear.  ``ControlMaster=auto`` opens the connection once and
+#: every subsequent call reuses it over the same socket (one auth per launch,
+#: and zero within ``ControlPersist`` of the previous launch).  ``%C`` hashes
+#: host/port/user so the socket path stays short and per-destination.  Applied
+#: only on the remote path; the local (``ssh_target=None``) argv is unchanged.
+_SSH_MUX_OPTS = [
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPath=~/.ssh/coord-mux-%C",
+    "-o", "ControlPersist=120s",
+]
+
 
 def _get_local_short_hostname() -> str:
     """Return the short hostname of the local machine (split on '.' and lowercased).
@@ -155,7 +171,14 @@ class TmuxHost:
         """
         if self.ssh_target is None:
             return ["tmux", *tmux_args]
-        return ["ssh", *(["-t"] if tty else []), self.ssh_target, "tmux", *tmux_args]
+        return [
+            "ssh",
+            *(["-t"] if tty else []),
+            *_SSH_MUX_OPTS,
+            self.ssh_target,
+            "tmux",
+            *tmux_args,
+        ]
 
 
 def tmux_session_name(assignment_id: str) -> str:
@@ -409,7 +432,7 @@ def _launch_via_tmux(
             # shlex.quote wraps shell_cmd so the remote shell treats it as
             # exactly one argument to tmux new-session.
             _parts.append(shlex.quote(shell_cmd))
-            create_cmd = ["ssh", host.ssh_target, " ".join(_parts)]
+            create_cmd = ["ssh", *_SSH_MUX_OPTS, host.ssh_target, " ".join(_parts)]
         else:
             # Local: pass args directly to tmux via subprocess list form.
             # No shell is involved, so shell_cmd is passed as ONE argument

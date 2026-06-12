@@ -713,16 +713,18 @@ class TestLaunchViaTmuxRawShellCmd:
         assert create_calls, f"new-session not found in calls: {captured_cmds!r}"
         create_cmd = create_calls[0]
 
-        # Remote: must be exactly ['ssh', 'myhost', '<tmux_cmd_string>']
+        # Remote: ['ssh', *ControlMaster opts, 'myhost', '<tmux_cmd_string>'].
+        # The mux -o opts sit between ssh and the host; the invariant under
+        # test is that the host and the single shell command string are the
+        # last two elements — the tmux command is NOT split across ssh args.
         assert create_cmd[0] == "ssh", f"Expected 'ssh', got {create_cmd[0]!r}"
-        assert create_cmd[1] == "myhost", f"Expected 'myhost', got {create_cmd[1]!r}"
-        # Third element is the single shell command string
-        assert len(create_cmd) == 3, (
-            f"Expected exactly 3 elements ['ssh', host, cmd_str]; got {create_cmd!r}"
+        assert create_cmd[-2] == "myhost", (
+            f"Expected host as penultimate element, got {create_cmd[-2]!r} "
+            f"in {create_cmd!r}"
         )
-        # The shell command string must contain both 'tmux new-session' and
-        # the quoted raw_shell_cmd.
-        cmd_str = create_cmd[2]
+        # The shell command string (last element) must contain both
+        # 'tmux new-session' and the quoted raw_shell_cmd — one single arg.
+        cmd_str = create_cmd[-1]
         assert "tmux" in cmd_str and "new-session" in cmd_str, (
             f"tmux new-session not in cmd_str: {cmd_str!r}"
         )
@@ -752,7 +754,9 @@ class TestLaunchViaTmuxRawShellCmd:
 
         create_calls = [c for c in captured_cmds if "new-session" in " ".join(c)]
         assert create_calls
-        cmd_str = create_calls[0][2]
+        # The single shell command string is the last ssh arg (after the
+        # ControlMaster -o opts and the host).
+        cmd_str = create_calls[0][-1]
 
         # shlex.quote(raw) should be present in the single ssh cmd string
         quoted_raw = shlex.quote(raw)
