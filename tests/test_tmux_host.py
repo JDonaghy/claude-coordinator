@@ -158,6 +158,26 @@ class TestTmuxHostCmd:
         # which comes after the host); the mux -o opts carry no -t.
         assert "-t" not in result[: result.index("myhost")]
 
+    # -- batch mode (#486 Leg 4: never-prompt background probes) ----------------
+
+    def test_batch_adds_batchmode_and_connecttimeout(self) -> None:
+        result = TmuxHost("myhost", batch=True).cmd(["ls", "-F", "#{session_name}"])
+        assert "BatchMode=yes" in result
+        assert "ConnectTimeout=4" in result
+        # BatchMode must precede the destination so ssh applies it.
+        assert result.index("BatchMode=yes") < result.index("myhost")
+
+    def test_batch_default_off_unchanged_argv(self) -> None:
+        """Default (batch=False) must NOT add BatchMode — interactive paths
+        (launch / reattach) still prompt once for the passphrase."""
+        result = TmuxHost("myhost").cmd(["ls"])
+        assert "BatchMode=yes" not in result
+        assert result == ["ssh", *_SSH_MUX_OPTS, "myhost", "tmux", "ls"]
+
+    def test_batch_local_host_ignores_flag(self) -> None:
+        """batch is meaningless for a local host (no ssh) — argv unchanged."""
+        assert TmuxHost(None, batch=True).cmd(["ls"]) == ["tmux", "ls"]
+
     # -- frozen / immutable ----------------------------------------------------
 
     def test_frozen_cannot_mutate_ssh_target(self) -> None:

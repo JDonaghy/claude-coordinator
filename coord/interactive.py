@@ -150,9 +150,18 @@ class TmuxHost:
     remote callers exist yet; all production call-sites use the default
     ``TmuxHost(None)`` which preserves the exact same subprocess argv as
     before.
+
+    ``batch=True`` adds ``BatchMode=yes`` (+ a short ``ConnectTimeout``) so the
+    ssh call NEVER prompts for a passphrase/password — it fails fast instead.
+    Use it for **non-interactive, background** probes (e.g. the `coord sessions
+    --remote` fleet sweep the TUI runs at startup): without it, ssh grabs the
+    controlling terminal to ask for the key passphrase, corrupting the TUI
+    display (#486 Leg 4 regression).  Leave it ``False`` for human-attended
+    paths (launch / reattach) that legitimately prompt once.
     """
 
     ssh_target: str | None  # None => local
+    batch: bool = False  # True => BatchMode=yes (never prompt; fail fast)
 
     def cmd(self, tmux_args: list[str], *, tty: bool = False) -> list[str]:
         """Build the full subprocess argv for a tmux invocation.
@@ -171,9 +180,17 @@ class TmuxHost:
         """
         if self.ssh_target is None:
             return ["tmux", *tmux_args]
+        # BatchMode must precede the destination; it disables every interactive
+        # auth prompt (passphrase/password) so a background probe degrades to a
+        # fast failure instead of hijacking the terminal.  An existing
+        # ControlMaster socket / ssh-agent key still authenticates silently.
+        batch_opts = (
+            ["-o", "BatchMode=yes", "-o", "ConnectTimeout=4"] if self.batch else []
+        )
         return [
             "ssh",
             *(["-t"] if tty else []),
+            *batch_opts,
             *_SSH_MUX_OPTS,
             self.ssh_target,
             "tmux",

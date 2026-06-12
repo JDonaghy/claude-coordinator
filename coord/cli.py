@@ -6031,8 +6031,12 @@ def sessions_cmd(output_json: bool, remote: bool, config_path: Path) -> None:
 
         def _probe(machine: object) -> tuple[str, list[dict[str, str]]]:
             try:
+                # batch=True: this is a background sweep — NEVER prompt for an
+                # ssh passphrase (that would hijack the TUI's terminal at
+                # startup, #486 Leg 4 regression).  No warm ControlMaster / agent
+                # key ⇒ the probe just fails and the machine reports no sessions.
                 found = list_coord_tmux_sessions(
-                    host=TmuxHost(ssh_target=machine.host)  # type: ignore[attr-defined]
+                    host=TmuxHost(ssh_target=machine.host, batch=True)  # type: ignore[attr-defined]
                 )
                 return machine.name, found  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
