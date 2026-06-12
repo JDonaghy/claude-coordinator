@@ -584,6 +584,43 @@ class TestAssignInteractiveReview:
         ]
         assert review_rows == [], "dry-run must not persist a review assignment"
 
+    def test_review_of_remote_dry_run_builds_remote_dispatch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Track B / #486: a remote `--review-of` is no longer gated; the
+        dry-run shows the read-only ssh+tmux dispatch (remote checkout, no
+        worktree, absolute claude path) instead of the old local-only error."""
+        _seed_done_work("work-abc", "issue-1-fix-bug")
+        # gethostname=laptop ⇒ machine "server" resolves as REMOTE.
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--review-of", "work-abc", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        # The local-only gate is gone.
+        assert "local-only" not in result.output
+        # Remote-shaped: ssh+tmux, read-only live checkout, no worktree.
+        assert "remote tmux" in result.output
+        assert "remote checkout" in result.output
+        # The live checkout (configured repo_path), read-only, no worktree.
+        assert "/tmp/api" in result.output
+        assert "read-only, no worktree" in result.output
+        assert "Track B #486" in result.output
+        # Absolute remote claude binary (not on the SSH login PATH).
+        assert "~/.local/bin/claude" in result.output
+        assert "(dry run — not launched)" in result.output
+        # Dry-run must NOT persist a review row.
+        from coord.state import build_board
+        review_rows = [
+            a for a in build_board().completed + build_board().active
+            if a.type == "review" and a.review_of_assignment_id == "work-abc"
+        ]
+        assert review_rows == [], "dry-run must not persist a review assignment"
+
 
 def _seed_review_and_work(
     work_id: str,

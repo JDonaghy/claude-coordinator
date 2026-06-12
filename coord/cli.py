@@ -2100,23 +2100,28 @@ def assign(
                 )
                 sys.exit(2)
 
-            if not _is_local:
-                click.echo(
-                    "error: --review-of is local-only for now; run it on the "
-                    "machine that holds the checkout (remote interactive review "
-                    "is Track B / #486).",
-                    err=True,
+            # Track B / #486: the review runs either on the LOCAL TTY (in the
+            # live checkout) or on a REMOTE machine over ssh+tmux.  A review is
+            # read-only either way (no worktree, no branch mutation), so the
+            # remote path is the lowest-risk Track-B leg.
+            if _is_local:
+                # Expand `~` — the path is handed straight to a local child cwd.
+                review_repo_path = str(
+                    Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
                 )
-                sys.exit(2)
-
-            review_repo_path = str(
-                Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
-            )
+            else:
+                # Keep the raw path so the remote shell expands `~`/$HOME itself.
+                review_repo_path = machine_obj.repo_path(repo) or f"~/src/{repo}"
             review_default_branch = repo_cfg.default_branch or "main"
             resolved_model = model if model else cfg.models.default
             assignment_id = _uuid.uuid4().hex[:12]
 
-            claude_md = _read_repo_claude_md(Path(review_repo_path))
+            # CLAUDE.md: local → read the live checkout; remote → leave empty and
+            # have the reviewer read ./CLAUDE.md in the remote checkout it sits
+            # in (its actual rules, not the coordinator's possibly-divergent copy).
+            claude_md = (
+                _read_repo_claude_md(Path(review_repo_path)) if _is_local else ""
+            )
             review_briefing = build_review_briefing(
                 pr_number=None,
                 pr_url=None,
@@ -2134,17 +2139,37 @@ def assign(
                 review_iteration=getattr(work, "review_iteration", 0) or 0,
             )
             # Interactive reviewer reports via report-result, not the
-            # REVIEW_VERDICT block the briefing's tail describes.
-            report_reminder = (
-                f"[Coordinator review assignment {assignment_id}] This is a "
-                "HUMAN-ATTENDED interactive review. When you finish, instead of "
-                "the REVIEW_VERDICT block, run:\n"
-                f"  coord report-result --assignment {assignment_id} "
-                "--status done --verdict approve|request-changes "
-                "--summary <one-line summary>\n"
-                "Do NOT run any `gh` commands; the coordinator posts the "
-                "verdict for you.\n\n"
-            )
+            # REVIEW_VERDICT block the briefing's tail describes.  The reminder
+            # differs by location: a LOCAL review runs `coord report-result`
+            # itself (the same DB the merge gate reads); a REMOTE review must
+            # NOT — its `report-result` would write the remote machine's DB,
+            # which the coordinator never sees (#486d).  Instead the remote
+            # reviewer states the verdict and the operator records it on the
+            # coordinator (where the assignment row lives).
+            if _is_local:
+                report_reminder = (
+                    f"[Coordinator review assignment {assignment_id}] This is a "
+                    "HUMAN-ATTENDED interactive review. When you finish, instead "
+                    "of the REVIEW_VERDICT block, run:\n"
+                    f"  coord report-result --assignment {assignment_id} "
+                    "--status done --verdict approve|request-changes "
+                    "--summary <one-line summary>\n"
+                    "Do NOT run any `gh` commands; the coordinator posts the "
+                    "verdict for you.\n\n"
+                )
+            else:
+                report_reminder = (
+                    f"[Coordinator review assignment {assignment_id}] HUMAN-"
+                    "ATTENDED interactive review running on a REMOTE machine. "
+                    "You are in the live checkout — read ./CLAUDE.md (and any "
+                    "sub-repo CLAUDE.md) for the project rules before reviewing. "
+                    "When you finish, do NOT run `coord report-result` here (it "
+                    "would write this machine's DB and never reach the "
+                    "coordinator) and do NOT run any `gh` commands. State your "
+                    "final verdict (approve / request-changes) and a one-line "
+                    "summary clearly; the operator records it on the "
+                    "coordinator.\n\n"
+                )
             effective_briefing = report_reminder + review_briefing
 
             spec = _AssignmentSpecRv(
@@ -2168,18 +2193,36 @@ def assign(
                 system_prompt=REVIEWER_SYSTEM_PROMPT,
                 allowed_tools="Read,Bash,Grep,Glob",
             )
+            # Remote: a bare "claude" is not on the SSH login PATH (#424/#425);
+            # swap argv[0] for the absolute path the remote shell can find.
+            if not _is_local:
+                argv = ["~/.local/bin/claude"] + list(argv)[1:]
 
+            _rv_location = (
+                "local TTY" if _is_local
+                else f"{machine_obj.host} (remote tmux)"
+            )
             click.echo(
-                f"{machine} (local TTY) → REVIEW of #{issue} "
+                f"{machine} ({_rv_location}) → REVIEW of #{issue} "
                 f"on branch {work.branch}: {issue_title}"
             )
-            click.echo("  mode: HUMAN-ATTENDED interactive review (migration A1)")
+            click.echo(
+                "  mode: HUMAN-ATTENDED interactive review "
+                "(migration A1 / Track B #486)"
+            )
             click.echo(
                 f"  assignment id: {assignment_id}  (review_of={review_of})"
             )
-            click.echo(
-                f"  cwd: {review_repo_path} (live checkout — read-only, no worktree)"
-            )
+            if _is_local:
+                click.echo(
+                    f"  cwd: {review_repo_path} (live checkout — read-only, "
+                    "no worktree)"
+                )
+            else:
+                click.echo(
+                    f"  remote checkout: {review_repo_path} on "
+                    f"{machine_obj.host} (read-only, no worktree)"
+                )
             if dry_run:
                 click.echo("  (dry run — not launched)")
                 click.echo(f"  would exec: {argv}")
@@ -2208,56 +2251,135 @@ def assign(
             os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
 
             started_at = _time.time()
-            exit_code = launch_human_attended_interactive(
+            if _is_local:
+                exit_code = launch_human_attended_interactive(
+                    argv,
+                    effective_briefing,
+                    assignment_id=assignment_id,
+                    cwd=review_repo_path,
+                )
+                if exit_code != 0:
+                    click.echo(
+                        f"  claude exited with status {exit_code}", err=True
+                    )
+
+                _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+                if _sname and _tmux_alive(_sname):
+                    click.echo(
+                        f"  session still running in tmux: {_sname}\n"
+                        f"  reattach with:  coord reattach {assignment_id}"
+                    )
+                    sys.exit(0)
+
+                # finalize with worktree_path=None — the backstop must never push
+                # or remove the live checkout.  If the reviewer ran
+                # `coord report-result --verdict`, finalize sees the terminal row
+                # and leaves the verdict untouched.
+                try:
+                    finalize_result = finalize_interactive_exit(
+                        assignment_id=assignment_id,
+                        repo_name=repo,
+                        repo_github=repo_cfg.github,
+                        issue_number=issue,
+                        machine_name=machine,
+                        worktree_path=None,
+                        base_branch=review_default_branch,
+                        exit_code=exit_code,
+                        started_at=started_at,
+                        log_path=None,
+                        repo_path=None,
+                    )
+                    if finalize_result.already_recorded:
+                        click.echo("  verdict recorded via `coord report-result`")
+                    else:
+                        click.echo(
+                            "  review session ended with no verdict reported "
+                            "(status="
+                            f"{finalize_result.terminal_status}) — the merge gate "
+                            "stays blocked until a verdict is reported."
+                        )
+                except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                    click.echo(
+                        f"  warning: backstop failed to record review exit: {exc}",
+                        err=True,
+                    )
+                return
+
+            # ── REMOTE REVIEW (Track B / #486) ────────────────────────────
+            # Read-only: cd into the remote LIVE checkout, fetch+prune so the
+            # reviewer can diff origin/<branch>, then launch the reviewer.  NO
+            # worktree and NO branch mutation — the live checkout is the worker
+            # worktree base and must not be disturbed.  Verdict comes back via
+            # the operator running `coord report-result` on THIS coordinator
+            # (the assignment row lives here); a remote report-result would
+            # write the remote DB and never reach the merge gate (#486d).
+            import shlex as _shlex_rv  # noqa: PLC0415
+
+            _rp_sh = (
+                "$HOME/" + review_repo_path[2:]
+                if review_repo_path.startswith("~/")
+                else ("$HOME" if review_repo_path == "~" else review_repo_path)
+            )
+            _claude_args = _shlex_rv.join(list(argv)[1:])
+            _remote_cmd = (
+                f"cd {_rp_sh}"
+                f" && git fetch origin --prune 2>/dev/null || true"
+                f" && COORD_ASSIGNMENT_ID={assignment_id} {argv[0]} {_claude_args}"
+            )
+            _tmux_host = TmuxHost(ssh_target=machine_obj.host)
+            _sname = _tmux_name(assignment_id)
+
+            # Echo the briefing to the LOCAL terminal before attaching, so the
+            # operator can read it before pressing Enter (mirrors the remote
+            # work path).
+            if effective_briefing.strip():
+                _hdr = (
+                    "--- seeded briefing -- review below; "
+                    "submit the pre-filled input in Claude to send ---"
+                )
+                _ftr = "-" * len(_hdr)
+                _preview = f"\n{_hdr}\n{effective_briefing.rstrip()}\n{_ftr}\n\n"
+                try:
+                    os.write(sys.stdout.fileno(), _preview.encode("utf-8"))
+                except OSError:
+                    pass
+
+            _rc = _tmux_launch(
                 argv,
                 effective_briefing,
-                assignment_id=assignment_id,
-                cwd=review_repo_path,
+                _sname,
+                cwd=None,
+                host=_tmux_host,
+                raw_shell_cmd=_remote_cmd,
             )
+            if _rc is None:
+                click.echo(
+                    "  error: could not create remote tmux session on "
+                    f"{machine_obj.host}",
+                    err=True,
+                )
+                sys.exit(1)
+            exit_code = _rc
             if exit_code != 0:
                 click.echo(f"  claude exited with status {exit_code}", err=True)
 
-            _sname = _tmux_name(assignment_id) if _tmux_avail() else None
-            if _sname and _tmux_alive(_sname):
+            _still_alive = _tmux_alive(_sname, host=_tmux_host)
+            if _still_alive:
                 click.echo(
-                    f"  session still running in tmux: {_sname}\n"
-                    f"  reattach with:  coord reattach {assignment_id}"
+                    f"  session still running in remote tmux: {_sname}\n"
+                    f"  reattach with:  ssh -t {machine_obj.host}"
+                    f" tmux attach-session -t {_sname}"
                 )
-                sys.exit(0)
-
-            # finalize with worktree_path=None — the backstop must never push
-            # or remove the live checkout.  If the reviewer ran
-            # `coord report-result --verdict`, finalize sees the terminal row
-            # and leaves the verdict untouched.
-            try:
-                finalize_result = finalize_interactive_exit(
-                    assignment_id=assignment_id,
-                    repo_name=repo,
-                    repo_github=repo_cfg.github,
-                    issue_number=issue,
-                    machine_name=machine,
-                    worktree_path=None,
-                    base_branch=review_default_branch,
-                    exit_code=exit_code,
-                    started_at=started_at,
-                    log_path=None,
-                    repo_path=None,
-                )
-                if finalize_result.already_recorded:
-                    click.echo("  verdict recorded via `coord report-result`")
-                else:
-                    click.echo(
-                        "  review session ended with no verdict reported "
-                        "(status="
-                        f"{finalize_result.terminal_status}) — the merge gate "
-                        "stays blocked until a verdict is reported."
-                    )
-            except Exception as exc:  # noqa: BLE001 — best-effort backstop
-                click.echo(
-                    f"  warning: backstop failed to record review exit: {exc}",
-                    err=True,
-                )
-            return
+            # Verdict-out (#486d): record on THIS coordinator, where the
+            # assignment row lives and the merge gate reads `review_verdict`.
+            click.echo(
+                "  to record the verdict (the merge gate keys on it), run ON "
+                "THIS coordinator:\n"
+                f"    coord report-result --assignment {assignment_id} "
+                "--status done --verdict approve|request-changes "
+                "--summary <one-line summary>"
+            )
+            sys.exit(0 if _still_alive else exit_code)
 
         # ── Leg 3 (#517): --fix-of <review_aid> ──────────────────────────
         # A human-attended FIX of a request-changes review.  Continues on the
