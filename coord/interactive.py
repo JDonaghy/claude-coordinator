@@ -1067,6 +1067,194 @@ def finalize_interactive_exit(
     )
 
 
+# ── Remote (#486d) finalize for a remote interactive FIX ──────────────────────
+
+
+def _remote_push_and_count(
+    ssh_target: str,
+    remote_worktree_sh: str,
+    branch: str,
+    base_branch: str,
+    *,
+    timeout: float = 90.0,
+) -> tuple[bool, str | None, int | None, str | None]:
+    """Over ssh: push the remote fix worktree's commits to ``origin/<branch>``
+    (a fast-forward — the worktree started at ``origin/<branch>`` plus the
+    session's commits), then read commits-ahead-of-base and the branch.
+
+    Returns ``(push_ok, push_error, commits_ahead, branch)``.  Any push error
+    (incl. a non-fast-forward) sets ``push_ok=False`` with the remote's
+    stderr; the caller then PRESERVES the worktree instead of removing it, so
+    the operator can recover the commits.  ``remote_worktree_sh`` is a
+    ``$HOME``-form path the remote shell expands — it is NOT quoted (coord
+    generates it: ``$HOME/.coord/worktrees/<hex>``).  *branch*/*base_branch*
+    are shell-quoted since they come from issue data.
+    """
+    refspec = shlex.quote(f"HEAD:{branch}")
+    base_ref = shlex.quote(f"origin/{base_branch}")
+    remote_cmd = (
+        f"cd {remote_worktree_sh} || exit 91; "
+        f"git push origin {refspec}; echo \"__PUSH_RC=$?\"; "
+        f"echo \"__COMMITS=$(git rev-list --count {base_ref}..HEAD 2>/dev/null)\"; "
+        f"echo \"__BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)\""
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return False, str(exc), None, None
+
+    push_rc: int | None = None
+    commits: int | None = None
+    branch_now: str | None = None
+    for raw in (result.stdout or "").splitlines():
+        line = raw.strip()
+        if line.startswith("__PUSH_RC="):
+            try:
+                push_rc = int(line.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif line.startswith("__COMMITS="):
+            val = line.split("=", 1)[1].strip()
+            if val.isdigit():
+                commits = int(val)
+        elif line.startswith("__BRANCH="):
+            branch_now = line.split("=", 1)[1].strip() or None
+    if branch_now in (None, "", "HEAD"):
+        branch_now = None
+    push_ok = push_rc == 0
+    push_error = (
+        None if push_ok
+        else (result.stderr or result.stdout or "git push failed").strip()
+    )
+    return push_ok, push_error, commits, branch_now
+
+
+def _remote_worktree_remove(
+    ssh_target: str,
+    remote_repo_sh: str,
+    remote_worktree_sh: str,
+    *,
+    timeout: float = 30.0,
+) -> bool:
+    """Best-effort ``git worktree remove --force`` + ``prune`` over ssh.
+
+    The worktree is a worktree OF the remote ``~/src/<repo>`` checkout, so
+    removing it never touches the live checkout (the worker-worktree base).
+    Returns ``True`` when the remote command ran to completion.
+    """
+    remote_cmd = (
+        f"git -C {remote_repo_sh} worktree remove {remote_worktree_sh} --force"
+        f" 2>/dev/null; git -C {remote_repo_sh} worktree prune 2>/dev/null;"
+        f" echo __WT_DONE"
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "__WT_DONE" in (result.stdout or "")
+
+
+def finalize_remote_interactive_exit(
+    *,
+    assignment_id: str,
+    repo_name: str,
+    repo_github: str,
+    issue_number: int,
+    machine_name: str,
+    ssh_target: str,
+    remote_worktree_sh: str,
+    remote_repo_sh: str,
+    branch: str,
+    base_branch: str,
+    exit_code: int,
+    started_at: float | None = None,
+) -> InteractiveFinalizeResult:
+    """Remote (#486d) analog of :func:`finalize_interactive_exit` for a remote
+    interactive FIX.
+
+    The fix session ran in a worktree ON the remote machine, so the local
+    git-floor backstop can't see its commits.  This sshs in to:
+
+    1. push the worktree's commits to ``origin/<branch>`` (fast-forward) and
+       read commits-ahead-of-base + the branch;
+    2. record the completion through the issue_store seam LOCALLY (coordinator
+       DB + GitHub comment) so the pipeline sees a normal completion and the
+       re-review fires;
+    3. remove the remote worktree — but ONLY when the push succeeded, so
+       unpushed commits are never silently destroyed.
+
+    Respects an existing ``coord report-result`` (same as the local backstop):
+    if the row already holds a terminal status, the verdict/result wins and
+    this only attempts worktree cleanup.
+    """
+    if _assignment_already_recorded(assignment_id):
+        removed = _remote_worktree_remove(
+            ssh_target, remote_repo_sh, remote_worktree_sh,
+        )
+        return InteractiveFinalizeResult(
+            terminal_status="report-result",
+            commits_ahead=None,
+            push_ok=True,
+            push_error=None,
+            already_recorded=True,
+            seam_outcome=None,
+            worktree_removed=removed,
+        )
+
+    push_ok, push_error, commits, branch_now = _remote_push_and_count(
+        ssh_target, remote_worktree_sh, branch, base_branch,
+    )
+
+    duration = (
+        max(0.0, time.time() - started_at) if started_at is not None else None
+    )
+
+    from coord.issue_store import CompletionRecord, post_completion  # noqa: PLC0415
+
+    record = CompletionRecord(
+        assignment_id=assignment_id,
+        machine_name=machine_name,
+        repo_name=repo_name,
+        repo_github=repo_github,
+        issue_number=issue_number,
+        exit_code=exit_code,
+        commits_ahead=commits,
+        branch=branch_now or branch,
+        duration_seconds=duration,
+        log_path=None,
+        summary="",
+    )
+    outcome = post_completion(record)
+
+    # Clean up the remote worktree only on a successful push — a failed push
+    # means the commits live nowhere but the worktree, so preserve it.
+    worktree_removed = False
+    if push_ok:
+        worktree_removed = _remote_worktree_remove(
+            ssh_target, remote_repo_sh, remote_worktree_sh,
+        )
+
+    return InteractiveFinalizeResult(
+        terminal_status=outcome.status,
+        commits_ahead=commits,
+        push_ok=push_ok,
+        push_error=push_error,
+        already_recorded=False,
+        seam_outcome=outcome,
+        worktree_removed=worktree_removed,
+    )
+
+
 # ── Stale interactive-session reaper ─────────────────────────────────────────
 
 

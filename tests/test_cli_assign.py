@@ -751,3 +751,36 @@ class TestAssignInteractiveFix:
         b = build_board()
         fix_rows = [a for a in b.active + b.completed if a.review_iteration == 1]
         assert fix_rows == [], "dry-run must not persist a fix assignment"
+
+    def test_fix_of_remote_dry_run_builds_remote_dispatch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Track B / #486: a remote `--fix-of` is no longer gated; the dry-run
+        shows the ssh+tmux dispatch (remote worktree on the existing branch,
+        absolute claude path) instead of the old local-only error."""
+        _seed_review_and_work("work-y", "rev-y", "issue-1-fix-bug")
+        # gethostname=laptop ⇒ machine "server" resolves as REMOTE.
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--fix-of", "rev-y", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "local-only" not in result.output
+        assert "FIX of #1" in result.output
+        assert "iteration 1/" in result.output
+        assert "remote tmux" in result.output
+        # A fix WRITES → a remote worktree on the existing branch (not the
+        # read-only live checkout the review uses).
+        assert "remote worktree: $HOME/.coord/worktrees/" in result.output
+        assert "would continue branch: issue-1-fix-bug" in result.output
+        assert "~/.local/bin/claude" in result.output
+        assert "Track B #486" in result.output
+        assert "(dry run — not launched)" in result.output
+        from coord.state import build_board
+        b = build_board()
+        fix_rows = [a for a in b.active + b.completed if a.review_iteration == 1]
+        assert fix_rows == [], "dry-run must not persist a fix assignment"

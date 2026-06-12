@@ -2029,6 +2029,7 @@ def assign(
             TmuxHost,
             _launch_via_tmux as _tmux_launch,
             finalize_interactive_exit,
+            finalize_remote_interactive_exit,
             launch_human_attended_interactive,
             tmux_available as _tmux_avail,
             tmux_session_alive as _tmux_alive,
@@ -2406,15 +2407,12 @@ def assign(
                 save_board as _save_board_fx,
             )
 
-            if not _is_local:
-                click.echo(
-                    "error: --fix-of is local-only for now; run it on the "
-                    "machine that holds the checkout (remote interactive fix "
-                    "is Track B / #486).",
-                    err=True,
-                )
-                sys.exit(2)
-
+            # Track B / #486: a fix runs on the LOCAL TTY or on a REMOTE
+            # machine over ssh+tmux.  Unlike review, a fix WRITES — it needs a
+            # worktree on the EXISTING branch and its commits must be pushed
+            # back to origin (the #486d push-back, via
+            # finalize_remote_interactive_exit; the local finalize only sees
+            # the local filesystem).
             _fx_board = _build_board_fx()
             review = _fx_board.find_by_id(fix_of)
             if review is None:
@@ -2490,19 +2488,34 @@ def assign(
 
             resolved_model = model if model else cfg.models.default
             assignment_id = _uuid.uuid4().hex[:12]
-            fix_repo_path = str(
-                Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
-            )
+            if _is_local:
+                fix_repo_path = str(
+                    Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+                )
+            else:
+                fix_repo_path = machine_obj.repo_path(repo) or f"~/src/{repo}"
             fix_default_branch = repo_cfg.default_branch or "main"
 
             os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
-            report_reminder = (
-                f"[Coordinator fix assignment {assignment_id}] HUMAN-ATTENDED "
-                f"fix iteration {next_iteration}/{max_iter} on branch "
-                f"{work.branch}. Before you exit, run `coord report-result "
-                f"--assignment {assignment_id} --status done --summary <text>` "
-                "so the coordinator records the result and can re-review.\n\n"
-            )
+            if _is_local:
+                report_reminder = (
+                    f"[Coordinator fix assignment {assignment_id}] HUMAN-ATTENDED "
+                    f"fix iteration {next_iteration}/{max_iter} on branch "
+                    f"{work.branch}. Before you exit, run `coord report-result "
+                    f"--assignment {assignment_id} --status done --summary <text>` "
+                    "so the coordinator records the result and can re-review.\n\n"
+                )
+            else:
+                report_reminder = (
+                    f"[Coordinator fix assignment {assignment_id}] HUMAN-ATTENDED "
+                    f"fix iteration {next_iteration}/{max_iter} on branch "
+                    f"{work.branch}, running on a REMOTE machine. Make your "
+                    "changes and COMMIT them. Do NOT run `coord report-result` "
+                    "here (it writes this machine's DB, not the coordinator's) "
+                    "and do NOT run any `gh` commands. When you exit, the "
+                    f"coordinator pushes your commits to origin/{work.branch} "
+                    "and re-reviews.\n\n"
+                )
             effective_briefing = report_reminder + fix_briefing
 
             spec = _AssignmentSpecFx(
@@ -2518,12 +2531,22 @@ def assign(
             # type="work" ⇒ default worker tool set (Read/Edit/Write/Bash): the
             # fix session must be able to mutate the checkout, unlike --review-of.
             argv = provider.build_command(spec, resolved_model=resolved_model)
+            # Remote: bare "claude" isn't on the SSH login PATH (#424/#425).
+            if not _is_local:
+                argv = ["~/.local/bin/claude"] + list(argv)[1:]
 
+            _fx_location = (
+                "local TTY" if _is_local
+                else f"{machine_obj.host} (remote tmux)"
+            )
             click.echo(
-                f"{machine} (local TTY) → FIX of #{issue} "
+                f"{machine} ({_fx_location}) → FIX of #{issue} "
                 f"(iteration {next_iteration}/{max_iter}) on branch {work.branch}"
             )
-            click.echo("  mode: HUMAN-ATTENDED interactive fix (migration leg 3)")
+            click.echo(
+                "  mode: HUMAN-ATTENDED interactive fix "
+                "(migration leg 3 / Track B #486)"
+            )
             click.echo(
                 f"  assignment id: {assignment_id}  (fix_of={fix_of}, "
                 f"work={work.assignment_id})"
@@ -2531,27 +2554,13 @@ def assign(
             if dry_run:
                 click.echo("  (dry run — not launched)")
                 click.echo(f"  would continue branch: {work.branch}")
+                if not _is_local:
+                    click.echo(
+                        f"  remote worktree: $HOME/.coord/worktrees/{assignment_id}"
+                        f" on {machine_obj.host} (branch: {work.branch})"
+                    )
                 click.echo(f"  would exec: {argv}")
                 return
-
-            try:
-                _wt_path, _ = _setup_wt_fx(
-                    Path(fix_repo_path),
-                    issue_number=issue,
-                    issue_title=issue_title,
-                    assignment_id=assignment_id,
-                    default_branch=fix_default_branch,
-                    existing_branch=work.branch,
-                )
-                worktree_path = str(_wt_path)
-            except (_AgentGitErrorFx, OSError) as _wt_err:
-                click.echo(
-                    f"  error: could not create fix worktree on branch "
-                    f"{work.branch}: {_wt_err}",
-                    err=True,
-                )
-                sys.exit(1)
-            click.echo(f"  worktree: {worktree_path} (branch: {work.branch})")
 
             fix_assignment = _AssignmentFx(
                 machine_name=machine,
@@ -2573,56 +2582,195 @@ def assign(
             _record_fx(assignment=fix_assignment, repo_github=repo_cfg.github)
             _save_board_fx(_build_board_fx())
 
+            if _is_local:
+                try:
+                    _wt_path, _ = _setup_wt_fx(
+                        Path(fix_repo_path),
+                        issue_number=issue,
+                        issue_title=issue_title,
+                        assignment_id=assignment_id,
+                        default_branch=fix_default_branch,
+                        existing_branch=work.branch,
+                    )
+                    worktree_path = str(_wt_path)
+                except (_AgentGitErrorFx, OSError) as _wt_err:
+                    click.echo(
+                        f"  error: could not create fix worktree on branch "
+                        f"{work.branch}: {_wt_err}",
+                        err=True,
+                    )
+                    sys.exit(1)
+                click.echo(f"  worktree: {worktree_path} (branch: {work.branch})")
+
+                started_at = _time.time()
+                exit_code = launch_human_attended_interactive(
+                    argv,
+                    effective_briefing,
+                    assignment_id=assignment_id,
+                    cwd=worktree_path,
+                )
+                if exit_code != 0:
+                    click.echo(f"  claude exited with status {exit_code}", err=True)
+
+                _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+                if _sname and _tmux_alive(_sname):
+                    click.echo(
+                        f"  session still running in tmux: {_sname}\n"
+                        f"  reattach with:  coord reattach {assignment_id}"
+                    )
+                    sys.exit(0)
+
+                try:
+                    finalize_result = finalize_interactive_exit(
+                        assignment_id=assignment_id,
+                        repo_name=repo,
+                        repo_github=repo_cfg.github,
+                        issue_number=issue,
+                        machine_name=machine,
+                        worktree_path=worktree_path,
+                        base_branch=fix_default_branch,
+                        exit_code=exit_code,
+                        started_at=started_at,
+                        log_path=None,
+                        repo_path=fix_repo_path,
+                    )
+                    if finalize_result.already_recorded:
+                        click.echo(
+                            "  result recorded via `coord report-result`; backstop "
+                            "did not overwrite"
+                        )
+                    else:
+                        click.echo(
+                            f"  backstop: status={finalize_result.terminal_status} "
+                            f"commits_ahead={finalize_result.commits_ahead}"
+                        )
+                        if not finalize_result.push_ok:
+                            click.echo(
+                                f"  warning: git push failed: {finalize_result.push_error}",
+                                err=True,
+                            )
+                except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                    click.echo(
+                        f"  warning: backstop failed to record fix exit: {exc}",
+                        err=True,
+                    )
+                sys.exit(exit_code)
+
+            # ── REMOTE FIX (Track B / #486) ───────────────────────────────
+            # A remote worktree on the EXISTING branch (`-B <branch>
+            # origin/<branch>` resets a dedicated local branch to the reviewed
+            # work's branch); the session commits there; on exit the
+            # coordinator pushes the commits back to origin + records the
+            # completion (#486d) so the re-review fires.
+            import shlex as _shlex_fx  # noqa: PLC0415
+
+            _remote_wt = "$HOME/.coord/worktrees/" + assignment_id
+            _rp_sh = (
+                "$HOME/" + fix_repo_path[2:]
+                if fix_repo_path.startswith("~/")
+                else ("$HOME" if fix_repo_path == "~" else fix_repo_path)
+            )
+            _claude_args = _shlex_fx.join(list(argv)[1:])
+            _br_q = _shlex_fx.quote(work.branch)
+            _orig_ref = _shlex_fx.quote(f"origin/{work.branch}")
+            _remote_cmd = (
+                f"mkdir -p $HOME/.coord/worktrees"
+                f" && cd {_rp_sh}"
+                f" && git fetch origin --prune 2>/dev/null || true"
+                f" && git worktree prune 2>/dev/null || true"
+                f" && git worktree add -B {_br_q} {_remote_wt} {_orig_ref}"
+                f" && cd {_remote_wt}"
+                f" && COORD_ASSIGNMENT_ID={assignment_id} {argv[0]} {_claude_args}"
+            )
+            _tmux_host = TmuxHost(ssh_target=machine_obj.host)
+            _sname = _tmux_name(assignment_id)
+            click.echo(
+                f"  remote worktree: $HOME/.coord/worktrees/{assignment_id}"
+                f" on {machine_obj.host} (branch: {work.branch})"
+            )
+
+            if effective_briefing.strip():
+                _hdr = (
+                    "--- seeded briefing -- review below; "
+                    "submit the pre-filled input in Claude to send ---"
+                )
+                _ftr = "-" * len(_hdr)
+                _preview = f"\n{_hdr}\n{effective_briefing.rstrip()}\n{_ftr}\n\n"
+                try:
+                    os.write(sys.stdout.fileno(), _preview.encode("utf-8"))
+                except OSError:
+                    pass
+
             started_at = _time.time()
-            exit_code = launch_human_attended_interactive(
+            _rc = _tmux_launch(
                 argv,
                 effective_briefing,
-                assignment_id=assignment_id,
-                cwd=worktree_path,
+                _sname,
+                cwd=None,
+                host=_tmux_host,
+                raw_shell_cmd=_remote_cmd,
             )
+            if _rc is None:
+                click.echo(
+                    "  error: could not create remote tmux session on "
+                    f"{machine_obj.host}",
+                    err=True,
+                )
+                sys.exit(1)
+            exit_code = _rc
             if exit_code != 0:
                 click.echo(f"  claude exited with status {exit_code}", err=True)
 
-            _sname = _tmux_name(assignment_id) if _tmux_avail() else None
-            if _sname and _tmux_alive(_sname):
+            if _tmux_alive(_sname, host=_tmux_host):
                 click.echo(
-                    f"  session still running in tmux: {_sname}\n"
-                    f"  reattach with:  coord reattach {assignment_id}"
+                    f"  session still running in remote tmux: {_sname}\n"
+                    f"  reattach with:  ssh -t {machine_obj.host}"
+                    f" tmux attach-session -t {_sname}\n"
+                    "  (the fix is not pushed until the session ends and the "
+                    "coordinator finalizes)"
                 )
                 sys.exit(0)
 
+            # Remote finalize (#486d): push the fix commits to origin/<branch>,
+            # record the completion, and clean up the remote worktree.
             try:
-                finalize_result = finalize_interactive_exit(
+                _fr = finalize_remote_interactive_exit(
                     assignment_id=assignment_id,
                     repo_name=repo,
                     repo_github=repo_cfg.github,
                     issue_number=issue,
                     machine_name=machine,
-                    worktree_path=worktree_path,
+                    ssh_target=machine_obj.host,
+                    remote_worktree_sh=_remote_wt,
+                    remote_repo_sh=_rp_sh,
+                    branch=work.branch,
                     base_branch=fix_default_branch,
                     exit_code=exit_code,
                     started_at=started_at,
-                    log_path=None,
-                    repo_path=fix_repo_path,
                 )
-                if finalize_result.already_recorded:
+                if _fr.already_recorded:
                     click.echo(
-                        "  result recorded via `coord report-result`; backstop "
-                        "did not overwrite"
+                        "  result recorded via `coord report-result`; remote "
+                        "backstop did not overwrite"
                     )
                 else:
                     click.echo(
-                        f"  backstop: status={finalize_result.terminal_status} "
-                        f"commits_ahead={finalize_result.commits_ahead}"
+                        f"  remote backstop: status={_fr.terminal_status} "
+                        f"commits_ahead={_fr.commits_ahead} pushed={_fr.push_ok}"
                     )
-                    if not finalize_result.push_ok:
+                    if not _fr.push_ok:
                         click.echo(
-                            f"  warning: git push failed: {finalize_result.push_error}",
+                            f"  warning: remote push failed: {_fr.push_error}",
+                            err=True,
+                        )
+                        click.echo(
+                            f"  fix commits preserved in {_remote_wt} on "
+                            f"{machine_obj.host} (worktree NOT removed)",
                             err=True,
                         )
             except Exception as exc:  # noqa: BLE001 — best-effort backstop
                 click.echo(
-                    f"  warning: backstop failed to record fix exit: {exc}",
+                    f"  warning: remote backstop failed to record fix exit: {exc}",
                     err=True,
                 )
             sys.exit(exit_code)

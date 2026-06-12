@@ -378,3 +378,135 @@ class TestListCoordTmuxSessionsWithHost:
         assert "remotehost" in cmd
         assert "ls" in cmd
         assert sessions[0]["session_name"] == "coord-abc"
+
+
+# ── remote FIX push-back (#486d) ──────────────────────────────────────────────
+
+
+class TestRemotePushAndCount:
+    """Unit tests for :func:`coord.interactive._remote_push_and_count`."""
+
+    def test_parses_markers_on_success(self) -> None:
+        from coord.interactive import _remote_push_and_count
+
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "To github.com\n__PUSH_RC=0\n__COMMITS=3\n__BRANCH=issue-1-fix\n"
+        m.stderr = ""
+        with patch("subprocess.run", return_value=m):
+            ok, err, commits, branch = _remote_push_and_count(
+                "host", "$HOME/.coord/worktrees/abc", "issue-1-fix", "main",
+            )
+        assert ok is True
+        assert err is None
+        assert commits == 3
+        assert branch == "issue-1-fix"
+
+    def test_push_failure_surfaces_stderr(self) -> None:
+        from coord.interactive import _remote_push_and_count
+
+        m = MagicMock()
+        m.returncode = 0  # ssh itself ran fine; the inner push failed
+        m.stdout = "__PUSH_RC=1\n__COMMITS=2\n__BRANCH=issue-1-fix\n"
+        m.stderr = "! [rejected] issue-1-fix -> issue-1-fix (non-fast-forward)"
+        with patch("subprocess.run", return_value=m):
+            ok, err, commits, _branch = _remote_push_and_count(
+                "host", "$HOME/.coord/worktrees/abc", "issue-1-fix", "main",
+            )
+        assert ok is False
+        assert err is not None and "non-fast-forward" in err
+        assert commits == 2
+
+    def test_ssh_uses_mux_opts(self) -> None:
+        from coord.interactive import _SSH_MUX_OPTS, _remote_push_and_count
+
+        captured: list[list[str]] = []
+
+        def _m(cmd: list[str], **kw: Any) -> MagicMock:
+            captured.append(list(cmd))
+            mm = MagicMock()
+            mm.returncode = 0
+            mm.stdout = "__PUSH_RC=0\n__COMMITS=0\n__BRANCH=b\n"
+            mm.stderr = ""
+            return mm
+
+        with patch("subprocess.run", side_effect=_m):
+            _remote_push_and_count("host", "$HOME/wt", "b", "main")
+        assert captured[0][0] == "ssh"
+        for opt in _SSH_MUX_OPTS:
+            assert opt in captured[0]
+
+
+class TestFinalizeRemoteInteractiveExit:
+    """Unit tests for :func:`coord.interactive.finalize_remote_interactive_exit`."""
+
+    @staticmethod
+    def _seam(status: str = "done") -> Any:
+        o = MagicMock()
+        o.status = status
+        return o
+
+    def test_push_ok_records_and_removes_worktree(self) -> None:
+        from coord.interactive import finalize_remote_interactive_exit
+
+        with patch("coord.interactive._assignment_already_recorded", return_value=False), \
+             patch("coord.interactive._remote_push_and_count",
+                   return_value=(True, None, 2, "issue-1-fix")), \
+             patch("coord.interactive._remote_worktree_remove", return_value=True) as rm, \
+             patch("coord.issue_store.post_completion",
+                   return_value=self._seam("done")) as pcompletion:
+            res = finalize_remote_interactive_exit(
+                assignment_id="aid", repo_name="api", repo_github="acme/api",
+                issue_number=1, machine_name="server", ssh_target="host",
+                remote_worktree_sh="$HOME/.coord/worktrees/aid",
+                remote_repo_sh="$HOME/src/api", branch="issue-1-fix",
+                base_branch="main", exit_code=0,
+            )
+        assert res.push_ok is True
+        assert res.commits_ahead == 2
+        assert res.worktree_removed is True
+        assert res.already_recorded is False
+        rec = pcompletion.call_args[0][0]
+        assert rec.commits_ahead == 2
+        assert rec.branch == "issue-1-fix"
+        rm.assert_called_once()
+
+    def test_push_failure_preserves_worktree(self) -> None:
+        from coord.interactive import finalize_remote_interactive_exit
+
+        with patch("coord.interactive._assignment_already_recorded", return_value=False), \
+             patch("coord.interactive._remote_push_and_count",
+                   return_value=(False, "rejected (non-fast-forward)", None, None)), \
+             patch("coord.interactive._remote_worktree_remove") as rm, \
+             patch("coord.issue_store.post_completion", return_value=self._seam("done")):
+            res = finalize_remote_interactive_exit(
+                assignment_id="aid", repo_name="api", repo_github="acme/api",
+                issue_number=1, machine_name="server", ssh_target="host",
+                remote_worktree_sh="$HOME/.coord/worktrees/aid",
+                remote_repo_sh="$HOME/src/api", branch="issue-1-fix",
+                base_branch="main", exit_code=0,
+            )
+        assert res.push_ok is False
+        assert res.push_error == "rejected (non-fast-forward)"
+        # A failed push must NOT remove the worktree — the commits live only there.
+        assert res.worktree_removed is False
+        rm.assert_not_called()
+
+    def test_already_recorded_skips_push_and_seam_but_cleans_up(self) -> None:
+        from coord.interactive import finalize_remote_interactive_exit
+
+        with patch("coord.interactive._assignment_already_recorded", return_value=True), \
+             patch("coord.interactive._remote_push_and_count") as pc, \
+             patch("coord.interactive._remote_worktree_remove", return_value=True) as rm, \
+             patch("coord.issue_store.post_completion") as pcompletion:
+            res = finalize_remote_interactive_exit(
+                assignment_id="aid", repo_name="api", repo_github="acme/api",
+                issue_number=1, machine_name="server", ssh_target="host",
+                remote_worktree_sh="$HOME/.coord/worktrees/aid",
+                remote_repo_sh="$HOME/src/api", branch="issue-1-fix",
+                base_branch="main", exit_code=0,
+            )
+        assert res.already_recorded is True
+        pc.assert_not_called()
+        pcompletion.assert_not_called()
+        rm.assert_called_once()  # report-result won; still clean up the worktree
