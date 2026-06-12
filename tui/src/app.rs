@@ -3019,6 +3019,29 @@ struct PendingAutoReview {
     issue_num: u64,
 }
 
+/// Leg 3 (#517): an interactive review the TUI launched this run, armed to
+/// route on its verdict (board-driven, via `coord report-result`).  Fires once
+/// when a NEW verdict appears (a review id not in `prior_verdicted_ids`):
+/// request-changes → rework prompt; approve → smoke/merge notice.
+struct ArmedVerdict {
+    coord_repo: String,
+    repo_slug: String,
+    issue_num: u64,
+    /// Review assignment ids that already carried a verdict when we armed —
+    /// so only a freshly-reported verdict triggers routing.
+    prior_verdicted_ids: std::collections::HashSet<String>,
+}
+
+/// Leg 3 (#517): a request-changes verdict awaiting the operator's one-key
+/// confirm to launch the human-attended `--fix-of` session.  The exact review
+/// id is re-resolved at confirm time (`selected_request_changes_review_aid`)
+/// against the selected row, so only the issue identity is held here.
+struct PendingRework {
+    coord_repo: String,
+    repo_slug: String,
+    issue_num: u64,
+}
+
 /// Fetch live `coord-*` tmux sessions by running `coord sessions --json`.
 ///
 /// Returns an empty `Vec` when tmux is not running, `coord` is not on PATH,
@@ -4411,6 +4434,16 @@ pub struct CoordApp {
     /// the interactive review for a just-finished work session.  Enter
     /// confirms; Esc/n dismisses.  See [`PendingAutoReview`].
     pending_auto_review: Option<PendingAutoReview>,
+
+    // ── Leg 3 (#517): verdict-driven routing ───────────────────────────────
+    /// Interactive reviews launched this run, keyed by `(repo_slug,
+    /// issue_number)`, armed to route on their reported verdict.  Entry removed
+    /// when the verdict is routed.  See [`ArmedVerdict`].
+    armed_for_verdict: std::collections::HashMap<(String, u64), ArmedVerdict>,
+    /// When `Some`, an inline confirm prompt is up asking whether to launch the
+    /// interactive `--fix-of` session for a request-changes verdict.  Enter
+    /// confirms; Esc/n dismisses.  See [`PendingRework`].
+    pending_rework: Option<PendingRework>,
 }
 
 /// Result returned by the background `gh search issues` poll.
@@ -4628,6 +4661,9 @@ impl CoordApp {
             // Leg 2 (#517): auto-advance Work → Review.
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
+            // Leg 3 (#517): verdict-driven routing.
+            armed_for_verdict: std::collections::HashMap::new(),
+            pending_rework: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -14594,6 +14630,15 @@ impl CoordApp {
                 ContextMenuItem::action("start-review-interactive", "Start review (interactive)");
             review_item.disabled = self.selected_completed_work_aid().is_none();
             items.push(review_item);
+            // Leg 3 (#517): interactive peer of `bounce` — a human-attended
+            // fix continuing the reviewed branch.  Only when a request-changes
+            // review exists for this issue (else there's nothing to fix).
+            if self.selected_row_has_request_changes_for(issue_number) {
+                items.push(ContextMenuItem::action(
+                    "start-fix-interactive",
+                    "Start fix (interactive)",
+                ));
+            }
             items.push(ContextMenuItem::separator());
             // #leg1: the non-interactive (claude -p) dispatch path — the
             // metered/automated peer to the interactive launchers above.
@@ -14977,6 +15022,44 @@ impl CoordApp {
             });
         }
 
+        // ── Leg 3 (#517): rework (request-changes) confirm ───────────────
+        if let Some(ref p) = self.pending_rework {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:rework"),
+                title: StyledText::plain("Review requested changes — start fix?"),
+                body: vec![
+                    StyledText::plain(format!(
+                        "The review of {} #{} requested changes.",
+                        p.coord_repo, p.issue_num,
+                    )),
+                    StyledText::plain(
+                        "Start an interactive fix on the same branch (continues the \
+                         PR; next review scopes to the fix)?"
+                            .to_string(),
+                    ),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("fix"),
+                        label: "⏎  Start fix".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Not now".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Force-merge confirm ──────────────────────────────────────────
         if let Some(ref repo) = self.pending_force_merge {
             let scope_line = if repo.is_empty() {
@@ -15240,6 +15323,8 @@ impl CoordApp {
     fn dismiss_prompt_dialog(&mut self) {
         if self.pending_auto_review.is_some() {
             self.pending_auto_review = None;
+        } else if self.pending_rework.is_some() {
+            self.pending_rework = None;
         } else if self.pending_repo_picker.is_some() {
             self.pending_repo_picker = None;
         } else if self.pending_refinement_close_prompt.is_some() {
@@ -15274,6 +15359,17 @@ impl CoordApp {
                 self.confirm_auto_review();
             } else {
                 self.pending_auto_review = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Leg 3 (#517): rework (request-changes) ───────────────────────
+        if self.pending_rework.is_some() {
+            if id == "fix" {
+                self.confirm_rework();
+            } else {
+                self.pending_rework = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -17355,6 +17451,11 @@ impl CoordApp {
                 self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Review);
                 true
             }
+            "start-fix-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
+                true
+            }
             "start-with-plan" => {
                 let dispatched = self.dispatch_pipeline_plan();
                 if !dispatched {
@@ -17787,6 +17888,7 @@ impl CoordApp {
             || self.pending_report_fix.is_some()
             || self.pending_refinement_close_prompt.is_some()
             || self.pending_auto_review.is_some()
+            || self.pending_rework.is_some()
             || self.artifact_pull_dialog.is_some()
         {
             return None;
@@ -18118,6 +18220,7 @@ fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "start-work-interactive" => Some("⌨"),
         "start-plan-interactive" => Some("⌨"),
         "start-review-interactive" => Some("⌨"),
+        "start-fix-interactive" => Some("⌨"),
         "start-with-plan" => Some("☰"),
         "start-skip-plan" => Some("▶"),
         "watch" => Some("◉"),
@@ -19524,15 +19627,95 @@ impl CoordApp {
             .collect()
     }
 
-    /// Leg 2 (#517): true when any `type="review"` assignment already exists for
-    /// `(coord_repo, issue_num)`.  Gates the auto-advance prompt so it only ever
-    /// fires for the first Work → Review hop (verdict-driven re-review is leg 3).
-    fn review_exists_for(&self, coord_repo: &str, issue_num: u64) -> bool {
+    /// Leg 2/3 (#517): true when some `type="review"` assignment already targets
+    /// the given work aid (`review_of_assignment_id == work_aid`).  Gates the
+    /// auto-advance prompt to fire once per work completion — and, crucially,
+    /// lets it fire AGAIN after a fix (the fix is a new work aid with no review
+    /// yet), driving the incremental re-review loop.
+    fn work_has_review(&self, coord_repo: &str, issue_num: u64, work_aid: &str) -> bool {
         self.data.assignments.iter().any(|a| {
             a.issue_number == issue_num
                 && a.repo == coord_repo
                 && a.assignment_type.as_deref() == Some("review")
+                && a.review_of_assignment_id.as_deref() == Some(work_aid)
         })
+    }
+
+    /// Leg 3 (#517): review assignment ids for `(coord_repo, issue_num)` that
+    /// already carry a verdict — the arm-time snapshot so verdict-routing only
+    /// fires on a freshly-reported verdict.
+    fn verdicted_review_ids_for(
+        &self,
+        coord_repo: &str,
+        issue_num: u64,
+    ) -> std::collections::HashSet<String> {
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
+            .filter(|a| a.assignment_type.as_deref() == Some("review"))
+            .filter(|a| {
+                a.review_verdict
+                    .as_deref()
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            })
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
+    /// Leg 3 (#517): the most-recent review for `(coord_repo, issue_num)` with a
+    /// verdict NOT in `prior`, as `(review_aid, verdict)` — a newly-reported
+    /// verdict to route on.
+    fn latest_new_verdict_for(
+        &self,
+        coord_repo: &str,
+        issue_num: u64,
+        prior: &std::collections::HashSet<String>,
+    ) -> Option<(String, String)> {
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
+            .filter(|a| a.assignment_type.as_deref() == Some("review"))
+            .filter(|a| !prior.contains(&a.id))
+            .filter_map(|a| {
+                let v = a.review_verdict.as_deref().filter(|v| !v.is_empty())?;
+                Some((a, v.to_string()))
+            })
+            .max_by(|(a, _), (b, _)| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(a, v)| (a.id.clone(), v))
+    }
+
+    /// Leg 3 (#517): the most-recent `type="review"` assignment id for the
+    /// SELECTED issue whose verdict was request-changes (the one a `--fix-of`
+    /// session addresses), or `None`.
+    fn selected_request_changes_review_aid(&self) -> Option<String> {
+        let (repo, issue_key) = self.selected_issue_repo_and_key()?;
+        self.request_changes_review_aid_for(&repo, issue_key.1)
+    }
+
+    fn request_changes_review_aid_for(
+        &self,
+        coord_repo: &str,
+        issue_num: u64,
+    ) -> Option<String> {
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
+            .filter(|a| a.assignment_type.as_deref() == Some("review"))
+            .filter(|a| a.review_verdict.as_deref() == Some("request-changes"))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|a| a.id.clone())
     }
 
     /// Leg 2 (#517): scan armed interactive-work sessions for one the board now
@@ -19540,16 +19723,18 @@ impl CoordApp {
     /// found, raise the confirm prompt.  Strictly board-driven — never reads the
     /// session TTY (ToS §3.7 / #437).  Returns `true` when a prompt was raised.
     fn detect_completed_interactive_work(&mut self) -> bool {
-        // One prompt at a time; don't stack over an open one.
-        if self.pending_auto_review.is_some() || self.armed_for_auto_review.is_empty() {
+        // One stage prompt at a time; don't stack over an open one.
+        if self.stage_prompt_open() || self.armed_for_auto_review.is_empty() {
             return false;
         }
         let fire = self.armed_for_auto_review.iter().find_map(|(key, armed)| {
-            if self.review_exists_for(&armed.coord_repo, armed.issue_num) {
+            let aid = self.completed_work_aid_for(&armed.coord_repo, armed.issue_num)?;
+            // Only a genuinely new completion (the just-launched work/fix), and
+            // only when that work hasn't already been handed to a review.
+            if armed.prior_done_ids.contains(&aid) {
                 return None;
             }
-            let aid = self.completed_work_aid_for(&armed.coord_repo, armed.issue_num)?;
-            if armed.prior_done_ids.contains(&aid) {
+            if self.work_has_review(&armed.coord_repo, armed.issue_num, &aid) {
                 return None;
             }
             Some(key.clone())
@@ -19598,6 +19783,87 @@ impl CoordApp {
         self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Review);
     }
 
+    /// Leg 2/3 (#517): true when any auto-advance stage prompt is already up.
+    /// The board-driven detectors check this so only one fires per tick.
+    fn stage_prompt_open(&self) -> bool {
+        self.pending_auto_review.is_some() || self.pending_rework.is_some()
+    }
+
+    /// Leg 3 (#517): scan armed interactive reviews for a freshly-reported
+    /// verdict and route it.  request-changes → raise the rework confirm
+    /// prompt; approve → surface a notice pointing at the smoke/merge gate.
+    /// Strictly board-driven (verdict comes from `coord report-result`, never
+    /// the session TTY).  Returns `true` when it raised a prompt or toast.
+    fn detect_review_verdict(&mut self) -> bool {
+        if self.stage_prompt_open() || self.armed_for_verdict.is_empty() {
+            return false;
+        }
+        let found = self.armed_for_verdict.iter().find_map(|(key, armed)| {
+            let (_review_aid, verdict) = self.latest_new_verdict_for(
+                &armed.coord_repo,
+                armed.issue_num,
+                &armed.prior_verdicted_ids,
+            )?;
+            Some((key.clone(), verdict))
+        });
+        let Some((key, verdict)) = found else {
+            return false;
+        };
+        let Some(armed) = self.armed_for_verdict.remove(&key) else {
+            return false;
+        };
+        self.detail_terminal_focused = false;
+        if verdict == "request-changes" {
+            self.pending_rework = Some(PendingRework {
+                coord_repo: armed.coord_repo,
+                repo_slug: armed.repo_slug,
+                issue_num: armed.issue_num,
+            });
+        } else {
+            // approve (incl. approved-with-nits): no rework needed.  Surface the
+            // transition and point at the existing smoke/merge affordances —
+            // the guided pull-and-merge flow is leg 3c.
+            self.push_toast(
+                "Review approved",
+                &format!(
+                    "#{} approved — pull the branch to smoke-test, then merge (Go).",
+                    armed.issue_num,
+                ),
+                ToastSeverity::Info,
+            );
+        }
+        true
+    }
+
+    /// Leg 3 (#517): the operator confirmed the rework prompt — select the
+    /// issue's row, open its Terminal tab, and launch the interactive
+    /// `--fix-of` session (continues the reviewed branch, briefed with the
+    /// findings, incremental re-review on completion).
+    fn confirm_rework(&mut self) {
+        let Some(p) = self.pending_rework.take() else {
+            return;
+        };
+        let idx = self
+            .pipeline_issues
+            .iter()
+            .position(|iss| iss.repo_slug == p.repo_slug && iss.number == p.issue_num);
+        let Some(idx) = idx else {
+            self.push_toast(
+                "Start fix",
+                &format!(
+                    "Could not find {} #{} in the pipeline to start its fix.",
+                    p.coord_repo, p.issue_num,
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+        self.pipeline_sel = Some(idx);
+        self.active_view = SidebarView::Pipeline;
+        self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
+    }
+
     /// Launch a local human-attended `claude` session for the selected
     /// pipeline issue (#467; supersedes the ssh+tmux launcher previously
     /// built for #446).
@@ -19633,8 +19899,8 @@ impl CoordApp {
         // #539: For Review mode, resolve the most-recent completed work
         // assignment id that has a branch.  If none exists, surface a toast
         // and bail — no point spawning a session with a broken command.
-        let work_aid: Option<String> = if matches!(mode, InteractiveLaunchMode::Review) {
-            match self.selected_completed_work_aid() {
+        let work_aid: Option<String> = match mode {
+            InteractiveLaunchMode::Review => match self.selected_completed_work_aid() {
                 Some(aid) => Some(aid),
                 None => {
                     self.push_toast(
@@ -19644,9 +19910,20 @@ impl CoordApp {
                     );
                     return;
                 }
-            }
-        } else {
-            None
+            },
+            // Leg 3 (#517): Fix carries the request-changes REVIEW id.
+            InteractiveLaunchMode::Fix => match self.selected_request_changes_review_aid() {
+                Some(aid) => Some(aid),
+                None => {
+                    self.push_toast(
+                        "Start fix (interactive)",
+                        "No request-changes review found for this issue — nothing to fix.",
+                        ToastSeverity::Warning,
+                    );
+                    return;
+                }
+            },
+            _ => None,
         };
 
         // Pass the TUI's resolved coordinator.yml path so `coord assign` finds
@@ -19707,11 +19984,15 @@ impl CoordApp {
                 self.detail_terminal_sessions.insert(issue_key.clone(), sess);
                 self.detail_terminal_spawn_errors.remove(&issue_key);
 
-                // Leg 2 (#517): arm a Work/Plan launch for auto-advance to
-                // Review; a Review launch disarms (a review now exists, so the
-                // board-driven detector must not also prompt for one).
+                // Leg 2/3 (#517): arm the right board-driven watcher.
+                //   Work/Plan/Fix → arm auto-advance to Review (after a Fix the
+                //     re-review is incremental — its review_iteration is bumped).
+                //   Review → arm verdict-routing; disarm the auto-review watcher
+                //     (a review is now in flight for this work).
                 match mode {
-                    InteractiveLaunchMode::Work | InteractiveLaunchMode::Plan => {
+                    InteractiveLaunchMode::Work
+                    | InteractiveLaunchMode::Plan
+                    | InteractiveLaunchMode::Fix => {
                         let prior_done_ids = self.done_work_aids_for(&repo, issue_num);
                         self.armed_for_auto_review.insert(
                             issue_key.clone(),
@@ -19722,9 +20003,25 @@ impl CoordApp {
                                 prior_done_ids,
                             },
                         );
+                        // A Fix consumes the request-changes verdict that
+                        // triggered it — stop verdict-routing from re-firing.
+                        if matches!(mode, InteractiveLaunchMode::Fix) {
+                            self.armed_for_verdict.remove(&issue_key);
+                        }
                     }
                     InteractiveLaunchMode::Review => {
                         self.armed_for_auto_review.remove(&issue_key);
+                        let prior_verdicted_ids =
+                            self.verdicted_review_ids_for(&repo, issue_num);
+                        self.armed_for_verdict.insert(
+                            issue_key.clone(),
+                            ArmedVerdict {
+                                coord_repo: repo.clone(),
+                                repo_slug: issue_key.0.clone(),
+                                issue_num,
+                                prior_verdicted_ids,
+                            },
+                        );
                     }
                 }
 
@@ -19735,6 +20032,7 @@ impl CoordApp {
                         InteractiveLaunchMode::Work => "work",
                         InteractiveLaunchMode::Plan => "plan→work",
                         InteractiveLaunchMode::Review => "review",
+                        InteractiveLaunchMode::Fix => "fix",
                     };
                     format!(
                         "Launching interactive {} session for {} #{} …",
@@ -19846,6 +20144,10 @@ enum InteractiveLaunchMode {
     /// Human-attended adversarial review of a completed work assignment (#539).
     /// Emits `coord assign --interactive --review-of <work_aid> …`.
     Review,
+    /// Leg 3 (#517): human-attended FIX of a request-changes review.  Continues
+    /// the reviewed work's branch; emits `coord assign --interactive --fix-of
+    /// <review_aid> …`.  `work_aid` carries the REVIEW assignment id here.
+    Fix,
 }
 
 /// #467: briefing seeded into a `Plan` interactive session — plan first, get
@@ -19920,6 +20222,16 @@ fn build_interactive_launch_cmd(
             let aid = shell_quote_arg(work_aid.unwrap_or(""));
             format!(
                 "coord assign {}--interactive --review-of {} {} {} {}\r",
+                cfg, aid, m, r, issue_num,
+            )
+        }
+        InteractiveLaunchMode::Fix => {
+            // Leg 3 (#517): `coord assign --interactive --fix-of <review_aid>`
+            // continues the reviewed work's branch with write tools.  work_aid
+            // carries the REVIEW id here (always Some — the caller guards it).
+            let aid = shell_quote_arg(work_aid.unwrap_or(""));
+            format!(
+                "coord assign {}--interactive --fix-of {} {} {} {}\r",
                 cfg, aid, m, r, issue_num,
             )
         }
@@ -20659,6 +20971,30 @@ impl ShellApp for CoordApp {
                         self.pending_auto_review = None;
                         self.push_toast(
                             "Review deferred",
+                            "Start it any time from the row's right-click menu.",
+                            ToastSeverity::Info,
+                        );
+                        return Reaction::Redraw;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Leg 3 (#517): rework (request-changes) confirm ───────────────
+        // Same intercept discipline as the auto-review prompt above: own
+        // Enter (→ launch the interactive --fix-of) and Esc/n (dismiss).
+        if self.pending_rework.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.confirm_rework();
+                        return Reaction::Redraw;
+                    }
+                    Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        self.pending_rework = None;
+                        self.push_toast(
+                            "Fix deferred",
                             "Start it any time from the row's right-click menu.",
                             ToastSeverity::Info,
                         );
@@ -22736,6 +23072,10 @@ impl ShellApp for CoordApp {
         // finished (board-driven — never scrapes the session TTY) and, if
         // so, raise the one-key confirm prompt to start its review.
         needs_redraw |= self.detect_completed_interactive_work();
+        // ── Leg 3 (#517): verdict-driven routing ────────────────────────
+        // Route a freshly-reported review verdict: request-changes → rework
+        // prompt; approve → smoke/merge notice.  Board-driven, never scraped.
+        needs_redraw |= self.detect_review_verdict();
         // After data has been applied, the Log tab's preferred assignment may
         // have changed (e.g. auto_loop dispatched a new review/fix). Re-attach
         // SSE so we don't fall back to the polling 'Loading log…' flicker.
@@ -24258,6 +24598,9 @@ mod tests {
             // Leg 2 (#517)
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
+            // Leg 3 (#517)
+            armed_for_verdict: std::collections::HashMap::new(),
+            pending_rework: None,
         }
     }
 
@@ -24486,17 +24829,47 @@ mod tests {
             .contains_key(&("repo-a".to_string(), 10)));
     }
 
+    fn review_of(work_id: &str, issue: u64, repo: &str, verdict: Option<&str>) -> Assignment {
+        let mut a = make_assignment_typed("done", issue, repo, Some("review"));
+        a.id = format!("rev-{}-{}", issue, work_id);
+        a.review_of_assignment_id = Some(work_id.to_string());
+        a.review_verdict = verdict.map(|v| v.to_string());
+        // Reviews are dispatched after the work they target.
+        a.dispatched_at = Some(2_000_000.0 + issue as f64);
+        a
+    }
+
     #[test]
-    fn detect_skips_when_review_already_exists() {
-        // First Work → Review hop only; once any review exists the detector
-        // bows out (verdict-driven re-review is leg 3, not this prompt).
+    fn detect_skips_when_latest_work_already_reviewed() {
+        // The latest work already has a review targeting it → no auto-prompt
+        // (a review is in flight / done for THIS work).
         let mut app = make_app_with_assignments(vec![
             done_work_with_branch(10, "repo-a"),
-            make_assignment_typed("running", 10, "repo-a", Some("review")),
+            review_of("id-10-done", 10, "repo-a", None),
         ]);
         arm_auto_review(&mut app, "repo-a", 10, &[]);
         assert!(!app.detect_completed_interactive_work());
         assert!(app.pending_auto_review.is_none());
+    }
+
+    #[test]
+    fn detect_re_review_fires_after_a_fix_even_with_a_prior_review() {
+        // Original work reviewed (request-changes); a FIX produced a NEW done
+        // work aid that has no review yet → re-review must fire (this is the
+        // incremental re-review loop; the old review must NOT block it).
+        let mut fix = make_assignment_typed("done", 10, "repo-a", Some("work"));
+        fix.id = "id-10-fix".to_string();
+        fix.branch = Some("issue-10-work".to_string());
+        fix.dispatched_at = Some(3_000_000.0); // newer than original work + review
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"), // id-10-done (original)
+            review_of("id-10-done", 10, "repo-a", Some("request-changes")),
+            fix, // id-10-fix — the latest work, not yet reviewed
+        ]);
+        // Armed at fix-launch time: only the ORIGINAL work was done then.
+        arm_auto_review(&mut app, "repo-a", 10, &["id-10-done"]);
+        assert!(app.detect_completed_interactive_work());
+        assert_eq!(app.pending_auto_review.as_ref().unwrap().issue_num, 10);
     }
 
     #[test]
@@ -24588,6 +24961,175 @@ mod tests {
         app.confirm_auto_review();
         assert!(app.pending_auto_review.is_none());
         assert!(app.detail_terminal_sessions.is_empty());
+    }
+
+    // ── Leg 3 (#517): verdict-driven routing ─────────────────────────────
+
+    fn arm_verdict(app: &mut CoordApp, repo: &str, issue: u64, prior: &[&str]) {
+        app.armed_for_verdict.insert(
+            (repo.to_string(), issue),
+            ArmedVerdict {
+                coord_repo: repo.to_string(),
+                repo_slug: repo.to_string(),
+                issue_num: issue,
+                prior_verdicted_ids: prior.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+    }
+
+    fn mk_pending_rework(repo: &str, issue: u64) -> PendingRework {
+        PendingRework {
+            coord_repo: repo.to_string(),
+            repo_slug: repo.to_string(),
+            issue_num: issue,
+        }
+    }
+
+    #[test]
+    fn detect_review_verdict_request_changes_raises_rework() {
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"),
+            review_of("id-10-done", 10, "repo-a", Some("request-changes")),
+        ]);
+        arm_verdict(&mut app, "repo-a", 10, &[]);
+        assert!(app.detect_review_verdict());
+        let p = app.pending_rework.as_ref().expect("rework prompt raised");
+        assert_eq!(p.issue_num, 10);
+        // Armed entry consumed so it doesn't re-route next tick.
+        assert!(app.armed_for_verdict.is_empty());
+    }
+
+    #[test]
+    fn detect_review_verdict_approve_notifies_without_rework() {
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"),
+            review_of("id-10-done", 10, "repo-a", Some("approve")),
+        ]);
+        arm_verdict(&mut app, "repo-a", 10, &[]);
+        // Routed (toast), but NO rework prompt for an approval.
+        assert!(app.detect_review_verdict());
+        assert!(app.pending_rework.is_none());
+        assert!(app.armed_for_verdict.is_empty());
+    }
+
+    #[test]
+    fn detect_review_verdict_ignores_already_seen_verdict() {
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"),
+            review_of("id-10-done", 10, "repo-a", Some("request-changes")),
+        ]);
+        // The verdicted review id was already in the arm-time snapshot.
+        arm_verdict(&mut app, "repo-a", 10, &["rev-10-id-10-done"]);
+        assert!(!app.detect_review_verdict());
+        assert!(app.pending_rework.is_none());
+        assert!(app
+            .armed_for_verdict
+            .contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    #[test]
+    fn detect_review_verdict_no_fire_while_review_running() {
+        // Review dispatched but no verdict reported yet → nothing to route.
+        let mut review = make_assignment_typed("running", 10, "repo-a", Some("review"));
+        review.review_of_assignment_id = Some("id-10-done".to_string());
+        let mut app =
+            make_app_with_assignments(vec![done_work_with_branch(10, "repo-a"), review]);
+        arm_verdict(&mut app, "repo-a", 10, &[]);
+        assert!(!app.detect_review_verdict());
+        assert!(app.pending_rework.is_none());
+    }
+
+    #[test]
+    fn detect_review_verdict_skipped_while_a_prompt_is_open() {
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"),
+            review_of("id-10-done", 10, "repo-a", Some("request-changes")),
+        ]);
+        arm_verdict(&mut app, "repo-a", 10, &[]);
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-b", 99));
+        assert!(!app.detect_review_verdict());
+        assert!(app.pending_rework.is_none());
+        assert!(app
+            .armed_for_verdict
+            .contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    #[test]
+    fn request_changes_review_aid_for_picks_latest() {
+        let mut older = review_of("id-10-done", 10, "repo-a", Some("request-changes"));
+        older.id = "rev-old".to_string();
+        older.dispatched_at = Some(2_000_000.0);
+        let mut newer = review_of("id-10-fix", 10, "repo-a", Some("request-changes"));
+        newer.id = "rev-new".to_string();
+        newer.dispatched_at = Some(2_500_000.0);
+        let app = make_app_with_assignments(vec![older, newer]);
+        assert_eq!(
+            app.request_changes_review_aid_for("repo-a", 10).as_deref(),
+            Some("rev-new"),
+        );
+    }
+
+    #[test]
+    fn rework_prompt_suppresses_panel_toolbar() {
+        let mut app = make_app_default();
+        assert!(app.panel_toolbar().is_some());
+        app.pending_rework = Some(mk_pending_rework("repo-a", 10));
+        assert!(app.panel_toolbar().is_none());
+    }
+
+    #[test]
+    fn build_prompt_dialog_returns_rework_dialog() {
+        let mut app = make_app_default();
+        app.pending_rework = Some(mk_pending_rework("repo-a", 42));
+        let dialog = app.build_prompt_dialog().expect("rework dialog");
+        assert_eq!(dialog.id, WidgetId::new("dialog:rework"));
+        assert!(dialog.buttons.iter().any(|b| b.id == WidgetId::new("fix")));
+        let body_text: String = dialog
+            .body
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            body_text.contains("#42"),
+            "rework dialog body should name the issue, got: {body_text}",
+        );
+    }
+
+    #[test]
+    fn dismiss_prompt_dialog_clears_rework() {
+        let mut app = make_app_default();
+        app.pending_rework = Some(mk_pending_rework("repo-a", 10));
+        app.dismiss_prompt_dialog();
+        assert!(app.pending_rework.is_none());
+    }
+
+    #[test]
+    fn confirm_rework_without_matching_row_is_noop() {
+        let mut app = make_app_default();
+        app.pending_rework = Some(mk_pending_rework("repo-a", 10));
+        app.confirm_rework();
+        assert!(app.pending_rework.is_none());
+        assert!(app.detail_terminal_sessions.is_empty());
+    }
+
+    #[test]
+    fn build_interactive_launch_cmd_fix_mode_emits_fix_of() {
+        let cmd = build_interactive_launch_cmd(
+            None,
+            "m",
+            "api",
+            7,
+            InteractiveLaunchMode::Fix,
+            Some("rev-abc"),
+        );
+        assert!(
+            cmd.contains("--fix-of rev-abc"),
+            "Fix mode must emit --fix-of <review_aid>, got: {cmd}",
+        );
+        assert!(cmd.contains("--interactive"));
+        assert!(cmd.ends_with('\r'), "launcher must auto-run");
     }
 
     #[test]
