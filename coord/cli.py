@@ -5980,17 +5980,73 @@ def session() -> None:
     default=False,
     help="Output as JSON (consumed by coord-tui startup check).",
 )
-def sessions_cmd(output_json: bool) -> None:
+@click.option(
+    "--remote",
+    is_flag=True,
+    default=False,
+    help=(
+        "Also enumerate coord-* sessions on REMOTE fleet machines over ssh+tmux "
+        "(#486 Leg 4).  Parallelised; bounded by a 5 s per-host probe."
+    ),
+)
+@_CONFIG_OPTION
+def sessions_cmd(output_json: bool, remote: bool, config_path: Path) -> None:
     """List live coord-* tmux sessions with their assignment metadata."""
     import json as _json  # noqa: PLC0415
 
     from coord.interactive import (  # noqa: PLC0415
+        TmuxHost,
         list_coord_tmux_sessions,
         TMUX_SESSION_PREFIX,
     )
     from coord.state import get_connection  # noqa: PLC0415
 
-    raw = list_coord_tmux_sessions()
+    # Track which machine each session lives on (None => local) so the TUI /
+    # operator knows where a reattach lands.
+    session_machine: dict[str, str | None] = {}
+    raw: list[dict[str, str]] = []
+    for _s in list_coord_tmux_sessions():
+        raw.append(_s)
+        session_machine.setdefault(_s["session_name"], None)
+
+    # #486 Leg 4: optionally probe REMOTE machines so the TUI can offer reattach
+    # to a session launched on another machine.  A local session always wins on
+    # name collision.  Down machines fail within the 5 s per-host cap; probes
+    # run in parallel so total wall-clock ≈ the slowest single host.
+    if remote:
+        import concurrent.futures as _cf  # noqa: PLC0415
+
+        try:
+            _cfg = _load_config(config_path)
+            _local_hn = socket.gethostname().split(".")[0].lower()
+            _remotes = [
+                m for m in _cfg.machines
+                if not (
+                    m.name.lower() == _local_hn
+                    or m.host.split(".")[0].lower() == _local_hn
+                )
+            ]
+        except Exception:  # noqa: BLE001
+            _remotes = []
+
+        def _probe(machine: object) -> tuple[str, list[dict[str, str]]]:
+            try:
+                found = list_coord_tmux_sessions(
+                    host=TmuxHost(ssh_target=machine.host)  # type: ignore[attr-defined]
+                )
+                return machine.name, found  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                return machine.name, []  # type: ignore[attr-defined]
+
+        if _remotes:
+            with _cf.ThreadPoolExecutor(max_workers=min(8, len(_remotes))) as _ex:
+                for _mname, _found in _ex.map(_probe, _remotes):
+                    for _s in _found:
+                        if _s["session_name"] in session_machine:
+                            continue  # local (or earlier) session wins
+                        raw.append(_s)
+                        session_machine[_s["session_name"]] = _mname
+
     enriched: list[dict] = []
 
     # Acquire the DB connection once before the loop — get_connection() is a
@@ -6007,10 +6063,11 @@ def sessions_cmd(output_json: bool) -> None:
         repo_name: str | None = None
         issue_title: str | None = None
 
+        machine_name: str | None = None
         if _db_conn is not None:
             try:
                 row = _db_conn.execute(
-                    "SELECT issue_number, repo_name, issue_title "
+                    "SELECT issue_number, repo_name, issue_title, machine_name "
                     "FROM assignments WHERE assignment_id=?",
                     (assignment_id,),
                 ).fetchone()
@@ -6018,9 +6075,13 @@ def sessions_cmd(output_json: bool) -> None:
                     issue_number = row["issue_number"] if hasattr(row, "keys") else row[0]
                     repo_name = row["repo_name"] if hasattr(row, "keys") else row[1]
                     issue_title = row["issue_title"] if hasattr(row, "keys") else row[2]
+                    machine_name = row["machine_name"] if hasattr(row, "keys") else row[3]
             except Exception:  # noqa: BLE001
                 pass
 
+        # Prefer the DB's machine_name (authoritative); fall back to the host
+        # the session was discovered on (#486 Leg 4).
+        machine = machine_name or session_machine.get(session_name)
         enriched.append(
             {
                 "session_name": session_name,
@@ -6028,6 +6089,7 @@ def sessions_cmd(output_json: bool) -> None:
                 "issue_number": issue_number,
                 "repo_name": repo_name,
                 "issue_title": issue_title,
+                "machine": machine,
             }
         )
 
@@ -6043,8 +6105,9 @@ def sessions_cmd(output_json: bool) -> None:
         issue_part = f"#{s['issue_number']}" if s["issue_number"] else "(unknown issue)"
         repo_part = s["repo_name"] or "(unknown repo)"
         title_part = f" — {s['issue_title']}" if s["issue_title"] else ""
+        machine_part = f" @{s['machine']}" if s.get("machine") else ""
         click.echo(
-            f"  {s['session_name']}  {repo_part} {issue_part}{title_part}"
+            f"  {s['session_name']}  {repo_part} {issue_part}{machine_part}{title_part}"
         )
         click.echo(
             f"    reattach: coord reattach {s['assignment_id']}"
@@ -6076,7 +6139,9 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     import time as _time  # noqa: PLC0415
 
     from coord.interactive import (  # noqa: PLC0415
+        TmuxHost,
         finalize_interactive_exit,
+        finalize_remote_interactive_exit,
         tmux_available,
         tmux_session_alive,
         tmux_session_name,
@@ -6096,12 +6161,18 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     issue_number_val: int | None = None
     machine_name_val: str | None = None
     base_branch_val: str = "main"
+    # #486 Leg 4: the assignment type + branch decide how a REMOTE session
+    # finalizes — a read-only review records DB-only; a fix pushes its remote
+    # worktree's commits back to origin.
+    assignment_type_val: str | None = None
+    branch_val: str | None = None
 
     try:
         from coord.state import get_connection as _gc  # noqa: PLC0415
         conn = _gc()
         row = conn.execute(
-            "SELECT issue_number, repo_name, repo_github, machine_name "
+            "SELECT issue_number, repo_name, repo_github, machine_name, "
+            "type, branch "
             "FROM assignments WHERE assignment_id=?",
             (assignment_id,),
         ).fetchone()
@@ -6113,6 +6184,10 @@ def reattach(assignment_id: str, config_path: Path) -> None:
             repo_name_val = str(_col(row, "repo_name", 1))
             repo_github_val = str(_col(row, "repo_github", 2))
             machine_name_val = str(_col(row, "machine_name", 3))
+            _at = _col(row, "type", 4)
+            assignment_type_val = str(_at) if _at is not None else None
+            _br = _col(row, "branch", 5)
+            branch_val = str(_br) if _br else None
     except Exception:  # noqa: BLE001
         pass
 
@@ -6122,6 +6197,11 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     worktree_path = str(_COORD_DIR / "worktrees" / assignment_id)
 
     repo_path_val: str | None = None
+    # #486 Leg 4: remote-vs-local routing for the attach + finalize.  Defaults
+    # to local so an unresolved machine preserves the original local behavior.
+    is_local_session: bool = True
+    ssh_target_val: str | None = None
+    remote_repo_sh: str | None = None
     try:
         cfg = _load_config(config_path)
         # Get default_branch from the repo config.
@@ -6131,7 +6211,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
             )
             if repo_cfg_obj:
                 base_branch_val = repo_cfg_obj.default_branch or "main"
-        # Get repo_path from machine config.
+        # Get repo_path + locality from machine config.
         if machine_name_val and repo_name_val:
             machine_obj = next(
                 (m for m in cfg.machines if m.name == machine_name_val), None
@@ -6140,71 +6220,182 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                 rp = machine_obj.repo_path(repo_name_val)
                 if rp:
                     repo_path_val = str(Path(rp).expanduser())
+                    # Raw `~/...` → `$HOME/...` so the REMOTE shell (not the
+                    # local one) expands it during the push-back finalize.
+                    remote_repo_sh = (
+                        "$HOME/" + rp[2:]
+                        if rp.startswith("~/")
+                        else ("$HOME" if rp == "~" else rp)
+                    )
+                ssh_target_val = machine_obj.host
+                _local_hn = socket.gethostname().split(".")[0].lower()
+                is_local_session = (
+                    machine_obj.name.lower() == _local_hn
+                    or machine_obj.host.split(".")[0].lower() == _local_hn
+                )
     except Exception:  # noqa: BLE001
         pass
 
+    # The tmux seam: local calls are plain `tmux …`; remote calls become
+    # `ssh -t <mux opts> <host> tmux …` (multiplexed via _SSH_MUX_OPTS).
+    _tmux_host = (
+        TmuxHost(ssh_target=ssh_target_val)
+        if (not is_local_session and ssh_target_val)
+        else TmuxHost(ssh_target=None)
+    )
+    _remote_worktree_sh = "$HOME/.coord/worktrees/" + assignment_id
+
     # ── Shared helper: run finalize backstop and echo results ────────────────
     def _run_finalize(exit_code: int, started_at: float | None = None) -> None:
-        if repo_name_val and repo_github_val and issue_number_val:
-            try:
-                finalize_result = finalize_interactive_exit(
+        if not (repo_name_val and repo_github_val and issue_number_val):
+            click.echo(
+                "  (assignment metadata not found — skipping git-floor backstop)",
+                err=True,
+            )
+            return
+        try:
+            # ── REMOTE session (#486 Leg 4) ──────────────────────────────
+            # The local git-floor backstop can't see a remote worktree, so a
+            # remote FIX pushes its commits back over ssh; everything else
+            # records a DB-only terminal state (a review is read-only; remote
+            # non-review push-back is deferred — #494/#486d).
+            if not is_local_session:
+                if (
+                    assignment_type_val == "fix"
+                    and branch_val
+                    and remote_repo_sh
+                    and ssh_target_val
+                ):
+                    fr = finalize_remote_interactive_exit(
+                        assignment_id=assignment_id,
+                        repo_name=repo_name_val,
+                        repo_github=repo_github_val,
+                        issue_number=int(issue_number_val),  # type: ignore[arg-type]
+                        machine_name=machine_name_val or "unknown",
+                        ssh_target=ssh_target_val,
+                        remote_worktree_sh=_remote_worktree_sh,
+                        remote_repo_sh=remote_repo_sh,
+                        branch=branch_val,
+                        base_branch=base_branch_val,
+                        exit_code=exit_code,
+                        started_at=started_at,
+                    )
+                    if fr.already_recorded:
+                        click.echo(
+                            "  result recorded via `coord report-result`; remote "
+                            "backstop did not overwrite"
+                        )
+                    else:
+                        click.echo(
+                            f"  remote backstop: status={fr.terminal_status} "
+                            f"commits_ahead={fr.commits_ahead} pushed={fr.push_ok}"
+                        )
+                        if not fr.push_ok:
+                            click.echo(
+                                f"  warning: remote push failed: {fr.push_error}",
+                                err=True,
+                            )
+                            click.echo(
+                                f"  fix commits preserved in {_remote_worktree_sh} "
+                                f"on {ssh_target_val} (worktree NOT removed)",
+                                err=True,
+                            )
+                    return
+                # Read-only review (or a remote write we can't push back):
+                # DB-only terminal state so the row doesn't linger as a phantom
+                # 'running' worker holding the claim.
+                fr2 = finalize_interactive_exit(
                     assignment_id=assignment_id,
                     repo_name=repo_name_val,
                     repo_github=repo_github_val,
                     issue_number=int(issue_number_val),  # type: ignore[arg-type]
                     machine_name=machine_name_val or "unknown",
-                    worktree_path=worktree_path,
+                    worktree_path=None,
                     base_branch=base_branch_val,
                     exit_code=exit_code,
                     started_at=started_at,
                     log_path=None,
-                    repo_path=repo_path_val,
+                    repo_path=None,
                 )
-                if finalize_result.already_recorded:
+                if fr2.already_recorded:
                     click.echo(
-                        "  result already recorded via `coord report-result`; "
-                        "backstop did not overwrite",
+                        "  result recorded via `coord report-result`; backstop "
+                        "did not overwrite"
                     )
                 else:
                     click.echo(
-                        f"  backstop: status={finalize_result.terminal_status} "
-                        f"commits_ahead={finalize_result.commits_ahead}"
+                        f"  backstop: status={fr2.terminal_status} (remote, DB-only)"
                     )
-                    if not finalize_result.push_ok:
+                    if assignment_type_val not in ("review", None):
                         click.echo(
-                            f"  warning: git push failed: {finalize_result.push_error}",
+                            "  note: remote non-review push-back is deferred — "
+                            "any commits remain on the remote worktree.",
                             err=True,
                         )
-            except Exception as exc:  # noqa: BLE001
+                return
+
+            # ── LOCAL session (unchanged) ────────────────────────────────
+            finalize_result = finalize_interactive_exit(
+                assignment_id=assignment_id,
+                repo_name=repo_name_val,
+                repo_github=repo_github_val,
+                issue_number=int(issue_number_val),  # type: ignore[arg-type]
+                machine_name=machine_name_val or "unknown",
+                worktree_path=worktree_path,
+                base_branch=base_branch_val,
+                exit_code=exit_code,
+                started_at=started_at,
+                log_path=None,
+                repo_path=repo_path_val,
+            )
+            if finalize_result.already_recorded:
                 click.echo(
-                    f"  warning: backstop failed to record completion: {exc}",
-                    err=True,
+                    "  result already recorded via `coord report-result`; "
+                    "backstop did not overwrite",
                 )
-        else:
+            else:
+                click.echo(
+                    f"  backstop: status={finalize_result.terminal_status} "
+                    f"commits_ahead={finalize_result.commits_ahead}"
+                )
+                if not finalize_result.push_ok:
+                    click.echo(
+                        f"  warning: git push failed: {finalize_result.push_error}",
+                        err=True,
+                    )
+        except Exception as exc:  # noqa: BLE001
             click.echo(
-                "  (assignment metadata not found — skipping git-floor backstop)",
+                f"  warning: backstop failed to record completion: {exc}",
                 err=True,
             )
 
     # ── Dead-before-attach: session was killed externally ────────────────────
     # Run finalize here to release the claim and remove the orphaned worktree
     # so the operator can immediately re-dispatch with --interactive.
-    if not tmux_session_alive(sname):
+    if not tmux_session_alive(sname, host=_tmux_host):
         click.echo(f"  session {sname!r} is not alive (it may have ended while you were away).")
         _run_finalize(exit_code=1)
         sys.exit(0)
 
     # ── Attach ───────────────────────────────────────────────────────────────
-    click.echo(f"  Attaching to {sname} …")
+    _where = "local" if is_local_session else f"{ssh_target_val} (ssh)"
+    click.echo(f"  Attaching to {sname} on {_where} …")
     click.echo("  (detach with Ctrl-b d to leave the session running)")
 
     started_at = _time.time()
     try:
         import subprocess as _sp  # noqa: PLC0415
-        # When the operator is already inside tmux, `attach-session` refuses to
-        # nest ("sessions should be nested with care") and exits 1; use
-        # `switch-client` to move the current client to the session instead.
-        if os.environ.get("TMUX"):
+        if not is_local_session:
+            # Remote: ssh -t into the machine and attach its tmux session
+            # (multiplexed via _SSH_MUX_OPTS).  No nesting concern — the remote
+            # tmux server is distinct from any local one we're sitting in.
+            _reattach_cmd = list(
+                _tmux_host.cmd(["attach-session", "-t", sname], tty=True)
+            )
+        elif os.environ.get("TMUX"):
+            # Local + already inside tmux: `attach-session` refuses to nest
+            # ("sessions should be nested with care") and exits 1; use
+            # `switch-client` to move the current client to the session instead.
             _reattach_cmd = ["tmux", "switch-client", "-t", sname]
         else:
             _reattach_cmd = ["tmux", "attach-session", "-t", sname]
@@ -6214,7 +6405,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
         exit_code = 1
 
     # After attach returns: check if session ended or user detached.
-    if tmux_session_alive(sname):
+    if tmux_session_alive(sname, host=_tmux_host):
         click.echo(
             f"\n  Session is still running.  "
             f"Reattach later with: coord reattach {assignment_id}"

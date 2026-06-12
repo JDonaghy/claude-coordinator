@@ -61,14 +61,16 @@ def _insert_assignment(conn, assignment_id: str, **overrides: Any) -> None:
         "issue_number": 42,
         "issue_title": "Test issue",
         "status": "running",
+        "type": "work",
+        "branch": None,
     }
     vals.update(overrides)
     conn.execute(
         """INSERT INTO assignments
            (assignment_id, machine_name, repo_name, repo_github,
-            issue_number, issue_title, status)
+            issue_number, issue_title, status, type, branch)
            VALUES (:assignment_id, :machine_name, :repo_name, :repo_github,
-                   :issue_number, :issue_title, :status)""",
+                   :issue_number, :issue_title, :status, :type, :branch)""",
         vals,
     )
     conn.commit()
@@ -189,12 +191,97 @@ class TestSessionsCmd:
         assert result.exit_code == 0
         assert "coord reattach" in result.output
 
+    # -- #486 Leg 4: remote discovery (--remote) -------------------------------
+
+    _TWO_MACHINE_YAML = """\
+repos:
+  - name: myrepo
+    github: acme/myrepo
+    default_branch: main
+machines:
+  - name: local-box
+    host: local-box.tailnet
+    repos: [myrepo]
+  - name: server
+    host: server.tailnet
+    repos: [myrepo]
+"""
+
+    def test_remote_flag_discovers_and_tags_remote_session(
+        self, tmp_path: Path, coord_db: Any
+    ) -> None:
+        """`--remote` probes non-local machines over ssh+tmux and surfaces their
+        sessions, tagged with the machine they live on (resolved from the DB)."""
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(self._TWO_MACHINE_YAML)
+        _insert_assignment(
+            coord_db, "remote-aid",
+            machine_name="server", repo_name="myrepo",
+            repo_github="acme/myrepo", issue_number=7,
+            issue_title="Remote work",
+        )
+
+        def fake_list(*, host: Any = None) -> list[dict[str, str]]:
+            # Local probe (no/None ssh_target) → empty; the remote machine
+            # ("server.tailnet") → one live session.
+            if host is not None and getattr(host, "ssh_target", None):
+                return [{"session_name": "coord-remote-aid"}]
+            return []
+
+        with patch("socket.gethostname", return_value="local-box"), \
+             patch("coord.interactive.list_coord_tmux_sessions", side_effect=fake_list):
+            result = CliRunner().invoke(
+                main, ["sessions", "--json", "--remote", "--config", str(cfg)]
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert len(data["sessions"]) == 1
+        s = data["sessions"][0]
+        assert s["assignment_id"] == "remote-aid"
+        assert s["machine"] == "server"
+        assert s["issue_number"] == 7
+
+    def test_remote_flag_survives_probe_failure(
+        self, tmp_path: Path, coord_db: Any
+    ) -> None:
+        """A remote probe that raises must not crash the command — local
+        sessions still list and exit is 0."""
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(self._TWO_MACHINE_YAML)
+
+        def fake_list(*, host: Any = None) -> list[dict[str, str]]:
+            if host is not None and getattr(host, "ssh_target", None):
+                raise RuntimeError("ssh blew up")
+            return [{"session_name": "coord-local-aid"}]
+
+        with patch("socket.gethostname", return_value="local-box"), \
+             patch("coord.interactive.list_coord_tmux_sessions", side_effect=fake_list):
+            result = CliRunner().invoke(
+                main, ["sessions", "--json", "--remote", "--config", str(cfg)]
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        ids = {s["assignment_id"] for s in data["sessions"]}
+        assert ids == {"local-aid"}
+
 
 # ── coord reattach ─────────────────────────────────────────────────────────────
 
 
 class TestReattachCmd:
-    """``coord reattach <assignment_id>``."""
+    """``coord reattach <assignment_id>`` — LOCAL session reattach.
+
+    The single configured machine (``mymachine``) is made to resolve as the
+    local machine so these tests exercise the local tmux path (#486 Leg 4 made
+    reattach locality-aware; the remote path is covered in TestReattachRemote).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _local_machine(self):
+        with patch("socket.gethostname", return_value="mymachine"):
+            yield
 
     # -- Pre-flight checks -----------------------------------------------------
 
@@ -235,7 +322,7 @@ class TestReattachCmd:
         alive_seq = iter([True, True])  # alive before attach; alive after (detached)
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, True)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, True)), \
              patch("subprocess.run", side_effect=_mock_run):
             CliRunner().invoke(
                 main, ["reattach", "aid-xyz", "--config", str(config_file)]
@@ -266,7 +353,7 @@ class TestReattachCmd:
         alive_seq = iter([True, True])
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, True)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, True)), \
              patch("subprocess.run", side_effect=_mock_run):
             CliRunner().invoke(
                 main, ["reattach", "aid-xyz", "--config", str(config_file)]
@@ -291,7 +378,7 @@ class TestReattachCmd:
         alive_seq = iter([True, True])  # alive before; alive after (just detached)
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, True)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, True)), \
              patch("subprocess.run", return_value=attach_result):
             result = CliRunner().invoke(
                 main, ["reattach", "aid-running", "--config", str(config_file)]
@@ -310,7 +397,7 @@ class TestReattachCmd:
         alive_seq = iter([True, True])
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, True)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, True)), \
              patch("subprocess.run", return_value=attach_result), \
              patch("coord.interactive.finalize_interactive_exit") as mock_fin:
             CliRunner().invoke(
@@ -345,7 +432,7 @@ class TestReattachCmd:
         fake_result.push_ok = True
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, False)), \
              patch("subprocess.run", return_value=attach_result), \
              patch("coord.interactive.finalize_interactive_exit", return_value=fake_result) as mock_fin:
             result = CliRunner().invoke(
@@ -378,7 +465,7 @@ class TestReattachCmd:
         fake_result.push_ok = True
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, False)), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("coord.interactive.finalize_interactive_exit", return_value=fake_result):
             result = CliRunner().invoke(
@@ -406,7 +493,7 @@ class TestReattachCmd:
         fake_result.push_ok = True
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, False)), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("coord.interactive.finalize_interactive_exit", return_value=fake_result):
             result = CliRunner().invoke(
@@ -425,7 +512,7 @@ class TestReattachCmd:
         alive_seq = iter([True, False])
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, False)), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("coord.interactive.finalize_interactive_exit") as mock_fin:
             result = CliRunner().invoke(
@@ -445,7 +532,7 @@ class TestReattachCmd:
 
         runner = CliRunner()
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, False)), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("coord.interactive.finalize_interactive_exit"):
             result = runner.invoke(
@@ -471,7 +558,7 @@ class TestReattachCmd:
         alive_seq = iter([True, False])  # alive before, dead after attach
 
         with patch("coord.interactive.tmux_available", return_value=True), \
-             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n: next(alive_seq, False)), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, False)), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("coord.state.get_connection", side_effect=RuntimeError("DB down")), \
              patch("coord.interactive.finalize_interactive_exit") as mock_fin:
@@ -486,6 +573,98 @@ class TestReattachCmd:
         mock_fin.assert_not_called()
         combined = output_and_stderr(result)
         assert "metadata not found" in combined or "skipping" in combined
+
+
+class TestReattachRemote:
+    """#486 Leg 4: ``coord reattach`` to a session on a REMOTE machine.
+
+    The local hostname differs from the configured machine, so ``mymachine``
+    resolves as remote: the attach goes over ``ssh -t`` and the finalize is
+    routed by assignment type (review → DB-only; fix → remote push-back)."""
+
+    @pytest.fixture(autouse=True)
+    def _remote_machine(self):
+        # Any hostname that is NOT "mymachine"/"mymachine.tailnet".
+        with patch("socket.gethostname", return_value="laptop"):
+            yield
+
+    def test_remote_review_attaches_over_ssh_and_finalizes_db_only(
+        self, config_file: Path, coord_db: Any
+    ) -> None:
+        _insert_assignment(
+            coord_db, "aid-rev",
+            type="review", branch="issue-42-fix", machine_name="mymachine",
+        )
+        captured: list[list[str]] = []
+
+        def _mock_run(cmd: list[str], **kwargs: Any) -> MagicMock:
+            captured.append(list(cmd))
+            return MagicMock(returncode=0)
+
+        alive_seq = iter([True, False])  # alive before; ended after attach
+        fake = MagicMock(already_recorded=False, terminal_status="advisory")
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive",
+                   side_effect=lambda _n, host=None: next(alive_seq, False)), \
+             patch("subprocess.run", side_effect=_mock_run), \
+             patch("coord.interactive.finalize_interactive_exit",
+                   return_value=fake) as mock_fin, \
+             patch("coord.interactive.finalize_remote_interactive_exit") as mock_remote_fin:
+            result = CliRunner().invoke(
+                main, ["reattach", "aid-rev", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, output_and_stderr(result)
+        # Attached over ssh -t to the remote tmux session.
+        ssh_attach = [c for c in captured if "ssh" in c and "attach-session" in c]
+        assert ssh_attach, f"expected an ssh attach; got {captured}"
+        cmd = ssh_attach[0]
+        assert cmd[0] == "ssh"
+        assert "-t" in cmd
+        assert "mymachine.tailnet" in cmd
+        assert "coord-aid-rev" in cmd
+        # Read-only review ⇒ DB-only finalize (no worktree), no remote push-back.
+        mock_remote_fin.assert_not_called()
+        mock_fin.assert_called_once()
+        kwargs = mock_fin.call_args[1]
+        assert kwargs["worktree_path"] is None
+        assert kwargs["repo_path"] is None
+
+    def test_remote_fix_pushes_back_via_remote_finalize(
+        self, config_file: Path, coord_db: Any
+    ) -> None:
+        _insert_assignment(
+            coord_db, "aid-fix",
+            type="fix", branch="issue-42-fix", machine_name="mymachine",
+        )
+        alive_seq = iter([True, False])
+        fake_remote = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=2, push_ok=True, push_error=None,
+        )
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive",
+                   side_effect=lambda _n, host=None: next(alive_seq, False)), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("coord.interactive.finalize_interactive_exit") as mock_fin, \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=fake_remote) as mock_remote_fin:
+            result = CliRunner().invoke(
+                main, ["reattach", "aid-fix", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, output_and_stderr(result)
+        # A fix wrote in a remote worktree ⇒ push-back via the remote backstop.
+        mock_fin.assert_not_called()
+        mock_remote_fin.assert_called_once()
+        kwargs = mock_remote_fin.call_args[1]
+        assert kwargs["ssh_target"] == "mymachine.tailnet"
+        assert kwargs["branch"] == "issue-42-fix"
+        assert "aid-fix" in kwargs["remote_worktree_sh"]
+        assert kwargs["remote_repo_sh"]  # resolved from repo_paths
+        assert "remote backstop" in result.output
 
 
 # ── _inject_briefing_into_tmux_session ─────────────────────────────────────────
