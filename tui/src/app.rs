@@ -21030,23 +21030,26 @@ impl CoordApp {
                     };
                     format!("coord reattach {}{}\r", cfg, shell_quote_arg(assignment_id))
                 } else if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
-                    // #569: Troubleshoot path — build a diagnostic snapshot
-                    // briefing from current board state and seed it as the
-                    // session's opening prompt.  Uses --no-plan (work tools)
-                    // so the session can run coord/gh/sqlite3 freely.
+                    // #569: write the multi-line diagnostic briefing to a temp
+                    // file and launch a READ-ONLY diagnostic via
+                    // `coord assign --troubleshoot --briefing-file` as a SINGLE
+                    // physical line.  Inlining a multi-line --briefing here
+                    // would split on newlines and strand the embedded PTY shell
+                    // at `quote>` (bug #2); and --troubleshoot runs with no
+                    // claim / no worktree so it never conflicts with the
+                    // stalled item's own in-progress claim (bug #3).
                     let briefing = self.troubleshoot_briefing(&repo, issue_num);
-                    let cfg = match cfg_path.as_deref() {
-                        Some(p) if !p.is_empty() => {
-                            format!("--config {} ", shell_quote_arg(p))
-                        }
-                        _ => String::new(),
-                    };
-                    format!(
-                        "coord assign {}--interactive --no-plan --briefing {} {} {} {}\r",
-                        cfg,
-                        shell_quote_arg(&briefing),
-                        shell_quote_arg(&machine),
-                        shell_quote_arg(&repo),
+                    let briefing_path = std::env::temp_dir()
+                        .join(format!("coord-troubleshoot-{issue_num}.md"));
+                    // Best-effort write; if it fails, `coord assign` surfaces a
+                    // clear "file not found" error in the terminal rather than
+                    // silently launching with no briefing.
+                    let _ = std::fs::write(&briefing_path, &briefing);
+                    build_troubleshoot_launch_cmd(
+                        cfg_path.as_deref(),
+                        &briefing_path.to_string_lossy(),
+                        &machine,
+                        &repo,
                         issue_num,
                     )
                 } else {
@@ -21348,6 +21351,37 @@ fn build_interactive_launch_cmd(
              handle it in the caller with the troubleshoot_briefing path"
         ),
     }
+}
+
+/// #569: Build the single-line shell command that launches a read-only
+/// Troubleshoot diagnostic session.
+///
+/// The (multi-line) diagnostic briefing is passed by FILE path — never inlined
+/// — because a multi-line `--briefing` typed into the embedded PTY shell would
+/// be split on its newlines and strand the shell at `quote>` (bug #2).  The
+/// `--troubleshoot` flag runs read-only in the live checkout with no claim and
+/// no worktree, so it never conflicts with the In-progress item's own claim
+/// (bug #3).  The returned line is a single physical line; the trailing `\r`
+/// is the submit key, not a line break.
+fn build_troubleshoot_launch_cmd(
+    config_path: Option<&str>,
+    briefing_file: &str,
+    machine: &str,
+    repo: &str,
+    issue_num: u64,
+) -> String {
+    let cfg = match config_path {
+        Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
+        _ => String::new(),
+    };
+    format!(
+        "coord assign {}--interactive --troubleshoot --briefing-file {} {} {} {}\r",
+        cfg,
+        shell_quote_arg(briefing_file),
+        shell_quote_arg(machine),
+        shell_quote_arg(repo),
+        issue_num,
+    )
 }
 
 /// Minimal POSIX shell quoter for a single argument (#467).
@@ -38208,6 +38242,41 @@ mod tests {
         // No stray \n either — the briefing is delivered by
         // `coord assign --interactive` itself, not by us.
         assert!(!cmd.contains('\n'), "launcher must not embed newlines");
+    }
+
+    #[test]
+    fn build_troubleshoot_launch_cmd_is_single_line_file_briefing_and_read_only() {
+        // #569 bugs #2 and #3: Troubleshoot must launch as a single physical
+        // line with the briefing passed BY FILE (not inlined) and via the
+        // read-only --troubleshoot mode (not a claim-gated work dispatch).
+        let cmd = build_troubleshoot_launch_cmd(
+            None,
+            "/tmp/coord-troubleshoot-42.md",
+            "elitebook",
+            "claude-coordinator",
+            42,
+        );
+        // Bug #2: ONE physical line — the trailing \r is the submit key, not a
+        // line break.  A multi-line briefing inlined here would split on its
+        // newlines and strand the PTY shell at `quote>`.
+        assert_eq!(cmd.matches('\r').count(), 1, "exactly one \\r: {cmd:?}");
+        assert!(
+            !cmd.trim_end_matches('\r').contains('\n'),
+            "troubleshoot launch must be a single line: {cmd:?}"
+        );
+        // Bug #2: briefing delivered by file, not inlined.
+        assert!(
+            cmd.contains("--briefing-file /tmp/coord-troubleshoot-42.md"),
+            "must pass --briefing-file: {cmd}"
+        );
+        // Bug #3: read-only --troubleshoot mode, NOT a claim-gated work dispatch.
+        assert!(cmd.contains("--interactive --troubleshoot"), "{cmd}");
+        assert!(
+            !cmd.contains("--no-plan"),
+            "must not use the old claim-gated work dispatch: {cmd}"
+        );
+        assert!(cmd.contains("claude-coordinator"), "{cmd}");
+        assert!(cmd.ends_with("42\r"), "issue number at the tail: {cmd:?}");
     }
 
     #[test]

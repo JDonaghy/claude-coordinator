@@ -949,3 +949,95 @@ class TestAssignInteractiveRemoteWork:
         assert result.exit_code == 0, result.output
         spy.assert_not_called()
         assert "coord reattach" in result.output
+
+
+class TestAssignBriefingFileAndTroubleshoot:
+    """#569: --briefing-file (bug #2) and --troubleshoot (bug #3)."""
+
+    def test_briefing_file_is_read_as_briefing(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path
+    ) -> None:
+        # A multi-line briefing read from a file is delivered verbatim (this is
+        # what lets the TUI avoid inlining a multi-line --briefing that would
+        # strand the PTY shell at `quote>`).
+        bf = tmp_path / "brief.md"
+        bf.write_text("Line one\nLine two\nmulti-line diagnostic briefing")
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "bf-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "5",
+                    "--config", str(config_file),
+                    "--briefing-file", str(bf),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert (
+            "Line one\nLine two\nmulti-line diagnostic briefing"
+            in proposal.briefing
+        )
+
+    def test_troubleshoot_requires_interactive(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path
+    ) -> None:
+        bf = tmp_path / "d.md"
+        bf.write_text("diag")
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "9",
+                    "--config", str(config_file),
+                    "--troubleshoot", "--briefing-file", str(bf),
+                ],
+            )
+        assert result.exit_code == 2
+        assert "requires --interactive" in result.output
+
+    def test_troubleshoot_mutually_exclusive_with_review_of(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path
+    ) -> None:
+        bf = tmp_path / "d.md"
+        bf.write_text("diag")
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "9",
+                    "--config", str(config_file),
+                    "--interactive", "--troubleshoot", "--review-of", "abc123",
+                    "--briefing-file", str(bf),
+                ],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_troubleshoot_dry_run_is_read_only_no_worktree(
+        self, config_file: Path, coord_dir: Path, tmp_path: Path
+    ) -> None:
+        bf = tmp_path / "diag.md"
+        bf.write_text("diagnostic snapshot\nassignments: (none)")
+        # Make the target machine look local so the local diagnostic path runs.
+        with patch("coord.github_ops.get_issue", return_value={"title": "Stuck"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "9",
+                    "--config", str(config_file),
+                    "--interactive", "--troubleshoot",
+                    "--briefing-file", str(bf),
+                    "--dry-run",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "TROUBLESHOOT" in result.output
+        assert "read-only" in result.output
+        assert "no worktree" in result.output
+        # Read-only tool set — no Edit/Write granted to the live checkout.
+        assert "Read,Bash,Grep,Glob" in result.output
