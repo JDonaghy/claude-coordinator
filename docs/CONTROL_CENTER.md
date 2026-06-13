@@ -345,10 +345,11 @@ window key). So control keys route through the leader, never bare keys:
 (§6)** uses for tile ops. Unify them: one pane-leader across the detail
 tab-groups and the wall.
 
-**Decision to confirm:** `Ctrl-W` as the leader shadows vim's own `Ctrl-W`
-inside a focused terminal (resolved by the double-press above). If too intrusive,
-use a dedicated leader (the old F12, or screen-style `Ctrl-A`) — but `Ctrl-W` is
-what keyboard/vim users reach for.
+**Decided (2026-06-13): `Ctrl-W` is the leader.** It shadows vim's own `Ctrl-W`
+inside a focused terminal — accepted, and resolved by the double-press
+(`Ctrl-W Ctrl-W` → literal `Ctrl-W`). Alternatives (a dedicated F12 / screen-style
+`Ctrl-A` leader) were considered and rejected: `Ctrl-W` is what keyboard/vim
+users reach for, and the double-press fully recovers vim's window key.
 
 **Related:** #551 (the leak this prevents), #454 (mouse forwarding, shipped),
 #484 (terminal selection vs scroll offset), #574 (the wall uses this leader),
