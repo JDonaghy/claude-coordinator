@@ -529,3 +529,173 @@ class TestFinalizeRemovesWorktree:
         assert result.already_recorded is True
         assert result.worktree_removed is True
         assert not wt_path.exists()
+
+
+# ── Artifact stash on interactive finalize (#562) ─────────────────────────────
+
+
+class TestFinalizeStashesArtifacts:
+    """finalize_interactive_exit must stash build artifacts before worktree removal."""
+
+    def test_stash_on_normal_finalize(
+        self, repo_with_remote: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """Artifacts matching artifact_paths are stashed before the worktree is removed."""
+        from coord.interactive import finalize_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        local, _ = repo_with_remote
+        state_dir = tmp_path / "state"
+        wt_path, _ = setup_interactive_worktree(
+            local,
+            issue_number=562,
+            issue_title="stash test",
+            assignment_id="stash01",
+            default_branch="main",
+            state_dir=state_dir,
+        )
+
+        # Place a fake binary in the worktree that matches the artifact pattern.
+        bin_dir = wt_path / "target" / "debug"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "myapp").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+        _seed_running_assignment("stash01")
+        coord_dir = tmp_path / "coord"
+        coord_dir.mkdir()
+        with patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.state.COORD_DIR", coord_dir):
+            result = finalize_interactive_exit(
+                assignment_id="stash01",
+                repo_name="myrepo",
+                repo_github="acme/myrepo",
+                issue_number=562,
+                machine_name="laptop",
+                worktree_path=str(wt_path),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                repo_path=str(local),
+                artifact_paths=["target/debug/myapp"],
+            )
+
+        # Worktree should be gone.
+        assert result.worktree_removed is True
+        assert not wt_path.exists()
+
+        # Artifact should be stashed under coord_dir.
+        # Branch name is deterministic: issue-{N}-{slug} from setup_interactive_worktree.
+        from coord.agent import _sanitize_branch, _slugify
+        expected_branch = f"issue-562-{_slugify('stash test')}"
+        sanitized = _sanitize_branch(expected_branch)
+        stash = coord_dir / "artifacts" / "myrepo" / sanitized
+        assert stash.exists(), f"stash dir not created at {stash}"
+        assert (stash / "myapp").exists(), "artifact not stashed before worktree removal"
+        assert (stash / ".assignment_id").read_text() == "stash01"
+
+    def test_no_stash_when_artifact_paths_empty(
+        self, repo_with_remote: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """When artifact_paths is empty, no stash directory is created."""
+        from coord.interactive import finalize_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        local, _ = repo_with_remote
+        state_dir = tmp_path / "state"
+        wt_path, _ = setup_interactive_worktree(
+            local,
+            issue_number=563,
+            issue_title="no stash",
+            assignment_id="stash02",
+            default_branch="main",
+            state_dir=state_dir,
+        )
+
+        _seed_running_assignment("stash02")
+        coord_dir = tmp_path / "coord"
+        coord_dir.mkdir()
+        with patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.state.COORD_DIR", coord_dir):
+            finalize_interactive_exit(
+                assignment_id="stash02",
+                repo_name="myrepo",
+                repo_github="acme/myrepo",
+                issue_number=563,
+                machine_name="laptop",
+                worktree_path=str(wt_path),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                repo_path=str(local),
+                # No artifact_paths — default None
+            )
+
+        assert not (coord_dir / "artifacts").exists(), (
+            "no artifact stash dir should be created when artifact_paths is empty"
+        )
+
+    def test_stash_on_already_recorded_finalize(
+        self, repo_with_remote: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """Artifacts are stashed even when coord report-result already ran."""
+        from coord.interactive import finalize_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+        import coord.issue_store as issue_store
+
+        local, _ = repo_with_remote
+        state_dir = tmp_path / "state"
+        wt_path, _ = setup_interactive_worktree(
+            local,
+            issue_number=564,
+            issue_title="early report",
+            assignment_id="stash03",
+            default_branch="main",
+            state_dir=state_dir,
+        )
+
+        # Put a binary in the worktree.
+        bin_dir = wt_path / "target" / "debug"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "myapp").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+        _seed_running_assignment("stash03")
+        # Simulate coord report-result having already written DONE.
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="stash03",
+                    machine_name="laptop",
+                    repo_name="myrepo",
+                    repo_github="acme/myrepo",
+                    issue_number=564,
+                    status="done",
+                    verdict="approve",
+                    summary="done via report-result",
+                )
+            )
+
+        coord_dir = tmp_path / "coord"
+        coord_dir.mkdir()
+        with patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.state.COORD_DIR", coord_dir):
+            result = finalize_interactive_exit(
+                assignment_id="stash03",
+                repo_name="myrepo",
+                repo_github="acme/myrepo",
+                issue_number=564,
+                machine_name="laptop",
+                worktree_path=str(wt_path),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                repo_path=str(local),
+                artifact_paths=["target/debug/myapp"],
+            )
+
+        # Already recorded path: stash should still have run.
+        assert result.already_recorded is True
+        assert result.worktree_removed is True
+        # Artifact stashed using the branch the worktree HEAD is on.
+        stash_base = coord_dir / "artifacts" / "myrepo"
+        stash_files = list(stash_base.rglob("myapp")) if stash_base.exists() else []
+        assert stash_files, "artifact should be stashed even when already_recorded=True"

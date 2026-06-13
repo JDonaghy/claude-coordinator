@@ -1121,6 +1121,82 @@ def test_artifact_manifest_returns_file_list(tmp_path: Path) -> None:
     assert manifest["total_bytes"] == manifest["files"][0]["size"]
 
 
+# ── stash_artifacts_for_branch standalone function (#562) ─────────────────────
+
+
+def test_stash_artifacts_for_branch_copies_file(tmp_path: Path) -> None:
+    """stash_artifacts_for_branch (module-level) copies matching files."""
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    (wt / "target" / "debug").mkdir(parents=True)
+    binary = wt / "target" / "debug" / "coord-tui"
+    binary.write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    state_dir = tmp_path / "state"
+    count = stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-562-fix",
+        repo_name="coord-tui",
+        patterns=["target/debug/coord-tui"],
+        state_dir=state_dir,
+        assignment_id="aid-test",
+    )
+
+    stash = state_dir / "artifacts" / "coord-tui" / "issue-562-fix"
+    assert count == 1
+    assert (stash / "coord-tui").exists()
+    assert (stash / ".assignment_id").read_text() == "aid-test"
+
+
+def test_stash_artifacts_for_branch_noop_empty_patterns(tmp_path: Path) -> None:
+    """Returns 0 immediately when patterns list is empty."""
+    from coord.agent import stash_artifacts_for_branch
+
+    count = stash_artifacts_for_branch(
+        worktree_path=tmp_path / "wt",
+        branch="some-branch",
+        repo_name="myrepo",
+        patterns=[],
+        state_dir=tmp_path / "state",
+    )
+    assert count == 0
+    assert not (tmp_path / "state" / "artifacts").exists()
+
+
+def test_stash_artifacts_for_branch_noop_missing_worktree(tmp_path: Path) -> None:
+    """Returns 0 when the worktree directory doesn't exist."""
+    from coord.agent import stash_artifacts_for_branch
+
+    count = stash_artifacts_for_branch(
+        worktree_path=tmp_path / "nonexistent",
+        branch="some-branch",
+        repo_name="myrepo",
+        patterns=["target/debug/foo"],
+        state_dir=tmp_path / "state",
+    )
+    assert count == 0
+
+
+def test_agent_stash_artifacts_delegates_to_standalone(tmp_path: Path) -> None:
+    """AgentServer._stash_artifacts delegates to stash_artifacts_for_branch (#562).
+
+    Verify the refactored wrapper still produces the correct stash so we
+    haven't broken the existing worker path while extracting the function.
+    """
+    server, a, wt_path = _make_done_assignment(tmp_path)
+
+    target_dir = wt_path / "target" / "debug"
+    target_dir.mkdir(parents=True)
+    (target_dir / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    server._stash_artifacts(a)
+
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-1-my-feature"
+    assert (stash_dir / "mybinary").exists(), "delegation broke the stash"
+    assert (stash_dir / ".assignment_id").read_text() == "asgn-abc123"
+
+
 def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:
     """_sanitize_branch should replace slashes with dashes."""
     from coord.agent import _sanitize_branch

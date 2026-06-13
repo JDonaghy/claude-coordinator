@@ -523,6 +523,123 @@ _STASH_SKIP_SUFFIXES: frozenset[str] = frozenset(
 _BUILD_HASH_SUFFIX_RE = re.compile(r"^(.+)-[0-9a-f]{16}$")
 
 
+def stash_artifacts_for_branch(
+    worktree_path: Path,
+    branch: str,
+    repo_name: str,
+    patterns: list[str],
+    state_dir: Path,
+    assignment_id: str | None = None,
+    log_path: str | None = None,
+) -> int:
+    """Copy build artifacts from *worktree_path* into the persistent stash.
+
+    Standalone helper shared by :meth:`AgentServer._stash_artifacts` (worker
+    path) and :func:`coord.interactive.finalize_interactive_exit` (interactive
+    path, #562).  Both call this function so the same filter/copy/GC logic
+    applies regardless of how the session was launched.
+
+    Files matching *patterns* (glob strings relative to *worktree_path*) are
+    copied to ``<state_dir>/artifacts/<repo_name>/<sanitized_branch>/``.
+    Build-intermediate suffixes (.d, .o, .rlib, .rmeta, .rcgu) and files
+    smaller than 100 bytes are skipped.  Cargo hash-stamped duplicates
+    (``<name>-<16 hex>``) are de-duplicated when the canonical sibling also
+    matches.
+
+    A ``.assignment_id`` marker is written when *assignment_id* is provided so
+    the manifest endpoint can surface which build produced the stash.
+
+    Returns the number of files copied (0 for a no-op).
+    """
+    if not patterns:
+        return 0
+    sanitized = _sanitize_branch(branch)
+    stash_dir = state_dir / "artifacts" / repo_name / sanitized
+    stash_dir.mkdir(parents=True, exist_ok=True)
+
+    if not worktree_path.exists():
+        return 0
+
+    copied = 0
+    # Collect every candidate path up-front so we can identify which canonical
+    # names are present before deciding whether to skip hash-suffixed duplicates.
+    candidates: list[Path] = []
+    for pattern in patterns:
+        # Reject patterns containing ".." — Path.glob("../foo") succeeds in
+        # Python 3.12+ and can escape the worktree.  artifact_paths comes from
+        # trusted config, but an explicit check is cheap insurance.
+        if ".." in Path(pattern).parts:
+            continue
+        try:
+            matches = list(worktree_path.glob(pattern))
+        except (ValueError, OSError):
+            continue
+        for src in matches:
+            if src.is_file():
+                candidates.append(src)
+
+    # Build the set of canonical file names: files whose stem does NOT look
+    # like `<name>-<16 hex>`.  Used below to skip hash-stamped duplicates.
+    canonical_names: set[str] = {
+        src.name
+        for src in candidates
+        if _BUILD_HASH_SUFFIX_RE.match(src.stem) is None
+    }
+
+    for src in candidates:
+        # Skip build-intermediate files (.d, .o, .rlib, .rmeta, .rcgu).
+        if src.suffix in _STASH_SKIP_SUFFIXES:
+            continue
+        try:
+            st = src.stat()
+        except OSError:
+            continue
+        # Skip tiny files (< 100 bytes — not a real binary).
+        if st.st_size < 100:
+            continue
+        # De-duplicate hash-suffixed binaries: Cargo emits both `tui_app` and
+        # `tui_app-abcdef0123456789`.  Skip the hash-stamped copy when the
+        # canonical sibling is also present in the match set.  If ONLY the
+        # hash-suffixed form exists (no canonical sibling), keep it — never
+        # drop the only copy of a binary.
+        m = _BUILD_HASH_SUFFIX_RE.match(src.stem)
+        if m is not None:
+            canonical_name = m.group(1) + src.suffix
+            if canonical_name in canonical_names:
+                continue
+        dst = stash_dir / src.name
+        try:
+            shutil.copy2(src, dst)
+            copied += 1
+        except (OSError, shutil.Error):
+            pass
+
+    # Touch the stash directory so its mtime reflects this stash run.
+    # mkdir(exist_ok=True) is a no-op when the directory already exists, so
+    # a re-stash would leave the original Day-1 mtime — causing _gc_artifacts
+    # to evict the refreshed stash prematurely.
+    try:
+        stash_dir.touch()
+    except OSError:
+        pass
+
+    # Write the assignment_id marker so the manifest endpoint can surface
+    # which build produced this stash without iterating all assignments.
+    if assignment_id is not None:
+        try:
+            (stash_dir / ".assignment_id").write_text(assignment_id)
+        except OSError:
+            pass
+
+    if log_path:
+        _append_log_line(
+            log_path,
+            f"# stash: {copied} artifact(s) → {stash_dir}\n",
+        )
+
+    return copied
+
+
 def _parse_worktree_porcelain(output: str) -> list[dict[str, str]]:
     """Parse ``git worktree list --porcelain`` output into a list of dicts.
 
@@ -1343,10 +1460,9 @@ class AgentServer:
         workers) with a recorded branch and at least one configured glob
         pattern for the repo.
 
-        The stash is at ``~/.coord/artifacts/<repo>/<sanitized_branch>/``.
-        A ``.assignment_id`` marker is written so the manifest endpoint can
-        report which assignment produced the stash.  Existing stash contents
-        for the same (repo, branch) pair are overwritten — latest-wins.
+        Delegates to the module-level :func:`stash_artifacts_for_branch`
+        (#562) so the same logic is reachable from the interactive finalize
+        path without importing the full AgentServer graph.
         """
         if assignment.status != DONE:
             return
@@ -1360,96 +1476,19 @@ class AgentServer:
         if not branch:
             return
 
-        sanitized = _sanitize_branch(branch)
-        stash_dir = self.state_dir / "artifacts" / repo_name / sanitized
-        stash_dir.mkdir(parents=True, exist_ok=True)
-
-        wt_path = Path(assignment.worktree_path)
-        if not wt_path.exists():
-            return
-
-        copied = 0
-        # Collect every candidate path up-front so we can identify which
-        # canonical names are present before deciding whether to skip
-        # hash-suffixed duplicates.
-        candidates: list[Path] = []
-        for pattern in patterns:
-            # Reject patterns containing ".." — Path.glob("../foo") succeeds
-            # in Python 3.12+ and can reach outside the worktree.  The
-            # ValueError guard below does NOT catch this.  artifact_paths comes
-            # from trusted config, but an explicit check is cheap insurance.
-            if ".." in Path(pattern).parts:
-                continue
-            try:
-                matches = list(wt_path.glob(pattern))
-            except (ValueError, OSError):
-                continue
-            for src in matches:
-                if src.is_file():
-                    candidates.append(src)
-
-        # Build the set of canonical file names: files whose stem does NOT
-        # look like `<name>-<16 hex>`.  Used below to identify the canonical
-        # sibling when deciding whether to skip a hash-stamped duplicate.
-        canonical_names: set[str] = {
-            src.name
-            for src in candidates
-            if _BUILD_HASH_SUFFIX_RE.match(src.stem) is None
-        }
-
-        for src in candidates:
-            # Skip build-intermediate files (.d, .o, .rlib, .rmeta, .rcgu).
-            if src.suffix in _STASH_SKIP_SUFFIXES:
-                continue
-            try:
-                st = src.stat()
-            except OSError:
-                continue
-            # Skip tiny files (< 100 bytes — not a real binary)
-            if st.st_size < 100:
-                continue
-            # De-duplicate hash-suffixed binaries: Cargo emits both
-            # `tui_app` and `tui_app-<16 hex>`.  Skip the hash-stamped copy
-            # when the canonical sibling is also present in the match set.
-            # If ONLY the hash-suffixed form exists (no canonical sibling),
-            # keep it — never drop the only copy of a binary.
-            m = _BUILD_HASH_SUFFIX_RE.match(src.stem)
-            if m is not None:
-                canonical_name = m.group(1) + src.suffix
-                if canonical_name in canonical_names:
-                    continue
-            dst = stash_dir / src.name
-            try:
-                shutil.copy2(src, dst)
-                copied += 1
-            except (OSError, shutil.Error):
-                pass
-
-        # Touch the stash directory so its mtime reflects this stash run.
-        # mkdir(exist_ok=True) is a no-op when the directory already exists,
-        # meaning a re-stash (e.g. after a review cycle on the same branch)
-        # would leave the original Day-1 mtime in place — causing _gc_artifacts
-        # to evict the refreshed stash prematurely.
-        try:
-            stash_dir.touch()
-        except OSError:
-            pass
-
-        # Write the assignment_id marker so the manifest endpoint can surface
-        # which build produced this stash without iterating all assignments.
-        try:
-            (stash_dir / ".assignment_id").write_text(assignment.id)
-        except OSError:
-            pass
+        copied = stash_artifacts_for_branch(
+            worktree_path=Path(assignment.worktree_path),
+            branch=branch,
+            repo_name=repo_name,
+            patterns=patterns,
+            state_dir=self.state_dir,
+            assignment_id=assignment.id,
+            log_path=assignment.log_path,
+        )
 
         # Invalidate the artifact_bytes cache so health() picks up the new files.
-        self._artifact_bytes_cache = None
-
-        if assignment.log_path:
-            _append_log_line(
-                assignment.log_path,
-                f"# stash: {copied} artifact(s) → {stash_dir}\n",
-            )
+        if copied > 0:
+            self._artifact_bytes_cache = None
 
     def _gc_artifacts(self, ttl_days: float = 3.0) -> int:
         """Remove artifact stash directories older than *ttl_days* days.
