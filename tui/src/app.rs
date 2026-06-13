@@ -8243,12 +8243,26 @@ impl CoordApp {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         if let Some(latest) = latest {
-            let verdict = match latest.status.as_str() {
+            let mapped = match latest.status.as_str() {
+                // #473: the Review stage colour must reflect the VERDICT, not
+                // merely that the review process ran (a review always ends
+                // status="done").  Keying on status alone painted a
+                // `request-changes` verdict GREEN — reading as "approved" and
+                // inviting a premature merge.  Consult `review_verdict`:
+                //   approve         → Done   (green ✓)
+                //   request-changes → Failed (red ✗ — changes requested)
+                //   None/unknown    → Active (distinct; verdict not extracted —
+                //                     must NOT read as green)
+                "done" if stage == "review" => match latest.review_verdict.as_deref() {
+                    Some("approve") => Some(StageStatus::Done),
+                    Some("request-changes") | Some("fail") => Some(StageStatus::Failed),
+                    _ => Some(StageStatus::Active),
+                },
                 "done" => Some(StageStatus::Done),
                 "failed" => Some(StageStatus::Failed),
                 _ => None,
             };
-            if let Some(v) = verdict {
+            if let Some(v) = mapped {
                 // #193: a Done/Failed verdict is only trustworthy if no upstream
                 // stage has been re-dispatched since. If any upstream's latest
                 // dispatched_at is newer than this stage's latest, the verdict
@@ -26814,6 +26828,45 @@ mod tests {
     }
 
     #[test]
+    fn review_stage_status_reflects_verdict_not_just_done() {
+        // #473: the Review stage must key on review_verdict, not merely that the
+        // review process ran (it always ends status="done").  A request-changes
+        // verdict must NEVER render Done (green).
+        let issue = PipelineIssue {
+            number: 700,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        };
+        let mk_review = |verdict: Option<&str>| {
+            let mut a = make_assignment_typed("done", 700, "api", Some("review"));
+            a.review_verdict = verdict.map(|s| s.to_string());
+            a.dispatched_at = Some(100.0); // no upstream → no #193 stale path
+            a
+        };
+        let mut app = make_app_default();
+
+        app.data.assignments = vec![mk_review(Some("approve"))];
+        assert_eq!(app.stage_status_for(&issue, "review"), StageStatus::Done);
+
+        app.data.assignments = vec![mk_review(Some("request-changes"))];
+        assert_eq!(
+            app.stage_status_for(&issue, "review"),
+            StageStatus::Failed,
+            "request-changes must render Failed (red), never green"
+        );
+
+        app.data.assignments = vec![mk_review(None)];
+        let s = app.stage_status_for(&issue, "review");
+        assert_ne!(s, StageStatus::Done, "a verdict-less review must not render green");
+        assert_eq!(s, StageStatus::Active);
+    }
+
+    #[test]
     fn rebuild_pipeline_sidebar_lifecycle_refinement_only_is_pending_not_in_progress() {
         let mut app = make_pipeline_app();
         app.pipeline_issues[0]
@@ -27630,7 +27683,14 @@ mod tests {
             exit_code: if status == "failed" { Some(1) } else { Some(0) },
             assignment_type: Some(kind.to_string()),
             test_state: None,
-            review_verdict: None,
+            // #473: a *done* review in these stage-status fixtures means
+            // "approved" (green) — the stage colour now keys on the verdict,
+            // not just status=done, so the fixture must carry it.
+            review_verdict: if kind == "review" && status == "done" {
+                Some("approve".to_string())
+            } else {
+                None
+            },
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
@@ -29508,7 +29568,7 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("review".to_string()),
             test_state: None,
-            review_verdict: None,
+            review_verdict: Some("approve".to_string()),  // #473: approved → green
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
@@ -30015,7 +30075,12 @@ mod tests {
                 exit_code: Some(0),
                 assignment_type: Some(stage_name.to_string()),
                 test_state: None,
-                review_verdict: None,
+                // #473: the review stage is green only when approved.
+                review_verdict: if stage_name == "review" {
+                    Some("approve".to_string())
+                } else {
+                    None
+                },
                 review_of_assignment_id: None,
                 cost_usd: None,
                 smoke_tests: None,
@@ -30094,7 +30159,12 @@ mod tests {
                 exit_code: Some(0),
                 assignment_type: Some(stage_name.to_string()),
                 test_state: None,
-                review_verdict: None,
+                // #473: the review stage is green only when approved.
+                review_verdict: if stage_name == "review" {
+                    Some("approve".to_string())
+                } else {
+                    None
+                },
                 review_of_assignment_id: None,
                 cost_usd: None,
                 smoke_tests: None,
