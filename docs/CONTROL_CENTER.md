@@ -333,3 +333,45 @@ acceptance, latest review verdict/comment) without navigating away.
   on tmux for the Terminal tab).
 - Named-context schema for the Conversations panel (what context sources, how
   stored, how shared in team mode).
+
+---
+
+## 13. Teams — auth & deployment (summary; full design in #282)
+
+A "small team" (e.g. two developers on a Tailscale network, **each with their
+own Claude Max**) is — for this tool — a shared **fleet + shared board state**,
+**not** a shared-auth problem. Verified mechanics and the recommended shape:
+
+- **Credentials are per-OS-user**: `~/.claude/.credentials.json` (mode 0600),
+  tied to `$HOME`. Each Max sub is per-individual (ToS); each dev having their
+  own is compliant.
+- **Headless/SSH per-person auth** = `claude setup-token` (once, locally, with a
+  browser → ~1-year token) then export `CLAUDE_CODE_OAUTH_TOKEN` in that dev's
+  remote shell. This is how each dev "individually authenticates" their own Max
+  over SSH.
+- **`CLAUDE_CONFIG_DIR` / `direnv` is the wrong tool here.** It keys off
+  *directory, not person*, gives no isolation between two humans, and is really
+  for *one* human juggling *several of their own* accounts. Don't reach for it
+  to share a machine between two people.
+
+**Deployment shapes, best → worst:**
+
+1. **Two machines on Tailscale (recommended)** — coord's *existing*
+   multi-machine model. Each dev runs coord-TUI + `coord agent` on their own box
+   under their own `~/.claude`. No auth trickery, ToS-clean. The Sessions wall
+   (§6) + `coord sessions --remote` already shows both devs' sessions.
+2. **Shared server, separate OS users** — clean OS-level credential isolation.
+   **coord gap:** `coord agent` binds port 7433 by default, so two agents can't
+   share one host until the port is configurable (tracked in #282).
+3. **Shared OS user + `direnv`** — avoid: no credential isolation, and the single
+   shared agent can only carry one auth.
+
+**Subtlety:** session auth follows whoever's *host/tmux* the session runs on,
+not who is watching it on the wall — attaching to a buddy's session drives it on
+*their* Max. Fine for pairing; just the boundary.
+
+Sustainable post-June-15 team model: each dev drives **interactive,
+human-attended** sessions on **their own Max** (billed to its owner) — the same
+migration this project is already making, now with the cleanest billing
+boundary. Full team-mode design (centralized state, identity, agent transport)
+lives in **#282**.
