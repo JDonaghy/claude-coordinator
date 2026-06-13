@@ -2627,6 +2627,33 @@ def assign(
             )
             effective_briefing = ts_reminder + briefing
 
+            # Pre-fill a SHORT, single-line prompt that points the session at
+            # the full diagnostic on disk, rather than pasting the whole
+            # multi-line briefing into the input box.  A short paste lands
+            # reliably; a multi-KB multi-line paste over the embedded-terminal /
+            # nested-tmux path often is dropped by the readiness poll
+            # (interactive._inject_briefing_into_tmux_session is best-effort).
+            # And it degrades gracefully — if the paste is missed, the operator
+            # can type the one short line by hand instead of being stranded with
+            # no context.  The full briefing still lives in the file and on the
+            # assignment row.
+            if briefing_file:
+                _ts_brief_path = str(Path(briefing_file).expanduser())
+            else:
+                import tempfile as _tempfile  # noqa: PLC0415
+
+                _ts_brief_path = str(
+                    Path(_tempfile.gettempdir()) / f"coord-troubleshoot-{issue}.md"
+                )
+                Path(_ts_brief_path).write_text(effective_briefing, encoding="utf-8")
+            seed_prompt = (
+                f"Troubleshoot {repo} #{issue}: read the diagnostic briefing at "
+                f"{_ts_brief_path} (board state, assignments, merge-queue, CI, and a "
+                "playbook of likely causes), then tell me what's wrong and the "
+                "options to unstick it. You are read-only — do not modify files, "
+                "commit, or run gh; surface any fix plan for me to approve."
+            )
+
             spec = _AssignmentSpecTs(
                 repo_name=repo,
                 repo_path=ts_repo_path,
@@ -2678,9 +2705,11 @@ def assign(
             os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
 
             started_at = _time.time()
+            # Pre-fill the SHORT seed prompt (not the full briefing) — see the
+            # seed_prompt rationale above.
             exit_code = launch_human_attended_interactive(
                 argv,
-                effective_briefing,
+                seed_prompt,
                 assignment_id=assignment_id,
                 cwd=ts_repo_path,
             )

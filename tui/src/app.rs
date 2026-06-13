@@ -20861,6 +20861,18 @@ impl CoordApp {
             return;
         };
 
+        // #569: Troubleshoot is a LOCAL-ONLY read-only diagnostic — it reads
+        // the coordinator's own board/DB and the live checkout, so there is no
+        // machine choice (and never a reattach).  Always launch on the local
+        // machine and skip both the machine picker and the reattach
+        // short-circuit below.  (A picker here would offer remote machines that
+        // `coord assign --troubleshoot` rejects with "local-only".)
+        if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
+            let machine = self.data.local_machine.clone();
+            self.launch_interactive_session_on_machine(mode, machine);
+            return;
+        }
+
         // #486 Leg 4 UX: reattach short-circuit.  If a live interactive session
         // already exists for this issue, attach to it directly and SKIP the
         // machine picker — the machine choice is meaningless for a reattach
