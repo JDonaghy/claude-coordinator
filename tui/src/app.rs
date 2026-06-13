@@ -1679,6 +1679,12 @@ struct MergeQueueEntry {
     /// Repo slug (owner/name) — needed to call `gh pr checks --repo <slug>`.
     /// Joined from the `merge_queue.repo_github` column.
     repo_github: String,
+    /// Target branch the PR merges into (e.g. "main").  `None` for entries
+    /// written before this column was read by the TUI.
+    target_branch: Option<String>,
+    /// Last gate-eval error string from `coord merge`, if any.  Non-empty
+    /// is the single most useful clue when a merge is stalled.
+    error: Option<String>,
 }
 
 /// CI check status for one PR, fetched in the background via `gh pr checks`.
@@ -2895,7 +2901,8 @@ fn load_data() -> BoardData {
     // Join to assignments to resolve issue_number (merge_queue may not have it).
     let merge_queue: Vec<MergeQueueEntry> = {
         let mut stmt = match conn.prepare(
-            "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url, mq.repo_github \
+            "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url, \
+             mq.repo_github, mq.target_branch, mq.error \
              FROM merge_queue mq \
              LEFT JOIN assignments a ON mq.assignment_id = a.assignment_id",
         ) {
@@ -2918,6 +2925,8 @@ fn load_data() -> BoardData {
                 pr_number: row.get::<_, Option<i64>>(3)?,
                 pr_url: row.get::<_, Option<String>>(4)?,
                 repo_github: row.get::<_, String>(5)?,
+                target_branch: row.get::<_, Option<String>>(6)?,
+                error: row.get::<_, Option<String>>(7)?,
             })
         }) {
             Ok(r) => r,
@@ -14916,6 +14925,14 @@ impl CoordApp {
                             .with_shortcut("f"),
                     );
                 }
+                // #569: Troubleshoot — launch a human-attended Claude session
+                // pre-loaded with a diagnostic snapshot (assignments, merge_queue,
+                // CI, stage statuses) so the operator can pinpoint why the item
+                // is stalled and either unstick it or get the exact next step.
+                items.push(ContextMenuItem::action(
+                    "troubleshoot-interactive",
+                    "Troubleshoot (interactive)",
+                ));
                 items.push(ContextMenuItem::separator());
             }
             PipelineRowLifecycle::Done => {
@@ -18082,6 +18099,16 @@ impl CoordApp {
                 self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
                 true
             }
+            // #569: Troubleshoot — human-attended diagnostic session for a
+            // stalled In-progress item.  Only shown for InProgress rows;
+            // the session is seeded with a full board-state snapshot.
+            "troubleshoot-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_interactive_session_for_selected_issue(
+                    InteractiveLaunchMode::Troubleshoot,
+                );
+                true
+            }
             "start-with-plan" => {
                 let dispatched = self.dispatch_pipeline_plan();
                 if !dispatched {
@@ -18872,6 +18899,7 @@ fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "start-plan-interactive" => Some("⌨"),
         "start-review-interactive" => Some("⌨"),
         "start-fix-interactive" => Some("⌨"),
+        "troubleshoot-interactive" => Some("⚕"),
         "start-with-plan" => Some("☰"),
         "start-skip-plan" => Some("▶"),
         "watch" => Some("◉"),
@@ -20618,6 +20646,194 @@ impl CoordApp {
             .any(|s| self.session_assignment_is_running(&s.assignment_id))
     }
 
+    /// #569: Build a diagnostic snapshot briefing for a Troubleshoot interactive
+    /// session.  Assembles the current board state — all assignments for the
+    /// issue, the merge_queue entry, CI check summary, and per-stage statuses —
+    /// into a structured prompt that a human-attended Claude session can use to
+    /// pinpoint the stall and either unstick it or advise the exact next step.
+    fn troubleshoot_briefing(&self, coord_repo: &str, issue_num: u64) -> String {
+        // Locate the PipelineIssue for stage-status helpers and display info.
+        let issue = self.pipeline_issues.iter().find(|p| {
+            p.number == issue_num
+                && p.coord_repo
+                    .as_deref()
+                    .map(|r| r == coord_repo)
+                    .unwrap_or(false)
+        });
+        let issue_title = issue
+            .map(|p| p.title.as_str())
+            .unwrap_or("(title not available)");
+        let repo_slug = issue
+            .map(|p| p.repo_slug.as_str())
+            .unwrap_or(coord_repo);
+
+        // All assignments for this issue (all types, any status), newest last.
+        let mut assignments: Vec<&Assignment> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
+            .collect();
+        assignments.sort_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut asgn_lines = Vec::new();
+        for a in &assignments {
+            let atype = a.assignment_type.as_deref().unwrap_or("work");
+            let branch = a.branch.as_deref().unwrap_or("(none)");
+            let verdict = a.review_verdict.as_deref().unwrap_or("-");
+            let test = a.test_state.as_deref().unwrap_or("-");
+            asgn_lines.push(format!(
+                "  {id}  type={typ}  status={st}  branch={br}  verdict={vd}  test={ts}",
+                id = a.id,
+                typ = atype,
+                st = a.status,
+                br = branch,
+                vd = verdict,
+                ts = test,
+            ));
+        }
+        let assignments_text = if asgn_lines.is_empty() {
+            "  (none)".to_string()
+        } else {
+            asgn_lines.join("\n")
+        };
+
+        // Merge queue entry for this issue.
+        let mq_entry = self.data.merge_queue.iter().find(|m| {
+            m.issue_number == Some(issue_num) && m.repo_github == repo_slug
+        });
+        let mq_text = match mq_entry {
+            None => "  No merge_queue entry found.".to_string(),
+            Some(m) => {
+                let pr_s = m
+                    .pr_number
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(none)".to_string());
+                let tb_s = m.target_branch.as_deref().unwrap_or("(none)");
+                let err_s = m.error.as_deref().unwrap_or("(none)");
+                format!(
+                    "  state={st}  pr_number={pr}  target_branch={tb}  error={err}",
+                    st = m.state,
+                    pr = pr_s,
+                    tb = tb_s,
+                    err = err_s,
+                )
+            }
+        };
+
+        // CI check summary (if fetched for this PR).
+        let ci_text = mq_entry
+            .and_then(|m| m.pr_number.map(|pr| (m.repo_github.as_str(), pr)))
+            .and_then(|(slug, pr)| {
+                self.pipeline_ci_checks.get(&(slug.to_string(), pr))
+            })
+            .map(|ci| {
+                let failed = if ci.failed_names.is_empty() {
+                    "none".to_string()
+                } else {
+                    ci.failed_names.join(", ")
+                };
+                format!(
+                    "  summary: {}  failed checks: {}",
+                    ci.terse(),
+                    failed,
+                )
+            })
+            .unwrap_or_else(|| "  (not yet fetched -- run: gh pr checks)".to_string());
+
+        // Per-stage statuses from the TUI board model.
+        let stage_text = if let Some(iss) = issue {
+            let stages = self.pipeline_stage_names_for_issue(iss);
+            stages
+                .iter()
+                .map(|s| {
+                    let status = self.stage_status_for(iss, s);
+                    format!("  {}: {:?}", s, status)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            "  (issue not found in current pipeline view)".to_string()
+        };
+
+        // PR number for reference commands.
+        let pr_num_str = mq_entry
+            .and_then(|m| m.pr_number)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "(none)".to_string());
+
+        format!(
+            "You are a coordinator troubleshooter. Diagnose and unstick a stalled \
+            pipeline item.\n\
+            \n\
+            ISSUE: #{n} in repo {repo} ({slug})\n\
+            Title: {title}\n\
+            \n\
+            STAGE STATUSES (TUI board state):\n{stages}\n\
+            \n\
+            ASSIGNMENTS (oldest to newest):\n{asgns}\n\
+            \n\
+            MERGE QUEUE:\n{mq}\n\
+            \n\
+            CI CHECKS:\n{ci}\n\
+            \n\
+            TASK: Diagnose the specific stall. Check each pattern in order:\n\
+            1. Test gate not recorded (smoke test required but no verdict)\n   \
+               -> coord test --passed <aid>\n\
+            2. Verdict keyed to wrong assignment after a bounce (#567)\n   \
+               -> check if latest review assignment id matches what the merge gate checks\n\
+            3. NULL-branch remote rework (#557): finalize went DB-only, branch col empty\n   \
+               -> check branch field in assignments table above\n\
+            4. Lingering worktree blocks next fix (#560)\n   \
+               -> ssh <machine> ls ~/.coord/worktrees/\n\
+            5. Coordinator running stale code from wrong base branch (#561)\n   \
+               -> git -C ~/src/claude-coordinator branch --show-current\n\
+            6. Review = request-changes, no fix dispatched yet\n   \
+               -> launch an interactive fix session from the TUI right-click menu\n\
+            7. Stale merge_queue.error\n   \
+               -> re-run: coord merge --repo {repo} --dry-run\n\
+            8. Headless review fired on interactive work (#555)\n   \
+               -> check assignment_type on the review row\n\
+            9. Misleading green review box (#473)\n   \
+               -> cross-check review_verdict in DB: sqlite3 ~/.coord/coord.db\n\
+            10. Live/Idle misclassification (#559)\n   \
+               -> confirm assignment status matches what TUI shows\n\
+            11. CI failing or pending (#240)\n   \
+               -> gh pr checks --repo {slug} {pr}\n\
+            12. PR not mergeable or has conflicts\n   \
+               -> gh pr view {pr} --repo {slug}; rebase if needed\n\
+            13. status:ready limbo (#359)\n   \
+               -> coord backlog {repo} {n}\n\
+            \n\
+            TOOLS:\n\
+            - sqlite3 ~/.coord/coord.db\n\
+            - gh pr view {pr} --repo {slug}\n\
+            - gh pr checks --repo {slug} {pr}\n\
+            - coord merge --repo {repo} --dry-run\n\
+            - docs/ARCHITECTURE.md (section: When a merge isn't happening)\n\
+            \n\
+            Start with: coord merge --repo {repo} --dry-run\n\
+            Then inspect the merge_queue error and assignment statuses above.\n\
+            \n\
+            For read-only diagnostics: act immediately.\n\
+            For mutating recovery (recording verdicts, freeing worktrees, merging):\n\
+            surface the plan and confirm with me before acting.",
+            n = issue_num,
+            repo = coord_repo,
+            slug = repo_slug,
+            title = issue_title,
+            stages = stage_text,
+            asgns = assignments_text,
+            mq = mq_text,
+            ci = ci_text,
+            pr = pr_num_str,
+        )
+    }
+
     fn launch_interactive_session_for_selected_issue(&mut self, mode: InteractiveLaunchMode) {
         // Resolve the repo up front so we can decide which machines qualify.
         let Some((repo, _key)) = self.selected_issue_repo_and_key() else {
@@ -20787,6 +21003,26 @@ impl CoordApp {
                         _ => String::new(),
                     };
                     format!("coord reattach {}{}\r", cfg, shell_quote_arg(assignment_id))
+                } else if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
+                    // #569: Troubleshoot path — build a diagnostic snapshot
+                    // briefing from current board state and seed it as the
+                    // session's opening prompt.  Uses --no-plan (work tools)
+                    // so the session can run coord/gh/sqlite3 freely.
+                    let briefing = self.troubleshoot_briefing(&repo, issue_num);
+                    let cfg = match cfg_path.as_deref() {
+                        Some(p) if !p.is_empty() => {
+                            format!("--config {} ", shell_quote_arg(p))
+                        }
+                        _ => String::new(),
+                    };
+                    format!(
+                        "coord assign {}--interactive --no-plan --briefing {} {} {} {}\r",
+                        cfg,
+                        shell_quote_arg(&briefing),
+                        shell_quote_arg(&machine),
+                        shell_quote_arg(&repo),
+                        issue_num,
+                    )
                 } else {
                     // Fresh launch path.  Re-pressing the launch key while a
                     // previous interactive session is still alive replaces the PTY.
@@ -20805,14 +21041,16 @@ impl CoordApp {
                 self.detail_terminal_spawn_errors.remove(&issue_key);
 
                 // Leg 2/3 (#517): arm the right board-driven watcher.
-                //   Work/Plan/Fix → arm auto-advance to Review (after a Fix the
-                //     re-review is incremental — its review_iteration is bumped).
+                //   Work/Plan/Fix/Troubleshoot → arm auto-advance to Review
+                //     (Troubleshoot may implement a fix, so arm the watcher
+                //     so the pipeline can advance automatically if it does).
                 //   Review → arm verdict-routing; disarm the auto-review watcher
                 //     (a review is now in flight for this work).
                 match mode {
                     InteractiveLaunchMode::Work
                     | InteractiveLaunchMode::Plan
-                    | InteractiveLaunchMode::Fix => {
+                    | InteractiveLaunchMode::Fix
+                    | InteractiveLaunchMode::Troubleshoot => {
                         let prior_done_ids = self.done_work_aids_for(&repo, issue_num);
                         self.armed_for_auto_review.insert(
                             issue_key.clone(),
@@ -20853,6 +21091,7 @@ impl CoordApp {
                         InteractiveLaunchMode::Plan => "plan→work",
                         InteractiveLaunchMode::Review => "review",
                         InteractiveLaunchMode::Fix => "fix",
+                        InteractiveLaunchMode::Troubleshoot => "troubleshoot",
                     };
                     format!(
                         "Launching interactive {} session for {} #{} …",
@@ -20968,6 +21207,12 @@ enum InteractiveLaunchMode {
     /// the reviewed work's branch; emits `coord assign --interactive --fix-of
     /// <review_aid> …`.  `work_aid` carries the REVIEW assignment id here.
     Fix,
+    /// #569: human-attended diagnostic session for a stalled pipeline item.
+    /// Opens an interactive Claude Max session seeded with a snapshot of all
+    /// board state (assignments, merge_queue, CI checks, stage statuses) plus
+    /// a playbook of common stall patterns, so the operator can diagnose and
+    /// unstick the item without manual DB spelunking.
+    Troubleshoot,
 }
 
 /// #486: short verb for an interactive launch mode — used in the machine-picker
@@ -20978,6 +21223,7 @@ fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str {
         InteractiveLaunchMode::Plan => "plan",
         InteractiveLaunchMode::Review => "review",
         InteractiveLaunchMode::Fix => "fix",
+        InteractiveLaunchMode::Troubleshoot => "troubleshoot",
     }
 }
 
@@ -21066,6 +21312,14 @@ fn build_interactive_launch_cmd(
                 cfg, aid, m, r, issue_num,
             )
         }
+        // #569: Troubleshoot is handled in the caller before reaching here
+        // (the diagnostic briefing requires app state not available in this
+        // free function).  This arm is unreachable in practice — emit a
+        // plain work command as a safe fallback.
+        InteractiveLaunchMode::Troubleshoot => format!(
+            "coord assign {}--interactive --no-plan {} {} {}\r",
+            cfg, m, r, issue_num,
+        ),
     }
 }
 
@@ -26834,6 +27088,8 @@ mod tests {
             pr_number: Some(1),
             pr_url: None,
             repo_github: "acme/repo-a".to_string(),
+            target_branch: None,
+            error: None,
         });
         seed_open_issue_records(&mut app, "repo-a", &[7]);
         let cache = app.board_issues_cache.clone();
@@ -27566,6 +27822,8 @@ mod tests {
             pr_number: Some(1),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "done");
@@ -27654,6 +27912,8 @@ mod tests {
             pr_number: Some(101),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
 
         // Real state takes over — the merge_queue entry exists, so the
@@ -27706,6 +27966,8 @@ mod tests {
                 pr_number: Some(101),
                 pr_url: None,
                 repo_github: "acme/api".to_string(),
+                target_branch: None,
+                error: None,
             }],
             ..BoardData::default()
         };
@@ -28912,6 +29174,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         assert!(app.merge_blocked_on_review_for_selected_issue());
     }
@@ -28928,6 +29192,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         // An approved review on the board unblocks the merge.
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -28949,6 +29215,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -28971,6 +29239,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         assert!(!app.merge_blocked_on_review_for_selected_issue());
     }
@@ -29004,6 +29274,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -29030,6 +29302,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -29067,6 +29341,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         // Work assignment carries review_verdict='approve' directly — no
         // separate review assignment is present (the self-approval case).
@@ -29098,6 +29374,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         assert_eq!(
             app.pipeline_merge_state(),
@@ -29120,6 +29398,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -29186,6 +29466,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -29232,6 +29514,8 @@ mod tests {
             pr_number: Some(268),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
 
         // Original work (done, request-changes review).
@@ -29324,6 +29608,8 @@ mod tests {
             pr_number: None,
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
 
         let mut orig_work = _stage_assignment("orig-work", "work", 100.0, "done");
@@ -29367,6 +29653,8 @@ mod tests {
             pr_number: Some(268),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
 
         // Bounce scenario: original request-changes, fix approved.
@@ -29759,6 +30047,8 @@ mod tests {
             pr_number: Some(7),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let issue = &app.pipeline_issues[0];
         // Lifecycle section must say "done" (open-but-merged path).
@@ -29781,6 +30071,8 @@ mod tests {
             pr_number: Some(8),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.pipeline_lifecycle_section(issue), "done");
@@ -30237,6 +30529,8 @@ mod tests {
             pr_number: Some(7),
             pr_url: Some("https://example/pr/7".to_string()),
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Done);
@@ -30253,6 +30547,8 @@ mod tests {
             pr_number: Some(7),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Active);
@@ -30272,6 +30568,8 @@ mod tests {
             pr_number: Some(7),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
 
         // Failing CI → Failed.
@@ -30369,6 +30667,8 @@ mod tests {
             pr_number: Some(pr),
             pr_url: None,
             repo_github: repo.to_string(),
+            target_branch: None,
+            error: None,
         }
     }
 
@@ -30738,6 +31038,8 @@ mod tests {
             pr_number: Some(7),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -30822,6 +31124,8 @@ mod tests {
             pr_number: None,
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[2].status, StageStatus::Failed);
@@ -32239,6 +32543,8 @@ mod tests {
             pr_number: Some(123),
             pr_url: Some("https://github.com/acme/api/pull/123".to_string()),
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         // Seed the cache directly — bypasses the gh subprocess.
         app.fetched_prs_cache.borrow_mut().insert(
@@ -32308,6 +32614,8 @@ mod tests {
             pr_number: Some(243),
             pr_url: Some("https://github.com/acme/api/pull/243".to_string()),
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         // Seed the cache with a fully populated PR including review.
         app.fetched_prs_cache.borrow_mut().insert(
@@ -32380,6 +32688,8 @@ mod tests {
             pr_number: Some(244),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         app.fetched_prs_cache.borrow_mut().insert(
             ("acme/api".to_string(), 244),
@@ -32437,6 +32747,8 @@ mod tests {
             pr_number: Some(124),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         // Pre-populate `pending_pr_fetches` so `pr_info_for_issue`
         // doesn't actually shell out to gh during the test.  An empty
@@ -33042,6 +33354,8 @@ mod tests {
                 pr_number: None,
                 pr_url: None,
                 repo_github: "JDonaghy/quadraui".to_string(),
+                target_branch: None,
+                error: None,
             }],
             ..BoardData::default()
         });
@@ -33774,6 +34088,8 @@ mod tests {
             pr_number: Some(999),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.issue_number = 42;
@@ -33806,6 +34122,113 @@ mod tests {
         let acted = app.dispatch_bounce_for_selected_pipeline_row();
         assert!(!acted, "no spawn when nothing to bounce");
         assert!(app.toasts.len() > toasts_before);
+    }
+
+    // ── #569: Troubleshoot right-click action ────────────────────────────────
+
+    #[test]
+    fn pipeline_in_progress_row_offers_troubleshoot() {
+        // InProgress rows must include the Troubleshoot action so the
+        // operator can launch a diagnostic session for a stalled item.
+        let app = make_app_default();
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            action_ids.contains(&"troubleshoot-interactive"),
+            "Pipeline:InProgress menu must offer Troubleshoot; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn pipeline_new_row_does_not_offer_troubleshoot() {
+        // New (unstarted) rows have no stall to diagnose — Troubleshoot
+        // only makes sense for InProgress items.
+        let app = make_app_default();
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let action_ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            !action_ids.contains(&"troubleshoot-interactive"),
+            "Pipeline:New row must NOT offer Troubleshoot; got {:?}",
+            action_ids,
+        );
+    }
+
+    #[test]
+    fn dispatch_troubleshoot_interactive_handled() {
+        // The troubleshoot-interactive action id must be recognised by
+        // dispatch_context_menu_action — i.e. it returns true (handled).
+        // Spawning the terminal session will fail silently in the test
+        // environment (no PTY), but the dispatch itself must not panic or
+        // return false.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            lifecycle: PipelineRowLifecycle::InProgress,
+        };
+        let handled = app.dispatch_context_menu_action("troubleshoot-interactive", &target);
+        assert!(
+            handled,
+            "'troubleshoot-interactive' must be handled by dispatch_context_menu_action",
+        );
+    }
+
+    #[test]
+    fn troubleshoot_briefing_contains_issue_and_repo() {
+        // The diagnostic briefing must embed the issue number and repo so
+        // the seeded session knows what it is diagnosing.
+        let mut app = make_pipeline_app();
+        // Make sure issue 42 is in pipeline_issues (make_pipeline_app does this).
+        let briefing = app.troubleshoot_briefing("api", 42);
+        assert!(
+            briefing.contains("42"),
+            "briefing must reference issue number 42; got: {}",
+            &briefing[..briefing.len().min(200)],
+        );
+        assert!(
+            briefing.contains("api"),
+            "briefing must reference repo 'api'; got: {}",
+            &briefing[..briefing.len().min(200)],
+        );
+    }
+
+    #[test]
+    fn troubleshoot_briefing_includes_merge_queue_state() {
+        // When a merge_queue entry exists for the issue, the briefing
+        // must surface its state and error so the operator can see at a
+        // glance why the merge gate is blocked.
+        let mut app = make_pipeline_app();
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(101),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: Some("main".to_string()),
+            error: Some("CI check failed: build".to_string()),
+        });
+        let briefing = app.troubleshoot_briefing("api", 42);
+        assert!(
+            briefing.contains("pending"),
+            "briefing must include merge_queue state; got: {}",
+            &briefing[..briefing.len().min(400)],
+        );
+        assert!(
+            briefing.contains("CI check failed"),
+            "briefing must include merge_queue error; got: {}",
+            &briefing[..briefing.len().min(400)],
+        );
     }
 
     #[test]
@@ -33985,6 +34408,8 @@ mod tests {
             pr_number: Some(7),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         // Query the helper directly rather than via rebuild so we don't trip
         // the "same issue — skip auto-focus" guard.
@@ -34080,6 +34505,8 @@ mod tests {
             pr_number: Some(99),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         // Explicitly focus the last stage (merge = index 2).
         let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
@@ -34119,6 +34546,8 @@ mod tests {
             pr_number: Some(7),
             pr_url: None,
             repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
         });
         app.active_view = SidebarView::Pipeline;
         app.pipeline_sel = Some(0);
@@ -38035,6 +38464,8 @@ mod tests {
             pr_number: None,
             pr_url: None,
             repo_github: repo_github.to_string(),
+            target_branch: None,
+            error: None,
         }
     }
 
