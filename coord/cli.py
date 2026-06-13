@@ -6433,9 +6433,46 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                 # A fix/work/plan session wrote commits in a remote worktree on
                 # a known branch → push them back (#486d).  (A review is
                 # read-only and falls through to the DB-only branch below.)
+                #
+                # #557 defensive backstop: if branch_val is None (rework/fix
+                # assignment was created before the record_dispatched_assignment
+                # branch-persist fix landed), try to derive it from the remote
+                # worktree's HEAD so we don't strand commits.
+                _branch_val = branch_val
                 if (
                     assignment_type_val in ("fix", "work", "plan")
-                    and branch_val
+                    and not _branch_val
+                    and ssh_target_val
+                ):
+                    try:
+                        import subprocess as _sp  # noqa: PLC0415
+                        from coord.interactive import (  # noqa: PLC0415
+                            _SSH_MUX_OPTS as _MUX,
+                        )
+                        _probe = _sp.run(
+                            [
+                                "ssh", *_MUX, ssh_target_val,
+                                f"git -C {_remote_worktree_sh}"
+                                " rev-parse --abbrev-ref HEAD 2>/dev/null",
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
+                        if _probe.returncode == 0:
+                            _derived = _probe.stdout.strip()
+                            if _derived and _derived != "HEAD":
+                                click.echo(
+                                    f"  note: branch not in DB — derived from "
+                                    f"remote worktree HEAD: {_derived}",
+                                    err=True,
+                                )
+                                _branch_val = _derived
+                    except Exception:  # noqa: BLE001
+                        pass
+                if (
+                    assignment_type_val in ("fix", "work", "plan")
+                    and _branch_val
                     and remote_repo_sh
                     and ssh_target_val
                 ):
@@ -6448,7 +6485,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                         ssh_target=ssh_target_val,
                         remote_worktree_sh=_remote_worktree_sh,
                         remote_repo_sh=remote_repo_sh,
-                        branch=branch_val,
+                        branch=_branch_val,
                         base_branch=base_branch_val,
                         exit_code=exit_code,
                         started_at=started_at,

@@ -699,6 +699,103 @@ class TestReattachRemote:
         assert kwargs["branch"] == "issue-42-classify-fix"
         assert kwargs["ssh_target"] == "mymachine.tailnet"
 
+    def test_remote_fix_null_branch_derives_from_worktree_head(
+        self, config_file: Path, coord_db: Any
+    ) -> None:
+        """#557 defensive backstop: when a remote fix/work row has branch=NULL
+        (pre-fix dispatch), _run_finalize derives the branch via
+        `ssh … git rev-parse --abbrev-ref HEAD` and uses it for the
+        remote push-back instead of falling to the DB-only path."""
+        # Assignment recorded WITHOUT a branch (simulates old dispatch bug).
+        _insert_assignment(
+            coord_db, "aid-null-branch",
+            type="work", branch=None, machine_name="mymachine",
+        )
+        alive_seq = iter([True, False])  # alive before attach; gone after
+        fake_remote = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=2, push_ok=True, push_error=None,
+        )
+
+        def _mock_run(cmd: list[str], **kwargs: Any) -> MagicMock:
+            m = MagicMock(returncode=0)
+            # The ssh git rev-parse probe: capture-pane calls don't reach here
+            # (we mock tmux_session_alive); only the ssh attach and the branch
+            # probe pass through subprocess.run in this path.
+            if "rev-parse" in " ".join(cmd):
+                m.stdout = "issue-42-derived-branch\n"
+            else:
+                m.stdout = ""
+            return m
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive",
+                   side_effect=lambda _n, host=None: next(alive_seq, False)), \
+             patch("subprocess.run", side_effect=_mock_run), \
+             patch("coord.interactive.finalize_interactive_exit") as mock_fin, \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=fake_remote) as mock_remote_fin:
+            result = CliRunner().invoke(
+                main, ["reattach", "aid-null-branch", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, output_and_stderr(result)
+        # Must have used the remote push-back, NOT the DB-only fallback.
+        mock_remote_fin.assert_called_once()
+        mock_fin.assert_not_called()
+        kwargs = mock_remote_fin.call_args[1]
+        assert kwargs["branch"] == "issue-42-derived-branch", (
+            "branch should be derived from remote worktree HEAD, not left as None"
+        )
+        assert kwargs["ssh_target"] == "mymachine.tailnet"
+        # Must emit the "derived from remote worktree HEAD" note.
+        combined = result.output + (result.stderr or "")
+        assert "derived from remote worktree HEAD" in combined, (
+            "operator should see a note explaining the branch was derived"
+        )
+
+    def test_remote_work_null_branch_db_only_when_derive_fails(
+        self, config_file: Path, coord_db: Any
+    ) -> None:
+        """#557: when branch is NULL AND the ssh rev-parse probe fails (e.g.
+        worktree already reaped), fall through gracefully to DB-only finalize
+        — no crash, no unhandled exception."""
+        _insert_assignment(
+            coord_db, "aid-null-reaped",
+            type="work", branch=None, machine_name="mymachine",
+        )
+        alive_seq = iter([True, False])
+        fake_db = MagicMock(already_recorded=False, terminal_status="done")
+
+        def _mock_run(cmd: list[str], **kwargs: Any) -> MagicMock:
+            m = MagicMock(returncode=0)
+            if "rev-parse" in " ".join(cmd):
+                # Simulate worktree already reaped — non-zero exit.
+                m.returncode = 128
+                m.stdout = ""
+            else:
+                m.stdout = ""
+            return m
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive",
+                   side_effect=lambda _n, host=None: next(alive_seq, False)), \
+             patch("subprocess.run", side_effect=_mock_run), \
+             patch("coord.interactive.finalize_interactive_exit",
+                   return_value=fake_db) as mock_fin, \
+             patch("coord.interactive.finalize_remote_interactive_exit") as mock_remote_fin:
+            result = CliRunner().invoke(
+                main, ["reattach", "aid-null-reaped", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, output_and_stderr(result)
+        # Branch could not be derived → falls back to DB-only.
+        mock_remote_fin.assert_not_called()
+        mock_fin.assert_called_once()
+        # Still emits the "no branch recorded" note as before.
+        combined = result.output + (result.stderr or "")
+        assert "no branch recorded" in combined
+
 
 # ── _inject_briefing_into_tmux_session ─────────────────────────────────────────
 

@@ -489,8 +489,8 @@ def record_dispatched_assignment(
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, review_of_assignment_id,
             review_target, required_gates, review_iteration,
-            provider_name
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            provider_name, branch
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -505,7 +505,10 @@ def record_dispatched_assignment(
             review_iteration = excluded.review_iteration,
             -- #324: COALESCE so a retry/re-dispatch doesn't clear a
             -- previously-recorded provider_name from the original dispatch.
-            provider_name = COALESCE(excluded.provider_name, provider_name)""",
+            provider_name = COALESCE(excluded.provider_name, provider_name),
+            -- #557: COALESCE so a re-dispatch doesn't clear a branch that
+            -- finalize already wrote (mark_notified sets branch on completion).
+            branch = COALESCE(excluded.branch, branch)""",
         (
             assignment.assignment_id or "",
             assignment.machine_name,
@@ -523,6 +526,7 @@ def record_dispatched_assignment(
             json.dumps(list(assignment.required_gates)),
             assignment.review_iteration,
             assignment.provider_name,
+            assignment.branch,
         ),
     )
     conn.commit()
