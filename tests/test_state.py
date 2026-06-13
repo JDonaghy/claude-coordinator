@@ -133,3 +133,115 @@ class TestClaudeSessionId:
         """Calling with empty strings silently does nothing."""
         update_assignment_claude_session_id("", "ses-123")  # must not raise
         update_assignment_claude_session_id("some-id", "")  # must not raise
+
+
+class TestRecordDispatchedAssignmentBranch:
+    """#557: record_dispatched_assignment must persist the branch column so
+    coord reattach can find it for the remote push-back finalize."""
+
+    def test_branch_persisted_when_set(self, coord_db) -> None:
+        """A fix/rework assignment created with branch=<name> must have that
+        branch written to the DB row, not left as NULL."""
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment, get_connection
+
+        assignment = Assignment(
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=514,
+            issue_title="[fix-1] migrate terminal",
+            assignment_id="971a1947ad91",
+            status="running",
+            branch="issue-514-migrate-terminal-onto-quadraui",
+            type="work",
+            provider_name="claude-pty",
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(
+            assignment=assignment,
+            repo_github="acme/myrepo",
+        )
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?",
+            ("971a1947ad91",),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "issue-514-migrate-terminal-onto-quadraui", (
+            "record_dispatched_assignment must persist assignment.branch to the DB"
+        )
+
+    def test_branch_none_when_not_set(self, coord_db) -> None:
+        """A review assignment (branch=None) must leave the DB branch as NULL."""
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment, get_connection
+
+        assignment = Assignment(
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=514,
+            issue_title="[review] migrate terminal",
+            assignment_id="6873d9f346d0",
+            status="running",
+            branch=None,
+            type="review",
+            provider_name="claude-pty",
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(
+            assignment=assignment,
+            repo_github="acme/myrepo",
+        )
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?",
+            ("6873d9f346d0",),
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None
+
+    def test_redispatch_does_not_clear_existing_branch(self, coord_db) -> None:
+        """ON CONFLICT: re-dispatching with branch=None must not overwrite a
+        branch that was already recorded (COALESCE guard)."""
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment, get_connection
+
+        # First dispatch — with a branch.
+        assignment_v1 = Assignment(
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=1,
+            issue_title="First dispatch",
+            assignment_id="abc123",
+            status="running",
+            branch="issue-1-some-branch",
+            type="work",
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(assignment=assignment_v1, repo_github="acme/myrepo")
+
+        # Re-dispatch without a branch (e.g. a retry that doesn't know the branch).
+        assignment_v2 = Assignment(
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=1,
+            issue_title="Re-dispatch",
+            assignment_id="abc123",
+            status="running",
+            branch=None,
+            type="work",
+            dispatched_at=1.0,
+        )
+        record_dispatched_assignment(assignment=assignment_v2, repo_github="acme/myrepo")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?",
+            ("abc123",),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "issue-1-some-branch", (
+            "COALESCE must prevent a branch-less re-dispatch from clearing the existing branch"
+        )
