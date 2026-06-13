@@ -5385,6 +5385,15 @@ impl CoordApp {
         if self.pending_data.is_none() {
             self.pending_data = Some(start_data_load());
         }
+        // #559: re-arm remote session discovery so the Live/Idle split stays
+        // current for the entire TUI run.  The initial arm is one-shot
+        // (startup only); without this, any session started after startup
+        // stays in Idle forever until the TUI is restarted.
+        if self.pending_remote_sessions.is_none() {
+            self.pending_remote_sessions = Some(spawn_remote_tmux_sessions_fetch(
+                crate::commands::find_config(),
+            ));
+        }
     }
 
     /// Push a new toast with the given title, body, and severity. Toasts
@@ -11476,7 +11485,27 @@ impl CoordApp {
         };
         match rx.try_recv() {
             Ok(sessions) => {
-                self.live_tmux_sessions = sessions;
+                // #559: merge rather than replace so that an optimistic entry
+                // (assignment_id starts with "pending-") added on a fresh
+                // launch isn't clobbered by a discovery sweep that ran before
+                // the new session was discoverable.  Keep any pending entry
+                // whose (repo_name, issue_number) pair is NOT already covered
+                // by the real discovery result; drop it once the real session
+                // appears (to avoid stale phantom entries accumulating).
+                let covered: std::collections::HashSet<(Option<String>, Option<u64>)> = sessions
+                    .iter()
+                    .map(|s| (s.repo_name.clone(), s.issue_number))
+                    .collect();
+                let surviving_pending: Vec<LiveTmuxSession> = self
+                    .live_tmux_sessions
+                    .drain(..)
+                    .filter(|s| {
+                        s.assignment_id.starts_with("pending-")
+                            && !covered.contains(&(s.repo_name.clone(), s.issue_number))
+                    })
+                    .collect();
+                self.live_tmux_sessions = surviving_pending;
+                self.live_tmux_sessions.extend(sessions);
                 self.pending_remote_sessions = None;
                 true
             }
@@ -22051,6 +22080,29 @@ impl CoordApp {
 
                 self.detail_terminal_sessions.insert(issue_key.clone(), sess);
                 self.detail_terminal_spawn_errors.remove(&issue_key);
+
+                // #559: on a fresh launch (not a reattach), optimistically add
+                // a synthetic LiveTmuxSession so the pipeline card moves to
+                // Active → Live immediately, without waiting for the next
+                // remote-discovery sweep.  The "pending-" prefix lets
+                // `poll_remote_sessions` merge it away once the real session
+                // appears in a subsequent discovery result.
+                if maybe_live_session.is_none() {
+                    // Remove any stale pending entry for this (repo, issue)
+                    // before adding the fresh one (e.g. user pressed launch
+                    // twice without a discovery sweep in between).
+                    self.live_tmux_sessions.retain(|s| {
+                        !(s.assignment_id.starts_with("pending-")
+                            && s.issue_number == Some(issue_num)
+                            && s.repo_name.as_deref() == Some(repo.as_str()))
+                    });
+                    self.live_tmux_sessions.push(LiveTmuxSession {
+                        assignment_id: format!("pending-{}-{}", repo, issue_num),
+                        issue_number: Some(issue_num),
+                        repo_name: Some(repo.clone()),
+                        issue_title: None,
+                    });
+                }
 
                 // Leg 2/3 (#517): arm the right board-driven watcher.
                 //   Work/Plan/Fix/Troubleshoot → arm auto-advance to Review
@@ -34583,6 +34635,102 @@ mod tests {
         // Nothing sent yet → no update, receiver retained for a later poll.
         assert!(!app.poll_remote_sessions());
         assert!(app.pending_remote_sessions.is_some());
+    }
+
+    // #559 — re-arm on refresh
+    #[test]
+    fn refresh_rearms_remote_session_fetch_when_idle() {
+        let mut app = make_app_default();
+        // Drain the startup arm (poll with nothing sent → stays pending).
+        // For this test we want to start in the "one-shot already consumed" state.
+        app.pending_remote_sessions = None;
+        assert!(app.pending_remote_sessions.is_none());
+        app.refresh();
+        assert!(
+            app.pending_remote_sessions.is_some(),
+            "refresh() must re-arm the remote session fetch when it was None"
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_double_arm_while_fetch_in_flight() {
+        let mut app = make_app_default();
+        // An in-flight fetch is already armed.
+        let (_tx, rx) = std::sync::mpsc::channel::<Vec<LiveTmuxSession>>();
+        app.pending_remote_sessions = Some(rx);
+        let ptr_before = app.pending_remote_sessions.as_ref().unwrap()
+            as *const std::sync::mpsc::Receiver<Vec<LiveTmuxSession>>;
+        app.refresh();
+        let ptr_after = app.pending_remote_sessions.as_ref().unwrap()
+            as *const std::sync::mpsc::Receiver<Vec<LiveTmuxSession>>;
+        assert_eq!(
+            ptr_before, ptr_after,
+            "refresh() must not replace an in-flight receiver"
+        );
+    }
+
+    // #559 — merge behaviour in poll_remote_sessions
+    #[test]
+    fn poll_remote_sessions_preserves_pending_entry_when_not_in_discovery() {
+        // An optimistic "pending-" entry for (api, #42) was added at launch.
+        // The discovery result comes back WITHOUT that session (e.g. the
+        // session was just starting up and isn't discoverable yet).
+        // The pending entry must survive so the card stays Live.
+        let mut app = make_app_default();
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "pending-api-42".to_string(),
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+        }];
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Discovery returns an unrelated session only.
+        tx.send(vec![LiveTmuxSession {
+            assignment_id: "aid-other".to_string(),
+            issue_number: Some(7),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+        }])
+        .unwrap();
+        app.pending_remote_sessions = Some(rx);
+
+        assert!(app.poll_remote_sessions());
+        // Both the optimistic entry AND the discovered entry must be present.
+        assert_eq!(app.live_tmux_sessions.len(), 2);
+        let ids: Vec<&str> = app
+            .live_tmux_sessions
+            .iter()
+            .map(|s| s.assignment_id.as_str())
+            .collect();
+        assert!(ids.contains(&"pending-api-42"), "optimistic entry must survive");
+        assert!(ids.contains(&"aid-other"), "discovered entry must be present");
+    }
+
+    #[test]
+    fn poll_remote_sessions_drops_pending_entry_when_covered_by_discovery() {
+        // The discovery result now INCLUDES a real session for (api, #42).
+        // The optimistic "pending-" entry must be dropped to avoid duplicates.
+        let mut app = make_app_default();
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "pending-api-42".to_string(),
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+        }];
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![LiveTmuxSession {
+            assignment_id: "real-aid-42".to_string(),
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+        }])
+        .unwrap();
+        app.pending_remote_sessions = Some(rx);
+
+        assert!(app.poll_remote_sessions());
+        // Only the real entry remains; the pending one is evicted.
+        assert_eq!(app.live_tmux_sessions.len(), 1);
+        assert_eq!(app.live_tmux_sessions[0].assignment_id, "real-aid-42");
     }
 
     #[test]
