@@ -2431,7 +2431,6 @@ fn plain_list(id: &str, msg: &str, scroll_offset: usize) -> ListView {
         bordered: true,
         h_scroll: 0,
         max_content_width: None,
-        show_v_scrollbar: false,
     }
 }
 
@@ -2529,7 +2528,6 @@ fn build_summary_list_view(summaries: Vec<SessionSummary>, scroll_offset: usize)
         bordered: true,
         h_scroll: 0,
         max_content_width: None,
-        show_v_scrollbar: false,
     }
 }
 
@@ -5977,7 +5975,6 @@ impl CoordApp {
             bordered: true,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -7330,7 +7327,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -7389,7 +7385,6 @@ impl CoordApp {
                 bordered: false,
                 h_scroll: 0,
                 max_content_width: None,
-                show_v_scrollbar: false,
             };
         }
 
@@ -7545,7 +7540,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -7859,7 +7853,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -7968,7 +7961,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         });
 
         // Sparkline body — only when we have data and enough vertical room.
@@ -9357,7 +9349,6 @@ impl CoordApp {
             bordered: true,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -11454,7 +11445,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -11774,7 +11764,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -11879,7 +11868,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -13064,7 +13052,6 @@ impl CoordApp {
             bordered: false,
             h_scroll,
             max_content_width,
-            show_v_scrollbar: false,
         }
     }
 
@@ -13105,7 +13092,6 @@ impl CoordApp {
                 bordered: false,
                 h_scroll: 0,
                 max_content_width: None,
-                show_v_scrollbar: false,
             };
         };
 
@@ -13126,7 +13112,6 @@ impl CoordApp {
                 bordered: false,
                 h_scroll: 0,
                 max_content_width: None,
-                show_v_scrollbar: false,
             };
         }
 
@@ -13212,7 +13197,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -17024,7 +17008,6 @@ impl CoordApp {
             bordered: true,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         };
         backend.draw_list(modal_rect, &list);
     }
@@ -17752,7 +17735,6 @@ impl CoordApp {
                 bordered: true,
                 h_scroll: 0,
                 max_content_width: None,
-                show_v_scrollbar: false,
             },
         );
 
@@ -17805,7 +17787,6 @@ impl CoordApp {
                 bordered: false,
                 h_scroll: 0,
                 max_content_width: None,
-                show_v_scrollbar: false,
             },
         );
     }
@@ -18104,7 +18085,6 @@ impl CoordApp {
                     bordered: true,
                     h_scroll: 0,
                     max_content_width: None,
-                    show_v_scrollbar: false,
                 },
             );
             if let Some(ref chat) = self.inject_chat {
@@ -18201,7 +18181,6 @@ impl CoordApp {
                     bordered: false,
                     h_scroll: 0,
                     max_content_width: None,
-                    show_v_scrollbar: false,
                 },
             );
         }
@@ -20166,7 +20145,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -20189,7 +20167,6 @@ impl CoordApp {
             bordered: false,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
         }
     }
 
@@ -21746,7 +21723,6 @@ impl CoordApp {
                     bordered: false,
                     h_scroll: 0,
                     max_content_width: None,
-                    show_v_scrollbar: false,
                 },
             );
             return;
@@ -21788,7 +21764,6 @@ impl CoordApp {
                     bordered: false,
                     h_scroll: 0,
                     max_content_width: None,
-                    show_v_scrollbar: false,
                 },
             );
         }
@@ -22444,7 +22419,6 @@ impl ShellApp for CoordApp {
                                         bordered: true,
                                         h_scroll: 0,
                                         max_content_width: None,
-                                        show_v_scrollbar: false,
                                     },
                                 );
                                 if let Some(ref chat) = self.inject_chat {
@@ -22520,7 +22494,6 @@ impl ShellApp for CoordApp {
                             bordered: false,
                             h_scroll: 0,
                             max_content_width: None,
-                            show_v_scrollbar: false,
                         },
                     );
                 }
@@ -22548,7 +22521,6 @@ impl ShellApp for CoordApp {
                         bordered: true,
                         h_scroll: 0,
                         max_content_width: None,
-                        show_v_scrollbar: false,
                     },
                 );
                 chat.render(backend, m);
@@ -25948,7 +25920,6 @@ fn issue_body_list(
         bordered: false,
         h_scroll: 0,
         max_content_width: None,
-        show_v_scrollbar: false,
     }
 }
 
