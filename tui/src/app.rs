@@ -20979,8 +20979,18 @@ impl CoordApp {
         // Otherwise (finalized work whose tmux session is gone, but the
         // discovery sweep hasn't refreshed yet) fall through to a fresh launch
         // instead of reattaching to a dead session ("session not alive").
-        let maybe_live_session =
-            maybe_live_session.filter(|aid| self.session_assignment_is_running(aid));
+        //
+        // #569: Troubleshoot is *always* a fresh diagnostic launch — never a
+        // reattach. A stalled item almost always still has a stuck/phantom
+        // `running` assignment (that's *why* it's stalled), and reattaching to
+        // it would hijack the diagnostic with the very session we're trying to
+        // diagnose — landing the user in a dead/headless session instead of a
+        // seeded diagnostic. Force a fresh launch for Troubleshoot.
+        let maybe_live_session = if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
+            None
+        } else {
+            maybe_live_session.filter(|aid| self.session_assignment_is_running(aid))
+        };
 
         match quadraui::terminal_engine::TerminalSession::spawn(
             cols.max(20),
