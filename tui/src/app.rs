@@ -720,6 +720,11 @@ enum PipelineDetailTab {
     /// Live worker log — same content as the watch overlay but inline
     /// so the pipeline stage boxes remain visible above.
     Log,
+    /// #558: session-history summary for the selected issue.  Lists every
+    /// work/review/fix session (newest-first) with type, machine,
+    /// status/verdict, and summary text.  Data is fetched from GitHub
+    /// issue comments on demand and cached per-issue.
+    Summary,
     /// #264: refinement chat for the selected issue.  Empty placeholder
     /// when no `type="refinement"` assignment is active for the row; an
     /// embedded `ChatController` when one is — so the user can flip back
@@ -1876,6 +1881,263 @@ fn parse_coord_review_header(body: &str) -> Option<CoordReviewHeader> {
     }
 }
 
+/// #558: One session entry shown in the Pipeline Summary tab.
+/// Represents a single work/review/fix/plan session from GitHub comments.
+#[derive(Clone, Debug, PartialEq)]
+struct SessionSummary {
+    /// The coord assignment id (from the `assignment=` marker token), or empty.
+    assignment_id: String,
+    /// Session type: "work", "review", "fix", "plan", "re-review", etc.
+    /// Derived from `assignment_type` in the local DB when available, otherwise
+    /// inferred from the comment event (completion → "work", review → "review").
+    session_type: String,
+    /// Machine name from the comment marker (`machine=` or `reviewer=` token).
+    machine: String,
+    /// Terminal status: "done", "failed", "advisory".
+    status: String,
+    /// Verdict for review sessions: "approve" | "request-changes".  None for
+    /// non-review sessions.
+    verdict: Option<String>,
+    /// One-line prose summary extracted from the `### Summary` block (completion
+    /// comments) or the first non-empty line of the REVIEW_BODY block (review
+    /// comments).  May be empty when the worker didn't emit a summary.
+    summary_text: String,
+    /// Unix timestamp of the comment creation, used for newest-first sorting.
+    /// Zero when the comment carries no timestamp.
+    created_at_ts: f64,
+}
+
+/// Parse `gh issue view --json comments` output into a `Vec<SessionSummary>`.
+/// Returns entries newest-first.  Comments without coord markers are skipped.
+///
+/// `assignments` is passed so we can promote the `assignment_type` from the
+/// local DB (the comment marker only carries the id, not the type).
+fn parse_session_summaries_from_comments(
+    comments_json: &serde_json::Value,
+    assignments: &[Assignment],
+) -> Vec<SessionSummary> {
+    let arr = match comments_json.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+
+    let mut entries: Vec<SessionSummary> = Vec::new();
+
+    for comment in arr {
+        let body = comment
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("");
+        let created_at_str = comment
+            .get("createdAt")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        // Parse ISO-8601 "YYYY-MM-DDTHH:MM:SSZ" to a rough numeric timestamp
+        // for sort ordering.  We only need relative ordering so a lexicographic
+        // parse is fine (strings already sort correctly).
+        let created_at_ts: f64 = {
+            // Convert "2024-01-15T12:34:56Z" → keep it as-is for sort.
+            // Store len as a proxy so newer > older (longer dates are not
+            // necessarily later, but ISO-8601 strings sort lexicographically).
+            // Better: try parse via a simple epoch conversion.
+            parse_iso8601_to_epoch(created_at_str).unwrap_or(0.0)
+        };
+
+        // Try to parse a `<!-- coord:review ... -->` header first.
+        if let Some(review_header) = parse_coord_review_header(body) {
+            let assignment_id = review_header.assignment.clone().unwrap_or_default();
+            let machine = review_header.reviewer.clone().unwrap_or_default();
+            let verdict = review_header.verdict.clone();
+
+            // Look up the local assignment to get the type.
+            let session_type = assignments
+                .iter()
+                .find(|a| a.id == assignment_id)
+                .and_then(|a| a.assignment_type.as_deref())
+                .unwrap_or("review")
+                .to_string();
+
+            // Extract the prose summary: first non-empty line that isn't the
+            // machine-readable header.
+            let summary_text = extract_review_summary(body);
+
+            entries.push(SessionSummary {
+                assignment_id,
+                session_type,
+                machine,
+                status: "done".to_string(),
+                verdict,
+                summary_text,
+                created_at_ts,
+            });
+            continue;
+        }
+
+        // Try to parse a `<!-- coord:event=completion ... -->` or
+        // `<!-- coord:event=failure ... -->` or `<!-- coord:event=advisory ... -->` header.
+        if let Some(event_summary) = parse_coord_event_comment(body, assignments, created_at_ts) {
+            entries.push(event_summary);
+        }
+    }
+
+    // Newest-first.
+    entries.sort_by(|a, b| {
+        b.created_at_ts
+            .partial_cmp(&a.created_at_ts)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries
+}
+
+/// Parse a `<!-- coord:event=... -->` comment into a `SessionSummary`.
+/// Returns `None` when the comment doesn't carry a recognised coord event.
+fn parse_coord_event_comment(
+    body: &str,
+    assignments: &[Assignment],
+    created_at_ts: f64,
+) -> Option<SessionSummary> {
+    // Locate the first <!-- coord:... --> marker.
+    let marker_start = body.find("<!--")?;
+    let rest = &body[marker_start..];
+    let end = rest.find("-->")?;
+    let inside = rest[4..end].trim();
+    if !inside.starts_with("coord:") {
+        return None;
+    }
+    let after_coord = inside.strip_prefix("coord:")?.trim();
+
+    // Parse key=value tokens.
+    let mut event = "";
+    let mut assignment_id = String::new();
+    let mut machine = String::new();
+    let mut _exit_code: Option<i32> = None;
+
+    for token in after_coord.split_whitespace() {
+        if let Some((k, v)) = token.split_once('=') {
+            match k {
+                "event" => event = v,
+                "assignment" => assignment_id = v.to_string(),
+                "machine" => machine = v.to_string(),
+                "exit_code" => _exit_code = v.parse().ok(),
+                _ => {}
+            }
+        }
+    }
+
+    let status = match event {
+        "completion" => "done",
+        "failure" => "failed",
+        "advisory" => "advisory",
+        // Skip briefings, stuck, plan, etc. — not terminal summaries.
+        _ => return None,
+    };
+
+    // Look up assignment type from local DB.
+    let session_type = assignments
+        .iter()
+        .find(|a| a.id == assignment_id)
+        .and_then(|a| a.assignment_type.as_deref())
+        .unwrap_or("work")
+        .to_string();
+
+    let summary_text = extract_completion_summary(body);
+
+    Some(SessionSummary {
+        assignment_id,
+        session_type,
+        machine,
+        status: status.to_string(),
+        verdict: None,
+        summary_text,
+        created_at_ts,
+    })
+}
+
+/// Extract the prose from a `### Summary` block in a completion comment.
+/// Returns the trimmed block text (may be multi-line), or empty string.
+fn extract_completion_summary(body: &str) -> String {
+    // Find "### Summary" heading and collect text until the next heading or end.
+    let lower = body.to_ascii_lowercase();
+    let Some(start) = lower.find("### summary") else {
+        return String::new();
+    };
+    let after = &body[start + "### summary".len()..];
+    let text: String = after
+        .lines()
+        .skip(1) // blank line after heading
+        .take_while(|l| !l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.trim().to_string()
+}
+
+/// Extract a one-line prose summary from a review comment body.
+/// Skips the `<!-- coord:review ... -->` header line and returns the first
+/// non-empty content line.
+fn extract_review_summary(body: &str) -> String {
+    // Find "REVIEW_BODY:" marker if present (the structured review format).
+    let lower = body.to_ascii_lowercase();
+    if let Some(pos) = lower.find("review_body:") {
+        let after = &body[pos + "review_body:".len()..];
+        // Collect up to "END_REVIEW".
+        let end = after
+            .to_ascii_lowercase()
+            .find("end_review")
+            .unwrap_or(after.len());
+        let block = &after[..end];
+        // Return first non-empty line.
+        for line in block.lines() {
+            let t = line.trim();
+            if !t.is_empty() {
+                let truncated: String = t.chars().take(200).collect();
+                return truncated;
+            }
+        }
+    }
+    // Fallback: first non-empty, non-header line.
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty()
+            || t.starts_with("<!--")
+            || t.starts_with('#')
+            || t.starts_with("**")
+        {
+            continue;
+        }
+        let truncated: String = t.chars().take(200).collect();
+        return truncated;
+    }
+    String::new()
+}
+
+/// Very small ISO-8601 → Unix epoch converter.  Only handles the
+/// `YYYY-MM-DDTHH:MM:SSZ` format that GitHub returns.  Returns `None` on
+/// parse failure (the caller falls back to 0.0).
+fn parse_iso8601_to_epoch(s: &str) -> Option<f64> {
+    // Expected: "2024-01-15T12:34:56Z" (20 chars minimum)
+    if s.len() < 19 {
+        return None;
+    }
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day: i64 = s[8..10].parse().ok()?;
+    let hour: i64 = s[11..13].parse().ok()?;
+    let min: i64 = s[14..16].parse().ok()?;
+    let sec: i64 = s[17..19].parse().ok()?;
+
+    // Rough Julian-day-number → seconds calculation (ignores leap seconds).
+    // Good enough for sorting; no external crate needed.
+    let a: i64 = (14 - month) / 12;
+    let y: i64 = year + 4800 - a;
+    let m: i64 = month + 12 * a - 3;
+    let jdn: i64 =
+        day + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
+    // Unix epoch starts at JDN 2440588.
+    let epoch_days = jdn - 2440588;
+    let epoch_secs = epoch_days * 86400 + hour * 3600 + min * 60 + sec;
+    Some(epoch_secs as f64)
+}
+
 /// An open issue from the local `issues` table (synced from GitHub on coord plan).
 #[derive(Clone)]
 struct OpenIssue {
@@ -2145,6 +2407,144 @@ fn activity_item(text: &str, color: Color) -> ListItem {
         icon: None,
         detail: None,
         decoration: Decoration::Normal,
+    }
+}
+
+/// #558: Build a minimal single-item `ListView` with a plain text message.
+/// Used for loading / empty states in the Summary tab.
+fn plain_list(id: &str, msg: &str, scroll_offset: usize) -> ListView {
+    let item = ListItem {
+        text: StyledText {
+            spans: vec![StyledSpan::with_fg(msg, Color::rgb(160, 160, 160))],
+        },
+        icon: None,
+        detail: None,
+        decoration: Decoration::Normal,
+    };
+    ListView {
+        id: WidgetId::new(id),
+        title: None,
+        items: vec![item],
+        selected_idx: 0,
+        scroll_offset,
+        has_focus: false,
+        bordered: true,
+        h_scroll: 0,
+        max_content_width: None,
+        show_v_scrollbar: false,
+    }
+}
+
+/// #558: Build the `ListView` for the Pipeline Summary tab from a list of
+/// `SessionSummary` entries (already sorted newest-first).
+///
+/// Each session renders as:
+///   ● <type>  <machine>  <status/verdict (coloured)>
+///      "<summary text wrapped>"
+fn build_summary_list_view(summaries: Vec<SessionSummary>, scroll_offset: usize) -> ListView {
+    if summaries.is_empty() {
+        return plain_list(
+            "pipeline-summary",
+            "  No session summaries yet for this issue.",
+            scroll_offset,
+        );
+    }
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let dim = Color::rgb(120, 120, 120);
+    let muted = Color::rgb(170, 170, 170);
+    let machine_color = Color::rgb(130, 170, 210);
+
+    for s in &summaries {
+        // Header row: ● <type>  <machine>  <status/verdict>
+        let (badge_text, badge_color) = if let Some(v) = &s.verdict {
+            match v.as_str() {
+                "approve" => ("approve ✓", Color::rgb(120, 200, 120)),
+                "request-changes" => ("request-changes ✗", Color::rgb(220, 100, 100)),
+                other => (other, Color::rgb(200, 200, 70)),
+            }
+        } else {
+            match s.status.as_str() {
+                "done" => ("done", Color::rgb(120, 120, 120)),
+                "failed" => ("failed", Color::rgb(220, 70, 70)),
+                "advisory" => ("advisory", Color::rgb(200, 200, 70)),
+                other => (other, Color::rgb(200, 200, 70)),
+            }
+        };
+
+        let type_label = session_type_label(&s.session_type);
+
+        let header = ListItem {
+            text: StyledText {
+                spans: vec![
+                    StyledSpan::with_fg("● ", muted),
+                    StyledSpan::with_fg(format!("{:<10}", type_label), muted),
+                    StyledSpan::with_fg(format!("  {:<14}", s.machine), machine_color),
+                    StyledSpan::with_fg(format!("  {}", badge_text), badge_color),
+                ],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        };
+        items.push(header);
+
+        // Summary text (may be multi-line; each line indented).
+        if !s.summary_text.is_empty() {
+            for line in s.summary_text.lines() {
+                let trimmed: String = line.chars().take(200).collect();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            format!("   {}", trimmed),
+                            Color::rgb(200, 200, 200),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Normal,
+                });
+            }
+        }
+
+        // Blank separator between sessions.
+        items.push(ListItem {
+            text: StyledText { spans: vec![StyledSpan::with_fg(" ", dim)] },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+    }
+
+    ListView {
+        id: WidgetId::new("pipeline-summary"),
+        title: None,
+        items,
+        selected_idx: 0,
+        scroll_offset,
+        has_focus: false,
+        bordered: true,
+        h_scroll: 0,
+        max_content_width: None,
+        show_v_scrollbar: false,
+    }
+}
+
+/// Human-readable label for a session type string.
+fn session_type_label(t: &str) -> &str {
+    match t {
+        "work" => "Work",
+        "review" => "Review",
+        "fix" => "Fix",
+        "plan" => "Plan",
+        "re-review" | "rereview" => "Re-review",
+        "refinement" => "Refinement",
+        "conflict-fix" => "Conflict-fix",
+        "smoke" => "Smoke",
+        other => other,
     }
 }
 
@@ -3509,6 +3909,46 @@ fn spawn_pr_fetch(
     rx
 }
 
+/// #558: Fetch GitHub issue comments asynchronously via `gh issue view --json
+/// comments`.  Returns a channel that yields the raw `comments` JSON array on
+/// success or an error string on failure.  The caller (poll loop in tick)
+/// passes the JSON through `parse_session_summaries_from_comments` to build
+/// the Summary tab entries.
+fn spawn_comments_fetch(
+    repo_slug: String,
+    issue_number: u64,
+) -> std::sync::mpsc::Receiver<Result<serde_json::Value, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let output = std::process::Command::new("gh")
+            .args([
+                "issue",
+                "view",
+                &issue_number.to_string(),
+                "--repo",
+                &repo_slug,
+                "--json",
+                "comments",
+            ])
+            .output();
+        let result = match output {
+            Ok(o) if o.status.success() => {
+                match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                    Ok(v) => {
+                        // Return the `comments` array (or null → empty array).
+                        Ok(v.get("comments").cloned().unwrap_or(serde_json::Value::Array(Vec::new())))
+                    }
+                    Err(e) => Err(format!("gh json parse failed: {}", e)),
+                }
+            }
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(format!("could not run gh: {}", e)),
+        };
+        let _ = tx.send(result);
+    });
+    rx
+}
+
 /// Upsert a freshly-fetched issue into the local `issues` table. Mirrors the
 /// `upsert_open_issues` Python helper but for a single row, using the same
 /// connection-with-busy-timeout pattern as the other TUI writers (purge,
@@ -4076,6 +4516,21 @@ pub struct CoordApp {
     /// of truth for invalidation.
     fetched_issues_cache:
         std::cell::RefCell<std::collections::HashMap<(String, u64), FetchedIssue>>,
+    /// #558: In-flight `gh issue view --json comments` fetches for the Pipeline
+    /// Summary tab.  Keyed by `(repo_slug, issue_number)`.  The receiver yields
+    /// the raw `comments` JSON array value, or an error string.
+    pending_comments_fetches: std::cell::RefCell<
+        std::collections::HashMap<
+            (String, u64),
+            std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
+        >,
+    >,
+    /// #558: In-memory cache of parsed session-summary entries for the Pipeline
+    /// Summary tab.  Keyed by `(repo_slug, issue_number)`.  Populated by
+    /// `poll_pending_comments_fetches`; entries survive until the TUI restarts
+    /// (no TTL — the user can switch away and back without a re-fetch).
+    fetched_comments_cache:
+        std::cell::RefCell<std::collections::HashMap<(String, u64), Vec<SessionSummary>>>,
     /// Pending purge confirmation state.  `Some((assignments, issues))` means
     /// we are waiting for the user to confirm; `None` means not pending.
     ///
@@ -4638,6 +5093,8 @@ impl CoordApp {
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_issue_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_comments_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fetched_comments_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
             pending_report_fix: None,
@@ -11188,6 +11645,14 @@ impl CoordApp {
                     is_preview: false,
                     is_closable: false,
                 },
+                // #558: session-history summary tab.
+                TabItem {
+                    label: " Summary ".to_string(),
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Summary,
+                    is_dirty: false,
+                    is_preview: false,
+                    is_closable: false,
+                },
                 TabItem {
                     // #264: an indicator dot when a refinement worker is
                     // actively talking on this issue makes the tab
@@ -13759,7 +14224,8 @@ impl CoordApp {
                         1 => PipelineDetailTab::Issue,
                         2 => PipelineDetailTab::Stages,
                         3 => PipelineDetailTab::Log,
-                        4 => PipelineDetailTab::Refinement,
+                        4 => PipelineDetailTab::Summary,
+                        5 => PipelineDetailTab::Refinement,
                         _ => PipelineDetailTab::Terminal,
                     };
                     if new_tab != self.pipeline_detail_tab {
@@ -14252,6 +14718,18 @@ impl CoordApp {
                             let new = (current + 1).min(max);
                             // Re-stick when reaching the bottom.
                             self.pipeline_detail_scroll = if new >= max { usize::MAX } else { new };
+                        }
+                    }
+                    PipelineDetailTab::Summary => {
+                        // #558: plain scroll — same pattern as the Issue tab.
+                        let items = self.pipeline_summary_list().items.len();
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        if delta.y > 0.0 {
+                            self.pipeline_detail_scroll =
+                                self.pipeline_detail_scroll.saturating_sub(1);
+                        } else if delta.y < 0.0 {
+                            self.pipeline_detail_scroll =
+                                (self.pipeline_detail_scroll + 1).min(max);
                         }
                     }
                     PipelineDetailTab::Refinement => {
@@ -14791,6 +15269,87 @@ impl CoordApp {
             }
         }
         changed
+    }
+
+    /// #558: Drain completed `gh issue view --json comments` fetches into the
+    /// in-memory cache.  Returns `true` when at least one fetch resolved —
+    /// caller should redraw so the Summary tab picks up the new entries.
+    fn poll_pending_comments_fetches(&self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let mut changed = false;
+        let mut done: Vec<(String, u64)> = Vec::new();
+        {
+            let pending = self.pending_comments_fetches.borrow();
+            for (key, rx) in pending.iter() {
+                match rx.try_recv() {
+                    Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                        done.push(key.clone());
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+        }
+        for key in done {
+            let rx = match self.pending_comments_fetches.borrow_mut().remove(&key) {
+                Some(rx) => rx,
+                None => continue,
+            };
+            match rx.try_recv() {
+                Ok(Ok(comments_json)) => {
+                    let summaries = parse_session_summaries_from_comments(
+                        &comments_json,
+                        &self.data.assignments,
+                    );
+                    self.fetched_comments_cache.borrow_mut().insert(key, summaries);
+                    changed = true;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // Fetch failed — leave cache untouched; next render retries.
+                }
+            }
+        }
+        changed
+    }
+
+    /// #558: Build the Summary tab ListView for the selected Pipeline issue.
+    ///
+    /// Kicks off a `spawn_comments_fetch` when the cache is empty (lazy fetch);
+    /// shows a "fetching…" placeholder while the fetch is in flight, or an
+    /// empty-state message when no coord comments exist.
+    fn pipeline_summary_list(&self) -> ListView {
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i));
+        let Some(issue) = issue else {
+            return plain_list("pipeline-summary", "  (no issue selected)", 0);
+        };
+        let key = (issue.repo_slug.clone(), issue.number);
+
+        // Check the cache first.
+        if let Some(summaries) = self.fetched_comments_cache.borrow().get(&key).cloned() {
+            return build_summary_list_view(summaries, self.pipeline_detail_scroll);
+        }
+
+        // If a fetch is already in flight, show loading state.
+        if self.pending_comments_fetches.borrow().contains_key(&key) {
+            return plain_list(
+                "pipeline-summary",
+                "  Fetching session history…",
+                self.pipeline_detail_scroll,
+            );
+        }
+
+        // Kick off a new fetch.
+        let rx = spawn_comments_fetch(issue.repo_slug.clone(), issue.number);
+        self.pending_comments_fetches
+            .borrow_mut()
+            .insert(key, rx);
+
+        plain_list(
+            "pipeline-summary",
+            "  Fetching session history…",
+            self.pipeline_detail_scroll,
+        )
     }
 
     fn pipeline_row_lifecycle(&self, issue: &PipelineIssue) -> PipelineRowLifecycle {
@@ -19300,6 +19859,12 @@ impl CoordApp {
             needs_redraw = true;
         }
 
+        // #558: Drain completed `gh issue view --json comments` fetches for
+        // the Pipeline Summary tab.
+        if self.poll_pending_comments_fetches() {
+            needs_redraw = true;
+        }
+
         // #336: Poll the in-flight artifact manifest fetch and populate cache.
         if let Some((key, rx)) = &self.artifact_fetch_rx {
             match rx.try_recv() {
@@ -21846,6 +22411,13 @@ impl ShellApp for CoordApp {
                                 lines,
                             });
                         }
+                        PipelineDetailTab::Summary => {
+                            // #558: session-history summary — kick the async
+                            // fetch if needed (pipeline_summary_list handles
+                            // that) then paint the list.
+                            let summary_list = self.pipeline_summary_list();
+                            backend.draw_list(content_rect, &summary_list);
+                        }
                         PipelineDetailTab::Refinement => {
                             // #264: refinement chat lives in its own tab so
                             // the user can flip back to Issue / Stages / Log
@@ -23328,6 +23900,27 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── j/k — scroll Summary tab ──────────────────────────
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Summary =>
+                    {
+                        let items = self.pipeline_summary_list().items.len();
+                        let visible = self.last_main_visible_rows.get().max(1);
+                        let max = items.saturating_sub(visible.saturating_sub(1));
+                        self.pipeline_detail_scroll =
+                            (self.pipeline_detail_scroll + 1).min(max);
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Summary =>
+                    {
+                        self.pipeline_detail_scroll =
+                            self.pipeline_detail_scroll.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+
                     // ── i — inject/steer a running worker from the Log tab (#386)
                     // Opens the guidance-chat overlay bound to the running
                     // assignment for the selected pipeline row so the user can
@@ -23502,7 +24095,7 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── h/l — cycle Pipeline detail tabs ─────────────────
-                    // Order: Pipeline → Issue → Stages → Log → Refinement → Terminal → Pipeline …
+                    // Order: Pipeline → Issue → Stages → Log → Summary → Refinement → Terminal → Pipeline …
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
@@ -23511,7 +24104,8 @@ impl ShellApp for CoordApp {
                             PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
                             PipelineDetailTab::Stages => PipelineDetailTab::Issue,
                             PipelineDetailTab::Log => PipelineDetailTab::Stages,
-                            PipelineDetailTab::Refinement => PipelineDetailTab::Log,
+                            PipelineDetailTab::Summary => PipelineDetailTab::Log,
+                            PipelineDetailTab::Refinement => PipelineDetailTab::Summary,
                             PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
                         };
                         // Release PTY focus whenever the user navigates away
@@ -23538,7 +24132,8 @@ impl ShellApp for CoordApp {
                             PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
                             PipelineDetailTab::Issue => PipelineDetailTab::Stages,
                             PipelineDetailTab::Stages => PipelineDetailTab::Log,
-                            PipelineDetailTab::Log => PipelineDetailTab::Refinement,
+                            PipelineDetailTab::Log => PipelineDetailTab::Summary,
+                            PipelineDetailTab::Summary => PipelineDetailTab::Refinement,
                             PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
                             PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
                         };
@@ -25820,6 +26415,8 @@ mod tests {
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_issue_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_comments_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fetched_comments_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_purge: None,
             pending_test_fail: None,
             pending_report_fix: None,
@@ -34847,6 +35444,220 @@ mod tests {
         assert_eq!(h.blocking, None);
     }
 
+    // ── #558: parse_session_summaries_from_comments ───────────────────────────
+
+    /// Build a minimal GitHub-style comment JSON value for test fixtures.
+    fn make_comment(
+        body: &str,
+        created_at: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "body": body,
+            "createdAt": created_at,
+        })
+    }
+
+    #[test]
+    fn parse_iso8601_converts_known_date() {
+        // 2024-01-15T12:34:56Z
+        // Rough check: result is in Unix-epoch ballpark (~1.7B).
+        let ts = parse_iso8601_to_epoch("2024-01-15T12:34:56Z").expect("parsed");
+        assert!(ts > 1_700_000_000.0, "should be past Nov 2023: {ts}");
+        assert!(ts < 1_800_000_000.0, "should be before 2027: {ts}");
+    }
+
+    #[test]
+    fn parse_iso8601_returns_none_on_short_string() {
+        assert!(parse_iso8601_to_epoch("bad").is_none());
+        assert!(parse_iso8601_to_epoch("").is_none());
+    }
+
+    #[test]
+    fn parse_session_summaries_skips_non_coord_comments() {
+        let comments = serde_json::Value::Array(vec![
+            make_comment("Just a regular comment without markers.", "2024-01-01T00:00:00Z"),
+            make_comment("<!-- some-other-tool: data -->", "2024-01-01T01:00:00Z"),
+        ]);
+        let result = parse_session_summaries_from_comments(&comments, &[]);
+        assert!(result.is_empty(), "no coord markers → empty result");
+    }
+
+    #[test]
+    fn parse_session_summaries_parses_completion_comment() {
+        // Mirrors what `format_completion` in coord/comments.py produces.
+        let body = "## Coordinator: Assignment Complete\n\
+            <!-- coord:event=completion assignment=abc123 machine=precision repo=myrepo issue=42 exit_code=0 -->\n\
+            **Machine:** precision\n\
+            **Status:** done\n\
+            **Exit code:** 0\n\
+            **Duration:** 5m 30s\n\
+            \n\
+            ### Summary\n\
+            Migrated the TUI to use the new primitive.\n";
+
+        let comments = serde_json::Value::Array(vec![
+            make_comment(body, "2024-06-01T10:00:00Z"),
+        ]);
+        let result = parse_session_summaries_from_comments(&comments, &[]);
+        assert_eq!(result.len(), 1);
+        let s = &result[0];
+        assert_eq!(s.assignment_id, "abc123");
+        assert_eq!(s.machine, "precision");
+        assert_eq!(s.status, "done");
+        assert!(s.verdict.is_none());
+        assert_eq!(s.summary_text, "Migrated the TUI to use the new primitive.");
+    }
+
+    #[test]
+    fn parse_session_summaries_parses_review_comment_with_verdict() {
+        let body = "<!-- coord:review verdict=request-changes blocking=1 reviewer=elitebook assignment=rev001 -->\n\
+            ## Review\n\
+            REVIEW_BODY:\n\
+            Tab-click activation broken: MouseDown drag-start swallows clicks.\n\
+            END_REVIEW\n";
+
+        let comments = serde_json::Value::Array(vec![
+            make_comment(body, "2024-06-01T11:00:00Z"),
+        ]);
+        let result = parse_session_summaries_from_comments(&comments, &[]);
+        assert_eq!(result.len(), 1);
+        let s = &result[0];
+        assert_eq!(s.machine, "elitebook");
+        assert_eq!(s.verdict.as_deref(), Some("request-changes"));
+        assert!(s.summary_text.contains("Tab-click activation"), "got: {}", s.summary_text);
+    }
+
+    #[test]
+    fn parse_session_summaries_review_approve_verdict() {
+        let body = "<!-- coord:review verdict=approve reviewer=dellserver assignment=rev002 -->\n\
+            ## Review\n\
+            REVIEW_BODY:\n\
+            Looks good. Tests pass.\n\
+            END_REVIEW\n";
+
+        let comments = serde_json::Value::Array(vec![
+            make_comment(body, "2024-06-01T12:00:00Z"),
+        ]);
+        let result = parse_session_summaries_from_comments(&comments, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].verdict.as_deref(), Some("approve"));
+    }
+
+    #[test]
+    fn parse_session_summaries_newest_first_ordering() {
+        // Two completion comments: older first in the input array.
+        let body_a = "<!-- coord:event=completion assignment=a1 machine=m1 repo=r issue=1 exit_code=0 -->\n\
+            ### Summary\nFirst session.";
+        let body_b = "<!-- coord:event=completion assignment=b1 machine=m2 repo=r issue=1 exit_code=0 -->\n\
+            ### Summary\nSecond session.";
+
+        let comments = serde_json::Value::Array(vec![
+            make_comment(body_a, "2024-05-01T09:00:00Z"),
+            make_comment(body_b, "2024-05-02T09:00:00Z"),
+        ]);
+        let result = parse_session_summaries_from_comments(&comments, &[]);
+        assert_eq!(result.len(), 2);
+        // Newest first → "Second session." before "First session."
+        assert!(
+            result[0].summary_text.contains("Second session."),
+            "expected second session first, got: {}",
+            result[0].summary_text
+        );
+        assert!(result[1].summary_text.contains("First session."));
+    }
+
+    #[test]
+    fn parse_session_summaries_work_review_fix_history() {
+        // A full work→review→fix pipeline: three comments.
+        let work_body = "## Coordinator: Assignment Complete\n\
+            <!-- coord:event=completion assignment=w1 machine=precision repo=r issue=10 exit_code=0 -->\n\
+            ### Summary\nMigrated terminal onto quadraui TerminalSession primitive.";
+        let review_body = "<!-- coord:review verdict=request-changes reviewer=elitebook assignment=rv1 -->\n\
+            REVIEW_BODY:\n\
+            tab-click activation broken.\n\
+            END_REVIEW";
+        let fix_body = "## Coordinator: Assignment Complete\n\
+            <!-- coord:event=completion assignment=fx1 machine=precision repo=r issue=10 exit_code=0 -->\n\
+            ### Summary\nAdded a 6px movement threshold before drag starts.";
+
+        let comments = serde_json::Value::Array(vec![
+            make_comment(work_body,   "2024-06-10T08:00:00Z"),
+            make_comment(review_body, "2024-06-10T09:00:00Z"),
+            make_comment(fix_body,    "2024-06-10T10:00:00Z"),
+        ]);
+
+        // Give the review a type by providing an assignment for rv1.
+        let assignments = vec![Assignment {
+            id: "rv1".to_string(),
+            repo: "r".to_string(),
+            issue_number: 10,
+            issue_title: String::new(),
+            machine: "elitebook".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: None,
+            finished_at: None,
+            exit_code: Some(0),
+            assignment_type: Some("review".to_string()),
+            test_state: None,
+            review_verdict: Some("request-changes".to_string()),
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+        }];
+
+        let result = parse_session_summaries_from_comments(&comments, &assignments);
+        assert_eq!(result.len(), 3, "expected 3 sessions, got {}", result.len());
+
+        // Newest-first: fix → review → work.
+        assert!(result[0].summary_text.contains("6px"), "expected fix first: {}", result[0].summary_text);
+        assert_eq!(result[1].verdict.as_deref(), Some("request-changes"));
+        assert!(result[2].summary_text.contains("quadraui"), "expected work last: {}", result[2].summary_text);
+    }
+
+    #[test]
+    fn extract_completion_summary_returns_block_text() {
+        let body = "## Header\n### Summary\nThis is the summary.\nWith two lines.";
+        assert_eq!(extract_completion_summary(body), "This is the summary.\nWith two lines.");
+    }
+
+    #[test]
+    fn extract_completion_summary_returns_empty_when_missing() {
+        assert_eq!(extract_completion_summary("## No summary here."), "");
+    }
+
+    #[test]
+    fn extract_review_summary_prefers_review_body_block() {
+        let body = "<!-- coord:review verdict=approve -->\nREVIEW_BODY:\nGood work.\nEND_REVIEW";
+        assert_eq!(extract_review_summary(body), "Good work.");
+    }
+
+    #[test]
+    fn extract_review_summary_falls_back_to_first_prose_line() {
+        let body = "<!-- coord:review verdict=approve -->\n\nThis is a prose summary.";
+        // The HTML comment line is skipped; empty line is skipped; prose is returned.
+        assert_eq!(extract_review_summary(body), "This is a prose summary.");
+    }
+
+    #[test]
+    fn session_type_label_known_types() {
+        assert_eq!(session_type_label("work"), "Work");
+        assert_eq!(session_type_label("review"), "Review");
+        assert_eq!(session_type_label("fix"), "Fix");
+        assert_eq!(session_type_label("plan"), "Plan");
+        assert_eq!(session_type_label("re-review"), "Re-review");
+        assert_eq!(session_type_label("conflict-fix"), "Conflict-fix");
+    }
+
+    #[test]
+    fn session_type_label_unknown_passthrough() {
+        assert_eq!(session_type_label("custom-type"), "custom-type");
+    }
+
     // ── parse_issue_proposal (#316) ────────────────────────────────────────────
 
     /// Helper: build a stream-json text line as the worker emits.
@@ -36811,18 +37622,23 @@ mod tests {
 
     #[test]
     fn detail_terminal_tab_is_seventh_in_pipeline_tab_bar() {
-        // Order: Pipeline / Issue / Stages / Log / Refinement / Terminal.
-        // Index 5 (0-based) → Terminal.
+        // Order: Pipeline / Issue / Stages / Log / Summary / Refinement / Terminal.
+        // Index 6 (0-based) → Terminal.  (#558 added Summary at index 4.)
         let app = make_app_default();
         let bar = app.pipeline_detail_tab_bar();
         assert!(
-            bar.tabs.len() >= 6,
-            "expected at least 6 pipeline detail tabs"
+            bar.tabs.len() >= 7,
+            "expected at least 7 pipeline detail tabs"
         );
         assert_eq!(
-            bar.tabs[5].label.trim(),
+            bar.tabs[4].label.trim(),
+            "Summary",
+            "tab index 4 must be Summary"
+        );
+        assert_eq!(
+            bar.tabs[6].label.trim(),
             "Terminal",
-            "tab index 5 must be Terminal"
+            "tab index 6 must be Terminal"
         );
     }
 
@@ -36836,7 +37652,8 @@ mod tests {
             PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
             PipelineDetailTab::Issue => PipelineDetailTab::Stages,
             PipelineDetailTab::Stages => PipelineDetailTab::Log,
-            PipelineDetailTab::Log => PipelineDetailTab::Refinement,
+            PipelineDetailTab::Log => PipelineDetailTab::Summary,
+            PipelineDetailTab::Summary => PipelineDetailTab::Refinement,
             PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
             PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
         };
@@ -36853,7 +37670,8 @@ mod tests {
             PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
             PipelineDetailTab::Stages => PipelineDetailTab::Issue,
             PipelineDetailTab::Log => PipelineDetailTab::Stages,
-            PipelineDetailTab::Refinement => PipelineDetailTab::Log,
+            PipelineDetailTab::Summary => PipelineDetailTab::Log,
+            PipelineDetailTab::Refinement => PipelineDetailTab::Summary,
             PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
         };
         assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
