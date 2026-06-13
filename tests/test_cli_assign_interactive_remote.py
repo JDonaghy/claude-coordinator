@@ -849,3 +849,91 @@ class TestRemoteReviewVerdictRelay:
         )
         assert ok is False
         assert "rec" not in posted
+
+
+# ── _remote_stash_artifacts path expansion (#562 fix) ───────────────────────
+
+
+class TestRemoteStashArtifactsPathExpansion:
+    """_remote_stash_artifacts must resolve ``$HOME``-form worktree paths.
+
+    ``remote_worktree_sh`` is always a ``$HOME/.coord/worktrees/<id>`` string.
+    shlex.quote() wraps it in single quotes, so the remote shell NEVER expands
+    ``$HOME``.  The Python snippet must use ``os.path.expandvars()`` (not
+    ``Path.expanduser()``) to resolve the ``$HOME`` variable on the remote
+    before constructing the Path.
+    """
+
+    def test_snippet_uses_expandvars_not_expanduser(self) -> None:
+        """The py_snippet in _remote_stash_artifacts must call os.path.expandvars."""
+        import inspect
+
+        from coord.interactive import _remote_stash_artifacts
+
+        src = inspect.getsource(_remote_stash_artifacts)
+        assert "expandvars" in src, (
+            "_remote_stash_artifacts snippet must use os.path.expandvars to "
+            "expand $HOME-form paths; Path.expanduser() only handles ~ prefixes"
+        )
+
+    def test_home_form_path_resolved_in_subprocess(self, tmp_path: Path) -> None:
+        """A ``$HOME/.coord/worktrees/<id>`` path is correctly resolved when
+        the snippet runs via subprocess (simulates the ssh-invoked Python call).
+
+        We invoke the snippet locally (no real ssh) to verify end-to-end that
+        ``os.path.expandvars`` resolves ``$HOME`` correctly.
+        """
+        import json
+        import os
+        import subprocess
+        import sys
+
+        # Build an actual worktree dir under HOME.
+        home = os.environ.get("HOME", str(tmp_path))
+        wt = tmp_path / "worktrees" / "testid"
+        (wt / "target" / "debug").mkdir(parents=True)
+        (wt / "target" / "debug" / "fakebinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+
+        # Use the $HOME-form path as _remote_stash_artifacts does.
+        wt_str = str(wt)
+        worktree_home_form = (
+            "$HOME" + wt_str[len(home):]
+            if wt_str.startswith(home)
+            else wt_str
+        )
+        branch = "issue-562-stash-test"
+        repo_name = "myrepo"
+        patterns_json = json.dumps(["target/debug/fakebinary"])
+        assignment_id = "testaid"
+
+        py_snippet = (
+            "import sys,json,os; from pathlib import Path; "
+            "from coord.agent import stash_artifacts_for_branch; "
+            "stash_artifacts_for_branch("
+            "worktree_path=Path(os.path.expandvars(sys.argv[1])),"
+            "branch=sys.argv[2],"
+            "repo_name=sys.argv[3],"
+            "patterns=json.loads(sys.argv[4]),"
+            f"state_dir=Path(r'{state_dir}'),"
+            "assignment_id=sys.argv[5]"
+            ")"
+        )
+        result = subprocess.run(
+            [
+                sys.executable, "-c", py_snippet,
+                worktree_home_form, branch, repo_name, patterns_json, assignment_id,
+            ],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, (
+            f"snippet failed: stderr={result.stderr!r}"
+        )
+        from coord.agent import _sanitize_branch
+        stash_dir = state_dir / "artifacts" / repo_name / _sanitize_branch(branch)
+        assert (stash_dir / "fakebinary").exists(), (
+            f"artifact not stashed; expandvars probably did not resolve $HOME.\n"
+            f"worktree_home_form={worktree_home_form!r}, resolved wt={wt}"
+        )
