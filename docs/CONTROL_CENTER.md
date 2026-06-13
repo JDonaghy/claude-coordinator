@@ -4,6 +4,7 @@
 **Panels:** Backlog #572 · Kanban #573 · Sessions #574 · Conversations #575 ·
 quick-peek popup #576. **Gating deps:** #559 (live roster), #551 (key routing).
 **Substrate:** #518 (tab-groups). **Carried-forward semantics:** #256.
+**Focus model:** #578.
 **Supersedes the framing of:** #256 (two-panel Board ↔ Pipeline). The *label and
 transition semantics* in #256 carry forward unchanged; only the panel structure
 changes.
@@ -307,6 +308,8 @@ acceptance, latest review verdict/comment) without navigating away.
 ---
 
 ## 11. Focus & input routing
+
+**Tracked by #578.**
 
 The current TUI toggles terminal focus with **F12** (a manual mode switch) — the
 known bugbear. The next incarnation makes focus *intuitive for mouse users* and
