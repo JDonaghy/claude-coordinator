@@ -1895,6 +1895,18 @@ def _prompt_and_relay_review_verdict(
 @_CONFIG_OPTION
 @click.option("--briefing", default="", help="Optional briefing text for the worker.")
 @click.option(
+    "--briefing-file",
+    "briefing_file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help=(
+        "#569: read the briefing from a file instead of --briefing. Avoids "
+        "shell-quoting a multi-line briefing on the command line (a multi-line "
+        "--briefing typed into a PTY shell strands it at `quote>`). Overrides "
+        "--briefing when both are given."
+    ),
+)
+@click.option(
     "--model",
     default=None,
     help="Claude model tier (haiku, sonnet, opus). Defaults to models.default.",
@@ -1982,6 +1994,19 @@ def _prompt_and_relay_review_verdict(
         "Requires --interactive; local-only for now (remote is Track B / #486)."
     ),
 )
+@click.option(
+    "--troubleshoot",
+    "troubleshoot",
+    is_flag=True,
+    default=False,
+    help=(
+        "#569: launch a human-attended READ-ONLY diagnostic session for a "
+        "stalled item. Runs in the LIVE checkout with NO claim and NO worktree "
+        "(so it never conflicts with the item's own in-progress claim), "
+        "type=troubleshoot, briefed from --briefing/--briefing-file. Requires "
+        "--interactive; local-only."
+    ),
+)
 def assign(
     machine: str,
     repo: str,
@@ -1998,6 +2023,8 @@ def assign(
     interactive: bool,
     review_of: str | None,
     fix_of: str | None,
+    briefing_file: str | None,
+    troubleshoot: bool,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -2052,6 +2079,13 @@ def assign(
         sys.exit(1)
     issue_title = issue_data.get("title", f"Issue #{issue}")
 
+    # --briefing-file (#569): read the briefing from a file; this avoids having
+    # to shell-quote a multi-line briefing on the command line (a multi-line
+    # --briefing typed into a PTY shell strands it at `quote>`).  Overrides
+    # --briefing when both are given.
+    if briefing_file:
+        briefing = Path(briefing_file).read_text(encoding="utf-8")
+
     # Auto-generate briefing from issue body when none provided.
     if not briefing:
         issue_body = issue_data.get("body", "")
@@ -2072,6 +2106,19 @@ def assign(
         sys.exit(2)
     if fix_of is not None and review_of is not None:
         click.echo("error: --fix-of and --review-of are mutually exclusive", err=True)
+        sys.exit(2)
+
+    # #569: --troubleshoot is a third interactive flavour — a read-only
+    # diagnostic.  Same interactive requirement; mutually exclusive with the
+    # review/fix flavours (a dispatch is one shape only).
+    if troubleshoot and not interactive:
+        click.echo("error: --troubleshoot requires --interactive", err=True)
+        sys.exit(2)
+    if troubleshoot and (review_of is not None or fix_of is not None):
+        click.echo(
+            "error: --troubleshoot is mutually exclusive with --review-of/--fix-of",
+            err=True,
+        )
         sys.exit(2)
 
     # #437: HUMAN-ATTENDED branch.  When --interactive is set, we run
@@ -2528,6 +2575,149 @@ def assign(
         # reviewer's findings, and bumps review_iteration so the next review can
         # scope to just the fix delta.  Self-contained and returns, leaving the
         # work/plan launch below unchanged.  Local-only for now (Track B / #486).
+        # ── #569: TROUBLESHOOT — read-only diagnostic interactive session ───
+        # A human-attended diagnostic for a stalled item.  Like --review-of it
+        # runs READ-ONLY in the LIVE checkout (no claim, no worktree, finalize
+        # worktree_path=None) so it never disturbs the item's in-progress claim
+        # or the worker-worktree base — but it carries the caller-supplied
+        # diagnostic briefing (--briefing/--briefing-file), uses
+        # type="troubleshoot", and has no verdict.  Local-only.
+        if troubleshoot:
+            from coord.models import Assignment as _AssignmentTs  # noqa: PLC0415
+            from coord.state import (  # noqa: PLC0415
+                build_board as _build_board_ts,
+                record_dispatched_assignment as _record_ts,
+                save_board as _save_board_ts,
+            )
+            from coord.agent import AssignmentSpec as _AssignmentSpecTs  # noqa: PLC0415
+
+            if not (briefing or "").strip():
+                click.echo(
+                    "error: --troubleshoot requires a briefing "
+                    "(--briefing or --briefing-file).",
+                    err=True,
+                )
+                sys.exit(2)
+            if not _is_local:
+                click.echo("error: --troubleshoot is local-only for now.", err=True)
+                sys.exit(2)
+
+            ts_repo_path = str(
+                Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+            )
+            ts_default_branch = repo_cfg.default_branch or "main"
+            resolved_model = model if model else cfg.models.default
+            assignment_id = _uuid.uuid4().hex[:12]
+
+            _ts_system_prompt = (
+                "You are a coordinator troubleshooter in a HUMAN-ATTENDED "
+                "session. You are READ-ONLY in a live checkout: do NOT modify "
+                "files, do NOT commit, do NOT run `gh`. Investigate the stalled "
+                "pipeline item using coord, git, and sqlite3 reads; explain "
+                "what is wrong and what will unstick it; and surface any plan "
+                "for the operator to approve before mutating anything."
+            )
+            ts_reminder = (
+                f"[Coordinator troubleshoot assignment {assignment_id}] "
+                "HUMAN-ATTENDED, READ-ONLY diagnostic for a stalled pipeline "
+                "item. You are in the LIVE checkout — do NOT modify files here "
+                "(it is the editable coordinator and the worker-worktree base). "
+                "If a code fix is needed, surface the plan so the operator can "
+                "dispatch a proper Fix.\n\n"
+            )
+            effective_briefing = ts_reminder + briefing
+
+            spec = _AssignmentSpecTs(
+                repo_name=repo,
+                repo_path=ts_repo_path,
+                issue_number=issue,
+                issue_title=f"[troubleshoot] {issue_title}",
+                briefing=effective_briefing,
+                model=resolved_model,
+                type="troubleshoot",
+                provider="claude-pty",
+            )
+            # READ-ONLY: no Edit/Write (the live checkout must not be mutated).
+            # Bash for coord/git/sqlite3 reads; Read/Grep/Glob for inspection.
+            argv = provider.build_command(
+                spec,
+                resolved_model=resolved_model,
+                system_prompt=_ts_system_prompt,
+                allowed_tools="Read,Bash,Grep,Glob",
+            )
+
+            click.echo(
+                f"{machine} (local TTY) → TROUBLESHOOT #{issue}: {issue_title}"
+            )
+            click.echo(
+                "  mode: HUMAN-ATTENDED interactive diagnostic "
+                "(read-only, no claim, no worktree) (#569)"
+            )
+            click.echo(f"  assignment id: {assignment_id}")
+            click.echo(f"  cwd: {ts_repo_path} (live checkout — read-only)")
+            if dry_run:
+                click.echo("  (dry run — not launched)")
+                click.echo(f"  would exec: {argv}")
+                return
+
+            ts_assignment = _AssignmentTs(
+                machine_name=machine,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=f"[troubleshoot] {issue_title}",
+                briefing=effective_briefing,
+                assignment_id=assignment_id,
+                status="running",
+                dispatched_at=_time.time(),
+                type="troubleshoot",
+                model=resolved_model,
+                provider_name="claude-pty",
+            )
+            _record_ts(assignment=ts_assignment, repo_github=repo_cfg.github)
+            _save_board_ts(_build_board_ts())
+            os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+
+            started_at = _time.time()
+            exit_code = launch_human_attended_interactive(
+                argv,
+                effective_briefing,
+                assignment_id=assignment_id,
+                cwd=ts_repo_path,
+            )
+            if exit_code != 0:
+                click.echo(f"  claude exited with status {exit_code}", err=True)
+
+            _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+            if _sname and _tmux_alive(_sname):
+                click.echo(
+                    f"  session still running in tmux: {_sname}\n"
+                    f"  reattach with:  coord reattach {assignment_id}"
+                )
+                sys.exit(0)
+
+            # finalize with worktree_path=None — read-only, never push/remove the
+            # live checkout; the git-floor backstop just records a terminal row.
+            try:
+                finalize_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    worktree_path=None,
+                    base_branch=ts_default_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    log_path=None,
+                    repo_path=None,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: backstop failed to record troubleshoot exit: {exc}",
+                    err=True,
+                )
+            return
+
         if fix_of is not None:
             from coord.auto_loop import (  # noqa: PLC0415
                 _build_fix_briefing,
