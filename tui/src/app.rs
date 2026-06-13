@@ -20703,8 +20703,19 @@ impl CoordApp {
         };
 
         // Merge queue entry for this issue.
+        //
+        // When `issue` is Some, `repo_slug` is the full GitHub slug (e.g.
+        // "owner/api") so the exact match works.  When `issue` is None,
+        // `repo_slug` falls back to `coord_repo` (the short coordinator name,
+        // e.g. "api") which won't match `repo_github` ("owner/api") — also
+        // accept a suffix match so the MQ entry is still found in that edge
+        // case.
         let mq_entry = self.data.merge_queue.iter().find(|m| {
-            m.issue_number == Some(issue_num) && m.repo_github == repo_slug
+            m.issue_number == Some(issue_num)
+                && (m.repo_github == repo_slug
+                    || (issue.is_none()
+                        && m.repo_github
+                            .ends_with(&format!("/{}", coord_repo))))
         });
         let mq_text = match mq_entry {
             None => "  No merge_queue entry found.".to_string(),
@@ -20821,7 +20832,12 @@ impl CoordApp {
             \n\
             For read-only diagnostics: act immediately.\n\
             For mutating recovery (recording verdicts, freeing worktrees, merging):\n\
-            surface the plan and confirm with me before acting.",
+            surface the plan and confirm with me before acting.\n\
+            \n\
+            WATCHER NOTE: This session is armed for auto-review (same as Work/Plan/Fix).\n\
+            If you commit changes during diagnosis, an automated review will be dispatched\n\
+            automatically. This is intentional — Troubleshoot may implement a fix — but\n\
+            be aware: committing triggers the review pipeline.",
             n = issue_num,
             repo = coord_repo,
             slug = repo_slug,
@@ -21322,13 +21338,14 @@ fn build_interactive_launch_cmd(
                 cfg, aid, m, r, issue_num,
             )
         }
-        // #569: Troubleshoot is handled in the caller before reaching here
-        // (the diagnostic briefing requires app state not available in this
-        // free function).  This arm is unreachable in practice — emit a
-        // plain work command as a safe fallback.
-        InteractiveLaunchMode::Troubleshoot => format!(
-            "coord assign {}--interactive --no-plan {} {} {}\r",
-            cfg, m, r, issue_num,
+        // #569: Troubleshoot is dispatched by the right-click handler via a
+        // dedicated path that bypasses this function (the diagnostic briefing
+        // requires app state not available here).  This arm must never be
+        // reached; surface any future invariant violation immediately rather
+        // than silently launching a plain work session with no briefing.
+        InteractiveLaunchMode::Troubleshoot => unreachable!(
+            "Troubleshoot mode must not reach build_interactive_launch_cmd — \
+             handle it in the caller with the troubleshoot_briefing path"
         ),
     }
 }
@@ -33393,6 +33410,10 @@ mod tests {
         assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Plan), "plan");
         assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Review), "review");
         assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Fix), "fix");
+        assert_eq!(
+            interactive_mode_verb(InteractiveLaunchMode::Troubleshoot),
+            "troubleshoot"
+        );
     }
 
     #[test]
@@ -34197,8 +34218,8 @@ mod tests {
     fn troubleshoot_briefing_contains_issue_and_repo() {
         // The diagnostic briefing must embed the issue number and repo so
         // the seeded session knows what it is diagnosing.
-        let mut app = make_pipeline_app();
-        // Make sure issue 42 is in pipeline_issues (make_pipeline_app does this).
+        let app = make_pipeline_app();
+        // make_pipeline_app seeds issue 42 into pipeline_issues.
         let briefing = app.troubleshoot_briefing("api", 42);
         assert!(
             briefing.contains("42"),
