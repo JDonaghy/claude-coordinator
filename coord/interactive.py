@@ -977,6 +977,7 @@ def finalize_interactive_exit(
     started_at: float | None = None,
     log_path: str | None = None,
     repo_path: str | None = None,
+    artifact_paths: list[str] | None = None,
 ) -> InteractiveFinalizeResult:
     """Git-floor backstop for the interactive launcher exit path (#466).
 
@@ -1004,14 +1005,33 @@ def finalize_interactive_exit(
     worktree after recording the terminal state — matching the cleanup
     discipline of :meth:`coord.agent.AgentServer._cleanup_worktree`.
     """
+    _effective_patterns = list(artifact_paths or [])
+
     # Respect an explicit `coord report-result` from the agent.  Without
     # this check, every review session (which legitimately has 0 commits)
     # would have its agent-reported verdict overwritten with an advisory
     # the instant the human closed the TTY.
     if _assignment_already_recorded(assignment_id):
         worktree_removed = False
-        if repo_path is not None and worktree_path is not None:
-            worktree_removed = _remove_worktree(Path(repo_path), Path(worktree_path))
+        wt_p = Path(worktree_path) if worktree_path else None
+        if wt_p is not None and wt_p.exists():
+            # #562: stash before removing — `coord report-result` never stashes.
+            if _effective_patterns:
+                from coord.agent import (  # noqa: PLC0415
+                    stash_artifacts_for_branch as _stash_fn,
+                )
+                from coord.state import COORD_DIR as _CD  # noqa: PLC0415
+                _stash_fn(
+                    worktree_path=wt_p,
+                    branch=_current_branch(wt_p) or "",
+                    repo_name=repo_name,
+                    patterns=_effective_patterns,
+                    state_dir=_CD,
+                    assignment_id=assignment_id,
+                    log_path=log_path,
+                )
+        if repo_path is not None and wt_p is not None:
+            worktree_removed = _remove_worktree(Path(repo_path), wt_p)
         return InteractiveFinalizeResult(
             terminal_status="report-result",  # informational only
             commits_ahead=None,
@@ -1077,6 +1097,24 @@ def finalize_interactive_exit(
         summary="",
     )
     outcome = post_completion(record)
+
+    # Step 3.5 — stash artifacts BEFORE removing the worktree (#562).
+    # This is the missing link that caused "Artifact unavailable" in the TUI
+    # for every interactive work session.  Same discipline as the agent-side
+    # stash: best-effort, runs regardless of outcome.status so partially
+    # built artifacts on a failed session are still captured.
+    if _effective_patterns and wt_path is not None and wt_path.exists():
+        from coord.agent import stash_artifacts_for_branch as _stash_fn  # noqa: PLC0415
+        from coord.state import COORD_DIR as _COORD_DIR  # noqa: PLC0415
+        _stash_fn(
+            worktree_path=wt_path,
+            branch=branch_now or "",
+            repo_name=repo_name,
+            patterns=_effective_patterns,
+            state_dir=_COORD_DIR,
+            assignment_id=assignment_id,
+            log_path=log_path,
+        )
 
     # Step 4 — remove the interactive worktree when repo_path is provided.
     # Matches _cleanup_worktree discipline: always runs, best-effort.
@@ -1192,6 +1230,81 @@ def _remote_worktree_remove(
     return "__WT_DONE" in (result.stdout or "")
 
 
+def _remote_stash_artifacts(
+    ssh_target: str,
+    remote_worktree_sh: str,
+    repo_name: str,
+    branch: str,
+    patterns: list[str],
+    assignment_id: str,
+    *,
+    timeout: float = 60.0,
+) -> bool:
+    """Run :func:`coord.agent.stash_artifacts_for_branch` on the remote machine.
+
+    SSHes into *ssh_target* and invokes the standalone stash function via the
+    remote's coord venv Python so the artifact-filter logic is identical to the
+    local worker path.  Must be called **before** :func:`_remote_worktree_remove`
+    so the files are still present.
+
+    All dynamic values (worktree path, branch, patterns JSON, assignment_id)
+    are passed as ``sys.argv`` positional arguments so no shell-within-shell
+    quoting is needed — the outer ssh call handles quoting of the argv list.
+
+    Returns ``True`` when the remote command echoed ``__STASH_DONE``.
+    Best-effort: SSH/import failures are silently ignored by the caller.
+    """
+    import json as _json  # noqa: PLC0415
+
+    patterns_json = _json.dumps(patterns)
+    # The Python snippet reads all inputs from argv — no interpolation of
+    # branch/repo/patterns inside the script string itself.  This avoids any
+    # quoting-within-quoting hazards.
+    py_snippet = (
+        "import sys,json; from pathlib import Path; "
+        "from coord.agent import stash_artifacts_for_branch; "
+        "stash_artifacts_for_branch("
+        "worktree_path=Path(sys.argv[1]).expanduser(),"
+        "branch=sys.argv[2],"
+        "repo_name=sys.argv[3],"
+        "patterns=json.loads(sys.argv[4]),"
+        "state_dir=Path.home()/'.coord',"
+        "assignment_id=sys.argv[5]"
+        ")"
+    )
+    # Try the coord venv Python first; fall back to plain python3.
+    # Both invocations pass the same argv so the snippet is identical.
+    argv_tail = [
+        remote_worktree_sh,
+        branch,
+        repo_name,
+        patterns_json,
+        assignment_id,
+    ]
+    # Build a single shell command:
+    #   ( ~/.coord-venv/bin/python3 -c SNIPPET ARGS || python3 -c SNIPPET ARGS )
+    #   && echo __STASH_DONE
+    # The final echo is a reliable sentinel even if the snippet's own print()
+    # is swallowed by 2>/dev/null.
+    snippet_q = shlex.quote(py_snippet)
+    args_q = " ".join(shlex.quote(a) for a in argv_tail)
+    remote_cmd = (
+        f"( ~/.coord-venv/bin/python3 -c {snippet_q} {args_q} 2>/dev/null"
+        f" || python3 -c {snippet_q} {args_q} 2>/dev/null )"
+        " && echo __STASH_DONE"
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "__STASH_DONE" in (result.stdout or "")
+
+
 def finalize_remote_interactive_exit(
     *,
     assignment_id: str,
@@ -1206,6 +1319,7 @@ def finalize_remote_interactive_exit(
     base_branch: str,
     exit_code: int,
     started_at: float | None = None,
+    artifact_paths: list[str] | None = None,
 ) -> InteractiveFinalizeResult:
     """Remote (#486d) analog of :func:`finalize_interactive_exit` for a remote
     interactive FIX.
@@ -1218,14 +1332,27 @@ def finalize_remote_interactive_exit(
     2. record the completion through the issue_store seam LOCALLY (coordinator
        DB + GitHub comment) so the pipeline sees a normal completion and the
        re-review fires;
+    2.5 (#562) stash configured artifacts ON THE REMOTE via ssh so the built
+        binaries survive worktree removal and ``coord pull-artifact`` can fetch
+        them.  Stash runs before worktree removal regardless of push outcome.
     3. remove the remote worktree — but ONLY when the push succeeded, so
        unpushed commits are never silently destroyed.
 
     Respects an existing ``coord report-result`` (same as the local backstop):
     if the row already holds a terminal status, the verdict/result wins and
-    this only attempts worktree cleanup.
+    this only attempts worktree cleanup (after a best-effort remote stash).
     """
+    _effective_patterns = list(artifact_paths or [])
+
     if _assignment_already_recorded(assignment_id):
+        # #562: stash artifacts before removing the worktree, even when the
+        # agent already recorded via `coord report-result` — that path never
+        # stashes on its own.
+        if _effective_patterns:
+            _remote_stash_artifacts(
+                ssh_target, remote_worktree_sh, repo_name, branch,
+                _effective_patterns, assignment_id,
+            )
         removed = _remote_worktree_remove(
             ssh_target, remote_repo_sh, remote_worktree_sh,
         )
@@ -1263,6 +1390,16 @@ def finalize_remote_interactive_exit(
         summary="",
     )
     outcome = post_completion(record)
+
+    # #562: stash artifacts BEFORE removing the worktree so compiled outputs
+    # survive cleanup — same discipline as the agent-side stash on workers.
+    # Stash regardless of push_ok (the worktree files are still present even
+    # when the push failed) so a failed-push session doesn't lose its build.
+    if _effective_patterns:
+        _remote_stash_artifacts(
+            ssh_target, remote_worktree_sh, repo_name, branch,
+            _effective_patterns, assignment_id,
+        )
 
     # Clean up the remote worktree only on a successful push — a failed push
     # means the commits live nowhere but the worktree, so preserve it.

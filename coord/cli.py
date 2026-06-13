@@ -2746,6 +2746,7 @@ def assign(
                         started_at=started_at,
                         log_path=None,
                         repo_path=fix_repo_path,
+                        artifact_paths=repo_cfg.artifact_paths,
                     )
                     if finalize_result.already_recorded:
                         click.echo(
@@ -2860,6 +2861,7 @@ def assign(
                     base_branch=fix_default_branch,
                     exit_code=exit_code,
                     started_at=started_at,
+                    artifact_paths=repo_cfg.artifact_paths,
                 )
                 if _fr.already_recorded:
                     click.echo(
@@ -3102,6 +3104,7 @@ def assign(
                     started_at=started_at,
                     log_path=None,
                     repo_path=repo_path,
+                    artifact_paths=repo_cfg.artifact_paths,
                 )
                 if finalize_result.already_recorded:
                     click.echo(
@@ -3293,6 +3296,7 @@ def assign(
                     base_branch=repo_default_branch,
                     exit_code=exit_code,
                     started_at=started_at,
+                    artifact_paths=repo_cfg.artifact_paths,
                 )
                 if _fr.already_recorded:
                     click.echo(
@@ -6299,6 +6303,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     issue_number_val: int | None = None
     machine_name_val: str | None = None
     base_branch_val: str = "main"
+    artifact_paths_val: list[str] = []
     # #486 Leg 4: the assignment type + branch decide how a REMOTE session
     # finalizes — a read-only review records DB-only; a fix pushes its remote
     # worktree's commits back to origin.
@@ -6342,13 +6347,14 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     remote_repo_sh: str | None = None
     try:
         cfg = _load_config(config_path)
-        # Get default_branch from the repo config.
+        # Get default_branch + artifact_paths from the repo config.
         if repo_name_val:
             repo_cfg_obj = next(
                 (r for r in cfg.repos if r.name == repo_name_val), None
             )
             if repo_cfg_obj:
                 base_branch_val = repo_cfg_obj.default_branch or "main"
+                artifact_paths_val = list(repo_cfg_obj.artifact_paths or [])
         # Get repo_path + locality from machine config.
         if machine_name_val and repo_name_val:
             machine_obj = next(
@@ -6420,6 +6426,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                         base_branch=base_branch_val,
                         exit_code=exit_code,
                         started_at=started_at,
+                        artifact_paths=artifact_paths_val,
                     )
                     if fr.already_recorded:
                         click.echo(
@@ -6505,6 +6512,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                 started_at=started_at,
                 log_path=None,
                 repo_path=repo_path_val,
+                artifact_paths=artifact_paths_val,
             )
             if finalize_result.already_recorded:
                 click.echo(
