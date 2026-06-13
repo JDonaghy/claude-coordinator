@@ -683,6 +683,54 @@ class TestAssignInteractiveReview:
         assert "session still running in remote tmux" in result.output
         assert "coord report-result" in result.output
 
+    def test_review_of_local_session_ended_prompts_for_verdict(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """A LOCAL interactive review that exits without the reviewer running
+        `coord report-result` must route the missing verdict through the
+        operator prompt+relay helper (parity with the remote #486d path) —
+        not silently print 'no verdict reported' and strand the merge gate.
+
+        The prompt helper is spied here; when it declines (returns False, e.g.
+        the non-TTY CliRunner) the stall consequence is still surfaced."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-abc", "issue-1-fix-bug")
+        fake_result = MagicMock(already_recorded=False, terminal_status="advisory")
+        finalize_spy = MagicMock(return_value=fake_result)
+        relay_spy = MagicMock(return_value=False)
+        local_spy = MagicMock(return_value=0)
+        remote_spy = MagicMock()
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive.launch_human_attended_interactive", local_spy), \
+             patch("coord.interactive._launch_via_tmux", remote_spy), \
+             patch("coord.interactive.tmux_available", return_value=False), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_interactive_exit", finalize_spy), \
+             patch("coord.cli._prompt_and_relay_review_verdict", relay_spy):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--review-of", "work-abc"],
+            )
+        assert result.exit_code == 0, result.output
+        # Local path was taken (not the remote tmux launch).
+        local_spy.assert_called_once()
+        remote_spy.assert_not_called()
+        # The fix: the local exit routes the missing verdict through the
+        # operator prompt+relay helper (parity with the remote #486d path).
+        relay_spy.assert_called_once()
+        kwargs = relay_spy.call_args.kwargs
+        assert kwargs["assignment_id"]
+        assert kwargs["repo_name"] == "api"
+        assert kwargs["issue_number"] == 1
+        assert "coord report-result" in kwargs["verdict_cmd_hint"]
+        # Helper declined (False) ⇒ the stall consequence is still surfaced.
+        assert "no verdict reported" in result.output
+        assert "merge gate" in result.output
+
 
 def _seed_review_and_work(
     work_id: str,

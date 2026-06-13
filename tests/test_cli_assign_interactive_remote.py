@@ -778,7 +778,7 @@ class TestRemoteReviewVerdictRelay:
     session exits, instead of being left as a manual `coord report-result`."""
 
     def test_non_tty_skips_prompt_and_does_not_post(self, monkeypatch) -> None:
-        from coord.cli import _prompt_and_relay_remote_review_verdict
+        from coord.cli import _prompt_and_relay_review_verdict
 
         monkeypatch.setattr("sys.stdin.isatty", lambda: False)
         posted: dict = {}
@@ -786,7 +786,7 @@ class TestRemoteReviewVerdictRelay:
             "coord.issue_store.post_result",
             lambda rec: posted.setdefault("rec", rec),
         )
-        ok = _prompt_and_relay_remote_review_verdict(
+        ok = _prompt_and_relay_review_verdict(
             assignment_id="rev1",
             repo_name="vimcode",
             repo_github="JDonaghy/vimcode",
@@ -798,7 +798,7 @@ class TestRemoteReviewVerdictRelay:
         assert "rec" not in posted  # headless → no inline relay
 
     def test_tty_request_changes_relays_verdict(self, monkeypatch) -> None:
-        from coord.cli import _prompt_and_relay_remote_review_verdict
+        from coord.cli import _prompt_and_relay_review_verdict
 
         monkeypatch.setattr("sys.stdin.isatty", lambda: True)
         answers = iter(["r", ""])  # verdict choice, then summary
@@ -814,7 +814,7 @@ class TestRemoteReviewVerdictRelay:
             "coord.issue_store.post_result",
             lambda rec: (captured.setdefault("rec", rec), _Out())[1],
         )
-        ok = _prompt_and_relay_remote_review_verdict(
+        ok = _prompt_and_relay_review_verdict(
             assignment_id="rev1",
             repo_name="vimcode",
             repo_github="JDonaghy/vimcode",
@@ -830,7 +830,7 @@ class TestRemoteReviewVerdictRelay:
         assert rec.repo_github == "JDonaghy/vimcode"
 
     def test_tty_skip_does_not_post(self, monkeypatch) -> None:
-        from coord.cli import _prompt_and_relay_remote_review_verdict
+        from coord.cli import _prompt_and_relay_review_verdict
 
         monkeypatch.setattr("sys.stdin.isatty", lambda: True)
         monkeypatch.setattr("click.prompt", lambda *a, **k: "s")
@@ -839,7 +839,7 @@ class TestRemoteReviewVerdictRelay:
             "coord.issue_store.post_result",
             lambda rec: posted.setdefault("rec", rec),
         )
-        ok = _prompt_and_relay_remote_review_verdict(
+        ok = _prompt_and_relay_review_verdict(
             assignment_id="rev1",
             repo_name="vimcode",
             repo_github="JDonaghy/vimcode",

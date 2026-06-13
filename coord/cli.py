@@ -1814,7 +1814,7 @@ def approve(
             write_session_start()
 
 
-def _prompt_and_relay_remote_review_verdict(
+def _prompt_and_relay_review_verdict(
     *,
     assignment_id: str,
     repo_name: str,
@@ -1823,14 +1823,21 @@ def _prompt_and_relay_remote_review_verdict(
     machine_name: str,
     verdict_cmd_hint: str,
 ) -> bool:
-    """#486d: relay a *remote* review's verdict on the coordinator.
+    """Prompt the operator for a review verdict on exit and relay it (#486d).
 
-    A remote review session can't write this DB (its `coord report-result`
-    would hit the remote machine's DB), and the reattach/assign finalize is
-    DB-only — so the verdict silently never reaches the merge gate and the
-    Work→Review→Fix flow stalls.  After the session ends, prompt the operator
-    here (the embedded terminal is a TTY) and relay the verdict through the
-    same `issue_store` seam `coord report-result` uses.
+    Used by BOTH interactive-review exit paths when the reviewer left without
+    running `coord report-result`:
+
+    * remote review — the session can't write this DB (its `report-result`
+      would hit the *remote* machine's DB), so the verdict would otherwise
+      never reach the merge gate;
+    * local review — the reviewer simply didn't run `report-result` before
+      closing the TTY.
+
+    In both cases the verdict silently never reaches the merge gate and the
+    Work→Review→Fix flow stalls.  Prompt the operator here (the terminal is a
+    TTY) and relay through the same `issue_store` seam `coord report-result`
+    uses.
 
     No-op that prints the manual hint when stdin isn't a TTY (tests/headless).
     Returns True when a verdict was recorded.
@@ -1839,7 +1846,7 @@ def _prompt_and_relay_remote_review_verdict(
         click.echo(f"  no verdict reported — record it with:\n{verdict_cmd_hint}")
         return False
     ans = click.prompt(
-        "  Remote review verdict — [a]pprove / [r]equest-changes / [s]kip",
+        "  Review verdict — [a]pprove / [r]equest-changes / [s]kip",
         type=click.Choice(["a", "r", "s"], case_sensitive=False),
         default="s",
         show_choices=True,
@@ -2360,12 +2367,31 @@ def assign(
                     if finalize_result.already_recorded:
                         click.echo("  verdict recorded via `coord report-result`")
                     else:
-                        click.echo(
-                            "  review session ended with no verdict reported "
-                            "(status="
-                            f"{finalize_result.terminal_status}) — the merge gate "
-                            "stays blocked until a verdict is reported."
+                        # The reviewer exited without running `coord
+                        # report-result`.  Mirror the remote path (#486d): prompt
+                        # the operator here (this is a TTY) and relay the verdict
+                        # through the same issue_store seam, so the merge gate /
+                        # Fix routing sees it instead of silently stalling on a
+                        # missing verdict.
+                        _verdict_cmd = (
+                            f"    coord report-result --assignment {assignment_id} "
+                            "--status done --verdict approve|request-changes "
+                            "--summary <one-line summary>"
                         )
+                        if not _prompt_and_relay_review_verdict(
+                            assignment_id=assignment_id,
+                            repo_name=repo,
+                            repo_github=repo_cfg.github,
+                            issue_number=issue,
+                            machine_name=machine,
+                            verdict_cmd_hint=_verdict_cmd,
+                        ):
+                            click.echo(
+                                "  review session ended with no verdict reported "
+                                f"(status={finalize_result.terminal_status}) — the "
+                                "merge gate stays blocked until a verdict is "
+                                "reported."
+                            )
                 except Exception as exc:  # noqa: BLE001 — best-effort backstop
                     click.echo(
                         f"  warning: backstop failed to record review exit: {exc}",
@@ -2480,7 +2506,7 @@ def assign(
                     # #486d: don't leave the verdict as a manual step — prompt the
                     # operator here (on the coordinator, where the row lives) and
                     # relay it, so the merge gate / leg-3 Fix routing sees it.
-                    _prompt_and_relay_remote_review_verdict(
+                    _prompt_and_relay_review_verdict(
                         assignment_id=assignment_id,
                         repo_name=repo,
                         repo_github=repo_cfg.github,
@@ -6471,7 +6497,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                         # #486d: relay the review verdict here — the remote
                         # session can't write this DB — instead of leaving it
                         # a manual `coord report-result` step.
-                        _prompt_and_relay_remote_review_verdict(
+                        _prompt_and_relay_review_verdict(
                             assignment_id=assignment_id,
                             repo_name=repo_name_val,
                             repo_github=repo_github_val,
