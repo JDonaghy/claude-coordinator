@@ -35629,6 +35629,189 @@ mod tests {
         assert_eq!(session_type_label("custom-type"), "custom-type");
     }
 
+    #[test]
+    fn parse_session_summaries_failure_event_produces_failed_status() {
+        // A `<!-- coord:event=failure ... -->` comment should produce status="failed".
+        let body = "## Coordinator: Assignment Failed\n\
+            <!-- coord:event=failure assignment=fail01 machine=dellserver repo=r issue=5 exit_code=1 -->\n\
+            **Machine:** dellserver\n\
+            **Status:** failed\n";
+        let comments = serde_json::Value::Array(vec![
+            make_comment(body, "2024-06-01T14:00:00Z"),
+        ]);
+        let result = parse_session_summaries_from_comments(&comments, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].status, "failed");
+        assert_eq!(result[0].assignment_id, "fail01");
+        assert_eq!(result[0].machine, "dellserver");
+        assert!(result[0].verdict.is_none());
+    }
+
+    #[test]
+    fn parse_session_summaries_advisory_event_produces_advisory_status() {
+        // A `<!-- coord:event=advisory ... -->` comment should produce status="advisory".
+        let body = "<!-- coord:event=advisory assignment=adv01 machine=precision repo=r issue=6 exit_code=0 -->\n\
+            **Machine:** precision\n\
+            **Status:** advisory (zero commits)\n";
+        let comments = serde_json::Value::Array(vec![
+            make_comment(body, "2024-06-01T15:00:00Z"),
+        ]);
+        let result = parse_session_summaries_from_comments(&comments, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].status, "advisory");
+        assert_eq!(result[0].assignment_id, "adv01");
+        assert!(result[0].verdict.is_none());
+    }
+
+    #[test]
+    fn parse_session_summaries_type_promoted_from_db_assignment() {
+        // When the local DB has an assignment with type="fix", the completion
+        // comment for that assignment id should get session_type="fix".
+        let body = "<!-- coord:event=completion assignment=fix42 machine=precision repo=r issue=7 exit_code=0 -->\n\
+            ### Summary\nFixed the tab-click threshold.";
+        let comments = serde_json::Value::Array(vec![
+            make_comment(body, "2024-06-02T10:00:00Z"),
+        ]);
+        let fix_assignment = Assignment {
+            id: "fix42".to_string(),
+            repo: "r".to_string(),
+            issue_number: 7,
+            issue_title: String::new(),
+            machine: "precision".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: None,
+            finished_at: None,
+            exit_code: Some(0),
+            assignment_type: Some("fix".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+        };
+        let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].session_type, "fix",
+            "session_type should be promoted from DB assignment to 'fix'"
+        );
+    }
+
+    #[test]
+    fn parse_session_summaries_unknown_event_types_are_skipped() {
+        // Events like "briefing", "stuck" are not terminal and should be skipped.
+        let briefing_body = "<!-- coord:event=briefing assignment=b1 machine=m repo=r issue=1 -->";
+        let stuck_body = "<!-- coord:event=stuck assignment=s1 machine=m repo=r issue=1 -->";
+        let comments = serde_json::Value::Array(vec![
+            make_comment(briefing_body, "2024-06-01T00:00:00Z"),
+            make_comment(stuck_body, "2024-06-01T01:00:00Z"),
+        ]);
+        let result = parse_session_summaries_from_comments(&comments, &[]);
+        assert!(result.is_empty(), "briefing/stuck events must be skipped");
+    }
+
+    #[test]
+    fn build_summary_list_view_empty_summaries_returns_placeholder() {
+        // When there are no session summaries, the list should show a
+        // single placeholder "No session summaries yet" item.
+        let lv = build_summary_list_view(vec![], 0);
+        assert_eq!(lv.items.len(), 1, "empty → exactly one placeholder item");
+        let text = lv.items[0]
+            .text
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains("No session summaries"),
+            "placeholder text missing; got: {:?}",
+            text,
+        );
+    }
+
+    #[test]
+    fn build_summary_list_view_one_session_produces_header_and_separator() {
+        // A single session → header item + optional summary text + blank separator.
+        let summaries = vec![SessionSummary {
+            assignment_id: "w1".to_string(),
+            session_type: "work".to_string(),
+            machine: "precision".to_string(),
+            status: "done".to_string(),
+            verdict: None,
+            summary_text: "Migrated the TUI.".to_string(),
+            created_at_ts: 0.0,
+        }];
+        let lv = build_summary_list_view(summaries, 0);
+        // Expect: header row, summary-text row, blank separator = 3 items minimum.
+        assert!(
+            lv.items.len() >= 3,
+            "expected at least 3 items (header + text + separator); got {}",
+            lv.items.len()
+        );
+    }
+
+    #[test]
+    fn build_summary_list_view_approve_verdict_colours_green() {
+        // A review with verdict=approve should have green colour on the badge span.
+        let summaries = vec![SessionSummary {
+            assignment_id: "rv1".to_string(),
+            session_type: "review".to_string(),
+            machine: "dellserver".to_string(),
+            status: "done".to_string(),
+            verdict: Some("approve".to_string()),
+            summary_text: "LGTM".to_string(),
+            created_at_ts: 0.0,
+        }];
+        let lv = build_summary_list_view(summaries, 0);
+        // The header is items[0]. Its last span should carry the badge text.
+        let header = &lv.items[0];
+        let badge_span = header.text.spans.last().expect("header must have spans");
+        assert!(
+            badge_span.text.contains("approve"),
+            "badge span should contain 'approve'; got {:?}",
+            badge_span.text
+        );
+        // Colour: green ≈ rgb(120, 200, 120).
+        assert_eq!(
+            badge_span.fg,
+            Some(Color::rgb(120, 200, 120)),
+            "approve badge must be green"
+        );
+    }
+
+    #[test]
+    fn build_summary_list_view_request_changes_verdict_colours_red() {
+        // A review with verdict=request-changes should have red colour on the badge span.
+        let summaries = vec![SessionSummary {
+            assignment_id: "rv2".to_string(),
+            session_type: "review".to_string(),
+            machine: "elitebook".to_string(),
+            status: "done".to_string(),
+            verdict: Some("request-changes".to_string()),
+            summary_text: "Tab-click broken".to_string(),
+            created_at_ts: 0.0,
+        }];
+        let lv = build_summary_list_view(summaries, 0);
+        let header = &lv.items[0];
+        let badge_span = header.text.spans.last().expect("header must have spans");
+        assert!(
+            badge_span.text.contains("request-changes"),
+            "badge span should contain 'request-changes'; got {:?}",
+            badge_span.text
+        );
+        // Colour: red ≈ rgb(220, 100, 100).
+        assert_eq!(
+            badge_span.fg,
+            Some(Color::rgb(220, 100, 100)),
+            "request-changes badge must be red"
+        );
+    }
+
     // ── parse_issue_proposal (#316) ────────────────────────────────────────────
 
     /// Helper: build a stream-json text line as the worker emits.
