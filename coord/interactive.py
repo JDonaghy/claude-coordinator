@@ -64,6 +64,7 @@ Linux/macOS only.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import select
 import shlex
@@ -1254,17 +1255,22 @@ def _remote_stash_artifacts(
     Returns ``True`` when the remote command echoed ``__STASH_DONE``.
     Best-effort: SSH/import failures are silently ignored by the caller.
     """
-    import json as _json  # noqa: PLC0415
-
-    patterns_json = _json.dumps(patterns)
+    patterns_json = json.dumps(patterns)
     # The Python snippet reads all inputs from argv — no interpolation of
     # branch/repo/patterns inside the script string itself.  This avoids any
     # quoting-within-quoting hazards.
+    #
+    # ``remote_worktree_sh`` is a ``$HOME``-form path (e.g.
+    # ``$HOME/.coord/worktrees/<id>``).  When passed via shlex.quote() it
+    # becomes a single-quoted shell token, so the remote shell NEVER expands
+    # ``$HOME``.  ``Path.expanduser()`` only handles ``~``, not ``$HOME``.
+    # Use ``os.path.expandvars()`` in the snippet to resolve ``$HOME`` on the
+    # remote machine before constructing the Path.
     py_snippet = (
-        "import sys,json; from pathlib import Path; "
+        "import sys,json,os; from pathlib import Path; "
         "from coord.agent import stash_artifacts_for_branch; "
         "stash_artifacts_for_branch("
-        "worktree_path=Path(sys.argv[1]).expanduser(),"
+        "worktree_path=Path(os.path.expandvars(sys.argv[1])),"
         "branch=sys.argv[2],"
         "repo_name=sys.argv[3],"
         "patterns=json.loads(sys.argv[4]),"
