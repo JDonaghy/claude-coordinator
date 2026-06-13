@@ -306,7 +306,57 @@ acceptance, latest review verdict/comment) without navigating away.
 
 ---
 
-## 11. Dependencies & suggested sequencing
+## 11. Focus & input routing
+
+The current TUI toggles terminal focus with **F12** (a manual mode switch) — the
+known bugbear. The next incarnation makes focus *intuitive for mouse users* and
+*complete for keyboard users*, with **no global mode toggle**.
+
+**Model — one pane owns "bare" keys at a time.** Exactly one pane (tree, card
+grid, tab, or terminal tile) is *focused* and visibly highlighted (heavy
+border). Bare keystrokes go to the focused pane: a focused tree navigates with
+`h/j/k/l`; a focused terminal sends them to the inner app (vim, claude's TUI).
+
+**Mouse — focus follows click (retire F12):**
+- Click a pane → it becomes focused. Click inside the *focused* terminal → the
+  event forwards to the PTY/inner app (clicking a button in claude's TUI both
+  focuses and acts). Click any other pane / the sidebar / a tab → focus moves
+  there. This is the GUI-standard behavior; no F12.
+- Mouse-forwarding infra exists (#454). Scrollback text selection with scroll
+  offset is the open rough edge (#484).
+
+**Keyboard — vim-style, two levels:**
+- **Intra-pane:** bare `h/j/k/l` move *within* the focused pane (tree selection,
+  card grid, terminal app).
+- **Inter-pane:** **`Ctrl-W`** is the pane leader (vim window-nav). `Ctrl-W
+  h/j/k/l` (or arrows) moves focus across panes / tiles / sidebar; `Ctrl-W` +
+  ops for split / close / zoom. **This replaces F12.**
+
+**The greedy-terminal problem & the leader.** A full-screen app inside a
+terminal wants *every* key — `h/j/k/l`, arrows, `Esc`, even `Ctrl-W` (vim's own
+window key). So control keys route through the leader, never bare keys:
+- bare keys → focused terminal (the inner app gets everything),
+- `Ctrl-W <dir>` → the TUI moves focus,
+- `Ctrl-W Ctrl-W` → sends a *literal* `Ctrl-W` to the inner app (the same
+  prefix-prefix escape hatch as tmux's `Ctrl-b Ctrl-b`).
+
+**One leader everywhere.** This is the *same* prefix that fixes **#551**
+(digit/nav keys leaking into the PTY) and the *same* one the **Sessions wall
+(§6)** uses for tile ops. Unify them: one pane-leader across the detail
+tab-groups and the wall.
+
+**Decision to confirm:** `Ctrl-W` as the leader shadows vim's own `Ctrl-W`
+inside a focused terminal (resolved by the double-press above). If too intrusive,
+use a dedicated leader (the old F12, or screen-style `Ctrl-A`) — but `Ctrl-W` is
+what keyboard/vim users reach for.
+
+**Related:** #551 (the leak this prevents), #454 (mouse forwarding, shipped),
+#484 (terminal selection vs scroll offset), #574 (the wall uses this leader),
+#518 (tab-group splits navigated by `Ctrl-W`).
+
+---
+
+## 12. Dependencies & suggested sequencing
 
 1. **#559** — live session-roster refresh (today it is startup-only). *Gate for
    the Sessions wall*; also fixes reattach staleness.
@@ -322,7 +372,7 @@ acceptance, latest review verdict/comment) without navigating away.
 
 ---
 
-## 12. Open questions
+## 13. Open questions
 
 - Swimlane-key default and whether it persists per-user.
 - Same-issue sub-tab split (tear-off a single sub-tab) — deliberately
@@ -336,7 +386,7 @@ acceptance, latest review verdict/comment) without navigating away.
 
 ---
 
-## 13. Teams — auth & deployment (summary; full design in #282)
+## 14. Teams — auth & deployment (summary; full design in #282)
 
 A "small team" (e.g. two developers on a Tailscale network, **each with their
 own Claude Max**) is — for this tool — a shared **fleet + shared board state**,
