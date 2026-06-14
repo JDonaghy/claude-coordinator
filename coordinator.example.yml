@@ -83,6 +83,10 @@ concurrency:
   stagger_seconds: 30     # delay between starting workers
   backoff_base: 60        # seconds to wait on rate limit before retry
   max_retries: 3          # retries per dispatch on transient failures
+  # #588: SSH-probe remote interactive sessions after this many hours idle.
+  # If the remote tmux session is gone, finalize and free the machine slot.
+  # Set to 0 to disable. Default: 12.
+  # interactive_session_timeout_hours: 12
 
 hooks:
   on_round_complete:
