@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import select
 import shlex
@@ -95,6 +96,7 @@ __all__ = [
     "launch_human_attended_interactive",
     "finalize_interactive_exit",
     "reap_stale_interactive_sessions",
+    "reap_stale_remote_interactive_sessions",
     "InteractiveFinalizeResult",
     "TMUX_SESSION_PREFIX",
     "TmuxHost",
@@ -1592,6 +1594,257 @@ def reap_stale_interactive_sessions(
         moved = board.mark_failed_by_id(a.assignment_id, finished_at=now)
         # mark_failed_by_id always sets status="failed"; upgrade to advisory
         # when the commit count shows no work was produced.
+        if moved is not None and terminal_status == "advisory":
+            moved.status = "advisory"
+        reaped.append(a.assignment_id)
+
+    return reaped
+
+
+# ── Remote stale-session reaper (#588) ───────────────────────────────────────
+
+#: Per-session count of consecutive reconcile passes where SSH to the remote
+#: host timed out or refused.  Reset to 0 on first successful SSH probe.
+#: Module-level (ephemeral — not persisted to DB) so the count survives
+#: multiple reconcile calls within a coordinator session.
+_REMOTE_SSH_UNREACHABLE_COUNTS: dict[str, int] = {}
+
+
+def _probe_remote_tmux_alive(
+    session_name: str,
+    host: TmuxHost,
+) -> tuple[bool, bool]:
+    """Probe a remote tmux session and report liveness + SSH reachability.
+
+    Returns a ``(session_alive, ssh_ok)`` tuple:
+
+    * ``session_alive`` — ``True`` when ``tmux has-session`` exited 0.
+    * ``ssh_ok`` — ``True`` when SSH connected successfully (even if the
+      session was absent).  ``False`` indicates an SSH transport failure
+      (connection refused / timeout / auth error) rather than a tmux
+      answer of "no such session".
+
+    SSH exit code 255 is the canonical "SSH could not connect" indicator.
+    The ``BatchMode=yes`` + ``ConnectTimeout=4`` flags on the
+    :class:`TmuxHost` (``batch=True``) ensure the call fails fast and
+    never prompts for credentials.
+    """
+    try:
+        result = subprocess.run(
+            host.cmd(["has-session", "-t", session_name]),
+            capture_output=True,
+            timeout=8.0,
+        )
+        # SSH itself returns 255 when it cannot connect (refused, timeout,
+        # auth failure).  tmux returns 0 (alive) or 1 (no session) — both
+        # mean SSH succeeded.
+        if result.returncode == 255:
+            return False, False
+        return result.returncode == 0, True
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+        return False, False
+
+
+def reap_stale_remote_interactive_sessions(
+    board: "Board",
+    config: "Config",
+) -> list[str]:
+    """Sweep *board.active* for remote interactive sessions whose tmux session
+    is dead, and release their machine slots via
+    :func:`finalize_remote_interactive_exit`.
+
+    This is the **remote** complement to :func:`reap_stale_interactive_sessions`,
+    which deliberately skips remote assignments to avoid false-positive reaping
+    of live sessions.  This function only touches assignments that are:
+
+    * ``provider_name == "claude-pty"``
+    * ``status`` is ``"running"`` or ``"pending"``
+    * The assigned machine is **not** the local host
+    * The assignment has been running for at least
+      ``concurrency.interactive_session_timeout_hours`` (default 12 h)
+
+    For each candidate it SSHes to the remote host (using ``BatchMode=yes``
+    + ``ConnectTimeout`` for a fast, non-prompting probe) and runs
+    ``tmux has-session -t coord-<id>``.  Three outcomes:
+
+    1. **Session alive** — skip; the human is still working.
+    2. **SSH ok but session dead** — the tmux session exited without going
+       through the normal finalize path.  Call
+       :func:`finalize_remote_interactive_exit` to push any outstanding
+       commits, record the terminal status, and remove the remote worktree.
+       The assignment is moved to ``board.completed`` and the machine slot
+       is freed.
+    3. **SSH unreachable** — the host is down or the connection timed out.
+       Increment a per-session counter in :data:`_REMOTE_SSH_UNREACHABLE_COUNTS`
+       and emit a ``logging.warning()`` so the operator sees it in CLI
+       output.  The assignment is left ``running`` — a host that was up 22h
+       ago might just be temporarily unreachable.
+
+    Returns the assignment IDs that were reaped (outcome 2 only).  The
+    caller should extend its ``changed`` list with these IDs so
+    :func:`coord.state.save_board` is triggered.
+    """
+    timeout_hours = getattr(config.concurrency, "interactive_session_timeout_hours", 12.0)
+    if timeout_hours <= 0:
+        return []  # sweep disabled by config
+
+    timeout_secs = timeout_hours * 3600
+    machines_by_name = {m.name: m for m in config.machines}
+    repos_by_name = {r.name: r for r in config.repos}
+    _local_hn = _get_local_short_hostname()
+    reaped: list[str] = []
+    now = time.time()
+
+    for a in board.active[:]:  # iterate a copy — we mutate board mid-loop
+        if a.provider_name != "claude-pty":
+            continue
+        if a.status not in ("running", "pending"):
+            continue
+        if not a.assignment_id:
+            continue
+
+        # Only probe remote machines — local ones are handled by
+        # reap_stale_interactive_sessions().
+        machine = machines_by_name.get(a.machine_name or "")
+        if machine is None:
+            continue
+        _is_local = (
+            machine.name.lower() == _local_hn
+            or machine.host.split(".")[0].lower() == _local_hn
+        )
+        if _is_local:
+            continue
+
+        # Skip sessions that are too young to have plausibly gone stale.
+        dispatched_at = a.dispatched_at or 0.0
+        age_secs = now - dispatched_at
+        if age_secs < timeout_secs:
+            continue
+
+        # ── SSH probe ──────────────────────────────────────────────────────
+        sname = tmux_session_name(a.assignment_id)
+        tmux_host = TmuxHost(ssh_target=machine.host, batch=True)
+        alive, ssh_ok = _probe_remote_tmux_alive(sname, tmux_host)
+
+        if alive:
+            # Session is genuinely running — clear any unreachable counter
+            # accumulated from prior SSH hiccups.
+            _REMOTE_SSH_UNREACHABLE_COUNTS.pop(a.assignment_id, None)
+            continue
+
+        if not ssh_ok:
+            # SSH transport failure — host may be rebooting, not crashed.
+            # Emit a warning and leave the slot occupied rather than
+            # destroying potentially good work.
+            count = _REMOTE_SSH_UNREACHABLE_COUNTS.get(a.assignment_id, 0) + 1
+            _REMOTE_SSH_UNREACHABLE_COUNTS[a.assignment_id] = count
+            age_h = age_secs / 3600
+            logging.warning(
+                "⚠ %s unreachable — interactive session %s may be stale; "
+                "running for %.1fh (consecutive SSH failures: %d)",
+                machine.name, a.assignment_id, age_h, count,
+            )
+            continue
+
+        # ── SSH ok, tmux session dead — reap it ───────────────────────────
+        _REMOTE_SSH_UNREACHABLE_COUNTS.pop(a.assignment_id, None)
+
+        repo_cfg = repos_by_name.get(a.repo_name or "")
+        repo_github = repo_cfg.github if repo_cfg is not None else ""
+        base_branch = (repo_cfg.default_branch or "main") if repo_cfg is not None else "main"
+        artifact_paths_val = list(repo_cfg.artifact_paths or []) if repo_cfg is not None else []
+
+        rp = machine.repo_path(a.repo_name or "")
+        remote_repo_sh: str | None = None
+        if rp:
+            # Convert the machine's ``~/…`` repo path to a ``$HOME/…`` form
+            # that the *remote* shell (not the coordinator's local shell) will
+            # expand correctly.
+            remote_repo_sh = (
+                "$HOME/" + rp[2:]
+                if rp.startswith("~/")
+                else ("$HOME" if rp == "~" else rp)
+            )
+
+        remote_worktree_sh = "$HOME/.coord/worktrees/" + a.assignment_id
+
+        # Recover the branch from the assignment record.  When the branch
+        # wasn't persisted at dispatch time (pre-#557 boards) derive it from
+        # the remote worktree HEAD so we don't strand commits.
+        branch_val = a.branch
+        if not branch_val and machine.host:
+            try:
+                probe = subprocess.run(
+                    [
+                        "ssh", *_SSH_MUX_OPTS, machine.host,
+                        f"git -C {remote_worktree_sh}"
+                        " rev-parse --abbrev-ref HEAD 2>/dev/null",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if probe.returncode == 0:
+                    derived = probe.stdout.strip()
+                    if derived and derived != "HEAD":
+                        branch_val = derived
+            except Exception:  # noqa: BLE001
+                pass
+
+        if branch_val and remote_repo_sh:
+            # Full finalize: push commits, record completion, clean worktree.
+            try:
+                fr = finalize_remote_interactive_exit(
+                    assignment_id=a.assignment_id,
+                    repo_name=a.repo_name or "",
+                    repo_github=repo_github,
+                    issue_number=a.issue_number,
+                    machine_name=a.machine_name or "",
+                    ssh_target=machine.host,
+                    remote_worktree_sh=remote_worktree_sh,
+                    remote_repo_sh=remote_repo_sh,
+                    branch=branch_val,
+                    base_branch=base_branch,
+                    exit_code=1,  # stale / timed-out exit
+                    started_at=a.dispatched_at,
+                    artifact_paths=artifact_paths_val,
+                )
+                terminal_status = fr.terminal_status
+                if terminal_status not in ("done", "advisory", "failed", "report-result"):
+                    terminal_status = "failed"
+            except Exception:  # noqa: BLE001
+                # Finalize failed (e.g. network error mid-push). Fall back to
+                # a plain DB mark so the slot is still freed.
+                terminal_status = "failed"
+                try:
+                    from coord.state import get_connection  # noqa: PLC0415
+                    conn = get_connection()
+                    conn.execute(
+                        "UPDATE assignments SET status=?, finished_at=? "
+                        "WHERE assignment_id=? AND status IN ('running', 'pending')",
+                        (terminal_status, now, a.assignment_id),
+                    )
+                    conn.commit()
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            # No branch recoverable — mark failed in DB so the slot is freed
+            # without attempting a push.
+            terminal_status = "failed"
+            try:
+                from coord.state import get_connection  # noqa: PLC0415
+                conn = get_connection()
+                conn.execute(
+                    "UPDATE assignments SET status=?, finished_at=? "
+                    "WHERE assignment_id=? AND status IN ('running', 'pending')",
+                    (terminal_status, now, a.assignment_id),
+                )
+                conn.commit()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Update the in-memory board so the claim is released immediately.
+        moved = board.mark_failed_by_id(a.assignment_id, finished_at=now)
         if moved is not None and terminal_status == "advisory":
             moved.status = "advisory"
         reaped.append(a.assignment_id)
