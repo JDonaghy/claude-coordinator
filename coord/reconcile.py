@@ -185,10 +185,19 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # stale "running" board row + orphaned worktree that blocks relaunch.
     # Reaping here ensures ``coord resume`` / ``coord notify`` clean up
     # without requiring the user to first run ``coord reattach``.
-    from coord.interactive import reap_stale_interactive_sessions  # noqa: PLC0415
+    from coord.interactive import (  # noqa: PLC0415
+        reap_stale_interactive_sessions,
+        reap_stale_remote_interactive_sessions,
+    )
 
     reaped = reap_stale_interactive_sessions(board, config)
     changed.extend(reaped)
+
+    # #588: probe remote claude-pty sessions older than the configured timeout
+    # threshold.  The local reaper above skips these; this sweep SSHes to the
+    # remote host and finalizes sessions whose tmux has exited.
+    remote_reaped = reap_stale_remote_interactive_sessions(board, config)
+    changed.extend(remote_reaped)
 
     # Pass 1: transition active assignments that have finished.
     for a in board.active[:]:

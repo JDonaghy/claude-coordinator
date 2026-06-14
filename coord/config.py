@@ -84,6 +84,16 @@ class ConcurrencyConfig:
     # catches truly silent hangs — a rate-limited worker still emits output and
     # therefore passes the check.
     first_output_timeout: float = 600.0
+    # Remote interactive-session staleness timeout (#588).  After a remote
+    # ``claude-pty`` assignment has been running for longer than this many
+    # hours, each reconcile pass probes the remote tmux session via SSH.  If
+    # the session is dead (tmux has-session exits 1) the coordinator calls
+    # ``finalize_remote_interactive_exit`` to push any commits and release the
+    # machine slot.  If SSH is unreachable, a warning is emitted instead.
+    # Default is 12 hours — generous enough that a genuinely long session is
+    # never interrupted, but tight enough to catch orphaned rows from crashed
+    # sessions overnight.  Set to 0 to disable the sweep entirely.
+    interactive_session_timeout_hours: float = 12.0
 
 
 @dataclass
@@ -671,7 +681,7 @@ def _parse_concurrency(raw: Any) -> ConcurrencyConfig:
     cfg = ConcurrencyConfig()
     for key in (
         "max_workers", "stagger_seconds", "backoff_base", "max_retries",
-        "stale_threshold", "first_output_timeout",
+        "stale_threshold", "first_output_timeout", "interactive_session_timeout_hours",
     ):
         val = raw.get(key)
         if val is None:
