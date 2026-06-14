@@ -565,7 +565,10 @@ def build_review_briefing(
     else:
         lines.append(
             f"1. The worker pushed branch `{branch}` but no PR was opened. "
-            "Inspect the diff with `git diff main..." + (branch or "<branch>") + "`."
+            f"Get the diff: `git fetch origin && git diff origin/{default_branch}..."
+            f"origin/{branch or '<branch>'}`. Always diff against `origin/` after "
+            "fetching — a local base ref may be stale and would sweep in unrelated "
+            "already-merged commits."
         )
         lines.append("2. Run the project's test suite.")
         lines.append("3. Review the diff against the checklist above.")

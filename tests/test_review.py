@@ -285,8 +285,28 @@ def test_briefing_falls_back_to_branch_diff_when_no_pr() -> None:
         branch="my-branch", worker_machine="laptop", same_as_worker=False,
         reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
     )
-    assert "git diff main...my-branch" in briefing
+    # Must fetch first and diff against origin/<base> — diffing bare local
+    # `main` against a recently-cut branch on a stale agent checkout sweeps in
+    # every PR merged since the local ref last moved (the #563 "bundled 5
+    # issues" false positive). Always fetch + origin/<base>...origin/<branch>.
+    assert "git fetch origin && git diff origin/main...origin/my-branch" in briefing
+    assert "git diff main...my-branch" not in briefing
     assert "gh pr review" not in briefing
+
+
+def test_briefing_no_pr_diff_uses_default_branch_not_hardcoded_main() -> None:
+    """The no-PR diff base must follow ``default_branch`` (e.g. ``develop``),
+    not a hardcoded ``main`` — otherwise develop-default repos diff against the
+    wrong base."""
+    briefing = build_review_briefing(
+        pr_number=None, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        default_branch="develop",
+    )
+    assert "git diff origin/develop...origin/my-branch" in briefing
+    assert "origin/main" not in briefing
 
 
 def test_briefing_first_review_is_full_scope() -> None:
