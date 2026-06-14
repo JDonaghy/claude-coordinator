@@ -1111,6 +1111,51 @@ enum ArtifactAbsence {
     AgentUnreachable(String),
 }
 
+/// Whether a change for this issue/repo is *expected* to produce the
+/// configured build artifact.  claude-coordinator's only `artifact_paths`
+/// entry is `tui/target/debug/coord-tui`, produced solely by `tui/` changes;
+/// a `coord/**` CLI/Python change never builds it (titled `coord:` vs the
+/// `coord-tui:` convention for TUI work).  For such a change an empty stash
+/// is *expected*, not a failure — the test path is a branch checkout, not an
+/// artifact pull.  Other repos are build-centric, so every change produces
+/// their artifact.
+fn issue_produces_build_artifact(repo: &str, title: &str) -> bool {
+    if repo == "claude-coordinator" {
+        title.to_lowercase().contains("coord-tui")
+    } else {
+        true
+    }
+}
+
+/// Actionable explanation for an empty/absent artifact stash, told apart by
+/// whether the change was expected to build an artifact at all.  Stops an
+/// empty stash from reading as a generic failure (#563/#569): a CLI change
+/// has nothing to pull (test the branch directly); a build-producing change
+/// with an empty stash means the session exited without a successful build.
+fn artifact_absence_body(produces_artifact: bool, branch: &str) -> String {
+    if produces_artifact {
+        format!(
+            "No build artifact stashed for branch `{branch}`.\n\
+             A build was expected but the session exited without producing \
+             the configured artifact (no successful build, or nothing matched \
+             artifact_paths).\n\n\
+             To test, check out the branch and build it locally:\n  \
+             git fetch origin && git checkout {branch}\n  \
+             # then the project's build (for coord-tui: `cd tui && cargo build \
+             && cp target/debug/coord-tui ~/.local/bin/coord-tui`)"
+        )
+    } else {
+        format!(
+            "No artifact for branch `{branch}` — and none is expected.\n\
+             This is a coord/ CLI/Python change; it doesn't build the coord-tui \
+             binary, so there is nothing to pull.\n\n\
+             Test it from the branch instead:\n  \
+             git fetch origin && git checkout {branch}   # then run `coord ...`\n  \
+             (or `pip install -e <worktree>` in a throwaway venv)"
+        )
+    }
+}
+
 /// A cached manifest entry with a fetch timestamp for 30-second TTL eviction.
 struct ArtifactCacheEntry {
     fetched_at: Instant,
@@ -9815,24 +9860,23 @@ impl CoordApp {
                 sanitized,
             });
         }
-        // 3. No badge but a known absence reason → explain it.
+        // 3. No badge but a known absence reason → explain it.  An empty
+        //    stash is the common, confusing case (#563/#569): distinguish a
+        //    non-building CLI change (nothing to pull, ever) from a build that
+        //    should have happened but didn't.
+        let produces_artifact = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .map(|iss| issue_produces_build_artifact(&repo, &iss.title))
+            .unwrap_or(true);
         let cache_key = (repo, sanitized.clone());
         let body = self
             .artifact_cache
             .get(&cache_key)
             .and_then(|e| e.absence_reason.as_ref())
             .map(|absence| match absence {
-                ArtifactAbsence::NotStashed => format!(
-                    "No artifacts stashed (branch {}).\n\
-                     Worker produced no files matching the \
-                     configured globs, or artifact_paths is not \
-                     set in coordinator.yml.",
-                    sanitized
-                ),
-                ArtifactAbsence::ManifestEmpty => {
-                    "Artifact manifest is empty — \
-                     no files were stashed."
-                        .to_string()
+                ArtifactAbsence::NotStashed | ArtifactAbsence::ManifestEmpty => {
+                    artifact_absence_body(produces_artifact, &sanitized)
                 }
                 ArtifactAbsence::AgentUnreachable(e) => {
                     let msg: String = e.chars().take(200).collect();
@@ -12262,12 +12306,13 @@ impl CoordApp {
                         // ── Fetch completed but no artifacts available ────────
                         // Surface why, so intermittent absences are diagnosable.
                         let reason = match &entry.absence_reason {
-                            Some(ArtifactAbsence::NotStashed) => format!(
-                                "no artifacts stashed (branch {} on {}): 404",
-                                sanitized, latest.machine
-                            ),
-                            Some(ArtifactAbsence::ManifestEmpty) => {
-                                "manifest empty".to_string()
+                            Some(ArtifactAbsence::NotStashed)
+                            | Some(ArtifactAbsence::ManifestEmpty) => {
+                                if issue_produces_build_artifact(&latest.repo, &issue.title) {
+                                    format!("no binary built on {} — a: how to test", latest.machine)
+                                } else {
+                                    "CLI change — no binary; a: how to test".to_string()
+                                }
                             }
                             Some(ArtifactAbsence::AgentUnreachable(e)) => {
                                 let msg: String = e.chars().take(80).collect();
@@ -36492,15 +36537,17 @@ mod tests {
         );
         match app.compute_a_key_artifact_action() {
             Some(AKeyArtifactAction::ShowAbsence(dlg)) => {
+                // "my-repo" is build-centric → produces_artifact=true → the
+                // build-missing wording (not the CLI "nothing to pull" path).
                 assert!(
                     dlg.body
-                        .contains("No artifacts stashed (branch issue-42-test)."),
-                    "must match production NotStashed wording, got: {}",
+                        .contains("No build artifact stashed for branch `issue-42-test`"),
+                    "must match production build-missing wording, got: {}",
                     dlg.body,
                 );
                 assert!(
-                    dlg.body.contains("artifact_paths is not set in coordinator.yml"),
-                    "must include the coordinator.yml hint, got: {}",
+                    dlg.body.contains("git checkout issue-42-test"),
+                    "must tell the user how to build/test the branch, got: {}",
                     dlg.body,
                 );
             }
@@ -36508,8 +36555,45 @@ mod tests {
         }
     }
 
-    /// ManifestEmpty absence routes to the production
-    /// "Artifact manifest is empty" wording.
+    /// #563/#569: a coord/ CLI change never builds the coord-tui binary, so an
+    /// empty stash is expected — the classifier must say so, while a coord-tui
+    /// change (and any other repo) is treated as build-producing.
+    #[test]
+    fn issue_produces_build_artifact_distinguishes_cli_from_tui() {
+        assert!(
+            !issue_produces_build_artifact("claude-coordinator", "coord: add --rework-of flag"),
+            "a coord/ CLI change does not build the coord-tui binary"
+        );
+        assert!(
+            issue_produces_build_artifact("claude-coordinator", "coord-tui: telescope finder"),
+            "a coord-tui change builds the binary"
+        );
+        assert!(
+            issue_produces_build_artifact("vimcode", "anything at all"),
+            "non-coordinator repos are build-centric"
+        );
+    }
+
+    /// The absence body must give the right next step for each case: a CLI
+    /// change has nothing to pull (test the branch); a build-producing change
+    /// with an empty stash means the build didn't run.
+    #[test]
+    fn artifact_absence_body_distinguishes_cli_from_build_missing() {
+        let cli = artifact_absence_body(false, "issue-563-rework");
+        assert!(
+            cli.contains("nothing to pull") && cli.contains("git checkout issue-563-rework"),
+            "CLI body must point at a branch checkout, got: {cli}"
+        );
+        let build = artifact_absence_body(true, "issue-569-troubleshoot");
+        assert!(
+            build.contains("build was expected")
+                && build.contains("git checkout issue-569-troubleshoot"),
+            "build-missing body must explain the missing build, got: {build}"
+        );
+    }
+
+    /// ManifestEmpty (200 + empty files — the #563/#569 `.assignment_id`-only
+    /// stash) routes through the same actionable absence body as NotStashed.
     #[test]
     fn a_key_with_manifest_empty_absence_uses_production_wording() {
         let mut app = make_app_for_artifact_tests();
@@ -36526,10 +36610,17 @@ mod tests {
         );
         match app.compute_a_key_artifact_action() {
             Some(AKeyArtifactAction::ShowAbsence(dlg)) => {
+                // "my-repo" is build-centric → build-missing wording, and an
+                // empty manifest must NOT keep the bare old "no files" string.
                 assert!(
                     dlg.body
-                        .contains("Artifact manifest is empty — no files were stashed."),
-                    "must match production ManifestEmpty wording, got: {}",
+                        .contains("No build artifact stashed for branch `issue-42-test`"),
+                    "must match production build-missing wording, got: {}",
+                    dlg.body,
+                );
+                assert!(
+                    !dlg.body.contains("Artifact manifest is empty"),
+                    "stale unhelpful wording must be gone, got: {}",
                     dlg.body,
                 );
             }
