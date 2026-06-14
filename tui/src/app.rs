@@ -9166,6 +9166,25 @@ impl CoordApp {
         })
     }
 
+    /// #585: is there a manual/interactive smoke (or test-chat) session in
+    /// flight for *issue*?  Mirrors [`has_active_conflict_fix`] for the Merge
+    /// box: while the operator is re-verifying, the Test box should read blue
+    /// (Active) — even over a prior automated `passed` verdict — so the green
+    /// box doesn't imply the verdict is already in when it isn't yet.  The
+    /// interactive testing agent (`--smoke-of`) is `type="smoke"`; the
+    /// conversational gate is `type="test-chat"`.
+    fn has_active_smoke_session(&self, issue: &PipelineIssue) -> bool {
+        self.data.assignments.iter().any(|a| {
+            a.issue_number == issue.number
+                && issue.coord_repo.as_deref().map_or(true, |r| a.repo == r)
+                && matches!(
+                    a.assignment_type.as_deref(),
+                    Some("smoke") | Some("test-chat")
+                )
+                && (a.status == "running" || a.status == "pending")
+        })
+    }
+
     /// #200: Resolve the Test gate status from `test_state` on the latest
     /// Work assignment for `issue`.
     ///
@@ -9199,6 +9218,13 @@ impl CoordApp {
             if self.test_build_in_flight(&a.id) {
                 return StageStatus::Active;
             }
+        }
+        // #585: a manual/interactive smoke session in flight keeps the Test box
+        // blue (Active) — even over a prior `passed` verdict — so the operator
+        // sees the gate is being re-evaluated, not already decided.  Resolves to
+        // green/red once the session ends and its verdict is the latest.
+        if self.has_active_smoke_session(issue) {
+            return StageStatus::Active;
         }
         // #310: a review bounce creates a new fix-work assignment that carries
         // an *empty* test_state. The test genuinely passed on the earlier work,
@@ -30167,6 +30193,37 @@ mod tests {
             .push(_work_assignment("w1", 100.0, "done", Some("skipped")));
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "test"), StageStatus::Done);
+    }
+
+    #[test]
+    fn test_stage_active_while_interactive_smoke_running() {
+        // #585: a prior automated pass left test_state="passed" (green), but the
+        // operator opened an interactive smoke session (type="smoke"). The Test
+        // box must read Active (blue) while it runs, then resolve back to the
+        // recorded verdict when the session ends.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        // No running smoke → Done (green).
+        assert_eq!(
+            app.stage_status_for(&app.pipeline_issues[0], "test"),
+            StageStatus::Done
+        );
+        // Interactive testing agent running → Active (blue), over the pass.
+        app.data
+            .assignments
+            .push(_stage_assignment("s1", "smoke", 200.0, "running"));
+        assert_eq!(
+            app.stage_status_for(&app.pipeline_issues[0], "test"),
+            StageStatus::Active
+        );
+        // Session finished → back to the recorded verdict (Done).
+        app.data.assignments.last_mut().unwrap().status = "done".to_string();
+        assert_eq!(
+            app.stage_status_for(&app.pipeline_issues[0], "test"),
+            StageStatus::Done
+        );
     }
 
     #[test]
