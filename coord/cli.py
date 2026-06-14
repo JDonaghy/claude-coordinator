@@ -1991,6 +1991,8 @@ def _prompt_and_relay_review_verdict(
         "reviewed work's EXISTING branch (so the same PR is updated, not a new "
         "orphan branch), is briefed with the reviewer's findings, and bumps "
         "review_iteration so the next review can scope to just the fix delta. "
+        "ALSO accepts a WORK assignment id whose test gate FAILED (#581): the "
+        "fix is then briefed with the recorded test-failure story. "
         "Requires --interactive; local-only for now (remote is Track B / #486)."
     ),
 )
@@ -2021,6 +2023,32 @@ def _prompt_and_relay_review_verdict(
         "worktree + push-back as --fix-of)."
     ),
 )
+@click.option(
+    "--smoke-of",
+    "smoke_of",
+    default=None,
+    help=(
+        "Leg 3c / A3 (#517, #350, #581): launch a human-attended interactive "
+        "TESTING agent for completed work assignment <ID>. The agent lists the "
+        "smoke tests, pulls the build artifact, guides you through running it, "
+        "interviews you about what you saw, and records the verdict with "
+        "`coord test --passed|--fail`. Read-only tools, NO worktree (runs in the "
+        "live checkout). Requires --interactive; local-only for now."
+    ),
+)
+@click.option(
+    "--merge-of",
+    "merge_of",
+    default=None,
+    help=(
+        "Leg 3c (#517, #306): launch a human-attended interactive MERGE agent "
+        "for completed+approved work assignment <ID>. Continues the work branch "
+        "in a worktree, fetches + rebases it onto the repo's default branch "
+        "(proactive rebase, #306), resolves mechanical conflicts, runs the "
+        "tests, pushes --force-with-lease, then guides you to merge. Requires "
+        "--interactive; local-only for now."
+    ),
+)
 def assign(
     machine: str,
     repo: str,
@@ -2040,6 +2068,8 @@ def assign(
     briefing_file: str | None,
     troubleshoot: bool,
     rework_of: str | None,
+    smoke_of: str | None,
+    merge_of: str | None,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -2123,37 +2153,48 @@ def assign(
         click.echo("error: --fix-of and --review-of are mutually exclusive", err=True)
         sys.exit(2)
 
-    # #569: --troubleshoot is a third interactive flavour — a read-only
-    # diagnostic.  Same interactive requirement; mutually exclusive with the
-    # review/fix flavours (a dispatch is one shape only).
+    # #569: --troubleshoot is a read-only diagnostic flavour — requires
+    # --interactive.
     if troubleshoot and not interactive:
         click.echo("error: --troubleshoot requires --interactive", err=True)
         sys.exit(2)
-    if troubleshoot and (review_of is not None or fix_of is not None):
-        click.echo(
-            "error: --troubleshoot is mutually exclusive with --review-of/--fix-of",
-            err=True,
-        )
-        sys.exit(2)
 
-    # #563: --rework-of — same interactive requirement; mutually exclusive with
-    # all other interactive flavours; requires --briefing so the operator always
-    # supplies explicit rework instructions.
+    # #563: --rework-of — requires --interactive, and --briefing so the operator
+    # always supplies explicit rework instructions.
     if rework_of is not None and not interactive:
         click.echo("error: --rework-of requires --interactive", err=True)
-        sys.exit(2)
-    if rework_of is not None and (
-        review_of is not None or fix_of is not None or troubleshoot
-    ):
-        click.echo(
-            "error: --rework-of is mutually exclusive with "
-            "--review-of/--fix-of/--troubleshoot",
-            err=True,
-        )
         sys.exit(2)
     if rework_of is not None and not (briefing or "").strip():
         click.echo(
             "error: --rework-of requires --briefing (supply the rework instructions).",
+            err=True,
+        )
+        sys.exit(2)
+
+    # Leg 3c (#517): --smoke-of (interactive testing agent) and --merge-of
+    # (interactive merge agent) — each requires --interactive.
+    if smoke_of is not None and not interactive:
+        click.echo("error: --smoke-of requires --interactive", err=True)
+        sys.exit(2)
+    if merge_of is not None and not interactive:
+        click.echo("error: --merge-of requires --interactive", err=True)
+        sys.exit(2)
+
+    # All interactive flavours are mutually exclusive — a dispatch is exactly
+    # one shape (review / fix / troubleshoot / rework / smoke / merge).
+    _interactive_flavours = [
+        ("--review-of", review_of is not None),
+        ("--fix-of", fix_of is not None),
+        ("--troubleshoot", troubleshoot),
+        ("--rework-of", rework_of is not None),
+        ("--smoke-of", smoke_of is not None),
+        ("--merge-of", merge_of is not None),
+    ]
+    _set_flavours = [name for name, on in _interactive_flavours if on]
+    if len(_set_flavours) > 1:
+        click.echo(
+            f"error: {', '.join(_set_flavours)} are mutually exclusive "
+            "(a dispatch is exactly one shape).",
             err=True,
         )
         sys.exit(2)
@@ -2605,6 +2646,235 @@ def assign(
                 )
             sys.exit(exit_code)
 
+        # ── Leg 3c / A3 (#517, #350, #581): --smoke-of <work_aid> ─────────
+        # A human-attended interactive TESTING agent for an already-completed
+        # work assignment.  Like --review-of it is READ-ONLY and runs in the
+        # LIVE checkout (no isolated worktree): the agent pulls the build
+        # artifact, lists the smoke tests, walks the operator through running
+        # them, interviews about what was seen, and records the verdict via
+        # `coord test --passed|--fail <work_aid>` (which writes test_state /
+        # smoke_test on the WORK row — exactly what the merge gate and the TUI
+        # Test stage read).  The session row itself reports done via
+        # report-result.  Self-contained and returns.  Local-only (Track B / #486).
+        if smoke_of is not None:
+            from coord.models import Assignment as _AssignmentSm  # noqa: PLC0415
+            from coord.state import (  # noqa: PLC0415
+                build_board as _build_board_sm,
+                get_test_plan as _get_test_plan_sm,
+                record_dispatched_assignment as _record_sm,
+                save_board as _save_board_sm,
+            )
+            from coord.agent import AssignmentSpec as _AssignmentSpecSm  # noqa: PLC0415
+
+            _sm_board = _build_board_sm()
+            work = _sm_board.find_by_id(smoke_of)
+            if work is None:
+                click.echo(
+                    f"error: --smoke-of {smoke_of}: no such assignment on the "
+                    "board (use the work id from `coord status`).",
+                    err=True,
+                )
+                sys.exit(2)
+            if not work.branch:
+                click.echo(
+                    f"error: work assignment {smoke_of} has no branch to test.",
+                    err=True,
+                )
+                sys.exit(2)
+
+            if not _is_local:
+                click.echo(
+                    "error: --smoke-of is local-only for now; run it on the "
+                    "machine that holds the checkout (remote interactive smoke "
+                    "is Track B / #486).",
+                    err=True,
+                )
+                sys.exit(2)
+
+            smoke_repo_path = str(
+                Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+            )
+            smoke_default_branch = repo_cfg.default_branch or "main"
+            resolved_model = model if model else cfg.models.default
+            assignment_id = _uuid.uuid4().hex[:12]
+
+            # Surface the cached smoke-test plan (#342) when one exists so the
+            # agent can lead with the concrete steps instead of re-deriving them.
+            try:
+                _plan = _get_test_plan_sm(smoke_of)
+            except Exception:  # noqa: BLE001
+                _plan = None
+            if _plan and isinstance(_plan, dict) and _plan.get("steps"):
+                import json as _json_sm  # noqa: PLC0415
+                _plan_block = (
+                    "A cached smoke-test plan exists for this branch:\n\n"
+                    "```json\n" + _json_sm.dumps(_plan, indent=2) + "\n```\n"
+                )
+            else:
+                _plan_block = (
+                    "No cached smoke-test plan was found. Run "
+                    f"`coord test-plan {smoke_of}` to generate one (it reads the "
+                    "PR diff, the repo's CLAUDE.md and the artifact manifest), "
+                    "then read it back to the operator.\n"
+                )
+
+            INTERACTIVE_SMOKE_SYSTEM_PROMPT = (
+                "You are a human-attended smoke-test guide dispatched by the "
+                "coordinator. A human operator is at the keyboard with you. Your "
+                "job is to walk them through validating a completed branch and "
+                "then record their verdict.\n\n"
+                "Rules:\n"
+                "- Do NOT modify code, push commits, or open/merge PRs. You only "
+                "help validate. (Edit/Write are not available to you.)\n"
+                "- Do NOT run `gh` commands. The coordinator owns GitHub.\n"
+                "- You MAY run git (read-only), build/run commands, and the "
+                "`coord pull-artifact` / `coord test-plan` / `coord test` "
+                "commands.\n"
+                "- Keep it conversational: propose ONE concrete next command at a "
+                "time, wait for the operator to run it (or run it yourself when "
+                "it's safe and read-only) and tell you what they saw.\n\n"
+                "Flow:\n"
+                "1. Read the smoke-test plan (below, or generate one). List the "
+                "checks for the operator.\n"
+                "2. Offer to pull the prebuilt artifact for this branch with "
+                "`coord pull-artifact <work_aid>` so they don't have to rebuild.\n"
+                "3. Walk through each check. Ask what they observed. If something "
+                "is wrong, interview them for a clear repro (expected vs actual, "
+                "suspected area/files) — this becomes the fix brief.\n"
+                "4. When every check has a clear position, record the verdict:\n"
+                "   - All good  → run `coord test --passed <work_aid>`\n"
+                "   - Broken    → run `coord test --fail <work_aid> --reason "
+                "\"<one-line story in the operator's words>\"`\n"
+                "   Then tell the operator exactly what happens next (the TUI "
+                "will offer the fix or merge step).\n"
+            )
+
+            smoke_briefing = (
+                f"# Smoke-test assignment: {repo_cfg.github} #{issue}\n\n"
+                f"**Issue:** {issue_title}\n"
+                f"**Branch under test:** `{work.branch}` "
+                f"(worker: {work.machine_name or machine})\n"
+                f"**Work assignment id (use this for `coord test` / "
+                f"`coord pull-artifact`):** `{smoke_of}`\n"
+                f"**Repo checkout:** {smoke_repo_path}\n"
+                f"**Default branch:** {smoke_default_branch}\n\n"
+                f"## Issue body\n\n{issue_data.get('body', '') or '(none)'}\n\n"
+                f"## Smoke-test plan\n\n{_plan_block}\n"
+                "## Your job\n\n"
+                "Guide the operator through validating this branch (see the "
+                "system prompt for the flow), then record the verdict with "
+                f"`coord test --passed {smoke_of}` or `coord test --fail "
+                f"{smoke_of} --reason \"...\"`.\n"
+            )
+
+            report_reminder = (
+                f"[Coordinator smoke assignment {assignment_id}] HUMAN-ATTENDED "
+                "interactive smoke test. Record the operator's verdict with "
+                f"`coord test --passed {smoke_of}` or `coord test --fail "
+                f"{smoke_of} --reason \"...\"`. When you exit, also run "
+                f"`coord report-result --assignment {assignment_id} --status done "
+                "--summary <one-line summary>` so this session's row closes.\n\n"
+            )
+            effective_briefing = report_reminder + smoke_briefing
+
+            spec = _AssignmentSpecSm(
+                repo_name=repo,
+                repo_path=smoke_repo_path,
+                issue_number=issue,
+                issue_title=f"[smoke] {issue_title}",
+                briefing=effective_briefing,
+                model=resolved_model,
+                type="smoke",
+                provider="claude-pty",
+            )
+            # READ-ONLY like --review-of: no Edit/Write — the smoke agent
+            # validates, it does not fix.  Bash stays for build/run + the
+            # coord helper commands; Read/Grep/Glob for inspecting the code.
+            argv = provider.build_command(
+                spec,
+                resolved_model=resolved_model,
+                system_prompt=INTERACTIVE_SMOKE_SYSTEM_PROMPT,
+                allowed_tools="Read,Bash,Grep,Glob",
+            )
+
+            click.echo(
+                f"{machine} (local TTY) → SMOKE TEST of #{issue} "
+                f"on branch {work.branch}: {issue_title}"
+            )
+            click.echo("  mode: HUMAN-ATTENDED interactive smoke test (leg 3c / A3)")
+            click.echo(
+                f"  assignment id: {assignment_id}  (smoke_of={smoke_of})"
+            )
+            click.echo(
+                f"  cwd: {smoke_repo_path} (live checkout — read-only, no worktree)"
+            )
+            if dry_run:
+                click.echo("  (dry run — not launched)")
+                click.echo(f"  would exec: {argv}")
+                return
+
+            smoke_assignment = _AssignmentSm(
+                machine_name=machine,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=f"[smoke] {issue_title}",
+                briefing=effective_briefing,
+                assignment_id=assignment_id,
+                status="running",
+                branch=work.branch,
+                dispatched_at=_time.time(),
+                type="smoke",
+                review_of_assignment_id=smoke_of,
+                review_target=work.branch,
+                model=resolved_model,
+                provider_name="claude-pty",
+            )
+            _record_sm(assignment=smoke_assignment, repo_github=repo_cfg.github)
+            _save_board_sm(_build_board_sm())
+            os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+
+            started_at = _time.time()
+            exit_code = launch_human_attended_interactive(
+                argv,
+                effective_briefing,
+                assignment_id=assignment_id,
+                cwd=smoke_repo_path,
+            )
+            if exit_code != 0:
+                click.echo(f"  claude exited with status {exit_code}", err=True)
+
+            _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+            if _sname and _tmux_alive(_sname):
+                click.echo(
+                    f"  session still running in tmux: {_sname}\n"
+                    f"  reattach with:  coord reattach {assignment_id}"
+                )
+                sys.exit(0)
+
+            # worktree_path=None: read-only smoke runs in the live checkout, the
+            # backstop must never push or remove it.  The verdict that matters
+            # is the `coord test` write on the WORK row, not this session's row.
+            try:
+                finalize_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    worktree_path=None,
+                    base_branch=smoke_default_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    log_path=None,
+                    repo_path=None,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: backstop failed to record smoke exit: {exc}",
+                    err=True,
+                )
+            return
+
         # ── Leg 3 (#517): --fix-of <review_aid> ──────────────────────────
         # A human-attended FIX of a request-changes review.  Continues on the
         # reviewed work's EXISTING branch (updates the same PR, never an orphan
@@ -2816,19 +3086,34 @@ def assign(
                     err=True,
                 )
                 sys.exit(2)
-            if review.type != "review":
+            # Two accepted shapes for --fix-of (#581):
+            #   (a) a REVIEW assignment whose verdict was request-changes — the
+            #       original leg-3a path; work = review.review_of_assignment_id,
+            #       findings = the reviewer's findings.
+            #   (b) a WORK assignment whose Test gate FAILED — the test-fail fix
+            #       front door; work = the target itself, findings = the recorded
+            #       test-failure story (test_reason).
+            _fix_from_test_fail = (
+                review.type != "review"
+                and (getattr(review, "test_state", None) == "failed")
+            )
+            if review.type != "review" and not _fix_from_test_fail:
                 click.echo(
-                    f"error: --fix-of {fix_of} is type={review.type!r}, not "
-                    "'review'. Pass the REVIEW assignment id (the one whose "
-                    "verdict was request-changes).",
+                    f"error: --fix-of {fix_of} is type={review.type!r} with "
+                    f"test_state={getattr(review, 'test_state', None)!r}. Pass "
+                    "either a REVIEW id whose verdict was request-changes, or a "
+                    "WORK id whose Test gate failed.",
                     err=True,
                 )
                 sys.exit(2)
-            work = (
-                _fx_board.find_by_id(review.review_of_assignment_id)
-                if review.review_of_assignment_id
-                else None
-            )
+            if _fix_from_test_fail:
+                work = review  # the failed work row IS the thing to fix
+            else:
+                work = (
+                    _fx_board.find_by_id(review.review_of_assignment_id)
+                    if review.review_of_assignment_id
+                    else None
+                )
             if work is None:
                 click.echo(
                     f"error: review {fix_of} has no linked work assignment "
@@ -2861,21 +3146,39 @@ def assign(
             # cache → log → agent).  Local-only ⇒ no machine_host.  Fall back to
             # a pointer-to-the-review brief when nothing structured was captured
             # (interactive reviews may report only a one-line verdict summary).
-            _fx_log = _COORD_DIR_FX / "logs" / f"{fix_of}.log"
-            _fx_log_path = str(_fx_log) if _fx_log.exists() else None
-            try:
-                findings = _load_review_findings(review, _fx_log_path, None)
-            except Exception:  # noqa: BLE001 — best-effort; fall back below
-                findings = None
-            if findings is not None and (getattr(findings, "body", "") or "").strip():
-                _findings_body = findings.body.strip()
-            else:
+            if _fix_from_test_fail:
+                # The findings ARE the recorded test-failure story (#581).  No
+                # reviewer log to consult — the operator's `coord test --fail
+                # --reason` text is what the fix worker needs.
+                _test_story = (getattr(work, "test_reason", None) or "").strip()
                 _findings_body = (
-                    f"(No structured findings were captured for review {fix_of}.) "
-                    f"The review verdict was {review.review_verdict or 'request-changes'!r}. "
-                    "Read the reviewer's feedback on the PR / issue and address "
-                    "every blocking item before pushing."
+                    "The manual smoke test FAILED. The operator reported:\n\n"
+                    f"> {_test_story}\n\n"
+                    "Reproduce the failure, fix the root cause, and re-validate "
+                    "before pushing."
+                    if _test_story
+                    else (
+                        "The manual smoke test FAILED (no reason text was "
+                        "recorded). Pull the branch, reproduce the failure the "
+                        "operator hit, and fix the root cause before pushing."
+                    )
                 )
+            else:
+                _fx_log = _COORD_DIR_FX / "logs" / f"{fix_of}.log"
+                _fx_log_path = str(_fx_log) if _fx_log.exists() else None
+                try:
+                    findings = _load_review_findings(review, _fx_log_path, None)
+                except Exception:  # noqa: BLE001 — best-effort; fall back below
+                    findings = None
+                if findings is not None and (getattr(findings, "body", "") or "").strip():
+                    _findings_body = findings.body.strip()
+                else:
+                    _findings_body = (
+                        f"(No structured findings were captured for review {fix_of}.) "
+                        f"The review verdict was {review.review_verdict or 'request-changes'!r}. "
+                        "Read the reviewer's feedback on the PR / issue and address "
+                        "every blocking item before pushing."
+                    )
             from types import SimpleNamespace as _SNS  # noqa: PLC0415
             fix_briefing = _build_fix_briefing(
                 work, _SNS(body=_findings_body), next_iteration, max_iter,
@@ -3509,6 +3812,243 @@ def assign(
             except Exception as exc:  # noqa: BLE001 — best-effort backstop
                 click.echo(
                     f"  warning: remote backstop failed to record rework exit: {exc}",
+                    err=True,
+                )
+            sys.exit(exit_code)
+
+        # ── Leg 3c (#517, #306): --merge-of <work_aid> ───────────────────
+        # A human-attended interactive MERGE agent for a completed+approved
+        # branch.  Merging is where the pipeline most often stalls — the branch
+        # has gone stale against the default branch and needs a rebase, or there
+        # are conflicts to resolve.  This continues the work branch in a worktree
+        # (like --fix-of), proactively rebases it onto origin/<default_branch>
+        # (#306), helps resolve conflicts, runs the tests, force-pushes with
+        # --force-with-lease, then hands back to the operator to merge (TUI Go /
+        # `coord merge`).  Self-contained and returns.  Local-only (Track B / #486).
+        if merge_of is not None:
+            from coord.agent import (  # noqa: PLC0415
+                AssignmentSpec as _AssignmentSpecMg,
+                _GitError as _AgentGitErrorMg,
+                setup_interactive_worktree as _setup_wt_mg,
+            )
+            from coord.models import Assignment as _AssignmentMg  # noqa: PLC0415
+            from coord.state import (  # noqa: PLC0415
+                build_board as _build_board_mg,
+                record_dispatched_assignment as _record_mg,
+                save_board as _save_board_mg,
+            )
+
+            if not _is_local:
+                click.echo(
+                    "error: --merge-of is local-only for now; run it on the "
+                    "machine that holds the checkout (remote interactive merge "
+                    "is Track B / #486).",
+                    err=True,
+                )
+                sys.exit(2)
+
+            _mg_board = _build_board_mg()
+            work = _mg_board.find_by_id(merge_of)
+            if work is None:
+                click.echo(
+                    f"error: --merge-of {merge_of}: no such assignment on the "
+                    "board (use the work id from `coord status`).",
+                    err=True,
+                )
+                sys.exit(2)
+            if not work.branch:
+                click.echo(
+                    f"error: work assignment {merge_of} has no branch to merge.",
+                    err=True,
+                )
+                sys.exit(2)
+
+            resolved_model = model if model else cfg.models.default
+            assignment_id = _uuid.uuid4().hex[:12]
+            merge_repo_path = str(
+                Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+            )
+            merge_target_branch = repo_cfg.default_branch or "main"
+            _merge_test_cmd = None
+            try:
+                _merge_test_cmd = getattr(repo_cfg, "test_command", None)
+            except Exception:  # noqa: BLE001
+                _merge_test_cmd = None
+
+            INTERACTIVE_MERGE_SYSTEM_PROMPT = (
+                "You are a human-attended merge-prep agent dispatched by the "
+                "coordinator. A human operator is at the keyboard with you. The "
+                "branch has been reviewed/approved; your job is to get it cleanly "
+                "rebased and ready to merge.\n\n"
+                "Rules:\n"
+                "- Stay on the worker's branch. NEVER push to the default branch "
+                "directly.\n"
+                "- Use `git push --force-with-lease` (NOT plain --force) after a "
+                "rebase.\n"
+                "- Resolve MECHANICAL conflicts (non-overlapping struct fields, "
+                "list/import entries, separate functions) additively — keep both "
+                "sides. For SEMANTIC conflicts (same logic changed two ways), do "
+                "NOT guess: explain the conflict to the operator and let them "
+                "decide.\n"
+                "- Do NOT merge to the default branch yourself. After the rebase "
+                "is clean, pushed, and tests pass, hand back to the operator: "
+                "they merge via the TUI 'Go' button (or `coord merge`).\n\n"
+                "Flow:\n"
+                "1. `git fetch origin`.\n"
+                "2. Rebase the branch onto `origin/<default_branch>`.\n"
+                "3. Resolve conflicts (mechanical additively; semantic with the "
+                "operator).\n"
+                "4. Run the project's build/tests to confirm nothing broke.\n"
+                "5. `git push --force-with-lease`.\n"
+                "6. Tell the operator the branch is rebased + green and ready to "
+                "merge.\n"
+            )
+
+            merge_briefing = (
+                f"# Merge-prep assignment: {repo_cfg.github} #{issue}\n\n"
+                f"**Issue:** {issue_title}\n"
+                f"**Branch to merge:** `{work.branch}` "
+                f"(worker: {work.machine_name or machine})\n"
+                f"**Rebase onto:** `origin/{merge_target_branch}`\n"
+                f"**Work assignment id:** `{merge_of}`\n"
+                + (
+                    f"**Test command:** `{_merge_test_cmd}`\n"
+                    if _merge_test_cmd
+                    else ""
+                )
+                + "\n## Your job\n\n"
+                "This branch is approved. Fetch, rebase it onto "
+                f"`origin/{merge_target_branch}` (#306 proactive rebase), resolve "
+                "any conflicts (mechanical additively; semantic with the "
+                "operator), run the tests, and `git push --force-with-lease`. "
+                "Then tell the operator it's ready to merge — they press 'Go' in "
+                "the TUI (or run `coord merge`). Do NOT merge to the default "
+                "branch yourself.\n"
+            )
+
+            os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+            report_reminder = (
+                f"[Coordinator merge assignment {assignment_id}] HUMAN-ATTENDED "
+                f"merge-prep on branch {work.branch} (rebasing onto "
+                f"{merge_target_branch}). Before you exit, run `coord "
+                f"report-result --assignment {assignment_id} --status done "
+                "--summary <text>` (use --status blocked if a semantic conflict "
+                "needs the operator).\n\n"
+            )
+            effective_briefing = report_reminder + merge_briefing
+
+            spec = _AssignmentSpecMg(
+                repo_name=repo,
+                repo_path=merge_repo_path,
+                issue_number=issue,
+                issue_title=f"[merge] {issue_title}",
+                briefing=effective_briefing,
+                model=resolved_model,
+                type="conflict-fix",
+                provider="claude-pty",
+            )
+            # Full worker tool set (Read/Edit/Write/Bash) — rebasing and resolving
+            # conflicts mutates the checkout.
+            argv = provider.build_command(spec, resolved_model=resolved_model)
+
+            click.echo(
+                f"{machine} (local TTY) → MERGE-PREP of #{issue} "
+                f"on branch {work.branch}: {issue_title}"
+            )
+            click.echo("  mode: HUMAN-ATTENDED interactive merge agent (leg 3c)")
+            click.echo(
+                f"  assignment id: {assignment_id}  (merge_of={merge_of}, "
+                f"rebase onto origin/{merge_target_branch})"
+            )
+            if dry_run:
+                click.echo("  (dry run — not launched)")
+                click.echo(f"  would continue branch: {work.branch}")
+                click.echo(f"  would exec: {argv}")
+                return
+
+            try:
+                _wt_path, _ = _setup_wt_mg(
+                    Path(merge_repo_path),
+                    issue_number=issue,
+                    issue_title=issue_title,
+                    assignment_id=assignment_id,
+                    default_branch=merge_target_branch,
+                    existing_branch=work.branch,
+                )
+                worktree_path = str(_wt_path)
+            except (_AgentGitErrorMg, OSError) as _wt_err:
+                click.echo(
+                    f"  error: could not create merge worktree on branch "
+                    f"{work.branch}: {_wt_err}",
+                    err=True,
+                )
+                sys.exit(1)
+            click.echo(f"  worktree: {worktree_path} (branch: {work.branch})")
+
+            merge_assignment = _AssignmentMg(
+                machine_name=machine,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=f"[merge] {issue_title}",
+                briefing=effective_briefing,
+                assignment_id=assignment_id,
+                status="running",
+                branch=work.branch,
+                pr_url=work.pr_url,
+                dispatched_at=_time.time(),
+                type="conflict-fix",
+                review_of_assignment_id=work.assignment_id,
+                model=resolved_model,
+                provider_name="claude-pty",
+            )
+            _record_mg(assignment=merge_assignment, repo_github=repo_cfg.github)
+            _save_board_mg(_build_board_mg())
+
+            started_at = _time.time()
+            exit_code = launch_human_attended_interactive(
+                argv,
+                effective_briefing,
+                assignment_id=assignment_id,
+                cwd=worktree_path,
+            )
+            if exit_code != 0:
+                click.echo(f"  claude exited with status {exit_code}", err=True)
+
+            _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+            if _sname and _tmux_alive(_sname):
+                click.echo(
+                    f"  session still running in tmux: {_sname}\n"
+                    f"  reattach with:  coord reattach {assignment_id}"
+                )
+                sys.exit(0)
+
+            try:
+                finalize_result = finalize_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    worktree_path=worktree_path,
+                    base_branch=merge_target_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    log_path=None,
+                    repo_path=merge_repo_path,
+                )
+                if finalize_result.already_recorded:
+                    click.echo(
+                        "  result recorded via `coord report-result`; backstop "
+                        "did not overwrite"
+                    )
+                else:
+                    click.echo(
+                        f"  backstop: status={finalize_result.terminal_status} "
+                        f"commits_ahead={finalize_result.commits_ahead}"
+                    )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: backstop failed to record merge exit: {exc}",
                     err=True,
                 )
             sys.exit(exit_code)

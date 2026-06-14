@@ -3,7 +3,7 @@
 > **The living, cross-repo / cross-machine objective for the coordinator and every agent it dispatches.**
 > This is *meta-level*: above any single issue, repo, or session (and broader than Claude's own per-session goal feature). Both humans and agents may edit it as priorities evolve — keep it short, current, and re-date the Status line. `coordinator.yml` is the source of truth for *topology*; **this file is the source of truth for *intent*.**
 >
-> _Last updated: 2026-06-11_
+> _Last updated: 2026-06-14_
 
 ## 🎯 North star
 
@@ -32,10 +32,11 @@ the critical path** (demoted to Horizon).
 | **A1 — interactive Review dispatch** (`coord assign --interactive --review-of`) | 🟢 merged | PR #538 |
 | **In-TUI render** — scrub `$TMUX` from the embedded terminal so interactive sessions render in the pane | 🟢 merged | quadraui PR #360 |
 | **A2 — TUI "Review (interactive)" board action** | 🟢 merged | PR #540 |
-| **A3 — interactive Smoke** (`--smoke-of`) | 🔴 local NEXT | — |
+| **A3 — interactive Smoke** (`--smoke-of`) — testing agent: lists smoke tests, pulls artifact, records verdict | 🟢 merged | #350, #581 |
+| **leg 3c — guided approve→test→merge** — test-fail→interactive fix dialog, test-pass→interactive merge agent (`--merge-of`, proactive rebase) | 🟢 merged | #306, #581 |
 | **Track B — remote Review** (`--review-of` over ssh+tmux, read-only) | 🟢 merged | #486 (`9e0c5d2`) |
 | **Track B — remote Fix** (`--fix-of`: remote worktree + finalize/push-back) | 🟢 merged | #486 (`6c16d3b`) |
-| **Track B — TUI machine picker** (drive remote Review/Fix from a board card) | 🔴 **NEXT** | #486, #493/#499 |
+| **Track B — TUI machine picker** (drive remote Review/Fix from a board card) | 🟢 merged | #486, #493/#499 |
 
 ## Status (2026-06-11)
 
@@ -51,8 +52,13 @@ the critical path** (demoted to Horizon).
   - **✅ SMOKED END-TO-END in the wild (2026-06-12, quadraui #287 rounded corners):** interactive Work → interactive Review (approved) → smoke gate → **merged to develop (PR #361)**, driven from the board. Session resilience proven (an accidental Esc didn't lose the work — tmux #487 survived; recovered via `coord reattach`). Smoke fixed the **Esc-quits** bug (`f184726`) and filed 8 follow-ups: #541 (issue fuzzy-finder), #542 (auto-advance resilience across TUI restarts — refs #517), #543 (finalize must record branch), #544 (coord ready add coord label), #545 (refinement leaves work-shaped branch), #546 (cost-per-issue reporting), #547 (briefing readability), #548 (review verdict misrouted to work row → merge gate blind). The manual board nudges needed (record branch, relocate verdict, smoke pass) all map to #543/#548 — once those land the flow is hands-off.
   - **leg 4 (Track B) — remote interactive Review is LANDED + smoked e2e (2026-06-11).** `coord assign --interactive --review-of <work_aid> <remote>` ungated from local-only (`9e0c5d2`): read-only in the remote's LIVE checkout (no worktree — it's the worker-worktree base), reviewer prompt + read-only tools, recorded in the coordinator DB. Verdict relay is operator-on-coordinator (a remote `report-result` writes the wrong DB — the #486d gap), zero release needed. **Proven on dellserver against quadraui #287:** 1-prompt launch → in-pane render → real `git fetch`+diff → a genuinely good independent `REVIEW_VERDICT` (cross-backend Before/After table, macOS Core-Graphics correctness check, caught a real run-on-doc nit). Also shipped a needed SSH `ControlMaster` multiplex fix (`f40f632`): one remote launch fired ~5 unmultiplexed ssh auths → a wall of passphrase prompts; now one connection per launch (smoked: 5 prompts → 1).
   - **leg 4 (Track B) — remote interactive Fix is LANDED + smoked e2e (2026-06-11).** `coord assign --interactive --fix-of <review_aid> <remote>` ungated (`6c16d3b`): a remote worktree on the EXISTING branch (`git worktree add -B <branch> origin/<branch>`) + `finalize_remote_interactive_exit` — on exit the coordinator sshs in, fast-forward-pushes the worktree's commits to origin/<branch>, records the completion through the seam locally (re-review fires), and removes the worktree (PRESERVED on push failure — commits never live only in a deleted worktree). This is the #486d push-back the remote-WORK path deferred. **Proven on dellserver against quadraui #326 (a real request-changes review):** worktree on issue-326 → the worker fixed the cargo-fmt violations + ran cargo test/clippy → pushed → finalize `status=done commits_ahead=3 pushed=True`, worktree removed.
-  - **Next: leg 4 cont. — TUI machine picker** (`tui/src/app.rs` `launch_interactive_session_for_selected_issue` hard-codes `local_machine`; add a fleet-machine picker so remote Review/Fix dispatch from a board card). **leg 3c** — guided approve → pull-artifact + smoke → merge — remains open on the local track.
-- 📋 **Next, in order:** **A3** interactive Smoke (`--smoke-of`, mirror A1/A2) → **Track B** remote (start with dellserver, read-only Review/Smoke). A1 follow-ups to fold in: the briefing emits both the `REVIEW_VERDICT` block and the report-result reminder (claude used the block); `coord report-result` needs a `--body-file` for full review bodies (see `project_a1_interactive_review`).
+  - **✅ leg 3c + A3 LANDED (2026-06-14):** the testing + merge agents are now driven from the row right-click menu, completing the **Test → Merge** handoff:
+    - **Start testing (interactive)** → `coord assign --interactive --smoke-of <work_aid>`: a human-attended testing agent (read-only, live checkout) that surfaces the cached smoke-test plan, offers `coord pull-artifact`, interviews the operator, and records the verdict via `coord test --passed|--fail`.
+    - **Verdict routing** (board-driven, never TTY-scraped): a recorded `failed` raises a **fail→fix** confirm dialog → interactive `--fix-of` on the same branch; `passed`/`skipped` raises a **pass→merge** confirm dialog → interactive `--merge-of`. Mirrors the leg-2/3b Work→Review / request-changes→fix prompts.
+    - **`--fix-of` generalised (#581):** it now also accepts a WORK id whose Test gate failed (not only a request-changes review), briefing the fix with the recorded failure story — so an *approved* branch that fails a *manual test* reaches the same interactive fix loop.
+    - **Start merge (interactive)** → `coord assign --interactive --merge-of <work_aid>`: a merge agent that worktrees the branch, fetches + **rebases onto the default branch (#306 proactive rebase)**, resolves mechanical conflicts (semantic with the operator), runs tests, `git push --force-with-lease`, then hands back to the operator to merge (Go / `coord merge`).
+    - All on `main`; coord suite 2062 + tui 599 pass; coord-tui rebuilt + installed.
+- 📋 **Next, in order:** local interactive lifecycle (Work→Review→Test→Merge) is now complete end-to-end; **leg 4 cont. is remote Test/Merge over SSH (Track B)**. The merge agent supersedes #306's reactive-only conflict-fix with a proactive interactive rebase; #277/#567 (conflict-fix orphan branch, NULL-branch verdict gate) remain open backend hygiene. A1 follow-ups to fold in: the briefing emits both the `REVIEW_VERDICT` block and the report-result reminder; `coord report-result` needs a `--body-file` for full review bodies (see `project_a1_interactive_review`).
 - 🧭 **Open design Q — where do automated tests gate?** CI is pytest-only, so Rust repos (tui/quadraui/vimcode) still have no automated gate; they need an explicit `cargo build && cargo test` gate (extend CI, or a pre-merge verify step).
 
 ## Horizon (beyond the deadline)

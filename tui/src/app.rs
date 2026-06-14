@@ -3659,6 +3659,40 @@ struct PendingRework {
     issue_num: u64,
 }
 
+/// Leg 3c / A3 (#517, #581): an interactive testing session the TUI launched,
+/// armed to route on its verdict (board-driven, via `coord test --passed|--fail`
+/// recorded on the WORK row).  Fires once when the work row's `test_state`
+/// changes to a terminal value: `failed` → fail→fix prompt; `passed`/`skipped`
+/// → pass→merge prompt.
+struct ArmedTestVerdict {
+    coord_repo: String,
+    repo_slug: String,
+    issue_num: u64,
+    /// The WORK assignment id under test — its `test_state` carries the verdict.
+    work_aid: String,
+    /// The work row's `test_state` when we armed, so only a NEW verdict fires.
+    prior_test_state: Option<String>,
+}
+
+/// Leg 3c (#517, #581): a failed manual test awaiting the operator's one-key
+/// confirm to launch the human-attended `--fix-of` fix on the existing branch.
+/// `work_aid` is the failed WORK id (the backend's #581 test-fail fix front
+/// door accepts it directly).
+struct PendingTestFix {
+    coord_repo: String,
+    repo_slug: String,
+    issue_num: u64,
+}
+
+/// Leg 3c (#517, #306): a passed test awaiting the operator's one-key confirm
+/// to launch the human-attended `--merge-of` merge agent (proactive rebase +
+/// conflict resolution) on the approved branch.
+struct PendingMerge {
+    coord_repo: String,
+    repo_slug: String,
+    issue_num: u64,
+}
+
 /// Fetch live `coord-*` tmux sessions by running `coord sessions --json`.
 ///
 /// Returns an empty `Vec` when tmux is not running, `coord` is not on PATH,
@@ -5013,6 +5047,19 @@ pub struct CoordApp {
     /// confirms; Esc/n dismisses.  See [`PendingRework`].
     pending_rework: Option<PendingRework>,
 
+    // ── Leg 3c / A3 (#517, #581): test-verdict routing ─────────────────────
+    /// Interactive testing sessions launched this run, keyed by `(repo_slug,
+    /// issue_number)`, armed to route on the WORK row's recorded test verdict.
+    /// Entry removed when the verdict is routed.  See [`ArmedTestVerdict`].
+    armed_for_test_verdict: std::collections::HashMap<(String, u64), ArmedTestVerdict>,
+    /// When `Some`, an inline confirm prompt is up asking whether to launch the
+    /// interactive `--fix-of` fix for a FAILED test.  See [`PendingTestFix`].
+    pending_test_fix: Option<PendingTestFix>,
+    /// When `Some`, an inline confirm prompt is up asking whether to launch the
+    /// interactive `--merge-of` merge agent after a PASSED test.  See
+    /// [`PendingMerge`].
+    pending_merge: Option<PendingMerge>,
+
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
@@ -5238,6 +5285,10 @@ impl CoordApp {
             pending_rework: None,
             // #541: global issue fuzzy finder — closed by default.
             issue_finder: None,
+            // Leg 3c / A3 (#517, #581): test-verdict routing.
+            armed_for_test_verdict: std::collections::HashMap::new(),
+            pending_test_fix: None,
+            pending_merge: None,
         };
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
@@ -15490,6 +15541,25 @@ impl CoordApp {
                     ));
                 }
             }
+            // Leg 3c / A3 (#517, #581): the human-attended testing agent —
+            // pulls the artifact, lists the smoke tests, guides the operator,
+            // records the verdict.  Gated on a completed work assignment with a
+            // branch (same gate as Review).
+            let mut test_item = ContextMenuItem::action(
+                "start-testing-interactive",
+                "Start testing (interactive)",
+            );
+            test_item.disabled = self.selected_completed_work_aid().is_none();
+            items.push(test_item);
+            // Leg 3c (#517, #306): the human-attended merge agent — rebases the
+            // approved branch onto the default branch, resolves conflicts,
+            // pushes.  Same completed-work gate.
+            let mut merge_item = ContextMenuItem::action(
+                "start-merge-interactive",
+                "Start merge (interactive)",
+            );
+            merge_item.disabled = self.selected_completed_work_aid().is_none();
+            items.push(merge_item);
             items.push(ContextMenuItem::separator());
             // #leg1: the non-interactive (claude -p) dispatch path — the
             // metered/automated peer to the interactive launchers above.
@@ -15996,6 +16066,82 @@ impl CoordApp {
             });
         }
 
+        // ── Leg 3c / A3 (#517, #581): test FAILED → start fix confirm ────
+        if let Some(ref p) = self.pending_test_fix {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:test-fix"),
+                title: StyledText::plain("Test failed — start fix?"),
+                body: vec![
+                    StyledText::plain(format!(
+                        "The manual smoke test for {} #{} failed.",
+                        p.coord_repo, p.issue_num,
+                    )),
+                    StyledText::plain(
+                        "Start an interactive fix on the same branch, briefed with \
+                         the failure (continues the PR; re-reviews after)?"
+                            .to_string(),
+                    ),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("fix"),
+                        label: "⏎  Start fix".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Not now".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
+        // ── Leg 3c (#517, #306): test PASSED → start merge agent confirm ─
+        if let Some(ref p) = self.pending_merge {
+            return Some(Dialog {
+                id: WidgetId::new("dialog:merge-agent"),
+                title: StyledText::plain("Test passed — start merge agent?"),
+                body: vec![
+                    StyledText::plain(format!(
+                        "The smoke test for {} #{} passed.",
+                        p.coord_repo, p.issue_num,
+                    )),
+                    StyledText::plain(
+                        "Start an interactive merge agent (rebases onto the default \
+                         branch, resolves conflicts, pushes — then you merge)?"
+                            .to_string(),
+                    ),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("merge"),
+                        label: "⏎  Start merge".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Not now".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Force-merge confirm ──────────────────────────────────────────
         if let Some(ref repo) = self.pending_force_merge {
             let scope_line = if repo.is_empty() {
@@ -16265,6 +16411,10 @@ impl CoordApp {
             self.pending_rework = None;
         } else if self.pending_machine_picker.is_some() {
             self.pending_machine_picker = None;
+        } else if self.pending_test_fix.is_some() {
+            self.pending_test_fix = None;
+        } else if self.pending_merge.is_some() {
+            self.pending_merge = None;
         } else if self.pending_repo_picker.is_some() {
             self.pending_repo_picker = None;
         } else if self.pending_refinement_close_prompt.is_some() {
@@ -16342,6 +16492,28 @@ impl CoordApp {
                         }
                     }
                 }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Leg 3c / A3 (#517, #581): test failed → start fix ────────────
+        if self.pending_test_fix.is_some() {
+            if id == "fix" {
+                self.confirm_test_fix();
+            } else {
+                self.pending_test_fix = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Leg 3c (#517, #306): test passed → start merge agent ─────────
+        if self.pending_merge.is_some() {
+            if id == "merge" {
+                self.confirm_merge();
+            } else {
+                self.pending_merge = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -18711,6 +18883,18 @@ impl CoordApp {
                 );
                 true
             }
+            // Leg 3c / A3 (#517, #581): human-attended testing agent launcher.
+            "start-testing-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Test);
+                true
+            }
+            // Leg 3c (#517, #306): human-attended merge agent launcher.
+            "start-merge-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Merge);
+                true
+            }
             "start-with-plan" => {
                 let dispatched = self.dispatch_pipeline_plan();
                 if !dispatched {
@@ -19169,6 +19353,8 @@ impl CoordApp {
             || self.pending_refinement_close_prompt.is_some()
             || self.pending_auto_review.is_some()
             || self.pending_rework.is_some()
+            || self.pending_test_fix.is_some()
+            || self.pending_merge.is_some()
             || self.artifact_pull_dialog.is_some()
         {
             return None;
@@ -21069,7 +21255,10 @@ impl CoordApp {
     /// Leg 2/3 (#517): true when any auto-advance stage prompt is already up.
     /// The board-driven detectors check this so only one fires per tick.
     fn stage_prompt_open(&self) -> bool {
-        self.pending_auto_review.is_some() || self.pending_rework.is_some()
+        self.pending_auto_review.is_some()
+            || self.pending_rework.is_some()
+            || self.pending_test_fix.is_some()
+            || self.pending_merge.is_some()
     }
 
     /// True when the Pipeline detail Terminal tab is showing a LIVE (not
@@ -21521,6 +21710,148 @@ impl CoordApp {
         self.launch_interactive_session_on_machine(mode, machine);
     }
 
+    // ── Leg 3c / A3 (#517, #581): test-verdict routing ─────────────────────
+
+    /// The `test_state` of the assignment row with `id == aid`, or `None`.
+    fn test_state_for_aid(&self, aid: &str) -> Option<String> {
+        self.data
+            .assignments
+            .iter()
+            .find(|a| a.id == aid)
+            .and_then(|a| a.test_state.clone())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// #581: the most-recent `done` `type="work"` assignment id for the SELECTED
+    /// issue whose Test gate FAILED (`test_state == "failed"`), or `None`.  This
+    /// is the work id the interactive `--fix-of` test-fail front door consumes.
+    fn selected_test_failed_work_aid(&self) -> Option<String> {
+        let (repo, issue_key) = self.selected_issue_repo_and_key()?;
+        self.test_failed_work_aid_for(&repo, issue_key.1)
+    }
+
+    fn test_failed_work_aid_for(&self, coord_repo: &str, issue_num: u64) -> Option<String> {
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .filter(|a| a.test_state.as_deref() == Some("failed"))
+            .filter(|a| a.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|a| a.id.clone())
+    }
+
+    /// Leg 3c / A3 (#517): scan armed interactive testing sessions for a
+    /// freshly-recorded test verdict on the WORK row and route it: `failed`
+    /// → fail→fix confirm prompt; `passed`/`skipped` → pass→merge confirm
+    /// prompt.  Strictly board-driven — the verdict comes from `coord test`
+    /// (written to the DB), never the session TTY.  Returns `true` when it
+    /// raised a prompt.
+    fn detect_test_verdict(&mut self) -> bool {
+        if self.stage_prompt_open() || self.armed_for_test_verdict.is_empty() {
+            return false;
+        }
+        let found = self.armed_for_test_verdict.iter().find_map(|(key, armed)| {
+            let current = self.test_state_for_aid(&armed.work_aid);
+            // Edge-trigger: a terminal verdict that differs from the arm-time
+            // snapshot (so re-arming over an already-tested row doesn't re-fire).
+            match current.as_deref() {
+                Some(v @ ("failed" | "passed" | "skipped"))
+                    if Some(v) != armed.prior_test_state.as_deref() =>
+                {
+                    Some((key.clone(), v.to_string()))
+                }
+                _ => None,
+            }
+        });
+        let Some((key, verdict)) = found else {
+            return false;
+        };
+        let Some(armed) = self.armed_for_test_verdict.remove(&key) else {
+            return false;
+        };
+        // Drop terminal focus so the confirm prompt owns Enter, not the shell.
+        self.detail_terminal_focused = false;
+        if verdict == "failed" {
+            self.pending_test_fix = Some(PendingTestFix {
+                coord_repo: armed.coord_repo,
+                repo_slug: armed.repo_slug,
+                issue_num: armed.issue_num,
+            });
+        } else {
+            // passed / skipped → offer the interactive merge agent.
+            self.pending_merge = Some(PendingMerge {
+                coord_repo: armed.coord_repo,
+                repo_slug: armed.repo_slug,
+                issue_num: armed.issue_num,
+            });
+        }
+        true
+    }
+
+    /// Leg 3c (#517, #581): the operator confirmed the fail→fix prompt — select
+    /// the issue's row, open its Terminal tab, and launch the interactive
+    /// `--fix-of` session.  The fix is keyed on the failed WORK id (the backend
+    /// #581 test-fail fix front door accepts it directly).
+    fn confirm_test_fix(&mut self) {
+        let Some(p) = self.pending_test_fix.take() else {
+            return;
+        };
+        let idx = self
+            .pipeline_issues
+            .iter()
+            .position(|iss| iss.repo_slug == p.repo_slug && iss.number == p.issue_num);
+        let Some(idx) = idx else {
+            self.push_toast(
+                "Start fix",
+                &format!(
+                    "Could not find {} #{} in the pipeline to start its fix.",
+                    p.coord_repo, p.issue_num,
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+        self.pipeline_sel = Some(idx);
+        self.active_view = SidebarView::Pipeline;
+        self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
+    }
+
+    /// Leg 3c (#517, #306): the operator confirmed the pass→merge prompt —
+    /// select the issue's row, open its Terminal tab, and launch the
+    /// interactive `--merge-of` merge agent (proactive rebase + conflict
+    /// resolution on the approved branch).
+    fn confirm_merge(&mut self) {
+        let Some(p) = self.pending_merge.take() else {
+            return;
+        };
+        let idx = self
+            .pipeline_issues
+            .iter()
+            .position(|iss| iss.repo_slug == p.repo_slug && iss.number == p.issue_num);
+        let Some(idx) = idx else {
+            self.push_toast(
+                "Start merge",
+                &format!(
+                    "Could not find {} #{} in the pipeline to start its merge.",
+                    p.coord_repo, p.issue_num,
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+        self.pipeline_sel = Some(idx);
+        self.active_view = SidebarView::Pipeline;
+        self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Merge);
+    }
+
     /// Launch a human-attended `claude` session for the selected pipeline
     /// issue on `machine` (#467; supersedes the ssh+tmux launcher previously
     /// built for #446).  When `machine` is the local machine the session runs
@@ -21574,13 +21905,42 @@ impl CoordApp {
                     return;
                 }
             },
-            // Leg 3 (#517): Fix carries the request-changes REVIEW id.
-            InteractiveLaunchMode::Fix => match self.selected_request_changes_review_aid() {
+            // Leg 3 (#517): Fix carries the request-changes REVIEW id, OR the
+            // test-failed WORK id (#581).  Prefer a request-changes review; fall
+            // back to a test-failed work row (the backend accepts either).
+            InteractiveLaunchMode::Fix => match self
+                .selected_request_changes_review_aid()
+                .or_else(|| self.selected_test_failed_work_aid())
+            {
                 Some(aid) => Some(aid),
                 None => {
                     self.push_toast(
                         "Start fix (interactive)",
-                        "No request-changes review found for this issue — nothing to fix.",
+                        "No request-changes review or failed test found for this issue — nothing to fix.",
+                        ToastSeverity::Warning,
+                    );
+                    return;
+                }
+            },
+            // Leg 3c / A3 (#517): Test + Merge both operate on the completed
+            // work assignment's branch.
+            InteractiveLaunchMode::Test => match self.selected_completed_work_aid() {
+                Some(aid) => Some(aid),
+                None => {
+                    self.push_toast(
+                        "Start testing (interactive)",
+                        "No completed work assignment with a branch found — cannot start testing.",
+                        ToastSeverity::Warning,
+                    );
+                    return;
+                }
+            },
+            InteractiveLaunchMode::Merge => match self.selected_completed_work_aid() {
+                Some(aid) => Some(aid),
+                None => {
+                    self.push_toast(
+                        "Start merge (interactive)",
+                        "No completed work assignment with a branch found — cannot start merge.",
                         ToastSeverity::Warning,
                     );
                     return;
@@ -21730,6 +22090,26 @@ impl CoordApp {
                             },
                         );
                     }
+                    // Leg 3c / A3 (#517): arm the test-verdict watcher so a
+                    // `coord test --passed|--fail` recorded by the testing agent
+                    // routes to the fail→fix or pass→merge confirm prompt.
+                    InteractiveLaunchMode::Test => {
+                        let work_aid = work_aid.clone().unwrap_or_default();
+                        let prior_test_state = self.test_state_for_aid(&work_aid);
+                        self.armed_for_test_verdict.insert(
+                            issue_key.clone(),
+                            ArmedTestVerdict {
+                                coord_repo: repo.clone(),
+                                repo_slug: issue_key.0.clone(),
+                                issue_num,
+                                work_aid,
+                                prior_test_state,
+                            },
+                        );
+                    }
+                    // Leg 3c (#517): merge-prep ends with the operator merging
+                    // manually (TUI Go / `coord merge`) — no auto-advance to arm.
+                    InteractiveLaunchMode::Merge => {}
                 }
 
                 let status_msg = if maybe_live_session.is_some() {
@@ -21741,6 +22121,8 @@ impl CoordApp {
                         InteractiveLaunchMode::Review => "review",
                         InteractiveLaunchMode::Fix => "fix",
                         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
+                        InteractiveLaunchMode::Test => "testing",
+                        InteractiveLaunchMode::Merge => "merge",
                     };
                     format!(
                         "Launching interactive {} session for {} #{} …",
@@ -21852,9 +22234,10 @@ enum InteractiveLaunchMode {
     /// Human-attended adversarial review of a completed work assignment (#539).
     /// Emits `coord assign --interactive --review-of <work_aid> …`.
     Review,
-    /// Leg 3 (#517): human-attended FIX of a request-changes review.  Continues
-    /// the reviewed work's branch; emits `coord assign --interactive --fix-of
-    /// <review_aid> …`.  `work_aid` carries the REVIEW assignment id here.
+    /// Leg 3 (#517): human-attended FIX of a request-changes review, OR of a
+    /// work row whose Test gate failed (#581).  Continues the existing branch;
+    /// emits `coord assign --interactive --fix-of <aid> …`.  `work_aid` carries
+    /// the REVIEW id (request-changes path) or the WORK id (test-fail path).
     Fix,
     /// #569: human-attended diagnostic session for a stalled pipeline item.
     /// Opens an interactive Claude Max session seeded with a snapshot of all
@@ -21862,6 +22245,16 @@ enum InteractiveLaunchMode {
     /// a playbook of common stall patterns, so the operator can diagnose and
     /// unstick the item without manual DB spelunking.
     Troubleshoot,
+    /// Leg 3c / A3 (#517, #350, #581): human-attended TESTING agent for a
+    /// completed work assignment.  Lists the smoke tests, pulls the artifact,
+    /// guides the operator, records the verdict.  Emits `coord assign
+    /// --interactive --smoke-of <work_aid> …`.  `work_aid` is the WORK id.
+    Test,
+    /// Leg 3c (#517, #306): human-attended MERGE agent for a completed+approved
+    /// work assignment.  Rebases the branch onto the default branch, resolves
+    /// conflicts, pushes.  Emits `coord assign --interactive --merge-of
+    /// <work_aid> …`.  `work_aid` is the WORK id.
+    Merge,
 }
 
 /// #486: short verb for an interactive launch mode — used in the machine-picker
@@ -21873,6 +22266,8 @@ fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str {
         InteractiveLaunchMode::Review => "review",
         InteractiveLaunchMode::Fix => "fix",
         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
+        InteractiveLaunchMode::Test => "testing",
+        InteractiveLaunchMode::Merge => "merge",
     }
 }
 
@@ -21952,9 +22347,10 @@ fn build_interactive_launch_cmd(
             )
         }
         InteractiveLaunchMode::Fix => {
-            // Leg 3 (#517): `coord assign --interactive --fix-of <review_aid>`
-            // continues the reviewed work's branch with write tools.  work_aid
-            // carries the REVIEW id here (always Some — the caller guards it).
+            // Leg 3 (#517): `coord assign --interactive --fix-of <aid>`
+            // continues the existing branch with write tools.  work_aid carries
+            // the REVIEW id (request-changes) or the WORK id (test-fail, #581) —
+            // the backend accepts either.  Always Some (the caller guards it).
             let aid = shell_quote_arg(work_aid.unwrap_or(""));
             format!(
                 "coord assign {}--interactive --fix-of {} {} {} {}\r",
@@ -21970,6 +22366,26 @@ fn build_interactive_launch_cmd(
             "Troubleshoot mode must not reach build_interactive_launch_cmd — \
              handle it in the caller with the troubleshoot_briefing path"
         ),
+        InteractiveLaunchMode::Test => {
+            // Leg 3c / A3 (#517): `coord assign --interactive --smoke-of
+            // <work_aid>` launches the human-attended testing agent in the live
+            // checkout.  work_aid is the WORK id (always Some — caller guards it).
+            let aid = shell_quote_arg(work_aid.unwrap_or(""));
+            format!(
+                "coord assign {}--interactive --smoke-of {} {} {} {}\r",
+                cfg, aid, m, r, issue_num,
+            )
+        }
+        InteractiveLaunchMode::Merge => {
+            // Leg 3c (#517, #306): `coord assign --interactive --merge-of
+            // <work_aid>` launches the human-attended merge agent (rebase +
+            // conflict resolution).  work_aid is the WORK id (always Some).
+            let aid = shell_quote_arg(work_aid.unwrap_or(""));
+            format!(
+                "coord assign {}--interactive --merge-of {} {} {} {}\r",
+                cfg, aid, m, r, issue_num,
+            )
+        }
     }
 }
 
@@ -22775,6 +23191,53 @@ impl ShellApp for CoordApp {
                         self.pending_rework = None;
                         self.push_toast(
                             "Fix deferred",
+                            "Start it any time from the row's right-click menu.",
+                            ToastSeverity::Info,
+                        );
+                        return Reaction::Redraw;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Leg 3c / A3 (#517, #581): test failed → start fix confirm ────
+        // Same intercept discipline: own Enter (→ launch interactive --fix-of
+        // briefed with the failure) and Esc/n (dismiss).
+        if self.pending_test_fix.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.confirm_test_fix();
+                        return Reaction::Redraw;
+                    }
+                    Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        self.pending_test_fix = None;
+                        self.push_toast(
+                            "Fix deferred",
+                            "Start it any time from the row's right-click menu.",
+                            ToastSeverity::Info,
+                        );
+                        return Reaction::Redraw;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Leg 3c (#517, #306): test passed → start merge agent confirm ─
+        // Own Enter (→ launch interactive --merge-of) and Esc/n (dismiss).
+        if self.pending_merge.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.confirm_merge();
+                        return Reaction::Redraw;
+                    }
+                    Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        self.pending_merge = None;
+                        self.push_toast(
+                            "Merge deferred",
                             "Start it any time from the row's right-click menu.",
                             ToastSeverity::Info,
                         );
@@ -25023,6 +25486,11 @@ impl ShellApp for CoordApp {
         // Route a freshly-reported review verdict: request-changes → rework
         // prompt; approve → smoke/merge notice.  Board-driven, never scraped.
         needs_redraw |= self.detect_review_verdict();
+        // ── Leg 3c / A3 (#517, #581): test-verdict routing ──────────────
+        // Route a freshly-recorded `coord test` verdict on the work row:
+        // failed → fail→fix prompt; passed/skipped → pass→merge prompt.
+        // Board-driven (the verdict is written to the DB), never scraped.
+        needs_redraw |= self.detect_test_verdict();
         // After data has been applied, the Log tab's preferred assignment may
         // have changed (e.g. auto_loop dispatched a new review/fix). Re-attach
         // SSE so we don't fall back to the polling 'Loading log…' flicker.
@@ -26554,6 +27022,10 @@ mod tests {
             pending_rework: None,
             // #541
             issue_finder: None,
+            // Leg 3c / A3 (#517, #581)
+            armed_for_test_verdict: std::collections::HashMap::new(),
+            pending_test_fix: None,
+            pending_merge: None,
         }
     }
 
@@ -27083,6 +27555,119 @@ mod tests {
         );
         assert!(cmd.contains("--interactive"));
         assert!(cmd.ends_with('\r'), "launcher must auto-run");
+    }
+
+    #[test]
+    fn build_interactive_launch_cmd_test_mode_emits_smoke_of() {
+        let cmd = build_interactive_launch_cmd(
+            None,
+            "m",
+            "api",
+            7,
+            InteractiveLaunchMode::Test,
+            Some("work-abc"),
+        );
+        assert!(
+            cmd.contains("--smoke-of work-abc"),
+            "Test mode must emit --smoke-of <work_aid>, got: {cmd}",
+        );
+        assert!(cmd.contains("--interactive"));
+        assert!(cmd.ends_with('\r'), "launcher must auto-run");
+    }
+
+    #[test]
+    fn build_interactive_launch_cmd_merge_mode_emits_merge_of() {
+        let cmd = build_interactive_launch_cmd(
+            None,
+            "m",
+            "api",
+            7,
+            InteractiveLaunchMode::Merge,
+            Some("work-abc"),
+        );
+        assert!(
+            cmd.contains("--merge-of work-abc"),
+            "Merge mode must emit --merge-of <work_aid>, got: {cmd}",
+        );
+        assert!(cmd.contains("--interactive"));
+        assert!(cmd.ends_with('\r'), "launcher must auto-run");
+    }
+
+    // ── Leg 3c / A3 (#517, #581): test-verdict routing ────────────────────
+
+    fn done_work_with_test_state(issue: u64, repo: &str, state: &str) -> Assignment {
+        let mut a = done_work_with_branch(issue, repo);
+        a.test_state = Some(state.to_string());
+        a
+    }
+
+    fn arm_test_verdict(
+        app: &mut CoordApp,
+        repo: &str,
+        issue: u64,
+        work_aid: &str,
+        prior: Option<&str>,
+    ) {
+        app.armed_for_test_verdict.insert(
+            (repo.to_string(), issue),
+            ArmedTestVerdict {
+                coord_repo: repo.to_string(),
+                repo_slug: repo.to_string(),
+                issue_num: issue,
+                work_aid: work_aid.to_string(),
+                prior_test_state: prior.map(|s| s.to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn detect_test_verdict_failed_raises_test_fix() {
+        let mut app =
+            make_app_with_assignments(vec![done_work_with_test_state(10, "repo-a", "failed")]);
+        arm_test_verdict(&mut app, "repo-a", 10, "id-10-done", None);
+        assert!(app.detect_test_verdict());
+        let p = app.pending_test_fix.as_ref().expect("test-fix prompt raised");
+        assert_eq!(p.issue_num, 10);
+        assert!(app.pending_merge.is_none());
+        // Armed entry consumed so it doesn't re-route next tick.
+        assert!(app.armed_for_test_verdict.is_empty());
+    }
+
+    #[test]
+    fn detect_test_verdict_passed_raises_merge() {
+        let mut app =
+            make_app_with_assignments(vec![done_work_with_test_state(10, "repo-a", "passed")]);
+        arm_test_verdict(&mut app, "repo-a", 10, "id-10-done", None);
+        assert!(app.detect_test_verdict());
+        let p = app.pending_merge.as_ref().expect("merge prompt raised");
+        assert_eq!(p.issue_num, 10);
+        assert!(app.pending_test_fix.is_none());
+        assert!(app.armed_for_test_verdict.is_empty());
+    }
+
+    #[test]
+    fn detect_test_verdict_ignores_unchanged_prior_state() {
+        // The work was already failed at arm time → no NEW verdict, so the
+        // detector must not re-fire (edge-triggered on a state change).
+        let mut app =
+            make_app_with_assignments(vec![done_work_with_test_state(10, "repo-a", "failed")]);
+        arm_test_verdict(&mut app, "repo-a", 10, "id-10-done", Some("failed"));
+        assert!(!app.detect_test_verdict());
+        assert!(app.pending_test_fix.is_none());
+        assert!(app.pending_merge.is_none());
+        assert!(app
+            .armed_for_test_verdict
+            .contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    #[test]
+    fn detect_test_verdict_no_fire_without_verdict() {
+        // Work has no test verdict yet → nothing to route.
+        let mut app = make_app_with_assignments(vec![done_work_with_branch(10, "repo-a")]);
+        arm_test_verdict(&mut app, "repo-a", 10, "id-10-done", None);
+        assert!(!app.detect_test_verdict());
+        assert!(app.pending_test_fix.is_none());
+        assert!(app.pending_merge.is_none());
     }
 
     #[test]

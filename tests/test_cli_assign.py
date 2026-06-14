@@ -825,7 +825,9 @@ class TestAssignInteractiveFix:
     def test_fix_of_on_non_review_id_errors(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        # Passing the WORK id (type=work) instead of the review id must error.
+        # Passing a WORK id (type=work) that did NOT fail its test gate must
+        # error — --fix-of accepts only a review (request-changes) or a
+        # test-failed work row (#581).
         _seed_review_and_work("work-x", "rev-x", "issue-1-fix-bug")
         with patch("coord.github_ops.get_issue",
                    return_value={"title": "Fix bug", "body": "b"}), \
@@ -836,7 +838,7 @@ class TestAssignInteractiveFix:
                  "--interactive", "--fix-of", "work-x", "--dry-run"],
             )
         assert result.exit_code == 2
-        assert "not 'review'" in result.output
+        assert "test_state" in result.output
 
     def test_fix_of_dry_run_continues_existing_branch(
         self, config_file: Path, coord_dir: Path
@@ -915,6 +917,35 @@ def _seed_work(
         branch=branch,
         type="work",
         review_iteration=review_iteration,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[],
+        active=[],
+        completed=[work],
+    )
+    save_board(board)
+
+
+def _seed_test_failed_work(assignment_id: str, branch: str, reason: str) -> None:
+    """Persist a done work assignment whose Test gate FAILED, so the #581
+    test-fail `--fix-of` front door can resolve it."""
+    from coord.models import Assignment, Board, Repo
+    from coord.state import save_board
+
+    work = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1,
+        issue_title="Fix bug",
+        assignment_id=assignment_id,
+        status="done",
+        branch=branch,
+        type="work",
+        test_state="failed",
+        test_reason=reason,
         dispatched_at=0.0,
         finished_at=1.0,
     )
@@ -1218,3 +1249,125 @@ class TestAssignBriefingFileAndTroubleshoot:
         assert "no worktree" in result.output
         # Read-only tool set — no Edit/Write granted to the live checkout.
         assert "Read,Bash,Grep,Glob" in result.output
+
+
+class TestAssignInteractiveFixFromTestFail:
+    """#581: `--fix-of <work_aid>` also accepts a WORK row whose Test gate
+    failed — the test-fail front door to the interactive fix loop."""
+
+    def test_fix_of_test_failed_work_dry_run(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        _seed_test_failed_work("work-tf", "issue-1-fix-bug", "GTK shows no glyphs")
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--fix-of", "work-tf", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "FIX of #1" in result.output
+        assert "would continue branch: issue-1-fix-bug" in result.output
+        assert "(dry run — not launched)" in result.output
+
+
+class TestAssignInteractiveSmoke:
+    """Leg 3c / A3: `coord assign --interactive --smoke-of <work_aid>` — a
+    human-attended interactive testing agent."""
+
+    def test_smoke_of_requires_interactive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--smoke-of", "work-123"],
+            )
+        assert result.exit_code == 2
+        assert "--smoke-of requires --interactive" in result.output
+
+    def test_smoke_of_unknown_work_errors(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "nope", "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "no such assignment" in result.output
+
+    def test_smoke_of_dry_run_builds_smoke_dispatch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        _seed_done_work("work-sm", "issue-1-fix-bug")
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "work-sm", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "SMOKE TEST of #1" in result.output
+        assert "issue-1-fix-bug" in result.output
+        assert "live checkout" in result.output
+        assert "(dry run — not launched)" in result.output
+        # Dry-run must NOT persist a smoke row.
+        from coord.state import build_board
+        b = build_board()
+        smoke_rows = [a for a in b.active + b.completed if a.type == "smoke"]
+        assert smoke_rows == [], "dry-run must not persist a smoke assignment"
+
+
+class TestAssignInteractiveMerge:
+    """Leg 3c: `coord assign --interactive --merge-of <work_aid>` — a
+    human-attended interactive merge agent (proactive rebase, #306)."""
+
+    def test_merge_of_requires_interactive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--merge-of", "work-123"],
+            )
+        assert result.exit_code == 2
+        assert "--merge-of requires --interactive" in result.output
+
+    def test_merge_of_dry_run_continues_existing_branch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        _seed_done_work("work-mg", "issue-1-fix-bug")
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--merge-of", "work-mg", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "MERGE-PREP of #1" in result.output
+        assert "would continue branch: issue-1-fix-bug" in result.output
+        assert "rebase onto origin/" in result.output
+        assert "(dry run — not launched)" in result.output
+
+    def test_flavours_are_mutually_exclusive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "a", "--merge-of", "b",
+                 "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
