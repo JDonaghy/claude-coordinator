@@ -8650,7 +8650,7 @@ impl CoordApp {
                             .copied()
                             .unwrap_or(true);
                         let header_color = if group_key == "live" {
-                            Color::rgb(80, 220, 80) // green = live
+                            Color::rgb(80, 160, 240) // blue = active session (matches accent_bg)
                         } else {
                             Color::rgb(150, 150, 160) // dim = idle
                         };
