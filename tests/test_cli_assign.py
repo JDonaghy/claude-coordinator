@@ -896,6 +896,183 @@ class TestAssignInteractiveFix:
         assert fix_rows == [], "dry-run must not persist a fix assignment"
 
 
+def _seed_work(
+    work_id: str,
+    branch: str,
+    review_iteration: int = 0,
+) -> None:
+    """Persist a done work assignment so the `--rework-of` path can resolve it."""
+    from coord.models import Assignment, Board, Repo
+    from coord.state import save_board
+
+    work = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1,
+        issue_title="Fix bug",
+        assignment_id=work_id,
+        status="done",
+        branch=branch,
+        type="work",
+        review_iteration=review_iteration,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[],
+        active=[],
+        completed=[work],
+    )
+    save_board(board)
+
+
+class TestAssignInteractiveRework:
+    """#563: `coord assign --interactive --rework-of <work_aid|branch>` —
+    a human-attended rework continuing an existing branch with an operator
+    briefing seeded verbatim."""
+
+    def test_rework_of_requires_interactive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--rework-of", "work-abc", "--briefing", "rebase it"],
+            )
+        assert result.exit_code == 2
+        assert "--rework-of requires --interactive" in result.output
+
+    def test_rework_of_requires_briefing(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--rework-of", "work-abc"],
+            )
+        assert result.exit_code == 2
+        assert "--rework-of requires --briefing" in result.output
+
+    def test_rework_of_mutually_exclusive_with_fix_of(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--rework-of", "work-1",
+                 "--fix-of", "rev-1", "--briefing", "x"],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_rework_of_mutually_exclusive_with_review_of(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--rework-of", "work-1",
+                 "--review-of", "work-2", "--briefing", "x"],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_rework_of_mutually_exclusive_with_troubleshoot(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--rework-of", "work-1",
+                 "--troubleshoot", "--briefing", "x"],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_rework_of_by_assignment_id_dry_run(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Custom briefing is seeded verbatim; existing branch is reused."""
+        _seed_work("work-rw1", "issue-1-the-branch", review_iteration=0)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--rework-of", "work-rw1",
+                 "--briefing", "Rebase onto main and resolve conflicts.",
+                 "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "REWORK of #1" in result.output
+        assert "iteration 1/" in result.output
+        assert "would continue branch: issue-1-the-branch" in result.output
+        assert "(dry run — not launched)" in result.output
+        # Briefing must NOT contain fix/request-changes framing.
+        assert "request-changes" not in result.output
+        assert "address" not in result.output.lower() or "Rebase" in result.output
+        # Dry-run must NOT persist a rework row.
+        from coord.state import build_board
+        b = build_board()
+        rw_rows = [a for a in b.active + b.completed if a.review_iteration == 1]
+        assert rw_rows == [], "dry-run must not persist a rework assignment"
+
+    def test_rework_of_by_branch_name_dry_run(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--rework-of with a bare branch name (no matching board entry)."""
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--rework-of", "issue-194-stale-branch",
+                 "--briefing", "Rebase onto main after the app.rs rewrite.",
+                 "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "REWORK of #1" in result.output
+        assert "would continue branch: issue-194-stale-branch" in result.output
+        assert "(dry run — not launched)" in result.output
+
+    def test_rework_of_remote_dry_run(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Remote --rework-of shows ssh+tmux dispatch on the existing branch."""
+        _seed_work("work-rw2", "issue-1-the-branch", review_iteration=0)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--rework-of", "work-rw2",
+                 "--briefing", "Rebase onto main.",
+                 "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "REWORK of #1" in result.output
+        assert "iteration 1/" in result.output
+        assert "remote tmux" in result.output
+        assert "remote worktree: $HOME/.coord/worktrees/" in result.output
+        assert "would continue branch: issue-1-the-branch" in result.output
+        assert "~/.local/bin/claude" in result.output
+        assert "(dry run — not launched)" in result.output
+        from coord.state import build_board
+        b = build_board()
+        rw_rows = [a for a in b.active + b.completed if a.review_iteration == 1]
+        assert rw_rows == [], "dry-run must not persist a rework assignment"
+
+
 class TestAssignInteractiveRemoteWork:
     """#486d: a remote interactive WORK session pushes its commits back on
     session-end via finalize_remote_interactive_exit (was a deferred no-op)."""

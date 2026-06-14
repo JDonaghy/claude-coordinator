@@ -2007,6 +2007,20 @@ def _prompt_and_relay_review_verdict(
         "--interactive; local-only."
     ),
 )
+@click.option(
+    "--rework-of",
+    "rework_of",
+    default=None,
+    help=(
+        "#563: launch a human-attended interactive REWORK of an existing branch. "
+        "Accepts a work assignment ID (resolves its branch) or a branch name "
+        "directly. Continues on the EXISTING branch (no orphan branch), seeds "
+        "the session with the operator-supplied --briefing verbatim, and bumps "
+        "review_iteration so the reworked branch is re-reviewed before merge. "
+        "Requires --interactive and --briefing; works local and remote (same "
+        "worktree + push-back as --fix-of)."
+    ),
+)
 def assign(
     machine: str,
     repo: str,
@@ -2025,6 +2039,7 @@ def assign(
     fix_of: str | None,
     briefing_file: str | None,
     troubleshoot: bool,
+    rework_of: str | None,
 ) -> None:
     from coord.dispatch import dispatch, post_briefing
     from coord.state import build_board, load_dispatched, record_dispatched, save_board
@@ -2117,6 +2132,28 @@ def assign(
     if troubleshoot and (review_of is not None or fix_of is not None):
         click.echo(
             "error: --troubleshoot is mutually exclusive with --review-of/--fix-of",
+            err=True,
+        )
+        sys.exit(2)
+
+    # #563: --rework-of — same interactive requirement; mutually exclusive with
+    # all other interactive flavours; requires --briefing so the operator always
+    # supplies explicit rework instructions.
+    if rework_of is not None and not interactive:
+        click.echo("error: --rework-of requires --interactive", err=True)
+        sys.exit(2)
+    if rework_of is not None and (
+        review_of is not None or fix_of is not None or troubleshoot
+    ):
+        click.echo(
+            "error: --rework-of is mutually exclusive with "
+            "--review-of/--fix-of/--troubleshoot",
+            err=True,
+        )
+        sys.exit(2)
+    if rework_of is not None and not (briefing or "").strip():
+        click.echo(
+            "error: --rework-of requires --briefing (supply the rework instructions).",
             err=True,
         )
         sys.exit(2)
@@ -3131,6 +3168,347 @@ def assign(
             except Exception as exc:  # noqa: BLE001 — best-effort backstop
                 click.echo(
                     f"  warning: remote backstop failed to record fix exit: {exc}",
+                    err=True,
+                )
+            sys.exit(exit_code)
+
+        # ── #563: --rework-of <work_aid|branch> ──────────────────────────
+        # A human-attended REWORK of an existing branch — rebase, conflict
+        # resolution, ad-hoc fixes after approval, etc.  Sibling of --fix-of
+        # but WITHOUT the request-changes framing: the operator supplies the
+        # briefing verbatim via --briefing.  Continues on the existing branch
+        # (worktree + push-back identical to --fix-of), bumps review_iteration
+        # so the reworked result is re-reviewed before merge.
+        if rework_of is not None:
+            from coord.agent import (  # noqa: PLC0415
+                AssignmentSpec as _AssignmentSpecRw,
+                _GitError as _AgentGitErrorRw,
+                setup_interactive_worktree as _setup_wt_rw,
+            )
+            from coord.models import Assignment as _AssignmentRw  # noqa: PLC0415
+            from coord.state import (  # noqa: PLC0415
+                COORD_DIR as _COORD_DIR_RW,
+                build_board as _build_board_rw,
+                record_dispatched_assignment as _record_rw,
+                save_board as _save_board_rw,
+            )
+
+            # Resolve branch: try to find a work assignment by ID first, then
+            # fall back to treating the argument as a literal branch name.
+            _rw_board = _build_board_rw()
+            _rw_work = _rw_board.find_by_id(rework_of)
+            if _rw_work is not None:
+                if not _rw_work.branch:
+                    click.echo(
+                        f"error: work assignment {rework_of} has no branch.",
+                        err=True,
+                    )
+                    sys.exit(2)
+                rw_branch = _rw_work.branch
+                next_rw_iteration = (_rw_work.review_iteration or 0) + 1
+                rw_work_id: str | None = _rw_work.assignment_id
+            else:
+                # Treat the argument as a branch name — useful when the
+                # original assignment has aged off the board.
+                rw_branch = rework_of
+                # Look for any completed work on that branch to inherit
+                # the iteration counter; default to 1 if none found.
+                _branch_work = next(
+                    (
+                        a for a in _rw_board.completed
+                        if a.branch == rw_branch and a.type in ("work", "plan")
+                    ),
+                    None,
+                )
+                next_rw_iteration = (
+                    (_branch_work.review_iteration or 0) + 1
+                    if _branch_work is not None
+                    else 1
+                )
+                rw_work_id = (
+                    _branch_work.assignment_id if _branch_work is not None else None
+                )
+
+            resolved_model = model if model else cfg.models.default
+            assignment_id = _uuid.uuid4().hex[:12]
+            if _is_local:
+                rw_repo_path = str(
+                    Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+                )
+            else:
+                rw_repo_path = machine_obj.repo_path(repo) or f"~/src/{repo}"
+            rw_default_branch = repo_cfg.default_branch or "main"
+
+            os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+            if _is_local:
+                rw_report_reminder = (
+                    f"[Coordinator rework assignment {assignment_id}] "
+                    f"HUMAN-ATTENDED rework (iteration {next_rw_iteration}) "
+                    f"on branch {rw_branch}. Before you exit, run "
+                    f"`coord report-result --assignment {assignment_id} "
+                    "--status done --summary <text>` so the coordinator "
+                    "records the result and can re-review.\n\n"
+                )
+            else:
+                rw_report_reminder = (
+                    f"[Coordinator rework assignment {assignment_id}] "
+                    f"HUMAN-ATTENDED rework (iteration {next_rw_iteration}) "
+                    f"on branch {rw_branch}, running on a REMOTE machine. "
+                    "Make your changes and COMMIT them. Do NOT run "
+                    "`coord report-result` here (it writes this machine's "
+                    "DB, not the coordinator's) and do NOT run any `gh` "
+                    f"commands. When you exit, the coordinator pushes your "
+                    f"commits to origin/{rw_branch} and re-reviews.\n\n"
+                )
+            effective_briefing = rw_report_reminder + briefing
+
+            spec = _AssignmentSpecRw(
+                repo_name=repo,
+                repo_path=rw_repo_path,
+                issue_number=issue,
+                issue_title=f"[rework-{next_rw_iteration}] {issue_title}",
+                briefing=effective_briefing,
+                model=resolved_model,
+                type="work",
+                provider="claude-pty",
+            )
+            argv = provider.build_command(spec, resolved_model=resolved_model)
+            if not _is_local:
+                argv = ["~/.local/bin/claude"] + list(argv)[1:]
+
+            _rw_location = (
+                "local TTY" if _is_local
+                else f"{machine_obj.host} (remote tmux)"
+            )
+            _rw_max_iter = cfg.pipeline.max_review_iterations
+            click.echo(
+                f"{machine} ({_rw_location}) → REWORK of #{issue} "
+                f"(iteration {next_rw_iteration}/{_rw_max_iter}) on branch {rw_branch}"
+            )
+            click.echo(
+                "  mode: HUMAN-ATTENDED interactive rework (#563)"
+            )
+            click.echo(
+                f"  assignment id: {assignment_id}  "
+                f"(rework_of={rework_of!r}, branch={rw_branch})"
+            )
+            if dry_run:
+                click.echo("  (dry run — not launched)")
+                click.echo(f"  would continue branch: {rw_branch}")
+                if not _is_local:
+                    click.echo(
+                        f"  remote worktree: $HOME/.coord/worktrees/{assignment_id}"
+                        f" on {machine_obj.host} (branch: {rw_branch})"
+                    )
+                click.echo(f"  would exec: {argv}")
+                return
+
+            rw_assignment = _AssignmentRw(
+                machine_name=machine,
+                repo_name=repo,
+                issue_number=issue,
+                issue_title=f"[rework-{next_rw_iteration}] {issue_title}",
+                briefing=effective_briefing,
+                assignment_id=assignment_id,
+                status="running",
+                branch=rw_branch,
+                pr_url=_rw_work.pr_url if _rw_work is not None else None,
+                dispatched_at=_time.time(),
+                type="work",
+                review_of_assignment_id=rw_work_id,
+                review_iteration=next_rw_iteration,
+                model=resolved_model,
+                provider_name="claude-pty",
+            )
+            _record_rw(assignment=rw_assignment, repo_github=repo_cfg.github)
+            _save_board_rw(_build_board_rw())
+
+            if _is_local:
+                try:
+                    _wt_path, _ = _setup_wt_rw(
+                        Path(rw_repo_path),
+                        issue_number=issue,
+                        issue_title=issue_title,
+                        assignment_id=assignment_id,
+                        default_branch=rw_default_branch,
+                        existing_branch=rw_branch,
+                    )
+                    worktree_path = str(_wt_path)
+                except (_AgentGitErrorRw, OSError) as _wt_err:
+                    click.echo(
+                        f"  error: could not create rework worktree on branch "
+                        f"{rw_branch}: {_wt_err}",
+                        err=True,
+                    )
+                    sys.exit(1)
+                click.echo(f"  worktree: {worktree_path} (branch: {rw_branch})")
+
+                started_at = _time.time()
+                exit_code = launch_human_attended_interactive(
+                    argv,
+                    effective_briefing,
+                    assignment_id=assignment_id,
+                    cwd=worktree_path,
+                )
+                if exit_code != 0:
+                    click.echo(f"  claude exited with status {exit_code}", err=True)
+
+                _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+                if _sname and _tmux_alive(_sname):
+                    click.echo(
+                        f"  session still running in tmux: {_sname}\n"
+                        f"  reattach with:  coord reattach {assignment_id}"
+                    )
+                    sys.exit(0)
+
+                try:
+                    finalize_result = finalize_interactive_exit(
+                        assignment_id=assignment_id,
+                        repo_name=repo,
+                        repo_github=repo_cfg.github,
+                        issue_number=issue,
+                        machine_name=machine,
+                        worktree_path=worktree_path,
+                        base_branch=rw_default_branch,
+                        exit_code=exit_code,
+                        started_at=started_at,
+                        log_path=None,
+                        repo_path=rw_repo_path,
+                        artifact_paths=repo_cfg.artifact_paths,
+                    )
+                    if finalize_result.already_recorded:
+                        click.echo(
+                            "  result recorded via `coord report-result`; backstop "
+                            "did not overwrite"
+                        )
+                    else:
+                        click.echo(
+                            f"  backstop: status={finalize_result.terminal_status} "
+                            f"commits_ahead={finalize_result.commits_ahead}"
+                        )
+                        if not finalize_result.push_ok:
+                            click.echo(
+                                f"  warning: git push failed: {finalize_result.push_error}",
+                                err=True,
+                            )
+                except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                    click.echo(
+                        f"  warning: backstop failed to record rework exit: {exc}",
+                        err=True,
+                    )
+                sys.exit(exit_code)
+
+            # ── REMOTE REWORK ─────────────────────────────────────────────
+            import shlex as _shlex_rw  # noqa: PLC0415
+
+            _remote_wt = "$HOME/.coord/worktrees/" + assignment_id
+            _rp_sh = (
+                "$HOME/" + rw_repo_path[2:]
+                if rw_repo_path.startswith("~/")
+                else ("$HOME" if rw_repo_path == "~" else rw_repo_path)
+            )
+            _claude_args = _shlex_rw.join(list(argv)[1:])
+            _br_q = _shlex_rw.quote(rw_branch)
+            _orig_ref = _shlex_rw.quote(f"origin/{rw_branch}")
+            _remote_cmd = (
+                f"mkdir -p $HOME/.coord/worktrees"
+                f" && cd {_rp_sh}"
+                f" && git fetch origin --prune 2>/dev/null || true"
+                f" && git worktree prune 2>/dev/null || true"
+                f" && git worktree add -B {_br_q} {_remote_wt} {_orig_ref}"
+                f" && cd {_remote_wt}"
+                f" && COORD_ASSIGNMENT_ID={assignment_id} {argv[0]} {_claude_args}"
+            )
+            _tmux_host = TmuxHost(ssh_target=machine_obj.host)
+            _sname = _tmux_name(assignment_id)
+            click.echo(
+                f"  remote worktree: $HOME/.coord/worktrees/{assignment_id}"
+                f" on {machine_obj.host} (branch: {rw_branch})"
+            )
+
+            if effective_briefing.strip():
+                _hdr = (
+                    "--- seeded briefing -- review below; "
+                    "submit the pre-filled input in Claude to send ---"
+                )
+                _ftr = "-" * len(_hdr)
+                _preview = f"\n{_hdr}\n{effective_briefing.rstrip()}\n{_ftr}\n\n"
+                try:
+                    os.write(sys.stdout.fileno(), _preview.encode("utf-8"))
+                except OSError:
+                    pass
+
+            started_at = _time.time()
+            _rc = _tmux_launch(
+                argv,
+                effective_briefing,
+                _sname,
+                cwd=None,
+                host=_tmux_host,
+                raw_shell_cmd=_remote_cmd,
+            )
+            if _rc is None:
+                click.echo(
+                    "  error: could not create remote tmux session on "
+                    f"{machine_obj.host}",
+                    err=True,
+                )
+                sys.exit(1)
+            exit_code = _rc
+            if exit_code != 0:
+                click.echo(f"  claude exited with status {exit_code}", err=True)
+
+            if _tmux_alive(_sname, host=_tmux_host):
+                click.echo(
+                    f"  session still running in remote tmux: {_sname}\n"
+                    f"  reattach with:  ssh -t {machine_obj.host}"
+                    f" tmux attach-session -t {_sname}\n"
+                    "  (the rework is not pushed until the session ends and "
+                    "the coordinator finalizes)"
+                )
+                sys.exit(0)
+
+            # Remote finalize: push the rework commits to origin/<branch>,
+            # record the completion, and clean up the remote worktree.
+            try:
+                _fr = finalize_remote_interactive_exit(
+                    assignment_id=assignment_id,
+                    repo_name=repo,
+                    repo_github=repo_cfg.github,
+                    issue_number=issue,
+                    machine_name=machine,
+                    ssh_target=machine_obj.host,
+                    remote_worktree_sh=_remote_wt,
+                    remote_repo_sh=_rp_sh,
+                    branch=rw_branch,
+                    base_branch=rw_default_branch,
+                    exit_code=exit_code,
+                    started_at=started_at,
+                    artifact_paths=repo_cfg.artifact_paths,
+                )
+                if _fr.already_recorded:
+                    click.echo(
+                        "  result recorded via `coord report-result`; remote "
+                        "backstop did not overwrite"
+                    )
+                else:
+                    click.echo(
+                        f"  remote backstop: status={_fr.terminal_status} "
+                        f"commits_ahead={_fr.commits_ahead} pushed={_fr.push_ok}"
+                    )
+                    if not _fr.push_ok:
+                        click.echo(
+                            f"  warning: remote push failed: {_fr.push_error}",
+                            err=True,
+                        )
+                        click.echo(
+                            f"  rework commits preserved in {_remote_wt} on "
+                            f"{machine_obj.host} (worktree NOT removed)",
+                            err=True,
+                        )
+            except Exception as exc:  # noqa: BLE001 — best-effort backstop
+                click.echo(
+                    f"  warning: remote backstop failed to record rework exit: {exc}",
                     err=True,
                 )
             sys.exit(exit_code)
