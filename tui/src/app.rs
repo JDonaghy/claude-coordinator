@@ -15532,9 +15532,12 @@ impl CoordApp {
                 review_item.disabled = self.selected_completed_work_aid().is_none();
                 items.push(review_item);
                 // Leg 3 (#517): interactive peer of `bounce` — a human-attended
-                // fix continuing the reviewed branch.  Only when a request-changes
-                // review exists for this issue (else there's nothing to fix).
-                if self.selected_row_has_request_changes_for(issue_number) {
+                // fix continuing the existing branch.  Shown when a request-changes
+                // review exists for this issue, OR (#581) when the Test gate failed
+                // (the red test box) — both are things to fix on the same branch.
+                if self.selected_row_has_request_changes_for(issue_number)
+                    || self.selected_test_failed_work_aid().is_some()
+                {
                     items.push(ContextMenuItem::action(
                         "start-fix-interactive",
                         "Start fix (interactive)",
