@@ -15237,36 +15237,34 @@ impl CoordApp {
     fn poll_pending_pr_fetches(&self) -> bool {
         use std::sync::mpsc::TryRecvError;
         let mut changed = false;
+        // Receive each ready message exactly once — `try_recv` consumes it, so
+        // capturing the payload here (rather than re-receiving in a second pass)
+        // is required; the second receive would always see `Disconnected` and
+        // silently drop the fetched PR info.
         let mut done: Vec<(String, i64)> = Vec::new();
-        let pending = self.pending_pr_fetches.borrow();
-        for (key, rx) in pending.iter() {
-            match rx.try_recv() {
-                Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-                    done.push(key.clone());
+        let mut resolved: Vec<((String, i64), FetchedPr)> = Vec::new();
+        {
+            let pending = self.pending_pr_fetches.borrow();
+            for (key, rx) in pending.iter() {
+                match rx.try_recv() {
+                    Ok(Ok(fp)) => {
+                        resolved.push((key.clone(), fp));
+                        done.push(key.clone());
+                    }
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                        // Fetch failed — drop the receiver; next render retries.
+                        done.push(key.clone());
+                    }
+                    Err(TryRecvError::Empty) => {}
                 }
-                Err(TryRecvError::Empty) => {}
             }
         }
-        drop(pending);
-        for key in done {
-            // Pull the receiver back out and consume the message.
-            let rx = match self.pending_pr_fetches.borrow_mut().remove(&key) {
-                Some(rx) => rx,
-                None => continue,
-            };
-            match rx.try_recv() {
-                Ok(Ok(fp)) => {
-                    self.fetched_prs_cache.borrow_mut().insert(key, fp);
-                    changed = true;
-                }
-                Ok(Err(_)) | Err(_) => {
-                    // Fetch failed — leave the cache untouched; the
-                    // next render will trigger a retry.  Worth a
-                    // background poll later (#TBD) instead of
-                    // re-fetching on every render but the cost is
-                    // ~200ms per failure so leave for now.
-                }
-            }
+        for key in &done {
+            self.pending_pr_fetches.borrow_mut().remove(key);
+        }
+        for (key, fp) in resolved {
+            self.fetched_prs_cache.borrow_mut().insert(key, fp);
+            changed = true;
         }
         changed
     }
@@ -15277,36 +15275,36 @@ impl CoordApp {
     fn poll_pending_comments_fetches(&self) -> bool {
         use std::sync::mpsc::TryRecvError;
         let mut changed = false;
+        // Receive each ready message exactly once.  `try_recv` consumes the
+        // message, so we must capture the payload here rather than re-receiving
+        // in a second pass (that would always see `Disconnected` and silently
+        // drop the result, leaving the Summary tab stuck on "Fetching…").
         let mut done: Vec<(String, u64)> = Vec::new();
+        let mut resolved: Vec<((String, u64), serde_json::Value)> = Vec::new();
         {
             let pending = self.pending_comments_fetches.borrow();
             for (key, rx) in pending.iter() {
                 match rx.try_recv() {
-                    Ok(Ok(_)) | Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                    Ok(Ok(comments_json)) => {
+                        resolved.push((key.clone(), comments_json));
+                        done.push(key.clone());
+                    }
+                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+                        // Fetch failed — drop the receiver; next render retries.
                         done.push(key.clone());
                     }
                     Err(TryRecvError::Empty) => {}
                 }
             }
         }
-        for key in done {
-            let rx = match self.pending_comments_fetches.borrow_mut().remove(&key) {
-                Some(rx) => rx,
-                None => continue,
-            };
-            match rx.try_recv() {
-                Ok(Ok(comments_json)) => {
-                    let summaries = parse_session_summaries_from_comments(
-                        &comments_json,
-                        &self.data.assignments,
-                    );
-                    self.fetched_comments_cache.borrow_mut().insert(key, summaries);
-                    changed = true;
-                }
-                Ok(Err(_)) | Err(_) => {
-                    // Fetch failed — leave cache untouched; next render retries.
-                }
-            }
+        for key in &done {
+            self.pending_comments_fetches.borrow_mut().remove(key);
+        }
+        for (key, comments_json) in resolved {
+            let summaries =
+                parse_session_summaries_from_comments(&comments_json, &self.data.assignments);
+            self.fetched_comments_cache.borrow_mut().insert(key, summaries);
+            changed = true;
         }
         changed
     }
