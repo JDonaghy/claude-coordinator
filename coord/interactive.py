@@ -1610,6 +1610,31 @@ def reap_stale_interactive_sessions(
 _REMOTE_SSH_UNREACHABLE_COUNTS: dict[str, int] = {}
 
 
+def _mark_stale_reap_in_db(assignment_id: str, status: str, finished_at: float) -> None:
+    """Best-effort DB update when a stale remote session is reaped without a
+    full ``finalize_remote_interactive_exit`` call.
+
+    Called when either:
+
+    * ``finalize_remote_interactive_exit`` raised an exception mid-run, OR
+    * There is no branch / repo path to pass to finalize (push cannot run).
+
+    The update is silently swallowed on DB error so the in-memory board
+    update that follows always frees the machine slot regardless.
+    """
+    try:
+        from coord.state import get_connection  # noqa: PLC0415
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status=?, finished_at=? "
+            "WHERE assignment_id=? AND status IN ('running', 'pending')",
+            (status, finished_at, assignment_id),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _probe_remote_tmux_alive(
     session_name: str,
     host: TmuxHost,
@@ -1684,7 +1709,7 @@ def reap_stale_remote_interactive_sessions(
     caller should extend its ``changed`` list with these IDs so
     :func:`coord.state.save_board` is triggered.
     """
-    timeout_hours = getattr(config.concurrency, "interactive_session_timeout_hours", 12.0)
+    timeout_hours = config.concurrency.interactive_session_timeout_hours
     if timeout_hours <= 0:
         return []  # sweep disabled by config
 
@@ -1816,32 +1841,12 @@ def reap_stale_remote_interactive_sessions(
                 # Finalize failed (e.g. network error mid-push). Fall back to
                 # a plain DB mark so the slot is still freed.
                 terminal_status = "failed"
-                try:
-                    from coord.state import get_connection  # noqa: PLC0415
-                    conn = get_connection()
-                    conn.execute(
-                        "UPDATE assignments SET status=?, finished_at=? "
-                        "WHERE assignment_id=? AND status IN ('running', 'pending')",
-                        (terminal_status, now, a.assignment_id),
-                    )
-                    conn.commit()
-                except Exception:  # noqa: BLE001
-                    pass
+                _mark_stale_reap_in_db(a.assignment_id, terminal_status, now)
         else:
-            # No branch recoverable — mark failed in DB so the slot is freed
-            # without attempting a push.
+            # branch or remote_repo_sh unavailable — can't push via finalize;
+            # fall back to a bare DB mark so the machine slot is freed.
             terminal_status = "failed"
-            try:
-                from coord.state import get_connection  # noqa: PLC0415
-                conn = get_connection()
-                conn.execute(
-                    "UPDATE assignments SET status=?, finished_at=? "
-                    "WHERE assignment_id=? AND status IN ('running', 'pending')",
-                    (terminal_status, now, a.assignment_id),
-                )
-                conn.commit()
-            except Exception:  # noqa: BLE001
-                pass
+            _mark_stale_reap_in_db(a.assignment_id, terminal_status, now)
 
         # Update the in-memory board so the claim is released immediately.
         moved = board.mark_failed_by_id(a.assignment_id, finished_at=now)
