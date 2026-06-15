@@ -5486,10 +5486,10 @@ def _maybe_reconcile_branch(
     head ref from GitHub and reconcile the DB.
 
     Returns the new branch name when reconciliation succeeded (DB
-    updated + checkout retried + succeeded), or `None` when no PR is
-    associated, the gh call failed, the head ref matches what we
-    already had, or the retry checkout also failed.  The caller falls
-    back to the original error in those cases.
+    updated + the reconciled branch verified on origin), or `None` when no
+    PR is associated, the gh call failed, the head ref matches what we
+    already had, or the reconciled ref is missing on origin.  The caller
+    falls back to the original error in those cases.
     """
     from coord.db import get_connection
 
@@ -5534,12 +5534,15 @@ def _maybe_reconcile_branch(
         # Don't pretend we fixed it.
         return None
 
-    # Try the checkout with the real branch — must succeed before we
-    # write it back to the DB.
+    # Validate the reconciled branch exists on origin before writing it to
+    # the DB.  #561: this MUST be non-mutating — never `git checkout` in the
+    # base checkout (it doubles as the live editable coordinator source).
+    # `git fetch origin` already ran in the caller, so origin/<branch> is
+    # current; a rev-parse verify confirms it without moving HEAD.
     try:
         subprocess.run(
-            ["git", "checkout", real_branch], cwd=str(repo_dir),
-            check=True, capture_output=True, text=True,
+            ["git", "rev-parse", "--verify", f"origin/{real_branch}"],
+            cwd=str(repo_dir), check=True, capture_output=True, text=True,
         )
     except subprocess.CalledProcessError:
         return None
@@ -6884,6 +6887,73 @@ def resume(config_path: Path) -> None:
             click.echo(f"  {a.machine_name} → {a.repo_name} #{a.issue_number}: {a.issue_title}")
 
 
+def _test_worktree_path(assignment_id: str, repo_name: str) -> Path:
+    """#561: throwaway worktree path for `coord test`'s build (per assignment).
+
+    Lives under ``~/.coord/test-worktrees/`` — OUTSIDE the base checkout — so a
+    Build never moves the base checkout's branch (which doubles as the live
+    editable coordinator source).
+    """
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    return COORD_DIR / "test-worktrees" / f"{repo_name}-{assignment_id}"
+
+
+def _remove_test_worktree(repo_dir: Path, wt_path: Path) -> None:
+    """Best-effort removal of a `coord test` worktree (+ prune admin refs)."""
+    import subprocess  # noqa: PLC0415
+
+    if not wt_path.exists():
+        return
+    for args in (
+        ["git", "worktree", "remove", "--force", str(wt_path)],
+        ["git", "worktree", "prune"],
+    ):
+        try:
+            subprocess.run(
+                args, cwd=str(repo_dir), capture_output=True, text=True, timeout=30
+            )
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+
+def _cleanup_test_worktree(cfg, assignment) -> None:
+    """Remove the test worktree for *assignment* (called on a pass/skip verdict).
+
+    Resolves the base checkout the same way the build path does; a no-op when no
+    worktree exists (e.g. a verdict recorded without a prior Build).
+    """
+    if not assignment.assignment_id:
+        return
+    repo_dir = _local_repo_dir(cfg, assignment.repo_name)
+    if repo_dir is None:
+        return
+    _remove_test_worktree(
+        repo_dir, _test_worktree_path(assignment.assignment_id, assignment.repo_name)
+    )
+
+
+def _local_repo_dir(cfg, repo_name: str) -> Path | None:
+    """Resolve the base checkout for *repo_name* (local machine first, then any
+    machine that knows it).  Returns an expanded ``Path`` or ``None``."""
+    import socket  # noqa: PLC0415
+
+    hostname = socket.gethostname().split(".")[0]
+    local_machine = next(
+        (m for m in cfg.machines if m.name == hostname or m.host.split(".")[0] == hostname),
+        None,
+    )
+    repo_path = None
+    if local_machine:
+        repo_path = local_machine.repo_path(repo_name)
+    if repo_path is None:
+        for m in cfg.machines:
+            repo_path = m.repo_path(repo_name)
+            if repo_path:
+                break
+    return Path(repo_path).expanduser() if repo_path else None
+
+
 def _restore_default_branch_after_test(cfg, assignment) -> None:
     """#271 part 1: switch the local checkout back to the repo's
     `default_branch` after a pass/skip verdict.
@@ -7043,16 +7113,17 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
         elif verdict == "pass":
             click.echo("  Run: coord merge to proceed")
 
-        # #271 part 1: restore the local checkout to `default_branch`
-        # after a pass/skip verdict — local testing is done, the user
-        # is back to their normal workflow.  `--fail` leaves the
-        # branch checked out (user may want to dig further on the
-        # failure).
+        # #271 part 1: restore the local checkout to `default_branch` after a
+        # pass/skip verdict (legacy safety — #561 means a Build no longer moves
+        # the base, so this is a no-op on fresh checkouts), and #561: remove the
+        # throwaway test worktree now that testing concluded.  `--fail` leaves
+        # the worktree so the user can dig into the failure.
         if verdict in ("pass", "skip"):
             _restore_default_branch_after_test(cfg, assignment)
+            _cleanup_test_worktree(cfg, assignment)
         return
 
-    # ── Checkout and build ──────────────────────────────────────────────
+    # ── Checkout and build (in a throwaway worktree — #561) ──────────────
     if not assignment.branch:
         click.echo(
             f"error: assignment {assignment_id} has no branch recorded. "
@@ -7061,99 +7132,103 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
         )
         sys.exit(1)
 
-    import socket
     import subprocess
 
-    hostname = socket.gethostname().split(".")[0]
-    local_machine = next(
-        (m for m in cfg.machines if m.name == hostname or m.host.split(".")[0] == hostname),
-        None,
-    )
-    repo_path = None
-    if local_machine:
-        repo_path = local_machine.repo_path(assignment.repo_name)
-    if repo_path is None:
-        for m in cfg.machines:
-            repo_path = m.repo_path(assignment.repo_name)
-            if repo_path:
-                break
-    if repo_path is None:
+    repo_dir = _local_repo_dir(cfg, assignment.repo_name)
+    if repo_dir is None:
         click.echo(
             f"error: no repo_path configured for {assignment.repo_name!r}. "
             f"Add it to coordinator.yml under machines[].repo_paths.",
             err=True,
         )
         sys.exit(1)
-
-    from pathlib import Path as P
-    repo_dir = P(repo_path).expanduser()
     if not repo_dir.exists():
         click.echo(f"error: repo path does not exist: {repo_dir}", err=True)
         sys.exit(1)
 
-    click.echo(f"Fetching and checking out branch {assignment.branch!r} in {repo_dir}...")
+    # #561: build/test in a throwaway worktree fetched fresh from origin —
+    # NEVER `git checkout` in the base checkout. The base doubles as the live
+    # editable coordinator source, so moving its branch silently downgrades the
+    # running coord (disabled guards, reintroduced bugs) until restored. A
+    # `git fetch` is safe (it doesn't move HEAD); the worktree gets its own.
+    wt_path = _test_worktree_path(assignment_id, assignment.repo_name)
+    click.echo(
+        f"Fetching origin and preparing test worktree for {assignment.branch!r} "
+        f"(base checkout {repo_dir} stays untouched)..."
+    )
     try:
         subprocess.run(
-            ["git", "fetch", "origin"], cwd=str(repo_dir),
+            ["git", "fetch", "origin", "--prune"], cwd=str(repo_dir),
             check=True, capture_output=True, text=True,
         )
     except subprocess.CalledProcessError as e:
-        click.echo(f"error: git command failed: {e.stderr.strip()}", err=True)
+        click.echo(f"error: git fetch failed: {e.stderr.strip()}", err=True)
         sys.exit(1)
-    try:
-        subprocess.run(
-            ["git", "checkout", assignment.branch], cwd=str(repo_dir),
-            check=True, capture_output=True, text=True,
+
+    # Clear any stale worktree from a prior Build of this assignment.
+    _remove_test_worktree(repo_dir, wt_path)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _add_worktree(branch: str):
+        # --detach: we only read the tree to build/test; no local branch needed.
+        return subprocess.run(
+            ["git", "worktree", "add", "--force", "--detach",
+             str(wt_path), f"origin/{branch}"],
+            cwd=str(repo_dir), capture_output=True, text=True,
         )
-    except subprocess.CalledProcessError as e:
-        # Branch reconciliation: the DB-recorded branch can drift from
-        # reality (auto-loop creating orphan branches before #target_branch
-        # landed; slugifier changing max_len across releases; manual
-        # `git branch -m` on origin).  When checkout fails with a
-        # pathspec error AND the issue has a PR, fetch the PR's actual
-        # headRefName from GitHub, update the DB, and retry.
+
+    res = _add_worktree(assignment.branch)
+    if res.returncode != 0:
+        # Branch drift (auto-loop orphan branches; slugifier max_len changes
+        # across releases; manual `git branch -m` on origin). When the worktree
+        # add fails AND the issue has a PR, resolve the PR's actual headRefName
+        # (non-mutating), update the DB, and retry.
         reconciled = _maybe_reconcile_branch(
-            assignment, repo_dir, original_error=e.stderr.strip(), config=cfg,
+            assignment, repo_dir, original_error=res.stderr.strip(), config=cfg,
         )
         if reconciled is None:
             click.echo(
-                f"error: git command failed: {e.stderr.strip()}",
+                f"error: could not create test worktree: {res.stderr.strip()}",
                 err=True,
             )
             sys.exit(1)
-        # Re-load the assignment so subsequent code sees the new branch.
         assignment.branch = reconciled
         click.echo(
-            f"  branch drift reconciled: {assignment.branch!r} → using "
-            f"the PR's actual head ref",
+            f"  branch drift reconciled: using the PR's actual head ref "
+            f"{assignment.branch!r}"
         )
+        res = _add_worktree(assignment.branch)
+        if res.returncode != 0:
+            click.echo(
+                f"error: could not create test worktree: {res.stderr.strip()}",
+                err=True,
+            )
+            sys.exit(1)
 
-    click.echo(f"Branch {assignment.branch!r} checked out.")
+    click.echo(f"Test worktree ready at {wt_path} (branch {assignment.branch!r}).")
 
     if repo and repo.build_command:
         click.echo(f"Running build: {repo.build_command}")
-        result = subprocess.run(
-            repo.build_command, shell=True, cwd=str(repo_dir),
-        )
+        result = subprocess.run(repo.build_command, shell=True, cwd=str(wt_path))
         if result.returncode != 0:
             click.echo(f"Build failed (exit {result.returncode})", err=True)
+            click.echo(f"  worktree kept for inspection: {wt_path}")
             sys.exit(1)
         click.echo("Build succeeded.")
 
     if repo and repo.test_command:
         click.echo(f"Running tests: {repo.test_command}")
-        result = subprocess.run(
-            repo.test_command, shell=True, cwd=str(repo_dir),
-        )
+        result = subprocess.run(repo.test_command, shell=True, cwd=str(wt_path))
         if result.returncode != 0:
             click.echo(f"Tests failed (exit {result.returncode})", err=True)
+            click.echo(f"  worktree kept for inspection: {wt_path}")
             sys.exit(1)
         click.echo("Tests passed.")
 
     click.echo(
-        f"\nReady for smoke test. Run:\n"
-        f"  coord test --passed {assignment_id}   # if it looks good\n"
-        f"  coord test --fail {assignment_id} --reason \"description\"   # if not"
+        f"\nReady for smoke test (worktree: {wt_path}). Run:\n"
+        f"  coord test --passed {assignment_id}   # if it looks good (removes the worktree)\n"
+        f"  coord test --fail {assignment_id} --reason \"description\"   # keeps the worktree to dig in"
     )
 
 
