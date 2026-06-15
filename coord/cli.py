@@ -2288,6 +2288,23 @@ def assign(
             or machine_obj.host.split(".")[0].lower() == _local_hn
         )
 
+        # #590: on a thin client the local board/DB is empty, so resolve the
+        # interactive-launch target (--review-of/--fix-of/--rework-of/--smoke-of/
+        # --merge-of) from the daemon's board, and skip the local post-dispatch
+        # save_board (record_dispatched_assignment already routed the row to the
+        # daemon; a local save would write/resurrect an empty local coord.db).
+        from coord.client import (  # noqa: PLC0415
+            fetch_remote_board as _fetch_remote_board,
+            resolve_board_service as _resolve_svc,
+        )
+
+        _svc = _resolve_svc()
+
+        def _interactive_board(_local_build):
+            """The board used to resolve a launch target: remote when a board
+            service is set, else the local build."""
+            return _fetch_remote_board(_svc) if _svc is not None else _local_build()
+
         # ── A1 (interactive-mode migration, Track A): INTERACTIVE REVIEW ────
         # `--review-of <work_aid>` launches a human-attended REVIEW of an
         # already-completed work assignment, not a fresh work session.  It
@@ -2317,7 +2334,7 @@ def assign(
             )
             from coord.agent import AssignmentSpec as _AssignmentSpecRv  # noqa: PLC0415
 
-            _rv_board = _build_board_rv()
+            _rv_board = _interactive_board(_build_board_rv)
             work = _rv_board.find_by_id(review_of)
             if work is None:
                 click.echo(
@@ -2481,7 +2498,8 @@ def assign(
             record_dispatched_assignment(
                 assignment=review_assignment, repo_github=repo_cfg.github
             )
-            _save_board_rv(_build_board_rv())
+            if _svc is None:
+                _save_board_rv(_build_board_rv())
             os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
 
             started_at = _time.time()
@@ -2700,7 +2718,7 @@ def assign(
             )
             from coord.agent import AssignmentSpec as _AssignmentSpecSm  # noqa: PLC0415
 
-            _sm_board = _build_board_sm()
+            _sm_board = _interactive_board(_build_board_sm)
             work = _sm_board.find_by_id(smoke_of)
             if work is None:
                 click.echo(
@@ -2868,7 +2886,8 @@ def assign(
                 provider_name="claude-pty",
             )
             _record_sm(assignment=smoke_assignment, repo_github=repo_cfg.github)
-            _save_board_sm(_build_board_sm())
+            if _svc is None:
+                _save_board_sm(_build_board_sm())
             os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
 
             started_at = _time.time()
@@ -3116,7 +3135,7 @@ def assign(
             # back to origin (the #486d push-back, via
             # finalize_remote_interactive_exit; the local finalize only sees
             # the local filesystem).
-            _fx_board = _build_board_fx()
+            _fx_board = _interactive_board(_build_board_fx)
             review = _fx_board.find_by_id(fix_of)
             if review is None:
                 click.echo(
@@ -3320,7 +3339,8 @@ def assign(
                 provider_name="claude-pty",
             )
             _record_fx(assignment=fix_assignment, repo_github=repo_cfg.github)
-            _save_board_fx(_build_board_fx())
+            if _svc is None:
+                _save_board_fx(_build_board_fx())
 
             if _is_local:
                 try:
@@ -3540,7 +3560,7 @@ def assign(
 
             # Resolve branch: try to find a work assignment by ID first, then
             # fall back to treating the argument as a literal branch name.
-            _rw_board = _build_board_rw()
+            _rw_board = _interactive_board(_build_board_rw)
             _rw_work = _rw_board.find_by_id(rework_of)
             if _rw_work is not None:
                 if not _rw_work.branch:
@@ -3668,7 +3688,8 @@ def assign(
                 provider_name="claude-pty",
             )
             _record_rw(assignment=rw_assignment, repo_github=repo_cfg.github)
-            _save_board_rw(_build_board_rw())
+            if _svc is None:
+                _save_board_rw(_build_board_rw())
 
             if _is_local:
                 try:
@@ -3891,7 +3912,7 @@ def assign(
                 )
                 sys.exit(2)
 
-            _mg_board = _build_board_mg()
+            _mg_board = _interactive_board(_build_board_mg)
             work = _mg_board.find_by_id(merge_of)
             if work is None:
                 click.echo(
@@ -4046,7 +4067,8 @@ def assign(
                 provider_name="claude-pty",
             )
             _record_mg(assignment=merge_assignment, repo_github=repo_cfg.github)
-            _save_board_mg(_build_board_mg())
+            if _svc is None:
+                _save_board_mg(_build_board_mg())
 
             started_at = _time.time()
             exit_code = launch_human_attended_interactive(

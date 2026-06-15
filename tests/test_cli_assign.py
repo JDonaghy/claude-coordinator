@@ -1324,6 +1324,43 @@ class TestAssignInteractiveSmoke:
         smoke_rows = [a for a in b.active + b.completed if a.type == "smoke"]
         assert smoke_rows == [], "dry-run must not persist a smoke assignment"
 
+    def test_smoke_of_thin_client_resolves_target_from_daemon(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        # #590: a thin client has no local board — the launch target must
+        # resolve from the daemon's board, not the (empty) local DB. Regression
+        # for "no such assignment on the board" when driving from a thin client.
+        from coord import client as cc
+        from coord.models import Assignment, Board
+
+        remote = Board(
+            active=[],
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api", issue_number=1,
+                    issue_title="Fix bug", assignment_id="work-remote",
+                    status="done", branch="issue-1-fix", type="work",
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        monkeypatch.setattr(cc, "fetch_remote_board", lambda *a, **k: remote)
+        # NOTE: no _seed_done_work — the local DB is intentionally empty; the
+        # target exists only on the (mocked) daemon board.
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "work-remote", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "SMOKE TEST of #1" in result.output
+
 
 class TestAssignInteractiveMerge:
     """Leg 3c: `coord assign --interactive --merge-of <work_aid>` — a

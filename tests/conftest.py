@@ -20,6 +20,22 @@ def _non_terminal_work(monkeypatch):
     monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: False)
 
 
+@pytest.fixture(autouse=True)
+def _no_board_service(monkeypatch, tmp_path):
+    """#584/#590: keep board-service resolution UNSET by default so tests never
+    pick up the dev machine's real ``~/.coord/client.toml`` or
+    ``COORD_SERVICE_URL`` and try to hit a live daemon.  Tests that exercise the
+    thin-client path opt in by monkeypatching ``coord.client.resolve_board_service``
+    (or ``CLIENT_TOML`` / the env vars) themselves — that runs after this
+    autouse fixture, so it wins.
+    """
+    import coord.client as _cc
+
+    monkeypatch.delenv("COORD_SERVICE_URL", raising=False)
+    monkeypatch.delenv("COORD_TOKEN", raising=False)
+    monkeypatch.setattr(_cc, "CLIENT_TOML", tmp_path / "absent-client.toml")
+
+
 def output_and_stderr(result) -> str:
     """CLI text across click versions: newer click separates stderr; older
     mixes it into .output and raises on .stderr access."""
