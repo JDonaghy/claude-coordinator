@@ -27116,11 +27116,56 @@ fn record_test_verdict_conn(
     Ok(())
 }
 
+/// #590 Phase 2: POST the verdict to the daemon when a board service is set
+/// (the thin client's local coord.db is the wrong DB). Mirrors the smoke_test
+/// derivation in [`record_test_verdict_conn`] so the daemon writes the same
+/// columns. ureq is built without the `json` feature, so serialize + send_string.
+fn record_test_verdict_remote(
+    assignment_id: &str,
+    verdict: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let (url, token) = resolve_board_service().ok_or("no board service configured")?;
+    let (smoke_test, smoke_reason): (Option<&str>, Option<&str>) = match verdict {
+        "failed" => (Some("fail"), reason),
+        "passed" => (Some("pass"), None),
+        _ => (None, None),
+    };
+    let body = serde_json::json!({
+        "assignment_id": assignment_id,
+        "test_state": verdict,
+        "test_reason": reason,
+        "smoke_test": smoke_test,
+        "smoke_test_reason": smoke_reason,
+    });
+    let body_str = serde_json::to_string(&body).map_err(|e| format!("{e}"))?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let mut req = agent
+        .post(&format!("{url}/test-verdict"))
+        .set("Content-Type", "application/json");
+    if let Some(t) = token.as_deref() {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    req.send_string(&body_str).map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
 fn record_test_verdict_db(
     assignment_id: &str,
     verdict: &str,
     reason: Option<&str>,
 ) -> rusqlite::Result<()> {
+    if is_remote_board_service() {
+        return record_test_verdict_remote(assignment_id, verdict, reason).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e,
+            )))
+        });
+    }
     let conn = open_purge_conn()?;
     record_test_verdict_conn(&conn, assignment_id, verdict, reason)
 }

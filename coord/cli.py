@@ -135,7 +135,25 @@ def _save_config_snapshot(config: Config) -> None:
 
 
 def _load_config(path: Path) -> Config:
+    # #584/#591: a thin client (board_service set) has no local coordinator.yml.
+    # When the path is absent, fetch + cache the daemon's config and load that,
+    # so EVERY command — not just `coord status` — is config-portable. On the
+    # host (svc unset) or when a local config exists, this is a no-op.
     try:
+        if not Path(path).exists():
+            from coord.client import resolve_board_service  # noqa: PLC0415
+
+            svc = resolve_board_service()
+            if svc is not None:
+                from coord.client import fetch_remote_config  # noqa: PLC0415
+
+                try:
+                    path = fetch_remote_config(svc)
+                except Exception as exc:  # noqa: BLE001 — fall through to the normal error
+                    click.echo(
+                        f"warning: could not fetch config from {svc.url}: {exc}",
+                        err=True,
+                    )
         cfg = load(path)
     except ConfigError as e:
         click.echo(f"error: {e}", err=True)
@@ -6929,10 +6947,20 @@ def _restore_default_branch_after_test(cfg, assignment) -> None:
 @click.option("--output", "output_file", type=click.Path(), default=None,
               help="File with test output to store (used with --fail).")
 def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str, output_file: str | None) -> None:
-    from coord.state import build_board, load_board, save_board
+    from coord.client import resolve_board_service
+    from coord.state import build_board, load_board, record_test_verdict, save_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    # #590 Phase 2: a thin client reads the board from the daemon (its local DB
+    # is empty) so the assignment resolves; the verdict is then recorded back
+    # through the daemon. Unset ⇒ unchanged local board + save_board.
+    svc = resolve_board_service()
+    if svc is not None:
+        from coord.client import fetch_remote_board
+
+        board = fetch_remote_board(svc)
+    else:
+        board = load_board() or build_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
@@ -6974,7 +7002,18 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             else:
                 click.echo(f"  warning: output file not found: {output_file}", err=True)
 
-        save_board(board)
+        if svc is not None:
+            # Thin client: record the single-row verdict back through the daemon
+            # (save_board would write the empty local DB).
+            record_test_verdict(
+                assignment_id=assignment_id,
+                test_state=assignment.test_state,
+                test_reason=assignment.test_reason,
+                smoke_test=assignment.smoke_test,
+                smoke_test_reason=assignment.smoke_test_reason,
+            )
+        else:
+            save_board(board)
         verdict_word = {"pass": "PASSED", "fail": "FAILED", "skip": "SKIPPED"}[verdict]
         click.echo(f"Test gate {verdict_word} for {assignment.repo_name} #{assignment.issue_number}")
         if verdict == "fail" and reason:

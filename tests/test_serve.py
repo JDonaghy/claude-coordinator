@@ -369,6 +369,147 @@ def test_post_completion_remote_failure_is_graceful(monkeypatch):
     assert "daemon down" in (outcome.error or "")
 
 
+# ── Write path (#590 Phase 2): dispatch + test-verdict ────────────────────────
+
+
+def test_serve_dispatched_records_assignment_row(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    from coord.models import Assignment
+
+    a = Assignment(
+        machine_name="precision", repo_name="api", issue_number=11,
+        issue_title="thin-client dispatch", assignment_id="rev99", type="review",
+        review_of_assignment_id="work1", branch="issue-11-x",
+    )
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/dispatched",
+            json={"assignment": __import__("dataclasses").asdict(a), "repo_github": "owner/api"},
+        )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    row = rw_db.execute(
+        "SELECT status, type, review_of_assignment_id FROM assignments "
+        "WHERE assignment_id='rev99'"
+    ).fetchone()
+    assert row["status"] == "running" and row["type"] == "review"
+    assert row["review_of_assignment_id"] == "work1"
+
+
+def test_serve_dispatched_work_records_row(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    from coord.models import Proposal
+
+    p = Proposal(
+        id=1, machine_name="precision", repo_name="api", issue_number=12,
+        issue_title="thin-client work", rationale="because",
+    )
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/dispatched-work",
+            json={
+                "assignment_id": "work88",
+                "proposal": __import__("dataclasses").asdict(p),
+                "repo_github": "owner/api",
+                "provider_name": "claude",
+            },
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT status, provider_name FROM assignments WHERE assignment_id='work88'"
+    ).fetchone()
+    assert row["status"] == "running" and row["provider_name"] == "claude"
+
+
+def test_serve_test_verdict_records(file_db: Path, valid_config_path: Path, rw_db):
+    _seed_running_assignment(rw_db, aid="work77")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/test-verdict",
+            json={
+                "assignment_id": "work77", "test_state": "failed",
+                "test_reason": "scroll broke", "smoke_test": "fail",
+                "smoke_test_reason": "scroll broke",
+            },
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT test_state, test_reason, smoke_test FROM assignments "
+        "WHERE assignment_id='work77'"
+    ).fetchone()
+    assert row["test_state"] == "failed" and row["smoke_test"] == "fail"
+    assert row["test_reason"] == "scroll broke"
+
+
+def test_record_dispatched_assignment_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+    from coord.models import Assignment
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.record_dispatched_assignment(
+        assignment=Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="zzz", type="review",
+        ),
+        repo_github="o/api",
+    )
+    assert captured["path"] == "/dispatched"
+    assert captured["payload"]["assignment"]["assignment_id"] == "zzz"
+    # Routed → no local row created.
+    assert coord_db.execute(
+        "SELECT COUNT(*) c FROM assignments WHERE assignment_id='zzz'"
+    ).fetchone()["c"] == 0
+
+
+def test_record_test_verdict_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.record_test_verdict(
+        assignment_id="aaa", test_state="passed", smoke_test="pass",
+    )
+    assert captured["path"] == "/test-verdict"
+    assert captured["payload"]["test_state"] == "passed"
+
+
+def test_record_dispatched_assignment_unset_writes_local(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+    from coord.models import Assignment
+
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+    state.record_dispatched_assignment(
+        assignment=Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="loc1", type="review",
+        ),
+        repo_github="o/api",
+    )
+    assert coord_db.execute(
+        "SELECT status FROM assignments WHERE assignment_id='loc1'"
+    ).fetchone()["status"] == "running"
+
+
 def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
     from coord import serve_app
 

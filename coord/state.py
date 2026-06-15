@@ -375,7 +375,56 @@ def _row_to_dispatched_dict(row: object) -> dict:
     }
 
 
+# ── Daemon routing (#590 Phase 2) ────────────────────────────────────────────
+#
+# When ``board_service`` is set (a thin client over Tailscale), an assignment
+# dispatched from this box must land on the daemon's shared DB, not the client's
+# local ``coord.db`` — otherwise the new row never reaches the board everyone
+# else sees and the launch is invisible.  ``record_dispatched`` /
+# ``record_dispatched_assignment`` / ``record_test_verdict`` become thin routing
+# wrappers over ``_*_local``; the daemon endpoints call the ``_local`` form
+# directly so a daemon can never recurse back out over HTTP.  ``board_service``
+# unset → the ``_local`` path runs unchanged (no regression).
+
+
+def _board_service():  # -> ServiceConfig | None
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    return resolve_board_service()
+
+
 def record_dispatched(
+    *,
+    assignment_id: str,
+    proposal: Proposal,
+    repo_github: str,
+    provider_name: str | None = None,
+) -> None:
+    """Record a newly dispatched assignment — routes to the daemon when set."""
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(
+            svc,
+            "/dispatched-work",
+            {
+                "assignment_id": assignment_id,
+                "proposal": asdict(proposal),
+                "repo_github": repo_github,
+                "provider_name": provider_name,
+            },
+        )
+        return
+    _record_dispatched_local(
+        assignment_id=assignment_id,
+        proposal=proposal,
+        repo_github=repo_github,
+        provider_name=provider_name,
+    )
+
+
+def _record_dispatched_local(
     *,
     assignment_id: str,
     proposal: Proposal,
@@ -421,6 +470,25 @@ def record_dispatched(
 
 
 def record_dispatched_assignment(
+    *,
+    assignment: Assignment,
+    repo_github: str,
+) -> None:
+    """Record a dispatched assignment — routes to the daemon when set."""
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(
+            svc,
+            "/dispatched",
+            {"assignment": asdict(assignment), "repo_github": repo_github},
+        )
+        return
+    _record_dispatched_assignment_local(assignment=assignment, repo_github=repo_github)
+
+
+def _record_dispatched_assignment_local(
     *,
     assignment: Assignment,
     repo_github: str,
@@ -473,6 +541,70 @@ def record_dispatched_assignment(
             assignment.branch,
         ),
     )
+    conn.commit()
+
+
+def record_test_verdict(
+    *,
+    assignment_id: str,
+    test_state: str,
+    test_reason: str | None = None,
+    smoke_test: str | None = None,
+    smoke_test_reason: str | None = None,
+) -> None:
+    """Record a Test-gate verdict on one assignment — routes to the daemon when set.
+
+    The single-row analogue of the ``coord test`` ``save_board`` write, used so a
+    thin client (and the TUI's verdict key) can record a verdict to the shared DB
+    without rewriting the whole board.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(
+            svc,
+            "/test-verdict",
+            {
+                "assignment_id": assignment_id,
+                "test_state": test_state,
+                "test_reason": test_reason,
+                "smoke_test": smoke_test,
+                "smoke_test_reason": smoke_test_reason,
+            },
+        )
+        return
+    _record_test_verdict_local(
+        assignment_id=assignment_id,
+        test_state=test_state,
+        test_reason=test_reason,
+        smoke_test=smoke_test,
+        smoke_test_reason=smoke_test_reason,
+    )
+
+
+def _record_test_verdict_local(
+    *,
+    assignment_id: str,
+    test_state: str,
+    test_reason: str | None = None,
+    smoke_test: str | None = None,
+    smoke_test_reason: str | None = None,
+) -> None:
+    """UPDATE the assignment's test_state/test_reason (+ smoke_test mirror)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET test_state=?, test_reason=? WHERE assignment_id=?",
+        (test_state, test_reason, assignment_id),
+    )
+    # Mirror to legacy smoke_test only when a value was supplied (pass/fail),
+    # matching coord test / the TUI's record_test_verdict_conn.
+    if smoke_test is not None:
+        conn.execute(
+            "UPDATE assignments SET smoke_test=?, smoke_test_reason=? "
+            "WHERE assignment_id=?",
+            (smoke_test, smoke_test_reason, assignment_id),
+        )
     conn.commit()
 
 

@@ -171,12 +171,95 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse(asdict(outcome))
 
+    async def _read_json(request: Request) -> dict | None:
+        try:
+            data = await request.json()
+        except Exception:  # noqa: BLE001
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _kwargs(cls, data: dict) -> dict:
+        known = {f.name for f in fields(cls)}
+        return {k: v for k, v in data.items() if k in known}
+
+    async def post_dispatched_work(request: Request) -> Response:
+        # #590 Phase 2: record a thin client's work dispatch on the shared DB.
+        from coord import state  # noqa: PLC0415
+        from coord.models import Proposal  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            proposal = Proposal(**_kwargs(Proposal, body.get("proposal") or {}))
+            state._record_dispatched_local(
+                assignment_id=body["assignment_id"],
+                proposal=proposal,
+                repo_github=body["repo_github"],
+                provider_name=body.get("provider_name"),
+            )
+        except (TypeError, KeyError) as e:
+            return JSONResponse({"error": f"bad dispatch: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "dispatch write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_dispatched(request: Request) -> Response:
+        # #590 Phase 2: record a thin client's review/fix/rework/merge dispatch.
+        from coord import state  # noqa: PLC0415
+        from coord.models import Assignment  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            assignment = Assignment(**_kwargs(Assignment, body.get("assignment") or {}))
+            state._record_dispatched_assignment_local(
+                assignment=assignment, repo_github=body["repo_github"]
+            )
+        except (TypeError, KeyError) as e:
+            return JSONResponse({"error": f"bad dispatch: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "dispatch write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_test_verdict(request: Request) -> Response:
+        # #590 Phase 2: record a Test-gate verdict on the shared DB.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._record_test_verdict_local(
+                assignment_id=body["assignment_id"],
+                test_state=body["test_state"],
+                test_reason=body.get("test_reason"),
+                smoke_test=body.get("smoke_test"),
+                smoke_test_reason=body.get("smoke_test_reason"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "test-verdict write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
         Route("/config", serve_config, methods=["GET"]),
         Route("/result", post_result, methods=["POST"]),
         Route("/completion", post_completion, methods=["POST"]),
+        Route("/dispatched-work", post_dispatched_work, methods=["POST"]),
+        Route("/dispatched", post_dispatched, methods=["POST"]),
+        Route("/test-verdict", post_test_verdict, methods=["POST"]),
     ]
     middleware = [Middleware(_BearerAuthMiddleware, token=token)] if token else []
     return Starlette(routes=routes, middleware=middleware)
