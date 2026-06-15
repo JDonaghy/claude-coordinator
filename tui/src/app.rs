@@ -22447,31 +22447,36 @@ impl CoordApp {
         let cwd = self.detail_terminal_cwd(&issue_key);
         let shell = quadraui::terminal_engine::default_shell();
 
-        // #487: if there is already a live tmux session for this issue,
-        // send `tmux attach-session` instead of a fresh `coord assign`.
-        let maybe_live_session = self
-            .live_tmux_sessions
-            .iter()
-            .find(|s| {
-                s.issue_number == Some(issue_num)
-                    && s.repo_name.as_deref() == Some(repo.as_str())
-            })
-            .map(|s| s.assignment_id.clone());
-        // #514: only reattach when the board still has the session running.
-        // Otherwise (finalized work whose tmux session is gone, but the
-        // discovery sweep hasn't refreshed yet) fall through to a fresh launch
-        // instead of reattaching to a dead session ("session not alive").
+        // #487/#514: reattach to the live tmux session for this issue (run
+        // `coord reattach` instead of a fresh `coord assign`) when one exists and
+        // the board still has it running.  Otherwise (finalized work whose tmux
+        // session is gone, but the discovery sweep hasn't refreshed yet) fall
+        // through to a fresh launch instead of a dead reattach ("session not
+        // alive").
+        //
+        // #601 follow-up: there are often SEVERAL discovered sessions for one
+        // issue (lingering done smoke/review sessions beside the live one), so
+        // filter by (issue, repo) AND running, then take the first — NOT
+        // `.find(match)` then-check, which could pick a finalized session and
+        // fall through to a fresh `coord assign` (→ "already claimed: remote
+        // branch exists"). Mirrors `selected_issue_live_session_id`.
         //
         // #569: Troubleshoot is *always* a fresh diagnostic launch — never a
         // reattach. A stalled item almost always still has a stuck/phantom
-        // `running` assignment (that's *why* it's stalled), and reattaching to
-        // it would hijack the diagnostic with the very session we're trying to
-        // diagnose — landing the user in a dead/headless session instead of a
-        // seeded diagnostic. Force a fresh launch for Troubleshoot.
+        // `running` assignment (that's *why* it's stalled), and reattaching to it
+        // would hijack the diagnostic with the very session we're trying to
+        // diagnose. Force a fresh launch for Troubleshoot.
         let maybe_live_session = if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
             None
         } else {
-            maybe_live_session.filter(|aid| self.session_assignment_is_running(aid))
+            self.live_tmux_sessions
+                .iter()
+                .filter(|s| {
+                    s.issue_number == Some(issue_num)
+                        && s.repo_name.as_deref() == Some(repo.as_str())
+                })
+                .map(|s| s.assignment_id.clone())
+                .find(|aid| self.session_assignment_is_running(aid))
         };
 
         match quadraui::terminal_engine::TerminalSession::spawn(

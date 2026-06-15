@@ -7835,29 +7835,60 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     assignment_type_val: str | None = None
     branch_val: str | None = None
 
-    try:
-        from coord.state import get_connection as _gc  # noqa: PLC0415
-        conn = _gc()
-        row = conn.execute(
-            "SELECT issue_number, repo_name, repo_github, machine_name, "
-            "type, branch "
-            "FROM assignments WHERE assignment_id=?",
-            (assignment_id,),
-        ).fetchone()
-        if row is not None:
-            def _col(r: object, key: str, idx: int) -> object:  # noqa: ANN001
-                return r[key] if hasattr(r, "keys") else r[idx]  # type: ignore[index]
+    # #601: resolve the assignment metadata that finalize_interactive_exit needs
+    # (repo/issue/machine/type/branch). On a thin client the local DB is retired,
+    # so read from the daemon's board when board_service is set — otherwise the
+    # metadata is all null and the session can never be finalized off its blue
+    # "running" box. Local DB path is unchanged.
+    from coord.client import resolve_board_service  # noqa: PLC0415
 
-            issue_number_val = _col(row, "issue_number", 0)  # type: ignore[assignment]
-            repo_name_val = str(_col(row, "repo_name", 1))
-            repo_github_val = str(_col(row, "repo_github", 2))
-            machine_name_val = str(_col(row, "machine_name", 3))
-            _at = _col(row, "type", 4)
-            assignment_type_val = str(_at) if _at is not None else None
-            _br = _col(row, "branch", 5)
+    _svc = resolve_board_service()
+    if _svc is not None:
+        try:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            row = next(
+                (
+                    a
+                    for a in fetch_board_payload(_svc).get("assignments", [])
+                    if a.get("assignment_id") == assignment_id
+                ),
+                None,
+            )
+        except Exception:  # noqa: BLE001
+            row = None
+        if row is not None:
+            issue_number_val = row.get("issue_number")
+            repo_name_val = row.get("repo_name")
+            repo_github_val = row.get("repo_github")
+            machine_name_val = row.get("machine_name")
+            assignment_type_val = row.get("type")
+            _br = row.get("branch")
             branch_val = str(_br) if _br else None
-    except Exception:  # noqa: BLE001
-        pass
+    else:
+        try:
+            from coord.state import get_connection as _gc  # noqa: PLC0415
+            conn = _gc()
+            row = conn.execute(
+                "SELECT issue_number, repo_name, repo_github, machine_name, "
+                "type, branch "
+                "FROM assignments WHERE assignment_id=?",
+                (assignment_id,),
+            ).fetchone()
+            if row is not None:
+                def _col(r: object, key: str, idx: int) -> object:  # noqa: ANN001
+                    return r[key] if hasattr(r, "keys") else r[idx]  # type: ignore[index]
+
+                issue_number_val = _col(row, "issue_number", 0)  # type: ignore[assignment]
+                repo_name_val = str(_col(row, "repo_name", 1))
+                repo_github_val = str(_col(row, "repo_github", 2))
+                machine_name_val = str(_col(row, "machine_name", 3))
+                _at = _col(row, "type", 4)
+                assignment_type_val = str(_at) if _at is not None else None
+                _br = _col(row, "branch", 5)
+                branch_val = str(_br) if _br else None
+        except Exception:  # noqa: BLE001
+            pass
 
     # Reconstruct the worktree path and repo_path from coordinator.yml.
     # worktree_path is always ~/.coord/worktrees/<assignment_id> per agent.py.
