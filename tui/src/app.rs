@@ -21884,22 +21884,24 @@ impl CoordApp {
     fn selected_issue_live_session_id(&self) -> Option<String> {
         let (repo, issue_key) = self.selected_issue_repo_and_key()?;
         let issue_num = issue_key.1;
-        let aid = self
-            .live_tmux_sessions
+        // #514: only reattachable while the board still considers the session
+        // running — a finalized assignment means the session was torn down, so a
+        // stale live_tmux_sessions entry must NOT drive a dead reattach.
+        //
+        // #601 follow-up: there are often SEVERAL discovered sessions for one
+        // issue (lingering done smoke/review tmux sessions alongside the live
+        // one). Pick the matching session whose board assignment is still
+        // running — NOT merely the first match (`.find` then-check), which could
+        // be a finalized session, leaving this `None` so the reattach
+        // short-circuit dies and the launch falls through to the machine picker.
+        self.live_tmux_sessions
             .iter()
-            .find(|s| {
+            .filter(|s| {
                 s.issue_number == Some(issue_num)
                     && s.repo_name.as_deref() == Some(repo.as_str())
             })
-            .map(|s| s.assignment_id.clone())?;
-        // #514: only reattachable while the board still considers the session
-        // running.  A finalized assignment means the session was torn down;
-        // a stale live_tmux_sessions entry must NOT drive a dead reattach.
-        if self.session_assignment_is_running(&aid) {
-            Some(aid)
-        } else {
-            None
-        }
+            .map(|s| s.assignment_id.clone())
+            .find(|aid| self.session_assignment_is_running(aid))
     }
 
     /// True when the session identified by `assignment_id` is still
@@ -35537,6 +35539,54 @@ mod tests {
         assert!(
             app.selected_issue_live_session_id().is_none(),
             "cross-repo same-number session must not match"
+        );
+    }
+
+    #[test]
+    fn selected_issue_live_session_id_prefers_running_over_lingering_done() {
+        // #601 follow-up: several discovered sessions for one issue — a lingering
+        // DONE smoke session listed BEFORE the live RUNNING review (local sessions
+        // are discovered before remote ones). The reattach short-circuit must pick
+        // the RUNNING one, not bail because the first match is finalized — that's
+        // what left the menu offering "Reattach" while the launch fell through to
+        // the "Select machine" picker.
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 494,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/vimcode".to_string(),
+            coord_repo: Some("vimcode".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 494, "vimcode", Some("smoke")));
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 494, "vimcode", Some("review")));
+        // DONE session first (local), RUNNING session second (remote).
+        app.live_tmux_sessions = vec![
+            LiveTmuxSession {
+                assignment_id: "id-494-done".to_string(),
+                issue_number: Some(494),
+                repo_name: Some("vimcode".to_string()),
+                issue_title: None,
+            },
+            LiveTmuxSession {
+                assignment_id: "id-494-running".to_string(),
+                issue_number: Some(494),
+                repo_name: Some("vimcode".to_string()),
+                issue_title: None,
+            },
+        ];
+        assert_eq!(
+            app.selected_issue_live_session_id().as_deref(),
+            Some("id-494-running"),
+            "must reattach to the RUNNING session, not bail on the first (done) match"
         );
     }
 
