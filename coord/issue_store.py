@@ -36,7 +36,7 @@ issue, so the pipeline sees an interactive completion identically to a
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 from coord import github_ops
@@ -216,10 +216,81 @@ def _post_github_comment(
         return False, str(exc)
 
 
+# ── Daemon routing (#590) ───────────────────────────────────────────────────
+#
+# When ``board_service`` is configured (a thin client over Tailscale, per #584),
+# the seam's DB writes must land on the daemon's shared DB, not the client's
+# local ``coord.db``.  We route the *whole* record to the daemon — it re-invokes
+# the ``_local`` implementation against the one shared DB (posting the GitHub
+# comment and writing the assignments/notifications rows there).  This is what
+# lets a remote interactive session self-report via ``coord report-result``
+# instead of the old "do NOT run report-result here" workaround.
+#
+# ``board_service`` unset → the ``_local`` path runs unchanged (no regression).
+# The daemon endpoints call ``_post_*_local`` directly, so a daemon process can
+# never recurse back out over HTTP even if it somehow had a service configured.
+
+
+def _remote_service():  # -> ServiceConfig | None
+    """The configured board service, or ``None`` for the local-DB path."""
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    return resolve_board_service()
+
+
+def _validate_result(record: ResultRecord) -> None:
+    """Reject invalid ``status`` / ``verdict`` before any write or POST."""
+    if record.status not in _VALID_STATUSES:
+        raise ValueError(
+            f"invalid status {record.status!r} (expected one of {_VALID_STATUSES!r})"
+        )
+    if record.verdict is not None and record.verdict not in _VALID_VERDICTS:
+        raise ValueError(
+            f"invalid verdict {record.verdict!r} "
+            f"(expected one of {_VALID_VERDICTS!r} or None)"
+        )
+
+
 # ── Public surface ──────────────────────────────────────────────────────────
 
 
 def post_completion(record: CompletionRecord) -> StoreOutcome:
+    """Git-floor backstop — routes to the daemon when ``board_service`` is set.
+
+    A daemon round-trip failure must NOT crash the launcher exit path (the
+    backstop is best-effort), so a network error degrades to an ``error``
+    outcome rather than raising.  ``board_service`` unset → local DB write.
+    """
+    svc = _remote_service()
+    if svc is None:
+        return _post_completion_local(record)
+    try:
+        from coord.client import post_record  # noqa: PLC0415
+
+        return StoreOutcome(**post_record(svc, "/completion", asdict(record)))
+    except Exception as exc:  # noqa: BLE001 — backstop must not crash the exit path
+        return StoreOutcome(status="error", event="", posted=False, error=str(exc))
+
+
+def post_result(record: ResultRecord) -> StoreOutcome:
+    """Structured report from the interactive agent — routes to the daemon
+    when ``board_service`` is set.
+
+    Validation runs client-side first (fast feedback for the operator), then
+    the record is POSTed; a daemon failure raises so ``coord report-result``
+    exits non-zero and the operator knows the verdict did not land.
+    ``board_service`` unset → local DB write (unchanged).
+    """
+    _validate_result(record)
+    svc = _remote_service()
+    if svc is None:
+        return _post_result_local(record)
+    from coord.client import post_record  # noqa: PLC0415
+
+    return StoreOutcome(**post_record(svc, "/result", asdict(record)))
+
+
+def _post_completion_local(record: CompletionRecord) -> StoreOutcome:
     """Git-floor backstop.
 
     Resolves the terminal status from ``exit_code`` and ``commits_ahead``
@@ -247,8 +318,8 @@ def post_completion(record: CompletionRecord) -> StoreOutcome:
     return _post_done_path(record)
 
 
-def post_result(record: ResultRecord) -> StoreOutcome:
-    """Structured report from the interactive agent.
+def _post_result_local(record: ResultRecord) -> StoreOutcome:
+    """Structured report from the interactive agent (local-DB write).
 
     Maps the agent-reported ``status`` to the same three terminal states
     the git-floor backstop produces:
@@ -265,16 +336,7 @@ def post_result(record: ResultRecord) -> StoreOutcome:
       clean exit; not a clean DONE, not a hard FAIL → no auto_reassign
       loop).
     """
-    if record.status not in _VALID_STATUSES:
-        raise ValueError(
-            f"invalid status {record.status!r} "
-            f"(expected one of {_VALID_STATUSES!r})"
-        )
-    if record.verdict is not None and record.verdict not in _VALID_VERDICTS:
-        raise ValueError(
-            f"invalid verdict {record.verdict!r} "
-            f"(expected one of {_VALID_VERDICTS!r} or None)"
-        )
+    _validate_result(record)
 
     if record.status == STATUS_BLOCKED:
         # Render as failure on the issue and in the DB.  This keeps the

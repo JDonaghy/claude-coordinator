@@ -37,6 +37,9 @@ CLIENT_TOML = COORD_DIR / "client.toml"
 REMOTE_CONFIG_CACHE = COORD_DIR / "coordinator.remote.yml"
 
 _DEFAULT_TIMEOUT = 5.0
+# Writes can post a GitHub comment synchronously on the daemon, so give them a
+# longer ceiling than read GETs.
+_WRITE_TIMEOUT = 30.0
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,28 @@ def board_from_payload(payload: dict) -> Board:
 def fetch_remote_board(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> Board:
     """GET /board and reconstruct a :class:`Board`."""
     return board_from_payload(fetch_board_payload(svc, timeout=timeout))
+
+
+def post_record(
+    svc: ServiceConfig,
+    path: str,
+    payload: dict,
+    *,
+    timeout: float = _WRITE_TIMEOUT,
+) -> dict:
+    """POST a serialized seam record to the daemon and return the JSON outcome.
+
+    Used by the ``coord.issue_store`` seam (#590): when ``board_service`` is
+    set, ``post_result`` / ``post_completion`` POST the record here instead of
+    writing the local DB, so a thin client's result lands on the one shared DB.
+    Raises ``httpx.HTTPError`` on transport/HTTP failure — the seam decides
+    whether that is fatal (``post_result``) or best-effort (``post_completion``).
+    """
+    resp = httpx.post(
+        f"{svc.url}{path}", json=payload, headers=_headers(svc), timeout=timeout
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def fetch_remote_config(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> Path:

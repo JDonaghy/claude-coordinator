@@ -1844,19 +1844,15 @@ def _prompt_and_relay_review_verdict(
 ) -> bool:
     """Prompt the operator for a review verdict on exit and relay it (#486d).
 
-    Used by BOTH interactive-review exit paths when the reviewer left without
-    running `coord report-result`:
+    Backstop used by BOTH interactive-review exit paths when the reviewer left
+    without running `coord report-result` (local or remote — since #590 a
+    remote `report-result` routes to the coordinator's shared DB via the daemon,
+    so both paths *can* self-report; this prompt only fires when they didn't).
 
-    * remote review — the session can't write this DB (its `report-result`
-      would hit the *remote* machine's DB), so the verdict would otherwise
-      never reach the merge gate;
-    * local review — the reviewer simply didn't run `report-result` before
-      closing the TTY.
-
-    In both cases the verdict silently never reaches the merge gate and the
+    Without it the verdict silently never reaches the merge gate and the
     Work→Review→Fix flow stalls.  Prompt the operator here (the terminal is a
     TTY) and relay through the same `issue_store` seam `coord report-result`
-    uses.
+    uses — which itself routes to the daemon when `board_service` is set.
 
     No-op that prints the manual hint when stdin isn't a TTY (tests/headless).
     Returns True when a verdict was recorded.
@@ -2358,42 +2354,38 @@ def assign(
                 review_iteration=getattr(work, "review_iteration", 0) or 0,
             )
             # Interactive reviewer reports via report-result, not the
-            # REVIEW_VERDICT block the briefing's tail describes.  The reminder
-            # differs by location: a LOCAL review runs `coord report-result`
-            # itself (the same DB the merge gate reads); a REMOTE review must
-            # NOT — its `report-result` would write the remote machine's DB,
-            # which the coordinator never sees (#486d).  Instead the remote
-            # reviewer states the verdict and the operator records it on the
-            # coordinator (where the assignment row lives).
-            if _is_local:
-                report_reminder = (
-                    f"[Coordinator review assignment {assignment_id}] This is a "
-                    "HUMAN-ATTENDED interactive review. When you finish:\n"
-                    "  1. Write your FULL findings (every blocking item, with "
-                    f"file:line) to a file, e.g. /tmp/review-{assignment_id}.md\n"
-                    "  2. Run:\n"
-                    f"     coord report-result --assignment {assignment_id} "
-                    "--status done --verdict approve|request-changes "
-                    f"--summary <one-line summary> --body-file /tmp/review-{assignment_id}.md\n"
-                    "The --body-file is IMPORTANT: it is what the fix worker is "
-                    "briefed with (the one-line --summary is not enough). Without "
-                    "it the fix worker has to re-derive your findings from the "
-                    "diff. Do NOT run any `gh` commands; the coordinator posts the "
-                    "verdict + findings for you.\n\n"
+            # REVIEW_VERDICT block the briefing's tail describes.  Since #590 the
+            # remote path matches local: `coord report-result` routes to the
+            # daemon's shared DB (board_service), so a remote reviewer
+            # self-reports exactly like a local one and the verdict reaches the
+            # merge gate from any machine.  (The host-side finalize
+            # operator-prompt stays as a backstop if nothing is recorded.)
+            _remote_note = (
+                ""
+                if _is_local
+                else (
+                    "running on a REMOTE machine. You are in the live checkout — "
+                    "read ./CLAUDE.md (and any sub-repo CLAUDE.md) for the project "
+                    "rules before reviewing. "
                 )
-            else:
-                report_reminder = (
-                    f"[Coordinator review assignment {assignment_id}] HUMAN-"
-                    "ATTENDED interactive review running on a REMOTE machine. "
-                    "You are in the live checkout — read ./CLAUDE.md (and any "
-                    "sub-repo CLAUDE.md) for the project rules before reviewing. "
-                    "When you finish, do NOT run `coord report-result` here (it "
-                    "would write this machine's DB and never reach the "
-                    "coordinator) and do NOT run any `gh` commands. State your "
-                    "final verdict (approve / request-changes) and a one-line "
-                    "summary clearly; the operator records it on the "
-                    "coordinator.\n\n"
-                )
+            )
+            report_reminder = (
+                f"[Coordinator review assignment {assignment_id}] This is a "
+                f"HUMAN-ATTENDED interactive review {_remote_note}When you finish:\n"
+                "  1. Write your FULL findings (every blocking item, with "
+                f"file:line) to a file, e.g. /tmp/review-{assignment_id}.md\n"
+                "  2. Run:\n"
+                f"     coord report-result --assignment {assignment_id} "
+                "--status done --verdict approve|request-changes "
+                f"--summary <one-line summary> --body-file /tmp/review-{assignment_id}.md\n"
+                "The --body-file is IMPORTANT: it is what the fix worker is "
+                "briefed with (the one-line --summary is not enough). Without "
+                "it the fix worker has to re-derive your findings from the "
+                "diff. Your `coord report-result` routes to the coordinator's "
+                "shared board (#590), so the verdict reaches the merge gate from "
+                "here. Do NOT run any `gh` commands; the coordinator posts the "
+                "verdict + findings for you.\n\n"
+            )
             effective_briefing = report_reminder + review_briefing
 
             spec = _AssignmentSpecRv(
@@ -3238,10 +3230,12 @@ def assign(
                     f"[Coordinator fix assignment {assignment_id}] HUMAN-ATTENDED "
                     f"fix iteration {next_iteration}/{max_iter} on branch "
                     f"{work.branch}, running on a REMOTE machine. Make your "
-                    "changes and COMMIT them. Do NOT run `coord report-result` "
-                    "here (it writes this machine's DB, not the coordinator's) "
-                    "and do NOT run any `gh` commands. When you exit, the "
-                    f"coordinator pushes your commits to origin/{work.branch} "
+                    "changes and COMMIT them. Before you exit, run `coord "
+                    f"report-result --assignment {assignment_id} --status done "
+                    "--summary <text>` — since #590 it routes to the "
+                    "coordinator's shared board, so the result is recorded from "
+                    "here. Do NOT run any `gh` commands. When you exit, the "
+                    f"coordinator also pushes your commits to origin/{work.branch} "
                     "and re-reviews.\n\n"
                 )
             effective_briefing = report_reminder + fix_briefing
@@ -3587,11 +3581,13 @@ def assign(
                     f"[Coordinator rework assignment {assignment_id}] "
                     f"HUMAN-ATTENDED rework (iteration {next_rw_iteration}) "
                     f"on branch {rw_branch}, running on a REMOTE machine. "
-                    "Make your changes and COMMIT them. Do NOT run "
-                    "`coord report-result` here (it writes this machine's "
-                    "DB, not the coordinator's) and do NOT run any `gh` "
-                    f"commands. When you exit, the coordinator pushes your "
-                    f"commits to origin/{rw_branch} and re-reviews.\n\n"
+                    "Make your changes and COMMIT them. Before you exit, run "
+                    f"`coord report-result --assignment {assignment_id} "
+                    "--status done --summary <text>` — since #590 it routes to "
+                    "the coordinator's shared board, so the result is recorded "
+                    "from here. Do NOT run any `gh` commands. When you exit, the "
+                    f"coordinator also pushes your commits to origin/{rw_branch} "
+                    "and re-reviews.\n\n"
                 )
             effective_briefing = rw_report_reminder + briefing
 
@@ -5294,7 +5290,7 @@ def report_result(
     import os as _os  # noqa: PLC0415
 
     from coord import issue_store  # noqa: PLC0415
-    from coord.state import build_board, load_dispatched  # noqa: PLC0415
+    from coord.client import resolve_board_service  # noqa: PLC0415
 
     assignment_id = assignment_id_opt or _os.environ.get("COORD_ASSIGNMENT_ID")
     if not assignment_id:
@@ -5304,44 +5300,79 @@ def report_result(
         )
         sys.exit(2)
 
-    cfg = _load_config(config_path)
-
-    # Look up the assignment metadata.  Prefer the dispatched ledger
-    # because it always has repo_github, then fall back to the live
-    # board for in-flight rows that haven't been queried elsewhere.
-    record = next(
-        (r for r in load_dispatched() if r.get("assignment_id") == assignment_id),
-        None,
-    )
     repo_github: str | None = None
     repo_name: str | None = None
     machine_name: str | None = None
     issue_number: int | None = None
     branch: str | None = None
-    if record is not None:
-        repo_github = record.get("repo_github")
-        repo_name = record.get("repo_name")
-        machine_name = record.get("machine_name")
-        issue_number = record.get("issue_number")
 
-    board = build_board()
-    assignment_obj = board.find_by_id(assignment_id)
-    if assignment_obj is not None:
-        repo_name = repo_name or assignment_obj.repo_name
-        machine_name = machine_name or assignment_obj.machine_name
-        issue_number = issue_number or assignment_obj.issue_number
-        branch = assignment_obj.branch
-        if repo_github is None:
-            repo_cfg = cfg.repo(assignment_obj.repo_name)
+    svc = resolve_board_service()
+    if svc is not None:
+        # Thin client (#590): no local DB/config — resolve the assignment's
+        # identity from the daemon's board payload (the assignments rows carry
+        # repo_github), then let issue_store.post_result route the write back to
+        # the daemon's shared DB.  This is what lets a remote interactive
+        # session self-report instead of the old "do NOT run report-result"
+        # workaround.
+        from coord.client import fetch_board_payload  # noqa: PLC0415
+
+        try:
+            payload = fetch_board_payload(svc)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(
+                f"error: could not reach board service {svc.url}: {exc}", err=True
+            )
+            sys.exit(1)
+        row = next(
+            (
+                a
+                for a in payload.get("assignments", [])
+                if a.get("assignment_id") == assignment_id
+            ),
+            None,
+        )
+        if row is not None:
+            repo_github = row.get("repo_github")
+            repo_name = row.get("repo_name")
+            machine_name = row.get("machine_name")
+            issue_number = row.get("issue_number")
+            branch = row.get("branch")
+    else:
+        from coord.state import build_board, load_dispatched  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+
+        # Look up the assignment metadata.  Prefer the dispatched ledger
+        # because it always has repo_github, then fall back to the live
+        # board for in-flight rows that haven't been queried elsewhere.
+        record = next(
+            (r for r in load_dispatched() if r.get("assignment_id") == assignment_id),
+            None,
+        )
+        if record is not None:
+            repo_github = record.get("repo_github")
+            repo_name = record.get("repo_name")
+            machine_name = record.get("machine_name")
+            issue_number = record.get("issue_number")
+
+        board = build_board()
+        assignment_obj = board.find_by_id(assignment_id)
+        if assignment_obj is not None:
+            repo_name = repo_name or assignment_obj.repo_name
+            machine_name = machine_name or assignment_obj.machine_name
+            issue_number = issue_number or assignment_obj.issue_number
+            branch = assignment_obj.branch
+            if repo_github is None:
+                repo_cfg = cfg.repo(assignment_obj.repo_name)
+                if repo_cfg is not None:
+                    repo_github = repo_cfg.github
+
+        # Final fallback: if a config repo matches the recorded repo_name,
+        # use its github slug.
+        if repo_github is None and repo_name is not None:
+            repo_cfg = cfg.repo(repo_name)
             if repo_cfg is not None:
                 repo_github = repo_cfg.github
-
-    # Final fallback: if a config repo matches the recorded repo_name,
-    # use its github slug.
-    if repo_github is None and repo_name is not None:
-        repo_cfg = cfg.repo(repo_name)
-        if repo_cfg is not None:
-            repo_github = repo_cfg.github
 
     if not (repo_github and repo_name and machine_name and issue_number):
         click.echo(
