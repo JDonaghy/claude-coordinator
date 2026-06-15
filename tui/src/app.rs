@@ -3696,6 +3696,18 @@ fn resolve_board_service() -> Option<(String, Option<String>)> {
     Some((url.trim_end_matches('/').to_string(), token))
 }
 
+/// #584: true when this coord-tui is a thin client of a remote `coord serve`
+/// daemon (board fetched over HTTP).  Cached for the process lifetime — the
+/// bootstrap (env / client.toml) doesn't change within a session.  Thin clients
+/// must NOT auto-run host-side control commands (`coord notify`, `coord sync`):
+/// they'd shell out locally against the wrong/absent DB and only produce error
+/// toasts.  Routing these through the daemon is the write-path story (#590).
+fn is_remote_board_service() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| resolve_board_service().is_some())
+}
+
 /// #584: parse the pipeline_* keys out of a `board_meta` map fetched over the
 /// /board wire.  Mirrors [`load_pipeline_meta`] (the SQLite reader) field for
 /// field, including the documented fallbacks, so the remote path fills the
@@ -6616,6 +6628,11 @@ impl CoordApp {
     /// and the last sync was more than 5 minutes ago (or never run).
     fn kick_issue_sync(&mut self) {
         const SYNC_INTERVAL: Duration = Duration::from_secs(300);
+        // #584: a thin client must not auto-run `coord sync` (host-side; it
+        // writes the issues cache to the local DB and needs a config).
+        if is_remote_board_service() {
+            return;
+        }
         if let Some(last) = self.issue_sync_last {
             if last.elapsed() < SYNC_INTERVAL {
                 return;
@@ -20411,9 +20428,12 @@ impl CoordApp {
             needs_redraw = true;
         }
 
-        // Auto-notify: run `coord notify` when running assignments exist
+        // Auto-notify: run `coord notify` when running assignments exist.
+        // #584: skip on a thin client — `coord notify` is a host-side control
+        // command; running it locally here only errors (no DB/config).
         let has_running = self.data.assignments.iter().any(|a| a.status == "running");
         if has_running
+            && !is_remote_board_service()
             && self.last_notify.elapsed() >= NOTIFY_EVERY
             && !self.command_runner.is_running()
         {
