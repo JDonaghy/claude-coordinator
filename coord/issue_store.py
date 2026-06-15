@@ -120,6 +120,11 @@ class ResultRecord:
     duration_seconds: float | None = None
     log_path: str | None = None
     branch: str | None = None
+    # Full review/findings body (markdown). When present it is persisted on the
+    # assignment row (review_findings) AND posted to the issue under a
+    # machine-parseable marker so the fix worker can recover it from any machine
+    # via the GitHub message bus (not just the one-line `summary`).
+    findings_body: str | None = None
 
 
 # ── Resolved terminal state (what the seam writes back) ─────────────────────
@@ -355,6 +360,13 @@ def post_result(record: ResultRecord) -> StoreOutcome:
         log_path=record.log_path,
         summary="\n".join(summary_lines),
     )
+    # Embed the full findings under a parseable marker so a fix worker can
+    # recover them from the GitHub message bus on ANY machine (no shared DB).
+    if record.findings_body and record.findings_body.strip():
+        from coord.comments import format_findings_block  # noqa: PLC0415
+        body = body + "\n\n" + format_findings_block(
+            record.assignment_id, record.verdict, record.findings_body.strip()
+        )
     posted, err = _post_github_comment(
         repo_github=record.repo_github,
         issue_number=record.issue_number,
@@ -374,16 +386,27 @@ def post_result(record: ResultRecord) -> StoreOutcome:
     )
     # When a verdict was supplied (review session — no commits) record it
     # on the assignment row so the merge-gate sees the same field a
-    # claude -p reviewer's parsed REVIEW_VERDICT would have set.
+    # claude -p reviewer's parsed REVIEW_VERDICT would have set.  When the full
+    # findings body was also supplied (--body-file), persist BOTH together via
+    # the same JSON column the claude -p path uses, so the fix worker's DB-cache
+    # lookup (load_assignment_review_findings) hits on this machine.
     if record.verdict is not None:
         try:
-            from coord.state import get_connection  # noqa: PLC0415
-            conn = get_connection()
-            conn.execute(
-                "UPDATE assignments SET review_verdict=? WHERE assignment_id=?",
-                (record.verdict, record.assignment_id),
-            )
-            conn.commit()
+            if record.findings_body and record.findings_body.strip():
+                from coord.state import update_assignment_review_findings  # noqa: PLC0415
+                update_assignment_review_findings(
+                    record.assignment_id,
+                    verdict=record.verdict,
+                    body=record.findings_body.strip(),
+                )
+            else:
+                from coord.state import get_connection  # noqa: PLC0415
+                conn = get_connection()
+                conn.execute(
+                    "UPDATE assignments SET review_verdict=? WHERE assignment_id=?",
+                    (record.verdict, record.assignment_id),
+                )
+                conn.commit()
         except Exception:  # noqa: BLE001 — best-effort
             pass
     return StoreOutcome(

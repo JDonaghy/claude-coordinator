@@ -30,6 +30,47 @@ class CommentMarker:
 _MARKER_RE = re.compile(r"<!--\s*coord:(?P<body>[^>]*?)\s*-->")
 _FIELD_RE = re.compile(r"(\w+)=(\S+)")
 
+# ── Review-findings block ────────────────────────────────────────────────────
+# The FULL review body, embedded in a completion comment under a parseable
+# marker so a fix worker can recover it from the GitHub message bus on ANY
+# machine (no shared DB required) — keyed by the review assignment id.
+FINDINGS_BEGIN = "coord:review-findings"
+FINDINGS_END = "coord:review-findings-end"
+
+
+def format_findings_block(assignment_id: str, verdict: str | None, body: str) -> str:
+    """Render the full review findings as a marked, GitHub-readable block."""
+    v = f" verdict={verdict}" if verdict else ""
+    return (
+        f"<!-- {FINDINGS_BEGIN} assignment={assignment_id}{v} -->\n"
+        f"### Review findings\n\n{body.strip()}\n"
+        f"<!-- {FINDINGS_END} -->"
+    )
+
+
+def extract_findings_block(
+    comment_body: str, assignment_id: str
+) -> tuple[str | None, str] | None:
+    """Return ``(verdict, body)`` from a comment carrying the marked findings
+    block for ``assignment_id``, or ``None`` when absent.  ``verdict`` is read
+    from the marker and may be ``None`` if it wasn't recorded."""
+    pat = re.compile(
+        r"<!--\s*" + re.escape(FINDINGS_BEGIN) + r"\s+assignment="
+        + re.escape(assignment_id) + r"(?P<attrs>[^>]*)-->\s*(?P<body>.*?)\s*<!--\s*"
+        + re.escape(FINDINGS_END) + r"\s*-->",
+        re.DOTALL,
+    )
+    m = pat.search(comment_body or "")
+    if not m:
+        return None
+    vm = re.search(r"verdict=(\S+)", m.group("attrs") or "")
+    verdict = vm.group(1) if vm else None
+    body = re.sub(r"^#+\s*Review findings\s*\n+", "", m.group("body").strip(), count=1)
+    body = body.strip()
+    if not body:
+        return None
+    return (verdict, body)
+
 
 def _marker(event: str, **fields: str | int | None) -> str:
     parts = [f"event={event}"]

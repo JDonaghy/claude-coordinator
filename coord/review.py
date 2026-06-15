@@ -305,6 +305,47 @@ def parse_review_from_agent(
     return _parse_review_from_lines(lines, stream_json=stream_json)
 
 
+def fetch_review_findings_from_github(
+    repo_github: str,
+    issue_number: int,
+    assignment_id: str,
+) -> ReviewFindings | None:
+    """Recover a review's findings from the GitHub message bus.
+
+    Interactive (claude-pty) reviews don't produce a parseable log; their full
+    body is instead posted to the issue under a `coord:review-findings` marker
+    by `report-result --body-file` (via the issue_store seam).  This reads those
+    comments back, so a fix worker on ANY machine can recover the findings even
+    when the review ran elsewhere and isn't in the local DB — GitHub is the one
+    store every machine already reaches.  Returns ``None`` on any failure.
+    """
+    import json as _json  # noqa: PLC0415
+    import subprocess as _sp  # noqa: PLC0415
+
+    from coord.comments import extract_findings_block  # noqa: PLC0415
+
+    if not (repo_github and assignment_id):
+        return None
+    try:
+        out = _sp.run(
+            ["gh", "issue", "view", str(issue_number), "--repo", repo_github,
+             "--json", "comments"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if out.returncode != 0:
+            return None
+        comments = _json.loads(out.stdout or "{}").get("comments", [])
+    except (_sp.TimeoutExpired, OSError, ValueError):
+        return None
+    # Newest-first so a re-review's findings win over an earlier iteration's.
+    for c in reversed(comments):
+        hit = extract_findings_block(c.get("body", ""), assignment_id)
+        if hit is not None:
+            verdict, body = hit
+            return ReviewFindings(verdict=verdict or "request-changes", body=body)
+    return None
+
+
 REVIEWER_SYSTEM_PROMPT = """\
 You are an independent code reviewer dispatched by the coordinator. \
 Your job is to find problems — do NOT rubber-stamp.

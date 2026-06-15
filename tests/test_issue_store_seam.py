@@ -337,6 +337,43 @@ class TestPostResult:
         ).fetchone()
         assert row["review_verdict"] == "approve"
 
+    def test_findings_body_persisted_and_posted(self) -> None:
+        """`--body-file` path: the full findings are persisted on the row (as
+        the {verdict, body} JSON the fix worker's DB-cache reads) AND embedded
+        in the posted comment under the `coord:review-findings` marker so a fix
+        worker on any machine can recover them via the GitHub message bus."""
+        from coord.comments import extract_findings_block
+        from coord.state import load_assignment_review_findings
+
+        _seed_running_assignment("aid-rev-bf")
+        findings = "- src/foo.rs:10 — missing nil guard\n- src/bar.rs:5 — typo"
+        with patch("coord.github_ops.post_issue_comment") as post:
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-rev-bf",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="two issues",
+                    findings_body=findings,
+                )
+            )
+        # 1. DB: full findings recoverable via the same loader the fix worker uses.
+        cached = load_assignment_review_findings("aid-rev-bf")
+        assert cached is not None
+        verdict, body = cached
+        assert verdict == "request-changes"
+        assert "src/foo.rs:10" in body and "src/bar.rs:5" in body
+        # 2. GitHub: the posted comment carries the parseable findings block.
+        posted_body = post.call_args.args[2] if post.call_args.args[2:] else \
+            post.call_args.kwargs.get("body", "")
+        hit = extract_findings_block(posted_body, "aid-rev-bf")
+        assert hit is not None
+        assert hit[0] == "request-changes" and "src/foo.rs:10" in hit[1]
+
     def test_invalid_status_raises(self) -> None:
         with pytest.raises(ValueError, match="invalid status"):
             issue_store.post_result(

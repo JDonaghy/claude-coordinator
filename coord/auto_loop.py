@@ -116,20 +116,22 @@ def _load_review_findings(
     review: Assignment,
     log_path: str | None,
     machine_host: str | None,
+    repo_github: str | None = None,
 ) -> ReviewFindings | None:
     """Resolve a reviewer's structured findings.
 
     Resolution order, cheapest first:
-    1. **DB cache** — `notify` populates `review_findings` on the row
-       when it first parses a review (#bounce).  Hit means zero I/O,
-       so a manual `coord bounce` after notify has run is near-instant.
+    1. **DB cache** — `notify` (or `report-result --body-file`) populates
+       `review_findings` on the row.  Hit means zero I/O.
     2. **Local log file** — works when the review ran on this machine.
     3. **Agent HTTP `/logs/<id>`** — fetches the worker's full log
-       from the remote agent.  Slowest (multi-MB downloads + 15s
-       timeout) but the only option when the review ran on another
-       machine and notify hasn't cached findings yet.
+       from the remote agent (claude -p reviews on another machine).
+    4. **GitHub message bus** — when `repo_github` is supplied, recover the
+       findings posted to the issue under a `coord:review-findings` marker.
+       This is the cross-machine path for INTERACTIVE (claude-pty) reviews,
+       which have no parseable log and may not be in this machine's DB.
 
-    Returns `None` only when ALL three sources fail.
+    Returns `None` only when ALL sources fail.
     """
     # 1. DB cache — fastest.
     if review.assignment_id:
@@ -161,6 +163,29 @@ def _load_review_findings(
                 machine_host, review.assignment_id, exc,
             )
             findings = None
+        if findings is not None:
+            return findings
+
+    # 4. GitHub message bus — works on ANY machine (no shared DB / local log
+    #    needed).  Interactive (claude-pty) reviews post their full body to the
+    #    issue under a `coord:review-findings` marker via `--body-file`; recover
+    #    it here when the review ran elsewhere.  This is the cross-machine path.
+    issue_number = getattr(review, "issue_number", None)
+    if repo_github and issue_number and review.assignment_id:
+        try:
+            from coord.review import fetch_review_findings_from_github  # noqa: PLC0415
+            gh_findings = fetch_review_findings_from_github(
+                repo_github, int(issue_number), review.assignment_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "auto_loop: GitHub findings fetch failed for %s: %s",
+                review.assignment_id, exc,
+            )
+            gh_findings = None
+        if gh_findings is not None:
+            return gh_findings
+
     return findings
 
 
@@ -191,7 +216,13 @@ def process_review_completion(
     if not config.pipeline.auto_loop:
         return [LoopAction(kind="disabled", assignment_id=review.assignment_id)]
 
-    findings = _load_review_findings(review, log_path, machine_host)
+    _rg = None
+    try:
+        _rc = config.repo(review.repo_name)
+        _rg = _rc.github if _rc is not None else None
+    except Exception:  # noqa: BLE001
+        _rg = None
+    findings = _load_review_findings(review, log_path, machine_host, repo_github=_rg)
     if findings is None:
         log.debug(
             "auto_loop: no structured REVIEW_VERDICT for %s (log=%r, host=%r) — skipping",

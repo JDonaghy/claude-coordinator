@@ -2349,13 +2349,18 @@ def assign(
             if _is_local:
                 report_reminder = (
                     f"[Coordinator review assignment {assignment_id}] This is a "
-                    "HUMAN-ATTENDED interactive review. When you finish, instead "
-                    "of the REVIEW_VERDICT block, run:\n"
-                    f"  coord report-result --assignment {assignment_id} "
+                    "HUMAN-ATTENDED interactive review. When you finish:\n"
+                    "  1. Write your FULL findings (every blocking item, with "
+                    f"file:line) to a file, e.g. /tmp/review-{assignment_id}.md\n"
+                    "  2. Run:\n"
+                    f"     coord report-result --assignment {assignment_id} "
                     "--status done --verdict approve|request-changes "
-                    "--summary <one-line summary>\n"
-                    "Do NOT run any `gh` commands; the coordinator posts the "
-                    "verdict for you.\n\n"
+                    f"--summary <one-line summary> --body-file /tmp/review-{assignment_id}.md\n"
+                    "The --body-file is IMPORTANT: it is what the fix worker is "
+                    "briefed with (the one-line --summary is not enough). Without "
+                    "it the fix worker has to re-derive your findings from the "
+                    "diff. Do NOT run any `gh` commands; the coordinator posts the "
+                    "verdict + findings for you.\n\n"
                 )
             else:
                 report_reminder = (
@@ -2744,7 +2749,11 @@ def assign(
                 "4. When every check has a clear position, record the verdict:\n"
                 "   - All good  → run `coord test --passed <work_aid>`\n"
                 "   - Broken    → run `coord test --fail <work_aid> --reason "
-                "\"<one-line story in the operator's words>\"`\n"
+                "\"<story>\"` where <story> is the COMPLETE failure brief the fix "
+                "worker needs: what was checked, expected vs actual, the repro "
+                "steps, and the suspected files/area — not just one line. This "
+                "reason IS what the fix worker is briefed with, so make it "
+                "self-contained.\n"
                 "   Then tell the operator exactly what happens next (the TUI "
                 "will offer the fix or merge step).\n"
             )
@@ -3167,7 +3176,9 @@ def assign(
                 _fx_log = _COORD_DIR_FX / "logs" / f"{fix_of}.log"
                 _fx_log_path = str(_fx_log) if _fx_log.exists() else None
                 try:
-                    findings = _load_review_findings(review, _fx_log_path, None)
+                    findings = _load_review_findings(
+                        review, _fx_log_path, None, repo_github=repo_cfg.github,
+                    )
                 except Exception:  # noqa: BLE001 — best-effort; fall back below
                     findings = None
                 if findings is not None and (getattr(findings, "body", "") or "").strip():
@@ -5221,12 +5232,25 @@ def stop(assignment_id: str, config_path: Path) -> None:
     "--summary", default="",
     help="One-paragraph summary posted on the issue under the result.",
 )
+@click.option(
+    "--body-file", "body_file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "Path to a file with the FULL findings body (markdown). For a REVIEW "
+        "session, write your complete review here and pass this — it is persisted "
+        "on the assignment AND posted to the issue under a machine-parseable "
+        "marker, so the fix worker is briefed with the actual findings (from any "
+        "machine, via the GitHub message bus), not just the one-line --summary."
+    ),
+)
 @_CONFIG_OPTION
 def report_result(
     assignment_id_opt: str | None,
     status: str,
     verdict: str | None,
     summary: str,
+    body_file: str | None,
     config_path: Path,
 ) -> None:
     """``coord report-result --assignment <id> --status <s> [--verdict <v>] --summary <text>``
@@ -5299,6 +5323,16 @@ def report_result(
         )
         sys.exit(1)
 
+    findings_body: str | None = None
+    if body_file:
+        try:
+            findings_body = Path(body_file).read_text(encoding="utf-8").strip() or None
+        except OSError as exc:
+            click.echo(
+                f"warning: could not read --body-file {body_file!r}: {exc}",
+                err=True,
+            )
+
     record_obj = issue_store.ResultRecord(
         assignment_id=assignment_id,
         machine_name=machine_name,
@@ -5309,6 +5343,7 @@ def report_result(
         verdict=verdict,  # type: ignore[arg-type]
         summary=summary,
         branch=branch,
+        findings_body=findings_body,
     )
     try:
         outcome = issue_store.post_result(record_obj)
