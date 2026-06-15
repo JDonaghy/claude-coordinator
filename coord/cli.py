@@ -5363,7 +5363,7 @@ def set_review_findings(
     findings_text = findings.strip()
     if not findings_text:
         click.echo("error: --findings must not be empty", err=True)
-        import sys as _sys; _sys.exit(2)  # noqa: E702
+        sys.exit(2)
 
     update_assignment_review_findings(
         assignment_id,
