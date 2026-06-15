@@ -485,15 +485,62 @@ class TestReportResultCli:
                     "--status", "done",
                     "--verdict", "request-changes",
                     "--summary", "see body",
+                    # #580: request-changes requires the findings body.
+                    "--body", "- foo.rs:10 missing guard",
                     "--config", str(config_file),
                 ],
             )
         assert result.exit_code == 0, result.output
         row = state_mod.get_connection().execute(
-            "SELECT review_verdict FROM assignments WHERE assignment_id=?",
+            "SELECT review_verdict, review_findings FROM assignments WHERE assignment_id=?",
             ("cli-4",),
         ).fetchone()
         assert row["review_verdict"] == "request-changes"
+        # The body is persisted (not silently discarded).
+        assert row["review_findings"] and "foo.rs:10" in row["review_findings"]
+
+    def test_request_changes_without_body_is_rejected(self, config_file: Path) -> None:
+        """#580: recording request-changes with only a one-line --summary (no
+        --body/--body-file) must fail loudly — never silently drop the findings."""
+        _seed_running_assignment("cli-rc-nobody")
+        with patch("coord.github_ops.post_issue_comment") as post:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "report-result",
+                    "--assignment", "cli-rc-nobody",
+                    "--status", "done",
+                    "--verdict", "request-changes",
+                    "--summary", "looks wrong",
+                    "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 2
+        assert "requires the review body" in result.output
+        # Nothing recorded / posted — the operator must re-run with the body.
+        post.assert_not_called()
+        row = state_mod.get_connection().execute(
+            "SELECT review_verdict FROM assignments WHERE assignment_id=?",
+            ("cli-rc-nobody",),
+        ).fetchone()
+        assert row["review_verdict"] is None
+
+    def test_approve_without_body_still_ok(self, config_file: Path) -> None:
+        """approve needs no findings — there's nothing to fix."""
+        _seed_running_assignment("cli-ap")
+        with patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "report-result",
+                    "--assignment", "cli-ap",
+                    "--status", "done",
+                    "--verdict", "approve",
+                    "--summary", "LGTM",
+                    "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
 
     def test_missing_assignment_id_errors(self, config_file: Path) -> None:
         """No --assignment and no $COORD_ASSIGNMENT_ID → user-facing error."""

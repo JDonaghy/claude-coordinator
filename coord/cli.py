@@ -5241,7 +5241,16 @@ def stop(assignment_id: str, config_path: Path) -> None:
         "session, write your complete review here and pass this — it is persisted "
         "on the assignment AND posted to the issue under a machine-parseable "
         "marker, so the fix worker is briefed with the actual findings (from any "
-        "machine, via the GitHub message bus), not just the one-line --summary."
+        "machine, via the GitHub message bus), not just the one-line --summary. "
+        "REQUIRED with `--verdict request-changes` (#580)."
+    ),
+)
+@click.option(
+    "--body", "body_inline", default=None,
+    help=(
+        "Inline alternative to --body-file (the full findings body as a string, "
+        "e.g. --body \"$(cat findings.md)\"). One of --body/--body-file is "
+        "required with `--verdict request-changes`."
     ),
 )
 @_CONFIG_OPTION
@@ -5251,6 +5260,7 @@ def report_result(
     verdict: str | None,
     summary: str,
     body_file: str | None,
+    body_inline: str | None,
     config_path: Path,
 ) -> None:
     """``coord report-result --assignment <id> --status <s> [--verdict <v>] --summary <text>``
@@ -5332,6 +5342,26 @@ def report_result(
                 f"warning: could not read --body-file {body_file!r}: {exc}",
                 err=True,
             )
+    if findings_body is None and body_inline and body_inline.strip():
+        findings_body = body_inline.strip()
+
+    # #580: a request-changes verdict MUST carry the reviewer's findings.
+    # Recording it with only a one-line --summary silently discards the
+    # objections, so the iteration-N+1 fix agent gets dispatched with nothing
+    # to fix. Require the body (file or inline) and fail loudly otherwise.
+    if verdict == "request-changes" and not findings_body:
+        click.echo(
+            "error: --verdict request-changes requires the review body — pass "
+            "--body-file <path> (or --body \"<text>\") with your full findings "
+            "(every blocking item, file:line). The one-line --summary is not "
+            "enough; it's what the fix worker is briefed with.\n"
+            "  Write your findings to a file and re-run, e.g.:\n"
+            f"  coord report-result --assignment {assignment_id} --status done "
+            "--verdict request-changes --summary <one-line> "
+            f"--body-file /tmp/review-{assignment_id}.md",
+            err=True,
+        )
+        sys.exit(2)
 
     record_obj = issue_store.ResultRecord(
         assignment_id=assignment_id,
