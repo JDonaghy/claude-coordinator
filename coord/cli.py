@@ -20,6 +20,10 @@ from coord.config import Config, ConfigError, DEFAULT_CONFIG_PATH, load
 from coord.brain import AGENT_PORT
 
 AGENT_PORT = 7433
+# Portable control-center daemon port (#584); canonical constant in
+# coord.serve_app.SERVE_PORT — duplicated here for the CLI decorator default,
+# mirroring the AGENT_PORT pattern above.
+SERVE_PORT = 7435
 
 
 _CONFIG_OPTION = click.option(
@@ -44,6 +48,12 @@ def _save_config_snapshot(config: Config) -> None:
     The pipeline keys let the TUI Pipeline panel pick up coordinator.yml
     settings without having to parse YAML itself.
     """
+    # #584: a thin client (board_service configured) must not create/write a
+    # local DB — the daemon/host owns the config snapshot.  On the host
+    # board_service is unset, so the snapshot is written as before.
+    from coord.client import resolve_board_service
+    if resolve_board_service() is not None:
+        return
     conn = None
     try:
         from coord.db import get_connection
@@ -1222,9 +1232,15 @@ def _resolve_machine(cfg: Config, explicit_name: str | None):
 def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, timeout: float, freshness: bool) -> None:
     from coord import freshness as fresh
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph
+    from coord.client import fetch_remote_board, fetch_remote_config, resolve_board_service
     from coord.network import check_all, fetch_repos, fetch_status
     from coord.state import build_board, load_board, load_dispatched, load_notified, save_board
 
+    # #584: when a board service is configured, read the board + config from the
+    # daemon instead of local SQLite.  Unset ⇒ unchanged local behaviour.
+    svc = resolve_board_service()
+    if svc and not Path(config_path).exists():
+        config_path = fetch_remote_config(svc)
     cfg = _load_config(config_path)
 
     # Dependency graph (only when --machine isn't narrowing the view).
@@ -1322,8 +1338,10 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     click.echo(f"    latest: {updates[-1]}")
 
     # Reconcile board with live agent data
-    board = load_board() or build_board()
-    if not no_reconcile and agent_completed:
+    board = fetch_remote_board(svc) if svc else (load_board() or build_board())
+    if not no_reconcile and agent_completed and not svc:
+        # Remote board service owns reconciliation + writes (#590); a thin client
+        # must not write to a local DB.
         reconciled = 0
         for a in board.active[:]:
             if a.assignment_id is None:
@@ -1425,8 +1443,9 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # Merge queue
     from coord import merge_queue as mq
 
-    queue = mq.load_queue()
-    by_repo = mq.pending_summary(queue)
+    # #584: merge_queue lives in the (host-local) DB; skip it for a thin client.
+    queue = [] if svc else mq.load_queue()
+    by_repo = mq.pending_summary(queue) if queue else {}
     if by_repo:
         click.echo("")
         click.echo("Merge queue:")
@@ -1483,7 +1502,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 f"  #{a.issue_number}: {a.issue_title} ({a.repo_name}){rs_suffix}"
             )
 
-    notified = load_notified()
+    notified = {} if svc else load_notified()
     if notified:
         dispatched_by_id = {r["assignment_id"]: r for r in load_dispatched()}
         items = sorted(notified.items(), key=lambda kv: kv[1].get("posted_at", 0), reverse=True)[:5]
@@ -1501,7 +1520,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         from coord.usage import build_session_usage, format_burn_rate_line
         import datetime
 
-        sess = load_session()
+        sess = None if svc else load_session()
         started_at: float | None = None
         if sess and sess.get("started_at"):
             try:
@@ -7927,6 +7946,42 @@ def web(config_path: Path, bind_host: str, bind_port: int) -> None:
     cfg = _load_config(config_path)
     app = build_app(cfg)
     click.echo(f"coord web: dashboard at http://{bind_host}:{bind_port}")
+    uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
+
+
+@main.command(
+    help=(
+        "Start the portable control-center daemon (#584, port 7435).  Serves a "
+        "read-only board projection (GET /board) and config (GET /config) so any "
+        "Tailscale machine can render the same live board.  Run this on the host "
+        "that owns ~/.coord/coord.db (always-on box for production)."
+    )
+)
+@_CONFIG_OPTION
+@click.option("--host", "bind_host", default="0.0.0.0", show_default=True)
+@click.option("--port", "bind_port", default=SERVE_PORT, show_default=True, type=int)
+@click.option(
+    "--token",
+    "token",
+    default=None,
+    envvar="COORD_TOKEN",
+    help="Optional shared bearer token; clients must send Authorization: Bearer <token>.",
+)
+def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) -> None:
+    import uvicorn
+
+    from coord.dao import SqliteStore
+    from coord.db import DB_PATH
+    from coord.serve_app import build_app as build_serve_app
+
+    cfg = _load_config(config_path)
+    store = SqliteStore(DB_PATH)
+    app = build_serve_app(store, cfg, token=token)
+    auth = "bearer-token" if token else "open (tailnet ACL only)"
+    click.echo(
+        f"coord serve: control center at http://{bind_host}:{bind_port} "
+        f"(db={DB_PATH}, auth={auth})"
+    )
     uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
 
 

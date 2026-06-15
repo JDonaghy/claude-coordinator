@@ -17,8 +17,19 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from coord._board_mapping import (
+    decode_smoke_tests as _decode_smoke_tests,
+    infer_review_state as _infer_review_state_core,
+    json_loads as _json_loads,
+    row_to_assignment as _row_to_assignment,
+)
 from coord.db import get_connection
 from coord.models import Assignment, Board, Proposal, SplitChunk, SplitProposal
+
+# Re-exported for backward compatibility (these moved to coord._board_mapping in
+# #584 so the daemon/client can share the one mapping):
+#   _json_loads, _decode_smoke_tests, _row_to_assignment
+__all__ = ["_json_loads", "_decode_smoke_tests", "_row_to_assignment"]
 
 # ── Directory for logs and other non-DB state ─────────────────────────────────
 COORD_DIR = Path.home() / ".coord"
@@ -35,76 +46,9 @@ PLANS_FILE = COORD_DIR / "plans.json"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _json_loads(s: str | None) -> object:
-    if s is None:
-        return None
-    try:
-        return json.loads(s)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-def _row_to_assignment(row: object) -> Assignment:
-    """Convert a sqlite3.Row (or dict-like) into an Assignment dataclass."""
-    d = dict(row)
-    return Assignment(
-        assignment_id=d.get("assignment_id"),
-        machine_name=d["machine_name"],
-        repo_name=d["repo_name"],
-        issue_number=d["issue_number"],
-        issue_title=d["issue_title"],
-        status=d.get("status", "running"),
-        type=d.get("type", "work"),
-        branch=d.get("branch"),
-        pr_url=d.get("pr_url"),
-        briefing=d.get("briefing") or "",
-        files_allowed=_json_loads(d.get("files_allowed")) or [],
-        files_forbidden=_json_loads(d.get("files_forbidden")) or [],
-        model=d.get("model"),
-        dispatched_at=d.get("dispatched_at"),
-        finished_at=d.get("finished_at"),
-        smoke_test=d.get("smoke_test"),
-        smoke_test_reason=d.get("smoke_test_reason"),
-        review_state=d.get("review_state"),
-        review_of_assignment_id=d.get("review_of_assignment_id"),
-        review_target=d.get("review_target"),
-        required_gates=_json_loads(d.get("required_gates")) or [],
-        plan=_json_loads(d.get("plan")),
-        unreachable_count=d.get("unreachable_count") or 0,
-        review_iteration=d.get("review_iteration") or 0,
-        review_posted_at=d.get("review_posted_at"),
-        test_state=d.get("test_state"),
-        test_reason=d.get("test_reason"),
-        review_verdict=d.get("review_verdict"),
-        cost_usd=d.get("cost_usd"),
-        # #252: stored as JSON; absent column → None (not parsed yet).
-        smoke_tests=_decode_smoke_tests(d.get("smoke_tests")),
-        # #324: resolved provider name; None for rows predating this feature.
-        provider_name=d.get("provider_name"),
-    )
-
-
-def _decode_smoke_tests(raw: str | None) -> list[str] | None:
-    """#252: decode the smoke_tests JSON column.
-
-    SQLite stores ``None`` (column missing or unset), ``"[]"`` (explicit
-    "no smoke tests — change internal"), or ``'["item1", "item2", ...]'``
-    (bullets).  Anything else (malformed JSON, unexpected shape) folds
-    back to ``None`` so the TUI shows the graceful-degradation
-    placeholder instead of crashing.
-    """
-    if raw is None:
-        return None
-    if not raw:
-        return None
-    try:
-        value = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(value, list):
-        return None
-    return [str(item) for item in value]
+# _json_loads, _decode_smoke_tests and _row_to_assignment now live in
+# coord._board_mapping (#584) so the daemon/client share the one mapping; they
+# are imported above under their original private names.
 
 
 def _assignment_upsert_params(a: Assignment) -> tuple:
@@ -934,37 +878,19 @@ def build_board() -> Board:
 
 
 def _infer_review_state(board: Board, conn: sqlite3.Connection) -> None:
-    """Set review_state on completed work assignments from their linked reviews."""
-    # Build index: work_assignment_id → (review_status, review_assignment_id)
+    """Set review_state on completed work assignments from their linked reviews.
+
+    Thin SQLite wrapper: fetch the review rows + notified ids, then delegate to
+    the storage-neutral core (``coord._board_mapping.infer_review_state``) so the
+    daemon/client path applies the identical logic (#584).
+    """
     review_rows = conn.execute(
         "SELECT assignment_id, review_of_assignment_id, status FROM assignments "
         "WHERE type = 'review' AND review_of_assignment_id IS NOT NULL"
     ).fetchall()
-    review_status_for: dict[str, str] = {}
-    for row in review_rows:
-        review_status_for[row["review_of_assignment_id"]] = row["status"]
-
     notified_rows = conn.execute("SELECT assignment_id FROM notifications").fetchall()
     notified_ids = {r["assignment_id"] for r in notified_rows}
-
-    for a in board.completed:
-        if a.type != "work" or a.assignment_id is None:
-            continue
-        if a.review_state is not None:
-            continue  # explicitly set — don't override
-        review_aid = next(
-            (r["assignment_id"] for r in review_rows
-             if r["review_of_assignment_id"] == a.assignment_id),
-            None,
-        )
-        if review_aid is None:
-            continue
-        if review_aid in notified_ids or review_status_for.get(
-            a.assignment_id, ""
-        ) in ("done", "failed"):
-            a.review_state = "done"
-        else:
-            a.review_state = "dispatched"
+    _infer_review_state_core(board, review_rows, notified_ids)
 
 
 def update_issue_labels(repo_name: str, issue_number: int, labels: list[str]) -> bool:

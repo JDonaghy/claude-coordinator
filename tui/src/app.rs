@@ -679,7 +679,7 @@ enum AKeyArtifactAction {
 
 /// #349: One step in a generated smoke-test plan.  Parsed from the JSON stored
 /// in `assignments.test_plan` when the DB row is loaded.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize)]
 struct TestPlanStep {
     /// Step type: "pull", "run", or "verify".
     kind: String,
@@ -872,32 +872,45 @@ impl SidebarView {
 
 // ─── App data model ───────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 struct Assignment {
+    #[serde(rename = "assignment_id")]
     id: String,
+    #[serde(rename = "repo_name")]
     repo: String,
     issue_number: u64,
     issue_title: String,
+    #[serde(rename = "machine_name")]
     machine: String,
     status: String,
+    #[serde(default)]
     branch: Option<String>,
+    #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
     dispatched_at: Option<f64>,
+    #[serde(default)]
     finished_at: Option<f64>,
+    #[serde(default)]
     exit_code: Option<i32>,
+    #[serde(rename = "type", default)]
     assignment_type: Option<String>,
     /// #200: human-driven Test gate verdict for type="work" assignments.
     /// None | "passed" | "failed" | "skipped".
+    #[serde(default)]
     test_state: Option<String>,
     /// #253: parsed adversarial-review verdict for type="review" assignments.
     /// None | "approve" | "request-changes".  Drives the merge-gate hint
     /// swap so the user sees the block before pressing m.
+    #[serde(default)]
     review_verdict: Option<String>,
     /// #253: links a review assignment back to the work assignment it
     /// reviews — needed to pair review_verdict with the merge entry.
+    #[serde(default)]
     review_of_assignment_id: Option<String>,
     /// #208: worker cost captured from the final stream-json result event.
     /// `None` for in-flight workers and for pre-#208 rows.
+    #[serde(default)]
     cost_usd: Option<f64>,
     /// #252: worker-emitted smoke-test list, parsed from the SMOKE_TESTS
     /// block in the worker's log.
@@ -906,19 +919,32 @@ struct Assignment {
     ///                "inspect the diff" placeholder).
     /// * `Some([])` — explicit "(none — change is internal)" form.
     /// * `Some(vec)` — bullets to render under the Test stage.
+    ///
+    /// #584: on the /board wire this is a real JSON array (already decoded),
+    /// so plain serde handles it.
+    #[serde(default)]
     smoke_tests: Option<Vec<String>>,
     /// #bounce: cached review findings (verdict + body), JSON-encoded
     /// in the DB column.  `None` for non-review assignments and for
     /// reviews completed before the cache landed.
+    ///
+    /// #584: intentionally kept as a raw JSON STRING on the /board wire, so
+    /// plain serde deserialization works.
+    #[serde(default)]
     review_findings: Option<String>,
     /// #349 Phase B: AI-generated smoke-test plan for type="work" assignments.
     /// Parsed from the JSON blob in `assignments.test_plan`.  `None` = not
     /// yet generated (TUI will spawn `coord test-plan` to fill it in).
+    ///
+    /// #584: on the /board wire this is a decoded OBJECT `{"steps":[...]}`,
+    /// not an array — see [`deserialize_test_plan`].
+    #[serde(default, deserialize_with = "deserialize_test_plan")]
     test_plan: Option<Vec<TestPlanStep>>,
     /// #349 Phase B: git branch HEAD SHA at the time the cached test_plan was
     /// generated.  `None` when no plan exists or when it was generated without
     /// branch tracking.  Used to detect staleness (branch advanced →
     /// auto-refresh via `coord test-plan --refresh`).
+    #[serde(default)]
     test_plan_branch_head: Option<String>,
 }
 
@@ -967,6 +993,52 @@ struct Machine {
     version: Option<String>,
     /// Total git-worktree disk usage in bytes, from `/health.worktree_bytes`.
     worktree_bytes: u64,
+}
+
+/// #584: a machine row as it arrives on the `coord serve` /board wire.
+///
+/// `Machine` itself carries probe-only fields (reachable / active_count /
+/// version / worktree_bytes) that never appear in the payload, so we
+/// deserialize into this minimal shape and let `assemble_board_data` run the
+/// reachability + health probes exactly like the SQLite path does.
+#[derive(serde::Deserialize)]
+struct RawMachine {
+    name: String,
+    host: String,
+    #[serde(default)]
+    repos: Vec<String>,
+}
+
+/// #584: the top-level `coord serve` /board payload.
+///
+/// serde ignores unknown JSON keys by default, so the many extra columns the
+/// daemon emits (schema_version, notifications, per-row provider/files fields,
+/// etc.) are silently dropped.  JSON columns are decoded to native objects on
+/// the wire EXCEPT `assignments.review_findings` (a raw JSON string) — handled
+/// by the per-field serde attributes on `Assignment`.
+#[derive(serde::Deserialize, Default)]
+struct BoardPayload {
+    /// Round counter from the daemon.  Not rendered today (the SQLite path
+    /// never read it either) but kept on the wire shape for parity + tests.
+    #[serde(default)]
+    #[allow(dead_code)]
+    round_number: i64,
+    #[serde(default)]
+    assignments: Vec<Assignment>,
+    #[serde(default)]
+    machines: Vec<RawMachine>,
+    #[serde(default)]
+    merge_queue: Vec<MergeQueueEntry>,
+    #[serde(default)]
+    proposals: Vec<Proposal>,
+    #[serde(default)]
+    issues: Vec<OpenIssue>,
+    /// assignment_id → decoded plan object (parsed via [`parse_plan_data`]).
+    #[serde(default)]
+    plans: std::collections::HashMap<String, serde_json::Value>,
+    /// board_meta key → STRING value (JSON-encoded for the pipeline_* keys).
+    #[serde(default)]
+    board_meta: std::collections::HashMap<String, String>,
 }
 
 /// Parsed fields from a successful `/health` HTTP response.
@@ -1218,6 +1290,46 @@ fn parse_test_plan_steps(raw: &str) -> Option<Vec<TestPlanStep>> {
         })
         .collect();
     Some(result)
+}
+
+/// #584: serde deserializer for `Assignment::test_plan` on the remote
+/// (`coord serve` /board) read path.  The wire shape is the decoded JSON
+/// OBJECT `{"steps":[{kind,cmd,label,check},...], ...}` — NOT an array — so
+/// we read it as an `Option<serde_json::Value>` and reuse the same
+/// `.get("steps").as_array()` extraction as [`parse_test_plan_steps`].
+/// Returns `None` on any shape mismatch (mirrors the SQLite path's tolerant
+/// degradation to the "Preparing plan…" placeholder).
+fn deserialize_test_plan<'de, D>(deserializer: D) -> Result<Option<Vec<TestPlanStep>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let val = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(val) = val else {
+        return Ok(None);
+    };
+    let Some(steps) = val.get("steps").and_then(|s| s.as_array()) else {
+        return Ok(None);
+    };
+    let result: Vec<TestPlanStep> = steps
+        .iter()
+        .filter_map(|s| {
+            let kind = s.get("kind")?.as_str()?.to_string();
+            Some(TestPlanStep {
+                kind,
+                cmd: s.get("cmd").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                label: s
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                check: s
+                    .get("check")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            })
+        })
+        .collect();
+    Ok(Some(result))
 }
 
 /// #349: Read the current HEAD SHA for a git branch by examining the local
@@ -1718,22 +1830,27 @@ struct ContextMenuState {
     target: ContextMenuTarget,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 #[allow(dead_code)] // assignment_id and pr_url stored for future display
 struct MergeQueueEntry {
     assignment_id: String,
+    #[serde(default)]
     issue_number: Option<u64>,
     state: String,
+    #[serde(default)]
     pr_number: Option<i64>,
+    #[serde(default)]
     pr_url: Option<String>,
     /// Repo slug (owner/name) — needed to call `gh pr checks --repo <slug>`.
     /// Joined from the `merge_queue.repo_github` column.
     repo_github: String,
     /// Target branch the PR merges into (e.g. "main").  `None` for entries
     /// written before this column was read by the TUI.
+    #[serde(default)]
     target_branch: Option<String>,
     /// Last gate-eval error string from `coord merge`, if any.  Non-empty
     /// is the single most useful clue when a merge is stalled.
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -1780,14 +1897,17 @@ impl CiCheckSummary {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 struct Proposal {
     id: i64,
+    #[serde(rename = "machine_name")]
     machine: String,
+    #[serde(rename = "repo_name")]
     repo: String,
     issue_number: u64,
     issue_title: String,
     rationale: String,
+    #[serde(rename = "type")]
     proposal_type: String,
 }
 
@@ -2184,24 +2304,28 @@ fn parse_iso8601_to_epoch(s: &str) -> Option<f64> {
 }
 
 /// An open issue from the local `issues` table (synced from GitHub on coord plan).
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 struct OpenIssue {
     repo_name: String,
     number: u64,
     title: String,
     /// Issue body, synced from GitHub via `coord sync`.  Empty string when
     /// the issue has no description.
+    #[serde(default)]
     body: String,
     /// GitHub labels on this issue. Used by the Board Issue tab to render the
     /// same context the Pipeline Issue tab shows.
+    #[serde(default)]
     labels: Vec<String>,
     /// "open" | "closed".  We load both into `data.open_issues` so the Board
     /// Issue tab can display bodies for closed issues (e.g. in the Completed
     /// group), but only "open" entries get injected as Pending rows.
     state: String,
     /// #406: GitHub milestone number.  `None` for issues without a milestone.
+    #[serde(default)]
     milestone_number: Option<i64>,
     /// #406: GitHub milestone title (e.g. "v0.5").  `None` when no milestone.
+    #[serde(default)]
     milestone_title: Option<String>,
 }
 
@@ -3169,6 +3293,14 @@ fn tcp_probe(host: &str, port: u16) -> bool {
 }
 
 fn load_data() -> BoardData {
+    // #584: when a board service is configured (env or ~/.coord/client.toml),
+    // fetch the read-only board projection over HTTP from the `coord serve`
+    // daemon instead of opening coord.db directly.  When NO service is
+    // configured this falls through to the byte-identical SQLite path below.
+    if let Some((url, token)) = resolve_board_service() {
+        return load_data_remote(&url, token.as_deref());
+    }
+
     let dir = coord_dir();
     let db_path = dir.join("coord.db");
 
@@ -3276,6 +3408,174 @@ fn load_data() -> BoardData {
         rows.filter_map(|r| r.ok()).collect()
     };
 
+    // ── Query merge_queue ──────────────────────────────────────────────────
+    // Join to assignments to resolve issue_number (merge_queue may not have it).
+    // A missing table (rare) degrades to an empty queue rather than dropping the
+    // rest of the board — the assembly tail still runs (#584 shared with remote).
+    let merge_queue: Vec<MergeQueueEntry> = {
+        let stmt = conn.prepare(
+            "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url, \
+             mq.repo_github, mq.target_branch, mq.error \
+             FROM merge_queue mq \
+             LEFT JOIN assignments a ON mq.assignment_id = a.assignment_id",
+        );
+        match stmt {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| {
+                    Ok(MergeQueueEntry {
+                        assignment_id: row.get::<_, String>(0)?,
+                        issue_number: row.get::<_, Option<i64>>(1)?.map(|n| n as u64),
+                        state: row.get::<_, String>(2)?,
+                        pr_number: row.get::<_, Option<i64>>(3)?,
+                        pr_url: row.get::<_, Option<String>>(4)?,
+                        repo_github: row.get::<_, String>(5)?,
+                        target_branch: row.get::<_, Option<String>>(6)?,
+                        error: row.get::<_, Option<String>>(7)?,
+                    })
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    // ── Query proposals ───────────────────────────────────────────────────
+    let proposals: Vec<Proposal> = {
+        let stmt = conn.prepare(
+            "SELECT id, machine_name, repo_name, issue_number, issue_title, \
+             rationale, type FROM proposals ORDER BY id",
+        );
+        match stmt {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| {
+                    Ok(Proposal {
+                        id: row.get::<_, i64>(0)?,
+                        machine: row.get::<_, String>(1)?,
+                        repo: row.get::<_, String>(2)?,
+                        issue_number: row.get::<_, i64>(3)? as u64,
+                        issue_title: row.get::<_, String>(4)?,
+                        rationale: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                        proposal_type: row
+                            .get::<_, Option<String>>(6)?
+                            .unwrap_or_else(|| "work".into()),
+                    })
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    // ── Query synced issues (both open and closed) ─────────────────────────
+    // Loaded eagerly so the Board Issue tab can show bodies for issues in
+    // any lifecycle group, including closed ones in Completed. Only the
+    // "open" entries are injected as Pending rows downstream.
+    let open_issues: Vec<OpenIssue> = {
+        let stmt = conn.prepare(
+            "SELECT repo_name, number, title, body, labels, state, \
+             milestone_number, milestone_title FROM issues \
+             ORDER BY repo_name, number",
+        );
+        match stmt {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| {
+                    let labels_raw: String = row.get(4).unwrap_or_default();
+                    let labels: Vec<String> =
+                        serde_json::from_str(&labels_raw).unwrap_or_default();
+                    Ok(OpenIssue {
+                        repo_name: row.get::<_, String>(0)?,
+                        number: row.get::<_, i64>(1)? as u64,
+                        title: row.get::<_, String>(2)?,
+                        body: row.get::<_, String>(3).unwrap_or_default(),
+                        labels,
+                        state: row
+                            .get::<_, String>(5)
+                            .unwrap_or_else(|_| "open".to_string()),
+                        milestone_number: row.get::<_, Option<i64>>(6).unwrap_or(None),
+                        milestone_title: row.get::<_, Option<String>>(7).unwrap_or(None),
+                    })
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    // ── Query board_meta for pipeline config ───────────────────────────────
+    let (
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_require_plan,
+        pipeline_repo_run_cmds,
+        pipeline_repo_paths,
+    ) = load_pipeline_meta(&conn);
+
+    // ── Query cached structured plans ──────────────────────────────────────
+    // Populated by `coord notify` parsing the plan worker's log into the
+    // `plans` table.  The TUI renders these directly in the Plan stage
+    // content panel — without this the panel falls back to dumping the
+    // raw stream-json log (unreadable).
+    let plans: std::collections::HashMap<String, PlanData> = {
+        let mut out = std::collections::HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT assignment_id, plan_data FROM plans") {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                let aid: String = row.get(0)?;
+                let raw: String = row.get(1)?;
+                Ok((aid, raw))
+            }) {
+                for r in rows.flatten() {
+                    let (aid, raw) = r;
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        out.insert(aid, parse_plan_data(&v));
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    assemble_board_data(
+        assignments,
+        machine_rows,
+        open_issues,
+        merge_queue,
+        proposals,
+        plans,
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_repo_run_cmds,
+        pipeline_repo_paths,
+        pipeline_require_plan,
+    )
+}
+
+/// #584: run the machine reachability/health probes and assemble the final
+/// [`BoardData`] from data already gathered by EITHER the local SQLite path
+/// ([`load_data`]) or the remote `coord serve` /board path
+/// ([`load_data_remote`]).
+///
+/// This is the shared tail of `load_data`: it spawns the per-machine TCP +
+/// `/health` probes concurrently, derives `active_count` and the local-machine
+/// name, and packs everything into `BoardData`.  Both callers feed it identical
+/// inputs, so the probe + assembly behaviour is byte-identical regardless of
+/// where the rows came from.
+#[allow(clippy::too_many_arguments)]
+fn assemble_board_data(
+    assignments: Vec<Assignment>,
+    machine_rows: Vec<(String, String, Vec<String>)>,
+    open_issues: Vec<OpenIssue>,
+    merge_queue: Vec<MergeQueueEntry>,
+    proposals: Vec<Proposal>,
+    plans: std::collections::HashMap<String, PlanData>,
+    pipeline_default_gates: Vec<String>,
+    pipeline_tracked_labels: Vec<String>,
+    pipeline_repos: Vec<(String, String)>,
+    pipeline_repo_run_cmds: std::collections::HashMap<String, String>,
+    pipeline_repo_paths: std::collections::HashMap<String, String>,
+    pipeline_require_plan: bool,
+) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
     // Spawn all TCP probes AND HTTP /health fetches concurrently so total
@@ -3342,182 +3642,6 @@ fn load_data() -> BoardData {
         .map(|(name, _, _)| name.clone())
         .unwrap_or_default();
 
-    // ── Query merge_queue ──────────────────────────────────────────────────
-    // Join to assignments to resolve issue_number (merge_queue may not have it).
-    let merge_queue: Vec<MergeQueueEntry> = {
-        let mut stmt = match conn.prepare(
-            "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url, \
-             mq.repo_github, mq.target_branch, mq.error \
-             FROM merge_queue mq \
-             LEFT JOIN assignments a ON mq.assignment_id = a.assignment_id",
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                // merge_queue table may not exist yet — return what we have.
-                return BoardData {
-                    local_machine,
-                    assignments,
-                    machines,
-                    ..BoardData::default()
-                };
-            }
-        };
-        let rows = match stmt.query_map([], |row| {
-            Ok(MergeQueueEntry {
-                assignment_id: row.get::<_, String>(0)?,
-                issue_number: row.get::<_, Option<i64>>(1)?.map(|n| n as u64),
-                state: row.get::<_, String>(2)?,
-                pr_number: row.get::<_, Option<i64>>(3)?,
-                pr_url: row.get::<_, Option<String>>(4)?,
-                repo_github: row.get::<_, String>(5)?,
-                target_branch: row.get::<_, Option<String>>(6)?,
-                error: row.get::<_, Option<String>>(7)?,
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => {
-                return BoardData {
-                    local_machine,
-                    assignments,
-                    machines,
-                    ..BoardData::default()
-                };
-            }
-        };
-        rows.filter_map(|r| r.ok()).collect()
-    };
-
-    // ── Query proposals ───────────────────────────────────────────────────
-    let proposals: Vec<Proposal> = {
-        let mut stmt = match conn.prepare(
-            "SELECT id, machine_name, repo_name, issue_number, issue_title, \
-             rationale, type FROM proposals ORDER BY id",
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                return BoardData {
-                    local_machine,
-                    assignments,
-                    machines,
-                    merge_queue,
-                    ..BoardData::default()
-                };
-            }
-        };
-        let rows = match stmt.query_map([], |row| {
-            Ok(Proposal {
-                id: row.get::<_, i64>(0)?,
-                machine: row.get::<_, String>(1)?,
-                repo: row.get::<_, String>(2)?,
-                issue_number: row.get::<_, i64>(3)? as u64,
-                issue_title: row.get::<_, String>(4)?,
-                rationale: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                proposal_type: row
-                    .get::<_, Option<String>>(6)?
-                    .unwrap_or_else(|| "work".into()),
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => {
-                return BoardData {
-                    local_machine,
-                    assignments,
-                    machines,
-                    merge_queue,
-                    ..BoardData::default()
-                };
-            }
-        };
-        rows.filter_map(|r| r.ok()).collect()
-    };
-
-    // ── Query synced issues (both open and closed) ─────────────────────────
-    // Loaded eagerly so the Board Issue tab can show bodies for issues in
-    // any lifecycle group, including closed ones in Completed. Only the
-    // "open" entries are injected as Pending rows downstream.
-    let open_issues: Vec<OpenIssue> = {
-        let mut stmt = match conn.prepare(
-            "SELECT repo_name, number, title, body, labels, state, \
-             milestone_number, milestone_title FROM issues \
-             ORDER BY repo_name, number",
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                return BoardData {
-                    local_machine,
-                    assignments,
-                    machines,
-                    merge_queue,
-                    proposals,
-                    ..BoardData::default()
-                }
-            }
-        };
-        let rows = match stmt.query_map([], |row| {
-            let labels_raw: String = row.get(4).unwrap_or_default();
-            let labels: Vec<String> = serde_json::from_str(&labels_raw).unwrap_or_default();
-            Ok(OpenIssue {
-                repo_name: row.get::<_, String>(0)?,
-                number: row.get::<_, i64>(1)? as u64,
-                title: row.get::<_, String>(2)?,
-                body: row.get::<_, String>(3).unwrap_or_default(),
-                labels,
-                state: row
-                    .get::<_, String>(5)
-                    .unwrap_or_else(|_| "open".to_string()),
-                milestone_number: row.get::<_, Option<i64>>(6).unwrap_or(None),
-                milestone_title: row.get::<_, Option<String>>(7).unwrap_or(None),
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => {
-                return BoardData {
-                    local_machine,
-                    assignments,
-                    machines,
-                    merge_queue,
-                    proposals,
-                    ..BoardData::default()
-                }
-            }
-        };
-        rows.filter_map(|r| r.ok()).collect()
-    };
-
-    // ── Query board_meta for pipeline config ───────────────────────────────
-    let (
-        pipeline_default_gates,
-        pipeline_tracked_labels,
-        pipeline_repos,
-        pipeline_require_plan,
-        pipeline_repo_run_cmds,
-        pipeline_repo_paths,
-    ) = load_pipeline_meta(&conn);
-
-    // ── Query cached structured plans ──────────────────────────────────────
-    // Populated by `coord notify` parsing the plan worker's log into the
-    // `plans` table.  The TUI renders these directly in the Plan stage
-    // content panel — without this the panel falls back to dumping the
-    // raw stream-json log (unreadable).
-    let plans: std::collections::HashMap<String, PlanData> = {
-        let mut out = std::collections::HashMap::new();
-        if let Ok(mut stmt) = conn.prepare("SELECT assignment_id, plan_data FROM plans") {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                let aid: String = row.get(0)?;
-                let raw: String = row.get(1)?;
-                Ok((aid, raw))
-            }) {
-                for r in rows.flatten() {
-                    let (aid, raw) = r;
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        out.insert(aid, parse_plan_data(&v));
-                    }
-                }
-            }
-        }
-        out
-    };
-
     BoardData {
         local_machine,
         assignments,
@@ -3533,6 +3657,199 @@ fn load_data() -> BoardData {
         pipeline_repo_paths,
         plans,
     }
+}
+
+/// #584: resolve the configured board service URL + optional bearer token.
+///
+/// Precedence: environment (`COORD_SERVICE_URL` + `COORD_TOKEN`) wins over the
+/// `~/.coord/client.toml` file (TOML keys `board_service` and optional `token`).
+/// Returns `None` when no URL is found anywhere — the caller then falls back to
+/// the local SQLite read path (byte-identical to today, no regression).
+///
+/// Any trailing `/` is stripped from the URL so callers can append `/board`.
+fn resolve_board_service() -> Option<(String, Option<String>)> {
+    // Env first.
+    if let Ok(url) = std::env::var("COORD_SERVICE_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            let token = std::env::var("COORD_TOKEN")
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
+            return Some((url.trim_end_matches('/').to_string(), token));
+        }
+    }
+
+    // Then ~/.coord/client.toml.
+    let path = coord_dir().join("client.toml");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let parsed: toml::Value = toml::from_str(&text).ok()?;
+    let url = parsed.get("board_service")?.as_str()?.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let token = parsed
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    Some((url.trim_end_matches('/').to_string(), token))
+}
+
+/// #584: parse the pipeline_* keys out of a `board_meta` map fetched over the
+/// /board wire.  Mirrors [`load_pipeline_meta`] (the SQLite reader) field for
+/// field, including the documented fallbacks, so the remote path fills the
+/// `BoardData.pipeline_*` fields identically to the local path.
+fn parse_pipeline_meta_from_map(
+    meta: &std::collections::HashMap<String, String>,
+) -> (
+    Vec<String>,
+    Vec<String>,
+    Vec<(String, String)>,
+    bool,
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, String>,
+) {
+    fn read_map(
+        meta: &std::collections::HashMap<String, String>,
+        key: &str,
+    ) -> std::collections::HashMap<String, String> {
+        meta.get(key)
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+            .and_then(|val| match val {
+                serde_json::Value::Object(map) => Some(
+                    map.into_iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    let default_gates: Vec<String> = meta
+        .get("pipeline_default_gates")
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_else(|| vec!["review".to_string(), "merge".to_string()]);
+
+    let tracked_labels: Vec<String> = meta
+        .get("pipeline_tracked_labels")
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_else(|| vec!["coord".to_string()]);
+
+    let repos: Vec<(String, String)> = meta
+        .get("pipeline_repos")
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+        .and_then(|val| match val {
+            serde_json::Value::Object(map) => Some(
+                map.into_iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let require_plan: bool = meta
+        .get("pipeline_require_plan")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let repo_run_cmds = read_map(meta, "pipeline_repo_run_cmds");
+    let repo_paths = read_map(meta, "pipeline_repo_paths");
+
+    (
+        default_gates,
+        tracked_labels,
+        repos,
+        require_plan,
+        repo_run_cmds,
+        repo_paths,
+    )
+}
+
+/// #584: fetch the read-only board projection from the `coord serve` daemon
+/// over HTTP and assemble it into a [`BoardData`] via the shared
+/// [`assemble_board_data`] tail (so the machine probes still run exactly as the
+/// local path does).
+///
+/// On ANY error — network failure, non-2xx status, or JSON parse mismatch —
+/// returns `BoardData::default()` rather than panicking; the TUI's 5 s refresh
+/// loop simply retries.
+fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(8))
+        .build();
+    let mut req = agent.get(&format!("{url}/board"));
+    if let Some(t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    // ureq's `json` feature isn't enabled, so read the body as a string and
+    // parse with serde_json (already a dependency).
+    let payload: BoardPayload = match req.call() {
+        Ok(resp) => match resp.into_string() {
+            Ok(body) => match serde_json::from_str::<BoardPayload>(&body) {
+                Ok(p) => p,
+                Err(_) => return BoardData::default(),
+            },
+            Err(_) => return BoardData::default(),
+        },
+        Err(_) => return BoardData::default(),
+    };
+
+    let mut assignments = payload.assignments;
+    // Sort: running first, then failed, then done (most recent first within
+    // groups) — identical to the SQLite path.
+    assignments.sort_by(|a, b| {
+        let rank = |s: &str| match s {
+            "running" => 0u8,
+            "failed" => 1,
+            "done" => 2,
+            _ => 3,
+        };
+        rank(&a.status).cmp(&rank(&b.status)).then_with(|| {
+            b.dispatched_at
+                .partial_cmp(&a.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    let machine_rows: Vec<(String, String, Vec<String>)> = payload
+        .machines
+        .into_iter()
+        .map(|m| (m.name, m.host, m.repos))
+        .collect();
+
+    let plans: std::collections::HashMap<String, PlanData> = payload
+        .plans
+        .iter()
+        .map(|(aid, v)| (aid.clone(), parse_plan_data(v)))
+        .collect();
+
+    let (
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_require_plan,
+        pipeline_repo_run_cmds,
+        pipeline_repo_paths,
+    ) = parse_pipeline_meta_from_map(&payload.board_meta);
+
+    assemble_board_data(
+        assignments,
+        machine_rows,
+        payload.issues,
+        payload.merge_queue,
+        payload.proposals,
+        plans,
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_repo_run_cmds,
+        pipeline_repo_paths,
+        pipeline_require_plan,
+    )
 }
 
 /// Decode a JSON plan_data blob into a `PlanData`.  Mirrors
@@ -26838,6 +27155,88 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ── #584: /board payload deserialization ─────────────────────────────────
+
+    /// Deserialize the captured real /board payload (if present) into a
+    /// `BoardPayload` and assert the serde renames + custom deserializers work.
+    /// No-op when the fixture file is absent (e.g. in CI), so the test never
+    /// fails for environmental reasons.
+    #[test]
+    fn board_payload_deserializes_real_sample() {
+        let Ok(s) = std::fs::read_to_string("/tmp/584/board_sample.json") else {
+            // Fixture not present (CI / clean machine) — skip.
+            return;
+        };
+        let payload: BoardPayload =
+            serde_json::from_str(&s).expect("real /board sample must deserialize into BoardPayload");
+
+        // round_number is carried through from the top-level key.
+        assert_eq!(payload.round_number, 3, "round_number should match the sample");
+
+        // assignments populated, and the renames map DB columns → short fields.
+        assert!(!payload.assignments.is_empty(), "assignments must be non-empty");
+        let a = &payload.assignments[0];
+        assert!(!a.id.is_empty(), "assignment id (rename assignment_id) populated");
+        assert!(!a.repo.is_empty(), "repo (rename repo_name) populated");
+        assert!(
+            !a.machine.is_empty(),
+            "machine (rename machine_name) populated"
+        );
+        assert!(
+            a.assignment_type.is_some(),
+            "assignment_type (rename type) populated"
+        );
+
+        // At least one assignment carries a parsed smoke_tests array.
+        assert!(
+            payload.assignments.iter().any(|a| a.smoke_tests.is_some()),
+            "at least one assignment should have smoke_tests"
+        );
+
+        // Machines decode into RawMachine (name/host/repos).
+        assert!(!payload.machines.is_empty(), "machines must be non-empty");
+        assert!(
+            payload.machines.iter().all(|m| !m.name.is_empty()),
+            "every machine has a name"
+        );
+    }
+
+    /// The custom `test_plan` deserializer must turn the OBJECT wire shape
+    /// `{"steps":[...]}` into `Some(vec_of_steps)` (NOT treat it as an array).
+    #[test]
+    fn test_plan_object_deserializes_to_steps() {
+        let raw = r#"{
+            "assignment_id": "abc123",
+            "repo_name": "demo",
+            "machine_name": "m1",
+            "issue_number": 7,
+            "issue_title": "t",
+            "status": "done",
+            "test_plan": {"steps": [{"kind": "run", "cmd": "x"}]}
+        }"#;
+        let a: Assignment = serde_json::from_str(raw).expect("assignment with object test_plan");
+        let steps = a.test_plan.expect("test_plan should be Some");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, "run");
+        assert_eq!(steps[0].cmd.as_deref(), Some("x"));
+        assert!(steps[0].check.is_none());
+    }
+
+    /// A null / absent test_plan stays None (graceful degradation).
+    #[test]
+    fn test_plan_absent_is_none() {
+        let raw = r#"{
+            "assignment_id": "abc123",
+            "repo_name": "demo",
+            "machine_name": "m1",
+            "issue_number": 7,
+            "issue_title": "t",
+            "status": "done"
+        }"#;
+        let a: Assignment = serde_json::from_str(raw).expect("assignment without test_plan");
+        assert!(a.test_plan.is_none());
     }
 
     // ── fmt_dur ────────────────────────────────────────────────────────────────
