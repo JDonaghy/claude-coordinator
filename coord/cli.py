@@ -7982,10 +7982,12 @@ def web(config_path: Path, bind_host: str, bind_port: int) -> None:
 
 @main.command(
     help=(
-        "Start the portable control-center daemon (#584, port 7435).  Serves a "
-        "read-only board projection (GET /board) and config (GET /config) so any "
-        "Tailscale machine can render the same live board.  Run this on the host "
-        "that owns ~/.coord/coord.db (always-on box for production)."
+        "Start the portable control-center daemon (#584, port 7435).  Serves the "
+        "board (GET /board) + config (GET /config) and records results (POST "
+        "/result, /completion, #590) against the one shared ~/.coord/coord.db, so "
+        "any Tailscale machine renders and drives the same board.  Run this on "
+        "the always-on host that owns the DB.  Optional bearer token (flag > "
+        "$COORD_SERVE_TOKEN > ~/.coord/serve_token)."
     )
 )
 @_CONFIG_OPTION
@@ -7995,8 +7997,13 @@ def web(config_path: Path, bind_host: str, bind_port: int) -> None:
     "--token",
     "token",
     default=None,
-    envvar="COORD_TOKEN",
-    help="Optional shared bearer token; clients must send Authorization: Bearer <token>.",
+    envvar="COORD_SERVE_TOKEN",
+    help=(
+        "Shared bearer token; clients must send Authorization: Bearer <token>. "
+        "Resolves flag > $COORD_SERVE_TOKEN > ~/.coord/serve_token. Prefer the "
+        "file/env (a --token on the command line leaks via `ps`). Unset → open "
+        "(tailnet ACL only)."
+    ),
 )
 def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) -> None:
     import uvicorn
@@ -8004,15 +8011,24 @@ def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) 
     from coord.dao import SqliteStore
     from coord.db import DB_PATH
     from coord.serve_app import build_app as build_serve_app
+    from coord.serve_app import resolve_serve_token
 
     cfg = _load_config(config_path)
+    token = resolve_serve_token(token)
     store = SqliteStore(DB_PATH)
     app = build_serve_app(store, cfg, token=token)
-    auth = "bearer-token" if token else "open (tailnet ACL only)"
+    auth = "bearer-token" if token else "OPEN (tailnet ACL only)"
     click.echo(
         f"coord serve: control center at http://{bind_host}:{bind_port} "
         f"(db={DB_PATH}, auth={auth})"
     )
+    if not token:
+        click.echo(
+            "  warning: no bearer token — endpoints are open to anyone who can "
+            "reach this port. Fine for dev; the production daemon should set one "
+            "(echo <secret> > ~/.coord/serve_token). See AGENT_OPERATIONS.md.",
+            err=True,
+        )
     uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
 
 

@@ -369,6 +369,26 @@ def test_post_completion_remote_failure_is_graceful(monkeypatch):
     assert "daemon down" in (outcome.error or "")
 
 
+def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
+    from coord import serve_app
+
+    tok_file = tmp_path / "serve_token"
+    monkeypatch.setattr(serve_app, "SERVE_TOKEN_FILE", tok_file)
+    monkeypatch.delenv("COORD_SERVE_TOKEN", raising=False)
+
+    # nothing configured → open daemon
+    assert serve_app.resolve_serve_token() is None
+    # file source (what systemd uses), trailing whitespace stripped
+    tok_file.write_text("filetok\n")
+    assert serve_app.resolve_serve_token() == "filetok"
+    # env beats file
+    monkeypatch.setenv("COORD_SERVE_TOKEN", "envtok")
+    assert serve_app.resolve_serve_token() == "envtok"
+    # flag beats env; blank flag is treated as unset (falls through)
+    assert serve_app.resolve_serve_token("flagtok") == "flagtok"
+    assert serve_app.resolve_serve_token("   ") == "envtok"
+
+
 def test_post_result_unset_writes_local(coord_db, monkeypatch):
     """board_service unset → unchanged local-DB write (no regression)."""
     from coord import client as cc

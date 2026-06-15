@@ -1,0 +1,39 @@
+# coord serve — portable control-center daemon (#584/#591).
+#
+# A systemd *user* unit (mirrors coord-agent). Runs the read+write daemon that
+# fronts the one shared ~/.coord/coord.db so any Tailscale machine renders/drives
+# the same board. Install on the always-on box that owns the DB (dellserver).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-serve.service ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-serve
+#
+# Prereqs on the daemon host:
+#   - ~/.coord-venv has a coord BUILD that includes `coord serve` (a release
+#     >= the #584/#590 cut, or an editable checkout of the branch). PyPI
+#     releases before that do NOT have the command.
+#   - ~/coordinator.yml exists (the daemon serves it at GET /config so clients
+#     need none).
+#   - ~/.coord/coord.db exists (after the one-time cutover/ETL).
+#   - Bearer token (recommended): printf '%s' "<secret>" > ~/.coord/serve_token
+#     && chmod 600 ~/.coord/serve_token   (resolve_serve_token reads it; never
+#     put --token on ExecStart — it would leak via `ps`).
+#
+# See docs/AGENT_OPERATIONS.md → "Control-center daemon (coord serve)".
+
+[Unit]
+Description=coord serve — portable control-center daemon (#584)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.coord-venv/bin/coord serve --config %h/coordinator.yml --host 0.0.0.0 --port 7435
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

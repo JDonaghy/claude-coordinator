@@ -63,6 +63,112 @@ curl -s http://<host>:7433/health | python3 -m json.tool
 
 The `version` field should match the latest PyPI release.
 
+## Control-center daemon (`coord serve`, #584/#591)
+
+The portable control center runs a **daemon** that fronts the one shared
+`~/.coord/coord.db` over Tailscale, so `coord-tui` / `coord status` (and remote
+`coord report-result`) on **any** machine render and drive the **same** board.
+The daemon listens on **7435** (agent=7433, dashboard=7434). Run it on the
+always-on box that owns the DB — **dellserver** for production.
+
+Endpoints: `GET /healthz` (liveness, never auth-gated), `GET /board` (full
+projection), `GET /config` (raw `coordinator.yml`), `POST /result` /
+`POST /completion` (#590 write path — a remote session's result lands on the
+shared DB). A thin client carries no `coord.db`/`coordinator.yml`; it reads both
+from the daemon.
+
+### Prerequisites (daemon host)
+
+- **A coord build with `coord serve`.** It ships in the #584/#590 release and
+  later. A PyPI install older than that has no `serve` command, so the daemon
+  host must be on a release `>=` that cut (or, pre-release, an editable checkout
+  of the branch — note the editable-drift caveats elsewhere in this doc).
+- **`~/coordinator.yml` present** on the daemon host (it serves this at
+  `/config`; clients then need none — that's the point of #591).
+- **`~/.coord/coord.db` present** (after the one-time cutover below).
+
+### Install the service
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/coord-serve.service ~/.config/systemd/user/   # from a checkout, or scp it over
+loginctl enable-linger "$USER"          # survive logout / reboot (same as coord-agent)
+systemctl --user daemon-reload
+systemctl --user enable --now coord-serve
+```
+
+### Bearer token (defence-in-depth)
+
+Tailscale ACLs are the real boundary; a shared bearer token is belt-and-braces
+(full per-user auth is #282). Set one on the production daemon:
+
+```bash
+openssl rand -hex 32 > ~/.coord/serve_token && chmod 600 ~/.coord/serve_token
+systemctl --user restart coord-serve     # picks it up via resolve_serve_token()
+```
+
+The daemon resolves the token **flag > `$COORD_SERVE_TOKEN` > `~/.coord/serve_token`**.
+Prefer the file/env — a `--token` on the command line leaks via `ps`. With no
+token the daemon runs **open** (fine for dev; it logs a warning).
+
+### Verify
+
+```bash
+curl -s http://<daemon-host>:7435/healthz                 # {"status":"ok",...}
+curl -s -H "Authorization: Bearer $(cat ~/.coord/serve_token)" \
+  http://<daemon-host>:7435/board | python3 -c 'import sys,json;b=json.load(sys.stdin);print("round",b["round_number"],"assignments",len(b["assignments"]))'
+```
+
+### Point clients at it
+
+On every **client** machine (NOT the daemon host) — `~/.coord/client.toml`:
+
+```toml
+board_service = "http://<daemon-host>:7435"   # e.g. dellserver's stable tailnet IP/MagicDNS
+token = "<the same secret>"                    # omit if the daemon runs open
+```
+
+Resolution is **flag > `$COORD_SERVICE_URL`/`$COORD_TOKEN` > `client.toml`**. The
+client's `coord` must also be a build with the thin-client code (#584/#590). The
+**daemon host must NOT have `client.toml`** (it owns the DB; a stray file would
+make it a thin client of itself).
+
+### One-time cutover / ETL (elitebook → dellserver)
+
+The board DB currently lives on **elitebook**; #591 moves it to the always-on
+**dellserver** and makes every other box a thin client. The DB is a single
+SQLite file, so the "ETL" is a file copy + a parity check — do it during a quiet
+window (no active dispatch):
+
+```bash
+# 1. Quiesce: stop driving the pipeline; let in-flight workers settle.
+# 2. Copy the live DB to the daemon host. WAL-checkpoint first so the .db file
+#    is self-contained (otherwise also copy coord.db-wal / coord.db-shm).
+ssh elitebook '~/.coord-venv/bin/python -c "import sqlite3;c=sqlite3.connect(\"$HOME/.coord/coord.db\");c.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\");c.close()"'
+scp elitebook:~/.coord/coord.db dellserver:~/.coord/coord.db
+scp elitebook:~/coordinator.yml dellserver:~/coordinator.yml
+# 3. Start the daemon on dellserver (service above), verify /board parity:
+#    round_number + assignment count match elitebook's `coord status`.
+# 4. Flip every machine (incl. elitebook) to a thin client: write client.toml
+#    pointing at dellserver:7435. REMOVE elitebook's client.toml only if it is
+#    no longer the daemon host. If dellserver is the sole daemon, elitebook is
+#    a client and DOES get a client.toml.
+# 5. Verify each machine: `coord status` and `coord-tui` show the dellserver board.
+# 6. Retire the per-host DBs only AFTER parity is confirmed (rename, don't rm,
+#    until you've lived on the daemon for a bit): mv ~/.coord/coord.db ~/.coord/coord.db.retired
+```
+
+Parity check = the daemon's `/board` `round_number` and assignment count equal
+the source's `coord status` before the flip. Keep the elitebook DB renamed (not
+deleted) until the daemon has run clean for a day.
+
+### Restart / logs
+
+```bash
+systemctl --user restart coord-serve
+journalctl --user -u coord-serve -f
+```
+
 ## Graphify graph: reseed a machine's local clone
 
 `graphify-out/` is **not** tracked in git (claude-coordinator, vimcode, and quadraui all gitignore it as of 2026-06-07). Each repo's knowledge graph is a regenerable, machine-local cache rebuilt by the `post-commit` / `post-checkout` git hooks. PyPI agent installs have no clone and don't need this — it applies only to machines with a **local git checkout** of these repos (the dev machine, and any worker box that builds/tests them).

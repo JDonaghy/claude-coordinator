@@ -30,7 +30,9 @@ servers, which have no auth). Per-user auth is #282 / team-mode territory.
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, fields
+from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -44,6 +46,35 @@ from coord.dao import SCHEMA_VERSION, CoordStore
 
 # Default port for the coordination daemon (agent=7433, dashboard=7434).
 SERVE_PORT = 7435
+
+# Server-side bearer token sources, in precedence order.  Distinct from the
+# *client's* ``COORD_TOKEN`` so the two never collide on a box that runs both.
+# The file source is what a systemd unit uses (an ``EnvironmentFile`` or a
+# command-line ``--token`` would leak the secret into ``ps``).
+SERVE_TOKEN_ENV = "COORD_SERVE_TOKEN"
+SERVE_TOKEN_FILE = Path.home() / ".coord" / "serve_token"
+
+
+def resolve_serve_token(flag_token: str | None = None) -> str | None:
+    """Resolve the daemon's bearer token: flag > ``COORD_SERVE_TOKEN`` > file.
+
+    Returns ``None`` when none is configured (the daemon runs open, relying on
+    the Tailscale ACL — fine for dev/dogfood; the production daemon should set
+    one).  A blank/whitespace token is treated as unset.
+    """
+    # Each source falls through to the next when blank/whitespace-only, so a
+    # blank --token can't silently disable auth ahead of a configured env/file.
+    for src in (flag_token, os.environ.get(SERVE_TOKEN_ENV)):
+        if src and src.strip():
+            return src.strip()
+    if SERVE_TOKEN_FILE.exists():
+        try:
+            from_file = SERVE_TOKEN_FILE.read_text().strip()
+        except OSError:
+            from_file = ""
+        if from_file:
+            return from_file
+    return None
 
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
