@@ -3708,6 +3708,30 @@ fn is_remote_board_service() -> bool {
     *CACHE.get_or_init(|| resolve_board_service().is_some())
 }
 
+/// #584: a thin client has no local `coordinator.yml`.  Fetch it from the daemon
+/// (`GET /config`) once at startup and cache it to
+/// `~/.coord/coordinator.remote.yml`, so the "coordinator.yml not found" status
+/// warning clears and any `coord` subcommand has a config to point at (the
+/// daemon owns the single source — #591).  Returns the cached path on success,
+/// `None` on any network/IO error (the caller then leaves config_path as-is).
+fn fetch_remote_config_to_cache() -> Option<std::path::PathBuf> {
+    let (url, token) = resolve_board_service()?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    let mut req = agent.get(&format!("{url}/config"));
+    if let Some(t) = token.as_deref() {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    let body = req.call().ok()?.into_string().ok()?;
+    let dir = coord_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("coordinator.remote.yml");
+    std::fs::write(&path, body).ok()?;
+    Some(path)
+}
+
 /// #584: parse the pipeline_* keys out of a `board_meta` map fetched over the
 /// /board wire.  Mirrors [`load_pipeline_meta`] (the SQLite reader) field for
 /// field, including the documented fallbacks, so the remote path fills the
@@ -5619,6 +5643,14 @@ impl CoordApp {
             pending_test_fix: None,
             pending_merge: None,
         };
+        // #584: a thin client pulls config from the daemon (no local
+        // coordinator.yml) so the status bar doesn't warn and subcommands have
+        // a config path.  Best-effort: leave config_path None if the fetch fails.
+        if is_remote_board_service() {
+            if let Some(cfg) = fetch_remote_config_to_cache() {
+                app.command_runner.config_path = Some(cfg);
+            }
+        }
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
         // Sync issues from GitHub on startup so the board backlog is fresh.
