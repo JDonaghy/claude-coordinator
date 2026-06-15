@@ -150,6 +150,36 @@ class TestSessionsCmd:
         assert s["issue_title"] == "My specific issue"
         assert s["assignment_id"] == "my-aid"
 
+    def test_json_metadata_from_daemon_on_thin_client(self, monkeypatch: Any) -> None:
+        """#601: on a thin client (board_service set), session metadata is
+        enriched from the daemon's board, not the retired local DB — otherwise
+        issue_number/repo_name come back null and the TUI can't match the
+        session to its issue row to offer reattach."""
+        from coord import client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        monkeypatch.setattr(
+            cc, "fetch_board_payload",
+            lambda svc, **k: {
+                "assignments": [{
+                    "assignment_id": "rev-aid", "issue_number": 494,
+                    "repo_name": "vimcode", "issue_title": "[review] focus",
+                    "machine_name": "precision",
+                }]
+            },
+        )
+        raw = [{"session_name": "coord-rev-aid"}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions", "--json"])
+        assert result.exit_code == 0, result.output
+        s = json.loads(result.output)["sessions"][0]
+        assert s["issue_number"] == 494
+        assert s["repo_name"] == "vimcode"
+        assert s["machine"] == "precision"
+
     def test_json_nulls_when_no_db_match(self, coord_db: Any) -> None:
         """When the assignment is not in the DB, metadata fields are null."""
         raw = [{"session_name": "coord-unknown-aid"}]

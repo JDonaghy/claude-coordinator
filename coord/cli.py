@@ -7690,12 +7690,31 @@ def sessions_cmd(output_json: bool, remote: bool, config_path: Path) -> None:
 
     enriched: list[dict] = []
 
-    # Acquire the DB connection once before the loop — get_connection() is a
-    # module-level singleton and should not be re-imported per iteration.
-    try:
-        _db_conn = get_connection()
-    except Exception:  # noqa: BLE001
-        _db_conn = None
+    # #601: resolve session→assignment metadata (issue_number/repo_name/...) so
+    # the TUI can match a live session to its issue row and offer reattach. On a
+    # thin client the local DB is retired, so read from the daemon's board when
+    # board_service is set; otherwise use the local DB singleton (acquired once —
+    # get_connection() is a module-level singleton).
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    _svc = resolve_board_service()
+    _remote_by_aid: dict[str, dict] = {}
+    _db_conn = None
+    if _svc is not None:
+        try:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            _remote_by_aid = {
+                a.get("assignment_id"): a
+                for a in fetch_board_payload(_svc).get("assignments", [])
+            }
+        except Exception:  # noqa: BLE001
+            _remote_by_aid = {}
+    else:
+        try:
+            _db_conn = get_connection()
+        except Exception:  # noqa: BLE001
+            _db_conn = None
 
     for s in raw:
         session_name = s["session_name"]
@@ -7705,7 +7724,14 @@ def sessions_cmd(output_json: bool, remote: bool, config_path: Path) -> None:
         issue_title: str | None = None
 
         machine_name: str | None = None
-        if _db_conn is not None:
+        if _svc is not None:
+            a = _remote_by_aid.get(assignment_id)
+            if a is not None:
+                issue_number = a.get("issue_number")
+                repo_name = a.get("repo_name")
+                issue_title = a.get("issue_title")
+                machine_name = a.get("machine_name")
+        elif _db_conn is not None:
             try:
                 row = _db_conn.execute(
                     "SELECT issue_number, repo_name, issue_title, machine_name "
