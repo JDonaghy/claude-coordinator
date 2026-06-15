@@ -5539,6 +5539,55 @@ def report_result(
         click.echo(f"  github post warning: {outcome.error}", err=True)
 
 
+@main.command(
+    "set-review-findings",
+    help=(
+        "Write review findings to the DB for a completed review assignment (#587). "
+        "Used by the TUI rework dialog so the fix worker is briefed with the "
+        "reviewer's feedback even when the review ran as a human-attended "
+        "claude-pty session (which produces no parseable log)."
+    ),
+)
+@click.argument("assignment_id")
+@click.option(
+    "--findings",
+    required=True,
+    help=(
+        "The reviewer's findings, in plain text or markdown. Written as the "
+        "REVIEW_BODY so `_load_review_findings` can serve it from the DB "
+        "cache on the next `coord assign --fix-of` dispatch."
+    ),
+)
+@_CONFIG_OPTION
+def set_review_findings(
+    assignment_id: str,
+    findings: str,
+    config_path: Path,
+) -> None:
+    """``coord set-review-findings <id> --findings <text>``
+
+    Persist review findings for a human-attended (claude-pty) review whose
+    verdict was already recorded via ``coord report-result --verdict
+    request-changes``.  The DB cache written here is the first source
+    ``_load_review_findings`` checks, so the subsequent ``coord assign
+    --fix-of`` dispatch will read it and brief the fix worker correctly
+    instead of emitting the "(No structured findings were captured)" fallback.
+    """
+    from coord.state import update_assignment_review_findings  # noqa: PLC0415
+
+    findings_text = findings.strip()
+    if not findings_text:
+        click.echo("error: --findings must not be empty", err=True)
+        import sys as _sys; _sys.exit(2)  # noqa: E702
+
+    update_assignment_review_findings(
+        assignment_id,
+        verdict="request-changes",
+        body=findings_text,
+    )
+    click.echo(f"findings recorded for {assignment_id}")
+
+
 def _maybe_reconcile_branch(
     assignment, repo_dir, *, original_error: str, config,
 ):

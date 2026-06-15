@@ -4006,10 +4006,18 @@ struct ArmedVerdict {
 /// confirm to launch the human-attended `--fix-of` session.  The exact review
 /// id is re-resolved at confirm time (`selected_request_changes_review_aid`)
 /// against the selected row, so only the issue identity is held here.
+///
+/// `findings` is populated as the operator types in the rework dialog (#587).
+/// Written to the DB via `coord set-review-findings` on confirm, so the fix
+/// worker's `_load_review_findings` DB cache hit gives it concrete feedback
+/// instead of the "(No structured findings were captured)" fallback.
 struct PendingRework {
     coord_repo: String,
     repo_slug: String,
     issue_num: u64,
+    /// Reviewer findings typed by the operator.  Required before the fix
+    /// can be dispatched — the rework dialog blocks confirm when empty.
+    findings: String,
 }
 
 /// Leg 3c / A3 (#517, #581): an interactive testing session the TUI launched,
@@ -5397,8 +5405,13 @@ pub struct CoordApp {
     armed_for_verdict: std::collections::HashMap<(String, u64), ArmedVerdict>,
     /// When `Some`, an inline confirm prompt is up asking whether to launch the
     /// interactive `--fix-of` session for a request-changes verdict.  Enter
-    /// confirms; Esc/n dismisses.  See [`PendingRework`].
+    /// confirms; Esc dismisses.  See [`PendingRework`].
     pending_rework: Option<PendingRework>,
+    /// #587: one-shot flag set by `confirm_rework` to suppress the secondary
+    /// "no findings captured" gate inside `launch_interactive_session_for_selected_issue`
+    /// while it routes through Fix mode to launch the session.  Cleared on
+    /// the same tick, so it never survives a full user-initiated Fix request.
+    rework_bypass: bool,
 
     // ── Leg 3c / A3 (#517, #581): test-verdict routing ─────────────────────
     /// Interactive testing sessions launched this run, keyed by `(repo_slug,
@@ -5636,6 +5649,7 @@ impl CoordApp {
             // Leg 3 (#517): verdict-driven routing.
             armed_for_verdict: std::collections::HashMap::new(),
             pending_rework: None,
+            rework_bypass: false,
             // #541: global issue fuzzy finder — closed by default.
             issue_finder: None,
             // Leg 3c / A3 (#517, #581): test-verdict routing.
@@ -13006,9 +13020,26 @@ impl CoordApp {
             return Vec::new();
         };
         // Findings JSON was loaded with the board (no per-render DB
-        // query).  When None, notify hasn't parsed this review yet —
-        // running `coord notify` or `coord bounce` refreshes it.
+        // query).  When None: for an automated review, notify hasn't parsed
+        // it yet — run `coord notify` or `coord bounce`.  For a human-
+        // attended review with request-changes (#587), the findings were
+        // never written; the rework dialog will capture them when the fix
+        // is started.
         let Some(raw) = review.review_findings.as_deref() else {
+            if review.review_verdict.as_deref() == Some("request-changes") {
+                return vec![
+                    kv_item(
+                        "",
+                        "   ⚠ No findings captured for this review.",
+                        Some(Color::rgb(220, 180, 80)),
+                    ),
+                    kv_item(
+                        "",
+                        "   Use 'Start Fix' — the dialog will ask you to enter them.",
+                        Some(Color::rgb(180, 180, 180)),
+                    ),
+                ];
+            }
             return vec![kv_item(
                 "",
                 "   (review not yet parsed — run `coord notify` or `coord bounce` to refresh)",
@@ -16453,25 +16484,31 @@ impl CoordApp {
         }
 
         // ── Leg 3 (#517): rework (request-changes) confirm ───────────────
+        // #587: the dialog now includes a required findings text input.
+        // The operator types what the reviewer flagged; `confirm_rework`
+        // persists it via `coord set-review-findings` before launching the
+        // fix, so the fix worker is briefed with concrete feedback instead
+        // of the "(No structured findings were captured)" fallback.
         if let Some(ref p) = self.pending_rework {
             return Some(Dialog {
                 id: WidgetId::new("dialog:rework"),
-                title: StyledText::plain("Review requested changes — start fix?"),
+                title: StyledText::plain("Review requested changes — enter findings & start fix"),
                 body: vec![
                     StyledText::plain(format!(
                         "The review of {} #{} requested changes.",
                         p.coord_repo, p.issue_num,
                     )),
                     StyledText::plain(
-                        "Start an interactive fix on the same branch (continues the \
-                         PR; next review scopes to the fix)?"
+                        "Type the reviewer's findings above (required), then press \
+                         Enter to save them and start an interactive fix on the \
+                         same branch."
                             .to_string(),
                     ),
                 ],
                 buttons: vec![
                     DialogButton {
                         id: WidgetId::new("fix"),
-                        label: "⏎  Start fix".into(),
+                        label: "⏎  Save & start fix".into(),
                         is_default: true,
                         is_cancel: false,
                         tint: None,
@@ -16486,7 +16523,11 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
-                input: None,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: p.findings.clone(),
+                    placeholder: "What did the reviewer flag? (required)".into(),
+                    cursor: Some(p.findings.len()),
+                })),
             });
         }
 
@@ -21806,6 +21847,7 @@ impl CoordApp {
                 coord_repo: armed.coord_repo,
                 repo_slug: armed.repo_slug,
                 issue_num: armed.issue_num,
+                findings: String::new(),
             });
         } else {
             // approve (incl. approved-with-nits): no rework needed.  Surface the
@@ -21823,14 +21865,49 @@ impl CoordApp {
         true
     }
 
-    /// Leg 3 (#517): the operator confirmed the rework prompt — select the
-    /// issue's row, open its Terminal tab, and launch the interactive
+    /// Leg 3 (#517 / #587): the operator confirmed the rework prompt — select
+    /// the issue's row, open its Terminal tab, and launch the interactive
     /// `--fix-of` session (continues the reviewed branch, briefed with the
     /// findings, incremental re-review on completion).
+    ///
+    /// #587: validates that findings are non-empty before proceeding; if
+    /// empty, shows a warning toast and keeps the dialog open.  When findings
+    /// are provided, persists them via `coord set-review-findings` so the fix
+    /// worker's `_load_review_findings` DB cache hit gives it concrete feedback.
     fn confirm_rework(&mut self) {
+        // #587: findings are required — block confirm when empty.
+        let findings = self.pending_rework
+            .as_ref()
+            .map(|p| p.findings.trim().to_string())
+            .unwrap_or_default();
+        if findings.is_empty() {
+            self.push_toast(
+                "Findings required",
+                "Type what the reviewer flagged above — \
+                 the fix worker needs this to know what to address.",
+                ToastSeverity::Warning,
+            );
+            return;  // Keep the dialog open
+        }
+
         let Some(p) = self.pending_rework.take() else {
             return;
         };
+
+        // #587: persist findings via `coord set-review-findings` so the DB
+        // cache is warm before the fix worker reads `_load_review_findings`.
+        // Run asynchronously via CommandRunner — the DB write completes in
+        // milliseconds, long before the fix session initialises.
+        let review_aid = self.request_changes_review_aid_for(&p.coord_repo, p.issue_num);
+        if let Some(ref aid) = review_aid {
+            let _ = self.command_runner.spawn_queued(&[
+                "set-review-findings",
+                aid,
+                "--findings",
+                &findings,
+            ]);
+        }
+
         let idx = self
             .pipeline_issues
             .iter()
@@ -21849,7 +21926,11 @@ impl CoordApp {
         self.pipeline_sel = Some(idx);
         self.active_view = SidebarView::Pipeline;
         self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        // #587: bypass the secondary "no findings captured" gate — we just
+        // wrote the findings above so there is no need to re-prompt.
+        self.rework_bypass = true;
         self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
+        self.rework_bypass = false;
     }
 
     /// #486 Leg 4: fleet machines that can run `repo`, ordered local-first,
@@ -22167,6 +22248,60 @@ impl CoordApp {
             let machine = self.data.local_machine.clone();
             self.launch_interactive_session_on_machine(mode, machine);
             return;
+        }
+
+        // #587: secondary safety net — when Fix mode is triggered directly
+        // (keyboard / right-click menu, NOT via the rework dialog's confirm
+        // which sets `rework_bypass`), check whether the latest
+        // request-changes review still has NULL review_findings in the
+        // in-memory board.  If so, redirect to the rework dialog (which
+        // collects findings before launching) instead of going straight to
+        // the fix.  This prevents "blind fix" workers when the operator
+        // dismissed the rework dialog without entering findings.
+        // #587: secondary safety net — when Fix mode is triggered directly
+        // (keyboard / right-click menu, NOT via the rework dialog's confirm
+        // which sets `rework_bypass`), check whether the latest
+        // request-changes review still has NULL review_findings in the
+        // in-memory board.  If so, redirect to the rework dialog (which
+        // collects findings before launching) instead of going straight to
+        // the fix.  This prevents "blind fix" workers when the operator
+        // dismissed the rework dialog without entering findings.
+        //
+        // Guard: only applies when there is a request-changes review
+        // WITHOUT findings AND no failed-test work row (so the test-fail
+        // fix path, `confirm_test_fix`, is never blocked by a pending
+        // review findings issue on the same issue).
+        if matches!(mode, InteractiveLaunchMode::Fix) && !self.rework_bypass {
+            if let Some((issue_key_repo, issue_key)) = self.selected_issue_repo_and_key() {
+                let issue_num = issue_key.1;
+                let repo_slug = issue_key.0.clone();
+                // Only gate when there's a request-changes review missing findings.
+                let needs_findings = self.data.assignments.iter()
+                    .filter(|a| a.issue_number == issue_num && a.repo == issue_key_repo)
+                    .filter(|a| a.assignment_type.as_deref() == Some("review"))
+                    .filter(|a| a.review_verdict.as_deref() == Some("request-changes"))
+                    .any(|a| a.review_findings.is_none());
+                // Skip the gate when the fix is for a FAILED TEST (not a review) —
+                // the test-fail path is already briefed via the failure reason,
+                // not the review findings.
+                let is_test_fail_fix = self.test_failed_work_aid_for(&issue_key_repo, issue_num)
+                    .is_some();
+                if needs_findings && !is_test_fail_fix && self.pending_rework.is_none() {
+                    self.pending_rework = Some(PendingRework {
+                        coord_repo: repo.clone(),
+                        repo_slug,
+                        issue_num,
+                        findings: String::new(),
+                    });
+                    self.pipeline_status = Some((
+                        "⚠ No findings captured for this review — enter them in the \
+                         dialog before starting the fix"
+                            .to_string(),
+                        Instant::now(),
+                    ));
+                    return;
+                }
+            }
         }
 
         // #486 Leg 4 UX: reattach short-circuit.  If a live interactive session
@@ -23770,9 +23905,16 @@ impl ShellApp for CoordApp {
             }
         }
 
-        // ── Leg 3 (#517): rework (request-changes) confirm ───────────────
-        // Same intercept discipline as the auto-review prompt above: own
-        // Enter (→ launch the interactive --fix-of) and Esc/n (dismiss).
+        // ── Leg 3 (#517 / #587): rework (request-changes) confirm ───────────
+        // #587: the rework dialog now owns a findings text input, so ALL key
+        // events are consumed here (same discipline as `pending_test_fail`):
+        //   Enter  → validate findings non-empty → confirm (saves findings +
+        //             launches fix) or toast warning (keeps dialog open).
+        //   Escape → cancel and defer.
+        //   Backspace → edit the findings buffer.
+        //   Char   → append to the findings buffer.
+        // The `n`/`N` shortcut is intentionally removed: those characters
+        // should type into the findings buffer, not dismiss the dialog.
         if self.pending_rework.is_some() {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 match key {
@@ -23780,7 +23922,7 @@ impl ShellApp for CoordApp {
                         self.confirm_rework();
                         return Reaction::Redraw;
                     }
-                    Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                    Key::Named(NamedKey::Escape) => {
                         self.pending_rework = None;
                         self.push_toast(
                             "Fix deferred",
@@ -23789,8 +23931,21 @@ impl ShellApp for CoordApp {
                         );
                         return Reaction::Redraw;
                     }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(ref mut p) = self.pending_rework {
+                            p.findings.pop();
+                        }
+                        return Reaction::Redraw;
+                    }
+                    Key::Char(ch) => {
+                        if let Some(ref mut p) = self.pending_rework {
+                            p.findings.push(*ch);
+                        }
+                        return Reaction::Redraw;
+                    }
                     _ => {}
                 }
+                return Reaction::Redraw;
             }
         }
 
@@ -27740,6 +27895,7 @@ mod tests {
             // Leg 3 (#517)
             armed_for_verdict: std::collections::HashMap::new(),
             pending_rework: None,
+            rework_bypass: false,
             // #541
             issue_finder: None,
             // Leg 3c / A3 (#517, #581)
@@ -28127,6 +28283,7 @@ mod tests {
             coord_repo: repo.to_string(),
             repo_slug: repo.to_string(),
             issue_num: issue,
+            findings: String::new(),
         }
     }
 
@@ -28273,11 +28430,29 @@ mod tests {
 
     #[test]
     fn confirm_rework_without_matching_row_is_noop() {
+        // #587: findings must be non-empty to pass validation; supply them so
+        // the test exercises the "no matching pipeline row" path, not the
+        // "findings empty" path.
         let mut app = make_app_default();
-        app.pending_rework = Some(mk_pending_rework("repo-a", 10));
+        app.pending_rework = Some(PendingRework {
+            coord_repo: "repo-a".to_string(),
+            repo_slug: "repo-a".to_string(),
+            issue_num: 10,
+            findings: "Missing error handling in main path".to_string(),
+        });
         app.confirm_rework();
         assert!(app.pending_rework.is_none());
         assert!(app.detail_terminal_sessions.is_empty());
+    }
+
+    #[test]
+    fn confirm_rework_with_empty_findings_keeps_dialog_open() {
+        // #587: empty findings must block confirm and leave pending_rework set.
+        let mut app = make_app_default();
+        app.pending_rework = Some(mk_pending_rework("repo-a", 10));
+        app.confirm_rework();
+        // Dialog must stay open (pending_rework still set).
+        assert!(app.pending_rework.is_some(), "dialog should remain open when findings are empty");
     }
 
     #[test]
