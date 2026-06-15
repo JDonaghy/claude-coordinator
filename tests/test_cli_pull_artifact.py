@@ -107,6 +107,39 @@ def test_pull_artifact_404_from_agent(tmp_path: Path, coord_db) -> None:
            "not found" in output.lower() or "stash" in output.lower()
 
 
+def test_pull_artifact_thin_client_resolves_from_daemon(
+    tmp_path: Path, coord_db, monkeypatch
+) -> None:
+    """#601: a thin client's local DB is empty — pull-artifact must resolve the
+    assignment from the daemon's board (then pull from the agent as usual)."""
+    from coord import client as cc
+
+    cfg = _write_config(tmp_path)
+    # NOTE: no _insert_assignment — the local DB is intentionally empty.
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    monkeypatch.setattr(
+        cc, "fetch_board_payload",
+        lambda svc, **k: {
+            "assignments": [{
+                "assignment_id": "asgn-abc123", "machine_name": "builder",
+                "repo_name": "myrepo", "branch": "issue-42-my-feature",
+                "issue_number": 42, "issue_title": "my feature",
+            }]
+        },
+    )
+    mock_resp = MagicMock(status_code=404, text="not found")
+    with patch("httpx.get", return_value=mock_resp):
+        result = CliRunner().invoke(
+            main, ["pull-artifact", "asgn-abc123", "--config", str(cfg)]
+        )
+    # Resolved from the daemon → reached the agent query (404), NOT the
+    # "not found in database" local-DB failure.
+    assert "not found in database" not in result.output
+    assert "no artifacts" in result.output.lower()
+
+
 def test_pull_artifact_agent_unreachable(tmp_path: Path, coord_db) -> None:
     """Network error reaching agent should exit non-zero with message."""
     import httpx

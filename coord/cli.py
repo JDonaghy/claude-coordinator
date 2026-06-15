@@ -247,11 +247,57 @@ def _warn_if_source_install_drift() -> None:
         pass
 
 
+def _warn_if_editable_checkout_moved() -> None:
+    """#561/#601 backstop: when running from an EDITABLE checkout, warn loudly if
+    its branch was moved off the default.
+
+    A Build/`coord test`/smoke that git-checkout'd the base — or an interactive
+    agent inspecting a branch in the live checkout — silently puts the running
+    coordinator on that branch's code until restored (#561 incident: disabled
+    guards; #601 incident: old code + retired local DB). This makes that state
+    visible on every command instead of waiting for a verdict or manual restore.
+    """
+    import subprocess  # noqa: PLC0415
+    import sys as _sys  # noqa: PLC0415
+
+    if "pytest" in _sys.modules:
+        return  # don't add startup noise to the test suite
+    try:
+        import coord as _coord  # noqa: PLC0415
+
+        coord_file = _coord.__file__ or ""
+        if "site-packages" in coord_file:
+            return  # PyPI/snapshot install — moving a checkout can't affect it.
+        repo_root = Path(coord_file).resolve().parents[1]
+        if not (repo_root / ".git").exists():
+            return
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=3,
+        )
+        if head.returncode != 0:
+            return
+        branch = head.stdout.strip()
+        if branch in ("main", "master"):
+            return
+        shown = "(detached HEAD)" if branch == "HEAD" else f"'{branch}'"
+        click.echo(
+            f"⚠ coord: editable checkout {repo_root} is on {shown}, not the "
+            "default branch — the running coordinator is on THAT code. A "
+            "Build/smoke/test may have checked it out. Restore with:  "
+            f"git -C {repo_root} checkout main",
+            err=True,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never break the CLI
+        pass
+
+
 @click.group(help="Multi-agent coordinator for Claude Code workers.")
 @click.version_option(__version__, prog_name="coord")
 def main() -> None:
     """coord — coordinate Claude Code workers across machines and repos."""
     _warn_if_source_install_drift()
+    _warn_if_editable_checkout_moved()
 
 
 @main.command(help="Print the coord version.")
@@ -2814,6 +2860,20 @@ def assign(
                 f"`coord pull-artifact`):** `{smoke_of}`\n"
                 f"**Repo checkout:** {smoke_repo_path}\n"
                 f"**Default branch:** {smoke_default_branch}\n\n"
+                "## ⚠ Do NOT move this checkout's branch (#601)\n\n"
+                f"`{smoke_repo_path}` is the **live checkout that runs the "
+                "coordinator itself** (and the worktree base for workers). Do "
+                "**NOT** `git checkout` / `git switch` / `git reset` / "
+                "`git stash` it — checking out the branch here silently "
+                "downgrades the running `coord` to this branch's code until it's "
+                "restored. To inspect the branch under test WITHOUT moving it:\n"
+                f"  - `git -C {smoke_repo_path} fetch origin && "
+                f"git -C {smoke_repo_path} diff {smoke_default_branch}...origin/{work.branch}`\n"
+                f"  - `git -C {smoke_repo_path} show origin/{work.branch}:<path>` for a single file\n"
+                f"  - or make your OWN scratch worktree: "
+                f"`git -C {smoke_repo_path} worktree add /tmp/smoke-{smoke_of} origin/{work.branch}` "
+                f"(remove it with `git -C {smoke_repo_path} worktree remove /tmp/smoke-{smoke_of}` when done)\n"
+                "  - prefer `coord pull-artifact` (above) for the prebuilt binary.\n\n"
                 f"## Issue body\n\n{issue_data.get('body', '') or '(none)'}\n\n"
                 f"## Smoke-test plan\n\n{_plan_block}\n"
                 "## Your job\n\n"
@@ -5692,17 +5752,42 @@ def retry(assignment_id: str, config_path: Path) -> None:
 def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path) -> None:
     """Rsync build artifacts from the agent machine that ran ASSIGNMENT_ID."""
     from coord.agent import _sanitize_branch, _slugify
-    from coord.db import get_connection
+    from coord.client import resolve_board_service
 
     cfg = _load_config(config_path)
 
-    # ── Look up (machine, repo, branch) from the coordinator DB ──────────
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT machine_name, repo_name, branch, issue_number, issue_title "
-        "FROM assignments WHERE assignment_id = ?",
-        (assignment_id,),
-    ).fetchone()
+    # ── Look up (machine, repo, branch) ──────────────────────────────────
+    # #601: a thin client's local DB is retired, so resolve from the daemon's
+    # board when board_service is set (the artifact itself is still pulled from
+    # the agent host below — that works from any machine over Tailscale).
+    svc = resolve_board_service()
+    if svc is not None:
+        from coord.client import fetch_board_payload  # noqa: PLC0415
+
+        try:
+            payload = fetch_board_payload(svc)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(
+                f"error: could not reach board service {svc.url}: {exc}", err=True
+            )
+            sys.exit(1)
+        row = next(
+            (
+                a
+                for a in payload.get("assignments", [])
+                if a.get("assignment_id") == assignment_id
+            ),
+            None,
+        )
+    else:
+        from coord.db import get_connection  # noqa: PLC0415
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT machine_name, repo_name, branch, issue_number, issue_title "
+            "FROM assignments WHERE assignment_id = ?",
+            (assignment_id,),
+        ).fetchone()
 
     if row is None:
         click.echo(f"error: assignment {assignment_id!r} not found in database", err=True)
