@@ -1026,21 +1026,35 @@ def _infer_review_state(board: Board, conn: sqlite3.Connection) -> None:
 
 
 def update_issue_labels(repo_name: str, issue_number: int, labels: list[str]) -> bool:
+    """Update the issues cache's labels after a GitHub label change — routes to
+    the daemon when ``board_service`` is set (#601), else writes the local DB.
+
+    On a thin client the local DB is retired, so `coord ready`/`backlog`/`refine`/
+    `track` changing a label would otherwise never reach the daemon's issues
+    table and the TUI Pipeline (which reads it) wouldn't reflect the move.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        resp = post_record(
+            svc,
+            "/issue-labels",
+            {"repo_name": repo_name, "issue_number": issue_number, "labels": labels},
+        )
+        return bool(resp.get("updated"))
+    return _update_issue_labels_local(repo_name, issue_number, labels)
+
+
+def _update_issue_labels_local(
+    repo_name: str, issue_number: int, labels: list[str]
+) -> bool:
     """Update the local ``issues`` row's labels column after a successful
     GitHub label change.
 
-    Called by ``coord refine`` / ``coord ready`` / ``coord track`` /
-    ``coord backlog`` so the TUI's next data refresh picks up the new
-    label set without waiting for the full ``coord sync`` (which is
-    throttled to once per 5 minutes).
-
-    Returns ``True`` when a row was updated, ``False`` when no row
-    matched (the issue isn't in the local cache yet — it'll be
-    inserted on the next sync; not an error here).
-
-    Does not touch ``state`` or ``synced_at`` — only ``labels``.
-    Updating ``synced_at`` would defeat the brain's age-based pruning
-    of closed rows in ``upsert_open_issues``.
+    Returns ``True`` when a row was updated, ``False`` when no row matched (the
+    issue isn't in the local cache yet — it'll be inserted on the next sync; not
+    an error here).  Does not touch ``state`` or ``synced_at`` — only ``labels``.
     """
     conn = get_connection()
     cursor = conn.execute(
@@ -1052,10 +1066,24 @@ def update_issue_labels(repo_name: str, issue_number: int, labels: list[str]) ->
 
 
 def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
-    """Persist open issues for a repo into the local issues table.
+    """Persist open issues for a repo into the issues table — routes to the
+    daemon when ``board_service`` is set (#601), else writes the local DB.
 
-    Called by ``brain.gather_context`` after fetching from GitHub so the
-    TUI board can show the full backlog without making external calls.
+    On a thin client `coord sync` (and the TUI's `r` refresh) fetches from
+    GitHub fine but must forward the upsert to the daemon, or the canonical
+    issue cache the TUI reads never updates.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(svc, "/issues-sync", {"repo_name": repo_name, "issues": issues})
+        return
+    _upsert_open_issues_local(repo_name, issues)
+
+
+def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
+    """Persist open issues for a repo into the local issues table.
 
     ``issues`` is the list of dicts returned by ``github_ops.get_open_issues``:
     each dict has at minimum ``number``, ``title``, ``body``, and ``labels``

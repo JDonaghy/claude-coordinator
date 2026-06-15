@@ -510,6 +510,97 @@ def test_record_dispatched_assignment_unset_writes_local(coord_db, monkeypatch):
     ).fetchone()["status"] == "running"
 
 
+# ── Write path (#601): issue-cache (labels + sync) ────────────────────────────
+
+
+def test_serve_issue_labels_updates_cache(file_db: Path, valid_config_path: Path, rw_db):
+    import json as _j
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("api", 586, "x", "", "open", '["coord", "status:ready"]', 1.0),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/issue-labels",
+            json={"repo_name": "api", "issue_number": 586, "labels": ["coord"]},
+        )
+    assert resp.status_code == 200 and resp.json()["updated"] is True
+    row = rw_db.execute(
+        "SELECT labels FROM issues WHERE repo_name='api' AND number=586"
+    ).fetchone()
+    assert _j.loads(row["labels"]) == ["coord"]  # status:ready stripped on the daemon
+
+
+def test_serve_issues_sync_upserts(file_db: Path, valid_config_path: Path, rw_db):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/issues-sync",
+            json={
+                "repo_name": "api",
+                "issues": [
+                    {"number": 7, "title": "issue seven", "body": "b",
+                     "labels": [{"name": "coord"}]},
+                ],
+            },
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT title, state FROM issues WHERE repo_name='api' AND number=7"
+    ).fetchone()
+    assert row["title"] == "issue seven" and row["state"] == "open"
+
+
+def test_update_issue_labels_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, title, state, labels, synced_at) "
+        "VALUES ('api', 9, 'x', 'open', '[\"coord\", \"status:ready\"]', 1.0)"
+    )
+    coord_db.commit()
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"updated": True},
+    )
+    assert state.update_issue_labels("api", 9, ["coord"]) is True
+    assert captured["path"] == "/issue-labels"
+    assert captured["payload"]["issue_number"] == 9
+    # Routed → the local issues row is NOT touched (still has status:ready).
+    import json as _j
+    row = coord_db.execute("SELECT labels FROM issues WHERE number=9").fetchone()
+    assert "status:ready" in _j.loads(row["labels"])
+
+
+def test_upsert_open_issues_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"ok": True},
+    )
+    state.upsert_open_issues("api", [{"number": 1, "title": "t", "labels": []}])
+    assert captured["path"] == "/issues-sync"
+    assert captured["payload"]["repo_name"] == "api"
+    # Routed → no local issues row created.
+    assert coord_db.execute("SELECT COUNT(*) c FROM issues").fetchone()["c"] == 0
+
+
 def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
     from coord import serve_app
 

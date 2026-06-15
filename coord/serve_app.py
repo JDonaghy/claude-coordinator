@@ -251,6 +251,42 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_issue_labels(request: Request) -> Response:
+        # #601: update one issue's cached labels (coord ready/backlog/refine/track).
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            updated = state._update_issue_labels_local(
+                body["repo_name"], body["issue_number"], body.get("labels") or []
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-labels write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"updated": bool(updated)})
+
+    async def post_issues_sync(request: Request) -> Response:
+        # #601: upsert a repo's open issues into the shared issue cache (coord sync).
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._upsert_open_issues_local(body["repo_name"], body.get("issues") or [])
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issues-sync write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"ok": True})
+
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
@@ -260,6 +296,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/dispatched-work", post_dispatched_work, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
+        Route("/issue-labels", post_issue_labels, methods=["POST"]),
+        Route("/issues-sync", post_issues_sync, methods=["POST"]),
     ]
     middleware = [Middleware(_BearerAuthMiddleware, token=token)] if token else []
     return Starlette(routes=routes, middleware=middleware)
