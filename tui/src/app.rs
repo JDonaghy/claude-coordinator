@@ -16499,9 +16499,9 @@ impl CoordApp {
                         p.coord_repo, p.issue_num,
                     )),
                     StyledText::plain(
-                        "Type the reviewer's findings above (required), then press \
-                         Enter to save them and start an interactive fix on the \
-                         same branch."
+                        "Type the reviewer's findings in the text box below \
+                         (required), then press Enter to save them and start \
+                         an interactive fix on the same branch."
                             .to_string(),
                     ),
                 ],
@@ -22250,14 +22250,6 @@ impl CoordApp {
             return;
         }
 
-        // #587: secondary safety net — when Fix mode is triggered directly
-        // (keyboard / right-click menu, NOT via the rework dialog's confirm
-        // which sets `rework_bypass`), check whether the latest
-        // request-changes review still has NULL review_findings in the
-        // in-memory board.  If so, redirect to the rework dialog (which
-        // collects findings before launching) instead of going straight to
-        // the fix.  This prevents "blind fix" workers when the operator
-        // dismissed the rework dialog without entering findings.
         // #587: secondary safety net — when Fix mode is triggered directly
         // (keyboard / right-click menu, NOT via the rework dialog's confirm
         // which sets `rework_bypass`), check whether the latest
