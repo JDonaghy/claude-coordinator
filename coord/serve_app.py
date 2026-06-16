@@ -341,6 +341,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     body["repo_name"], body["issue_number"]
                 )
                 return JSONResponse({"deleted": deleted})
+            if action == "replace":
+                state._replace_issue_context_local(
+                    body["repo_name"], body["issue_number"], body.get("entries") or []
+                )
+                return JSONResponse({"ok": True})
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
         except Exception as e:  # noqa: BLE001

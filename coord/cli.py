@@ -6620,6 +6620,72 @@ def context_clear(repo: str, issue: int, config_path: Path) -> None:
     click.echo(f"cleared {n} entr{'y' if n == 1 else 'ies'} for {repo} #{issue}")
 
 
+@context_group.command("curate")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--model", default="haiku",
+    help="claude -p model for the compress (default haiku — cheap).",
+)
+@_CONFIG_OPTION
+def context_curate(repo: str, issue: int, model: str, config_path: Path) -> None:
+    """LLM-compress the digest: merge duplicates, drop resolved notes, keep
+    pinned criticals.  On-demand (one metered `claude -p` call) — the everyday
+    cap+pins curation is automatic and free."""
+    import json as _json
+    import re as _re
+
+    from coord.state import list_issue_context, replace_issue_context
+    from coord.test_orchestrator import _call_claude
+
+    entries = list_issue_context(repo, issue)
+    if len(entries) <= 3:
+        click.echo(f"{repo} #{issue}: {len(entries)} entries — nothing to curate.")
+        return
+    payload = _json.dumps(
+        [{"body": e["body"], "pinned": e["pinned"], "source": e.get("source")}
+         for e in entries],
+        indent=2,
+    )
+    system = (
+        "You compress a SHORT per-issue engineering context digest injected at "
+        "the top of an AI agent's briefing. Rules: merge duplicates; drop "
+        "resolved / obsolete / now-irrelevant notes; KEEP every cross-repo "
+        "dependency, hard constraint, and failed-approach lesson; never invent "
+        "facts. Preserve pinned=true for criticals (deps/constraints). Aim for "
+        "<= 8 entries, each one tight line. Output ONLY a JSON array of "
+        '{"body": str, "pinned": bool} — no prose, no code fences.'
+    )
+    try:
+        raw = _call_claude(system, payload, model=model)
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"error: curate failed: {exc}", err=True)
+        sys.exit(1)
+    match = _re.search(r"\[.*\]", raw, _re.DOTALL)
+    try:
+        parsed = _json.loads(match.group(0)) if match else None
+        assert isinstance(parsed, list)
+    except Exception:  # noqa: BLE001
+        click.echo(
+            "error: curate returned unparseable output; context left unchanged.",
+            err=True,
+        )
+        sys.exit(1)
+    cleaned = [
+        {"body": str(e.get("body", "")).strip(),
+         "pinned": bool(e.get("pinned")), "source": "curated"}
+        for e in parsed
+        if str(e.get("body", "")).strip()
+    ]
+    if not cleaned:
+        click.echo(
+            "error: curate produced no entries; context left unchanged.", err=True
+        )
+        sys.exit(1)
+    replace_issue_context(repo, issue, cleaned)
+    click.echo(f"curated {repo} #{issue}: {len(entries)} → {len(cleaned)} entries")
+
+
 @main.command(
     help=(
         "Send an issue to the Pipeline as DISPATCHABLE by tagging it with "

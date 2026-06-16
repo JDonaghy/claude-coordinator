@@ -768,6 +768,37 @@ def test_cli_context_add_show_clear(coord_db):
     assert out.exit_code == 0 and "cleared 1" in out.output
 
 
+def test_cli_context_curate_replaces_entries(coord_db, monkeypatch):
+    # #603 Phase 4: curate compresses via claude -p and replaces the entries.
+    from coord import state
+    for i in range(5):
+        state._add_issue_context_entry_local("api", 7, f"note {i}", pinned=(i == 0))
+    fake = '```json\n[{"body":"merged critical dep","pinned":true},' \
+           '{"body":"one lesson kept","pinned":false}]\n```'
+    monkeypatch.setattr("coord.test_orchestrator._call_claude", lambda *a, **k: fake)
+    from click.testing import CliRunner
+    from coord.cli import main
+    out = CliRunner().invoke(main, ["context", "curate", "api", "7"])
+    assert out.exit_code == 0 and "5 → 2" in out.output
+    ents = state._list_issue_context_local("api", 7)
+    assert len(ents) == 2
+    assert ents[0]["body"] == "merged critical dep" and ents[0]["pinned"] is True
+    assert all(e["source"] == "curated" for e in ents)
+
+
+def test_cli_context_curate_noop_when_few(coord_db, monkeypatch):
+    from coord import state
+    state._add_issue_context_entry_local("api", 7, "only note")
+    called = []
+    monkeypatch.setattr("coord.test_orchestrator._call_claude",
+                        lambda *a, **k: called.append(1) or "[]")
+    from click.testing import CliRunner
+    from coord.cli import main
+    out = CliRunner().invoke(main, ["context", "curate", "api", "7"])
+    assert out.exit_code == 0 and "nothing to curate" in out.output
+    assert called == []  # no metered call for a tiny digest
+
+
 def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
     from coord import serve_app
 

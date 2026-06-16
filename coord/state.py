@@ -1303,6 +1303,54 @@ def _clear_issue_context_local(repo_name: str, issue_number: int) -> int:
     return cur.rowcount
 
 
+def replace_issue_context(
+    repo_name: str, issue_number: int, entries: list[dict]
+) -> None:
+    """Atomically replace ALL context entries for an issue (used by `coord
+    context curate`) — routes to the daemon when set.  *entries* is an ordered
+    list of ``{body, pinned?, source?}`` dicts."""
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(
+            svc,
+            "/issue-context",
+            {
+                "action": "replace",
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "entries": entries,
+            },
+        )
+        return
+    _replace_issue_context_local(repo_name, issue_number, entries)
+
+
+def _replace_issue_context_local(
+    repo_name: str, issue_number: int, entries: list[dict]
+) -> None:
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM issue_context WHERE repo_name = ? AND issue_number = ?",
+        (repo_name, issue_number),
+    )
+    now = time.time()
+    for i, e in enumerate(entries):
+        body = (e.get("body") or "").strip()
+        if not body:
+            continue
+        conn.execute(
+            "INSERT INTO issue_context "
+            "(repo_name, issue_number, pinned, source, body, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            # +i·µs keeps the supplied order stable under the created_at sort.
+            (repo_name, issue_number, 1 if e.get("pinned") else 0,
+             e.get("source"), body, now + i * 1e-6),
+        )
+    conn.commit()
+
+
 def list_issue_context(repo_name: str, issue_number: int) -> list[dict]:
     """Return an issue's raw context entries (oldest-first) — routes to the
     daemon when set, else reads the local DB.  Each entry:
