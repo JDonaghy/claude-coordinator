@@ -4135,6 +4135,36 @@ fn spawn_remote_tmux_sessions_fetch(
     rx
 }
 
+/// #603: fetch the EXACT fix briefing for `aid` (`coord fix-briefing <aid>`) off
+/// the UI thread, so the fail→fix / rework confirm dialog can show the operator
+/// what the fix worker will be briefed with.  stdout IS the briefing text; on
+/// any failure a short human note is returned (the dialog still launches fine).
+fn spawn_fix_briefing_fetch(
+    aid: String,
+    config_path: Option<std::path::PathBuf>,
+) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // `--config` is a per-subcommand option → it must come AFTER `aid`.
+        let mut args: Vec<String> = vec!["fix-briefing".into(), aid];
+        if let Some(cfg) = config_path {
+            args.push("--config".into());
+            args.push(cfg.to_string_lossy().into_owned());
+        }
+        let out = std::process::Command::new("coord").args(&args).output().ok();
+        let text = match out {
+            Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Some(o) => format!(
+                "(could not resolve the fix briefing: {})",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            None => "(could not run `coord fix-briefing`)".to_string(),
+        };
+        let _ = tx.send(text);
+    });
+    rx
+}
+
 /// Return the version string of the local `coord` binary by running
 /// `coord --version` synchronously.  Parses the last whitespace-separated
 /// token from the first output line (e.g. "coord 0.4.1" → "0.4.1").
@@ -5387,6 +5417,16 @@ pub struct CoordApp {
     pending_remote_sessions:
         Option<std::sync::mpsc::Receiver<Vec<LiveTmuxSession>>>,
 
+    // ── #603: exact fix-briefing preview for the fail→fix / rework dialog ───
+    /// The resolved fix briefing text (context block + findings/test story),
+    /// shown in the confirm dialog so the operator sees what the fix worker
+    /// gets BEFORE launching.  `Some("Resolving…")` while the async
+    /// `coord fix-briefing` shell-out is in flight; cleared when the dialog is
+    /// dismissed.
+    fix_briefing_preview: Option<String>,
+    /// In-flight `coord fix-briefing <aid>` fetch feeding `fix_briefing_preview`.
+    fix_briefing_rx: Option<std::sync::mpsc::Receiver<String>>,
+
     // ── Leg 2 (#517): auto-advance Work → Review ───────────────────────────
     /// Interactive Work/Plan sessions launched this run, keyed by
     /// `(repo_slug, issue_number)`, armed to prompt for a review once the
@@ -5643,6 +5683,9 @@ impl CoordApp {
             pending_remote_sessions: Some(spawn_remote_tmux_sessions_fetch(
                 crate::commands::find_config(),
             )),
+            // #603: fix-briefing preview (lazily populated when a dialog raises).
+            fix_briefing_preview: None,
+            fix_briefing_rx: None,
             // Leg 2 (#517): auto-advance Work → Review.
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
@@ -16490,6 +16533,11 @@ impl CoordApp {
         // fix, so the fix worker is briefed with concrete feedback instead
         // of the "(No structured findings were captured)" fallback.
         if let Some(ref p) = self.pending_rework {
+            // #587 owns this dialog (operator types the reviewer's findings into
+            // the input below); the per-issue context block (#603 Phase 2) still
+            // reaches the fix worker via the briefing injection, so the #603
+            // dialog preview is reserved for the test-fix dialog where the
+            // findings are already captured (test_reason).
             return Some(Dialog {
                 id: WidgetId::new("dialog:rework"),
                 title: StyledText::plain("Review requested changes — enter findings & start fix"),
@@ -16533,20 +16581,22 @@ impl CoordApp {
 
         // ── Leg 3c / A3 (#517, #581): test FAILED → start fix confirm ────
         if let Some(ref p) = self.pending_test_fix {
+            let mut body = vec![
+                StyledText::plain(format!(
+                    "The manual smoke test for {} #{} failed.",
+                    p.coord_repo, p.issue_num,
+                )),
+                StyledText::plain(
+                    "Start an interactive fix on the same branch, briefed with \
+                     the failure (continues the PR; re-reviews after)?"
+                        .to_string(),
+                ),
+            ];
+            body.extend(self.fix_briefing_preview_lines());  // #603 preview
             return Some(Dialog {
                 id: WidgetId::new("dialog:test-fix"),
                 title: StyledText::plain("Test failed — start fix?"),
-                body: vec![
-                    StyledText::plain(format!(
-                        "The manual smoke test for {} #{} failed.",
-                        p.coord_repo, p.issue_num,
-                    )),
-                    StyledText::plain(
-                        "Start an interactive fix on the same branch, briefed with \
-                         the failure (continues the PR; re-reviews after)?"
-                            .to_string(),
-                    ),
-                ],
+                body,
                 buttons: vec![
                     DialogButton {
                         id: WidgetId::new("fix"),
@@ -20453,6 +20503,11 @@ impl CoordApp {
             needs_redraw = true;
         }
 
+        // #603: the fix-briefing preview arrived → repaint the confirm dialog.
+        if self.fix_briefing_rx.is_some() && self.poll_fix_briefing_preview() {
+            needs_redraw = true;
+        }
+
         // #315: drain InjectFallback signals from `spawn_inject_post`.
         // These fire when /inject/{id} returned 409/410 — the worker
         // exited mid-flight after submit_inject's gate.  Transparently
@@ -21843,6 +21898,8 @@ impl CoordApp {
         };
         self.detail_terminal_focused = false;
         if verdict == "request-changes" {
+            // #587 owns the rework dialog (operator types the findings); no #603
+            // briefing preview here — it's reserved for the test-fix dialog.
             self.pending_rework = Some(PendingRework {
                 coord_repo: armed.coord_repo,
                 repo_slug: armed.repo_slug,
@@ -22420,11 +22477,14 @@ impl CoordApp {
         // Drop terminal focus so the confirm prompt owns Enter, not the shell.
         self.detail_terminal_focused = false;
         if verdict == "failed" {
+            // #603: preview the fix briefing (the failed WORK id is the fix target).
+            let aid = armed.work_aid.clone();
             self.pending_test_fix = Some(PendingTestFix {
                 coord_repo: armed.coord_repo,
                 repo_slug: armed.repo_slug,
                 issue_num: armed.issue_num,
             });
+            self.start_fix_briefing_preview(Some(aid));
         } else {
             // passed / skipped → offer the interactive merge agent.
             self.pending_merge = Some(PendingMerge {
@@ -22434,6 +22494,71 @@ impl CoordApp {
             });
         }
         true
+    }
+
+    /// #603: kick off (or, with `None`, clear) the async fix-briefing preview
+    /// shown in the fail→fix / rework confirm dialog.  `aid` is the fix target
+    /// (a test-failed WORK id, or a request-changes REVIEW id).
+    fn start_fix_briefing_preview(&mut self, aid: Option<String>) {
+        self.fix_briefing_rx = None;
+        match aid {
+            Some(aid) => {
+                self.fix_briefing_preview =
+                    Some("Resolving the fix briefing…".to_string());
+                let cfg = self.command_runner.config_path.clone();
+                self.fix_briefing_rx = Some(spawn_fix_briefing_fetch(aid, cfg));
+            }
+            None => self.fix_briefing_preview = None,
+        }
+    }
+
+    /// #603: drain the in-flight `coord fix-briefing` fetch into the preview.
+    fn poll_fix_briefing_preview(&mut self) -> bool {
+        let recv = match self.fix_briefing_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+        match recv {
+            Ok(text) => {
+                self.fix_briefing_preview = Some(text);
+                self.fix_briefing_rx = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.fix_briefing_rx = None;
+                false
+            }
+        }
+    }
+
+    /// #603: the fix-briefing preview as capped dialog body lines.  The confirm
+    /// dialog has no scroll, so cap to keep it on-screen (char-safe — the
+    /// briefing contains multibyte glyphs like 📌/⚠️).
+    fn fix_briefing_preview_lines(&self) -> Vec<StyledText> {
+        let mut out = vec![
+            StyledText::plain(String::new()),
+            StyledText::plain("The fix worker will be briefed with:".to_string()),
+        ];
+        let text = self
+            .fix_briefing_preview
+            .as_deref()
+            .unwrap_or("Resolving the fix briefing…");
+        const MAX_LINES: usize = 16;
+        const MAX_CHARS: usize = 1200;
+        let capped: String = if text.chars().count() > MAX_CHARS {
+            text.chars().take(MAX_CHARS).collect::<String>() + "…"
+        } else {
+            text.to_string()
+        };
+        for (n, line) in capped.lines().enumerate() {
+            if n >= MAX_LINES {
+                out.push(StyledText::plain("…".to_string()));
+                break;
+            }
+            out.push(StyledText::plain(line.to_string()));
+        }
+        out
     }
 
     /// Leg 3c (#517, #581): the operator confirmed the fail→fix prompt — select
@@ -27881,6 +28006,8 @@ mod tests {
             // #487
             live_tmux_sessions: Vec::new(),
             pending_remote_sessions: None,
+            fix_briefing_preview: None,
+            fix_briefing_rx: None,
             // Leg 2 (#517)
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
@@ -28410,6 +28537,44 @@ mod tests {
             body_text.contains("#42"),
             "rework dialog body should name the issue, got: {body_text}",
         );
+    }
+
+    #[test]
+    fn test_fix_dialog_shows_briefing_preview() {
+        // #603: the fail→fix dialog renders the resolved fix-briefing preview
+        // (context block + findings) so the operator sees what the worker gets.
+        let mut app = make_app_default();
+        app.pending_test_fix = Some(PendingTestFix {
+            coord_repo: "repo-a".to_string(),
+            repo_slug: "o/repo-a".to_string(),
+            issue_num: 42,
+        });
+        app.fix_briefing_preview =
+            Some("📌 depends on quadraui #368\nfix is_keyboard_focused".to_string());
+        let dialog = app.build_prompt_dialog().expect("test-fix dialog");
+        let body_text: String = dialog
+            .body
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body_text.contains("The fix worker will be briefed with:"));
+        assert!(body_text.contains("depends on quadraui #368"));
+        assert!(body_text.contains("is_keyboard_focused"));
+    }
+
+    #[test]
+    fn fix_briefing_preview_lines_shows_resolving_placeholder() {
+        let app = make_app_default();  // fix_briefing_preview is None
+        let joined: String = app
+            .fix_briefing_preview_lines()
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Resolving"));
     }
 
     #[test]

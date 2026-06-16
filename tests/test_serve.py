@@ -799,6 +799,29 @@ def test_cli_context_curate_noop_when_few(coord_db, monkeypatch):
     assert called == []  # no metered call for a tiny digest
 
 
+def test_cli_fix_briefing_includes_context_and_test_story(coord_db):
+    # #603 Phase 5: `coord fix-briefing` prints the context block + the resolved
+    # test-failure story (the exact-briefing preview the TUI dialog shows).
+    from coord import state
+    coord_db.execute(
+        "INSERT INTO assignments(assignment_id,machine_name,repo_name,issue_number,"
+        "issue_title,status,type,branch,test_state,test_reason) VALUES"
+        "('w1','laptop','claude-coordinator',7,'Fix X','done','work','issue-7-x',"
+        "'failed','Button does nothing on click')"
+    )
+    coord_db.commit()
+    state._add_issue_context_entry_local(
+        "claude-coordinator", 7, "depends on quadraui #368", pinned=True
+    )
+    from click.testing import CliRunner
+    from coord.cli import main
+    out = CliRunner().invoke(main, ["fix-briefing", "w1"])
+    assert out.exit_code == 0, out.output
+    assert "⚠️ Issue context" in out.output  # context block at the top
+    assert "depends on quadraui #368" in out.output
+    assert "Button does nothing on click" in out.output  # the resolved test story
+
+
 def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
     from coord import serve_app
 

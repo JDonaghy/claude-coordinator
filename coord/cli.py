@@ -6686,6 +6686,96 @@ def context_curate(repo: str, issue: int, model: str, config_path: Path) -> None
     click.echo(f"curated {repo} #{issue}: {len(entries)} → {len(cleaned)} entries")
 
 
+@main.command("fix-briefing")
+@click.argument("aid")
+@_CONFIG_OPTION
+def fix_briefing_cmd(aid: str, config_path: Path) -> None:
+    """Print the briefing a `--fix-of <aid>` fix worker would receive — the
+    per-issue context block + the resolved findings / test-failure story (#603).
+
+    coord-tui shells out to this to preview the fix in the fail→fix / rework
+    confirm dialog so the operator sees exactly what the worker is briefed with
+    before launching.  Output is the briefing text ONLY (stdout).  AID is either
+    a request-changes REVIEW id or a test-failed WORK id (mirrors --fix-of).
+    """
+    from types import SimpleNamespace
+
+    from coord.auto_loop import _build_fix_briefing, _load_review_findings
+    from coord.client import fetch_remote_board, resolve_board_service
+    from coord.state import COORD_DIR as _CTX_COORD_DIR, build_board, issue_context_block
+
+    cfg = _load_config(config_path)
+    svc = resolve_board_service()
+    board = fetch_remote_board(svc) if svc is not None else build_board()
+    target = board.find_by_id(aid)
+    if target is None:
+        click.echo(f"error: no assignment {aid} on the board.", err=True)
+        sys.exit(2)
+
+    # Mirror the --fix-of fork (cli.py): a test-failed WORK id fixes itself
+    # (findings = test_reason); a request-changes REVIEW id fixes its linked work.
+    fix_from_test_fail = (
+        target.type != "review" and getattr(target, "test_state", None) == "failed"
+    )
+    if fix_from_test_fail:
+        work = target
+    elif target.type == "review":
+        work = (
+            board.find_by_id(target.review_of_assignment_id)
+            if target.review_of_assignment_id else None
+        )
+    else:
+        click.echo(
+            f"error: {aid} is not a fixable target "
+            f"(type={target.type!r}, test_state={getattr(target, 'test_state', None)!r}).",
+            err=True,
+        )
+        sys.exit(2)
+    if work is None or not work.branch:
+        click.echo("error: no linked work assignment with a branch to fix.", err=True)
+        sys.exit(2)
+
+    repo_cfg = cfg.repo(work.repo_name)
+    repo_github = repo_cfg.github if repo_cfg else work.repo_name
+    next_iteration = (work.review_iteration or 0) + 1
+    max_iter = cfg.pipeline.max_review_iterations
+    if fix_from_test_fail:
+        story = (getattr(work, "test_reason", None) or "").strip()
+        findings_body = (
+            "The manual smoke test FAILED. The operator reported:\n\n"
+            f"> {story}\n\nReproduce the failure, fix the root cause, and "
+            "re-validate before pushing."
+            if story else
+            "The manual smoke test FAILED (no reason text was recorded). Pull the "
+            "branch, reproduce the failure the operator hit, and fix the root "
+            "cause before pushing."
+        )
+    else:
+        _log = _CTX_COORD_DIR / "logs" / f"{aid}.log"
+        try:
+            findings = _load_review_findings(
+                target, str(_log) if _log.exists() else None, None,
+                repo_github=repo_github,
+            )
+        except Exception:  # noqa: BLE001
+            findings = None
+        findings_body = (
+            findings.body.strip()
+            if findings and (getattr(findings, "body", "") or "").strip()
+            else (
+                f"(No structured findings were captured for review {aid}.) "
+                f"The review verdict was {target.review_verdict or 'request-changes'!r}. "
+                "Read the reviewer's feedback and address every blocking item "
+                "before pushing."
+            )
+        )
+    fix_briefing = _build_fix_briefing(
+        work, SimpleNamespace(body=findings_body), next_iteration, max_iter
+    )
+    ctx = issue_context_block(work.repo_name, work.issue_number)
+    click.echo(ctx + fix_briefing, nl=False)
+
+
 @main.command(
     help=(
         "Send an issue to the Pipeline as DISPATCHABLE by tagging it with "
