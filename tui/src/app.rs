@@ -14169,54 +14169,10 @@ impl CoordApp {
                         };
                         self.mouse_sidebar_click(&synthetic_left, pos, sidebar_b, backend);
                     }
-                    let target = match self.active_view {
-                        SidebarView::Board => {
-                            let selected = self.board_selected_issue();
-                            let (repo_name, issue_number) = match selected {
-                                Some((r, n)) => (Some(r), Some(n)),
-                                None => (self.board_active_repo().map(|s| s.to_string()), None),
-                            };
-                            // #260: classify the row at right-click time
-                            // so the menu items reflect the current
-                            // lifecycle state (Backlog → Refine, etc.).
-                            let lifecycle = match (&repo_name, issue_number) {
-                                (Some(r), Some(n)) => self.board_row_lifecycle(r, n),
-                                _ => BoardRowLifecycle::Unknown,
-                            };
-                            Some(ContextMenuTarget::BoardRow {
-                                issue_number,
-                                repo_name,
-                                lifecycle,
-                            })
-                        }
-                        SidebarView::Pipeline => {
-                            let sel = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
-                            let issue_number = sel.map(|i| i.number);
-                            // #262: classify the row at right-click time
-                            // so the menu offers Start only when New.
-                            let lifecycle = sel
-                                .map(|i| self.pipeline_row_lifecycle(i))
-                                .unwrap_or(PipelineRowLifecycle::Other);
-                            Some(ContextMenuTarget::PipelineRow {
-                                issue_number,
-                                lifecycle,
-                            })
-                        }
-                        SidebarView::Machines => {
-                            // #pause: right-click on a Machines row opens
-                            // the Pause routing / Resume routing toggle.
-                            // Synthetic-left above already selected the
-                            // row, so `machine_sel` points at the right
-                            // entry.
-                            self.data.machines.get(self.machine_sel).map(|m| {
-                                ContextMenuTarget::MachineRow {
-                                    name: m.name.clone(),
-                                    is_paused: self.paused_machines.contains(&m.name),
-                                }
-                            })
-                        }
-                        _ => None,
-                    };
+                    // Synthetic-left above already moved the selection to the
+                    // row under the cursor, so the shared selection-based
+                    // target builder reflects the clicked row.
+                    let target = self.context_menu_target_for_selection();
                     if let Some(target) = target {
                         if self.open_context_menu(pos, target) {
                             return true;
@@ -16144,6 +16100,54 @@ impl CoordApp {
         }
         items.push(ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"));
         items
+    }
+
+    /// Build the context-menu target for the row that is *currently selected*
+    /// in the sidebar, independent of any mouse position.  Shared by the
+    /// right-click handler (which synthesises a left-click to select the row
+    /// under the cursor first) and the keyboard shortcut (Menu key / Shift+F10
+    /// / '.'), which opens the menu for whatever row j/k has already selected.
+    /// Returns `None` for views that have no context menu (Settings/Terminal).
+    fn context_menu_target_for_selection(&self) -> Option<ContextMenuTarget> {
+        match self.active_view {
+            SidebarView::Board => {
+                let selected = self.board_selected_issue();
+                let (repo_name, issue_number) = match selected {
+                    Some((r, n)) => (Some(r), Some(n)),
+                    None => (self.board_active_repo().map(|s| s.to_string()), None),
+                };
+                // #260: classify the row so the menu items reflect the current
+                // lifecycle state (Backlog → Refine, etc.).
+                let lifecycle = match (&repo_name, issue_number) {
+                    (Some(r), Some(n)) => self.board_row_lifecycle(r, n),
+                    _ => BoardRowLifecycle::Unknown,
+                };
+                Some(ContextMenuTarget::BoardRow {
+                    issue_number,
+                    repo_name,
+                    lifecycle,
+                })
+            }
+            SidebarView::Pipeline => {
+                let sel = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
+                let issue_number = sel.map(|i| i.number);
+                // #262: classify the row so the menu offers Start only when New.
+                let lifecycle = sel
+                    .map(|i| self.pipeline_row_lifecycle(i))
+                    .unwrap_or(PipelineRowLifecycle::Other);
+                Some(ContextMenuTarget::PipelineRow {
+                    issue_number,
+                    lifecycle,
+                })
+            }
+            SidebarView::Machines => self.data.machines.get(self.machine_sel).map(|m| {
+                ContextMenuTarget::MachineRow {
+                    name: m.name.clone(),
+                    is_paused: self.paused_machines.contains(&m.name),
+                }
+            }),
+            _ => None,
+        }
     }
 
     /// Open a right-click context menu anchored at `pos` for `target`.
@@ -19630,16 +19634,18 @@ impl CoordApp {
     /// doesn't shift between selections.  Returns the panel as a
     /// value rather than a `&SidebarPanel` because the toolbar buttons
     /// are derived from current state (selected row's lifecycle).
+    /// Build the sidebar header panel.  The per-row contextual action bar
+    /// (#270 — a no-mouse mirror of the right-click menu) was removed once the
+    /// keyboard context menu (Menu / Shift+F10 / '.') made it redundant; the
+    /// only surviving header button is the Board "Sync" affordance.  Views
+    /// with no header button (Pipeline / Machines) reserve no slot, so their
+    /// tree starts at the very top of the sidebar.
     fn build_sidebar_action_panel(&self, lh: f32) -> SidebarPanel {
-        let mut toolbar = self.sidebar_action_bar().unwrap_or_else(|| Toolbar {
-            id: WidgetId::new("sidebar-action-bar-empty"),
-            buttons: Vec::new(),
-            bg: None,
-        });
-        // Board panel always shows a Sync button so the user can pull fresh
-        // issues from GitHub on demand without needing a terminal.
+        let mut buttons: Vec<ToolbarButton> = Vec::new();
+        // Board panel keeps a Sync button so the user can pull fresh issues
+        // from GitHub on demand without needing a terminal ('S' does the same).
         if self.active_view == SidebarView::Board {
-            toolbar.buttons.push(ToolbarButton::Action {
+            buttons.push(ToolbarButton::Action {
                 id: WidgetId::new("sidebar-action:sync-issues"),
                 label: "Sync".to_string(),
                 icon: Some("↻".to_string()),
@@ -19649,9 +19655,22 @@ impl CoordApp {
                 tooltip: "coord sync — fetch all open issues from GitHub".to_string(),
             });
         }
+        if buttons.is_empty() {
+            // No header button → don't reserve the slot; the tree gets the
+            // full sidebar height.
+            return SidebarPanel {
+                id: WidgetId::new("sidebar-panel"),
+                toolbar: None,
+                toolbar_height: None,
+            };
+        }
         SidebarPanel {
             id: WidgetId::new("sidebar-panel"),
-            toolbar: Some(toolbar),
+            toolbar: Some(Toolbar {
+                id: WidgetId::new("sidebar-action-bar"),
+                buttons,
+                bg: None,
+            }),
             toolbar_height: Some(self.sidebar_action_bar_height(lh)),
         }
     }
@@ -19666,118 +19685,6 @@ impl CoordApp {
     /// proper button-row visual.
     fn sidebar_action_bar_height(&self, lh: f32) -> f32 {
         lh * 2.0
-    }
-
-    /// #270: build the contextual action bar for the currently-selected
-    /// sidebar row.  `None` for views where the action bar doesn't apply
-    /// (Machines / Settings) or when no row is selected.
-    ///
-    /// Mirrors the right-click context menu — same per-lifecycle item
-    /// sets, same `action_id` strings — so dispatch routes through the
-    /// same `dispatch_context_menu_action` code path the right-click
-    /// already uses.  This is the no-mouse path for SSH / Termux / GTK
-    /// users where right-click isn't available.
-    fn sidebar_action_bar(&self) -> Option<Toolbar> {
-        // Reuse the right-click target builder so the action set is the
-        // same data the menu shows.  Returns None when no row is
-        // selected — the caller renders nothing in that case.
-        let target = self.target_for_selected_sidebar_row()?;
-        let menu_items = match &target {
-            ContextMenuTarget::BoardRow {
-                issue_number,
-                lifecycle,
-                ..
-            } => self.context_menu_items_for_board_row(*issue_number, lifecycle),
-            ContextMenuTarget::PipelineRow {
-                issue_number,
-                lifecycle,
-            } => self.context_menu_items_for_pipeline_row(*issue_number, lifecycle),
-            ContextMenuTarget::MachineRow { name, is_paused } => {
-                self.context_menu_items_for_machine_row(name, *is_paused)
-            }
-        };
-        // The menu always includes Copy + Refresh — those aren't
-        // interesting in the action bar (Refresh has its own keybind,
-        // Copy isn't wired to a clipboard yet).  Strip them so the bar
-        // shows ONLY the row-state-specific verbs.
-        let interesting: Vec<&ContextMenuItem> = menu_items
-            .iter()
-            .filter(|it| match it.action_id.as_deref() {
-                Some("copy-issue-number") | Some("refresh") | None => false,
-                _ => true,
-            })
-            .collect();
-        if interesting.is_empty() {
-            return None;
-        }
-        let buttons: Vec<ToolbarButton> = interesting
-            .iter()
-            .filter_map(|it| {
-                // Items without an action_id are non-clickable headers
-                // (none used by the row menus today) — skip them rather
-                // than render an unclickable placeholder.
-                let id_raw = it.action_id.as_ref()?;
-                Some(ToolbarButton::Action {
-                    id: WidgetId::new(format!("sidebar-action:{}", id_raw)),
-                    label: it.label.clone(),
-                    icon: icon_for_action(id_raw).map(String::from),
-                    key_hint: it.shortcut.clone(),
-                    // The right-click menu only surfaces actions when
-                    // they apply to the current row state, so every
-                    // item here is enabled.  When that changes (#272
-                    // first-class wins), pipe per-item enabled state
-                    // through ContextMenuItem instead.
-                    enabled: true,
-                    is_active: false,
-                    tooltip: String::new(),
-                })
-            })
-            .collect();
-        if buttons.is_empty() {
-            return None;
-        }
-        Some(Toolbar {
-            id: WidgetId::new("sidebar-action-bar"),
-            buttons,
-            bg: None,
-        })
-    }
-
-    /// Build a `ContextMenuTarget` for whichever sidebar row is currently
-    /// selected.  Used by the action bar and (already) by the right-click
-    /// path.  Returns `None` when no row is selected or the active view
-    /// doesn't have row-level actions (Machines / Settings).
-    fn target_for_selected_sidebar_row(&self) -> Option<ContextMenuTarget> {
-        match self.active_view {
-            SidebarView::Board => {
-                let (repo, num) = self.board_selected_issue()?;
-                let lifecycle = self.board_row_lifecycle(&repo, num);
-                Some(ContextMenuTarget::BoardRow {
-                    issue_number: Some(num),
-                    repo_name: Some(repo),
-                    lifecycle,
-                })
-            }
-            SidebarView::Pipeline => {
-                let issue = self
-                    .pipeline_sel
-                    .and_then(|i| self.pipeline_issues.get(i))?;
-                let lifecycle = self.pipeline_row_lifecycle(issue);
-                Some(ContextMenuTarget::PipelineRow {
-                    issue_number: Some(issue.number),
-                    lifecycle,
-                })
-            }
-            SidebarView::Machines => {
-                let m = self.data.machines.get(self.machine_sel)?;
-                let is_paused = self.paused_machines.contains(&m.name);
-                Some(ContextMenuTarget::MachineRow {
-                    name: m.name.clone(),
-                    is_paused,
-                })
-            }
-            _ => None,
-        }
     }
 
     /// #pause: right-click menu for a Machines panel row.  One toggle
@@ -19821,14 +19728,10 @@ impl CoordApp {
         let content_rect = layout.content_bounds;
         match layout.hit_test(pos.x, pos.y) {
             SidebarPanelHit::ToolbarButton(id) => {
-                if let Some(action) = id.as_str().strip_prefix("sidebar-action:") {
-                    let action = action.to_string();
-                    // Panel-level actions that don't need a row target.
-                    if action == "sync-issues" {
-                        self.force_issue_sync();
-                    } else if let Some(target) = self.target_for_selected_sidebar_row() {
-                        self.dispatch_context_menu_action(&action, &target);
-                    }
+                // The Board "Sync" button is the only header action left — the
+                // #270 contextual verbs now live in the keyboard context menu.
+                if id.as_str().strip_prefix("sidebar-action:") == Some("sync-issues") {
+                    self.force_issue_sync();
                 }
                 (content_rect, true)
             }
@@ -23570,14 +23473,13 @@ impl ShellApp for CoordApp {
 
         // ── Sidebar: list content (sidebar system / machines) ────────
         if let Some(full_sidebar_rect) = layout.sidebar_content_bounds {
-            // #270 / #272: SidebarPanel composes the contextual action
-            // bar + the tree beneath into one primitive.  The slot is
-            // always reserved at `sidebar_action_bar_height` even when
-            // the bar has no buttons, so the tree doesn't shift as
-            // selections cycle through lifecycle states; and click
-            // dispatch routes through `SidebarPanelLayout::hit_test`
-            // so the off-by-one math we had to maintain by hand is
-            // gone.
+            // #272: SidebarPanel composes the optional header toolbar (now
+            // just the Board "Sync" button — the #270 contextual action bar
+            // was retired in favour of the keyboard context menu) + the tree
+            // beneath into one primitive.  When there's no header button the
+            // slot isn't reserved, so the tree gets the full height; click
+            // dispatch routes through `SidebarPanelLayout::hit_test` so the
+            // off-by-one math we had to maintain by hand is gone.
             let panel = self.build_sidebar_action_panel(lh);
             let panel_layout = backend.draw_sidebar_panel(
                 full_sidebar_rect,
@@ -25034,6 +24936,40 @@ impl ShellApp for CoordApp {
                         return Reaction::Redraw;
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // ── #259 follow-up: keyboard equivalent of right-click ────────────────
+        // Open the context menu for the row j/k has already selected, with no
+        // mouse needed.  Bindings:
+        //   • Menu / Application key (`NamedKey::Menu` — the dedicated key)
+        //   • Shift+F10              (the universal cross-platform convention)
+        //   • '.'                    (printable fallback for laptops that have
+        //                            no Menu key; the "more actions" kebab)
+        // Once open, the menu's own keyboard nav (j/k/Enter/Esc, intercepted
+        // earlier when `pending_context_menu` is Some) drives it.  Guarded so
+        // no binding steals a keystroke from an active search field or a
+        // chat/watch/quit overlay — '.' must still type into a focused search.
+        if self.pending_context_menu.is_none() {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                let is_trigger = matches!(key, Key::Named(NamedKey::Menu))
+                    || (matches!(key, Key::Named(NamedKey::F(10))) && modifiers.shift)
+                    || matches!(key, Key::Char('.'));
+                let input_active = self.board_search.focused
+                    || self.pipeline_search.focused
+                    || self.inject_chat.is_some()
+                    || self.watch_focused.is_some()
+                    || self.pending_quit_confirm;
+                if is_trigger && !input_active {
+                    if let Some(target) = self.context_menu_target_for_selection() {
+                        // Anchor near the sidebar's top-left; `menu.layout()`
+                        // clamps/flips the popup to stay within the viewport.
+                        let anchor = Point::new(list_b.x + 8.0, list_b.y + lh * 1.5);
+                        if self.open_context_menu(anchor, target) {
+                            return Reaction::Redraw;
+                        }
+                    }
                 }
             }
         }
@@ -27807,17 +27743,6 @@ mod tests {
             .iter()
             .filter_map(|b| match b {
                 ToolbarButton::Action { label, .. } => Some(label.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Collect every action_id (as raw string) from a toolbar.
-    fn toolbar_action_ids(bar: &Toolbar) -> Vec<String> {
-        bar.buttons
-            .iter()
-            .filter_map(|b| match b {
-                ToolbarButton::Action { id, .. } => Some(id.as_str().to_string()),
                 _ => None,
             })
             .collect()
@@ -35502,100 +35427,6 @@ mod tests {
         );
     }
 
-    // ── #270: selected-item action bar (no-mouse / SSH-friendly) ────────
-
-    #[test]
-    fn sidebar_action_bar_none_when_no_row_selected() {
-        // Without a focused row there's no row-specific verb to surface.
-        let app = make_app_default();
-        assert!(app.target_for_selected_sidebar_row().is_none());
-        assert!(app.sidebar_action_bar().is_none());
-    }
-
-    #[test]
-    fn sidebar_action_bar_offers_refine_on_backlog_row() {
-        let mut app = make_app_default();
-        // Seed a Backlog issue and focus it on the Board sidebar.
-        app.data.open_issues.push(OpenIssue {
-            repo_name: "repo-a".to_string(),
-            number: 88,
-            title: "backlog item".to_string(),
-            body: String::new(),
-            state: "open".to_string(),
-            labels: Vec::new(),
-            milestone_number: None,
-            milestone_title: None,
-        });
-        app.rebuild_board_sidebar();
-        app.select_issue("repo-a", 88);
-
-        let bar = app
-            .sidebar_action_bar()
-            .expect("Backlog selection → action bar");
-        let labels = toolbar_action_labels(&bar);
-        assert!(
-            labels.iter().any(|l| l.contains("Refine")),
-            "expected Refine button on a Backlog row; got {:?}",
-            labels,
-        );
-        // The action bar must NOT carry Copy or Refresh — those aren't
-        // row-state-specific (they live in the right-click menu only).
-        assert!(!labels.iter().any(|l| l.contains("Copy")));
-        assert!(!labels.iter().any(|l| l.contains("Refresh")));
-    }
-
-    #[test]
-    fn sidebar_action_bar_offers_mark_refined_on_refining_row() {
-        let mut app = make_app_default();
-        app.data.open_issues.push(OpenIssue {
-            repo_name: "repo-a".to_string(),
-            number: 89,
-            title: "refining item".to_string(),
-            body: String::new(),
-            state: "open".to_string(),
-            labels: vec!["status:refining".to_string()],
-            milestone_number: None,
-            milestone_title: None,
-        });
-        app.rebuild_board_sidebar();
-        app.select_issue("repo-a", 89);
-
-        let bar = app
-            .sidebar_action_bar()
-            .expect("Refining selection → action bar");
-        let labels = toolbar_action_labels(&bar);
-        assert!(labels.iter().any(|l| l.contains("Mark Refined")));
-        assert!(labels.iter().any(|l| l.contains("Drop to Backlog")));
-    }
-
-    #[test]
-    fn sidebar_action_bar_segments_carry_sidebar_action_prefix_for_dispatch() {
-        // The hit-tester strips `sidebar-action:` to recover the
-        // action_id; segments must carry the prefix so right-click
-        // and bar dispatch can be told apart from the same code path.
-        let mut app = make_app_default();
-        app.data.open_issues.push(OpenIssue {
-            repo_name: "repo-a".to_string(),
-            number: 90,
-            title: "t".to_string(),
-            body: String::new(),
-            state: "open".to_string(),
-            labels: Vec::new(),
-            milestone_number: None,
-            milestone_title: None,
-        });
-        app.rebuild_board_sidebar();
-        app.select_issue("repo-a", 90);
-
-        let bar = app.sidebar_action_bar().expect("backlog bar");
-        let ids = toolbar_action_ids(&bar);
-        assert!(
-            ids.iter().all(|id| id.starts_with("sidebar-action:")),
-            "every clickable action must carry the sidebar-action prefix; got {:?}",
-            ids,
-        );
-    }
-
     // ── #249 Principle 1: panel toolbar (clickable verb buttons) ────────
 
     #[test]
@@ -37011,36 +36842,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pipeline_in_progress_row_action_bar_is_not_empty() {
-        // Regression for the "I saw Refine on the board but didn't see
-        // anything yet in pipelines" report: an in-flight Pipeline row
-        // must produce a non-empty action bar.
-        let mut app = make_pipeline_app();
-        // Put issue #42 into InProgress by attaching a running work
-        // assignment.
-        app.data
-            .assignments
-            .push(_work_assignment("w1", 100.0, "running", None));
-        app.active_view = SidebarView::Pipeline;
-        app.pipeline_sel = Some(0);
-
-        let bar = app
-            .sidebar_action_bar()
-            .expect("In-progress row must produce an action bar");
-        let labels = toolbar_action_labels(&bar);
-        assert!(
-            labels.iter().any(|l| l == "Watch"),
-            "expected Watch in action bar; got {:?}",
-            labels,
-        );
-        assert!(
-            labels.iter().any(|l| l == "Stop"),
-            "expected Stop in action bar; got {:?}",
-            labels,
-        );
-    }
-
     // ── #stage-content: per-stage focus + content panel ──────────────────
 
     #[test]
@@ -37306,40 +37107,6 @@ mod tests {
         assert!(
             text.contains("Stage content") || text.contains("Merge") || text.contains("merge"),
             "expected merge stage content in Pipeline tab body for Done issue; got: {text:?}",
-        );
-    }
-
-    #[test]
-    fn pipeline_done_row_action_bar_offers_open_pr() {
-        // pipeline_lifecycle_section classifies "Done" as is_closed=true,
-        // so we close the issue + attach a merged PR to mirror the
-        // post-merge state the user actually sees.
-        let mut app = make_pipeline_app();
-        app.pipeline_issues[0].is_closed = true;
-        app.data
-            .assignments
-            .push(_work_assignment("w1", 100.0, "done", None));
-        app.data.merge_queue.push(MergeQueueEntry {
-            assignment_id: "w1".to_string(),
-            issue_number: Some(42),
-            state: "merged".to_string(),
-            pr_number: Some(7),
-            pr_url: None,
-            repo_github: "acme/api".to_string(),
-            target_branch: None,
-            error: None,
-        });
-        app.active_view = SidebarView::Pipeline;
-        app.pipeline_sel = Some(0);
-
-        let bar = app
-            .sidebar_action_bar()
-            .expect("Done row must produce an action bar");
-        let labels = toolbar_action_labels(&bar);
-        assert!(
-            labels.iter().any(|l| l == "Open PR"),
-            "expected Open PR in action bar; got {:?}",
-            labels,
         );
     }
 
