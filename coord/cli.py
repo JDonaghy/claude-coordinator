@@ -6971,6 +6971,28 @@ def _load_issue_states() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
     return open_by_repo, known_by_repo
 
 
+def _merge_via_daemon(svc, params: dict) -> None:
+    """#584: run ``coord merge`` on the daemon host (where the canonical DB +
+    merge queue + gh live) and relay its output, so the TUI 'Go' button and
+    ``coord merge`` work from any thin client.  Merges can take minutes (PR
+    creation, CI waits), hence the long timeout."""
+    from coord.client import post_record  # noqa: PLC0415
+
+    try:
+        resp = post_record(svc, "/merge", params, timeout=900.0)
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"error: merge via daemon failed: {exc}", err=True)
+        sys.exit(1)
+    output = resp.get("output") or ""
+    if output:
+        click.echo(output, nl=False)
+    if resp.get("error"):
+        click.echo(f"error: {resp['error']}", err=True)
+    code = resp.get("exit_code") or 0
+    if code:
+        sys.exit(int(code))
+
+
 @main.command(help="Process the merge queue: open PRs and merge in sequence.")
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Show the plan without opening or merging PRs.")
@@ -7011,6 +7033,23 @@ def merge(
     skip_review: bool,
     skip_smoke: bool,
 ) -> None:
+    # #584: the merge queue + board live in the canonical (host-local) DB, so on
+    # a thin client `coord merge` (and the TUI 'Go' button, which shells out to
+    # it) would silently no-op against an empty local board.  Route the whole
+    # operation to the daemon — it runs the merge where the DB + gh live and
+    # returns its output.  COORD_MERGE_ON_DAEMON guards the daemon against
+    # re-routing to itself (it calls this same command with the env var set).
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    _merge_svc = resolve_board_service()
+    if _merge_svc is not None and not os.environ.get("COORD_MERGE_ON_DAEMON"):
+        _merge_via_daemon(_merge_svc, {
+            "dry_run": dry_run, "order": order, "repo_filter": repo_filter,
+            "method": method, "force_merge": force_merge,
+            "skip_review": skip_review, "skip_smoke": skip_smoke,
+        })
+        return
+
     from coord import github_ops as gh_ops
     from coord import merge_queue as mq
     from coord.ci_store import build_ci_store

@@ -354,6 +354,57 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    async def post_merge(request: Request) -> Response:
+        # #584: the merge queue + board live in THIS (canonical) DB, and gh is
+        # authenticated here — so a thin client's `coord merge` / TUI 'Go' routes
+        # the whole operation here.  Run it in a threadpool so a multi-minute
+        # merge (PR creation, CI waits) doesn't block the event loop / other
+        # board reads.  Returns the captured CLI output + exit code.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+        def _run() -> dict:
+            import contextlib  # noqa: PLC0415
+            import io  # noqa: PLC0415
+            import os  # noqa: PLC0415
+
+            from coord.cli import merge as merge_cmd  # noqa: PLC0415
+
+            buf = io.StringIO()
+            code = 0
+            err = None
+            prev = os.environ.get("COORD_MERGE_ON_DAEMON")
+            os.environ["COORD_MERGE_ON_DAEMON"] = "1"  # guard against re-routing
+            try:
+                with contextlib.redirect_stdout(buf):
+                    merge_cmd.callback(
+                        config_path=config.path,
+                        dry_run=bool(body.get("dry_run")),
+                        order=body.get("order"),
+                        repo_filter=body.get("repo_filter"),
+                        method=body.get("method") or "rebase",
+                        force_merge=bool(body.get("force_merge")),
+                        skip_review=bool(body.get("skip_review")),
+                        skip_smoke=bool(body.get("skip_smoke")),
+                    )
+            except SystemExit as e:  # click commands sys.exit() on some paths
+                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                code = 1
+            finally:
+                if prev is None:
+                    os.environ.pop("COORD_MERGE_ON_DAEMON", None)
+                else:
+                    os.environ["COORD_MERGE_ON_DAEMON"] = prev
+            return {"output": buf.getvalue(), "exit_code": code, "error": err}
+
+        result = await run_in_threadpool(_run)
+        return JSONResponse(result)
+
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
@@ -367,6 +418,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/issues-sync", post_issues_sync, methods=["POST"]),
         Route("/issue-context", get_issue_context, methods=["GET"]),
         Route("/issue-context", post_issue_context, methods=["POST"]),
+        Route("/merge", post_merge, methods=["POST"]),
     ]
     middleware = [Middleware(_BearerAuthMiddleware, token=token)] if token else []
     return Starlette(routes=routes, middleware=middleware)
