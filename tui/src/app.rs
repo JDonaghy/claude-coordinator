@@ -5373,6 +5373,11 @@ pub struct CoordApp {
     /// keypresses route to the selected issue's PTY.  F12 toggles.
     /// Independent of `terminal_focused` (the standalone pane's flag).
     detail_terminal_focused: bool,
+    /// #605: `Ctrl-W` pane-leader latch — `true` after the user presses
+    /// `Ctrl-W`, until the next key resolves the chord (`h`/`Left` → side
+    /// panel, `l`/`Right` → content/PTY, `Ctrl-W` → literal to the PTY).
+    /// A keyboard-only slice of the #578 focus model (no mouse focus).
+    ctrl_w_pending: bool,
     /// Pending `(cols, rows)` for per-issue terminal resize, stashed by
     /// `render_detail_terminal_tab` (`&self`) and applied by `tick`
     /// (`&mut self`).
@@ -5669,6 +5674,7 @@ impl CoordApp {
             detail_terminal_sessions: std::collections::HashMap::new(),
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
+            ctrl_w_pending: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #454: tracks Press → Release for PTY mouse-reporting drags.
             pty_pressed_buttons: 0,
@@ -14760,7 +14766,8 @@ impl CoordApp {
             if pos.y - main_b.y < tab_h {
                 let bar = self.board_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
-                if let Some(idx) = hit_tab_index_from_labels(&labels, main_b.x, pos.x) {
+                // Board has only 3 tabs — never overflows, so scroll_offset is 0.
+                if let Some(idx) = hit_tab_index_from_labels(&labels, main_b.x, pos.x, 0) {
                     let new_tab = match idx {
                         0 => BoardDetailTab::Board,
                         1 => BoardDetailTab::Issue,
@@ -14809,7 +14816,20 @@ impl CoordApp {
             if pos.y - main_b.y < tab_h {
                 let bar = self.pipeline_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
-                if let Some(idx) = hit_tab_index_from_labels(&labels, main_b.x, pos.x) {
+                // #605: match the painter's scroll-to-active offset so clicks
+                // land on the right tab when the bar is scrolled on a narrow
+                // width. The TUI tab_bar_layout computes this identically (same
+                // width, same per-tab char measure, scroll arrows disabled).
+                let active_idx = bar.tabs.iter().position(|t| t.is_active).unwrap_or(0);
+                let tab_scroll = TabBar::fit_active_scroll_offset(
+                    active_idx,
+                    bar.tabs.len(),
+                    main_b.width as usize,
+                    |i| labels[i].chars().count(),
+                );
+                if let Some(idx) =
+                    hit_tab_index_from_labels(&labels, main_b.x, pos.x, tab_scroll)
+                {
                     let new_tab = match idx {
                         0 => PipelineDetailTab::Pipeline,
                         1 => PipelineDetailTab::Issue,
@@ -15540,10 +15560,11 @@ impl CoordApp {
         // status bar remains informative instead of going blank.
         let hints = if self.active_view == SidebarView::Terminal {
             // #424: Terminal pane — F12 toggles PTY focus / chrome focus.
+            // #605: Ctrl-W is the keyboard pane leader (Ctrl-W h = side panel).
             if self.terminal_focused {
-                " PTY focused — F12 = release  (typed keys go to the shell) ".to_string()
+                " PTY focused — F12 / Ctrl-W h = release  (typed keys go to the shell) ".to_string()
             } else {
-                " PTY released — F12 = focus  ·  1–5 switch view  ·  q=quit ".to_string()
+                " PTY released — F12 / Ctrl-W l = focus  ·  1–5 switch view  ·  q=quit ".to_string()
             }
         } else if self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal
@@ -15553,9 +15574,9 @@ impl CoordApp {
             // `s` (released only) launches a local `coord assign --interactive`
             // claude session for the selected issue.
             if self.detail_terminal_focused {
-                " PTY focused — F12 = release  (typed keys go to the shell) ".to_string()
+                " PTY focused — F12 / Ctrl-W h = release  (typed keys go to the shell) ".to_string()
             } else {
-                " PTY released — F12 = focus  ·  s = interactive claude  ·  j/k=nav  h/l=tabs  q=quit ".to_string()
+                " PTY released — F12 / Ctrl-W l = focus  ·  s = interactive claude  ·  j/k=nav  h/l=tabs  Ctrl-W h=side panel  q=quit ".to_string()
             }
         } else if self.active_view == SidebarView::Machines {
             // Machines panel action hints.
@@ -15611,7 +15632,7 @@ impl CoordApp {
             // #194: Pipeline-specific hints: refresh, navigate, go, dismiss done.
             // #386: include i=steer on the Log tab so the feature is discoverable.
             if self.pipeline_detail_tab == PipelineDetailTab::Log {
-                " j/k=nav  Enter=go  i=steer  R=refresh  D=dismiss-done  h/l=tabs  q=quit "
+                " j/k=nav  Enter=go  i=steer  R=refresh  D=dismiss-done  h/l=tabs  < >=hscroll  q=quit "
                     .to_string()
             } else {
                 " j/k=nav  Enter=go  R=refresh  D=dismiss-done  h/l=tabs  q=quit ".to_string()
@@ -19503,8 +19524,15 @@ impl CoordApp {
 
 /// #269: Hit-test a click against a TUI tab bar's labels.  Walks the
 /// labels left-to-right, accumulating character widths to derive each
-/// tab's `start_x..end_x` boundary.  Returns the tab index under the
-/// cursor or `None` if the click landed past the last tab.
+/// tab's `start_x..end_x` boundary.  Returns the (absolute) tab index
+/// under the cursor or `None` if the click landed past the last tab.
+///
+/// `scroll_offset` (#605) is the index of the first *visible* tab: the
+/// painter skips that many tabs and renders the rest from the left edge
+/// (the TUI rasteriser disables scroll arrows, so there is no left-arrow
+/// shift). The walk therefore starts accumulating at `origin_x` from tab
+/// `scroll_offset`, and the returned index is absolute so it still maps
+/// to the right tab. Pass `0` when the bar isn't scrolled.
 ///
 /// Why not `Backend::tab_bar_layout`: that's the rasteriser's authoritative
 /// hit-region map but requires a `&mut Backend` we don't want to plumb
@@ -19513,9 +19541,14 @@ impl CoordApp {
 /// same boundaries the painter used.  GTK rendering uses pixel widths
 /// and would need the layout call — track in a follow-up if that
 /// backend ever has a regression here.
-fn hit_tab_index_from_labels(labels: &[&str], origin_x: f32, click_x: f32) -> Option<usize> {
+fn hit_tab_index_from_labels(
+    labels: &[&str],
+    origin_x: f32,
+    click_x: f32,
+    scroll_offset: usize,
+) -> Option<usize> {
     let mut cursor = origin_x;
-    for (i, label) in labels.iter().enumerate() {
+    for (i, label) in labels.iter().enumerate().skip(scroll_offset) {
         let width = label.chars().count() as f32;
         let end = cursor + width;
         if click_x >= cursor && click_x < end {
@@ -21349,6 +21382,85 @@ impl CoordApp {
     /// the event was consumed (caller should suppress further routing
     /// and request a redraw); `false` when there is no live session or
     /// the key produced no PTY bytes (e.g. CapsLock).
+    /// #605: minimal `Ctrl-W` pane leader for keyboard focus movement — a
+    /// keyboard-only slice of the #578 focus model (no mouse focus).
+    ///
+    /// Returns `Some(Reaction)` when the event was consumed as part of a leader
+    /// sequence (either the `Ctrl-W` prefix itself, or the key that resolves
+    /// it), and `None` when the event is unrelated and should fall through to
+    /// normal dispatch.
+    ///
+    ///   `Ctrl-W h` / `Ctrl-W Left`   → focus the side panel: blur the embedded
+    ///                                   terminal so bare `j`/`k` drive the
+    ///                                   sidebar again.  Works from the terminal
+    ///                                   or any tab.
+    ///   `Ctrl-W l` / `Ctrl-W Right`  → focus the content pane (and the PTY when
+    ///                                   the active tab/view is a Terminal).
+    ///   `Ctrl-W Ctrl-W`              → forward a literal `Ctrl-W` to the focused
+    ///                                   PTY, so an inner app's own window key
+    ///                                   (e.g. vim) is still reachable.
+    /// Any other key after the prefix cancels the leader (swallowed, no action).
+    fn handle_ctrl_w_leader(
+        &mut self,
+        key: &Key,
+        modifiers: &quadraui::Modifiers,
+    ) -> Option<Reaction> {
+        use quadraui::NamedKey;
+
+        // Step 2 — a key following the `Ctrl-W` prefix resolves the chord.
+        if self.ctrl_w_pending {
+            self.ctrl_w_pending = false;
+            match key {
+                // → side panel: blur whichever embedded terminal is focused.
+                // No explicit sidebar-focus flag exists; releasing the PTY is
+                // what restores bare-key navigation to the sidebar.
+                Key::Char('h') | Key::Named(NamedKey::Left)
+                    if !modifiers.ctrl && !modifiers.alt =>
+                {
+                    self.terminal_focused = false;
+                    self.detail_terminal_focused = false;
+                }
+                // → content pane: focus the embedded terminal when one is shown.
+                Key::Char('l') | Key::Named(NamedKey::Right)
+                    if !modifiers.ctrl && !modifiers.alt =>
+                {
+                    if self.active_view == SidebarView::Terminal {
+                        self.terminal_focused = true;
+                    } else if self.active_view == SidebarView::Pipeline
+                        && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                    {
+                        self.detail_terminal_focused = true;
+                    }
+                }
+                // `Ctrl-W Ctrl-W` → literal `Ctrl-W` to the focused PTY.
+                Key::Char('w') | Key::Char('W') if modifiers.ctrl => {
+                    if self.active_view == SidebarView::Terminal && self.terminal_focused {
+                        let _ = self.forward_key_to_pty(key, modifiers);
+                    } else if self.active_view == SidebarView::Pipeline
+                        && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                        && self.detail_terminal_focused
+                    {
+                        let _ = self.forward_key_to_detail_terminal(key, modifiers);
+                    }
+                }
+                // Any other key cancels the leader.
+                _ => {}
+            }
+            return Some(Reaction::Redraw);
+        }
+
+        // Step 1 — the `Ctrl-W` prefix itself: arm the latch, consume the key.
+        if matches!(key, Key::Char('w') | Key::Char('W'))
+            && modifiers.ctrl
+            && !modifiers.alt
+        {
+            self.ctrl_w_pending = true;
+            return Some(Reaction::Redraw);
+        }
+
+        None
+    }
+
     fn forward_key_to_pty(&mut self, key: &Key, mods: &quadraui::Modifiers) -> bool {
         let Some(sess) = self.terminal_session.as_mut() else {
             return false;
@@ -23590,11 +23702,18 @@ impl ShellApp for CoordApp {
                     // Tab bar.  `#464`: route through `detail_tab_bar_height`
                     // so the painted top of the content rect lines up with
                     // the hit-test origin in the TUI backend.
-                    let tab_bar = self.pipeline_detail_tab_bar();
+                    let mut tab_bar = self.pipeline_detail_tab_bar();
                     let tab_h = detail_tab_bar_height(lh);
                     let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                     let content_rect =
                         Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
+                    // #605: scroll the tab bar so the ACTIVE tab is visible on a
+                    // narrow width (7 tabs overflow a small screen). The TUI
+                    // painter renders from `scroll_offset` verbatim, so resolve
+                    // the offset that keeps the active tab on-screen before
+                    // drawing. The click hit-test below derives the same offset.
+                    tab_bar.scroll_offset =
+                        backend.tab_bar_layout(tab_rect, &tab_bar).correct_scroll_offset;
                     backend.draw_tab_bar(tab_rect, &tab_bar, None);
 
                     match self.pipeline_detail_tab {
@@ -23941,6 +24060,19 @@ impl ShellApp for CoordApp {
                     // quadraui built-in text-selection copy path (tui/run.rs:258).
                     let _ = self.handle(UiEvent::TextCopied(text), backend, ctx);
                     return Reaction::Redraw;
+                }
+            }
+        }
+
+        // ── #605: Ctrl-W pane leader (keyboard focus move — no mouse) ────
+        // Caught BEFORE the terminal-focus blocks below so the chord is not
+        // swallowed by a focused PTY's key-forward.  Skipped while a blocking
+        // modal or the fuzzy finder owns the keyboard (they consume keys and
+        // a stray leader latch would surprise the user).
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            if !self.any_blocking_modal_active() && self.issue_finder.is_none() {
+                if let Some(reaction) = self.handle_ctrl_w_leader(key, modifiers) {
+                    return reaction;
                 }
             }
         }
@@ -25220,18 +25352,24 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── h/l (Left/Right) — horizontal scroll the Log tab (#302)
-                    // Lines are no longer clipped at 60 chars; scroll sideways
-                    // to read long turn text / commands. The rasteriser clamps
-                    // the offset to content width and paints an h-scrollbar.
-                    Key::Char('l') | Key::Named(NamedKey::Right)
+                    // ── < / > — horizontal scroll the Log tab (#302). Lines are
+                    // no longer clipped at 60 chars; scroll sideways to read long
+                    // turn text / commands. The rasteriser clamps the offset to
+                    // content width and paints an h-scrollbar.
+                    //
+                    // #605: bare h/l/Left/Right used to be bound here, which
+                    // hijacked the global tab-cycle convention and stranded the
+                    // user on the Log tab ("can't get past Log"). H-scroll now
+                    // lives on `<`/`>` so bare h/l/Left/Right fall through to the
+                    // detail-tab cycler below.
+                    Key::Char('>')
                         if self.active_view == SidebarView::Pipeline
                             && self.pipeline_detail_tab == PipelineDetailTab::Log =>
                     {
                         self.pipeline_log_hscroll = self.pipeline_log_hscroll.saturating_add(8);
                         needs_redraw = true;
                     }
-                    Key::Char('h') | Key::Named(NamedKey::Left)
+                    Key::Char('<')
                         if self.active_view == SidebarView::Pipeline
                             && self.pipeline_detail_tab == PipelineDetailTab::Log =>
                     {
@@ -25485,6 +25623,14 @@ impl ShellApp for CoordApp {
                             self.detail_terminal_focused = false;
                         }
                         self.pipeline_detail_tab = next;
+                        // #605: landing ON the Terminal tab via keyboard nav
+                        // focuses the PTY immediately — no separate F12 needed
+                        // ("once the tab is active it should have focus").
+                        // The mouse tab-click path is intentionally left
+                        // unfocused (no mouse-focus support yet).
+                        if next == PipelineDetailTab::Terminal {
+                            self.detail_terminal_focused = true;
+                        }
                         self.pipeline_detail_scroll =
                             if self.pipeline_detail_tab == PipelineDetailTab::Log {
                                 usize::MAX
@@ -25514,6 +25660,14 @@ impl ShellApp for CoordApp {
                             self.detail_terminal_focused = false;
                         }
                         self.pipeline_detail_tab = next;
+                        // #605: landing ON the Terminal tab via keyboard nav
+                        // focuses the PTY immediately — no separate F12 needed
+                        // ("once the tab is active it should have focus").
+                        // The mouse tab-click path is intentionally left
+                        // unfocused (no mouse-focus support yet).
+                        if next == PipelineDetailTab::Terminal {
+                            self.detail_terminal_focused = true;
+                        }
                         self.pipeline_detail_scroll =
                             if self.pipeline_detail_tab == PipelineDetailTab::Log {
                                 usize::MAX
@@ -27994,6 +28148,7 @@ mod tests {
             detail_terminal_sessions: std::collections::HashMap::new(),
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
+            ctrl_w_pending: false,
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #454
             pty_pressed_buttons: 0,
@@ -29119,14 +29274,14 @@ mod tests {
     fn hit_tab_index_from_labels_resolves_first_tab() {
         let labels = [" Board ", " Issue "];
         // Click at x=3 falls inside " Board " (chars 0-6).
-        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 3.0), Some(0));
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 3.0, 0), Some(0));
     }
 
     #[test]
     fn hit_tab_index_from_labels_resolves_second_tab() {
         let labels = [" Board ", " Issue "];
         // " Board " is 7 chars wide, " Issue " covers x=7..14.
-        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 10.0), Some(1));
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 10.0, 0), Some(1));
     }
 
     #[test]
@@ -29137,13 +29292,13 @@ mod tests {
         // " Pipeline " is 10 chars → " Issue " starts at 60.
         // " Issue " is 7 chars → " Stages " starts at 67.
         // Click at x=70 should land in " Stages ".
-        assert_eq!(hit_tab_index_from_labels(&labels, 50.0, 70.0), Some(2));
+        assert_eq!(hit_tab_index_from_labels(&labels, 50.0, 70.0, 0), Some(2));
     }
 
     #[test]
     fn hit_tab_index_from_labels_returns_none_past_last_tab() {
         let labels = [" Board ", " Issue "];
-        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 100.0), None);
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 100.0, 0), None);
     }
 
     #[test]
@@ -29153,7 +29308,39 @@ mod tests {
         // breaks here.
         let labels = [" Pipeline ", " Issue ", " Stages (3) "];
         // " Pipeline " (10) + " Issue " (7) = 17 → " Stages (3) " starts at 17.
-        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 20.0), Some(2));
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 20.0, 0), Some(2));
+    }
+
+    #[test]
+    fn hit_tab_index_from_labels_honors_scroll_offset() {
+        // #605: when the bar is scrolled so the first two tabs are off-screen,
+        // the visible tabs render from the origin starting at index 2. A click
+        // at the left edge resolves to the absolute index 2, not 0.
+        let labels = [" Pipeline ", " Issue ", " Stages ", " Log "];
+        // scroll_offset=2 → " Stages " painted at x=0..8, " Log " at 8..13.
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 3.0, 2), Some(2));
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 9.0, 2), Some(3));
+        // The scrolled-away tabs are unreachable by click.
+        assert_eq!(hit_tab_index_from_labels(&labels, 0.0, 3.0, 2), Some(2));
+    }
+
+    #[test]
+    fn fit_active_scroll_offset_scrolls_to_last_tab_when_narrow() {
+        // #605: the 7-tab Pipeline bar on a narrow width must scroll so the
+        // active (last) tab is visible. With ~20 cells available, offset 0
+        // can't show the Terminal tab; the helper walks back to an offset
+        // where it fits at the right edge.
+        let labels = [
+            " Pipeline ", " Issue ", " Stages ", " Log ", " Summary ",
+            " Refinement ", " Terminal ",
+        ];
+        let off = TabBar::fit_active_scroll_offset(
+            6, labels.len(), 20, |i| labels[i].chars().count(),
+        );
+        assert!(off > 0, "must scroll right to reveal the active last tab");
+        // And the active tab fits within the width from that offset.
+        let used: usize = labels[off..].iter().map(|l| l.chars().count()).sum();
+        assert!(used <= 20, "tabs from the offset fit the available width");
     }
 
     #[test]
@@ -40036,6 +40223,113 @@ mod tests {
             app.detail_terminal_pending_dims.get().is_none(),
             "detail_terminal_pending_dims should start as None"
         );
+    }
+
+    // ── #605: Ctrl-W pane-leader (keyboard focus move) ──────────────────────
+
+    fn ctrl() -> quadraui::Modifiers {
+        quadraui::Modifiers { ctrl: true, ..Default::default() }
+    }
+
+    #[test]
+    fn ctrl_w_pending_starts_false() {
+        assert!(!make_app_default().ctrl_w_pending);
+    }
+
+    #[test]
+    fn ctrl_w_arms_the_leader_latch() {
+        let mut app = make_app_default();
+        let r = app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        assert!(r.is_some(), "Ctrl-W is consumed");
+        assert!(app.ctrl_w_pending, "Ctrl-W arms the latch");
+    }
+
+    #[test]
+    fn ctrl_w_h_focuses_side_panel() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        app.detail_terminal_focused = true;
+
+        app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        let r = app.handle_ctrl_w_leader(&Key::Char('h'), &quadraui::Modifiers::default());
+        assert!(r.is_some(), "the follow-up key is consumed");
+        assert!(!app.ctrl_w_pending, "latch cleared after the follow-up");
+        assert!(!app.detail_terminal_focused, "Ctrl-W h blurs the terminal → side panel");
+    }
+
+    #[test]
+    fn ctrl_w_left_arrow_also_focuses_side_panel() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Terminal;
+        app.terminal_focused = true;
+
+        app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        app.handle_ctrl_w_leader(&Key::Named(NamedKey::Left), &quadraui::Modifiers::default());
+        assert!(!app.terminal_focused, "Ctrl-W Left blurs the standalone terminal");
+    }
+
+    #[test]
+    fn ctrl_w_l_focuses_detail_terminal_content() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        app.detail_terminal_focused = false;
+
+        app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        app.handle_ctrl_w_leader(&Key::Char('l'), &quadraui::Modifiers::default());
+        assert!(app.detail_terminal_focused, "Ctrl-W l focuses the detail terminal");
+        assert!(!app.ctrl_w_pending);
+    }
+
+    #[test]
+    fn ctrl_w_l_on_non_terminal_tab_is_noop_focus() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Issue;
+
+        app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        let r = app.handle_ctrl_w_leader(&Key::Char('l'), &quadraui::Modifiers::default());
+        assert!(r.is_some(), "still consumed (leader resolved)");
+        assert!(!app.detail_terminal_focused, "no terminal on this tab → nothing to focus");
+    }
+
+    #[test]
+    fn ctrl_w_ctrl_w_resolves_and_keeps_focus() {
+        // Ctrl-W Ctrl-W forwards a literal Ctrl-W to the focused PTY (no live
+        // session in the test → forward is a no-op), clears the latch, and is
+        // consumed.  Focus is unchanged (the byte goes to the inner app).
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Terminal;
+        app.terminal_focused = true;
+
+        app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        let r = app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        assert!(r.is_some());
+        assert!(!app.ctrl_w_pending, "second Ctrl-W resolves the chord");
+        assert!(app.terminal_focused, "literal-forward leaves focus unchanged");
+    }
+
+    #[test]
+    fn bare_key_without_latch_passes_through() {
+        let mut app = make_app_default();
+        let r = app.handle_ctrl_w_leader(&Key::Char('j'), &quadraui::Modifiers::default());
+        assert!(r.is_none(), "non-leader keys fall through to normal dispatch");
+        assert!(!app.ctrl_w_pending);
+    }
+
+    #[test]
+    fn unrecognized_follow_up_cancels_the_leader() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        app.detail_terminal_focused = true;
+
+        app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        let r = app.handle_ctrl_w_leader(&Key::Char('x'), &quadraui::Modifiers::default());
+        assert!(r.is_some(), "the follow-up is swallowed while latched");
+        assert!(!app.ctrl_w_pending, "latch cleared");
+        assert!(app.detail_terminal_focused, "an unrecognized key leaves focus unchanged");
     }
 
     /// Integration test: actually spawn /bin/sh for a per-issue terminal,
