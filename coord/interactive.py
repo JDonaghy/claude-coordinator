@@ -83,6 +83,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 if TYPE_CHECKING:
+    from coord.agent import MergeVerify
     from coord.config import Config
     from coord.models import Board
 
@@ -895,6 +896,11 @@ class InteractiveFinalizeResult:
     already_recorded: bool
     seam_outcome: object | None = None  # StoreOutcome | None
     worktree_removed: bool = field(default=False)
+    # #604: populated only on the --merge-of path (verify_merge=True).  Carries
+    # the merge verification (default_ahead / added / foreign) so the caller can
+    # surface the offending commits even after the worktree is removed.  None
+    # for every other interactive flavour.
+    merge_verify: MergeVerify | None = field(default=None)
 
 
 def _git_push(wt_path: Path, *, timeout: float = 60.0) -> tuple[bool, str | None]:
@@ -967,6 +973,82 @@ def _assignment_already_recorded(assignment_id: str) -> bool:
     return status not in (None, "", "running", "pending")
 
 
+def _finalize_merge_blocked(
+    *,
+    merge_verify,  # agent.MergeVerify (not ok)
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    repo_github: str,
+    issue_number: int,
+    base_branch: str,
+    worktree_path: str | None,
+    repo_path: str | None,
+    started_at: float | None,
+    log_path: str | None,
+) -> InteractiveFinalizeResult:
+    """Record a botched ``--merge-of`` rebase as blocked → ``failed`` (#604).
+
+    Routes through the same ``post_result(status=blocked)`` seam ``coord
+    report-result`` uses (so a thin client still lands the write on the daemon),
+    OVERRIDING any ``done`` the agent self-reported.  ``blocked`` maps to a
+    ``failed`` board state — there is no literal ``blocked`` status the rest of
+    the pipeline understands; the override's whole purpose is to keep the entry
+    out of the merge-ready set.  The offending commits ride in the summary,
+    posted on the issue, so the operator sees exactly why.  Cleans up the
+    worktree afterwards, matching the normal-path discipline.
+    """
+    from coord.issue_store import (  # noqa: PLC0415
+        STATUS_BLOCKED,
+        ResultRecord,
+        post_result,
+    )
+
+    wt_p = Path(worktree_path) if worktree_path else None
+    branch_now = (
+        _current_branch(wt_p) if wt_p is not None and wt_p.exists() else None
+    )
+    # Capture whether the agent had already self-reported BEFORE we override it,
+    # so the caller can tell "we overrode a self-reported done" from "we were
+    # the only writer".
+    prior_recorded = _assignment_already_recorded(assignment_id)
+
+    duration: float | None = None
+    if started_at is not None:
+        duration = max(0.0, time.time() - started_at)
+
+    outcome = post_result(
+        ResultRecord(
+            assignment_id=assignment_id,
+            machine_name=machine_name,
+            repo_name=repo_name,
+            repo_github=repo_github,
+            issue_number=issue_number,
+            status=STATUS_BLOCKED,
+            verdict=None,
+            summary=merge_verify.block_summary(base_branch),
+            duration_seconds=duration,
+            log_path=log_path,
+            branch=branch_now,
+        )
+    )
+
+    worktree_removed = False
+    if repo_path is not None and wt_p is not None:
+        worktree_removed = _remove_worktree(Path(repo_path), wt_p)
+
+    return InteractiveFinalizeResult(
+        terminal_status=outcome.status,  # "failed" (blocked → failed)
+        commits_ahead=merge_verify.default_ahead,
+        push_ok=True,
+        push_error=None,
+        already_recorded=prior_recorded,
+        seam_outcome=outcome,
+        worktree_removed=worktree_removed,
+        merge_verify=merge_verify,
+    )
+
+
 def finalize_interactive_exit(
     *,
     assignment_id: str,
@@ -981,6 +1063,7 @@ def finalize_interactive_exit(
     log_path: str | None = None,
     repo_path: str | None = None,
     artifact_paths: list[str] | None = None,
+    verify_merge: bool = False,
 ) -> InteractiveFinalizeResult:
     """Git-floor backstop for the interactive launcher exit path (#466).
 
@@ -1009,6 +1092,43 @@ def finalize_interactive_exit(
     discipline of :meth:`coord.agent.AgentServer._cleanup_worktree`.
     """
     _effective_patterns = list(artifact_paths or [])
+
+    # ── Merge-prep verification gate (#604) ──────────────────────────────────
+    # For the interactive MERGE agent (--merge-of), GIT TRUTH OVERRIDES the
+    # agent's self-report.  A rebase that left the branch behind the target
+    # branch, or force-pushed a polluted history dragging in unrelated
+    # already-merged commits, must NEVER be recorded as `done` — even if the
+    # agent ran `coord report-result --status done` (vimcode #494, 2026-06-15).
+    #
+    # This deliberately INVERTS the precedence used everywhere else in this
+    # function, where `_assignment_already_recorded` wins and a 0-commit review
+    # session is legitimately fine.  For merge-prep the opposite is true: a
+    # clean-exit self-report is exactly what a botched rebase looks like, so we
+    # re-derive the truth from git and let it override.  Do NOT "simplify" this
+    # back to deferring to the report.
+    merge_verify = None
+    if verify_merge and worktree_path:
+        wt_v = Path(worktree_path)
+        if wt_v.exists():
+            from coord.agent import verify_merge_branch  # noqa: PLC0415
+
+            merge_verify = verify_merge_branch(
+                wt_v, base=base_branch, issue_number=issue_number
+            )
+            if not merge_verify.ok:
+                return _finalize_merge_blocked(
+                    merge_verify=merge_verify,
+                    assignment_id=assignment_id,
+                    machine_name=machine_name,
+                    repo_name=repo_name,
+                    repo_github=repo_github,
+                    issue_number=issue_number,
+                    base_branch=base_branch,
+                    worktree_path=worktree_path,
+                    repo_path=repo_path,
+                    started_at=started_at,
+                    log_path=log_path,
+                )
 
     # Respect an explicit `coord report-result` from the agent.  Without
     # this check, every review session (which legitimately has 0 commits)
@@ -1043,6 +1163,7 @@ def finalize_interactive_exit(
             already_recorded=True,
             seam_outcome=None,
             worktree_removed=worktree_removed,
+            merge_verify=merge_verify,
         )
 
     # worktree_path is None for a human-attended REVIEW (migration A1): the
@@ -1133,6 +1254,7 @@ def finalize_interactive_exit(
         already_recorded=False,
         seam_outcome=outcome,
         worktree_removed=worktree_removed,
+        merge_verify=merge_verify,
     )
 
 

@@ -4049,7 +4049,14 @@ def assign(
                 "operator).\n"
                 "4. Run the project's build/tests to confirm nothing broke.\n"
                 "5. `git push --force-with-lease`.\n"
-                "6. Tell the operator the branch is rebased + green and ready to "
+                f"6. Run `coord verify-merge {merge_of}` to self-check the "
+                "result. If it reports `default-ahead != 0` or any FOREIGN "
+                "commits, your rebase is WRONG (stale base or polluted history) "
+                "— fix it before reporting done, or report `--status blocked`. "
+                "The coordinator runs this same check on exit and will record "
+                "`blocked` (not `done`) if it fails, so a botched rebase cannot "
+                "slip through.\n"
+                "7. Tell the operator the branch is rebased + green and ready to "
                 "merge.\n"
             )
 
@@ -4070,6 +4077,10 @@ def assign(
                 f"`origin/{merge_target_branch}` (#306 proactive rebase), resolve "
                 "any conflicts (mechanical additively; semantic with the "
                 "operator), run the tests, and `git push --force-with-lease`. "
+                f"Before you report done, run `coord verify-merge {merge_of}` — "
+                f"if `{merge_target_branch}-ahead != 0` or any FOREIGN commits "
+                "are listed, the rebase is wrong (stale base / polluted history); "
+                "fix it or report `--status blocked` (#604). "
                 "Then tell the operator it's ready to merge — they press 'Go' in "
                 "the TUI (or run `coord merge`). Do NOT merge to the default "
                 "branch yourself.\n"
@@ -4185,8 +4196,30 @@ def assign(
                     started_at=started_at,
                     log_path=None,
                     repo_path=merge_repo_path,
+                    # #604: git truth overrides the agent's self-report on the
+                    # merge path — a botched rebase records `blocked`, not `done`.
+                    verify_merge=True,
                 )
-                if finalize_result.already_recorded:
+                # Forensics (#604): the worktree + reflog are gone by now, so
+                # this echo is the only post-hoc record of what would merge.
+                _mv = finalize_result.merge_verify
+                if _mv is not None:
+                    click.echo(
+                        f"  merge verify: {merge_target_branch}-ahead="
+                        f"{_mv.default_ahead} added={len(_mv.added)} commit(s)"
+                    )
+                    for _sha, _subj in _mv.added:
+                        _flag = " [FOREIGN]" if (_sha, _subj) in _mv.foreign else ""
+                        click.echo(f"    {_sha[:9]} {_subj}{_flag}")
+                    if not _mv.ok:
+                        click.echo(
+                            "  ✗ MERGE BLOCKED (#604): "
+                            f"{_mv.block_summary(merge_target_branch)}",
+                            err=True,
+                        )
+                if finalize_result.already_recorded and (
+                    _mv is None or _mv.ok
+                ):
                     click.echo(
                         "  result recorded via `coord report-result`; backstop "
                         "did not overwrite"
@@ -5561,6 +5594,74 @@ def report_result(
     )
     if outcome.error:
         click.echo(f"  github post warning: {outcome.error}", err=True)
+
+
+@main.command(
+    "verify-merge",
+    help=(
+        "Self-check a --merge-of rebase before reporting done (#604). Run from "
+        "inside the merge worktree: `coord verify-merge <work_aid>`. Reports how "
+        "many commits the branch is still MISSING from the default branch "
+        "(`default-ahead`, must be 0), the commits it adds, and any FOREIGN "
+        "commits (referencing a different issue) — the signature of a botched "
+        "rebase that dragged in unrelated history. Exits non-zero when the "
+        "branch is not merge-ready."
+    ),
+)
+@click.argument("work_aid")
+@click.option(
+    "--path",
+    "path_opt",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Worktree to check (default: current directory).",
+)
+@_CONFIG_OPTION
+def verify_merge(work_aid: str, path_opt: str | None, config_path: Path) -> None:
+    """``coord verify-merge <work_aid>`` — git-truth check of a merge-prep branch.
+
+    Resolves the issue + default branch from the *work* assignment id (the same
+    id passed to ``coord assign --merge-of``) and runs the shared
+    :func:`coord.agent.verify_merge_branch` primitive against the worktree the
+    merge agent is sitting in.  This is the defense-in-depth twin of the
+    coordinator-side gate in :func:`coord.interactive.finalize_interactive_exit`:
+    same check, available to the agent before it self-reports.
+    """
+    from coord.agent import verify_merge_branch  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    board = build_board()
+    work = board.find_by_id(work_aid)
+    if work is None:
+        click.echo(
+            f"error: no assignment {work_aid!r} on the board (use the work id "
+            "from `coord status`).",
+            err=True,
+        )
+        sys.exit(2)
+
+    repo_cfg = cfg.repo(work.repo_name)
+    base = (repo_cfg.default_branch if repo_cfg else None) or "main"
+    wt_path = Path(path_opt).expanduser() if path_opt else Path.cwd()
+
+    mv = verify_merge_branch(
+        wt_path, base=base, issue_number=int(work.issue_number)
+    )
+
+    click.echo(f"branch:        {work.branch or '(unknown)'}")
+    click.echo(f"target base:   {base}")
+    click.echo(f"{base}-ahead:   {mv.default_ahead}  (must be 0)")
+    click.echo(f"adds {len(mv.added)} commit(s) over {base}:")
+    for sha, subj in mv.added:
+        flag = " [FOREIGN]" if (sha, subj) in mv.foreign else ""
+        click.echo(f"  {sha[:9]} {subj}{flag}")
+
+    if mv.ok:
+        click.echo("✓ merge-ready: base fully contained, no foreign commits.")
+        return
+    click.echo(f"✗ NOT merge-ready: {mv.block_summary(base)}", err=True)
+    sys.exit(1)
 
 
 @main.command(

@@ -432,6 +432,147 @@ def _commits_ahead(wt_path: Path, base: str) -> int | None:
     return None
 
 
+_ISSUE_REF_RE = re.compile(r"#(\d+)")
+
+
+def _subject_references_foreign_issue(subject: str, issue_number: int) -> bool:
+    """Cheap, high-signal heuristic for #604: does this commit subject belong
+    to a *different* issue than the one being merged?
+
+    Returns ``True`` only when the subject references at least one ``#NNN`` and
+    *none* of them is ``issue_number`` — so a commit that mentions the issue
+    (even alongside others) is never flagged, and a commit with no ``#NNN`` at
+    all (a fixup/wip with a bare message) is left alone.  This deliberately
+    keeps false positives low: it fired in the vimcode #494 botch because the
+    dragged-in commits were ``fix(#514)`` / ``#488`` / ``#207`` — each
+    referencing only its own, already-merged issue.
+    """
+    refs = {int(m) for m in _ISSUE_REF_RE.findall(subject)}
+    if not refs:
+        return False
+    return issue_number not in refs
+
+
+def _resolve_base_ref(wt_path: Path, base: str) -> str | None:
+    """First of ``origin/<base>`` / ``<base>`` that resolves, else ``None``.
+
+    Mirrors the :func:`_commits_ahead` fallback so the merge verification works
+    against both real remotes and the local-only git fixtures the test-suite
+    builds.  Resolving the ref ONCE (rather than per-query) keeps every count in
+    :func:`verify_merge_branch` consistent with the same base.
+    """
+    for ref in (f"origin/{base}", base):
+        try:
+            _git(wt_path, "rev-parse", "--verify", "--quiet", ref)
+            return ref
+        except _GitError:
+            continue
+    return None
+
+
+@dataclass
+class MergeVerify:
+    """Result of verifying a merge-prep branch against its target (#604).
+
+    Attributes:
+        default_ahead: Commits present in ``<base>`` but **missing** from
+            ``HEAD`` (``git rev-list --count HEAD..<base>``).  MUST be 0 — the
+            branch has to contain current ``<base>`` (the rebase actually
+            happened and is up to date).  ``None`` when git couldn't determine
+            it (base ref missing, detached HEAD) → treated as NOT ``ok``: an
+            unverifiable merge branch must never pass as clean.
+        added: ``(sha, subject)`` the branch contributes over ``<base>``
+            (``<base>..HEAD``), newest first.  Captured for forensics — the
+            worktree + reflog are removed on session exit, so this is the only
+            post-hoc record of exactly what would merge.
+        foreign: The subset of *added* whose subject references a *different*
+            ``#NNN`` than the issue being merged (see
+            :func:`_subject_references_foreign_issue`) — the heuristic for the
+            #494 pollution.
+    """
+
+    default_ahead: int | None
+    added: list[tuple[str, str]]
+    foreign: list[tuple[str, str]]
+
+    @property
+    def ok(self) -> bool:
+        """Clean to record ``done``: base fully contained AND no foreign commits."""
+        return self.default_ahead == 0 and not self.foreign
+
+    def block_summary(self, base: str) -> str:
+        """Operator-facing reason this branch is NOT merge-ready (for the
+        ``blocked`` summary posted on the issue)."""
+        parts: list[str] = []
+        if self.default_ahead is None:
+            parts.append(
+                f"could not confirm the branch contains current `{base}` "
+                "(git check failed)"
+            )
+        elif self.default_ahead != 0:
+            parts.append(
+                f"branch is missing {self.default_ahead} commit(s) from `{base}` "
+                "— the rebase did not bring it up to date (run `git fetch` and "
+                f"rebase onto `origin/{base}`)"
+            )
+        if self.foreign:
+            flist = "; ".join(f"{sha[:9]} {subj}" for sha, subj in self.foreign)
+            parts.append(
+                f"{len(self.foreign)} foreign commit(s) that do not belong to "
+                f"this issue: {flist}"
+            )
+        reason = "; ".join(parts) or "merge verification failed"
+        return f"Merge-prep blocked (#604): {reason}."
+
+
+def verify_merge_branch(
+    wt_path: Path, *, base: str, issue_number: int
+) -> MergeVerify:
+    """Verify a ``--merge-of`` branch before its terminal ``done`` is recorded.
+
+    A merge-prep agent's job is to rebase the approved work branch onto the
+    current default branch and force-push it, ready to merge.  It can get this
+    wrong — rebase onto a stale base, or force-push a polluted history that
+    drags in unrelated, already-merged commits — and still self-report ``done``
+    (vimcode #494, 2026-06-15).  This pure-git check is the floor that catches
+    that: see :class:`MergeVerify` for the fields.
+
+    Pure ``git rev-list`` / ``rev-parse`` plumbing — no network, no subprocess
+    ``claude``, no PTY — so the gate runs as a fast local-only test fixture.
+    """
+    ref = _resolve_base_ref(wt_path, base)
+    if ref is None:
+        # Base ref missing entirely — can't verify anything.  default_ahead=None
+        # makes this NOT ok (conservative): we won't pass an unverifiable branch.
+        return MergeVerify(default_ahead=None, added=[], foreign=[])
+
+    default_ahead: int | None
+    try:
+        raw = _git(wt_path, "rev-list", "--count", f"HEAD..{ref}")
+        default_ahead = int(raw.strip())
+    except (_GitError, ValueError):
+        default_ahead = None
+
+    added: list[tuple[str, str]] = []
+    try:
+        out = _git(wt_path, "log", "--format=%H%x09%s", f"{ref}..HEAD")
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            sha, _, subject = line.partition("\t")
+            added.append((sha, subject))
+    except _GitError:
+        added = []
+
+    foreign = [
+        (sha, subj)
+        for sha, subj in added
+        if _subject_references_foreign_issue(subj, issue_number)
+    ]
+    return MergeVerify(default_ahead=default_ahead, added=added, foreign=foreign)
+
+
 def _safe_realpath(path: str) -> str:
     try:
         return os.path.realpath(path)
