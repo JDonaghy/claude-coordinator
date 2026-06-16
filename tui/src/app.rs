@@ -22258,6 +22258,22 @@ impl CoordApp {
         let Some((key, verdict)) = found else {
             return false;
         };
+        // #602: don't preempt a still-attended testing session.  The verdict is
+        // usually recorded with `coord test --fail|--passed` from *inside* the
+        // interactive test session, so it lands while the operator is still in
+        // the pane (claude running, or the shell prompt after `/exit`).  Firing
+        // now would pop the fail→fix / pass→merge prompt over that live pane and
+        // — worse — confirming it replaces the pane's PTY (the launch insert() is
+        // keyed by this very issue_key).  So DEFER: leave the arm in place and
+        // re-check each tick; it fires once the test pane is closed (its shell
+        // has exited).  `key` IS the issue_key `detail_terminal_sessions` uses.
+        if self
+            .detail_terminal_sessions
+            .get(&key)
+            .is_some_and(|s| !s.is_exited())
+        {
+            return false;
+        }
         let Some(armed) = self.armed_for_test_verdict.remove(&key) else {
             return false;
         };
@@ -22285,9 +22301,36 @@ impl CoordApp {
     /// `--fix-of` session.  The fix is keyed on the failed WORK id (the backend
     /// #581 test-fail fix front door accepts it directly).
     fn confirm_test_fix(&mut self) {
-        let Some(p) = self.pending_test_fix.take() else {
+        let Some(p) = self.pending_test_fix.as_ref() else {
             return;
         };
+        // #602: belt-and-suspenders — never replace a live attended pane.  The
+        // offer is normally deferred until the test pane closes (see
+        // detect_test_verdict), but guard the launch directly too: if a live
+        // session for this issue is still open, keep the prompt up and tell the
+        // operator to exit first rather than clobber their session.
+        let issue_key = (p.repo_slug.clone(), p.issue_num);
+        if self
+            .detail_terminal_sessions
+            .get(&issue_key)
+            .is_some_and(|s| !s.is_exited())
+        {
+            let issue_num = p.issue_num;
+            self.push_toast(
+                "Start fix",
+                &format!(
+                    "An interactive session for #{issue_num} is still open — type \
+                     /exit (and close the shell) there, then press Enter again to \
+                     start the fix.",
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        }
+        let p = self
+            .pending_test_fix
+            .take()
+            .expect("pending_test_fix checked Some above");
         let idx = self
             .pipeline_issues
             .iter()
@@ -22314,9 +22357,32 @@ impl CoordApp {
     /// interactive `--merge-of` merge agent (proactive rebase + conflict
     /// resolution on the approved branch).
     fn confirm_merge(&mut self) {
-        let Some(p) = self.pending_merge.take() else {
+        let Some(p) = self.pending_merge.as_ref() else {
             return;
         };
+        // #602: never replace a live attended pane (same guard as confirm_test_fix).
+        let issue_key = (p.repo_slug.clone(), p.issue_num);
+        if self
+            .detail_terminal_sessions
+            .get(&issue_key)
+            .is_some_and(|s| !s.is_exited())
+        {
+            let issue_num = p.issue_num;
+            self.push_toast(
+                "Start merge",
+                &format!(
+                    "An interactive session for #{issue_num} is still open — type \
+                     /exit (and close the shell) there, then press Enter again to \
+                     start the merge.",
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        }
+        let p = self
+            .pending_merge
+            .take()
+            .expect("pending_merge checked Some above");
         let idx = self
             .pipeline_issues
             .iter()
@@ -28309,6 +28375,49 @@ mod tests {
         assert!(!app.detect_test_verdict());
         assert!(app.pending_test_fix.is_none());
         assert!(app.pending_merge.is_none());
+    }
+
+    #[test]
+    fn detect_test_verdict_defers_while_test_pane_is_live() {
+        // #602: the operator usually records the verdict (`coord test --fail`)
+        // from *inside* the still-attended interactive test pane.  The detector
+        // must NOT fire while a live session for that issue is open — otherwise
+        // the fail→fix prompt pops over the live pane and confirming it would
+        // replace the pane's PTY (the launch insert() is keyed by issue).  It
+        // must keep the arm and fire only once the test pane closes.
+        let mut app =
+            make_app_with_assignments(vec![done_work_with_test_state(10, "repo-a", "failed")]);
+        arm_test_verdict(&mut app, "repo-a", 10, "id-10-done", None);
+
+        // A live (non-exited) interactive session for this issue_key.
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 100)
+                .expect("spawn /bin/sh");
+        app.detail_terminal_sessions
+            .insert(("repo-a".to_string(), 10), sess);
+
+        // Deferred: no prompt raised, arm preserved for a later tick.
+        assert!(!app.detect_test_verdict(), "must defer while the pane is live");
+        assert!(app.pending_test_fix.is_none());
+        assert!(app.pending_merge.is_none());
+        assert!(
+            app.armed_for_test_verdict
+                .contains_key(&("repo-a".to_string(), 10)),
+            "arm must persist so it fires once the test pane closes"
+        );
+
+        // Operator closed the test pane → now the offer fires.
+        app.detail_terminal_sessions.clear();
+        assert!(app.detect_test_verdict(), "fires once the pane is gone");
+        assert_eq!(
+            app.pending_test_fix
+                .as_ref()
+                .expect("fail→fix prompt raised after the pane closed")
+                .issue_num,
+            10,
+        );
+        assert!(app.armed_for_test_verdict.is_empty());
     }
 
     #[test]
