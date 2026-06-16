@@ -21657,18 +21657,31 @@ impl CoordApp {
         coord_repo: &str,
         issue_num: u64,
     ) -> Option<String> {
-        self.data
+        // #602: only the LATEST review counts.  A request-changes review that a
+        // LATER review approved — or that the issue has since moved past to the
+        // Test gate — is RESOLVED; returning its stale aid would brief a fix
+        // worker with the old reviewer findings (the worker "fixes the
+        // reviewer's concerns", finds them already done, and the operator's
+        // actual test feedback never reaches it — the fail→fix misroute).  So
+        // take the most-recent review for this issue and surface it ONLY when
+        // ITS verdict is still request-changes; otherwise return None so the
+        // fail→fix path falls through to the failed WORK id (→ test_reason).
+        let latest = self
+            .data
             .assignments
             .iter()
             .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
             .filter(|a| a.assignment_type.as_deref() == Some("review"))
-            .filter(|a| a.review_verdict.as_deref() == Some("request-changes"))
             .max_by(|a, b| {
                 a.dispatched_at
                     .partial_cmp(&b.dispatched_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|a| a.id.clone())
+            })?;
+        if latest.review_verdict.as_deref() == Some("request-changes") {
+            Some(latest.id.clone())
+        } else {
+            None
+        }
     }
 
     /// Leg 2 (#517): scan armed interactive-work sessions for one the board now
@@ -28198,6 +28211,27 @@ mod tests {
         assert_eq!(
             app.request_changes_review_aid_for("repo-a", 10).as_deref(),
             Some("rev-new"),
+        );
+    }
+
+    #[test]
+    fn request_changes_review_aid_for_none_when_latest_review_approved() {
+        // #602: a round-1 request-changes review that a LATER review APPROVED is
+        // resolved — the resolver must return None so a subsequent test-failure
+        // fix targets the failed WORK row (→ its synthesized test_reason brief),
+        // not the stale reviewer findings.  This is the fail→fix misroute that
+        // briefed the worker with a previous reviewer's already-fixed concerns.
+        let mut rc = review_of("id-10-done", 10, "repo-a", Some("request-changes"));
+        rc.id = "rev-rc".to_string();
+        rc.dispatched_at = Some(2_000_000.0);
+        let mut approved = review_of("id-10-fix", 10, "repo-a", Some("approve"));
+        approved.id = "rev-ok".to_string();
+        approved.dispatched_at = Some(2_500_000.0);
+        let app = make_app_with_assignments(vec![rc, approved]);
+        assert_eq!(
+            app.request_changes_review_aid_for("repo-a", 10),
+            None,
+            "a later approval resolves the earlier request-changes",
         );
     }
 
