@@ -2359,6 +2359,22 @@ def assign(
 
         _issue_ctx = _issue_context_block(repo, issue)
 
+        # #603 write-path hint: interactive agents run in the operator's
+        # environment (so `coord` is on PATH, unlike #402-PATH-stripped -p
+        # workers).  Tell the implementer flavours to record durable findings so
+        # the next agent doesn't rediscover them.
+        _ctx_write_hint = (
+            "\n\n## Record durable findings for future agents (#603)\n"
+            "If you discover something a LATER agent on this issue must know — a "
+            "cross-repo dependency (another repo's branch/commit you had to "
+            "pull), an approach that FAILED and why, or a non-obvious constraint "
+            "— record it so it survives to the next attempt:\n"
+            f'  `coord context add {repo} {issue} "<one-line finding>" --pin`  '
+            "(--pin for a hard dependency/constraint; omit for a normal note).\n"
+            "It is injected at the TOP of every later briefing for this issue — "
+            "don't rely on memory or the PR alone.\n"
+        )
+
         # ── A1 (interactive-mode migration, Track A): INTERACTIVE REVIEW ────
         # `--review-of <work_aid>` launches a human-attended REVIEW of an
         # already-completed work assignment, not a fresh work session.  It
@@ -3057,7 +3073,7 @@ def assign(
                 "If a code fix is needed, surface the plan so the operator can "
                 "dispatch a proper Fix.\n\n"
             )
-            effective_briefing = _issue_ctx + ts_reminder + briefing
+            effective_briefing = _issue_ctx + ts_reminder + briefing + _ctx_write_hint
 
             # Pre-fill a SHORT, single-line prompt that points the session at
             # the full diagnostic on disk, rather than pasting the whole
@@ -3343,7 +3359,7 @@ def assign(
                     f"coordinator also pushes your commits to origin/{work.branch} "
                     "and re-reviews.\n\n"
                 )
-            effective_briefing = _issue_ctx + report_reminder + fix_briefing
+            effective_briefing = _issue_ctx + report_reminder + fix_briefing + _ctx_write_hint
 
             spec = _AssignmentSpecFx(
                 repo_name=repo,
@@ -4352,7 +4368,7 @@ def assign(
                 "already-implemented> [--verdict approve|request-changes] "
                 "--summary <text>` so the coordinator records the result.\n\n"
             )
-            effective_briefing = _issue_ctx + report_reminder + briefing
+            effective_briefing = _issue_ctx + report_reminder + briefing + _ctx_write_hint
 
             # Update board metadata (round_number / board_initialized).
             # `record_dispatched` already wrote the assignment row, so the
@@ -4521,7 +4537,7 @@ def assign(
                 "already-implemented> [--verdict approve|request-changes] "
                 "--summary <text>` so the coordinator records the result.\n\n"
             )
-            effective_briefing = _issue_ctx + report_reminder + briefing
+            effective_briefing = _issue_ctx + report_reminder + briefing + _ctx_write_hint
 
             save_board(build_board())
 
@@ -6510,6 +6526,98 @@ def refine(repo: str, issue: int, config_path: Path) -> None:
         remove_if_present={"status:ready"},
         success_message=f"#{issue} ({slug}) marked status:refining",
     )
+
+
+@main.group("context")
+def context_group() -> None:
+    """The per-issue rolling context digest (#603).
+
+    Short, curated notes (cross-repo deps, approaches already tried, hard
+    constraints) injected at the TOP of every agent briefing for the issue so
+    findings don't evaporate between attempts.  DB-only, dropped when the issue
+    closes.  Pinned entries stay on top and never age out.
+    """
+
+
+@context_group.command("show")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def context_show(repo: str, issue: int, config_path: Path) -> None:
+    """Print the rendered digest plus raw entries (with ids for pin/clear)."""
+    from coord.state import list_issue_context, render_issue_context_entries
+
+    entries = list_issue_context(repo, issue)
+    if not entries:
+        click.echo(f"(no context for {repo} #{issue})")
+        return
+    click.echo(render_issue_context_entries(entries))
+    click.echo("\nentries (id · source · pinned):")
+    for e in entries:
+        pin = "📌" if e["pinned"] else "  "
+        src = f" [{e['source']}]" if e.get("source") else ""
+        click.echo(f"  {pin} #{e['id']}{src}: {e['body']}")
+
+
+@context_group.command("add")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.argument("body")
+@click.option(
+    "--pin", "pinned", is_flag=True,
+    help="Pin as a critical (always on top, never aged out by the budget).",
+)
+@click.option(
+    "--source", default="operator",
+    help="Who recorded this: work|fix|review|test|operator (default operator).",
+)
+@_CONFIG_OPTION
+def context_add(
+    repo: str, issue: int, body: str, pinned: bool, source: str, config_path: Path
+) -> None:
+    """Append a context entry for REPO #ISSUE (BODY is one short finding)."""
+    from coord.state import add_issue_context_entry
+
+    eid = add_issue_context_entry(repo, issue, body, pinned=pinned, source=source)
+    tag = " (pinned)" if pinned else ""
+    suffix = f" (id {eid})" if eid else ""
+    click.echo(f"added{tag} to {repo} #{issue}{suffix}")
+
+
+@context_group.command("pin")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.argument("entry_id", type=int)
+@_CONFIG_OPTION
+def context_pin(repo: str, issue: int, entry_id: int, config_path: Path) -> None:
+    """Pin entry ENTRY_ID so it stays on top and never ages out."""
+    from coord.state import set_issue_context_pin
+
+    click.echo("pinned" if set_issue_context_pin(repo, issue, entry_id, True) else "no such entry")
+
+
+@context_group.command("unpin")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.argument("entry_id", type=int)
+@_CONFIG_OPTION
+def context_unpin(repo: str, issue: int, entry_id: int, config_path: Path) -> None:
+    """Unpin entry ENTRY_ID (it becomes a normal aged-out note)."""
+    from coord.state import set_issue_context_pin
+
+    click.echo("unpinned" if set_issue_context_pin(repo, issue, entry_id, False) else "no such entry")
+
+
+@context_group.command("clear")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def context_clear(repo: str, issue: int, config_path: Path) -> None:
+    """Delete ALL context entries for REPO #ISSUE."""
+    from coord.state import clear_issue_context
+
+    n = clear_issue_context(repo, issue)
+    click.echo(f"cleared {n} entr{'y' if n == 1 else 'ies'} for {repo} #{issue}")
 
 
 @main.command(

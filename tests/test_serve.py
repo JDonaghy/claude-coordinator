@@ -720,6 +720,54 @@ def test_issue_context_dropped_on_close(coord_db):
     assert len(state._list_issue_context_local("api", 8)) == 1
 
 
+def test_record_test_verdict_local_appends_context(coord_db):
+    # #603: a test FAILURE auto-appends a durable context entry (source=test).
+    from coord import state
+    coord_db.execute(
+        "INSERT INTO assignments(assignment_id,machine_name,repo_name,issue_number,"
+        "issue_title,status,type) VALUES('w1','m','api',7,'t','done','work')"
+    )
+    coord_db.commit()
+    state._record_test_verdict_local(assignment_id="w1", test_state="failed", test_reason="boom")
+    ents = state._list_issue_context_local("api", 7)
+    assert len(ents) == 1 and ents[0]["source"] == "test"
+    assert "Test FAILED: boom" in ents[0]["body"]
+    # A pass adds nothing.
+    state._record_test_verdict_local(assignment_id="w1", test_state="passed")
+    assert len(state._list_issue_context_local("api", 7)) == 1
+
+
+def test_post_result_request_changes_appends_context(coord_db, monkeypatch):
+    # #603: a request-changes verdict auto-appends a context entry (source=review).
+    from coord import issue_store, state
+    monkeypatch.setattr("coord.github_ops.post_issue_comment", lambda *a, **k: None)
+    coord_db.execute(
+        "INSERT INTO assignments(assignment_id,machine_name,repo_name,issue_number,"
+        "issue_title,status,type) VALUES('rev1','m','api',7,'t','running','review')"
+    )
+    coord_db.commit()
+    issue_store._post_result_local(issue_store.ResultRecord(
+        assignment_id="rev1", machine_name="m", repo_name="api", repo_github="o/api",
+        issue_number=7, status="done", verdict="request-changes",
+        findings_body="must set is_keyboard_focused", summary="",
+    ))
+    ents = state._list_issue_context_local("api", 7)
+    assert any(e["source"] == "review" and "is_keyboard_focused" in e["body"] for e in ents)
+
+
+def test_cli_context_add_show_clear(coord_db):
+    # #603: the operator-facing `coord context` round-trip.
+    from click.testing import CliRunner
+    from coord.cli import main
+    r = CliRunner()
+    out = r.invoke(main, ["context", "add", "api", "7", "depends on lib #9", "--pin"])
+    assert out.exit_code == 0 and "added" in out.output
+    out = r.invoke(main, ["context", "show", "api", "7"])
+    assert out.exit_code == 0 and "depends on lib #9" in out.output and "📌" in out.output
+    out = r.invoke(main, ["context", "clear", "api", "7"])
+    assert out.exit_code == 0 and "cleared 1" in out.output
+
+
 def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
     from coord import serve_app
 

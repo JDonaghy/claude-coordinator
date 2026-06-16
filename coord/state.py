@@ -606,6 +606,22 @@ def _record_test_verdict_local(
             (smoke_test, smoke_test_reason, assignment_id),
         )
     conn.commit()
+    # #603: a test failure is durable context for EVERY future agent on the
+    # issue (not just the immediate fix worker) — record it in the per-issue
+    # digest.  Local writer (we're already daemon-side on a thin client), so
+    # use the _local variant to avoid re-routing.
+    if test_state == "failed" and (test_reason or "").strip():
+        row = conn.execute(
+            "SELECT repo_name, issue_number FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        if row is not None:
+            _add_issue_context_entry_local(
+                row["repo_name"],
+                row["issue_number"],
+                f"Test FAILED: {test_reason.strip()}",
+                source="test",
+            )
 
 
 # ── Notification ledger ────────────────────────────────────────────────────────

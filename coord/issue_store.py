@@ -471,6 +471,25 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
                 conn.commit()
         except Exception:  # noqa: BLE001 — best-effort
             pass
+    # #603: a request-changes verdict is durable context for EVERY future agent
+    # on the issue — record a short note in the per-issue digest (local writer;
+    # daemon-side on a thin client, so use the _local variant).
+    if record.verdict == VERDICT_REQUEST_CHANGES:
+        try:
+            from coord.state import _add_issue_context_entry_local  # noqa: PLC0415
+
+            summary = (record.findings_body or record.summary or "").strip()
+            if summary:
+                if len(summary) > 240:
+                    summary = summary[:240].rstrip() + "…"
+                _add_issue_context_entry_local(
+                    record.repo_name,
+                    record.issue_number,
+                    f"Review requested changes: {summary}",
+                    source="review",
+                )
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
     return StoreOutcome(
         status="done", event=EVENT_COMPLETION, posted=posted, error=err,
     )
