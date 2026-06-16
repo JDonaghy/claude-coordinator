@@ -601,6 +601,125 @@ def test_upsert_open_issues_routes_when_service_set(coord_db, monkeypatch):
     assert coord_db.execute("SELECT COUNT(*) c FROM issues").fetchone()["c"] == 0
 
 
+# ── #603: per-issue context store ───────────────────────────────────────────
+
+def test_serve_issue_context_add_get_pin_clear(file_db: Path, valid_config_path: Path, rw_db):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        a = cli.post("/issue-context", json={
+            "action": "add", "repo_name": "api", "issue_number": 7,
+            "body": "depends on lib #99", "pinned": True, "source": "operator",
+        })
+        assert a.status_code == 200
+        eid = a.json()["entry_id"]
+        assert isinstance(eid, int)
+        cli.post("/issue-context", json={
+            "action": "add", "repo_name": "api", "issue_number": 7,
+            "body": "a later note", "source": "test",
+        })
+        # GET returns both entries, oldest-first.
+        g = cli.get("/issue-context", params={"repo_name": "api", "issue_number": 7})
+        assert g.status_code == 200
+        entries = g.json()["entries"]
+        assert [e["body"] for e in entries] == ["depends on lib #99", "a later note"]
+        assert entries[0]["pinned"] is True
+        # unpin, then clear.
+        p = cli.post("/issue-context", json={
+            "action": "pin", "repo_name": "api", "issue_number": 7,
+            "entry_id": eid, "pinned": False,
+        })
+        assert p.json()["updated"] is True
+        c = cli.post("/issue-context", json={
+            "action": "clear", "repo_name": "api", "issue_number": 7,
+        })
+        assert c.json()["deleted"] == 2
+    assert rw_db.execute(
+        "SELECT COUNT(*) c FROM issue_context WHERE repo_name='api' AND issue_number=7"
+    ).fetchone()["c"] == 0
+
+
+def test_serve_issue_context_unknown_action_400(file_db: Path, valid_config_path: Path, rw_db):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/issue-context", json={
+            "action": "bogus", "repo_name": "api", "issue_number": 7,
+        })
+    assert resp.status_code == 400
+
+
+def test_add_issue_context_entry_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"entry_id": 42},
+    )
+    assert state.add_issue_context_entry("api", 7, "x", pinned=True) == 42
+    assert captured["path"] == "/issue-context"
+    assert captured["payload"]["action"] == "add" and captured["payload"]["pinned"] is True
+    # Routed → no local row created.
+    assert coord_db.execute("SELECT COUNT(*) c FROM issue_context").fetchone()["c"] == 0
+
+
+def test_list_issue_context_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    monkeypatch.setattr(
+        cc, "fetch_issue_context",
+        lambda svc, repo, num: [{"id": 1, "pinned": True, "source": None,
+                                 "body": "remote note", "created_at": 1.0}],
+    )
+    assert state.list_issue_context("api", 7)[0]["body"] == "remote note"
+
+
+def test_add_issue_context_entry_blank_is_noop(coord_db):
+    from coord import state
+    assert state.add_issue_context_entry("api", 7, "   ") is None
+    assert coord_db.execute("SELECT COUNT(*) c FROM issue_context").fetchone()["c"] == 0
+
+
+def test_render_issue_context_entries_pins_first_then_newest_then_budget():
+    from coord import state
+    entries = [
+        {"id": 1, "pinned": True, "source": "operator", "body": "PIN dep #99", "created_at": 1.0},
+        {"id": 2, "pinned": False, "source": "test", "body": "old note", "created_at": 2.0},
+        {"id": 3, "pinned": False, "source": "work", "body": "new note", "created_at": 3.0},
+    ]
+    out = state.render_issue_context_entries(entries)
+    lines = out.splitlines()
+    assert lines[0].startswith("- 📌 PIN dep #99")  # pinned first
+    assert "new note" in lines[1] and "old note" in lines[2]  # newest-first notes
+    # Budget: 1 pin + 1 note slot → oldest non-pinned trimmed with a marker.
+    capped = state.render_issue_context_entries(entries, max_entries=2)
+    assert "PIN dep #99" in capped and "new note" in capped
+    assert "old note" not in capped and "trimmed" in capped
+    assert state.render_issue_context_entries([]) == ""
+
+
+def test_issue_context_dropped_on_close(coord_db):
+    from coord import state
+    state._add_issue_context_entry_local("api", 7, "ctx for closing issue", pinned=True)
+    state._add_issue_context_entry_local("api", 8, "ctx for issue staying open")
+    coord_db.execute(
+        "INSERT INTO issues(repo_name,number,state,synced_at) VALUES('api',8,'open',0)"
+    )
+    coord_db.commit()
+    # #7 absent from the open set → closed → its context dropped; #8 kept.
+    state._upsert_open_issues_local("api", [{"number": 8, "title": "t", "body": "", "labels": []}])
+    assert state._list_issue_context_local("api", 7) == []
+    assert len(state._list_issue_context_local("api", 8)) == 1
+
+
 def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
     from coord import serve_app
 

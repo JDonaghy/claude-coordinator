@@ -1140,7 +1140,241 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
                 milestone_title,
             ),
         )
+    # #603: the per-issue context digest is short-lived — drop it for any issue
+    # of this repo no longer open (closed, or already pruned from `issues`).
+    # Keyed off the open set (not state='closed') so it's robust regardless of
+    # the 7-day prune above.  Forgotten on close.
+    conn.execute(
+        "DELETE FROM issue_context WHERE repo_name = ? AND issue_number NOT IN "
+        "(SELECT number FROM issues WHERE repo_name = ? AND state = 'open')",
+        (repo_name, repo_name),
+    )
     conn.commit()
+
+
+# ── Per-issue rolling context digest (#603) ─────────────────────────────────────
+
+# Deterministic curation budget for the rendered digest (Phase 1/4).  Pins are
+# always kept; non-pinned notes fill the remaining slots newest-first and the
+# whole block is char-capped.  Kept small on purpose — this rides the TOP of
+# every agent briefing, so it must stay short.
+ISSUE_CONTEXT_MAX_ENTRIES = 12
+ISSUE_CONTEXT_MAX_CHARS = 2500
+
+
+def add_issue_context_entry(
+    repo_name: str,
+    issue_number: int,
+    body: str,
+    *,
+    pinned: bool = False,
+    source: str | None = None,
+) -> int | None:
+    """Append a per-issue context entry — routes to the daemon when
+    ``board_service`` is set (#603), else writes the local DB.
+
+    Returns the new entry id on the local path; ``None`` when routed (the
+    daemon owns the autoincrement) or when *body* is blank.
+    """
+    body = (body or "").strip()
+    if not body:
+        return None
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        resp = post_record(
+            svc,
+            "/issue-context",
+            {
+                "action": "add",
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "body": body,
+                "pinned": pinned,
+                "source": source,
+            },
+        )
+        return resp.get("entry_id")
+    return _add_issue_context_entry_local(
+        repo_name, issue_number, body, pinned=pinned, source=source
+    )
+
+
+def _add_issue_context_entry_local(
+    repo_name: str,
+    issue_number: int,
+    body: str,
+    *,
+    pinned: bool = False,
+    source: str | None = None,
+) -> int:
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT INTO issue_context "
+        "(repo_name, issue_number, pinned, source, body, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (repo_name, issue_number, 1 if pinned else 0, source, body.strip(), time.time()),
+    )
+    conn.commit()
+    return int(cur.lastrowid or 0)
+
+
+def set_issue_context_pin(
+    repo_name: str, issue_number: int, entry_id: int, pinned: bool
+) -> bool:
+    """Pin/unpin one entry — routes to the daemon when set.  Returns whether a
+    row was updated."""
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        resp = post_record(
+            svc,
+            "/issue-context",
+            {
+                "action": "pin",
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "entry_id": entry_id,
+                "pinned": pinned,
+            },
+        )
+        return bool(resp.get("updated"))
+    return _set_issue_context_pin_local(repo_name, issue_number, entry_id, pinned)
+
+
+def _set_issue_context_pin_local(
+    repo_name: str, issue_number: int, entry_id: int, pinned: bool
+) -> bool:
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE issue_context SET pinned = ? "
+        "WHERE id = ? AND repo_name = ? AND issue_number = ?",
+        (1 if pinned else 0, entry_id, repo_name, issue_number),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def clear_issue_context(repo_name: str, issue_number: int) -> int:
+    """Delete all context entries for an issue — routes to the daemon when set.
+    Returns the number of rows removed (0 when routed)."""
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        resp = post_record(
+            svc,
+            "/issue-context",
+            {
+                "action": "clear",
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+            },
+        )
+        return int(resp.get("deleted") or 0)
+    return _clear_issue_context_local(repo_name, issue_number)
+
+
+def _clear_issue_context_local(repo_name: str, issue_number: int) -> int:
+    conn = get_connection()
+    cur = conn.execute(
+        "DELETE FROM issue_context WHERE repo_name = ? AND issue_number = ?",
+        (repo_name, issue_number),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def list_issue_context(repo_name: str, issue_number: int) -> list[dict]:
+    """Return an issue's raw context entries (oldest-first) — routes to the
+    daemon when set, else reads the local DB.  Each entry:
+    ``{id, pinned, source, body, created_at}``."""
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_issue_context  # noqa: PLC0415
+
+        return fetch_issue_context(svc, repo_name, issue_number)
+    return _list_issue_context_local(repo_name, issue_number)
+
+
+def _list_issue_context_local(repo_name: str, issue_number: int) -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, pinned, source, body, created_at FROM issue_context "
+        "WHERE repo_name = ? AND issue_number = ? ORDER BY created_at",
+        (repo_name, issue_number),
+    ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "pinned": bool(r["pinned"]),
+            "source": r["source"],
+            "body": r["body"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+def render_issue_context_entries(
+    entries: list[dict],
+    *,
+    max_entries: int = ISSUE_CONTEXT_MAX_ENTRIES,
+    max_chars: int = ISSUE_CONTEXT_MAX_CHARS,
+) -> str:
+    """Render raw entries into the markdown digest block (pure function): pinned
+    criticals first (oldest-first, so the foundational pin stays on top), then
+    non-pinned notes newest-first, total capped at *max_entries* and the whole
+    block char-capped.  Returns "" when there are no entries (caller omits the
+    section).  Shared by the briefing read-path and ``coord context show``.
+    """
+    if not entries:
+        return ""
+    pinned = sorted(
+        (e for e in entries if e.get("pinned")), key=lambda e: e.get("created_at") or 0
+    )
+    notes = sorted(
+        (e for e in entries if not e.get("pinned")),
+        key=lambda e: e.get("created_at") or 0,
+        reverse=True,
+    )
+    note_slots = max(0, max_entries - len(pinned))
+
+    def _fmt(e: dict) -> str:
+        tag = "📌 " if e.get("pinned") else ""
+        src = f"  _[{e['source']}]_" if e.get("source") else ""
+        return f"- {tag}{(e.get('body') or '').strip()}{src}"
+
+    lines = [_fmt(e) for e in pinned] + [_fmt(e) for e in notes[:note_slots]]
+    dropped = len(notes) - note_slots
+    if dropped > 0:
+        lines.append(f"- _… {dropped} older note(s) trimmed — `coord context show` for all_")
+    block = "\n".join(lines)
+    if len(block) > max_chars:
+        block = (
+            block[:max_chars].rstrip()
+            + "\n- _… (truncated — `coord context show` for full context)_"
+        )
+    return block
+
+
+def render_issue_context(
+    repo_name: str,
+    issue_number: int,
+    *,
+    max_entries: int = ISSUE_CONTEXT_MAX_ENTRIES,
+    max_chars: int = ISSUE_CONTEXT_MAX_CHARS,
+) -> str:
+    """Render an issue's curated context digest (routes the list read to the
+    daemon when set).  Returns "" when empty.  This is what the briefing
+    read-path prepends and what ``coord fix-briefing`` includes."""
+    return render_issue_context_entries(
+        list_issue_context(repo_name, issue_number),
+        max_entries=max_entries,
+        max_chars=max_chars,
+    )
 
 
 # ── Purge ──────────────────────────────────────────────────────────────────────
@@ -1178,5 +1412,11 @@ def purge_done_assignments(older_than_days: float = 7.0) -> int:
         "AND synced_at < ?",
         (cutoff,),
     ).rowcount
+    # #603: backstop — drop context for any issue no longer open (closed or
+    # already purged above), in case drop-on-close was missed.
+    conn.execute(
+        "DELETE FROM issue_context WHERE (repo_name, issue_number) NOT IN "
+        "(SELECT repo_name, number FROM issues WHERE state = 'open')"
+    )
     conn.commit()
     return deleted_assignments + deleted_issues

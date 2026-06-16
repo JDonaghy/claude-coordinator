@@ -287,6 +287,68 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def get_issue_context(request: Request) -> Response:
+        # #603: read an issue's raw context entries (oldest-first) for the
+        # briefing read-path / `coord context show` on a thin client.
+        from coord import state  # noqa: PLC0415
+
+        repo_name = request.query_params.get("repo_name")
+        raw_issue = request.query_params.get("issue_number")
+        if not repo_name or raw_issue is None:
+            return JSONResponse(
+                {"error": "repo_name and issue_number are required"}, status_code=400
+            )
+        try:
+            issue_number = int(raw_issue)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "issue_number must be an int"}, status_code=400)
+        try:
+            entries = state._list_issue_context_local(repo_name, issue_number)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-context read failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"entries": entries})
+
+    async def post_issue_context(request: Request) -> Response:
+        # #603: add / pin / clear a per-issue context entry on the shared DB.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        action = body.get("action")
+        try:
+            if action == "add":
+                entry_id = state._add_issue_context_entry_local(
+                    body["repo_name"],
+                    body["issue_number"],
+                    body["body"],
+                    pinned=bool(body.get("pinned")),
+                    source=body.get("source"),
+                )
+                return JSONResponse({"entry_id": entry_id})
+            if action == "pin":
+                updated = state._set_issue_context_pin_local(
+                    body["repo_name"],
+                    body["issue_number"],
+                    body["entry_id"],
+                    bool(body.get("pinned")),
+                )
+                return JSONResponse({"updated": bool(updated)})
+            if action == "clear":
+                deleted = state._clear_issue_context_local(
+                    body["repo_name"], body["issue_number"]
+                )
+                return JSONResponse({"deleted": deleted})
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-context write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
+
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
@@ -298,6 +360,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/issue-labels", post_issue_labels, methods=["POST"]),
         Route("/issues-sync", post_issues_sync, methods=["POST"]),
+        Route("/issue-context", get_issue_context, methods=["GET"]),
+        Route("/issue-context", post_issue_context, methods=["POST"]),
     ]
     middleware = [Middleware(_BearerAuthMiddleware, token=token)] if token else []
     return Starlette(routes=routes, middleware=middleware)

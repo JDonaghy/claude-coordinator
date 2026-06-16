@@ -149,3 +149,32 @@ def fetch_remote_config(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
     COORD_DIR.mkdir(parents=True, exist_ok=True)
     REMOTE_CONFIG_CACHE.write_text(resp.text)
     return REMOTE_CONFIG_CACHE
+
+
+def fetch_issue_context(
+    svc: ServiceConfig,
+    repo_name: str,
+    issue_number: int,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> list[dict]:
+    """GET an issue's raw context entries from the daemon (#603).
+
+    Returns the ``entries`` list (oldest-first); ``[]`` on ANY failure (404 from
+    an older daemon, network error, bad JSON).  Fail-soft on purpose: this rides
+    the briefing read-path, so a missing/old daemon must degrade to "no context
+    block", never crash a dispatch.
+    """
+    try:
+        resp = httpx.get(
+            f"{svc.url}/issue-context",
+            params={"repo_name": repo_name, "issue_number": issue_number},
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001 — fail-soft; briefing just omits the block
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    return entries if isinstance(entries, list) else []

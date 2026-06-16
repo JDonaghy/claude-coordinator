@@ -194,9 +194,26 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (repo_name, number)
         );
 
+        -- #603: per-issue rolling context digest.  Short-lived curated notes
+        -- (cross-repo deps, failed approaches, hard constraints) that every
+        -- agent reads at the top of its briefing.  Structured entries rendered
+        -- to markdown at read time; pinned rows stay on top, newest-first
+        -- below, oldest non-pinned aged out by a budget; dropped on close.
+        CREATE TABLE IF NOT EXISTS issue_context (
+            id           INTEGER PRIMARY KEY,
+            repo_name    TEXT    NOT NULL,
+            issue_number INTEGER NOT NULL,
+            pinned       INTEGER NOT NULL DEFAULT 0,
+            source       TEXT,
+            body         TEXT    NOT NULL,
+            created_at   REAL    NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);
+        CREATE INDEX IF NOT EXISTS idx_issue_context_issue
+            ON issue_context(repo_name, issue_number);
 
         INSERT OR IGNORE INTO schema_version VALUES (1);
     """)
