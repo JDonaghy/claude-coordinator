@@ -108,13 +108,26 @@ def dispatch(
         from pathlib import Path
         new_issue_guidance = repo.resolve_new_issue_guidance(Path(repo_path).expanduser())
 
+    # #603: prepend the per-issue context digest to the TOP of a -p WORK
+    # briefing (cross-repo deps / prior-attempt findings) so the worker reads
+    # them first.  Only `work` (chat/refinement/conflict-fix carry no issue
+    # context); the interactive and auto-loop fix/review paths inject at their
+    # own sites, so this is the single -p work chokepoint (no double injection).
+    briefing_text = proposal.briefing
+    if proposal.type == "work" and proposal.issue_number:
+        from coord.state import issue_context_block  # noqa: PLC0415
+
+        briefing_text = (
+            issue_context_block(proposal.repo_name, proposal.issue_number) + briefing_text
+        )
+
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     payload: dict = {
         "repo_name": proposal.repo_name,
         "repo_path": repo_path,
         "issue_number": proposal.issue_number,
         "issue_title": proposal.issue_title,
-        "briefing": proposal.briefing,
+        "briefing": briefing_text,
         "files_allowed": proposal.files_likely,
         "files_forbidden": files_forbidden,
         "pull_repos": list(pull_repos),

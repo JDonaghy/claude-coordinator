@@ -799,6 +799,13 @@ def dispatch_review(
         review_iteration=getattr(completed, "review_iteration", 0) or 0,
     )
 
+    # #603: prepend the per-issue context digest so the reviewer also knows the
+    # cross-repo deps / prior-attempt findings.  The interactive review path
+    # prefixes it at its own call site, so build_review_briefing stays pure.
+    from coord.state import issue_context_block  # noqa: PLC0415
+
+    briefing = issue_context_block(completed.repo_name, completed.issue_number) + briefing
+
     # Pin the reviewer's model.  Without this the payload omits `model`
     # and the agent lets `claude -p` pick its CLI default, which became
     # Opus 4.8 in claude-code 2.1.x — silently making every review the

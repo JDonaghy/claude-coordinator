@@ -2351,6 +2351,14 @@ def assign(
             service is set, else the local build."""
             return _fetch_remote_board(_svc) if _svc is not None else _local_build()
 
+        # #603: the per-issue context digest, prepended to the TOP of EVERY
+        # interactive briefing below so each agent reads prior-attempt findings
+        # (cross-repo deps, approaches already tried, hard constraints) first.
+        # Computed once per dispatch; "" when there's no context (no-op prefix).
+        from coord.state import issue_context_block as _issue_context_block  # noqa: PLC0415
+
+        _issue_ctx = _issue_context_block(repo, issue)
+
         # ── A1 (interactive-mode migration, Track A): INTERACTIVE REVIEW ────
         # `--review-of <work_aid>` launches a human-attended REVIEW of an
         # already-completed work assignment, not a fresh work session.  It
@@ -2467,7 +2475,7 @@ def assign(
                 "here. Do NOT run any `gh` commands; the coordinator posts the "
                 "verdict + findings for you.\n\n"
             )
-            effective_briefing = report_reminder + review_briefing
+            effective_briefing = _issue_ctx + report_reminder + review_briefing
 
             spec = _AssignmentSpecRv(
                 repo_name=repo,
@@ -2891,7 +2899,7 @@ def assign(
                 f"`coord report-result --assignment {assignment_id} --status done "
                 "--summary <one-line summary>` so this session's row closes.\n\n"
             )
-            effective_briefing = report_reminder + smoke_briefing
+            effective_briefing = _issue_ctx + report_reminder + smoke_briefing
 
             spec = _AssignmentSpecSm(
                 repo_name=repo,
@@ -3049,7 +3057,7 @@ def assign(
                 "If a code fix is needed, surface the plan so the operator can "
                 "dispatch a proper Fix.\n\n"
             )
-            effective_briefing = ts_reminder + briefing
+            effective_briefing = _issue_ctx + ts_reminder + briefing
 
             # Pre-fill a SHORT, single-line prompt that points the session at
             # the full diagnostic on disk, rather than pasting the whole
@@ -3335,7 +3343,7 @@ def assign(
                     f"coordinator also pushes your commits to origin/{work.branch} "
                     "and re-reviews.\n\n"
                 )
-            effective_briefing = report_reminder + fix_briefing
+            effective_briefing = _issue_ctx + report_reminder + fix_briefing
 
             spec = _AssignmentSpecFx(
                 repo_name=repo,
@@ -3687,7 +3695,7 @@ def assign(
                     f"coordinator also pushes your commits to origin/{rw_branch} "
                     "and re-reviews.\n\n"
                 )
-            effective_briefing = rw_report_reminder + briefing
+            effective_briefing = _issue_ctx + rw_report_reminder + briefing
 
             spec = _AssignmentSpecRw(
                 repo_name=repo,
@@ -4060,7 +4068,7 @@ def assign(
                 "--summary <text>` (use --status blocked if a semantic conflict "
                 "needs the operator).\n\n"
             )
-            effective_briefing = report_reminder + merge_briefing
+            effective_briefing = _issue_ctx + report_reminder + merge_briefing
 
             spec = _AssignmentSpecMg(
                 repo_name=repo,
@@ -4344,7 +4352,7 @@ def assign(
                 "already-implemented> [--verdict approve|request-changes] "
                 "--summary <text>` so the coordinator records the result.\n\n"
             )
-            effective_briefing = report_reminder + briefing
+            effective_briefing = _issue_ctx + report_reminder + briefing
 
             # Update board metadata (round_number / board_initialized).
             # `record_dispatched` already wrote the assignment row, so the
@@ -4513,7 +4521,7 @@ def assign(
                 "already-implemented> [--verdict approve|request-changes] "
                 "--summary <text>` so the coordinator records the result.\n\n"
             )
-            effective_briefing = report_reminder + briefing
+            effective_briefing = _issue_ctx + report_reminder + briefing
 
             save_board(build_board())
 

@@ -65,6 +65,37 @@ class TestDispatch:
         assert "files_likely" not in payload
 
     @patch("coord.dispatch.httpx.post")
+    def test_payload_prepends_issue_context(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        # #603: a -p WORK briefing carries the per-issue context digest at the top.
+        from coord import state
+
+        state._add_issue_context_entry_local(
+            "api", 10, "depends on lib #99 (commit abc); do X first", pinned=True
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert briefing.startswith("## ⚠️ Issue context")  # block at the top
+        assert "depends on lib #99" in briefing
+        assert "Fix the auth module" in briefing  # original briefing preserved below
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_no_context_when_none(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        # No context for the issue → briefing unchanged (no empty block noise).
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_carries_default_branch(
         self, mock_post: MagicMock, proposal: Proposal,
     ) -> None:

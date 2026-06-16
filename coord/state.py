@@ -1377,6 +1377,29 @@ def render_issue_context(
     )
 
 
+def issue_context_block(repo_name: str, issue_number: int) -> str:
+    """The full briefing section (header + digest) prepended to the TOP of every
+    agent briefing (#603), or "" when there is no context.
+
+    This is the read-path: it carries findings from earlier attempts on the
+    issue (cross-repo dependencies, failed approaches, hard constraints) so the
+    next agent doesn't rediscover or contradict them.  Fail-soft (the underlying
+    fetch returns "" on a daemon miss) — an absent block never breaks dispatch.
+    """
+    digest = render_issue_context(repo_name, issue_number)
+    if not digest:
+        return ""
+    return (
+        "## ⚠️ Issue context — READ THIS FIRST\n\n"
+        "Findings carried forward from earlier work on this issue (cross-repo "
+        "dependencies, approaches already tried, hard constraints). Treat these "
+        "as authoritative — do **not** rediscover or contradict them; build on "
+        "them. 📌 = pinned critical.\n\n"
+        f"{digest}\n\n"
+        "---\n\n"
+    )
+
+
 # ── Purge ──────────────────────────────────────────────────────────────────────
 
 def purge_done_assignments(older_than_days: float = 7.0) -> int:

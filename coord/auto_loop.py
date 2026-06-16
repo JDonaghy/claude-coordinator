@@ -478,7 +478,15 @@ def _dispatch_fix_for_review(
     # Build briefing and dispatch.  The fix worker escalates the model per
     # iteration (when pipeline.escalate_fix_model is enabled); compute it here
     # where the iteration is known and thread it into the dispatch.
-    briefing = _build_fix_briefing(work, findings, next_iteration, max_iter)
+    # #603: prepend the per-issue context digest (prior-attempt findings,
+    # cross-repo deps) to the TOP of the -p fix briefing.  The interactive fix
+    # path prefixes it at its own call site, so the shared _build_fix_briefing
+    # stays pure (no double injection).
+    from coord.state import issue_context_block  # noqa: PLC0415
+
+    briefing = issue_context_block(work.repo_name, work.issue_number) + _build_fix_briefing(
+        work, findings, next_iteration, max_iter
+    )
     model = _fix_model_for_iteration(config, next_iteration)
     fix = _dispatch_fix(
         work, briefing, board, config, next_iteration,
