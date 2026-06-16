@@ -1447,10 +1447,14 @@ def issue_context_block(repo_name: str, issue_number: int) -> str:
 
     This is the read-path: it carries findings from earlier attempts on the
     issue (cross-repo dependencies, failed approaches, hard constraints) so the
-    next agent doesn't rediscover or contradict them.  Fail-soft (the underlying
-    fetch returns "" on a daemon miss) — an absent block never breaks dispatch.
+    next agent doesn't rediscover or contradict them.  FULLY fail-soft — this
+    runs on the dispatch hot path, so ANY failure (daemon miss, DB hiccup,
+    cross-thread conn) degrades to "no block" and never breaks a dispatch.
     """
-    digest = render_issue_context(repo_name, issue_number)
+    try:
+        digest = render_issue_context(repo_name, issue_number)
+    except Exception:  # noqa: BLE001 — never let a context read break dispatch
+        return ""
     if not digest:
         return ""
     return (
