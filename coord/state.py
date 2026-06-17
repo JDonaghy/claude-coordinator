@@ -914,6 +914,49 @@ def mark_assignment_merged(assignment_id: str) -> None:
     conn.commit()
 
 
+def update_assignment_tokens(
+    assignment_id: str,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> None:
+    """#546: record token counts on an existing assignment row.
+
+    Captured alongside ``cost_usd`` from the final stream-json result event.
+    Only writes when at least one token count is non-zero (interactive/Max
+    sessions produce no per-token data and should not overwrite 0 with 0).
+    Idempotent: the UPDATE only fires when the row's ``input_tokens`` is still
+    0 (first writer wins).  Silently swallows ``OperationalError`` so
+    pre-migration databases (tests, older installs that haven't restarted the
+    coordinator yet) never crash the notify path.
+    """
+    if not assignment_id:
+        return
+    total = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
+    if total <= 0:
+        return
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE assignments SET "
+            "input_tokens=?, output_tokens=?, "
+            "cache_creation_tokens=?, cache_read_tokens=? "
+            "WHERE assignment_id=? "
+            "AND (input_tokens IS NULL OR input_tokens = 0)",
+            (
+                input_tokens, output_tokens,
+                cache_creation_tokens, cache_read_tokens,
+                assignment_id,
+            ),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Column may not exist yet (pre-migration DB or test fixtures).
+        pass
+
+
 def set_test_plan(
     assignment_id: str,
     plan: dict,

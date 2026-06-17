@@ -102,6 +102,11 @@ def row_to_assignment(row: object) -> Assignment:
         smoke_tests=decode_smoke_tests(d.get("smoke_tests")),
         # #324: resolved provider name; None for rows predating this feature.
         provider_name=d.get("provider_name"),
+        # #546: token counts; absent column (pre-migration) or NULL → 0.
+        input_tokens=int(d.get("input_tokens") or 0),
+        output_tokens=int(d.get("output_tokens") or 0),
+        cache_creation_tokens=int(d.get("cache_creation_tokens") or 0),
+        cache_read_tokens=int(d.get("cache_read_tokens") or 0),
     )
 
 

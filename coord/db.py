@@ -278,6 +278,15 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # dispatched before #324 landed; the TUI shows "claude" as the
         # implicit default when the column is NULL.
         "ALTER TABLE assignments ADD COLUMN provider_name TEXT",
+        # #546: token counts for automated (claude -p) assignments, parsed from
+        # the final stream-json result event alongside cost_usd.  All default
+        # 0 so the TUI can sum them without NULLs.  Interactive (Max/OAuth)
+        # sessions do not bill per-token; those rows stay at 0 and the TUI
+        # labels them "Max (subscription)" rather than showing a dollar figure.
+        "ALTER TABLE assignments ADD COLUMN input_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE assignments ADD COLUMN output_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE assignments ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE assignments ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
     ]
     for sql in migrations:
         try:
