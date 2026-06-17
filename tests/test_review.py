@@ -760,6 +760,66 @@ END_REVIEW
         assert result.verdict == "request-changes"
         assert "critical bug" in result.body
 
+    def test_plain_text_no_review_body_marker(self, tmp_path: Path) -> None:
+        """#608: reviewer omits the `REVIEW_BODY:` line and writes Markdown
+        findings directly after the verdict. The body must still be captured
+        (this is the exact shape that stranded the #607 review)."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: request-changes
+
+#### 1. Out-of-scope removal
+
+`tui/src/app.rs` deletes `session_pane_live`.
+
+**Must be restored.**
+
+### Fix instructions
+
+Revert the out-of-scope removals.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "session_pane_live" in result.body
+        assert "Fix instructions" in result.body
+        # The optional marker must not leak into the captured body.
+        assert "REVIEW_BODY:" not in result.body
+
+    def test_stream_json_no_review_body_marker(self, tmp_path: Path) -> None:
+        """#608: same markers-only shape, but in stream-json transcript form."""
+        log = tmp_path / "review.log"
+        _write_stream_json_log(log, [
+            "Reviewing the diff...",
+            "REVIEW_VERDICT: request-changes\n\n## Findings\n\nBug at auth.py:10.\nEND_REVIEW",
+        ])
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "Bug at auth.py:10." in result.body
+
+    def test_last_block_wins_without_marker(self, tmp_path: Path) -> None:
+        """The optional-marker change must not break 'last block wins' when
+        neither block uses the `REVIEW_BODY:` header."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: approve
+First pass looks fine.
+END_REVIEW
+
+On reflection:
+
+REVIEW_VERDICT: request-changes
+Found a blocker at line 42.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "blocker at line 42" in result.body
+        assert "First pass" not in result.body
+
     def test_stream_json_approve(self, tmp_path: Path) -> None:
         log = tmp_path / "review.log"
         _write_stream_json_log(log, [

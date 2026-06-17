@@ -51,9 +51,15 @@ class ReviewFindings:
 # Allows optional leading/trailing whitespace and tolerates both LF and CRLF.
 # Accepts canonical verdicts (approve / request-changes) and short aliases
 # (PASS → approve, FAIL → request-changes) for workers that use the shorter form.
+#
+# The `REVIEW_BODY:` marker is OPTIONAL (#608): reviewers commonly emit the
+# verdict line followed directly by Markdown findings and `END_REVIEW`, omitting
+# the `REVIEW_BODY:` header. When it's absent the body is everything between the
+# verdict line and `END_REVIEW`. `END_REVIEW` stays the required terminator, so a
+# stray "REVIEW_VERDICT:" in prose (with no terminator) still won't match.
 _REVIEW_BLOCK_RE = re.compile(
     r"REVIEW_VERDICT:\s*(approve|request-changes|pass|fail)\s*[\r\n]+"
-    r"REVIEW_BODY:\s*[\r\n]+(.*?)[\r\n]*END_REVIEW",
+    r"(?:REVIEW_BODY:\s*[\r\n]+)?(.*?)[\r\n]*END_REVIEW",
     re.DOTALL | re.IGNORECASE,
 )
 
