@@ -1049,6 +1049,67 @@ def _finalize_merge_blocked(
     )
 
 
+def _review_findings_from_transcript(
+    issue_number: int,
+    started_at: float | None,
+    *,
+    projects_dir: Path | None = None,
+):
+    """Recover a human-attended review's verdict + findings from the Claude
+    session transcript — the **transcript-floor** backstop (#606).
+
+    A review session emits its verdict as ``REVIEW_VERDICT:`` / ``REVIEW_BODY:``
+    in its output, but often cannot run ``coord report-result`` because ``coord``
+    is not on the interactive session's PATH (same class as the ``claude``-not-
+    on-ssh-PATH issue).  Reviews also have no git-floor (read-only, 0 commits),
+    so without this the findings are lost the moment the operator exits Claude.
+
+    Claude Code persists every session as a JSONL transcript under
+    ``~/.claude/projects/<cwd>/``; we parse the most-recent one(s) active during
+    this session with the existing :func:`coord.review.parse_review_from_log`
+    (which already handles the transcript's stream-json shape).  Returns the
+    parsed ``ReviewFindings`` or ``None`` — independent of the agent running any
+    command.
+
+    Robustness: only a transcript that BOTH parses as a review AND names this
+    issue (``issue-<N>``, the format the review briefing produces) is trusted —
+    newest-first, so the just-exited session wins.  There is deliberately NO
+    "guess the only review in the window" fallback: that could mis-attribute an
+    unrelated/concurrent review (and record its verdict against the wrong
+    assignment id).  Self-gating — a work session's transcript carries no
+    ``REVIEW_VERDICT`` block, so this returns ``None`` and the caller falls
+    through to the git-floor.
+    """
+    from coord.review import parse_review_from_log  # noqa: PLC0415
+
+    # No session start → no bounded window → don't scan (avoid matching a stale,
+    # unrelated transcript).  Production always passes a real started_at; only a
+    # caller that can't bound the session (or a test) passes None.
+    if started_at is None:
+        return None
+    base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
+    if not base.is_dir():
+        return None
+    # Only sessions active at/after this review started (small clock-skew buffer).
+    cutoff = started_at - 5.0
+    candidates: list[tuple[float, Path]] = []
+    for p in base.glob("*/*.jsonl"):
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            candidates.append((mtime, p))
+    candidates.sort(reverse=True)  # newest first — the just-exited session
+
+    issue_tag = f"issue-{issue_number}"
+    for _mtime, p in candidates:
+        findings = parse_review_from_log(p)
+        if findings is not None and issue_tag in findings.body:
+            return findings
+    return None
+
+
 def finalize_interactive_exit(
     *,
     assignment_id: str,
@@ -1165,6 +1226,57 @@ def finalize_interactive_exit(
             worktree_removed=worktree_removed,
             merge_verify=merge_verify,
         )
+
+    # ── Transcript-floor (#606): durable review capture ──────────────────────
+    # A human-attended REVIEW emits its verdict (REVIEW_VERDICT:/REVIEW_BODY:)
+    # but frequently can't run `coord report-result` (coord not on the session
+    # PATH), and a review has no git-floor (0 commits) — so without this the
+    # findings vanish when the operator exits Claude.  Recover them from the
+    # Claude session transcript and record them through the same issue_store
+    # seam.  Runs BEFORE the git-floor (which would otherwise stamp a verdict-
+    # less advisory).  Self-gating: a work session's transcript has no review
+    # block, so this is a no-op there and the git-floor below still handles it.
+    _tf = _review_findings_from_transcript(issue_number, started_at)
+    if _tf is not None:
+        try:
+            from coord import issue_store  # noqa: PLC0415
+
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id=assignment_id,
+                    machine_name=machine_name,
+                    repo_name=repo_name,
+                    repo_github=repo_github,
+                    issue_number=issue_number,
+                    status="done",
+                    verdict=_tf.verdict,  # type: ignore[arg-type]  # approve|request-changes
+                    summary="Review verdict recovered from the session transcript "
+                    "(agent could not run `coord report-result`).",
+                    findings_body=_tf.body,
+                    branch=None,
+                )
+            )
+        except Exception:  # noqa: BLE001 — best-effort
+            # Recording failed (e.g. board unreachable) — fall through to the
+            # git-floor / human-prompt backstop rather than swallowing the review.
+            _tf = None
+        else:
+            _wt = Path(worktree_path) if worktree_path else None
+            _removed = (
+                _remove_worktree(Path(repo_path), _wt)
+                if repo_path is not None and _wt is not None and _wt.exists()
+                else False
+            )
+            return InteractiveFinalizeResult(
+                terminal_status="transcript-floor",
+                commits_ahead=None,
+                push_ok=True,
+                push_error=None,
+                already_recorded=True,
+                seam_outcome=None,
+                worktree_removed=_removed,
+                merge_verify=merge_verify,
+            )
 
     # worktree_path is None for a human-attended REVIEW (migration A1): the
     # review runs read-only in the LIVE checkout, so there is no session

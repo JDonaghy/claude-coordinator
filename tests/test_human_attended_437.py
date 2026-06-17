@@ -557,19 +557,28 @@ def test_no_auto_submit_or_scraper_in_human_attended_path() -> None:
 
 
 def test_interactive_launcher_has_no_completion_sentinel_watcher() -> None:
-    """coord/interactive.py must not contain a content-based completion
-    sentinel watcher or any other TTY-content scraper that advances state."""
+    """coord/interactive.py must not scrape the LIVE PTY/TTY to advance state
+    (ToS §3.7 / #437): no content-based completion-sentinel watcher, no result-
+    marker or progress-signal grep on the live output stream.
+
+    Carve-out (#606 transcript-floor): post-exit recovery is allowed and is NOT
+    live scraping.  After the HUMAN exits, `finalize_interactive_exit` may
+    recover a review verdict from Claude's *persisted* session transcript (a
+    `.jsonl` file) via the file-based `coord.review.parse_review_from_log` — it
+    reads a file, makes no automated access to Claude, and runs only on exit
+    (structurally the same as the git-floor reading commits).  So the guard bans
+    the live-stream markers but permits the file-based verdict parse.
+    """
     interactive_src = Path("coord/interactive.py").read_text()
     # Sanity: the module exists and exports the launcher.
     assert "launch_human_attended_interactive" in interactive_src
-    # The HUMAN closes the session; no result-marker / sentinel / regex
-    # walks the TTY output to decide when the session "is done".  We
-    # check for the absence of obvious sentinel-watching tokens — any
-    # future regression that wires one would have to use one of these.
+    # Markers that only make sense if something watches the LIVE output stream to
+    # decide the session is "done" / advance state — still forbidden.  (Note:
+    # REVIEW_VERDICT is intentionally NOT here — the post-exit transcript-floor
+    # legitimately parses it from a persisted file; see the carve-out check.)
     forbidden = [
         "result_marker",
         "PTY_RESULT_MARKER",
-        "REVIEW_VERDICT",
         "STATUS:",
         "STUCK:",
         "SMOKE_TESTS",
@@ -577,5 +586,15 @@ def test_interactive_launcher_has_no_completion_sentinel_watcher() -> None:
     for token in forbidden:
         assert token not in interactive_src, (
             f"coord/interactive.py references {token!r} — the human-attended "
-            "launcher must NOT parse the TTY to advance state (#437)."
+            "launcher must NOT scrape the live TTY to advance state (#437)."
+        )
+    # Carve-out enforcement: any review-verdict recovery MUST be the post-exit,
+    # FILE-based transcript-floor (Claude's persisted .jsonl via
+    # parse_review_from_log), never a live-pane scrape.  `capture-pane` stays
+    # permitted ONLY for the readiness poll, not to extract a verdict.
+    if "REVIEW_VERDICT" in interactive_src:
+        assert "parse_review_from_log" in interactive_src, (
+            "review-verdict recovery in coord/interactive.py must go through the "
+            "file-based parse_review_from_log (post-exit transcript-floor), not a "
+            "live-TTY scrape (#437 / #606)."
         )
