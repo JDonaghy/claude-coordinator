@@ -3989,6 +3989,27 @@ struct PendingAutoReview {
     issue_num: u64,
 }
 
+/// Which interactive stage a post-review [`PendingStageLaunch`] offer starts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StageLaunchKind {
+    /// request-changes review whose findings are already in the DB → `--fix-of`.
+    Fix,
+    /// approved review → `--smoke-of` interactive testing (then merge).
+    Test,
+}
+
+/// A one-key offer to launch the next interactive stage for an issue, raised by
+/// `detect_review_verdict` once the review session pane has exited.  Unlike the
+/// #587 rework dialog this carries NO findings input — it's used only when the
+/// next step needs no operator typing: a request-changes review whose findings
+/// the agent already self-reported (kind=Fix), or an approved review (kind=Test).
+struct PendingStageLaunch {
+    coord_repo: String,
+    repo_slug: String,
+    issue_num: u64,
+    kind: StageLaunchKind,
+}
+
 /// Leg 3 (#517): an interactive review the TUI launched this run, armed to
 /// route on its verdict (board-driven, via `coord report-result`).  Fires once
 /// when a NEW verdict appears (a review id not in `prior_verdicted_ids`):
@@ -5442,6 +5463,8 @@ pub struct CoordApp {
     /// the interactive review for a just-finished work session.  Enter
     /// confirms; Esc/n dismisses.  See [`PendingAutoReview`].
     pending_auto_review: Option<PendingAutoReview>,
+    /// Post-review one-key stage offer (Fix / Test) — see [`PendingStageLaunch`].
+    pending_stage_launch: Option<PendingStageLaunch>,
 
     // ── Leg 3 (#517): verdict-driven routing ───────────────────────────────
     /// Interactive reviews launched this run, keyed by `(repo_slug,
@@ -5695,6 +5718,7 @@ impl CoordApp {
             // Leg 2 (#517): auto-advance Work → Review.
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
+            pending_stage_launch: None,
             // Leg 3 (#517): verdict-driven routing.
             armed_for_verdict: std::collections::HashMap::new(),
             pending_rework: None,
@@ -16551,6 +16575,56 @@ impl CoordApp {
             });
         }
 
+        // ── Post-review one-key stage offer (Fix / Test) ─────────────────
+        // Raised by detect_review_verdict once the review session has exited.
+        // No findings input — the next stage needs no operator typing.
+        if let Some(ref p) = self.pending_stage_launch {
+            let (title, verdict_line, action, button) = match p.kind {
+                StageLaunchKind::Fix => (
+                    "Review requested changes — start a fix?",
+                    "requested changes (findings already captured in the DB)",
+                    "Start an interactive fix on the same branch?",
+                    "⏎  Start fix",
+                ),
+                StageLaunchKind::Test => (
+                    "Review approved — start testing?",
+                    "approved the branch",
+                    "Start the human-attended testing session (smoke tests, then merge)?",
+                    "⏎  Start testing",
+                ),
+            };
+            return Some(Dialog {
+                id: WidgetId::new("dialog:stage-launch"),
+                title: StyledText::plain(title.to_string()),
+                body: vec![
+                    StyledText::plain(format!(
+                        "The review of {} #{} {}.",
+                        p.coord_repo, p.issue_num, verdict_line,
+                    )),
+                    StyledText::plain(action.to_string()),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("stage-go"),
+                        label: button.into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Not now".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Leg 3 (#517): rework (request-changes) confirm ───────────────
         // #587: the dialog now includes a required findings text input.
         // The operator types what the reviewer flagged; `confirm_rework`
@@ -16947,6 +17021,8 @@ impl CoordApp {
             self.pending_quit_confirm = false;
         } else if self.pending_auto_review.is_some() {
             self.pending_auto_review = None;
+        } else if self.pending_stage_launch.is_some() {
+            self.pending_stage_launch = None;
         } else if self.pending_rework.is_some() {
             self.pending_rework = None;
         } else if self.pending_machine_picker.is_some() {
@@ -17002,6 +17078,17 @@ impl CoordApp {
                 self.confirm_auto_review();
             } else {
                 self.pending_auto_review = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── Post-review one-key stage offer (Fix / Test) ─────────────────
+        if self.pending_stage_launch.is_some() {
+            if id == "stage-go" {
+                self.confirm_stage_launch();
+            } else {
+                self.pending_stage_launch = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -21795,6 +21882,19 @@ impl CoordApp {
         }
     }
 
+    /// True when the embedded Terminal pane for issue `key` is showing a still-
+    /// LIVE (not exited) interactive session — the operator hasn't `/exit`ed
+    /// yet.  All three board-driven stage detectors gate on this so a freshly-
+    /// recorded board state (work done / review verdict / test verdict) never
+    /// pops its confirm prompt over — and, on confirm, REPLACES the PTY of — a
+    /// session the operator is still attending (#602).  `key` is the issue_key
+    /// `detail_terminal_sessions`, `armed_for_*`, and the launch path all share.
+    fn session_pane_live(&self, key: &(String, u64)) -> bool {
+        self.detail_terminal_sessions
+            .get(key)
+            .is_some_and(|s| !s.is_exited())
+    }
+
     /// Leg 2 (#517): scan armed interactive-work sessions for one the board now
     /// shows finished (a new done-with-branch work aid, no review yet) and, if
     /// found, raise the confirm prompt.  Strictly board-driven — never reads the
@@ -21805,6 +21905,14 @@ impl CoordApp {
             return false;
         }
         let fire = self.armed_for_auto_review.iter().find_map(|(key, armed)| {
+            // #602: don't preempt a still-attended session.  A fix/work agent
+            // reports `done` (git push / report-result) while the claude session
+            // is still wrapping up, so the completion lands BEFORE the pane
+            // exits — firing now would pop "start review?" over the live pane.
+            // Defer (leave the arm in place) until the operator has /exit'ed.
+            if self.session_pane_live(key) {
+                return None;
+            }
             let aid = self.completed_work_aid_for(&armed.coord_repo, armed.issue_num)?;
             // Only a genuinely new completion (the just-launched work/fix), and
             // only when that work hasn't already been handed to a review.
@@ -21864,6 +21972,7 @@ impl CoordApp {
     /// The board-driven detectors check this so only one fires per tick.
     fn stage_prompt_open(&self) -> bool {
         self.pending_auto_review.is_some()
+            || self.pending_stage_launch.is_some()
             || self.pending_rework.is_some()
             || self.pending_test_fix.is_some()
             || self.pending_merge.is_some()
@@ -21888,6 +21997,24 @@ impl CoordApp {
             .unwrap_or(false)
     }
 
+    /// True when review assignment `aid` already carries agent-reported
+    /// findings in the DB — a non-empty `body` in the `review_findings` JSON
+    /// that `coord report-result` persists when the review session ends.
+    /// When true the #587 manual-entry rework dialog is redundant (the fix
+    /// worker is briefed from these findings), so `detect_review_verdict`
+    /// skips prompting and the operator can just `/exit` the review session.
+    fn review_assignment_has_findings(&self, aid: &str) -> bool {
+        self.data
+            .assignments
+            .iter()
+            .find(|a| a.id == aid)
+            .and_then(|a| a.review_findings.as_deref())
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(str::to_string))
+            .map(|body| !body.trim().is_empty())
+            .unwrap_or(false)
+    }
+
     /// Leg 3 (#517): scan armed interactive reviews for a freshly-reported
     /// verdict and route it.  request-changes → raise the rework confirm
     /// prompt; approve → surface a notice pointing at the smoke/merge gate.
@@ -21898,14 +22025,21 @@ impl CoordApp {
             return false;
         }
         let found = self.armed_for_verdict.iter().find_map(|(key, armed)| {
-            let (_review_aid, verdict) = self.latest_new_verdict_for(
+            // #602: wait until the operator has `/exit`ed the review session
+            // pane before routing — don't preempt a still-attended session (the
+            // dialog used to pop mid-review).  No local pane (e.g. a remote
+            // review) routes as soon as the verdict lands.
+            if self.session_pane_live(key) {
+                return None;
+            }
+            let (review_aid, verdict) = self.latest_new_verdict_for(
                 &armed.coord_repo,
                 armed.issue_num,
                 &armed.prior_verdicted_ids,
             )?;
-            Some((key.clone(), verdict))
+            Some((key.clone(), review_aid, verdict))
         });
-        let Some((key, verdict)) = found else {
+        let Some((key, review_aid, verdict)) = found else {
             return false;
         };
         let Some(armed) = self.armed_for_verdict.remove(&key) else {
@@ -21913,26 +22047,37 @@ impl CoordApp {
         };
         self.detail_terminal_focused = false;
         if verdict == "request-changes" {
-            // #587 owns the rework dialog (operator types the findings); no #603
-            // briefing preview here — it's reserved for the test-fix dialog.
-            self.pending_rework = Some(PendingRework {
+            if self.review_assignment_has_findings(&review_aid) {
+                // The review agent already wrote its findings to the DB
+                // (`coord report-result`), so there's nothing for the operator
+                // to type.  Offer a one-key "start fix" launch (no findings
+                // input) instead of the #587 manual-entry dialog.
+                self.pending_stage_launch = Some(PendingStageLaunch {
+                    coord_repo: armed.coord_repo,
+                    repo_slug: armed.repo_slug,
+                    issue_num: armed.issue_num,
+                    kind: StageLaunchKind::Fix,
+                });
+            } else {
+                // No agent-reported findings → keep the #587 safety net so the
+                // fix worker isn't briefed blind: prompt the operator to type
+                // what the reviewer flagged.
+                self.pending_rework = Some(PendingRework {
+                    coord_repo: armed.coord_repo,
+                    repo_slug: armed.repo_slug,
+                    issue_num: armed.issue_num,
+                    findings: String::new(),
+                });
+            }
+        } else {
+            // approve (incl. approved-with-nits): offer a one-key "start
+            // testing" launch — the guided smoke → merge flow (leg 3c).
+            self.pending_stage_launch = Some(PendingStageLaunch {
                 coord_repo: armed.coord_repo,
                 repo_slug: armed.repo_slug,
                 issue_num: armed.issue_num,
-                findings: String::new(),
+                kind: StageLaunchKind::Test,
             });
-        } else {
-            // approve (incl. approved-with-nits): no rework needed.  Surface the
-            // transition and point at the existing smoke/merge affordances —
-            // the guided pull-and-merge flow is leg 3c.
-            self.push_toast(
-                "Review approved",
-                &format!(
-                    "#{} approved — pull the branch to smoke-test, then merge (Go).",
-                    armed.issue_num,
-                ),
-                ToastSeverity::Info,
-            );
         }
         true
     }
@@ -22003,6 +22148,48 @@ impl CoordApp {
         self.rework_bypass = true;
         self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
         self.rework_bypass = false;
+    }
+
+    /// The operator confirmed the post-review stage offer raised (after the
+    /// review session exited) by `detect_review_verdict` — select the issue's
+    /// pipeline row, open its Terminal tab, and launch the next interactive
+    /// stage: a `--fix-of` (request-changes, findings already in the DB) or a
+    /// `--smoke-of` testing session (approved).
+    fn confirm_stage_launch(&mut self) {
+        let Some(p) = self.pending_stage_launch.take() else {
+            return;
+        };
+        let idx = self
+            .pipeline_issues
+            .iter()
+            .position(|iss| iss.repo_slug == p.repo_slug && iss.number == p.issue_num);
+        let Some(idx) = idx else {
+            self.push_toast(
+                "Start stage",
+                &format!(
+                    "Could not find {} #{} in the pipeline to start its next stage.",
+                    p.coord_repo, p.issue_num,
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+        self.pipeline_sel = Some(idx);
+        self.active_view = SidebarView::Pipeline;
+        self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        match p.kind {
+            StageLaunchKind::Fix => {
+                // Findings are already in the DB (that's why this offer, not the
+                // #587 capture dialog, was raised) — bypass the secondary
+                // no-findings gate and launch the fix directly.
+                self.rework_bypass = true;
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
+                self.rework_bypass = false;
+            }
+            StageLaunchKind::Test => {
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Test);
+            }
+        }
     }
 
     /// #486 Leg 4: fleet machines that can run `repo`, ordered local-first,
@@ -22081,6 +22268,49 @@ impl CoordApp {
             .assignments
             .iter()
             .any(|a| a.id == assignment_id && a.status == "running")
+    }
+
+    /// The board assignment type for `aid` ("work" / "review" / "smoke" /
+    /// "merge" / …), or `None` if the assignment isn't on the in-memory board.
+    fn assignment_type_of(&self, aid: &str) -> Option<&str> {
+        self.data
+            .assignments
+            .iter()
+            .find(|a| a.id == aid)
+            .and_then(|a| a.assignment_type.as_deref())
+    }
+
+    /// The assignment id of a still-running tmux session for `(issue_num, repo)`
+    /// that this launch `mode` may reattach to — gated on the running session's
+    /// assignment TYPE matching the type this mode produces (Work/Plan/Fix →
+    /// "work", Review → "review", Test → "smoke", Merge → "merge").
+    ///
+    /// The type gate is the fix for the "Start fix dropped me back in a review"
+    /// kink: without it the reattach matched ANY running session for the issue,
+    /// so clicking "Start fix" while a review session was still running ran
+    /// `coord reattach <review_aid>` (back into the review + its verdict prompt)
+    /// instead of dispatching a fresh `--fix-of`.  Troubleshoot never reattaches
+    /// (#569: always a fresh diagnostic).
+    fn reattachable_session_aid(
+        &self,
+        issue_num: u64,
+        repo: &str,
+        mode: InteractiveLaunchMode,
+    ) -> Option<String> {
+        if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
+            return None;
+        }
+        let want_type = interactive_mode_assignment_type(mode);
+        self.live_tmux_sessions
+            .iter()
+            .filter(|s| {
+                s.issue_number == Some(issue_num) && s.repo_name.as_deref() == Some(repo)
+            })
+            .map(|s| s.assignment_id.clone())
+            .find(|aid| {
+                self.session_assignment_is_running(aid)
+                    && self.assignment_type_of(aid) == Some(want_type)
+            })
     }
 
     /// Whether `issue_number` has a *reattachable* live session (a discovered
@@ -22479,11 +22709,7 @@ impl CoordApp {
         // keyed by this very issue_key).  So DEFER: leave the arm in place and
         // re-check each tick; it fires once the test pane is closed (its shell
         // has exited).  `key` IS the issue_key `detail_terminal_sessions` uses.
-        if self
-            .detail_terminal_sessions
-            .get(&key)
-            .is_some_and(|s| !s.is_exited())
-        {
+        if self.session_pane_live(&key) {
             return false;
         }
         let Some(armed) = self.armed_for_test_verdict.remove(&key) else {
@@ -22812,18 +23038,9 @@ impl CoordApp {
         // `running` assignment (that's *why* it's stalled), and reattaching to it
         // would hijack the diagnostic with the very session we're trying to
         // diagnose. Force a fresh launch for Troubleshoot.
-        let maybe_live_session = if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
-            None
-        } else {
-            self.live_tmux_sessions
-                .iter()
-                .filter(|s| {
-                    s.issue_number == Some(issue_num)
-                        && s.repo_name.as_deref() == Some(repo.as_str())
-                })
-                .map(|s| s.assignment_id.clone())
-                .find(|aid| self.session_assignment_is_running(aid))
-        };
+        // Mode-aware: only reattach to a running session of the SAME type this
+        // mode launches, so "Start fix" never reattaches into a running review.
+        let maybe_live_session = self.reattachable_session_aid(issue_num, &repo, mode);
 
         match quadraui::terminal_engine::TerminalSession::spawn(
             cols.max(20),
@@ -23128,6 +23345,23 @@ fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str {
         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
         InteractiveLaunchMode::Test => "testing",
         InteractiveLaunchMode::Merge => "merge",
+    }
+}
+
+/// The board assignment TYPE a given interactive launch mode produces or
+/// continues — used to keep the reattach decision mode-aware so a `Fix` launch
+/// never reattaches into a running `review` session.  `--fix-of` continues the
+/// work branch as a `type="work"` row (coord/cli.py), so Fix maps to "work".
+/// Troubleshoot never reattaches (callers guard); its sentinel matches nothing.
+fn interactive_mode_assignment_type(mode: InteractiveLaunchMode) -> &'static str {
+    match mode {
+        InteractiveLaunchMode::Work
+        | InteractiveLaunchMode::Plan
+        | InteractiveLaunchMode::Fix => "work",
+        InteractiveLaunchMode::Review => "review",
+        InteractiveLaunchMode::Test => "smoke",
+        InteractiveLaunchMode::Merge => "merge",
+        InteractiveLaunchMode::Troubleshoot => "troubleshoot",
     }
 }
 
@@ -24047,6 +24281,30 @@ impl ShellApp for CoordApp {
                         self.push_toast(
                             "Review deferred",
                             "Start it any time from the row's right-click menu.",
+                            ToastSeverity::Info,
+                        );
+                        return Reaction::Redraw;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Post-review one-key stage offer (Fix / Test) confirm ─────────
+        // Own Enter (→ launch the next stage) and Esc/n (defer).  No text
+        // input, so other keys fall through and the shell stays usable.
+        if self.pending_stage_launch.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.confirm_stage_launch();
+                        return Reaction::Redraw;
+                    }
+                    Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        self.pending_stage_launch = None;
+                        self.push_toast(
+                            "Deferred",
+                            "Start the next stage any time from the row's right-click menu.",
                             ToastSeverity::Info,
                         );
                         return Reaction::Redraw;
@@ -28091,6 +28349,7 @@ mod tests {
             // Leg 2 (#517)
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
+            pending_stage_launch: None,
             // Leg 3 (#517)
             armed_for_verdict: std::collections::HashMap::new(),
             pending_rework: None,
@@ -28501,16 +28760,89 @@ mod tests {
     }
 
     #[test]
+    fn detect_review_verdict_request_changes_skips_prompt_when_findings_present() {
+        // When the review agent already self-reported findings to the DB
+        // (`coord report-result`), the #587 manual-entry rework dialog is
+        // redundant — detect_review_verdict raises a one-key "start fix" stage
+        // offer instead, so the operator never has to retype the findings.
+        let mut review = review_of("id-10-done", 10, "repo-a", Some("request-changes"));
+        review.review_findings = Some(
+            r#"{"verdict":"request-changes","body":"Missing keyboard-nav tests."}"#.to_string(),
+        );
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"),
+            review,
+        ]);
+        arm_verdict(&mut app, "repo-a", 10, &[]);
+        assert!(app.detect_review_verdict());
+        assert!(
+            app.pending_rework.is_none(),
+            "the #587 findings dialog must be skipped when findings are already in the DB",
+        );
+        let p = app
+            .pending_stage_launch
+            .as_ref()
+            .expect("a start-fix stage offer is raised");
+        assert_eq!(p.kind, StageLaunchKind::Fix);
+        assert_eq!(p.issue_num, 10);
+        assert!(app.armed_for_verdict.is_empty());
+    }
+
+    #[test]
+    fn review_assignment_has_findings_requires_nonempty_body() {
+        // None → false.
+        let r0 = review_of("w", 10, "repo-a", Some("request-changes"));
+        let aid0 = r0.id.clone();
+        let app0 = make_app_with_assignments(vec![r0]);
+        assert!(!app0.review_assignment_has_findings(&aid0));
+
+        // Non-empty body → true.
+        let mut r1 = review_of("w", 11, "repo-a", Some("request-changes"));
+        let aid1 = r1.id.clone();
+        r1.review_findings = Some(r#"{"verdict":"request-changes","body":"do x"}"#.to_string());
+        let app1 = make_app_with_assignments(vec![r1]);
+        assert!(app1.review_assignment_has_findings(&aid1));
+
+        // Present JSON but blank body → false (no real findings to brief from).
+        let mut r2 = review_of("w", 12, "repo-a", Some("request-changes"));
+        let aid2 = r2.id.clone();
+        r2.review_findings = Some(r#"{"verdict":"request-changes","body":"  "}"#.to_string());
+        let app2 = make_app_with_assignments(vec![r2]);
+        assert!(!app2.review_assignment_has_findings(&aid2));
+    }
+
+    #[test]
     fn detect_review_verdict_approve_notifies_without_rework() {
         let mut app = make_app_with_assignments(vec![
             done_work_with_branch(10, "repo-a"),
             review_of("id-10-done", 10, "repo-a", Some("approve")),
         ]);
         arm_verdict(&mut app, "repo-a", 10, &[]);
-        // Routed (toast), but NO rework prompt for an approval.
+        // Approve → a one-key "start testing" stage offer, never a rework prompt.
         assert!(app.detect_review_verdict());
         assert!(app.pending_rework.is_none());
+        let p = app
+            .pending_stage_launch
+            .as_ref()
+            .expect("a start-testing stage offer is raised");
+        assert_eq!(p.kind, StageLaunchKind::Test);
         assert!(app.armed_for_verdict.is_empty());
+    }
+
+    #[test]
+    fn confirm_stage_launch_without_matching_row_is_noop() {
+        // Empty pipeline → no row to select; confirm consumes the offer and
+        // spawns no terminal session (mirrors confirm_auto_review's no-op).
+        let mut app = make_app_default();
+        app.pending_stage_launch = Some(PendingStageLaunch {
+            coord_repo: "repo-a".to_string(),
+            repo_slug: "repo-a".to_string(),
+            issue_num: 10,
+            kind: StageLaunchKind::Test,
+        });
+        app.confirm_stage_launch();
+        assert!(app.pending_stage_launch.is_none());
+        assert!(app.detail_terminal_sessions.is_empty());
     }
 
     #[test]
@@ -35946,6 +36278,83 @@ mod tests {
             interactive_mode_verb(InteractiveLaunchMode::Troubleshoot),
             "troubleshoot"
         );
+    }
+
+    #[test]
+    fn interactive_mode_assignment_type_maps_fix_to_work() {
+        // --fix-of continues the work branch as type="work" (cli.py), so a Fix
+        // launch must reattach only to a running work session, never a review.
+        assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Fix), "work");
+        assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Work), "work");
+        assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Plan), "work");
+        assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Review), "review");
+        assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Test), "smoke");
+        assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Merge), "merge");
+    }
+
+    #[test]
+    fn reattach_is_mode_aware_fix_skips_running_review() {
+        // The kink: "Start fix" reattached into a still-running review session
+        // (→ verdict prompt) instead of dispatching a fresh --fix-of.  The
+        // reattach must be type-gated: Fix (→ work) ignores a running review,
+        // while Review still reattaches to it.
+        let mut review = review_of("w", 10, "repo-a", None);
+        review.status = "running".to_string();
+        let review_aid = review.id.clone();
+        let mut app = make_app_with_assignments(vec![review]);
+        app.live_tmux_sessions.push(LiveTmuxSession {
+            assignment_id: review_aid.clone(),
+            issue_number: Some(10),
+            repo_name: Some("repo-a".to_string()),
+            issue_title: None,
+        });
+
+        // Fix wants a running "work" session — the only one running is a review.
+        assert_eq!(
+            app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Fix),
+            None,
+            "Start fix must NOT reattach into a running review",
+        );
+        // Review mode legitimately reattaches to its own running review.
+        assert_eq!(
+            app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Review),
+            Some(review_aid),
+        );
+        // Troubleshoot never reattaches.
+        assert_eq!(
+            app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Troubleshoot),
+            None,
+        );
+    }
+
+    #[test]
+    fn reattach_matches_a_running_work_session_for_fix() {
+        // Positive case: a genuinely running work/fix session IS reattachable
+        // for a Fix launch (the operator quit the TUI mid-fix).
+        let mut work = done_work_with_branch(10, "repo-a");
+        work.status = "running".to_string();
+        let work_aid = work.id.clone();
+        let mut app = make_app_with_assignments(vec![work]);
+        app.live_tmux_sessions.push(LiveTmuxSession {
+            assignment_id: work_aid.clone(),
+            issue_number: Some(10),
+            repo_name: Some("repo-a".to_string()),
+            issue_title: None,
+        });
+        assert_eq!(
+            app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Fix),
+            Some(work_aid),
+        );
+    }
+
+    #[test]
+    fn session_pane_live_false_without_a_session() {
+        // The #602 exit-gate must NOT defer when there's no live pane for the
+        // issue (remote session, or after the operator /exit'ed) — the board-
+        // driven stage detectors then fire normally.  (The live-pane branch
+        // needs a real PTY and is covered by live smoke.)
+        let app = make_app_default();
+        assert!(!app.session_pane_live(&("repo-a".to_string(), 10)));
     }
 
     #[test]
