@@ -302,23 +302,36 @@ def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
 
 
 def _capture_cost(transition: Transition, entry: dict) -> None:
-    """#208: parse the worker's final cost and persist it on the assignment.
+    """#208/#546: parse the worker's final cost+tokens and persist them.
 
     Preferred source is the local stream-json log (cheap, no network).
     Falls back to the agent's status entry, which carries ``cost_so_far``
-    / ``total_cost_usd`` reported live by the worker.  Either path is
-    best-effort — failure is silent so it can't block the comment post.
+    / ``total_cost_usd`` reported live by the worker.  Tokens are only
+    available from the log (not from the agent status dict), so they are
+    captured when the local log exists.  Either path is best-effort —
+    failure is silent so it can't block the comment post.
     """
-    from coord.state import update_assignment_cost  # noqa: PLC0415
+    from coord.state import update_assignment_cost, update_assignment_tokens  # noqa: PLC0415
     from coord.usage import parse_usage_from_log  # noqa: PLC0415
 
     cost: float | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+
     log_path = entry.get("log_path")
     if log_path:
         try:
             parsed = parse_usage_from_log(Path(log_path))
-            if parsed is not None and parsed.total_cost_usd > 0:
-                cost = parsed.total_cost_usd
+            if parsed is not None:
+                if parsed.total_cost_usd > 0:
+                    cost = parsed.total_cost_usd
+                # #546: also capture token counts from the same parse.
+                input_tokens = parsed.input_tokens
+                output_tokens = parsed.output_tokens
+                cache_creation_tokens = parsed.cache_creation_tokens
+                cache_read_tokens = parsed.cache_read_tokens
         except Exception as exc:  # noqa: BLE001
             log.debug(
                 "_capture_cost: failed to parse log for %s: %s",
@@ -340,6 +353,22 @@ def _capture_cost(transition: Transition, entry: dict) -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "_capture_cost: failed to persist cost for %s: %s",
+                transition.assignment_id, exc,
+            )
+
+    # #546: persist token counts (best-effort; silent on missing columns).
+    if input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens > 0:
+        try:
+            update_assignment_tokens(
+                transition.assignment_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_tokens=cache_creation_tokens,
+                cache_read_tokens=cache_read_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "_capture_cost: failed to persist tokens for %s: %s",
                 transition.assignment_id, exc,
             )
 

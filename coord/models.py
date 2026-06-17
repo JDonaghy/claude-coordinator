@@ -225,6 +225,14 @@ class Assignment:
     # case.  Always the *resolved* name (after the spec > repo > default
     # precedence chain), not just the raw proposal.provider field.
     provider_name: str | None = None
+    # #546: token counts for automated (claude -p) assignments.  Parsed from
+    # the final stream-json result event at the same time as cost_usd.  All
+    # default to 0; interactive (Max/OAuth) sessions stay at 0 and the TUI
+    # labels them "Max (subscription)" rather than projecting a dollar figure.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 @dataclass

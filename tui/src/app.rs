@@ -946,6 +946,18 @@ struct Assignment {
     /// auto-refresh via `coord test-plan --refresh`).
     #[serde(default)]
     test_plan_branch_head: Option<String>,
+    /// #546: token counts for automated (claude -p) assignments, parsed from
+    /// the final stream-json result event alongside `cost_usd`.
+    /// 0 for interactive (Claude Max / OAuth) sessions — those have no
+    /// per-token billing and the TUI shows "Max" instead of a $ figure.
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+    #[serde(default)]
+    cache_creation_tokens: i64,
+    #[serde(default)]
+    cache_read_tokens: i64,
 }
 
 impl Assignment {
@@ -2462,6 +2474,23 @@ fn format_unix_time(ts: f64) -> String {
     format!("{} ago", fmt_dur(delta))
 }
 
+/// #546: format a token count with K/M suffix and one decimal place.
+///
+/// Examples: 1500 → "1.5k", 2_300_000 → "2.3M", 800 → "800".
+/// Used to keep token counts readable in the narrow TUI columns.
+fn fmt_tokens(n: i64) -> String {
+    if n <= 0 {
+        return "0".to_string();
+    }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// #208: format a worker cost in USD with two decimals.  Below 1¢ shows
 /// "< $0.01" so the rendering doesn't read as $0.00 (mathematically true
 /// but misleading — the worker did some non-zero work).
@@ -3353,7 +3382,9 @@ fn load_data() -> BoardData {
             "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, \
              status, branch, model, type, dispatched_at, finished_at, exit_code, \
              test_state, review_verdict, review_of_assignment_id, cost_usd, \
-             smoke_tests, review_findings, test_plan, test_plan_branch_head \
+             smoke_tests, review_findings, test_plan, test_plan_branch_head, \
+             COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), \
+             COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0) \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -3389,6 +3420,16 @@ fn load_data() -> BoardData {
                     .get::<_, Option<String>>(18)?
                     .and_then(|raw| parse_test_plan_steps(&raw)),
                 test_plan_branch_head: row.get::<_, Option<String>>(19)?,
+                // #546: token counts.  COALESCE(col, 0) in the SQL converts
+                // any NULL values to 0 for existing columns.  If the columns
+                // don't exist yet (pre-migration DB), the whole query fails
+                // and BoardData::default() is returned — acceptable graceful
+                // degradation since the Python coordinator always runs
+                // migrations before workers produce any data to show.
+                input_tokens: row.get::<_, i64>(20)?,
+                output_tokens: row.get::<_, i64>(21)?,
+                cache_creation_tokens: row.get::<_, i64>(22)?,
+                cache_read_tokens: row.get::<_, i64>(23)?,
             })
         }) {
             Ok(r) => r,
@@ -8758,6 +8799,52 @@ impl CoordApp {
         })
     }
 
+    /// #546: Sum ``cost_usd`` across ALL assignments for an issue (rollup).
+    ///
+    /// Returns ``None`` when no assignment has a captured cost yet (e.g. all
+    /// workers are still running or all rows predate #208).  Interactive / Max
+    /// subscription sessions have ``cost_usd = NULL`` and are excluded from
+    /// the sum (they are shown as "Max" in the per-assignment rows instead).
+    ///
+    /// The rollup shows the coordinator the TOTAL spend for an issue across all
+    /// stage iterations: plan + work + fix-1 + fix-2 + review + smoke.
+    fn issue_total_cost(&self, issue: &PipelineIssue) -> Option<f64> {
+        let local_repo = issue.coord_repo.as_deref();
+        let costs: Vec<f64> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == *r,
+                None => true,
+            })
+            .filter_map(|a| a.cost_usd)
+            .filter(|&c| c > 0.0)
+            .collect();
+        if costs.is_empty() {
+            None
+        } else {
+            Some(costs.iter().sum())
+        }
+    }
+
+    /// #546: Total token count (input + output) for an issue across all
+    /// assignments.  Returns 0 when no tokens have been persisted yet.
+    fn issue_total_tokens(&self, issue: &PipelineIssue) -> i64 {
+        let local_repo = issue.coord_repo.as_deref();
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == *r,
+                None => true,
+            })
+            .map(|a| a.input_tokens + a.output_tokens)
+            .sum()
+    }
+
     /// Return the coord_repo name for an issue, falling back to the repo_slug.
     fn pipeline_repo_key(issue: &PipelineIssue) -> &str {
         issue.coord_repo.as_deref().unwrap_or(&issue.repo_slug)
@@ -12514,6 +12601,23 @@ impl CoordApp {
                 &self.pipeline_stage_names_for_issue(issue).join(" → "),
                 Some(Color::rgb(160, 160, 180)),
             ));
+            // #546: per-issue cost rollup — sum of metered (claude -p) cost_usd
+            // across all stage iterations (work + review + fix + smoke + plan).
+            // Interactive (Max subscription) assignments show cost_usd=NULL and
+            // are excluded; they appear as individual "Max" rows in the stages.
+            if let Some(total_cost) = self.issue_total_cost(issue) {
+                let tok = self.issue_total_tokens(issue);
+                let cost_str = if tok > 0 {
+                    format!("{}  ({} tokens)", format_cost_usd(total_cost), fmt_tokens(tok))
+                } else {
+                    format_cost_usd(total_cost)
+                };
+                items.push(kv_item(
+                    "Cost (Σ)",
+                    &cost_str,
+                    Some(Color::rgb(160, 220, 160)),
+                ));
+            }
             if let Some((msg, when)) = &self.pipeline_status {
                 if when.elapsed() < Duration::from_secs(8) {
                     items.push(kv_item("", "", None));
@@ -14013,12 +14117,52 @@ impl CoordApp {
                 };
                 items.push(kv_item("Exit code", &ec.to_string(), Some(ec_color)));
             }
-            // #208: surface captured worker cost so the user can spot
-            // unusually expensive runs without leaving the TUI.
+            // #208/#546: surface captured worker cost + token counts so the
+            // user can spot unusually expensive runs without leaving the TUI.
+            // Token counts come from the same stream-json parse as cost_usd.
+            // Interactive (Max subscription) workers have cost_usd=None and
+            // token counts of 0 — we show "Max (subscription)" for those.
+            let tok_total = a.input_tokens + a.output_tokens
+                + a.cache_creation_tokens + a.cache_read_tokens;
+            let has_tokens = tok_total > 0;
             if let Some(cost) = a.cost_usd {
+                let tok_suffix = if has_tokens {
+                    // Show input·output with a cache note when cache was used.
+                    let cache = a.cache_creation_tokens + a.cache_read_tokens;
+                    if cache > 0 {
+                        format!(
+                            "  ({}in · {}out · {}cache)",
+                            fmt_tokens(a.input_tokens),
+                            fmt_tokens(a.output_tokens),
+                            fmt_tokens(cache),
+                        )
+                    } else {
+                        format!(
+                            "  ({}in · {}out)",
+                            fmt_tokens(a.input_tokens),
+                            fmt_tokens(a.output_tokens),
+                        )
+                    }
+                } else {
+                    String::new()
+                };
                 items.push(kv_item(
                     "Cost",
-                    &format_cost_usd(cost),
+                    &format!("{}{}", format_cost_usd(cost), tok_suffix),
+                    Some(Color::rgb(180, 180, 180)),
+                ));
+            } else if a.status == "done" && !has_tokens {
+                // Done assignment with no cost/tokens → interactive (Max) session.
+                items.push(kv_item(
+                    "Cost",
+                    "Max (subscription)",
+                    Some(Color::rgb(140, 140, 160)),
+                ));
+            } else if has_tokens {
+                // Tokens available but cost_usd not yet persisted (uncommon).
+                items.push(kv_item(
+                    "Tokens",
+                    &format!("{}tok", fmt_tokens(tok_total)),
                     Some(Color::rgb(180, 180, 180)),
                 ));
             }
@@ -29025,6 +29169,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         }
     }
 
@@ -29752,6 +29900,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         }
     }
 
@@ -31022,6 +31174,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -31155,6 +31311,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "pending");
@@ -31220,6 +31380,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -32068,6 +32232,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         }
     }
 
@@ -33433,6 +33601,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -33475,6 +33647,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -33517,6 +33693,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -33639,6 +33819,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -33725,6 +33909,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -33767,6 +33955,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -33796,6 +33988,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -33830,6 +34026,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -33853,6 +34053,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -33884,6 +34088,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -33944,6 +34152,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -33985,6 +34197,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -34007,6 +34223,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -34193,6 +34413,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         }
     }
 
@@ -34527,6 +34751,10 @@ mod tests {
                 review_findings: None,
                 test_plan: None,
                 test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -34571,6 +34799,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -34613,6 +34845,10 @@ mod tests {
                 review_findings: None,
                 test_plan: None,
                 test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -34657,6 +34893,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -34738,6 +34978,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -34775,6 +35019,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -34806,6 +35054,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -34837,6 +35089,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -38793,6 +39049,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -38907,6 +39167,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -39264,6 +39528,10 @@ mod tests {
             review_findings: None,
             test_plan: None,
             test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
