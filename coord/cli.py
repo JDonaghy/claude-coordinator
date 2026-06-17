@@ -4028,7 +4028,7 @@ def assign(
                 "You are a human-attended merge-prep agent dispatched by the "
                 "coordinator. A human operator is at the keyboard with you. The "
                 "branch has been reviewed/approved; your job is to get it cleanly "
-                "rebased and ready to merge.\n\n"
+                "rebased, verified, and MERGED.\n\n"
                 "Rules:\n"
                 "- Stay on the worker's branch. NEVER push to the default branch "
                 "directly.\n"
@@ -4039,9 +4039,14 @@ def assign(
                 "sides. For SEMANTIC conflicts (same logic changed two ways), do "
                 "NOT guess: explain the conflict to the operator and let them "
                 "decide.\n"
-                "- Do NOT merge to the default branch yourself. After the rebase "
-                "is clean, pushed, and tests pass, hand back to the operator: "
-                "they merge via the TUI 'Go' button (or `coord merge`).\n\n"
+                "- NEVER push to the default branch directly or use `gh`. "
+                f"`coord merge --repo {repo}` is the ONLY merge path — it routes "
+                "to the coordinator and re-checks the CI / review / smoke gates "
+                "before merging via PR. You run it yourself, but ONLY after "
+                "`coord verify-merge` passes clean.\n"
+                "- If `coord merge` reports a gate failure (CI red, conflict, "
+                "missing verdict), STOP and report it to the operator — never "
+                "`--force-merge` / `--skip-*` on your own.\n\n"
                 "Flow:\n"
                 "1. `git fetch origin`.\n"
                 "2. Rebase the branch onto `origin/<default_branch>`.\n"
@@ -4056,8 +4061,9 @@ def assign(
                 "The coordinator runs this same check on exit and will record "
                 "`blocked` (not `done`) if it fails, so a botched rebase cannot "
                 "slip through.\n"
-                "7. Tell the operator the branch is rebased + green and ready to "
-                "merge.\n"
+                f"7. Complete the merge: run `coord merge --repo {repo}` (it opens "
+                "the PR, enforces the gates, and merges in dependency order). "
+                "Report the outcome — merged, or which gate blocked.\n"
             )
 
             merge_briefing = (
@@ -4081,9 +4087,10 @@ def assign(
                 f"if `{merge_target_branch}-ahead != 0` or any FOREIGN commits "
                 "are listed, the rebase is wrong (stale base / polluted history); "
                 "fix it or report `--status blocked` (#604). "
-                "Then tell the operator it's ready to merge — they press 'Go' in "
-                "the TUI (or run `coord merge`). Do NOT merge to the default "
-                "branch yourself.\n"
+                f"Once verify-merge passes clean, COMPLETE the merge yourself: "
+                f"run `coord merge --repo {repo}` (it re-checks CI/review/smoke "
+                "on the coordinator and merges via PR). If it reports a gate "
+                "failure, report that to the operator instead of forcing.\n"
             )
 
             os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
