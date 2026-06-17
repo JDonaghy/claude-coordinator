@@ -650,8 +650,9 @@ class TestLaunchViaTmuxRawShellCmd:
         create_calls = [c for c in captured_create_cmds if "new-session" in c]
         assert create_calls, "new-session not called"
         create_cmd = create_calls[0]
-        # For local (TmuxHost(None)): shell_cmd is raw, which is the last element
-        assert raw in create_cmd, (
+        # For local (TmuxHost(None)): shell_cmd is raw, wrapped by the #606
+        # PATH prefix, present as the last element.
+        assert any(raw in part for part in create_cmd), (
             f"Expected raw_shell_cmd in create_cmd; got: {create_cmd!r}"
         )
         # argv[0] 'claude' must NOT appear as the command (raw overrides argv)
@@ -684,7 +685,8 @@ class TestLaunchViaTmuxRawShellCmd:
         assert create_calls
         create_cmd = create_calls[0]
         expected_shell_cmd = shlex.join(["echo", "hello world"])
-        assert expected_shell_cmd in create_cmd, (
+        # shell_cmd is shlex.join(argv), wrapped by the #606 PATH prefix.
+        assert any(expected_shell_cmd in part for part in create_cmd), (
             f"Expected shlex.join output {expected_shell_cmd!r} in {create_cmd!r}"
         )
 
@@ -765,11 +767,11 @@ class TestLaunchViaTmuxRawShellCmd:
         # ControlMaster -o opts and the host).
         cmd_str = create_calls[0][-1]
 
-        # shlex.quote(raw) should be present in the single ssh cmd string
-        quoted_raw = shlex.quote(raw)
-        assert quoted_raw in cmd_str, (
-            f"shlex.quote(raw_shell_cmd) not found in ssh cmd string.\n"
-            f"Expected: {quoted_raw!r}\nIn: {cmd_str!r}"
+        # raw_shell_cmd is sent as a single quoted ssh string (wrapped by the
+        # #606 PATH prefix), so the raw command is preserved inside cmd_str.
+        assert raw in cmd_str, (
+            f"raw_shell_cmd not found in ssh cmd string.\n"
+            f"Expected substring: {raw!r}\nIn: {cmd_str!r}"
         )
 
 

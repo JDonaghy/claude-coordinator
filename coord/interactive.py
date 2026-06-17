@@ -374,6 +374,23 @@ def _inject_briefing_into_tmux_session(
         return False
 
 
+def _with_coord_on_path(shell_cmd: str) -> str:
+    """Prefix *shell_cmd* so ``coord`` resolves inside the interactive session
+    (#606 PATH-fix).
+
+    Interactive sessions run under the machine's ``$SHELL``, which often lacks
+    the coord venv bin on ``PATH`` (same class as the claude-not-on-ssh-PATH
+    issue).  A human-attended REVIEW agent then can't run ``coord
+    report-result`` and falls back to printing ``REVIEW_VERDICT:`` (recovered by
+    the #606 transcript-floor).  Prepend the agent's coord venv bin — the
+    ``~/.coord-venv`` install INVARIANT, kept as a literal ``$HOME`` so the
+    session's own shell expands it on the machine the session runs on — so the
+    agent's PREFERRED self-report path works.  Additive: a non-existent PATH
+    entry is simply ignored, so this is harmless when coord lives elsewhere.
+    """
+    return f'export PATH="$HOME/.coord-venv/bin:$PATH"; {shell_cmd}'
+
+
 def _launch_via_tmux(
     argv: Sequence[str],
     briefing: str,
@@ -440,6 +457,8 @@ def _launch_via_tmux(
         # ``shlex.join``.  When not provided, fall back to the default
         # behaviour: quote the argv list.
         shell_cmd = raw_shell_cmd if raw_shell_cmd is not None else shlex.join(list(argv))
+        # #606: make `coord` resolvable in the session (agent self-report path).
+        shell_cmd = _with_coord_on_path(shell_cmd)
 
         if host.ssh_target is not None:
             # Remote: build the entire ``tmux new-session`` invocation as a
@@ -655,6 +674,12 @@ def _launch_via_pty(
         try:
             if cwd:
                 os.chdir(cwd)
+            # #606: ensure `coord` resolves for the agent's self-report (mirrors
+            # the tmux path's _with_coord_on_path; the PTY fallback execs argv
+            # directly, so set PATH in the child env here).
+            os.environ["PATH"] = (
+                os.path.expanduser("~/.coord-venv/bin") + ":" + os.environ.get("PATH", "")
+            )
             os.execvp(argv[0], list(argv))
         except OSError as e:
             sys.stderr.write(f"exec failed: {e}\n")
