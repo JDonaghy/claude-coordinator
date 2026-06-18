@@ -405,6 +405,52 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         result = await run_in_threadpool(_run)
         return JSONResponse(result)
 
+    async def post_reconcile_merges(request: Request) -> Response:
+        # #584: the canonical board + gh live in THIS DB — so a thin client's
+        # `coord reconcile-merges` routes the whole operation here instead of
+        # sweeping an empty local board.  Run it in a threadpool (the sweep
+        # shells out to gh) so it doesn't block the event loop / board reads.
+        # Returns the captured CLI output + exit code.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+        def _run() -> dict:
+            import contextlib  # noqa: PLC0415
+            import io  # noqa: PLC0415
+            import os  # noqa: PLC0415
+
+            from coord.cli import reconcile_merges as reconcile_cmd  # noqa: PLC0415
+
+            buf = io.StringIO()
+            code = 0
+            err = None
+            prev = os.environ.get("COORD_RECONCILE_ON_DAEMON")
+            os.environ["COORD_RECONCILE_ON_DAEMON"] = "1"  # guard against re-routing
+            try:
+                with contextlib.redirect_stdout(buf):
+                    reconcile_cmd.callback(
+                        config_path=config.path,
+                        dry_run=bool(body.get("dry_run")),
+                        repo_name=body.get("repo"),
+                    )
+            except SystemExit as e:  # click commands sys.exit() on some paths
+                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                code = 1
+            finally:
+                if prev is None:
+                    os.environ.pop("COORD_RECONCILE_ON_DAEMON", None)
+                else:
+                    os.environ["COORD_RECONCILE_ON_DAEMON"] = prev
+            return {"output": buf.getvalue(), "exit_code": code, "error": err}
+
+        result = await run_in_threadpool(_run)
+        return JSONResponse(result)
+
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
@@ -419,6 +465,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/issue-context", get_issue_context, methods=["GET"]),
         Route("/issue-context", post_issue_context, methods=["POST"]),
         Route("/merge", post_merge, methods=["POST"]),
+        Route("/reconcile-merges", post_reconcile_merges, methods=["POST"]),
     ]
     middleware = [Middleware(_BearerAuthMiddleware, token=token)] if token else []
     return Starlette(routes=routes, middleware=middleware)
