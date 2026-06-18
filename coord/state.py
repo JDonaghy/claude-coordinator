@@ -713,6 +713,72 @@ def update_assignment_review_findings(
     conn.commit()
 
 
+def delete_assignments_for_issue(
+    repo_name: str, issue_number: int, *, types: tuple[str, ...]
+) -> int:
+    """Delete assignment rows of the given *types* for an issue.
+
+    Used by the per-stage reset (``coord diagnose --reset``): wiping the
+    ``type='review'`` rows makes the Review stage show no verdict (grey /
+    Pending in the TUI) and removes the request-changes the merge gate keys on.
+    Returns the number of rows deleted.  Runs against the canonical DB (the
+    daemon executes diagnose), so no save_board is involved."""
+    if not types:
+        return 0
+    conn = get_connection()
+    placeholders = ",".join("?" for _ in types)
+    cur = conn.execute(
+        f"DELETE FROM assignments WHERE repo_name=? AND issue_number=? "  # noqa: S608 — placeholders are literal '?'
+        f"AND type IN ({placeholders})",
+        (repo_name, issue_number, *types),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def reset_work_review_state(repo_name: str, issue_number: int) -> int:
+    """Make an issue's work re-reviewable: reset the work/plan rows'
+    ``review_state`` → 'pending' and clear ``review_verdict`` /
+    ``review_posted_at``.  Returns rows updated."""
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE assignments SET review_state='pending', review_verdict=NULL, "
+        "review_posted_at=NULL "
+        "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan')",
+        (repo_name, issue_number),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def reset_work_test_state(repo_name: str, issue_number: int) -> int:
+    """Clear the work/plan rows' Test-gate verdict (``test_state`` /
+    ``test_reason``) so the issue is re-testable.  Returns rows updated."""
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE assignments SET test_state=NULL, test_reason=NULL "
+        "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan')",
+        (repo_name, issue_number),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def clear_issue_context_by_source(
+    repo_name: str, issue_number: int, source: str
+) -> int:
+    """Delete #603 context entries with a given *source* (e.g. 'review') for an
+    issue — the targeted peer of :func:`clear_issue_context`.  Returns rows
+    deleted."""
+    conn = get_connection()
+    cur = conn.execute(
+        "DELETE FROM issue_context WHERE repo_name=? AND issue_number=? AND source=?",
+        (repo_name, issue_number, source),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def load_assignment_review_findings(
     assignment_id: str,
 ) -> tuple[str, str] | None:

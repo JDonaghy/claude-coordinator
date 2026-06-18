@@ -19277,6 +19277,21 @@ impl CoordApp {
     ///
     /// `--stage` is intentionally omitted: the command auto-detects the issue's
     /// most-recent stage server-side, which is the wedged one in practice.
+    /// The stage box the operator currently has focused in the Stages strip,
+    /// mapped to a `coord diagnose --stage` value — so Diagnose/Reset target the
+    /// box they're looking at, not a newest-assignment guess.  `None` (no stage
+    /// focused, or a gate coord diagnose doesn't model) → server auto-detect.
+    fn selected_pipeline_stage_name(&self) -> Option<String> {
+        let idx = self.pipeline_focused_stage?;
+        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
+        let name = self.pipeline_stage_names_for_issue(issue).get(idx)?.clone();
+        match name.as_str() {
+            "plan" | "work" | "review" | "test" | "merge" => Some(name),
+            "smoke" => Some("test".to_string()), // gate alias → diagnose's "test"
+            _ => None,
+        }
+    }
+
     fn dispatch_diagnose_for_selected_pipeline_row(&mut self, reset: bool) -> bool {
         let (repo, key) = match self.selected_issue_repo_and_key() {
             Some(v) => v,
@@ -19291,6 +19306,11 @@ impl CoordApp {
         };
         let issue_str = key.1.to_string();
         let mut argv: Vec<String> = vec!["diagnose".into(), repo, issue_str];
+        // Target the focused stage box when there is one (else auto-detect).
+        if let Some(stage) = self.selected_pipeline_stage_name() {
+            argv.push("--stage".into());
+            argv.push(stage);
+        }
         if reset {
             argv.push("--reset".into());
         }

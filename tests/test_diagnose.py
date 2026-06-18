@@ -200,6 +200,64 @@ def test_reset_keeps_branch_and_stops_live_session(monkeypatch, config) -> None:
     assert any("branch preserved" in x for x in res.actions_taken)
 
 
+def test_reset_review_wipes_rows_state_and_context(monkeypatch, config) -> None:
+    # #607: resetting a COMPLETED review must delete the review rows (→ grey),
+    # reset the work's review_state (→ re-reviewable), AND purge the #603 review
+    # notes ("completely cleared") — not no-op because the session is dead.
+    _stub(monkeypatch, session="dead")
+    calls: dict = {}
+    monkeypatch.setattr(
+        "coord.state.delete_assignments_for_issue",
+        lambda repo, issue, *, types: calls.setdefault("delete", (repo, issue, types)) or 2,
+    )
+    monkeypatch.setattr(
+        "coord.state.reset_work_review_state",
+        lambda repo, issue: calls.setdefault("reset_state", (repo, issue)) or 1,
+    )
+    monkeypatch.setattr(
+        "coord.state.clear_issue_context_by_source",
+        lambda repo, issue, source: calls.setdefault("purge", (repo, issue, source)) or 3,
+    )
+    a = _assign(aid="r1", typ="review", status="done", verdict="request-changes")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+    assert res.reset_performed and res.recovered and res.branch_preserved
+    assert calls["delete"] == ("api", 42, ("review",))
+    assert calls["reset_state"] == ("api", 42)
+    assert calls["purge"] == ("api", 42, "review")
+
+
+def test_reset_review_dry_run_does_not_wipe(monkeypatch, config) -> None:
+    _stub(monkeypatch, session="dead")
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("dry-run review reset must not write")
+
+    monkeypatch.setattr("coord.state.delete_assignments_for_issue", _boom)
+    monkeypatch.setattr("coord.state.reset_work_review_state", _boom)
+    monkeypatch.setattr("coord.state.clear_issue_context_by_source", _boom)
+    a = _assign(aid="r1", typ="review", status="done", verdict="request-changes")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(
+        board, config, "api", 42, "review", reset=True, dry_run=True
+    )
+    assert res.reset_performed is False
+
+
+def test_reset_test_clears_test_state(monkeypatch, config) -> None:
+    _stub(monkeypatch, session="dead")
+    calls: dict = {}
+    monkeypatch.setattr(
+        "coord.state.reset_work_test_state",
+        lambda repo, issue: calls.setdefault("test", (repo, issue)) or 1,
+    )
+    a = _assign(aid="w1", typ="work", status="done")  # test verdict rides the work row
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test", reset=True)
+    assert res.reset_performed is True
+    assert calls["test"] == ("api", 42)
+
+
 def test_reset_dry_run_does_nothing(monkeypatch, config) -> None:
     calls = _stub(monkeypatch, session="live")
     a = _assign(aid="w1", typ="work", status="running")

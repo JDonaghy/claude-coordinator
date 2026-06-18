@@ -371,7 +371,10 @@ def diagnose_stage(
     )
 
     if reset:
-        _do_reset(board, config, assignments, res, dry_run=dry_run)
+        _do_reset(
+            board, config, assignments, res, stage=stage,
+            repo_name=repo_name, issue_number=issue_number, dry_run=dry_run,
+        )
         _cleanup_issue(
             board, config, repo_name, issue_number, res, dry_run=dry_run, skip_ids=handled
         )
@@ -466,23 +469,38 @@ def _recover_work_like(
 
 
 def _do_reset(
-    board, config, assignments, res: DiagnoseResult, *, dry_run: bool
+    board, config, assignments, res: DiagnoseResult, *, stage: str,
+    repo_name: str, issue_number: int, dry_run: bool,
 ) -> None:
-    """Non-destructive reset of the stage: stop a live session, finalize, mark
-    the row terminal, prune the worktree — KEEP the branch."""
+    """Stage-aware, non-destructive reset (KEEP the branch + commits always).
+
+    The shape of "reset" depends on the stage's state, not just on a live
+    session: a completed REVIEW has no session to kill — its data lives in the
+    board rows + #603 store — so resetting it means wiping that data so the
+    stage goes back to grey/unrun and re-reviewable.
+    """
     latest = _latest(assignments)
     if latest is None:
+        res.findings.append(f"no {stage} stage to reset")
+        res.recovered = True
         return
+
+    if stage == "review":
+        _reset_review_stage(config, repo_name, issue_number, res, dry_run=dry_run)
+        return
+    if stage == "test":
+        _reset_test_stage(repo_name, issue_number, res, dry_run=dry_run)
+        return
+
+    # work / plan / merge — clear a live/phantom session, KEEP the branch.
+    # (Merge reset deliberately does NOT un-merge; it only clears a stuck
+    # session/row, so a clean re-attempt is possible without rewriting history.)
     if dry_run:
         res.findings.append("(dry-run) would reset: stop session, finalize, clear row — branch kept")
         res.needs_reset = True
         return
-    state = _session_state(latest, config)
-    if state == "live":
-        if _kill_session(latest, config):
-            res.actions_taken.append("stopped the live session (tmux kill-session)")
-    # Finalize pushes any committed work and prunes the worktree; for a review
-    # there is no worktree so it just records a terminal row.
+    if _session_state(latest, config) == "live" and _kill_session(latest, config):
+        res.actions_taken.append("stopped the live session (tmux kill-session)")
     try:
         res.actions_taken.append(f"finalized session ({_finalize_dead(latest, config)})")
     except Exception as exc:  # noqa: BLE001 — fall back to a direct terminal mark
@@ -493,6 +511,50 @@ def _do_reset(
     res.recovered = True
     res.branch_preserved = True
     res.actions_taken.append("branch preserved — stage is re-dispatchable")
+
+
+def _reset_review_stage(
+    config, repo_name: str, issue_number: int, res: DiagnoseResult, *, dry_run: bool
+) -> None:
+    """Wipe a completed review so the stage returns to grey + re-reviewable:
+    delete the ``type='review'`` rows, reset the work's ``review_state``, and
+    purge the #603 ``source='review'`` context entries (the operator's
+    'completely cleared out' choice).  No branch/commits touched."""
+    from coord import state  # noqa: PLC0415
+
+    if dry_run:
+        res.findings.append(
+            "(dry-run) would DELETE the review rows, reset work review_state → "
+            "pending, and purge #603 review notes (box → grey, re-reviewable)"
+        )
+        res.needs_reset = True
+        return
+    deleted = state.delete_assignments_for_issue(repo_name, issue_number, types=("review",))
+    res.actions_taken.append(f"deleted {deleted} review row(s) → stage grey")
+    updated = state.reset_work_review_state(repo_name, issue_number)
+    res.actions_taken.append(f"reset review_state→pending on {updated} work row(s) (re-reviewable)")
+    purged = state.clear_issue_context_by_source(repo_name, issue_number, "review")
+    res.actions_taken.append(f"purged {purged} #603 review note(s)")
+    res.reset_performed = True
+    res.recovered = True
+    res.branch_preserved = True
+
+
+def _reset_test_stage(
+    repo_name: str, issue_number: int, res: DiagnoseResult, *, dry_run: bool
+) -> None:
+    """Clear the Test-gate verdict so the issue is re-testable.  No code touched."""
+    from coord import state  # noqa: PLC0415
+
+    if dry_run:
+        res.findings.append("(dry-run) would clear test_state → re-testable")
+        res.needs_reset = True
+        return
+    updated = state.reset_work_test_state(repo_name, issue_number)
+    res.actions_taken.append(f"cleared Test verdict on {updated} work row(s) (re-testable)")
+    res.reset_performed = True
+    res.recovered = True
+    res.branch_preserved = True
 
 
 def _cleanup_issue(
