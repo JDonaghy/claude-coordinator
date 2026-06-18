@@ -799,9 +799,13 @@ def test_cli_context_curate_noop_when_few(coord_db, monkeypatch):
     assert called == []  # no metered call for a tiny digest
 
 
-def test_cli_fix_briefing_includes_context_and_test_story(coord_db):
+def test_cli_fix_briefing_includes_context_and_test_story(coord_db, valid_config_path):
     # #603 Phase 5: `coord fix-briefing` prints the context block + the resolved
     # test-failure story (the exact-briefing preview the TUI dialog shows).
+    # Pass --config explicitly: coordinator.yml is NOT checked in (gitignored
+    # dev config), so the default relative path only resolves when cwd happens
+    # to hold a local one — it does on a dev box, but not in CI's fresh
+    # checkout, which left this test red on every push since v0.4.40.
     from coord import state
     coord_db.execute(
         "INSERT INTO assignments(assignment_id,machine_name,repo_name,issue_number,"
@@ -815,7 +819,9 @@ def test_cli_fix_briefing_includes_context_and_test_story(coord_db):
     )
     from click.testing import CliRunner
     from coord.cli import main
-    out = CliRunner().invoke(main, ["fix-briefing", "w1"])
+    out = CliRunner().invoke(
+        main, ["fix-briefing", "w1", "--config", str(valid_config_path)]
+    )
     assert out.exit_code == 0, out.output
     assert "⚠️ Issue context" in out.output  # context block at the top
     assert "depends on quadraui #368" in out.output
