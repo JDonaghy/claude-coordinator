@@ -67,6 +67,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import select
 import shlex
 import shutil
@@ -75,6 +76,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import tty
@@ -1074,11 +1076,116 @@ def _finalize_merge_blocked(
     )
 
 
+def _transcript_names_issue(body: str, issue_number: int) -> bool:
+    """True when a review body explicitly names *issue_number* (#617).
+
+    Accepts BOTH the ``#<N>`` form (how reviewers refer to an issue in prose —
+    the real #607 review body used ``#607``) and the ``issue-<N>`` form (the
+    branch / briefing tag).  The original floor gated on a literal
+    ``issue-<N>`` only, so a review whose body said ``#607`` was silently
+    rejected and its findings lost — a hidden contributor to the recurring
+    drop, caught by live-smoking the real transcript.  The trailing-digit
+    negative lookahead stops ``#607`` from matching ``#6070``; gating on an
+    explicit reference still prevents mis-attributing a concurrent, unrelated
+    review's verdict.
+    """
+    return re.search(rf"(?:#|issue-){issue_number}(?!\d)", body) is not None
+
+
+def _fetch_remote_review_findings(
+    issue_number: int,
+    cutoff: float,
+    ssh_target: str,
+    *,
+    max_candidates: int = 6,
+    timeout: float = 30.0,
+):
+    """Remote twin of the transcript-floor: parse the review block from the
+    Claude transcript on the SESSION'S OWN host (#617).
+
+    When an interactive review ran on a remote machine and the operator
+    reattached + exited from a DIFFERENT machine, the local
+    ``~/.claude/projects`` scan is blind — the transcript lives on the remote
+    host, so the findings vanished and only a verdict-less operator prompt was
+    left (the #607 incident).  This lists the remote host's recent transcripts
+    over ssh (newest-first, active at/after *cutoff*), streams each candidate
+    back, and parses it with the same :func:`coord.review.parse_review_from_log`
+    used locally.  Returns the first ``ReviewFindings`` that BOTH parses as a
+    review AND names this issue (``issue-<N>``), or ``None`` (ssh failure / no
+    match) so the caller falls through to the operator-prompt backstop.
+    """
+    from coord.review import parse_review_from_log  # noqa: PLC0415
+
+    # GNU find on the fleet (Linux): list every recent transcript with its
+    # mtime, newest-first.  `$HOME` is expanded by the REMOTE shell.
+    list_cmd = (
+        'find "$HOME/.claude/projects" -maxdepth 2 -name "*.jsonl" '
+        r"-printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -40"
+    )
+    try:
+        listing = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, list_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if listing.returncode != 0:
+        return None
+
+    candidates: list[str] = []
+    for raw in (listing.stdout or "").splitlines():
+        if "\t" not in raw:
+            continue
+        mtime_s, path = raw.split("\t", 1)
+        try:
+            mtime = float(mtime_s)
+        except ValueError:
+            continue
+        path = path.strip()
+        if path and mtime >= cutoff:
+            candidates.append(path)
+        if len(candidates) >= max_candidates:
+            break
+
+    for remote_path in candidates:
+        try:
+            cat = subprocess.run(
+                ["ssh", *_SSH_MUX_OPTS, ssh_target, f"cat {shlex.quote(remote_path)}"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if cat.returncode != 0 or not cat.stdout:
+            continue
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".jsonl", delete=False, encoding="utf-8"
+            ) as tf:
+                tf.write(cat.stdout)
+                tmp_path = Path(tf.name)
+            findings = parse_review_from_log(tmp_path)
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+        if findings is not None and _transcript_names_issue(findings.body, issue_number):
+            return findings
+    return None
+
+
 def _review_findings_from_transcript(
     issue_number: int,
     started_at: float | None,
     *,
     projects_dir: Path | None = None,
+    ssh_target: str | None = None,
 ):
     """Recover a human-attended review's verdict + findings from the Claude
     session transcript — the **transcript-floor** backstop (#606).
@@ -1112,11 +1219,17 @@ def _review_findings_from_transcript(
     # caller that can't bound the session (or a test) passes None.
     if started_at is None:
         return None
+    # Only sessions active at/after this review started (small clock-skew buffer).
+    cutoff = started_at - 5.0
+    # #617: when the session ran on a REMOTE host (operator reattached + exited
+    # from a different machine), its Claude transcript lives THERE — the local
+    # projects dir is blind to it (the #607 silent-drop).  Scan the session's
+    # own host over ssh instead.
+    if ssh_target is not None:
+        return _fetch_remote_review_findings(issue_number, cutoff, ssh_target)
     base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
     if not base.is_dir():
         return None
-    # Only sessions active at/after this review started (small clock-skew buffer).
-    cutoff = started_at - 5.0
     candidates: list[tuple[float, Path]] = []
     for p in base.glob("*/*.jsonl"):
         try:
@@ -1127,10 +1240,9 @@ def _review_findings_from_transcript(
             candidates.append((mtime, p))
     candidates.sort(reverse=True)  # newest first — the just-exited session
 
-    issue_tag = f"issue-{issue_number}"
     for _mtime, p in candidates:
         findings = parse_review_from_log(p)
-        if findings is not None and issue_tag in findings.body:
+        if findings is not None and _transcript_names_issue(findings.body, issue_number):
             return findings
     return None
 
@@ -1150,6 +1262,7 @@ def finalize_interactive_exit(
     repo_path: str | None = None,
     artifact_paths: list[str] | None = None,
     verify_merge: bool = False,
+    ssh_target: str | None = None,
 ) -> InteractiveFinalizeResult:
     """Git-floor backstop for the interactive launcher exit path (#466).
 
@@ -1261,7 +1374,9 @@ def finalize_interactive_exit(
     # seam.  Runs BEFORE the git-floor (which would otherwise stamp a verdict-
     # less advisory).  Self-gating: a work session's transcript has no review
     # block, so this is a no-op there and the git-floor below still handles it.
-    _tf = _review_findings_from_transcript(issue_number, started_at)
+    _tf = _review_findings_from_transcript(
+        issue_number, started_at, ssh_target=ssh_target
+    )
     if _tf is not None:
         try:
             from coord import issue_store  # noqa: PLC0415

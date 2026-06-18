@@ -249,6 +249,29 @@ def _validate_result(record: ResultRecord) -> None:
             f"invalid verdict {record.verdict!r} "
             f"(expected one of {_VALID_VERDICTS!r} or None)"
         )
+    # ── Keystone invariant (#617): request-changes MUST carry findings ───────
+    # A `request-changes` verdict with no body silently strands the review: the
+    # iteration-N+1 fix worker is dispatched with nothing to fix, and the #603
+    # per-issue context store (which is auto-injected into every future
+    # briefing) never learns why the change was rejected (#607).
+    #
+    # The #580 guard that catches this lives ONLY in the `coord report-result`
+    # CLI command — every OTHER caller (the operator-prompt verdict relay, the
+    # transcript-floor, any future path) routes around it and can persist a
+    # bodyless verdict.  Enforcing it HERE, at the single write seam through
+    # which all of them funnel, makes the bad state unrepresentable: a dropped
+    # review becomes a loud, recoverable error instead of silent data loss.
+    # Callers that can recover (read the transcript, prompt the operator for the
+    # body) catch this and retry with the findings attached.
+    if record.verdict == "request-changes" and not (
+        record.findings_body and record.findings_body.strip()
+    ):
+        raise ValueError(
+            "request-changes verdict requires findings_body — refusing to record "
+            "a review with no body, which would strand the fix worker with "
+            "nothing to fix (#607). Recover the findings from the session "
+            "transcript or supply them with --body-file."
+        )
 
 
 # ── Public surface ──────────────────────────────────────────────────────────

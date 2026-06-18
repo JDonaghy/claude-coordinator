@@ -799,12 +799,18 @@ class TestRemoteReviewVerdictRelay:
         assert ok is False
         assert "rec" not in posted  # headless → no inline relay
 
-    def test_tty_request_changes_relays_verdict(self, monkeypatch) -> None:
+    def test_tty_request_changes_relays_verdict_with_body(self, monkeypatch) -> None:
+        # #617: a request-changes relay MUST collect + carry the findings body.
         from coord.cli import _prompt_and_relay_review_verdict
 
         monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-        answers = iter(["r", ""])  # verdict choice, then summary
+        answers = iter(["r", ""])  # verdict choice, then one-line summary
         monkeypatch.setattr("click.prompt", lambda *a, **k: next(answers))
+        # The operator types the full findings in $EDITOR (stubbed here).
+        monkeypatch.setattr(
+            "coord.cli._collect_review_body_via_editor",
+            lambda **kw: "Blocking: app.rs:42 Right-on-leaf must be a no-op.",
+        )
 
         captured: dict = {}
 
@@ -830,6 +836,64 @@ class TestRemoteReviewVerdictRelay:
         assert rec.status == "done"
         assert rec.assignment_id == "rev1"
         assert rec.repo_github == "JDonaghy/vimcode"
+        # The keystone: the findings body rode along, not just the verdict.
+        assert rec.findings_body and "Right-on-leaf" in rec.findings_body
+
+    def test_tty_request_changes_with_no_body_refuses(self, monkeypatch) -> None:
+        # #617/#607: request-changes with an empty editor body must NOT post —
+        # a bodyless request-changes silently strands the fix worker.
+        from coord.cli import _prompt_and_relay_review_verdict
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        answers = iter(["r", ""])  # request-changes, empty summary
+        monkeypatch.setattr("click.prompt", lambda *a, **k: next(answers))
+        monkeypatch.setattr(
+            "coord.cli._collect_review_body_via_editor", lambda **kw: None
+        )
+        posted: dict = {}
+        monkeypatch.setattr(
+            "coord.issue_store.post_result",
+            lambda rec: posted.setdefault("rec", rec),
+        )
+        ok = _prompt_and_relay_review_verdict(
+            assignment_id="rev1",
+            repo_name="vimcode",
+            repo_github="JDonaghy/vimcode",
+            issue_number=514,
+            machine_name="precision",
+            verdict_cmd_hint="HINT",
+        )
+        assert ok is False
+        assert "rec" not in posted  # refused — nothing recorded bodyless
+
+    def test_tty_approve_relays_without_body(self, monkeypatch) -> None:
+        # Approve carries no findings requirement — relays on verdict alone.
+        from coord.cli import _prompt_and_relay_review_verdict
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        answers = iter(["a", ""])  # approve, empty summary
+        monkeypatch.setattr("click.prompt", lambda *a, **k: next(answers))
+
+        captured: dict = {}
+
+        class _Out:
+            posted = True
+            error = None
+
+        monkeypatch.setattr(
+            "coord.issue_store.post_result",
+            lambda rec: (captured.setdefault("rec", rec), _Out())[1],
+        )
+        ok = _prompt_and_relay_review_verdict(
+            assignment_id="rev1",
+            repo_name="vimcode",
+            repo_github="JDonaghy/vimcode",
+            issue_number=514,
+            machine_name="precision",
+            verdict_cmd_hint="HINT",
+        )
+        assert ok is True
+        assert captured["rec"].verdict == "approve"
 
     def test_tty_skip_does_not_post(self, monkeypatch) -> None:
         from coord.cli import _prompt_and_relay_review_verdict

@@ -1897,6 +1897,42 @@ def approve(
             write_session_start()
 
 
+def _collect_review_body_via_editor(*, assignment_id: str, summary: str) -> str | None:
+    """Open ``$EDITOR`` for the operator to enter the full review findings (#617).
+
+    Last-resort body capture for :func:`_prompt_and_relay_review_verdict` when
+    neither a durable ``coord report-result`` nor the (remote-aware)
+    transcript-floor produced the findings.  A ``request-changes`` verdict must
+    never be recorded bodyless — the write seam refuses it and the fix worker
+    would be dispatched with nothing to fix (#607) — so this collects the body
+    the operator just wrote in the review session.
+
+    Returns the entered body (template comment lines stripped) or ``None`` when
+    empty / no editor available, so the caller can refuse + print the manual
+    ``--body-file`` hint.
+    """
+    template = (
+        "\n\n"
+        f"# ── Review findings for assignment {assignment_id} ───────────────\n"
+        "# Enter the full findings above (Markdown). Every BLOCKING item, with\n"
+        "# file:line. This is exactly what the fix worker is briefed with, and\n"
+        "# what the #603 per-issue context store records for every future\n"
+        "# iteration on this issue.\n"
+        "# Lines starting with '#' are ignored. Save an empty file to cancel.\n"
+    )
+    seed = (f"{summary.strip()}\n" if summary.strip() else "") + template
+    try:
+        edited = click.edit(seed)
+    except Exception:  # noqa: BLE001 — no editor / editor failed → treat as cancel
+        edited = None
+    if not edited:
+        return None
+    body = "\n".join(
+        ln for ln in edited.splitlines() if not ln.lstrip().startswith("#")
+    ).strip()
+    return body or None
+
+
 def _prompt_and_relay_review_verdict(
     *,
     assignment_id: str,
@@ -1937,6 +1973,32 @@ def _prompt_and_relay_review_verdict(
     summary = click.prompt(
         "  one-line summary (optional, Enter to skip)", default="", show_default=False
     )
+    # #617: a request-changes verdict MUST carry the full findings body — the
+    # one-line summary is what the fix worker is briefed with and what the #603
+    # context store records, so recording request-changes bodyless silently
+    # strands the next iteration (#607).  The write seam refuses it, so collect
+    # the body here ($EDITOR) and never relay request-changes without it.
+    # Approve needs no body.
+    findings_body: str | None = None
+    if verdict == "request-changes":
+        click.echo(
+            "  request-changes needs your full findings — opening an editor "
+            "(every blocking item, file:line)…"
+        )
+        findings_body = _collect_review_body_via_editor(
+            assignment_id=assignment_id, summary=summary
+        )
+        if not findings_body:
+            click.echo(
+                "  verdict NOT recorded: request-changes requires the findings "
+                "body — recording it without one would strand the fix worker "
+                "(#607). Record it when ready with:\n"
+                f"    coord report-result --assignment {assignment_id} "
+                "--status done --verdict request-changes "
+                f"--body-file /tmp/review-{assignment_id}.md",
+                err=True,
+            )
+            return False
     try:
         from coord import issue_store  # noqa: PLC0415
 
@@ -1951,6 +2013,7 @@ def _prompt_and_relay_review_verdict(
                 verdict=verdict,  # type: ignore[arg-type]  # narrowed to approve/request-changes above
                 summary=summary,
                 branch=None,
+                findings_body=findings_body,
             )
         )
         click.echo(
@@ -8641,12 +8704,25 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                     started_at=started_at,
                     log_path=None,
                     repo_path=None,
+                    # #617: the review ran on the REMOTE host, so its Claude
+                    # transcript lives there.  Hand the transcript-floor the
+                    # ssh target so it recovers the verdict + findings from the
+                    # session's OWN host instead of scanning this (blind) one —
+                    # the #607 failure where a reattach-from-elsewhere dropped
+                    # the findings and left only a verdict-less operator prompt.
+                    ssh_target=ssh_target_val,
                 )
                 if fr2.already_recorded:
-                    click.echo(
-                        "  result recorded via `coord report-result`; backstop "
-                        "did not overwrite"
-                    )
+                    if fr2.terminal_status == "transcript-floor":
+                        click.echo(
+                            "  review verdict + findings recovered from the remote "
+                            "session transcript and recorded (#617)"
+                        )
+                    else:
+                        click.echo(
+                            "  result recorded via `coord report-result`; backstop "
+                            "did not overwrite"
+                        )
                 else:
                     click.echo(
                         f"  backstop: status={fr2.terminal_status} (remote, DB-only)"

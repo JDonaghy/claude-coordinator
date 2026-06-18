@@ -404,6 +404,30 @@ class TestPostResult:
                 )
             )
 
+    def test_request_changes_without_body_raises_at_seam(self) -> None:
+        """#617 keystone: request-changes with no findings_body is REFUSED at
+        the write seam itself — not just in the `report-result` CLI (#580).
+
+        This is what makes the #607 silent-drop unrepresentable: the
+        operator-prompt relay, the transcript-floor, and any future caller all
+        funnel through `post_result`, so none of them can persist a bodyless
+        request-changes.  A one-line `summary` is not enough."""
+        for body in (None, "", "   \n  "):
+            with pytest.raises(ValueError, match="requires findings_body"):
+                issue_store.post_result(
+                    issue_store.ResultRecord(
+                        assignment_id="aid-rc-nobody",
+                        machine_name="laptop",
+                        repo_name="api",
+                        repo_github="acme/api",
+                        issue_number=7,
+                        status="done",
+                        verdict="request-changes",
+                        summary="one-liner is not enough",
+                        findings_body=body,
+                    )
+                )
+
 
 # ── `coord report-result` CLI ───────────────────────────────────────────────
 
