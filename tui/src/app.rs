@@ -6860,6 +6860,45 @@ impl CoordApp {
         };
         match rx.try_recv() {
             Ok(data) => {
+                // #620: a refresh tick that comes back completely empty is
+                // almost always a transient fetch FAILURE, not a genuinely
+                // empty board.  `load_data_remote` returns `BoardData::default()`
+                // on any connect/timeout/parse error (thin clients poll the
+                // dellserver daemon over Tailscale, so an 8s timeout or a blip
+                // yields an empty payload), and the local SQLite path returns it
+                // when the DB is briefly locked.  Wholesale-applying that empty
+                // payload wiped the Pipeline tree, recomputed an empty
+                // `live_keys`, and `retain`-ed every live embedded terminal out
+                // of existence — bouncing the operator out of an attended
+                // session every couple of minutes and losing selection +
+                // tree-expansion state.  Guard: if we ALREADY have data and the
+                // incoming tick has no machines, no issues, AND no assignments,
+                // treat it as a degraded tick — keep the last good data, surface
+                // a soft self-clearing warning, and skip the apply.  (A real
+                // first load from an empty board has empty CURRENT data, so the
+                // guard is inert and the empty state still applies; machines come
+                // from coordinator.yml and never legitimately drop to zero on a
+                // configured board, making the all-three-empty check a reliable
+                // proxy for the default sentinel.)
+                let incoming_empty = data.machines.is_empty()
+                    && data.open_issues.is_empty()
+                    && data.assignments.is_empty();
+                let have_data = !self.data.machines.is_empty()
+                    || !self.data.open_issues.is_empty()
+                    || !self.data.assignments.is_empty();
+                if incoming_empty && have_data {
+                    // Consume the receiver but do NOT replace self.data; leave
+                    // refreshed_at alone so the "Xs ago" indicator keeps aging
+                    // (honest: this tick didn't land).  The next healthy tick
+                    // clears the warning and updates normally.
+                    self.pending_data = None;
+                    self.fetch_error = Some((
+                        "refresh failed — showing last good data".into(),
+                        Instant::now(),
+                    ));
+                    return true;
+                }
+
                 // Snapshot which assignments were running before the update so
                 // we can detect running→done/failed transitions for the audio bell.
                 let prev_running: std::collections::HashSet<String> = self
@@ -6912,7 +6951,21 @@ impl CoordApp {
                     .iter()
                     .map(|i| (i.repo_slug.clone(), i.number))
                     .collect();
-                self.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
+                // #620: never prune EVERY terminal at once.  The top-level
+                // degraded-tick guard above catches a fully-empty payload, but a
+                // *partial* degradation (machines/issues present yet
+                // `pipeline_tracked_labels` momentarily empty from a board_meta
+                // hiccup) still yields an empty `pipeline_issues` → empty
+                // `live_keys` → the retain would drop every live embedded
+                // terminal and bounce the operator.  An empty live set while we
+                // still hold terminals is itself a near-certain degradation, so
+                // skip the prune this tick; stale terminals are harmless and get
+                // pruned on the next healthy tick (when live_keys is non-empty).
+                let prune_terminals =
+                    !live_keys.is_empty() || self.detail_terminal_sessions.is_empty();
+                if prune_terminals {
+                    self.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
+                }
                 self.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
                 self.rebuild_pipeline_sidebar(prev_pl_sel);
 
@@ -31035,6 +31088,107 @@ mod tests {
             app.merge_stage_status_for(&issue),
             StageStatus::Done,
             "after clearing, real 'merged' state must be returned",
+        );
+    }
+
+    #[test]
+    fn apply_pending_data_skips_empty_degraded_tick() {
+        // #620: a fully-empty payload (load_data_remote returns
+        // BoardData::default() on a connect/timeout/parse failure) must NOT
+        // replace populated data — doing so wiped the Pipeline and dropped
+        // every live terminal, bouncing the operator out of an attended
+        // session.  The guard keeps the last good data + raises a soft warning.
+        let mut app = make_pipeline_app();
+        let issues_before = app.pipeline_issues.clone();
+        // A spawn-error entry stands in for a live terminal (a real PTY would
+        // be heavier here); the early-bail must happen BEFORE the prune, so it
+        // survives the degraded tick.
+        app.detail_terminal_spawn_errors
+            .insert(("acme/api".to_string(), 42), "live".to_string());
+
+        // Deliver the failure sentinel: an entirely empty BoardData.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(BoardData::default()).unwrap();
+        app.pending_data = Some(rx);
+
+        assert!(
+            app.apply_pending_data(),
+            "degraded tick still returns true so the warning redraws",
+        );
+        // Last good data is preserved — NOT clobbered with the empty payload.
+        assert!(
+            !app.data.machines.is_empty(),
+            "machines must survive a degraded tick",
+        );
+        assert_eq!(
+            app.pipeline_issues, issues_before,
+            "pipeline issues must survive a degraded tick",
+        );
+        assert!(
+            app.detail_terminal_spawn_errors
+                .contains_key(&("acme/api".to_string(), 42)),
+            "terminals must NOT be pruned on a degraded tick",
+        );
+        assert!(app.fetch_error.is_some(), "a soft warning is surfaced");
+        assert!(app.pending_data.is_none(), "the receiver is consumed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn apply_pending_data_keeps_terminals_when_pipeline_empties_partially() {
+        // #620: a PARTIAL degradation slips past the full-empty guard —
+        // machines + open_issues are present, but pipeline_tracked_labels
+        // momentarily drops out (a board_meta hiccup), so pipeline_issues_from_cache
+        // returns empty → live_keys empty.  The retain must NOT then nuke a live
+        // embedded terminal; an empty live set while we still hold sessions is a
+        // near-certain degradation, so the prune is skipped this tick.
+        let mut app = make_pipeline_app();
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 100)
+                .expect("spawn /bin/sh");
+        app.detail_terminal_sessions
+            .insert(("acme/api".to_string(), 42), sess);
+
+        // Non-empty payload (guard inert) but tracked_labels dropped → the
+        // Pipeline derives to empty.
+        let fresh = BoardData {
+            pipeline_tracked_labels: vec![], // the partial degradation
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            machines: vec![Machine {
+                name: "m1".to_string(),
+                host: String::new(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["api".to_string()],
+                version: None,
+                worktree_bytes: 0,
+            }],
+            open_issues: vec![OpenIssue {
+                repo_name: "api".to_string(),
+                number: 42,
+                title: "still here".to_string(),
+                body: String::new(),
+                state: "open".to_string(),
+                labels: vec!["coord".to_string()],
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            ..BoardData::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(fresh).unwrap();
+        app.pending_data = Some(rx);
+
+        assert!(app.apply_pending_data(), "data was consumed");
+        assert!(
+            app.pipeline_issues.is_empty(),
+            "pre-condition: dropped tracked_labels empties the Pipeline",
+        );
+        assert!(
+            app.detail_terminal_sessions
+                .contains_key(&("acme/api".to_string(), 42)),
+            "a live terminal must survive an empty-pipeline tick (no mass prune)",
         );
     }
 
