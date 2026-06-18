@@ -265,3 +265,90 @@ def test_transcript_floor_untagged_review_returns_none(tmp_path: Path) -> None:
         interactive._review_findings_from_transcript(370, started_at=0.0, projects_dir=tmp_path)
         is None
     )
+
+
+def test_remote_transcript_floor_crowded_out_target_still_found(monkeypatch) -> None:
+    """#619: target transcript crowded out of top-6 by concurrent sessions.
+
+    Under normal fleet load several sessions write transcripts simultaneously.
+    The old max_candidates=6 cap meant the target review was silently skipped
+    when 6+ unrelated transcripts had a newer mtime.  All candidates within the
+    cutoff window must now be checked — no early break.
+    """
+    import subprocess as _sp
+
+    # Build a listing with 8 unrelated (non-matching) transcripts ahead of the
+    # target one; all have mtime far in the future so they pass the cutoff.
+    unrelated = _transcript_jsonl("STATUS: working on something else entirely")
+    target = _transcript_jsonl(
+        "REVIEW_VERDICT: approve\nREVIEW_BODY:\n"
+        "# Review: issue-619 — concurrent-load fix\nLGTM.\nEND_REVIEW"
+    )
+    # Entries: 8 unrelated (paths 0..7) then the target (path 8)
+    listing_lines = "\n".join(
+        f"9999999999.0\t/h/.claude/projects/p{i}/s.jsonl" for i in range(9)
+    )
+
+    def fake_run(cmd, *args, **kwargs):
+        remote_cmd = cmd[-1]
+        if remote_cmd.startswith("find "):
+            return _sp.CompletedProcess(cmd, 0, stdout=listing_lines + "\n", stderr="")
+        if remote_cmd.startswith("cat "):
+            # Last path (p8) is the target; everything else is unrelated
+            if "/p8/" in remote_cmd:
+                return _sp.CompletedProcess(cmd, 0, stdout=target, stderr="")
+            return _sp.CompletedProcess(cmd, 0, stdout=unrelated, stderr="")
+        return _sp.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    monkeypatch.setattr("coord.interactive.subprocess.run", fake_run)
+    # Pass a large started_at so cutoff is way in the past and all 9 entries pass
+    findings = interactive._review_findings_from_transcript(
+        619, started_at=0.0, ssh_target="dellserver"
+    )
+    assert findings is not None, (
+        "target review crowded beyond position 6 must still be found (#619)"
+    )
+    assert findings.verdict == "approve"
+    assert "LGTM" in findings.body
+
+
+def test_remote_transcript_floor_retries_on_miss(monkeypatch) -> None:
+    """#619: a settle-and-retry covers a transcript-flush blip.
+
+    If the first scan finds nothing (e.g. the JSONL write hasn't been flushed
+    yet), the floor sleeps 2 s and retries once.  The second attempt should
+    recover the verdict without falling back to the operator prompt.
+    """
+    import subprocess as _sp
+
+    transcript = _transcript_jsonl(
+        "REVIEW_VERDICT: approve\nREVIEW_BODY:\n"
+        "# Review: issue-619 — retry\nAll good.\nEND_REVIEW"
+    )
+    call_count = {"find": 0}
+
+    def fake_run(cmd, *args, **kwargs):
+        remote_cmd = cmd[-1]
+        if remote_cmd.startswith("find "):
+            call_count["find"] += 1
+            if call_count["find"] == 1:
+                # First scan: nothing in the window yet
+                return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+            # Second scan: transcript now visible
+            return _sp.CompletedProcess(
+                cmd, 0,
+                stdout="9999999999.0\t/h/.claude/projects/p/s.jsonl\n",
+                stderr="",
+            )
+        if remote_cmd.startswith("cat "):
+            return _sp.CompletedProcess(cmd, 0, stdout=transcript, stderr="")
+        return _sp.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    monkeypatch.setattr("coord.interactive.subprocess.run", fake_run)
+    monkeypatch.setattr("coord.interactive.time.sleep", lambda _: None)  # no real delay
+    findings = interactive._review_findings_from_transcript(
+        619, started_at=0.0, ssh_target="dellserver"
+    )
+    assert findings is not None, "retry must recover the verdict after initial miss"
+    assert findings.verdict == "approve"
+    assert call_count["find"] == 2, "exactly one retry (two find calls total)"
