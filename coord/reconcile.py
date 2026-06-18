@@ -433,3 +433,118 @@ def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> Non
         machine_name=fix_assignment.machine_name or "",
         succeeded=succeeded,
     )
+
+
+def reconcile_board_merges(
+    board: Board,
+    config: Config,
+    *,
+    repo: str | None = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """Reconcile done work assignments against git/GitHub reality.
+
+    Two conservative sweeps over ``type='work'`` ``status='done'`` assignments,
+    returning a list of human-readable action (and skip) strings:
+
+    (a) #611 branch backfill — a remote interactive work session can finish
+        ``status=done`` with ``branch=None`` even though it pushed
+        ``issue-{N}-*`` to origin, which greys the TUI Start review/test/merge
+        buttons (they require a done work assignment WITH a branch).  When
+        exactly one remote branch matches ``issue-{N}-*`` for the issue, the
+        branch is backfilled via :func:`state.update_assignment_branch`.  More
+        than one candidate (or none) is left untouched and logged.
+
+    (b) #609 record out-of-band merges — work merged directly on GitHub, or a
+        ``merge_queue`` row that drained without flipping the board, is never
+        recorded as ``status='merged'`` so the TUI shows a grey merge box
+        forever.  When :func:`github_ops.work_is_terminal` reports the branch
+        merged (PR merged OR issue closed, fail-open), the row is flipped via
+        :func:`state.mark_assignment_merged`.
+
+    Both sweeps are **conservative**: they never act when uncertain and append a
+    skip reason instead.  *repo* filters to a single local repo name.  When
+    *dry_run* is True no writes happen (no ``state.update_*`` calls) — the
+    actions list still describes what *would* change.  The board objects are
+    mutated in place on a real run so a subsequent ``save_board`` agrees with
+    the targeted DB writes.
+    """
+    from coord import github_ops, state  # noqa: PLC0415
+
+    actions: list[str] = []
+    terminal_cache: dict = {}
+    # One remote-branch listing per repo, fetched lazily and reused.
+    branches_by_repo: dict[str, set[str]] = {}
+
+    candidates = [
+        a
+        for a in board.active + board.completed
+        if a.type == "work"
+        and a.status == "done"
+        and (repo is None or a.repo_name == repo)
+    ]
+
+    for a in candidates:
+        repo_cfg = config.repo(a.repo_name)
+        if repo_cfg is None:
+            actions.append(
+                f"skip {a.assignment_id} ({a.repo_name} #{a.issue_number}): "
+                "repo not in config"
+            )
+            continue
+
+        # (a) #611 — backfill a missing branch from origin.
+        if not a.branch:
+            if repo_cfg.github not in branches_by_repo:
+                branches_by_repo[repo_cfg.github] = (
+                    github_ops.list_remote_branch_names(repo_cfg.github)
+                )
+            prefix = f"issue-{a.issue_number}-"
+            matches = sorted(
+                name
+                for name in branches_by_repo[repo_cfg.github]
+                if name.startswith(prefix)
+            )
+            if len(matches) == 1:
+                branch = matches[0]
+                actions.append(
+                    f"backfill branch {a.assignment_id} "
+                    f"({a.repo_name} #{a.issue_number}) -> {branch}"
+                    + (" [dry-run]" if dry_run else "")
+                )
+                if not dry_run:
+                    a.branch = branch
+                    state.update_assignment_branch(a.assignment_id or "", branch)
+            elif len(matches) > 1:
+                actions.append(
+                    f"skip backfill {a.assignment_id} "
+                    f"({a.repo_name} #{a.issue_number}): "
+                    f"{len(matches)} ambiguous branch candidates {matches}"
+                )
+                continue
+            else:
+                actions.append(
+                    f"skip backfill {a.assignment_id} "
+                    f"({a.repo_name} #{a.issue_number}): "
+                    f"no remote branch matching {prefix}*"
+                )
+                continue
+
+        # (b) #609 — flip done work whose branch is merged on GitHub.
+        if not a.branch:
+            # Still no branch even after the backfill attempt — can't determine
+            # merge state without one, so leave it for the next sweep.
+            continue
+        if github_ops.work_is_terminal(
+            repo_cfg.github, a.issue_number, a.branch, cache=terminal_cache
+        ):
+            actions.append(
+                f"mark merged {a.assignment_id} "
+                f"({a.repo_name} #{a.issue_number}, {a.branch})"
+                + (" [dry-run]" if dry_run else "")
+            )
+            if not dry_run:
+                a.status = "merged"
+                state.mark_assignment_merged(a.assignment_id or "")
+
+    return actions

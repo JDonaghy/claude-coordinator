@@ -805,6 +805,49 @@ def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     conn.commit()
 
 
+def update_assignment_branch(assignment_id: str, branch: str) -> None:
+    """#611: backfill the branch on an assignment row that is missing it.
+
+    A remote interactive work session can finish ``status=done`` with
+    ``branch=None`` even though it pushed ``issue-{N}-*`` to origin — the TUI
+    then greys Start review/test/merge because the gate requires a done work
+    assignment WITH a non-empty branch.  Idempotent: only sets ``branch`` when
+    it is currently NULL or empty, so a reconcile sweep can run repeatedly and
+    never clobber a real value.  Silently no-ops when the row doesn't exist —
+    matches the other ``update_assignment_*`` helpers.
+    """
+    if not assignment_id or not branch:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET branch=? WHERE assignment_id=? "
+        "AND (branch IS NULL OR branch = '')",
+        (branch, assignment_id),
+    )
+    conn.commit()
+
+
+def mark_assignment_merged(assignment_id: str) -> None:
+    """#609: flip a done work assignment to ``status='merged'``.
+
+    Work merged out-of-band (a direct GitHub merge, or a merge_queue row that
+    drained without flipping the board) is otherwise never recorded as merged,
+    so the TUI shows a grey merge box forever.  Idempotent: only transitions a
+    row whose status is currently ``'done'`` (so a second call, or a row that
+    failed/was re-dispatched, is left alone).  Silently no-ops when the row
+    doesn't exist.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET status='merged' WHERE assignment_id=? "
+        "AND status='done'",
+        (assignment_id,),
+    )
+    conn.commit()
+
+
 def set_test_plan(
     assignment_id: str,
     plan: dict,
