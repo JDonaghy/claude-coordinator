@@ -16011,7 +16011,7 @@ impl CoordApp {
             let has_live = issue_number.map(|n| self.issue_has_live_session(n)).unwrap_or(false);
             if has_live {
                 items.push(ContextMenuItem::action(
-                    "start-work-interactive",
+                    "reattach-live-session",
                     "Reattach to live session",
                 ));
             } else {
@@ -17115,7 +17115,7 @@ impl CoordApp {
                         if let Some(entry) = picker.machines.get(idx) {
                             let mode = picker.mode;
                             let machine = entry.name.clone();
-                            self.launch_interactive_session_on_machine(mode, machine);
+                            self.launch_interactive_session_on_machine(mode, machine, None);
                         }
                     }
                 }
@@ -19484,6 +19484,15 @@ impl CoordApp {
                 self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Work);
                 true
             }
+            // Dedicated "Reattach to live session" action — reattaches to the
+            // live session for this issue REGARDLESS of its type (work / review
+            // / test / merge).  The generic Start launchers stay type-gated
+            // (#569), so this explicit reattach is the only type-agnostic path.
+            "reattach-live-session" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.reattach_to_selected_issue_live_session();
+                true
+            }
             "start-plan-interactive" => {
                 self.pipeline_detail_tab = PipelineDetailTab::Terminal;
                 self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Plan);
@@ -20225,6 +20234,7 @@ fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "start-plan-interactive" => Some("⌨"),
         "start-review-interactive" => Some("⌨"),
         "start-fix-interactive" => Some("⌨"),
+        "reattach-live-session" => Some("⌨"),
         "troubleshoot-interactive" => Some("⚕"),
         "start-with-plan" => Some("☰"),
         "start-skip-plan" => Some("▶"),
@@ -22548,7 +22558,7 @@ impl CoordApp {
         // `coord assign --troubleshoot` rejects with "local-only".)
         if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
             let machine = self.data.local_machine.clone();
-            self.launch_interactive_session_on_machine(mode, machine);
+            self.launch_interactive_session_on_machine(mode, machine, None);
             return;
         }
 
@@ -22611,7 +22621,7 @@ impl CoordApp {
                 Instant::now(),
             ));
             let machine = self.data.local_machine.clone();
-            self.launch_interactive_session_on_machine(mode, machine);
+            self.launch_interactive_session_on_machine(mode, machine, None);
             return;
         }
 
@@ -22635,7 +22645,34 @@ impl CoordApp {
             .first()
             .map(|m| m.name.clone())
             .unwrap_or_else(|| self.data.local_machine.clone());
-        self.launch_interactive_session_on_machine(mode, machine);
+        self.launch_interactive_session_on_machine(mode, machine, None);
+    }
+
+    /// Reattach to the live interactive session for the selected issue,
+    /// whatever its type (work / review / test / merge).  This is the dedicated
+    /// "Reattach to live session" action: unlike the type-gated Start launchers
+    /// (#569 keeps "Start fix" from reattaching into a running review), it
+    /// reattaches to ANY running session for this issue by passing the resolved
+    /// aid explicitly to `launch_interactive_session_on_machine`, which then
+    /// runs `coord reattach <aid>` instead of a fresh (claim-blocked)
+    /// `coord assign`.
+    fn reattach_to_selected_issue_live_session(&mut self) {
+        let Some(aid) = self.selected_issue_live_session_id() else {
+            self.pipeline_status =
+                Some(("No live session to reattach to.".to_string(), Instant::now()));
+            return;
+        };
+        self.pipeline_status = Some((
+            "Reattaching to the live interactive session for this issue…".to_string(),
+            Instant::now(),
+        ));
+        // The machine arg is ignored on the reattach path — `coord reattach
+        // <aid>` resolves the host from the board — so the local machine is a
+        // fine placeholder.  Mode is likewise irrelevant: an explicit
+        // `reattach_aid` (Some) short-circuits the type-gated lookup and runs
+        // `coord reattach`.
+        let machine = self.data.local_machine.clone();
+        self.launch_interactive_session_on_machine(InteractiveLaunchMode::Work, machine, Some(aid));
     }
 
     // ── Leg 3c / A3 (#517, #581): test-verdict routing ─────────────────────
@@ -22926,6 +22963,7 @@ impl CoordApp {
         &mut self,
         mode: InteractiveLaunchMode,
         machine: String,
+        reattach_aid: Option<String>,
     ) {
         let Some((repo, issue_key)) = self.selected_issue_repo_and_key() else {
             self.pipeline_status = Some((
@@ -23040,7 +23078,13 @@ impl CoordApp {
         // diagnose. Force a fresh launch for Troubleshoot.
         // Mode-aware: only reattach to a running session of the SAME type this
         // mode launches, so "Start fix" never reattaches into a running review.
-        let maybe_live_session = self.reattachable_session_aid(issue_num, &repo, mode);
+        //
+        // An EXPLICIT `reattach_aid` (the dedicated "Reattach to live session"
+        // menu action) overrides the type-gate: that action is type-agnostic on
+        // purpose, so reattaching to a running review/test/merge works (the
+        // generic launch paths still pass `None` here → type-gated, #569).
+        let maybe_live_session =
+            reattach_aid.or_else(|| self.reattachable_session_aid(issue_num, &repo, mode));
 
         match quadraui::terminal_engine::TerminalSession::spawn(
             cols.max(20),
@@ -24819,7 +24863,7 @@ impl ShellApp for CoordApp {
                                 let mode = picker.mode;
                                 let machine = picker.machines[digit].name.clone();
                                 self.pending_machine_picker = None;
-                                self.launch_interactive_session_on_machine(mode, machine);
+                                self.launch_interactive_session_on_machine(mode, machine, None);
                                 return Reaction::Redraw;
                             }
                         }
@@ -36344,6 +36388,90 @@ mod tests {
         assert_eq!(
             app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Fix),
             Some(work_aid),
+        );
+    }
+
+    #[test]
+    fn explicit_reattach_picks_a_running_review_session_type_agnostically() {
+        // The bug: the "Reattach to live session" menu item carried the Work
+        // action_id, so its launcher resolved the reattach target via the
+        // type-gated `reattachable_session_aid(.., Work)` — which ignores a
+        // running REVIEW (work-type only) → it fell through to a fresh
+        // `coord assign` and got claim-blocked.
+        //
+        // The dedicated reattach path instead resolves the target via the
+        // type-AGNOSTIC `selected_issue_live_session_id()`, so it reattaches to
+        // a running review/test/merge.  #569's type-gate must still hold for the
+        // generic launchers (`reattachable_session_aid(.., Work)` returns None).
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 10,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/repo-a".to_string(),
+            coord_repo: Some("repo-a".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+
+        // A RUNNING review session for the selected issue.
+        let mut review = review_of("w", 10, "repo-a", None);
+        review.status = "running".to_string();
+        let review_aid = review.id.clone();
+        app.data.assignments.push(review);
+        app.live_tmux_sessions.push(LiveTmuxSession {
+            assignment_id: review_aid.clone(),
+            issue_number: Some(10),
+            repo_name: Some("repo-a".to_string()),
+            issue_title: None,
+        });
+
+        // The dedicated reattach path picks the running review type-agnostically.
+        assert_eq!(
+            app.selected_issue_live_session_id().as_deref(),
+            Some(review_aid.as_str()),
+            "explicit reattach must pick up the running review session",
+        );
+        // #569 stays intact: the type-gated Work lookup still ignores a review.
+        assert_eq!(
+            app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Work),
+            None,
+            "type-gated Work launch must NOT reattach into a running review (#569)",
+        );
+    }
+
+    #[test]
+    fn reattach_action_with_no_live_session_surfaces_a_status() {
+        // The dedicated "Reattach to live session" action must fail gracefully
+        // (clear status, no spawn) when there's no reattachable session — e.g.
+        // the discovered session already finalized.  Dispatching with no live
+        // session hits the early-return guard, so no real PTY is spawned.
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 10,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/repo-a".to_string(),
+            coord_repo: Some("repo-a".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+
+        let target = pipeline_target(Some(10));
+        let handled = app.dispatch_context_menu_action("reattach-live-session", &target);
+        assert!(handled, "reattach-live-session action is handled");
+        let status = app
+            .pipeline_status
+            .as_ref()
+            .map(|(s, _)| s.clone())
+            .unwrap_or_default();
+        assert!(
+            status.contains("No live session"),
+            "no-live-session dispatch sets the guard status, got: {status:?}",
         );
     }
 
