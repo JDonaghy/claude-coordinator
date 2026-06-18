@@ -1100,7 +1100,6 @@ def _fetch_remote_review_findings(
     cutoff: float,
     ssh_target: str,
     *,
-    max_candidates: int = 6,
     timeout: float = 30.0,
 ):
     """Remote twin of the transcript-floor: parse the review block from the
@@ -1116,14 +1115,21 @@ def _fetch_remote_review_findings(
     used locally.  Returns the first ``ReviewFindings`` that BOTH parses as a
     review AND names this issue (``issue-<N>``), or ``None`` (ssh failure / no
     match) so the caller falls through to the operator-prompt backstop.
+
+    The ``cutoff`` filter already bounds the candidate set to the session
+    window — no additional per-scan cap is applied (#619: the original
+    ``max_candidates=6`` dropped the target transcript under concurrent-session
+    load, exactly the condition when reviews run).
     """
     from coord.review import parse_review_from_log  # noqa: PLC0415
 
     # GNU find on the fleet (Linux): list every recent transcript with its
     # mtime, newest-first.  `$HOME` is expanded by the REMOTE shell.
+    # head -200 is a safety rail against enormous project dirs; the cutoff
+    # filter below is the real bound.
     list_cmd = (
         'find "$HOME/.claude/projects" -maxdepth 2 -name "*.jsonl" '
-        r"-printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -40"
+        r"-printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -200"
     )
     try:
         listing = subprocess.run(
@@ -1147,10 +1153,11 @@ def _fetch_remote_review_findings(
         except ValueError:
             continue
         path = path.strip()
+        # Collect ALL candidates within the cutoff window — no early break.
+        # The cutoff is the authoritative bound; stopping at an arbitrary N
+        # is what caused the #619 miss under concurrent-session load.
         if path and mtime >= cutoff:
             candidates.append(path)
-        if len(candidates) >= max_candidates:
-            break
 
     for remote_path in candidates:
         try:
@@ -1318,7 +1325,15 @@ def _review_findings_from_transcript(
     # projects dir is blind to it (the #607 silent-drop).  Scan the session's
     # own host over ssh instead.
     if ssh_target is not None:
-        return _fetch_remote_review_findings(issue_number, cutoff, ssh_target)
+        result = _fetch_remote_review_findings(issue_number, cutoff, ssh_target)
+        if result is None:
+            # One settle-and-retry: covers a transcript-flush blip where the
+            # JSONL hasn't been fully flushed to disk at the instant we read it
+            # (#619).  2 s is long enough for a local flush but short enough
+            # to avoid annoying the operator on the fast path.
+            time.sleep(2.0)
+            result = _fetch_remote_review_findings(issue_number, cutoff, ssh_target)
+        return result
     base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
     if not base.is_dir():
         return None
