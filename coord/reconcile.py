@@ -26,6 +26,134 @@ def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dic
         return None
 
 
+# Terminal statuses an agent reports in its /status `completed` history,
+# mapped to the board terminal status we persist. (#625)
+_AGENT_TERMINAL_STATUS = {
+    "done": "done",
+    "advisory": "advisory",
+    "failed": "failed",
+    "cancelled": "failed",
+}
+
+
+def reconcile_completed_assignments(
+    config: Config,
+    *,
+    board: Board | None = None,
+    agent_status_fn=_query_agent,
+    update_state_fn=None,
+    capture_plan: bool = True,
+) -> list[dict]:
+    """Dispatch-free passive completion reconcile (#625).
+
+    Poll the agent of every RUNNING board assignment; for any the agent
+    reports terminal in its ``/status`` ``completed`` history, write the
+    terminal status + ``finished_at`` to the board via the issue_store seam
+    and (best-effort) capture a plan's structured output.  This reflects a
+    headless worker's already-finished state so the board — and the TUI box
+    colour — stops lying when the auto-loop (the only other thing that polled
+    agents) is turned off.
+
+    Deliberately minimal — it is the WHOLE point of #625 that reflecting a
+    termination is *passive* state, decoupled from auto-dispatch so it can
+    never re-introduce the dispatch flood:
+
+    * NEVER dispatches work/review.
+    * NEVER posts a GitHub comment (the single completion/plan comment is left
+      to an explicit ``coord notify``; this only writes board state).
+    * Only acts on ``status == "running"`` rows, so it is idempotent — once a
+      row is flipped terminal a later tick skips it.
+
+    Interactive sessions are tmux launches, not agent subprocesses, so they
+    never appear in the agent's ``completed`` list — a live attended session
+    can't be reaped by this path.
+
+    Returns one dict per reconciled assignment (empty when nothing changed).
+    """
+    if update_state_fn is None:
+        from coord.issue_store import _update_local_state  # noqa: PLC0415
+
+        update_state_fn = _update_local_state
+
+    if board is None:
+        from coord.state import build_board  # noqa: PLC0415
+
+        board = build_board()
+
+    running = [a for a in board.active if a.status == "running"]
+    if not running:
+        return []
+
+    hosts = {m.name: m.host for m in config.machines}
+    status_by_host: dict[str, dict | None] = {}  # poll each agent at most once
+    reconciled: list[dict] = []
+
+    for a in running:
+        aid = a.assignment_id
+        if not aid:
+            continue
+        host = hosts.get(a.machine_name)
+        if not host:
+            continue
+        if host not in status_by_host:
+            status_by_host[host] = agent_status_fn(host)
+        status = status_by_host[host]
+        if not status:
+            continue  # agent unreachable → leave the row, retry next tick
+        entry = next(
+            (e for e in status.get("completed", []) if e.get("id") == aid),
+            None,
+        )
+        if entry is None:
+            continue  # still active on the agent (or rolled off history) → leave it
+        terminal = _AGENT_TERMINAL_STATUS.get((entry.get("status") or "").lower())
+        if terminal is None:
+            continue
+
+        update_state_fn(
+            assignment_id=aid,
+            terminal_status=terminal,
+            branch=a.branch,
+            review_state=None,
+        )
+
+        plan_captured = (
+            _capture_plan_best_effort(host, aid)
+            if capture_plan and a.type == "plan"
+            else False
+        )
+        reconciled.append(
+            {
+                "assignment_id": aid,
+                "issue_number": a.issue_number,
+                "repo": a.repo_name,
+                "type": a.type,
+                "to_status": terminal,
+                "plan_captured": plan_captured,
+            }
+        )
+
+    return reconciled
+
+
+def _capture_plan_best_effort(host: str, assignment_id: str) -> bool:
+    """Fetch + persist a plan's structured output from the agent log so the
+    TUI's plan detail panel isn't empty after a passive reconcile.  Best
+    effort: any failure is swallowed — the terminal-status write already
+    landed and is what fixes the stuck box."""
+    try:
+        from coord.plan_parser import parse_plan_from_agent  # noqa: PLC0415
+        from coord.state import save_plan  # noqa: PLC0415
+
+        plan = parse_plan_from_agent(host, assignment_id)
+        if plan is None or plan.is_empty():
+            return False
+        save_plan(assignment_id, plan.to_dict())
+        return True
+    except Exception:  # noqa: BLE001 — never let plan capture break the reconcile
+        return False
+
+
 def _reassign(
     failed: Assignment, board: Board, config: Config,
     *,

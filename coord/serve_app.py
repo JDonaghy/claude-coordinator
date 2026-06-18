@@ -499,6 +499,68 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         result = await run_in_threadpool(_run)
         return JSONResponse(result)
 
+    def _lifespan(_app: Starlette):  # noqa: ANN202
+        """#625: a dispatch-free passive reconcile tick.
+
+        With the TUI auto-loop off, nothing polled the agents, so a finished
+        headless worker (e.g. a `claude -p` plan) left the board — and the TUI
+        box — stuck on ``running`` forever.  This polls the local agent(s) on an
+        interval and flips agent-completed rows to their terminal status (+
+        captures a plan's structured output).  It NEVER dispatches and NEVER
+        posts to GitHub — reflecting a termination is passive state and must not
+        be able to re-introduce the dispatch flood.
+
+        Interval is ``COORD_RECONCILE_INTERVAL`` seconds (default 30); set it to
+        0 to disable the tick entirely.
+        """
+        import asyncio  # noqa: PLC0415
+        import contextlib  # noqa: PLC0415
+        import logging  # noqa: PLC0415
+
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        log = logging.getLogger("coord.serve")
+        try:
+            interval = float(os.environ.get("COORD_RECONCILE_INTERVAL", "30"))
+        except ValueError:
+            interval = 30.0
+
+        async def _tick_loop() -> None:
+            from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
+
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    reconciled = await run_in_threadpool(
+                        reconcile_completed_assignments, config
+                    )
+                    if reconciled:
+                        log.info(
+                            "passive reconcile: %d assignment(s) → terminal (%s)",
+                            len(reconciled),
+                            ", ".join(
+                                f"#{r['issue_number']}:{r['to_status']}"
+                                for r in reconciled
+                            ),
+                        )
+                except Exception:  # noqa: BLE001 — a tick must never crash the daemon
+                    log.warning("passive reconcile tick failed", exc_info=True)
+
+        @contextlib.asynccontextmanager
+        async def _ctx(_a):  # noqa: ANN202
+            task = (
+                asyncio.create_task(_tick_loop()) if interval > 0 else None
+            )
+            try:
+                yield
+            finally:
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+        return _ctx(_app)
+
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
@@ -517,4 +579,4 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/diagnose", post_diagnose, methods=["POST"]),
     ]
     middleware = [Middleware(_BearerAuthMiddleware, token=token)] if token else []
-    return Starlette(routes=routes, middleware=middleware)
+    return Starlette(routes=routes, middleware=middleware, lifespan=_lifespan)
