@@ -501,6 +501,7 @@ def build_review_briefing(
     repo_claude_md: str | None,
     default_branch: str = "main",
     review_iteration: int = 0,
+    diff_text: str | None = None,
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
 
@@ -509,6 +510,14 @@ def build_review_briefing(
     then scoped to the fix delta instead of the whole PR (#476): re-reviewing
     the entire PR every round repeats work, wastes tokens, and surfaces fresh
     non-blocking nits that bounce an already-correct PR into another fix cycle.
+
+    When *diff_text* is non-empty (#612) the coordinator has already computed
+    the merge-base (three-dot) diff and it is embedded verbatim, so the
+    reviewer reviews exactly the branch's own changes — there is nothing for it
+    to get wrong. A reviewer that deviates to a two-dot/stale-base diff would
+    surface code merged to the default branch *after* the branch was cut as
+    spurious deletions and flag it as a regression (#546). When *diff_text* is
+    None the existing three-dot ``git diff`` fallback instructions stand.
     """
 
     lines: list[str] = []
@@ -567,6 +576,23 @@ def build_review_briefing(
         lines.append("## Additional instructions")
         lines.append(reviews_cfg.reviewer_prompt.strip())
 
+    if diff_text and diff_text.strip():
+        # #612: embed the merge-base (three-dot) diff verbatim so the reviewer
+        # has nothing to compute — a two-dot/stale-base diff would show
+        # already-merged commits as spurious deletions (#546).
+        lines.append("")
+        lines.append("## Diff to review (authoritative)")
+        lines.append(
+            "This is the merge-base (three-dot) diff — exactly the branch's own "
+            "changes, nothing else. Review THIS. Do NOT compute your own diff; a "
+            "two-dot or stale-base diff would show unrelated already-merged "
+            "commits as spurious deletions."
+        )
+        lines.append("")
+        lines.append("```diff")
+        lines.append(diff_text.strip())
+        lines.append("```")
+
     lines.append("")
     lines.append("## What to do")
     lines.append("")
@@ -603,20 +629,32 @@ def build_review_briefing(
             "non-blocking findings."
         )
     elif pr_number is not None:
-        lines.append(
-            f"1. Get the diff: `git fetch origin && git diff origin/{default_branch}..."
-            f"origin/{branch or 'HEAD'}` or ask the coordinator for the diff."
-        )
+        if diff_text and diff_text.strip():
+            lines.append(
+                "1. Review the diff in the '## Diff to review' section above "
+                "(already fetched for you — the merge-base diff)."
+            )
+        else:
+            lines.append(
+                f"1. Get the diff: `git fetch origin && git diff origin/{default_branch}..."
+                f"origin/{branch or 'HEAD'}` or ask the coordinator for the diff."
+            )
         lines.append("2. Run the project's test suite.")
         lines.append("3. Review the diff against the checklist above.")
     else:
-        lines.append(
-            f"1. The worker pushed branch `{branch}` but no PR was opened. "
-            f"Get the diff: `git fetch origin && git diff origin/{default_branch}..."
-            f"origin/{branch or '<branch>'}`. Always diff against `origin/` after "
-            "fetching — a local base ref may be stale and would sweep in unrelated "
-            "already-merged commits."
-        )
+        if diff_text and diff_text.strip():
+            lines.append(
+                "1. Review the diff in the '## Diff to review' section above "
+                "(already fetched for you — the merge-base diff)."
+            )
+        else:
+            lines.append(
+                f"1. The worker pushed branch `{branch}` but no PR was opened. "
+                f"Get the diff: `git fetch origin && git diff origin/{default_branch}..."
+                f"origin/{branch or '<branch>'}`. Always diff against `origin/` after "
+                "fetching — a local base ref may be stale and would sweep in unrelated "
+                "already-merged commits."
+            )
         lines.append("2. Run the project's test suite.")
         lines.append("3. Review the diff against the checklist above.")
     lines.append("")
@@ -785,6 +823,13 @@ def dispatch_review(
         return None
     claude_md = claude_md_reader(Path(repo_path).expanduser())
 
+    # #612: compute the merge-base (three-dot) diff ourselves and embed it in
+    # the briefing so the reviewer has nothing to compute (a stale-base diff
+    # would surface already-merged commits as spurious deletions). Best-effort:
+    # on failure diff_text is None and the briefing keeps its fallback
+    # three-dot diff instructions.
+    diff_text = github_ops.pr_diff(repo.github, pr["number"]) if pr else None
+
     fetch_body = issue_body_fetcher or _fetch_issue_body
     briefing = build_review_briefing(
         pr_number=pr["number"] if pr else None,
@@ -803,6 +848,7 @@ def dispatch_review(
         # #476: a fix worker carries review_iteration > 0; its re-review is
         # scoped to the fix delta rather than re-reviewing the whole PR.
         review_iteration=getattr(completed, "review_iteration", 0) or 0,
+        diff_text=diff_text,
     )
 
     # #603: prepend the per-issue context digest so the reviewer also knows the

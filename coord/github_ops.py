@@ -201,6 +201,25 @@ def find_pr_for_branch(repo: str, branch: str) -> dict | None:
     return items[0] if items else None
 
 
+def pr_diff(repo_github: str, pr_number: int, *, max_chars: int = 60000) -> str | None:
+    """Return the merge-base (three-dot) diff for PR ``pr_number``, or None.
+
+    ``gh pr diff`` is three-dot / merge-base by GitHub semantics, so the output
+    is exactly the branch's own changes (#612) — code merged to the base after
+    the branch was cut never appears as spurious deletions. Truncated to
+    *max_chars* with a trailing note so a huge diff can't blow the briefing
+    size. Best-effort: returns None on any ``gh`` error so the caller falls
+    back to the in-briefing three-dot diff instructions.
+    """
+    try:
+        diff = _gh("pr", "diff", str(pr_number), "--repo", repo_github)
+    except RuntimeError:
+        return None
+    if len(diff) > max_chars:
+        diff = diff[:max_chars] + f"\n... [diff truncated at {max_chars} chars] ..."
+    return diff
+
+
 def create_pr(
     repo: str,
     *,

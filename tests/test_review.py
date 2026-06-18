@@ -340,6 +340,67 @@ def test_briefing_re_review_is_incremental_and_nit_suppressing() -> None:
     assert "git log --oneline origin/main...origin/my-branch" in briefing
 
 
+def test_briefing_embeds_diff_text_when_supplied() -> None:
+    """#612: a supplied merge-base diff is embedded verbatim and the reviewer
+    is told NOT to compute its own diff (a stale-base diff false-flags
+    already-merged commits as deletions)."""
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+added_line = 1\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+    )
+    assert "## Diff to review (authoritative)" in briefing
+    assert "added_line = 1" in briefing
+    assert "Do NOT compute your own diff" in briefing
+    # The "What to do" step 1 points at the embedded section, not a git command.
+    assert "already fetched for you" in briefing
+
+
+def test_briefing_no_diff_text_keeps_three_dot_fallback() -> None:
+    """#612: with diff_text=None the existing three-dot ``git diff origin/``
+    fallback instructions stand (no embedded diff section)."""
+    briefing = build_review_briefing(
+        pr_number=None, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=None,
+    )
+    assert "## Diff to review (authoritative)" not in briefing
+    assert "git diff origin/main...origin/my-branch" in briefing
+
+
+def test_pr_diff_truncates_at_max_chars(monkeypatch) -> None:
+    """#612: github_ops.pr_diff caps a huge diff and appends a truncation note."""
+    from coord import github_ops
+
+    big = "x" * 10_000
+    monkeypatch.setattr(github_ops, "_gh", lambda *args: big)
+    out = github_ops.pr_diff("acme/api", 42, max_chars=100)
+    assert out is not None
+    assert out.startswith("x" * 100)
+    assert "[diff truncated at 100 chars]" in out
+    assert len(out) < len(big)
+
+
+def test_pr_diff_returns_none_on_gh_error(monkeypatch) -> None:
+    """#612: pr_diff is best-effort — a gh failure yields None, not a raise."""
+    from coord import github_ops
+
+    def _boom(*args):
+        raise RuntimeError("gh exploded")
+
+    monkeypatch.setattr(github_ops, "_gh", _boom)
+    assert github_ops.pr_diff("acme/api", 42) is None
+
+
 # ── dispatch_review (integration with mocked agent HTTP) ────────────────────
 
 
