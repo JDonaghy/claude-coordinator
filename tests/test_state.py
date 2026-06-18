@@ -245,3 +245,103 @@ class TestRecordDispatchedAssignmentBranch:
         assert row[0] == "issue-1-some-branch", (
             "COALESCE must prevent a branch-less re-dispatch from clearing the existing branch"
         )
+
+
+class TestReconcileBoardWriteHelpers:
+    """#611/#609: targeted, idempotent UPDATE helpers used by the
+    reconcile-merges sweep."""
+
+    def _insert_done_work(
+        self, *, assignment_id: str, branch: str | None, status: str = "done"
+    ) -> None:
+        from coord.db import get_connection
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        assignment = Assignment(
+            machine_name="laptop",
+            repo_name="myrepo",
+            issue_number=42,
+            issue_title="t",
+            assignment_id=assignment_id,
+            status=status,
+            branch=branch,
+            type="work",
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(
+            assignment=assignment, repo_github="acme/myrepo"
+        )
+        # record_dispatched_assignment always inserts status='running' (it
+        # mirrors a fresh dispatch); set the desired terminal status directly.
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status=? WHERE assignment_id=?",
+            (status, assignment_id),
+        )
+        conn.commit()
+
+    def test_update_assignment_branch_backfills_when_empty(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import update_assignment_branch
+
+        self._insert_done_work(assignment_id="bf1", branch=None)
+        update_assignment_branch("bf1", "issue-42-fix")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?", ("bf1",)
+        ).fetchone()
+        assert row[0] == "issue-42-fix"
+
+    def test_update_assignment_branch_does_not_clobber_existing(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import update_assignment_branch
+
+        self._insert_done_work(assignment_id="bf2", branch="issue-42-original")
+        update_assignment_branch("bf2", "issue-42-other")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?", ("bf2",)
+        ).fetchone()
+        assert row[0] == "issue-42-original"
+
+    def test_update_assignment_branch_noop_on_empty_args(self, coord_db) -> None:
+        from coord.state import update_assignment_branch
+
+        update_assignment_branch("", "x")  # must not raise
+        update_assignment_branch("some-id", "")  # must not raise
+
+    def test_mark_assignment_merged_flips_done(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import mark_assignment_merged
+
+        self._insert_done_work(assignment_id="mg1", branch="issue-42-fix")
+        mark_assignment_merged("mg1")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT status FROM assignments WHERE assignment_id=?", ("mg1",)
+        ).fetchone()
+        assert row[0] == "merged"
+
+    def test_mark_assignment_merged_only_acts_on_done(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import mark_assignment_merged
+
+        self._insert_done_work(
+            assignment_id="mg2", branch="issue-42-fix", status="running"
+        )
+        mark_assignment_merged("mg2")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT status FROM assignments WHERE assignment_id=?", ("mg2",)
+        ).fetchone()
+        assert row[0] == "running"
+
+    def test_mark_assignment_merged_noop_on_empty_id(self, coord_db) -> None:
+        from coord.state import mark_assignment_merged
+
+        mark_assignment_merged("")  # must not raise

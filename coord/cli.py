@@ -6680,6 +6680,44 @@ def refine(repo: str, issue: int, config_path: Path) -> None:
     )
 
 
+@main.command(
+    "reconcile-merges",
+    help=(
+        "Reconcile done work assignments against git/GitHub reality.\n\n"
+        "Two conservative sweeps over done work assignments:\n"
+        "  #611 — backfill a missing branch from a matching `issue-N-*` remote "
+        "branch (a remote interactive session can finish done with branch=None, "
+        "greying the TUI Start review/test/merge buttons);\n"
+        "  #609 — flip work merged out-of-band (direct GitHub merge or a drained "
+        "merge_queue row) to status='merged' so the TUI stops showing a grey "
+        "merge box forever.\n\n"
+        "Acts only when certain; skips and explains otherwise."
+    ),
+)
+@click.option("--repo", "repo_name", default=None, help="Only reconcile this repo.")
+@click.option(
+    "--dry-run", is_flag=True, help="Show what would change without writing."
+)
+@_CONFIG_OPTION
+def reconcile_merges(repo_name: str | None, dry_run: bool, config_path: Path) -> None:
+    """#609/#611: record out-of-band merges and backfill missing branches."""
+    from coord.reconcile import reconcile_board_merges
+    from coord.state import build_board, save_board
+
+    cfg = _load_config(config_path)
+    board = build_board()
+    actions = reconcile_board_merges(
+        board, cfg, repo=repo_name, dry_run=dry_run
+    )
+    if not dry_run:
+        save_board(board)
+    if not actions:
+        click.echo("Nothing to reconcile.")
+        return
+    for action in actions:
+        click.echo(action)
+
+
 @main.group("context")
 def context_group() -> None:
     """The per-issue rolling context digest (#603).
