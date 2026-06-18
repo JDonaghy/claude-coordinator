@@ -1784,12 +1784,17 @@ enum PipelineMergeState {
 /// shape converted to `quadraui::ContextMenuItem` at render time.
 #[derive(Clone, Debug)]
 struct ContextMenuItem {
-    /// Action identifier dispatched on click / Enter.  `None` ⇒ separator.
+    /// Action identifier dispatched on click / Enter.
+    /// `None` with `submenu.is_none()` ⇒ separator.
+    /// `None` with `submenu.is_some()` ⇒ pull-right parent.
     action_id: Option<String>,
     label: String,
     /// Optional right-aligned shortcut hint (e.g. `"r"`).
     shortcut: Option<String>,
     disabled: bool,
+    /// Pull-right submenu (#607).  When `Some`, activating the item opens
+    /// the child menu instead of dispatching an action.
+    submenu: Option<Vec<ContextMenuItem>>,
 }
 
 impl ContextMenuItem {
@@ -1799,6 +1804,7 @@ impl ContextMenuItem {
             label: label.to_string(),
             shortcut: None,
             disabled: false,
+            submenu: None,
         }
     }
     fn separator() -> Self {
@@ -1807,11 +1813,30 @@ impl ContextMenuItem {
             label: String::new(),
             shortcut: None,
             disabled: false,
+            submenu: None,
+        }
+    }
+    /// Create a pull-right parent item whose children appear in a submenu.
+    fn parent(label: &str, children: Vec<ContextMenuItem>) -> Self {
+        Self {
+            action_id: None,
+            label: label.to_string(),
+            shortcut: None,
+            disabled: false,
+            submenu: Some(children),
         }
     }
     fn with_shortcut(mut self, s: &str) -> Self {
         self.shortcut = Some(s.to_string());
         self
+    }
+    /// True iff this item is a visual separator (neither action nor parent).
+    fn is_separator(&self) -> bool {
+        self.action_id.is_none() && self.submenu.is_none()
+    }
+    /// True iff this item can be selected (action or submenu parent, not disabled).
+    fn is_selectable(&self) -> bool {
+        (self.action_id.is_some() || self.submenu.is_some()) && !self.disabled
     }
 }
 
@@ -1822,12 +1847,20 @@ struct ContextMenuState {
     items: Vec<ContextMenuItem>,
     /// Anchor point — where the right-click landed.
     anchor: Point,
-    /// Keyboard-selected item index.  Maintained skipping separators by
-    /// `quadraui::ContextMenu::move_selection`.
+    /// Keyboard-selected item index in the root menu.  Maintained skipping
+    /// separators and disabled items.
     selected_idx: usize,
     /// What the menu is "about" — used by `dispatch_context_menu_action`
     /// to route the action with row-specific data.
     target: ContextMenuTarget,
+    /// #607: depth-first path of open submenus.  `submenu_path[d]` = the
+    /// `item_idx` in the menu at depth `d` whose child submenu is currently
+    /// open.  Empty ⟹ only the root menu is showing.
+    submenu_path: Vec<usize>,
+    /// #607: selected item index at each submenu depth.
+    /// `submenu_selected[d]` is the selection inside the submenu opened by
+    /// `submenu_path[d]`.
+    submenu_selected: Vec<usize>,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -5107,11 +5140,13 @@ pub struct CoordApp {
     /// Opened by right-click on a Board / Pipeline sidebar row; dismissed by
     /// click-outside, Escape, or item activation.
     pending_context_menu: Option<ContextMenuState>,
-    /// #259: cached `ContextMenuLayout` from the last render — required for
-    /// click hit-testing on the menu items.  Borrowed from the `&self`
-    /// render path (same pattern as `settings_form`), populated on every
-    /// frame while a menu is open and cleared when it dismisses.
-    context_menu_layout: std::cell::RefCell<Option<ContextMenuLayout>>,
+    /// #259 / #607: cached layout stack from the last render — one entry per
+    /// open menu level (root + any open submenus).  Each entry is a
+    /// `(ContextMenu, ContextMenuLayout)` pair so hit-testing can walk the
+    /// stack deepest-first without rebuilding the menus.  Borrowed from the
+    /// `&self` render path; populated on every frame while a menu is open and
+    /// cleared when it dismisses.
+    context_menu_layout: std::cell::RefCell<Vec<(ContextMenu, ContextMenuLayout)>>,
     /// Cached `DialogLayout` from the last prompt-dialog render — used for
     /// click hit-testing on dialog buttons.  Populated while any
     /// `pending_*` prompt dialog is visible; cleared when it dismisses.
@@ -5637,7 +5672,7 @@ impl CoordApp {
             paused_machines: read_paused_machines(),
             pending_force_merge: None,
             pending_context_menu: None,
-            context_menu_layout: std::cell::RefCell::new(None),
+            context_menu_layout: std::cell::RefCell::new(Vec::new()),
             dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
@@ -15996,18 +16031,16 @@ impl CoordApp {
         lifecycle: &PipelineRowLifecycle,
     ) -> Vec<ContextMenuItem> {
         let mut items: Vec<ContextMenuItem> = Vec::new();
-        // #467: human-attended interactive launchers — always available for a
-        // real issue row.  Work implements directly; Plan plans then implements
-        // in the SAME session.
-        // #539: Review is added here too, gated on a completed work assignment
-        // with a branch existing for this issue.
+        // #467 / #607: "Start" launchers grouped into pull-right submenus.
+        // Interactive (Claude Max, human-attended) and automated (claude -p,
+        // coordinator-dispatched) are separate parents so the execution model
+        // is explicit at a glance.
         if issue_number.is_some() {
             // #486 Leg 4 UX: when a live interactive session already exists for
             // this issue, the only sensible interactive action is to reattach —
             // every mode would attach to the same session, and you can't start a
             // review/fix while the work session is still live.  Offer one clear
-            // "Reattach" item (routed through the reattach-aware launcher) and
-            // hide the Start variants.
+            // "Reattach" item (flat, no submenu) and hide the Start variants.
             let has_live = issue_number.map(|n| self.issue_has_live_session(n)).unwrap_or(false);
             if has_live {
                 items.push(ContextMenuItem::action(
@@ -16015,65 +16048,52 @@ impl CoordApp {
                     "Reattach to live session",
                 ));
             } else {
-                items.push(ContextMenuItem::action(
+                // ── Start (interactive) submenu ───────────────────────────
+                let mut interactive_children: Vec<ContextMenuItem> = Vec::new();
+                interactive_children.push(ContextMenuItem::action(
                     "start-work-interactive",
-                    "Start work (interactive)",
+                    "Work",
                 ));
-                items.push(ContextMenuItem::action(
+                interactive_children.push(ContextMenuItem::action(
                     "start-plan-interactive",
-                    "Start plan (interactive)",
+                    "Plan",
                 ));
-                let mut review_item =
-                    ContextMenuItem::action("start-review-interactive", "Start review (interactive)");
+                // #539: Review gated on a completed work assignment.
+                let mut review_item = ContextMenuItem::action("start-review-interactive", "Review");
                 review_item.disabled = self.selected_completed_work_aid().is_none();
-                items.push(review_item);
-                // Leg 3 (#517): interactive peer of `bounce` — a human-attended
-                // fix continuing the existing branch.  Shown when a request-changes
-                // review exists for this issue, OR (#581) when the Test gate failed
-                // (the red test box) — both are things to fix on the same branch.
+                interactive_children.push(review_item);
+                // Leg 3 (#517 / #581): Fix shown only when a request-changes
+                // review OR a test-failure exists for this issue.
                 if self.selected_row_has_request_changes_for(issue_number)
                     || self.selected_test_failed_work_aid().is_some()
                 {
-                    items.push(ContextMenuItem::action(
+                    interactive_children.push(ContextMenuItem::action(
                         "start-fix-interactive",
-                        "Start fix (interactive)",
+                        "Fix",
                     ));
                 }
+                // Leg 3c / A3 (#517 / #581 / #306): Testing and Merge gated on
+                // a completed work assignment.
+                let mut test_item = ContextMenuItem::action("start-testing-interactive", "Testing");
+                test_item.disabled = self.selected_completed_work_aid().is_none();
+                interactive_children.push(test_item);
+                let mut merge_item = ContextMenuItem::action("start-merge-interactive", "Merge");
+                merge_item.disabled = self.selected_completed_work_aid().is_none();
+                interactive_children.push(merge_item);
+
+                items.push(ContextMenuItem::parent("Start (interactive)", interactive_children));
+
+                // ── Start (automated) submenu ─────────────────────────────
+                // #leg1: non-interactive (claude -p) dispatch.  Claim-check in
+                // dispatch_pipeline_work/plan refuses a duplicate on an already-
+                // active issue gracefully.
+                // `start-skip-plan` = work directly; `start-with-plan` = plan-then-work.
+                let automated_children = vec![
+                    ContextMenuItem::action("start-skip-plan", "Work"),
+                    ContextMenuItem::action("start-with-plan", "Plan"),
+                ];
+                items.push(ContextMenuItem::parent("Start (automated)", automated_children));
             }
-            // Leg 3c / A3 (#517, #581): the human-attended testing agent —
-            // pulls the artifact, lists the smoke tests, guides the operator,
-            // records the verdict.  Gated on a completed work assignment with a
-            // branch (same gate as Review).
-            let mut test_item = ContextMenuItem::action(
-                "start-testing-interactive",
-                "Start testing (interactive)",
-            );
-            test_item.disabled = self.selected_completed_work_aid().is_none();
-            items.push(test_item);
-            // Leg 3c (#517, #306): the human-attended merge agent — rebases the
-            // approved branch onto the default branch, resolves conflicts,
-            // pushes.  Same completed-work gate.
-            let mut merge_item = ContextMenuItem::action(
-                "start-merge-interactive",
-                "Start merge (interactive)",
-            );
-            merge_item.disabled = self.selected_completed_work_aid().is_none();
-            items.push(merge_item);
-            items.push(ContextMenuItem::separator());
-            // #leg1: the non-interactive (claude -p) dispatch path — the
-            // metered/automated peer to the interactive launchers above.
-            // Always offered for a real issue row; dispatch_pipeline_work/plan
-            // claim-check, so a duplicate on an already-active issue is refused
-            // gracefully. `start-skip-plan` = work directly; `start-with-plan`
-            // = plan-then-work.
-            items.push(ContextMenuItem::action(
-                "start-skip-plan",
-                "Start work (non-interactive)",
-            ));
-            items.push(ContextMenuItem::action(
-                "start-with-plan",
-                "Start plan (non-interactive)",
-            ));
             items.push(ContextMenuItem::separator());
         }
         match lifecycle {
@@ -16209,121 +16229,222 @@ impl CoordApp {
         if items.is_empty() {
             return false;
         }
-        // First non-separator item is the initial selection.
+        // First selectable item (action or submenu parent, not disabled) is
+        // the initial keyboard selection.
         let selected_idx = items
             .iter()
-            .position(|it| it.action_id.is_some() && !it.disabled)
+            .position(|it| it.is_selectable())
             .unwrap_or(0);
         self.pending_context_menu = Some(ContextMenuState {
             items,
             anchor: pos,
             selected_idx,
             target,
+            submenu_path: Vec::new(),
+            submenu_selected: Vec::new(),
         });
         true
     }
 
-    /// Render the open context menu (if any) on top of the rest of the UI.
-    /// Caches the resolved layout so the click hit-test can match items
+    /// Render the open context menu (if any) on top of the rest of the UI,
+    /// including any currently-open pull-right submenus (#607).
+    /// Caches the resolved layout stack so the click hit-test can match items
     /// without recomputing.  Pure render — no state mutation.
     fn render_context_menu(&self, backend: &mut dyn Backend, viewport: Rect) {
         let Some(state) = self.pending_context_menu.as_ref() else {
             return;
         };
-        let menu = build_quadraui_context_menu(state);
-        // Width = longest label + longest shortcut + padding (mirrors
-        // vimcode's `render_impl.rs::draw_context_menu` heuristic).
-        let max_label = state
-            .items
-            .iter()
-            .map(|it| it.label.chars().count())
-            .max()
-            .unwrap_or(4);
-        let max_shortcut = state
-            .items
-            .iter()
-            .filter_map(|it| it.shortcut.as_ref())
-            .map(|s| s.chars().count())
-            .max()
-            .unwrap_or(0);
-        let menu_width = (max_label + max_shortcut + 6).clamp(20, 60) as f32;
         let lh = backend.line_height();
-        let layout = menu.layout(state.anchor.x, state.anchor.y, viewport, menu_width, |_| {
-            ContextMenuItemMeasure::new(lh)
-        });
-        backend.draw_context_menu(&menu, &layout);
-        *self.context_menu_layout.borrow_mut() = Some(layout);
+        let stack = build_context_menu_stack(state, lh, viewport);
+        let mut cache: Vec<(ContextMenu, ContextMenuLayout)> = Vec::with_capacity(stack.len());
+        for (menu, layout) in &stack {
+            backend.draw_context_menu(menu, layout);
+            cache.push((menu.clone(), layout.clone()));
+        }
+        *self.context_menu_layout.borrow_mut() = cache;
     }
 
-    /// Hit-test a click against the open context menu.  Returns
-    /// `Some(true)` when the click landed on an actionable item (dispatched
-    /// + menu dismissed), `Some(false)` when the click landed on a
-    /// non-actionable cell of the menu (separator / disabled — swallow,
-    /// keep menu open), or `None` when no menu is open.  Click outside the
-    /// menu dismisses it and returns `Some(true)` to signal redraw.
+    /// Hit-test a click against the open context menu and all open submenus.
+    /// Walk levels deepest-first so clicks on a child popup don't fall through
+    /// to the parent.
+    ///
+    /// Returns `Some(true)` when the click was handled (action dispatched or
+    /// submenu toggled), `Some(false)` when the click landed on a non-actionable
+    /// cell (separator / disabled — swallow, keep menu open), or `None` when no
+    /// menu is open.  A click outside all open levels dismisses the menu.
     fn handle_context_menu_click(&mut self, pos: Point) -> Option<bool> {
-        let layout = self.context_menu_layout.borrow().clone()?;
         if self.pending_context_menu.is_none() {
             return None;
         }
-        match layout.hit_test(pos.x, pos.y) {
-            ContextMenuHit::Item(id) => {
-                let action_id = id.as_str().to_string();
-                let state = self.pending_context_menu.take();
-                *self.context_menu_layout.borrow_mut() = None;
-                if let Some(state) = state {
+        let stack = self.context_menu_layout.borrow().clone();
+        if stack.is_empty() {
+            return None;
+        }
+
+        // Walk deepest-first so a child popup intercepts before the parent.
+        for (depth_idx, (ref menu, ref layout)) in stack.iter().enumerate().rev() {
+            match layout.hit_test(pos.x, pos.y) {
+                ContextMenuHit::Item(ref id) => {
+                    // Locate the item_idx this id belongs to.
+                    let item_idx_opt = layout
+                        .visible_items
+                        .iter()
+                        .find(|v| {
+                            v.clickable && menu.items[v.item_idx].id.as_ref() == Some(id)
+                        })
+                        .map(|v| v.item_idx);
+
+                    // Check whether the quadraui item has a submenu (⟹ parent).
+                    let is_parent = item_idx_opt
+                        .and_then(|idx| menu.items.get(idx))
+                        .map(|item| item.submenu.is_some())
+                        .unwrap_or(false);
+
+                    if is_parent {
+                        if let Some(item_idx) = item_idx_opt {
+                            let first_sel = menu
+                                .items
+                                .get(item_idx)
+                                .and_then(|it| it.submenu.as_ref())
+                                .and_then(|sub| {
+                                    sub.iter().position(|i| !i.is_separator() && !i.disabled)
+                                })
+                                .unwrap_or(0);
+                            if let Some(state) = self.pending_context_menu.as_mut() {
+                                // Trim deeper submenus and open this one.
+                                state.submenu_path.truncate(depth_idx);
+                                state.submenu_selected.truncate(depth_idx);
+                                state.submenu_path.push(item_idx);
+                                state.submenu_selected.push(first_sel);
+                            }
+                        }
+                        *self.context_menu_layout.borrow_mut() = Vec::new();
+                        return Some(true);
+                    }
+
+                    // Leaf action — guard against synthetic parent ids leaking through.
+                    let action_id = id.as_str().to_string();
+                    if action_id.starts_with("__parent__") {
+                        return Some(false);
+                    }
+                    let state = self.pending_context_menu.take()?;
+                    *self.context_menu_layout.borrow_mut() = Vec::new();
                     self.dispatch_context_menu_action(&action_id, &state.target);
+                    return Some(true);
                 }
-                Some(true)
-            }
-            ContextMenuHit::Inert => Some(false),
-            ContextMenuHit::Empty => {
-                // Click outside dismisses without firing.
-                self.pending_context_menu = None;
-                *self.context_menu_layout.borrow_mut() = None;
-                Some(true)
+                ContextMenuHit::Inert => return Some(false),
+                ContextMenuHit::Empty => {
+                    // Click outside this level — keep searching shallower levels
+                    // only if the click is within the parent's bounds (otherwise
+                    // fall through and dismiss below).
+                    continue;
+                }
             }
         }
+
+        // Click outside all open menu levels → dismiss.
+        self.pending_context_menu = None;
+        *self.context_menu_layout.borrow_mut() = Vec::new();
+        Some(true)
     }
 
-    /// Move the keyboard selection within the open context menu, skipping
-    /// separators and disabled items.  No-op when no menu is open.
+    /// Move the keyboard selection within the currently-deepest open menu level,
+    /// skipping separators and disabled items.  No-op when no menu is open.
     fn context_menu_move_selection(&mut self, delta: i32) {
         let Some(ref state) = self.pending_context_menu else {
             return;
         };
-        // Build a transient quadraui menu just to reuse its move_selection
-        // logic (skips separators + disabled items).
-        let menu = build_quadraui_context_menu(state);
-        let new_idx = menu.move_selection(state.selected_idx, delta);
+        let depth = state.submenu_path.len();
+        let current_sel = if depth == 0 {
+            state.selected_idx
+        } else {
+            *state.submenu_selected.last().unwrap_or(&0)
+        };
+
+        let level_items = items_at_depth(state, depth);
+        // Build a transient quadraui menu to reuse its move_selection logic
+        // (skips separators + disabled items, wraps around).
+        let qui_items: Vec<QuiContextMenuItem> = level_items.iter().map(coord_item_to_qui).collect();
+        let temp = ContextMenu {
+            id: WidgetId::new("_move"),
+            items: qui_items,
+            selected_idx: current_sel,
+            bg: None,
+            placement: ContextMenuPlacement::AnchorPoint,
+        };
+        let new_sel = temp.move_selection(current_sel, delta);
+
         if let Some(ref mut s) = self.pending_context_menu {
-            s.selected_idx = new_idx;
+            if depth == 0 {
+                s.selected_idx = new_sel;
+            } else if let Some(sel) = s.submenu_selected.last_mut() {
+                *sel = new_sel;
+            }
         }
     }
 
-    /// Activate the keyboard-selected item (Enter) and dismiss the menu.
-    /// No-op when no menu is open or the selected item is a separator.
+    /// Activate the keyboard-selected item (Enter) at the current menu depth.
+    /// If the selected item is a submenu parent → open the submenu.
+    /// If it's a leaf action → dispatch and dismiss the menu.
+    /// No-op when no menu is open or the item is a separator.
     fn context_menu_activate_selected(&mut self) -> bool {
-        let Some(state) = self.pending_context_menu.take() else {
+        let Some(ref state) = self.pending_context_menu else {
             return false;
         };
-        *self.context_menu_layout.borrow_mut() = None;
-        let Some(item) = state.items.get(state.selected_idx) else {
+        let depth = state.submenu_path.len();
+        let current_sel = if depth == 0 {
+            state.selected_idx
+        } else {
+            *state.submenu_selected.last().unwrap_or(&0)
+        };
+
+        let level_items = items_at_depth(state, depth);
+        let Some(item) = level_items.get(current_sel) else {
             return false;
         };
+
+        if item.submenu.is_some() {
+            // Open the submenu: push path + first-selectable.
+            let sub_items = item.submenu.as_ref().unwrap();
+            let first_sel = sub_items.iter().position(|i| i.is_selectable()).unwrap_or(0);
+            let path_idx = current_sel;
+            if let Some(ref mut s) = self.pending_context_menu {
+                s.submenu_path.push(path_idx);
+                s.submenu_selected.push(first_sel);
+            }
+            *self.context_menu_layout.borrow_mut() = Vec::new();
+            return true;
+        }
+
         let Some(action_id) = item.action_id.clone() else {
             // Selected a separator — shouldn't happen since move_selection
             // skips them, but defend anyway.
             return false;
         };
+        let state = self.pending_context_menu.take().unwrap();
+        *self.context_menu_layout.borrow_mut() = Vec::new();
         self.dispatch_context_menu_action(&action_id, &state.target);
         true
+    }
+
+    /// Close the deepest open submenu (#607).  If no submenus are open, dismisses
+    /// the whole menu.
+    fn context_menu_close_submenu_or_dismiss(&mut self) {
+        if let Some(ref mut state) = self.pending_context_menu {
+            if !state.submenu_path.is_empty() {
+                state.submenu_path.pop();
+                state.submenu_selected.pop();
+                *self.context_menu_layout.borrow_mut() = Vec::new();
+                return;
+            }
+        }
+        self.dismiss_context_menu();
     }
 
     /// Dismiss the open context menu without firing an action.
     fn dismiss_context_menu(&mut self) {
         self.pending_context_menu = None;
-        *self.context_menu_layout.borrow_mut() = None;
+        *self.context_menu_layout.borrow_mut() = Vec::new();
     }
 
     // ── #369 / #329: Prompt dialogs ─────────────────────────────────────────
@@ -19784,28 +19905,38 @@ fn board_row_status_badge(lifecycle: &str) -> Option<Badge> {
     }
 }
 
+/// Convert a single coord-tui `ContextMenuItem` into a `quadraui::ContextMenuItem`.
+/// Separators (no action_id, no submenu) map to a default item with `id: None`.
+/// Parent items (submenu.is_some()) get a synthetic id (`"__parent__<label>"`) so
+/// quadraui treats them as selectable; their children are mapped recursively.
+/// Leaf actions carry the original `action_id`.
+fn coord_item_to_qui(it: &ContextMenuItem) -> QuiContextMenuItem {
+    if it.is_separator() {
+        QuiContextMenuItem::default()
+    } else if let Some(ref children) = it.submenu {
+        QuiContextMenuItem {
+            id: Some(WidgetId::new(&format!("__parent__{}", it.label))),
+            label: StyledText::plain(it.label.clone()),
+            disabled: it.disabled,
+            submenu: Some(children.iter().map(coord_item_to_qui).collect()),
+            ..Default::default()
+        }
+    } else {
+        QuiContextMenuItem {
+            id: it.action_id.as_ref().map(WidgetId::new),
+            label: StyledText::plain(it.label.clone()),
+            detail: it.shortcut.as_ref().map(|s| StyledText::plain(s.clone())),
+            disabled: it.disabled,
+            ..Default::default()
+        }
+    }
+}
+
 /// Convert an engine-side `ContextMenuState` into the `quadraui::ContextMenu`
-/// primitive the rasteriser draws.  Separators map to `id: None`; actions
-/// carry `action:<id>` so the hit-test can route back to the engine.
+/// primitive the rasteriser draws (root level only; submenus are embedded
+/// recursively via `coord_item_to_qui`).
 fn build_quadraui_context_menu(state: &ContextMenuState) -> ContextMenu {
-    let items: Vec<QuiContextMenuItem> = state
-        .items
-        .iter()
-        .map(|it| {
-            if it.action_id.is_none() {
-                // Separator.
-                QuiContextMenuItem::default()
-            } else {
-                QuiContextMenuItem {
-                    id: it.action_id.as_ref().map(WidgetId::new),
-                    label: StyledText::plain(it.label.clone()),
-                    detail: it.shortcut.as_ref().map(|s| StyledText::plain(s.clone())),
-                    disabled: it.disabled,
-                    ..Default::default()
-                }
-            }
-        })
-        .collect();
+    let items: Vec<QuiContextMenuItem> = state.items.iter().map(coord_item_to_qui).collect();
     ContextMenu {
         id: WidgetId::new("coord-context-menu"),
         items,
@@ -19813,6 +19944,117 @@ fn build_quadraui_context_menu(state: &ContextMenuState) -> ContextMenu {
         bg: None,
         placement: ContextMenuPlacement::AnchorPoint,
     }
+}
+
+/// Return the coord-tui items at the given `depth` by walking `state.submenu_path`.
+/// Depth 0 = root items.  Returns an empty vec when a path entry is out of bounds
+/// or its target has no submenu.
+fn items_at_depth(state: &ContextMenuState, depth: usize) -> Vec<ContextMenuItem> {
+    let mut items = state.items.clone();
+    for &path_idx in state.submenu_path.iter().take(depth) {
+        match items.get(path_idx).and_then(|it| it.submenu.clone()) {
+            Some(sub) => items = sub,
+            None => return Vec::new(),
+        }
+    }
+    items
+}
+
+/// Compute a menu-popup width from a slice of coord-tui items:
+/// longest label + longest shortcut hint + 6 cells of padding, clamped to [20, 60].
+fn compute_menu_width(items: &[ContextMenuItem]) -> f32 {
+    let max_label = items
+        .iter()
+        .map(|it| it.label.chars().count())
+        .max()
+        .unwrap_or(4);
+    let max_shortcut = items
+        .iter()
+        .filter_map(|it| it.shortcut.as_ref())
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Extra 2 chars for the ▶ affordance on parent items.
+    let has_parent = items.iter().any(|it| it.submenu.is_some());
+    let extra = if has_parent { 2 } else { 0 };
+    (max_label + max_shortcut + extra + 6).clamp(20, 60) as f32
+}
+
+/// Build the full stack of `(ContextMenu, ContextMenuLayout)` for the open
+/// context menu and all currently-open submenus.  Index 0 = root; index 1 = first
+/// open submenu, etc.  Drives both rendering (one `draw_context_menu` call per
+/// level) and hit-testing (walk deepest-first).
+fn build_context_menu_stack(
+    state: &ContextMenuState,
+    lh: f32,
+    viewport: Rect,
+) -> Vec<(ContextMenu, ContextMenuLayout)> {
+    let mut stack: Vec<(ContextMenu, ContextMenuLayout)> = Vec::new();
+
+    // ── Root level ────────────────────────────────────────────────────────
+    let root_menu = build_quadraui_context_menu(state);
+    let root_width = compute_menu_width(&state.items);
+    let root_layout = root_menu.layout(
+        state.anchor.x,
+        state.anchor.y,
+        viewport,
+        root_width,
+        |_| ContextMenuItemMeasure::new(lh),
+    );
+    stack.push((root_menu, root_layout));
+
+    // ── Open submenu levels ───────────────────────────────────────────────
+    let mut current_coord_items: Vec<ContextMenuItem> = state.items.clone();
+
+    for (depth, &path_idx) in state.submenu_path.iter().enumerate() {
+        let sub_coord_items = match current_coord_items
+            .get(path_idx)
+            .and_then(|it| it.submenu.clone())
+        {
+            Some(items) => items,
+            None => break,
+        };
+        let selected = state.submenu_selected.get(depth).copied().unwrap_or(0);
+
+        let qui_items: Vec<QuiContextMenuItem> = sub_coord_items.iter().map(coord_item_to_qui).collect();
+        let sub_menu = ContextMenu {
+            id: WidgetId::new("coord-context-submenu"),
+            items: qui_items,
+            selected_idx: selected,
+            bg: None,
+            placement: ContextMenuPlacement::AnchorPoint,
+        };
+
+        // Pull-right anchor: right border of parent level + 1.
+        let parent_bounds = stack[depth].1.bounds;
+        let anchor_y = stack[depth]
+            .1
+            .visible_items
+            .iter()
+            .find(|v| v.item_idx == path_idx)
+            .map(|v| v.bounds.y)
+            .unwrap_or(parent_bounds.y);
+
+        let sub_width = compute_menu_width(&sub_coord_items);
+        let preferred_x = parent_bounds.x + parent_bounds.width + 1.0;
+        let flipped_x = parent_bounds.x - sub_width - 1.0;
+        let anchor_x = if preferred_x + sub_width <= viewport.x + viewport.width {
+            preferred_x
+        } else if flipped_x >= viewport.x {
+            flipped_x
+        } else {
+            (viewport.x + viewport.width - sub_width).max(viewport.x)
+        };
+
+        let sub_layout =
+            sub_menu.layout(anchor_x, anchor_y, viewport, sub_width, |_| {
+                ContextMenuItemMeasure::new(lh)
+            });
+        stack.push((sub_menu, sub_layout));
+        current_coord_items = sub_coord_items;
+    }
+
+    stack
 }
 
 // ─── Selected-item action bar (#270) ─────────────────────────────────────────
@@ -24323,7 +24565,7 @@ impl ShellApp for CoordApp {
             // Keep the cached layout in sync — clear it once the menu
             // is no longer rendered so a stale layout can't satisfy a
             // hit-test on the next click.
-            *self.context_menu_layout.borrow_mut() = None;
+            *self.context_menu_layout.borrow_mut() = Vec::new();
         }
 
         // ── #369/#329: Prompt dialogs (highest z-order) ──────────────────
@@ -25227,10 +25469,10 @@ impl ShellApp for CoordApp {
             }
         }
 
-        // ── #259: open context menu intercepts keyboard nav ──────────────
+        // ── #259 / #607: open context menu intercepts keyboard nav ──────────
         // Up/Down/j/k move the keyboard selection (skipping separators);
-        // Enter activates the selected item; Escape (or any other key)
-        // dismisses without firing.
+        // Enter / Right opens a submenu (if selected item has one) or activates;
+        // Left / Escape closes the deepest submenu; outer Escape dismisses all.
         if self.pending_context_menu.is_some() {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 match key {
@@ -25240,11 +25482,14 @@ impl ShellApp for CoordApp {
                     Key::Named(NamedKey::Up) | Key::Char('k') => {
                         self.context_menu_move_selection(-1);
                     }
-                    Key::Named(NamedKey::Enter) => {
+                    Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Right) => {
+                        // Enter: open submenu if parent, else activate leaf.
+                        // Right: always try to open submenu; no-op on leaf.
                         self.context_menu_activate_selected();
                     }
-                    Key::Named(NamedKey::Escape) => {
-                        self.dismiss_context_menu();
+                    Key::Named(NamedKey::Left) | Key::Named(NamedKey::Escape) => {
+                        // Left / Esc: close deepest submenu or dismiss entirely.
+                        self.context_menu_close_submenu_or_dismiss();
                     }
                     _ => {
                         // Any other key dismisses to keep the focus model
@@ -28457,7 +28702,7 @@ mod tests {
             paused_machines: read_paused_machines(),
             pending_force_merge: None,
             pending_context_menu: None,
-            context_menu_layout: std::cell::RefCell::new(None),
+            context_menu_layout: std::cell::RefCell::new(Vec::new()),
             dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
@@ -36798,23 +37043,29 @@ mod tests {
             app.selected_issue_live_session_id().is_none(),
             "a finalized session must not be reattachable"
         );
-        // The menu offers Start (advance to review), not Reattach.
+        // The menu offers Start (interactive) + Start (automated) submenus, not Reattach.
         let items =
             app.context_menu_items_for_pipeline_row(Some(514), &PipelineRowLifecycle::InProgress);
-        assert!(items.iter().any(|i| i.label == "Start work (interactive)"));
+        assert!(
+            items.iter().any(|i| i.label == "Start (interactive)"),
+            "#607: Start (interactive) parent must be present when no live session"
+        );
         assert!(!items.iter().any(|i| i.label == "Reattach to live session"));
     }
 
     #[test]
     fn pipeline_context_menu_offers_reattach_when_session_live() {
-        // #486 Leg 4 UX: a RUNNING live session for the issue collapses the four
-        // interactive Start items into a single "Reattach to live session".
+        // #486 Leg 4 UX: a RUNNING live session for the issue collapses the two
+        // submenu parents into a single "Reattach to live session" leaf item.
         let mut app = make_app_default();
         let lifecycle = PipelineRowLifecycle::New;
 
-        // No live session → the normal Start items are present.
+        // No live session → the Start (interactive/automated) submenu parents are present.
         let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle);
-        assert!(items.iter().any(|i| i.label == "Start work (interactive)"));
+        assert!(
+            items.iter().any(|i| i.label == "Start (interactive)"),
+            "#607: Start (interactive) parent must be present when no live session"
+        );
         assert!(!items.iter().any(|i| i.label == "Reattach to live session"));
 
         // Live session backed by a RUNNING assignment → single Reattach item.
@@ -36829,8 +37080,9 @@ mod tests {
         }];
         let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle);
         assert!(items.iter().any(|i| i.label == "Reattach to live session"));
-        assert!(!items.iter().any(|i| i.label == "Start work (interactive)"));
-        assert!(!items.iter().any(|i| i.label == "Start plan (interactive)"));
+        // Submenu parents must not appear alongside Reattach.
+        assert!(!items.iter().any(|i| i.label == "Start (interactive)"));
+        assert!(!items.iter().any(|i| i.label == "Start (automated)"));
     }
 
     #[test]
@@ -37215,54 +37467,183 @@ mod tests {
 
     // ── #262: Start right-click on Pipeline:New rows ────────────────────
 
+    /// Collect all `action_id`s from a menu item slice, recursively including
+    /// submenu children (#607).  Used by tests that check which actions are
+    /// reachable (leaf or nested) in the returned menu.
+    fn all_action_ids_recursive<'a>(items: &'a [ContextMenuItem]) -> Vec<&'a str> {
+        let mut ids: Vec<&'a str> = Vec::new();
+        for item in items {
+            if let Some(id) = item.action_id.as_deref() {
+                ids.push(id);
+            }
+            if let Some(ref children) = item.submenu {
+                ids.extend(all_action_ids_recursive(children));
+            }
+        }
+        ids
+    }
+
     #[test]
     fn pipeline_new_row_context_menu_offers_both_start_variants() {
+        // #607: start actions are now inside pull-right submenus — search
+        // recursively.
         let app = make_app_default();
         let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
-        let action_ids: Vec<&str> = items
-            .iter()
-            .filter_map(|it| it.action_id.as_deref())
-            .collect();
+        let action_ids = all_action_ids_recursive(&items);
         assert!(
             action_ids.contains(&"start-with-plan"),
-            "Pipeline:New menu must offer Start with Plan; got {:?}",
+            "Pipeline:New menu must offer Start with Plan (automated); got {:?}",
             action_ids,
         );
         assert!(
             action_ids.contains(&"start-skip-plan"),
-            "Pipeline:New menu must offer Skip Plan; got {:?}",
+            "Pipeline:New menu must offer Skip Plan (automated); got {:?}",
             action_ids,
+        );
+        // The two submenus must appear as top-level parent items.
+        assert!(
+            items.iter().any(|i| i.label == "Start (interactive)"),
+            "Must have Start (interactive) parent",
+        );
+        assert!(
+            items.iter().any(|i| i.label == "Start (automated)"),
+            "Must have Start (automated) parent",
         );
     }
 
     #[test]
     fn pipeline_in_progress_row_offers_noninteractive_start() {
-        // #leg1: the non-interactive dispatch is now a peer of the interactive
-        // launchers and offered for any real issue row (the claim check refuses
-        // a duplicate on an already-active issue).
+        // #leg1 / #607: the non-interactive dispatch is now nested inside the
+        // Start (automated) submenu — search recursively.
         let app = make_app_default();
         let items =
             app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
-        let action_ids: Vec<&str> = items
-            .iter()
-            .filter_map(|it| it.action_id.as_deref())
-            .collect();
+        let action_ids = all_action_ids_recursive(&items);
         assert!(action_ids.contains(&"start-with-plan"));
         assert!(action_ids.contains(&"start-skip-plan"));
     }
 
     #[test]
     fn pipeline_done_row_offers_noninteractive_start() {
-        // #leg1: also offered on Done rows — a non-interactive re-dispatch
-        // (rework) peer to "Start work (interactive)".
+        // #leg1 / #607: also offered on Done rows — nested in Start (automated).
         let app = make_app_default();
         let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Done);
-        let action_ids: Vec<&str> = items
-            .iter()
-            .filter_map(|it| it.action_id.as_deref())
-            .collect();
+        let action_ids = all_action_ids_recursive(&items);
         assert!(action_ids.contains(&"start-with-plan"));
         assert!(action_ids.contains(&"start-skip-plan"));
+    }
+
+    // ── #607: pull-right submenu structure ──────────────────────────────────
+
+    #[test]
+    fn pipeline_row_start_interactive_is_a_submenu_parent() {
+        // The "Start (interactive)" item must be a parent with children, not
+        // a flat action.  The flat "Start work (interactive)" label is gone.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let parent = items.iter().find(|i| i.label == "Start (interactive)");
+        assert!(parent.is_some(), "Start (interactive) parent must exist");
+        let parent = parent.unwrap();
+        assert!(parent.action_id.is_none(), "parent must have no action_id");
+        assert!(parent.submenu.is_some(), "parent must have a submenu");
+        let children = parent.submenu.as_ref().unwrap();
+        let child_ids: Vec<&str> = children.iter().filter_map(|i| i.action_id.as_deref()).collect();
+        assert!(child_ids.contains(&"start-work-interactive"), "Work must be in interactive submenu");
+        assert!(child_ids.contains(&"start-plan-interactive"), "Plan must be in interactive submenu");
+        assert!(child_ids.contains(&"start-review-interactive"), "Review must be in interactive submenu");
+        assert!(child_ids.contains(&"start-testing-interactive"), "Testing must be in interactive submenu");
+        assert!(child_ids.contains(&"start-merge-interactive"), "Merge must be in interactive submenu");
+    }
+
+    #[test]
+    fn pipeline_row_start_automated_is_a_submenu_parent() {
+        // "Start (automated)" must contain Work and Plan as children with the
+        // correct action_ids.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let parent = items.iter().find(|i| i.label == "Start (automated)");
+        assert!(parent.is_some(), "Start (automated) parent must exist");
+        let parent = parent.unwrap();
+        assert!(parent.submenu.is_some(), "automated parent must have submenu");
+        let children = parent.submenu.as_ref().unwrap();
+        let child_ids: Vec<&str> = children.iter().filter_map(|i| i.action_id.as_deref()).collect();
+        assert!(child_ids.contains(&"start-skip-plan"), "Work (start-skip-plan) must be in automated submenu");
+        assert!(child_ids.contains(&"start-with-plan"), "Plan (start-with-plan) must be in automated submenu");
+    }
+
+    #[test]
+    fn pipeline_row_review_testing_merge_disabled_without_completed_work() {
+        // Review, Testing, and Merge inside Start (interactive) must be
+        // disabled when no completed work assignment exists (#539 / #517).
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let children = items
+            .iter()
+            .find(|i| i.label == "Start (interactive)")
+            .and_then(|p| p.submenu.as_ref())
+            .expect("Start (interactive) submenu");
+        let find_child = |id: &str| children.iter().find(|c| c.action_id.as_deref() == Some(id));
+        assert!(find_child("start-review-interactive").map(|i| i.disabled).unwrap_or(false),
+            "Review must be disabled without a completed work assignment");
+        assert!(find_child("start-testing-interactive").map(|i| i.disabled).unwrap_or(false),
+            "Testing must be disabled without a completed work assignment");
+        assert!(find_child("start-merge-interactive").map(|i| i.disabled).unwrap_or(false),
+            "Merge must be disabled without a completed work assignment");
+    }
+
+    #[test]
+    fn context_menu_activate_on_parent_opens_submenu() {
+        // Activating a submenu parent must open the submenu (push to submenu_path)
+        // rather than dismissing the menu or dispatching an action.
+        let mut app = make_app_default();
+        app.open_context_menu(
+            Point::new(0.0, 0.0),
+            ContextMenuTarget::PipelineRow {
+                issue_number: Some(42),
+                lifecycle: PipelineRowLifecycle::New,
+            },
+        );
+        // Initial selection should land on "Start (interactive)" (the first parent).
+        {
+            let state = app.pending_context_menu.as_ref().unwrap();
+            assert_eq!(state.selected_idx, 0, "first item should be selected");
+            assert!(state.items[0].submenu.is_some(), "first item must be a submenu parent");
+            assert!(state.submenu_path.is_empty(), "no submenu open yet");
+        }
+        let before_toasts = app.toasts.len();
+        let fired = app.context_menu_activate_selected();
+        assert!(fired, "activate on parent must return true");
+        // Menu must NOT be dismissed — submenu is now open.
+        assert!(app.pending_context_menu.is_some(), "menu must stay open when submenu opens");
+        assert_eq!(app.toasts.len(), before_toasts, "no toast when opening submenu");
+        // submenu_path must now be [0].
+        let state = app.pending_context_menu.as_ref().unwrap();
+        assert_eq!(state.submenu_path, vec![0], "submenu_path must point to item 0");
+    }
+
+    #[test]
+    fn context_menu_close_submenu_pops_one_level() {
+        // close_submenu_or_dismiss pops the deepest open submenu without
+        // dismissing the root menu.
+        let mut app = make_app_default();
+        app.open_context_menu(
+            Point::new(0.0, 0.0),
+            ContextMenuTarget::PipelineRow {
+                issue_number: Some(42),
+                lifecycle: PipelineRowLifecycle::New,
+            },
+        );
+        // Open the submenu.
+        app.context_menu_activate_selected();
+        assert!(app.pending_context_menu.as_ref().unwrap().submenu_path.len() == 1);
+        // Close it.
+        app.context_menu_close_submenu_or_dismiss();
+        assert!(app.pending_context_menu.is_some(), "root menu must stay open");
+        assert!(app.pending_context_menu.as_ref().unwrap().submenu_path.is_empty(),
+            "submenu_path must be empty after closing");
+        // Close again (no submenu open) → full dismiss.
+        app.context_menu_close_submenu_or_dismiss();
+        assert!(app.pending_context_menu.is_none(), "menu must dismiss when no submenu open");
     }
 
     #[test]
