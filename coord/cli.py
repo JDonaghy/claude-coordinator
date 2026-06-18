@@ -6701,6 +6701,17 @@ def refine(repo: str, issue: int, config_path: Path) -> None:
 @_CONFIG_OPTION
 def reconcile_merges(repo_name: str | None, dry_run: bool, config_path: Path) -> None:
     """#609/#611: record out-of-band merges and backfill missing branches."""
+    # #584: the canonical board + gh live on the daemon host, so on a thin
+    # client this would sweep an empty local board and silently do nothing.
+    # Route the whole operation to the daemon (mirrors `coord merge`).
+    # COORD_RECONCILE_ON_DAEMON guards the daemon against re-routing to itself.
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    _svc = resolve_board_service()
+    if _svc is not None and not os.environ.get("COORD_RECONCILE_ON_DAEMON"):
+        _reconcile_via_daemon(_svc, {"repo": repo_name, "dry_run": dry_run})
+        return
+
     from coord.reconcile import reconcile_board_merges
     from coord.state import build_board, save_board
 
@@ -7159,6 +7170,29 @@ def _load_issue_states() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
         if row[2] == "open":
             open_by_repo.setdefault(repo_name, set()).add(number)
     return open_by_repo, known_by_repo
+
+
+def _reconcile_via_daemon(svc, params: dict) -> None:
+    """#584: run ``coord reconcile-merges`` on the daemon host (where the
+    canonical DB lives + gh is authenticated) and relay its output, so the
+    command does real work from a thin client instead of no-opping against an
+    empty local board.  Reconcile is gh-bound but quick, hence the shorter
+    timeout."""
+    from coord.client import post_record  # noqa: PLC0415
+
+    try:
+        resp = post_record(svc, "/reconcile-merges", params, timeout=120.0)
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"error: reconcile-merges via daemon failed: {exc}", err=True)
+        sys.exit(1)
+    output = resp.get("output") or ""
+    if output:
+        click.echo(output, nl=False)
+    if resp.get("error"):
+        click.echo(f"error: {resp['error']}", err=True)
+    code = resp.get("exit_code") or 0
+    if code:
+        sys.exit(int(code))
 
 
 def _merge_via_daemon(svc, params: dict) -> None:
