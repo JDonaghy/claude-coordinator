@@ -742,18 +742,26 @@ class TestPostOrphanedReviewFindings:
 # ── #208: cost capture on completion ────────────────────────────────────────
 
 
-def _make_log_with_cost(tmp_path: Path, cost: float) -> str:
+def _make_log_with_cost(
+    tmp_path: Path,
+    cost: float,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> str:
     """Write a minimal stream-json log whose final `result` event carries
-    *cost*.  Mirrors the format `claude -p --output-format stream-json`
-    emits — coord.usage.parse_usage_from_log knows how to pick out the
-    `total_cost_usd` field.
+    *cost* and optional token counts.  Mirrors the format
+    `claude -p --output-format stream-json` emits — coord.usage.parse_usage_from_log
+    knows how to pick out the `total_cost_usd` and token fields.
     """
     log = tmp_path / "cost.log"
     # Header line is non-JSON (coord.worker_events.is_stream_json starts
     # reading from the first `{` line, so a comment is fine).  The result
     # event is the canonical place workers report final usage.
     import json
-    payload = {
+    payload: dict = {
         "type": "result",
         "subtype": "success",
         "result": "done",
@@ -762,6 +770,11 @@ def _make_log_with_cost(tmp_path: Path, cost: float) -> str:
         "duration_ms": 12345,
         "session_id": "test-session",
     }
+    if input_tokens or output_tokens or cache_creation_tokens or cache_read_tokens:
+        payload["input_tokens"] = input_tokens
+        payload["output_tokens"] = output_tokens
+        payload["cache_creation_tokens"] = cache_creation_tokens
+        payload["cache_read_tokens"] = cache_read_tokens
     log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     return str(log)
 
@@ -841,6 +854,38 @@ class TestCostCapture:
         ).fetchone()
         assert row is not None
         assert row["cost_usd"] == 1.50
+
+    def test_tokens_persist_to_assignment_row(
+        self, coord_dir: Path, config: Config, tmp_path: Path,
+    ) -> None:
+        """When a worker log carries token counts, they land in the four
+        token columns alongside cost_usd on the same assignment row."""
+        _record("cost4")
+        log_path = _make_log_with_cost(
+            tmp_path, 0.55,
+            input_tokens=1000, output_tokens=200,
+            cache_creation_tokens=50, cache_read_tokens=300,
+        )
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("cost4", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd, input_tokens, output_tokens, "
+            "cache_creation_tokens, cache_read_tokens "
+            "FROM assignments WHERE assignment_id='cost4'"
+        ).fetchone()
+        assert row is not None
+        assert row["cost_usd"] == 0.55
+        assert row["input_tokens"] == 1000
+        assert row["output_tokens"] == 200
+        assert row["cache_creation_tokens"] == 50
+        assert row["cache_read_tokens"] == 300
 
 
 # ── #252: smoke-test list capture on completion ──────────────────────────────

@@ -933,6 +933,68 @@ def test_update_assignment_cost_unknown_id_is_silent_noop(coord_db) -> None:
     assert row["n"] == 0
 
 
+# ── #546: token columns + update_assignment_tokens ──────────────────────────
+
+
+def test_update_assignment_tokens_sets_values_when_zero(coord_db) -> None:
+    """First-time capture: all token columns are 0, the helper writes them."""
+    from coord.db import get_connection
+    from coord.state import update_assignment_tokens
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="tok1", status="done",
+        dispatched_at=10.0, finished_at=20.0,
+    )
+    save_board(Board(completed=[a]))
+    update_assignment_tokens("tok1", input_tokens=1000, output_tokens=200,
+                             cache_creation_tokens=50, cache_read_tokens=300)
+
+    row = get_connection().execute(
+        "SELECT input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens "
+        "FROM assignments WHERE assignment_id='tok1'"
+    ).fetchone()
+    assert row["input_tokens"] == 1000
+    assert row["output_tokens"] == 200
+    assert row["cache_creation_tokens"] == 50
+    assert row["cache_read_tokens"] == 300
+
+
+def test_update_assignment_tokens_does_not_overwrite_existing(coord_db) -> None:
+    """Idempotent: the UPDATE only fires when input_tokens is still 0 —
+    a second call with different values is silently ignored (first writer wins)."""
+    from coord.db import get_connection
+    from coord.state import update_assignment_tokens
+    a = Assignment(
+        machine_name="m", repo_name="r", issue_number=1, issue_title="t",
+        briefing="b", assignment_id="tok2", status="done",
+    )
+    save_board(Board(completed=[a]))
+    # Write the initial token values directly via the helper (simulating first capture).
+    update_assignment_tokens("tok2", input_tokens=500, output_tokens=100)
+    # A second call with different values must be a no-op (first writer wins).
+    update_assignment_tokens("tok2", input_tokens=9999, output_tokens=8888)
+
+    row = get_connection().execute(
+        "SELECT input_tokens, output_tokens FROM assignments WHERE assignment_id='tok2'"
+    ).fetchone()
+    assert row["input_tokens"] == 500
+    assert row["output_tokens"] == 100
+
+
+def test_update_assignment_tokens_unknown_id_is_silent_noop(coord_db) -> None:
+    """The helper doesn't raise when the assignment row doesn't exist —
+    callers shouldn't have to coordinate row existence with token capture."""
+    from coord.db import get_connection
+    from coord.state import update_assignment_tokens
+    # No save_board, no row exists.
+    update_assignment_tokens("ghost-tok", input_tokens=1000, output_tokens=200)  # must not raise
+
+    row = get_connection().execute(
+        "SELECT COUNT(*) AS n FROM assignments WHERE assignment_id='ghost-tok'"
+    ).fetchone()
+    assert row["n"] == 0
+
+
 def test_assignment_save_load_roundtrips_cost_usd(coord_db) -> None:
     """Assignment.cost_usd survives a save/load cycle through the upsert
     + ORM mapping.  This is the basic "the column is plumbed correctly"

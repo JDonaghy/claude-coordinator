@@ -958,6 +958,12 @@ struct Assignment {
     cache_creation_tokens: i64,
     #[serde(default)]
     cache_read_tokens: i64,
+    /// #546: true when the assignment ran as a human-attended interactive session
+    /// (Max / Pro subscription).  Set by `finalize_interactive_exit`; prevents
+    /// misidentifying old automated rows (which also have cost_usd=NULL and zero
+    /// token counts) as Max sessions.
+    #[serde(default)]
+    is_interactive: bool,
 }
 
 impl Assignment {
@@ -3384,7 +3390,8 @@ fn load_data() -> BoardData {
              test_state, review_verdict, review_of_assignment_id, cost_usd, \
              smoke_tests, review_findings, test_plan, test_plan_branch_head, \
              COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), \
-             COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0) \
+             COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0), \
+             COALESCE(is_interactive, 0) \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -3430,6 +3437,9 @@ fn load_data() -> BoardData {
                 output_tokens: row.get::<_, i64>(21)?,
                 cache_creation_tokens: row.get::<_, i64>(22)?,
                 cache_read_tokens: row.get::<_, i64>(23)?,
+                // #546: is_interactive distinguishes Max-subscription sessions from
+                // old automated rows that also have cost_usd=NULL + zero tokens.
+                is_interactive: row.get::<_, i64>(24)? != 0,
             })
         }) {
             Ok(r) => r,
@@ -14151,11 +14161,33 @@ impl CoordApp {
                     &format!("{}{}", format_cost_usd(cost), tok_suffix),
                     Some(Color::rgb(180, 180, 180)),
                 ));
-            } else if a.status == "done" && !has_tokens {
-                // Done assignment with no cost/tokens → interactive (Max) session.
+            } else if a.is_interactive {
+                // Confirmed interactive (Max) session — show billing model.
+                // Gate on is_interactive so pre-#208 automated rows (which also have
+                // cost_usd=NULL + zero tokens) are not mis-labelled "Max (subscription)".
+                // Include token breakdown when the transcript scan succeeded (#546).
+                let tok_suffix = if has_tokens {
+                    let cache = a.cache_creation_tokens + a.cache_read_tokens;
+                    if cache > 0 {
+                        format!(
+                            "  ({}in · {}out · {}cache)",
+                            fmt_tokens(a.input_tokens),
+                            fmt_tokens(a.output_tokens),
+                            fmt_tokens(cache),
+                        )
+                    } else {
+                        format!(
+                            "  ({}in · {}out)",
+                            fmt_tokens(a.input_tokens),
+                            fmt_tokens(a.output_tokens),
+                        )
+                    }
+                } else {
+                    String::new()
+                };
                 items.push(kv_item(
                     "Cost",
-                    "Max (subscription)",
+                    &format!("Max (subscription){}", tok_suffix),
                     Some(Color::rgb(140, 140, 160)),
                 ));
             } else if has_tokens {
@@ -29173,6 +29205,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         }
     }
 
@@ -29904,6 +29937,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         }
     }
 
@@ -31178,6 +31212,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -31315,6 +31350,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "pending");
@@ -31384,6 +31420,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -32236,6 +32273,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         }
     }
 
@@ -33605,9 +33643,299 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
+    }
+
+    // ── #546: issue_total_cost / issue_total_tokens ──────────────────────────
+
+    #[test]
+    fn issue_total_cost_none_when_no_assignments() {
+        let app = make_pipeline_app();
+        let issue = &app.pipeline_issues[0];
+        assert!(app.issue_total_cost(issue).is_none());
+    }
+
+    #[test]
+    fn issue_total_cost_sums_multiple_assignments() {
+        let mut app = make_pipeline_app();
+        let issue_number = app.pipeline_issues[0].number;
+        for (id, cost) in [("w1", 0.30_f64), ("r1", 0.15_f64)] {
+            app.data.assignments.push(Assignment {
+                id: id.to_string(),
+                repo: "api".to_string(),
+                issue_number,
+                issue_title: "Add cool thing".to_string(),
+                machine: "m1".to_string(),
+                status: "done".to_string(),
+                branch: None,
+                model: None,
+                dispatched_at: Some(1.0),
+                finished_at: Some(2.0),
+                exit_code: Some(0),
+                assignment_type: Some("work".to_string()),
+                test_state: None,
+                review_verdict: None,
+                review_of_assignment_id: None,
+                cost_usd: Some(cost),
+                smoke_tests: None,
+                review_findings: None,
+                test_plan: None,
+                test_plan_branch_head: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                is_interactive: false,
+            });
+        }
+        let issue = &app.pipeline_issues[0];
+        let total = app.issue_total_cost(issue).expect("should have cost");
+        assert!((total - 0.45).abs() < 1e-9, "expected 0.45 got {total}");
+    }
+
+    #[test]
+    fn issue_total_cost_filters_by_repo_when_coord_repo_set() {
+        // issue[0] has coord_repo=Some("api"); an assignment for "other-repo"
+        // with the same issue number must NOT be included in the rollup.
+        let mut app = make_pipeline_app();
+        let issue_number = app.pipeline_issues[0].number;
+        app.data.assignments.push(Assignment {
+            id: "own".to_string(),
+            repo: "api".to_string(),
+            issue_number,
+            issue_title: "it".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: Some(0.50),
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+        });
+        // Same issue number but different repo — should be excluded.
+        app.data.assignments.push(Assignment {
+            id: "other".to_string(),
+            repo: "other-repo".to_string(),
+            issue_number,
+            issue_title: "it".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: Some(9.99),
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+        });
+        let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
+        let total = app.issue_total_cost(issue).expect("should have cost");
+        assert!((total - 0.50).abs() < 1e-9, "expected only 0.50 (api repo), got {total}");
+    }
+
+    #[test]
+    fn issue_total_cost_excludes_interactive_null_cost_rows() {
+        // Interactive sessions have cost_usd=None (Max billing) — they must
+        // not be excluded from the rollup as Some(0); the rollup should
+        // only count the automated assignment.
+        let mut app = make_pipeline_app();
+        let issue_number = app.pipeline_issues[0].number;
+        app.data.assignments.push(Assignment {
+            id: "auto".to_string(),
+            repo: "api".to_string(),
+            issue_number,
+            issue_title: "it".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: Some(0.25),
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 1000,
+            output_tokens: 200,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+        });
+        // Interactive session — cost_usd is None (Max subscription).
+        app.data.assignments.push(Assignment {
+            id: "interactive".to_string(),
+            repo: "api".to_string(),
+            issue_number,
+            issue_title: "it".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(3.0),
+            finished_at: Some(4.0),
+            exit_code: Some(0),
+            assignment_type: Some("review".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: None,  // Max subscription — no per-token billing
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 500,
+            output_tokens: 100,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: true,
+        });
+        let issue = &app.pipeline_issues[0];
+        let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
+        assert!((total - 0.25).abs() < 1e-9, "expected 0.25 (automated only), got {total}");
+    }
+
+    #[test]
+    fn issue_total_tokens_zero_when_no_assignments() {
+        let app = make_pipeline_app();
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.issue_total_tokens(issue), 0);
+    }
+
+    #[test]
+    fn issue_total_tokens_sums_input_and_output() {
+        let mut app = make_pipeline_app();
+        let issue_number = app.pipeline_issues[0].number;
+        for (id, inp, out) in [("w1", 1000_i64, 200_i64), ("r1", 500_i64, 80_i64)] {
+            app.data.assignments.push(Assignment {
+                id: id.to_string(),
+                repo: "api".to_string(),
+                issue_number,
+                issue_title: "it".to_string(),
+                machine: "m1".to_string(),
+                status: "done".to_string(),
+                branch: None,
+                model: None,
+                dispatched_at: Some(1.0),
+                finished_at: Some(2.0),
+                exit_code: Some(0),
+                assignment_type: Some("work".to_string()),
+                test_state: None,
+                review_verdict: None,
+                review_of_assignment_id: None,
+                cost_usd: Some(0.10),
+                smoke_tests: None,
+                review_findings: None,
+                test_plan: None,
+                test_plan_branch_head: None,
+                input_tokens: inp,
+                output_tokens: out,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                is_interactive: false,
+            });
+        }
+        let issue = &app.pipeline_issues[0];
+        // 1000+200 + 500+80 = 1780
+        assert_eq!(app.issue_total_tokens(issue), 1780);
+    }
+
+    #[test]
+    fn issue_total_tokens_filters_by_repo_when_coord_repo_set() {
+        let mut app = make_pipeline_app();
+        let issue_number = app.pipeline_issues[0].number;
+        // Assignment in the right repo.
+        app.data.assignments.push(Assignment {
+            id: "own".to_string(),
+            repo: "api".to_string(),
+            issue_number,
+            issue_title: "it".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: Some(0.10),
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 1000,
+            output_tokens: 200,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+        });
+        // Same issue number, different repo — should be excluded.
+        app.data.assignments.push(Assignment {
+            id: "other".to_string(),
+            repo: "other-repo".to_string(),
+            issue_number,
+            issue_title: "it".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: Some(9.99),
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 9000,
+            output_tokens: 9000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+        });
+        let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
+        assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
     }
 
     #[test]
@@ -33651,6 +33979,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -33697,6 +34026,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -33823,6 +34153,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -33913,6 +34244,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -33959,6 +34291,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -33992,6 +34325,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -34030,6 +34364,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -34057,6 +34392,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -34092,6 +34428,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -34156,6 +34493,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -34201,6 +34539,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -34227,6 +34566,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -34417,6 +34757,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         }
     }
 
@@ -34751,10 +35092,11 @@ mod tests {
                 review_findings: None,
                 test_plan: None,
                 test_plan_branch_head: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                is_interactive: false,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -34803,6 +35145,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -34845,10 +35188,11 @@ mod tests {
                 review_findings: None,
                 test_plan: None,
                 test_plan_branch_head: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                is_interactive: false,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -34897,6 +35241,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -34982,6 +35327,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -35023,6 +35369,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -35058,6 +35405,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -35093,6 +35441,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -39053,6 +39402,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -39171,6 +39521,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -39532,6 +39883,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            is_interactive: false,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
