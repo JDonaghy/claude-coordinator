@@ -6872,7 +6872,7 @@ def diagnose(
         return
 
     from coord.diagnose import current_stage, diagnose_stage  # noqa: PLC0415
-    from coord.state import build_board, save_board  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
 
     cfg = _load_config(config_path)
     board = build_board()
@@ -6880,9 +6880,12 @@ def diagnose(
     res = diagnose_stage(
         board, cfg, repo, issue, resolved_stage, reset=reset, dry_run=dry_run
     )
-    if not dry_run:
-        # Persist the board mutations the doctor made (mirrors reconcile-merges).
-        save_board(board)
+    # NOTE: deliberately NO save_board here.  Every diagnose write goes through
+    # the authoritative seam (finalize→post_completion, recover→post_result,
+    # reconcile→state.update_*), which writes the canonical DB directly.  A
+    # save_board would persist the STALE in-memory snapshot (built before those
+    # seam writes) and clobber them — e.g. flip a just-finalized phantom back to
+    # 'running' (caught live on quadraui #366).
 
     click.echo(f"diagnose {repo} #{issue} — stage={resolved_stage}"
                + (" [reset]" if reset else "") + (" [dry-run]" if dry_run else ""))

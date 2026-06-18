@@ -1029,6 +1029,38 @@ def test_diagnose_routes_to_daemon_when_service_set(coord_db, monkeypatch):
     assert "DAEMON DIAGNOSE OUTPUT" in out.output
 
 
+def test_diagnose_cli_never_calls_save_board(valid_config_path: Path, coord_db, monkeypatch):
+    # Regression (quadraui #366): the diagnose command must persist ONLY through
+    # the issue_store seam (finalize→post_completion, recover→post_result,
+    # reconcile→state.update_*).  A save_board would write the STALE in-memory
+    # snapshot and clobber those seam writes — flipping a just-finalized phantom
+    # back to 'running'.  So save_board must NEVER be called by diagnose.
+    from coord import client as cc
+    from coord import state as state_mod
+    from coord.cli import diagnose as diagnose_cmd
+    from coord.diagnose import DiagnoseResult
+    from coord.models import Board
+
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)  # local path
+    monkeypatch.setattr(state_mod, "build_board", lambda: Board())
+    monkeypatch.setattr(
+        "coord.diagnose.diagnose_stage",
+        lambda *a, **k: DiagnoseResult(
+            repo_name="api", issue_number=42, stage="work", recovered=True
+        ),
+    )
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("diagnose must not save_board (it clobbers seam writes)")
+
+    monkeypatch.setattr(state_mod, "save_board", _boom, raising=False)
+    # Should complete without ever touching save_board.
+    diagnose_cmd.callback(
+        repo="api", issue=42, stage="work", reset=False, dry_run=False,
+        config_path=valid_config_path,
+    )
+
+
 def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
     from coord import serve_app
 

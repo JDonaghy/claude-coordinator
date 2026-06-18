@@ -300,12 +300,32 @@ def _reconcile_issue_merges(
     )
 
 
-def _mark_terminal(board: "Board", assignment: "Assignment") -> None:
-    """Move a phantom/abandoned row out of ``running`` to a benign terminal
-    state (``advisory`` — does not trigger auto-reassign or count as
-    merge-ready), routed through the same board write the rest of coord uses."""
-    if assignment.assignment_id:
-        board.mark_failed_by_id(assignment.assignment_id)
+def _mark_terminal(assignment: "Assignment", config: "Config") -> None:
+    """Best-effort terminal write via the issue_store seam — the fallback used
+    only when :func:`_finalize_dead` itself raised.  Records a failed completion
+    so the phantom row leaves ``running`` and persists to the canonical DB
+    WITHOUT relying on ``save_board`` (which the diagnose path deliberately does
+    not call — it would clobber the seam writes with a stale snapshot)."""
+    from coord import issue_store  # noqa: PLC0415
+
+    if not assignment.assignment_id:
+        return
+    repo_cfg = next((r for r in config.repos if r.name == assignment.repo_name), None)
+    try:
+        issue_store.post_completion(
+            issue_store.CompletionRecord(
+                assignment_id=assignment.assignment_id,
+                machine_name=assignment.machine_name or "unknown",
+                repo_name=assignment.repo_name,
+                repo_github=(repo_cfg.github if repo_cfg else assignment.repo_name),
+                issue_number=assignment.issue_number,
+                exit_code=1,  # → failed terminal state (out of 'running')
+                commits_ahead=0,
+                branch=assignment.branch,
+            )
+        )
+    except Exception:  # noqa: BLE001 — fallback of a fallback; leave the phantom
+        pass
 
 
 # ── orchestration ───────────────────────────────────────────────────────────
@@ -467,7 +487,7 @@ def _do_reset(
         res.actions_taken.append(f"finalized session ({_finalize_dead(latest, config)})")
     except Exception as exc:  # noqa: BLE001 — fall back to a direct terminal mark
         res.findings.append(f"finalize failed ({exc}); marking row terminal directly")
-        _mark_terminal(board, latest)
+        _mark_terminal(latest, config)
         res.actions_taken.append("marked stage row terminal")
     res.reset_performed = True
     res.recovered = True
@@ -503,7 +523,7 @@ def _cleanup_issue(
                 _finalize_dead(a, config)
                 res.actions_taken.append(f"cleanup: finalized phantom {a.type} row {a.assignment_id}")
             except Exception as exc:  # noqa: BLE001
-                _mark_terminal(board, a)
+                _mark_terminal(a, config)
                 res.actions_taken.append(f"cleanup: marked phantom row {a.assignment_id} terminal ({exc})")
 
 
