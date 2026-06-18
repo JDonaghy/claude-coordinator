@@ -2442,6 +2442,49 @@ def assign(
             claude_md = (
                 _read_repo_claude_md(Path(review_repo_path)) if _is_local else ""
             )
+
+            # #612: embed the merge-base (three-dot) diff so the reviewer has
+            # nothing to compute — a stale-base diff would show already-merged
+            # commits as spurious deletions (#546).  Prefer the PR diff via gh
+            # when a PR exists; otherwise (the #546 no-PR case) compute the
+            # local three-dot diff in the live checkout.  Remote / on-failure
+            # → diff_text=None and the briefing keeps its fallback instructions.
+            review_diff_text: str | None = None
+            try:
+                _existing_pr = github_ops.find_pr_for_branch(
+                    repo_cfg.github, work.branch
+                )
+            except RuntimeError:
+                _existing_pr = None
+            if _existing_pr is not None:
+                review_diff_text = github_ops.pr_diff(
+                    repo_cfg.github, _existing_pr["number"]
+                )
+            elif _is_local:
+                # No PR: compute the branch's own changes locally with a
+                # three-dot (merge-base) diff against origin/<default_branch>.
+                try:
+                    subprocess.run(
+                        ["git", "-C", review_repo_path, "fetch", "origin"],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    _diff_proc = subprocess.run(
+                        [
+                            "git", "-C", review_repo_path, "diff",
+                            f"origin/{review_default_branch}...origin/{work.branch}",
+                        ],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if _diff_proc.returncode == 0 and _diff_proc.stdout.strip():
+                        review_diff_text = _diff_proc.stdout
+                        if len(review_diff_text) > 60000:
+                            review_diff_text = (
+                                review_diff_text[:60000]
+                                + "\n... [diff truncated at 60000 chars] ..."
+                            )
+                except (subprocess.SubprocessError, OSError):
+                    review_diff_text = None
+
             review_briefing = build_review_briefing(
                 pr_number=None,
                 pr_url=None,
@@ -2457,6 +2500,7 @@ def assign(
                 repo_claude_md=claude_md,
                 default_branch=review_default_branch,
                 review_iteration=getattr(work, "review_iteration", 0) or 0,
+                diff_text=review_diff_text,
             )
             # Interactive reviewer reports via report-result, not the
             # REVIEW_VERDICT block the briefing's tail describes.  Since #590 the
