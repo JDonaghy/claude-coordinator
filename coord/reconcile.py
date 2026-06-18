@@ -440,6 +440,7 @@ def reconcile_board_merges(
     config: Config,
     *,
     repo: str | None = None,
+    issue: int | None = None,
     dry_run: bool = False,
 ) -> list[str]:
     """Reconcile done work assignments against git/GitHub reality.
@@ -482,6 +483,7 @@ def reconcile_board_merges(
         if a.type == "work"
         and a.status == "done"
         and (repo is None or a.repo_name == repo)
+        and (issue is None or a.issue_number == issue)
     ]
 
     for a in candidates:

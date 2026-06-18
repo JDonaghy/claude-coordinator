@@ -952,6 +952,83 @@ def test_reconcile_merges_routes_to_daemon_when_service_set(coord_db, monkeypatc
     assert "DAEMON RECONCILE OUTPUT" in out.output
 
 
+def test_serve_diagnose_runs_callback_and_captures_output(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    # POST /diagnose runs `coord diagnose` on the daemon with the recursion
+    # guard set, and relays the captured CLI output + exit code.
+    import os
+    import click
+    from coord.cli import diagnose as diagnose_cmd
+
+    def fake_callback(**kwargs):
+        assert os.environ.get("COORD_DIAGNOSE_ON_DAEMON") == "1"  # guard set
+        click.echo(
+            f"diagnosed repo={kwargs['repo']} issue={kwargs['issue']} "
+            f"stage={kwargs['stage']} reset={kwargs['reset']}"
+        )
+
+    monkeypatch.setattr(diagnose_cmd, "callback", fake_callback)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/diagnose",
+            json={"repo": "api", "issue": 42, "stage": "review", "reset": False},
+        )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["exit_code"] == 0 and out["error"] is None
+    assert "diagnosed repo=api issue=42 stage=review reset=False" in out["output"]
+    assert os.environ.get("COORD_DIAGNOSE_ON_DAEMON") is None  # restored after
+
+
+def test_serve_diagnose_relays_nonzero_exit(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    import sys
+    from coord.cli import diagnose as diagnose_cmd
+    monkeypatch.setattr(diagnose_cmd, "callback", lambda **k: sys.exit(2))
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/diagnose", json={"repo": "api", "issue": 1})
+    assert resp.json()["exit_code"] == 2
+
+
+def test_diagnose_routes_to_daemon_when_service_set(coord_db, monkeypatch):
+    # `coord diagnose` on a thin client POSTs to /diagnose and relays the
+    # output, instead of no-opping against the empty local board.
+    from coord import client as cc
+    from coord import state as coord_state
+    from click.testing import CliRunner
+    from coord.cli import main
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("build_board must not be called on a thin client")
+
+    monkeypatch.setattr(coord_state, "build_board", _boom, raising=False)
+    monkeypatch.setattr(coord_state, "save_board", _boom, raising=False)
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"output": "DAEMON DIAGNOSE OUTPUT\n", "exit_code": 0},
+    )
+    out = CliRunner().invoke(
+        main, ["diagnose", "api", "42", "--stage", "review", "--reset"]
+    )
+    assert out.exit_code == 0, out.output
+    assert captured["path"] == "/diagnose"
+    assert captured["payload"]["repo"] == "api"
+    assert captured["payload"]["issue"] == 42
+    assert captured["payload"]["stage"] == "review"
+    assert captured["payload"]["reset"] is True
+    assert "DAEMON DIAGNOSE OUTPUT" in out.output
+
+
 def test_resolve_serve_token_precedence(tmp_path: Path, monkeypatch):
     from coord import serve_app
 

@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 /// a worker is extremely verbose; the head is the most useful bit for diagnosing
 /// shell-level failures (`gh: not found`, missing label, auth prompt, etc.).
 const STDERR_CAPTURE_BYTES: usize = 2048;
+/// Bounds captured stdout (e.g. `coord diagnose`'s findings summary, which the
+/// TUI toasts back to the operator).  Larger than stderr — diagnose output is
+/// the *useful* payload here, not just a failure reason.
+const STDOUT_CAPTURE_BYTES: usize = 8192;
 
 pub struct CommandResult {
     pub label: String,
@@ -17,6 +21,11 @@ pub struct CommandResult {
     /// Captured tail of the child's stderr (bounded by `STDERR_CAPTURE_BYTES`).
     /// Empty when the spawn itself failed before stderr could be read.
     pub stderr: String,
+    /// Captured stdout (bounded by `STDOUT_CAPTURE_BYTES`).  Most commands write
+    /// nothing useful here, but `coord diagnose` writes its findings/actions +
+    /// the `DIAGNOSE_RESULT:` trailer the TUI parses to decide whether to offer
+    /// a reset.  Empty when the spawn failed before stdout could be read.
+    pub stdout: String,
 }
 
 /// Outcome returned by [`CommandRunner::spawn_queued`].
@@ -173,10 +182,14 @@ impl CommandRunner {
             // to STDERR_CAPTURE_BYTES so failure reasons (gh errors, missing
             // labels, auth prompts, etc.) can be toasted instead of vanishing
             // into the void.
+            // stdout is now piped + drained concurrently (was /dev/null, #251):
+            // `coord diagnose` reports its findings on stdout, and the
+            // concurrent drain below keeps a chatty child from blocking on a
+            // full pipe just as it does for stderr.
             let spawn_result = Command::new("coord")
                 .args(&full_args)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn();
             let result = match spawn_result {
@@ -202,15 +215,39 @@ impl CommandRunner {
                         }
                         buf
                     });
+                    // Drain stdout the same way (concurrent with wait).
+                    let stdout_handle = child.stdout.take();
+                    let out_reader = std::thread::spawn(move || {
+                        let mut buf = String::new();
+                        if let Some(mut s) = stdout_handle {
+                            let mut sink: Vec<u8> = Vec::new();
+                            let _ = s.read_to_end(&mut sink);
+                            buf = String::from_utf8_lossy(&sink).into_owned();
+                            if buf.len() > STDOUT_CAPTURE_BYTES {
+                                // Keep the TAIL: the DIAGNOSE_RESULT trailer and
+                                // the most recent actions are at the end.  Walk
+                                // forward to a char boundary so slicing a
+                                // multi-byte codepoint can't panic.
+                                let mut start = buf.len() - STDOUT_CAPTURE_BYTES;
+                                while start < buf.len() && !buf.is_char_boundary(start) {
+                                    start += 1;
+                                }
+                                buf = format!("…[truncated]\n{}", &buf[start..]);
+                            }
+                        }
+                        buf
+                    });
                     let exit_code = child.wait()
                         .map(|s| s.code().unwrap_or(-1))
                         .unwrap_or(-1);
                     let stderr = reader.join().unwrap_or_default();
+                    let stdout = out_reader.join().unwrap_or_default();
                     CommandResult {
                         label: label_clone,
                         exit_code,
                         duration: started.elapsed(),
                         stderr,
+                        stdout,
                     }
                 }
                 Err(_) => CommandResult {
@@ -218,6 +255,7 @@ impl CommandRunner {
                     exit_code: -1,
                     duration: started.elapsed(),
                     stderr: String::new(),
+                    stdout: String::new(),
                 },
             };
             let _ = tx.send(result);

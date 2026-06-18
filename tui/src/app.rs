@@ -16104,6 +16104,19 @@ impl CoordApp {
                     "troubleshoot-interactive",
                     "Troubleshoot (interactive)",
                 ));
+                // Per-stage doctor: diagnose + best-effort recover + reconcile
+                // this issue's board rows (phantom 'running', dropped review
+                // findings, stale sessions, merged-but-grey).  When it can't
+                // recover, the result toast says so and "Reset stage" clears it
+                // — non-destructively (the branch + commits are kept).
+                items.push(ContextMenuItem::action(
+                    "diagnose-stage",
+                    "Diagnose & fix stage",
+                ));
+                items.push(ContextMenuItem::action(
+                    "diagnose-reset",
+                    "Reset stage (keeps branch + commits)",
+                ));
                 items.push(ContextMenuItem::separator());
             }
             PipelineRowLifecycle::Done => {
@@ -19256,6 +19269,55 @@ impl CoordApp {
         true
     }
 
+    /// Per-stage doctor: spawn `coord diagnose <repo> <issue> [--reset]` for the
+    /// currently-selected pipeline issue.  `coord diagnose` routes through the
+    /// daemon (#diagnose), so it reconciles the canonical board even from a thin
+    /// client.  The findings + `DIAGNOSE_RESULT` summary are surfaced on
+    /// completion by the `poll` handler (which toasts the captured stdout).
+    ///
+    /// `--stage` is intentionally omitted: the command auto-detects the issue's
+    /// most-recent stage server-side, which is the wedged one in practice.
+    fn dispatch_diagnose_for_selected_pipeline_row(&mut self, reset: bool) -> bool {
+        let (repo, key) = match self.selected_issue_repo_and_key() {
+            Some(v) => v,
+            None => {
+                self.push_toast(
+                    "Diagnose",
+                    "No issue selected — focus a pipeline row first.",
+                    ToastSeverity::Info,
+                );
+                return false;
+            }
+        };
+        let issue_str = key.1.to_string();
+        let mut argv: Vec<String> = vec!["diagnose".into(), repo, issue_str];
+        if reset {
+            argv.push("--reset".into());
+        }
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&argv_refs);
+        let verb = if reset {
+            "Reset stage"
+        } else {
+            "Diagnose & fix stage"
+        };
+        match outcome {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => self.push_toast(
+                verb,
+                &format!("#{}: queued — will run after current command.", key.1),
+                ToastSeverity::Info,
+            ),
+            SpawnQueuedOutcome::Started => self.push_toast(
+                verb,
+                &format!("#{}: running…", key.1),
+                ToastSeverity::Info,
+            ),
+        }
+        true
+    }
+
     /// #410: Dispatch a Board row's issue directly as a work assignment
     /// (`coord assign <machine> <repo> <issue>`), bypassing any label changes
     /// or refinement steps.  Works regardless of the issue's current status.
@@ -19517,6 +19579,19 @@ impl CoordApp {
                 self.launch_interactive_session_for_selected_issue(
                     InteractiveLaunchMode::Troubleshoot,
                 );
+                true
+            }
+            // Per-stage doctor (diagnose + best-effort recover + reconcile this
+            // issue's board).  `coord diagnose` routes through the daemon, so it
+            // operates on the canonical board even from a thin client.
+            "diagnose-stage" => {
+                self.dispatch_diagnose_for_selected_pipeline_row(false);
+                true
+            }
+            // Non-destructive reset of the stage — clears the stage's
+            // rows/claim/worktree + stops a live session, KEEPING the branch.
+            "diagnose-reset" => {
+                self.dispatch_diagnose_for_selected_pipeline_row(true);
                 true
             }
             // Leg 3c / A3 (#517, #581): human-attended testing agent launcher.
@@ -20236,6 +20311,8 @@ fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "start-fix-interactive" => Some("⌨"),
         "reattach-live-session" => Some("⌨"),
         "troubleshoot-interactive" => Some("⚕"),
+        "diagnose-stage" => Some("⚕"),
+        "diagnose-reset" => Some("↺"),
         "start-with-plan" => Some("☰"),
         "start-skip-plan" => Some("▶"),
         "watch" => Some("◉"),
@@ -20334,6 +20411,49 @@ impl CoordApp {
                     &format!("{}\n{}", result.label, reason),
                     ToastSeverity::Error,
                 );
+            }
+            // Per-stage doctor: surface `coord diagnose`'s findings/actions and,
+            // when it couldn't recover, point at the non-destructive Reset.  The
+            // findings ride on stdout (captured since this feature); the trailing
+            // DIAGNOSE_RESULT line tells us whether a reset is still needed.
+            if result.label.contains("diagnose ") && result.exit_code == 0 {
+                let out = result.stdout.trim();
+                let needs_reset = out
+                    .lines()
+                    .rev()
+                    .find(|l| l.starts_with("DIAGNOSE_RESULT:"))
+                    .map(|l| l.contains("needs_reset=true"))
+                    .unwrap_or(false);
+                let is_reset = result.label.contains("--reset");
+                // Prefer the action (✓) lines; fall back to the findings (·).
+                let actions: Vec<&str> = out
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with('✓'))
+                    .collect();
+                let mut body = if !actions.is_empty() {
+                    actions.join("\n")
+                } else {
+                    out.lines()
+                        .filter(|l| l.trim_start().starts_with('·'))
+                        .take(6)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                if body.is_empty() {
+                    body = "no changes needed".to_string();
+                }
+                let (title, sev) = if is_reset {
+                    ("Stage reset (branch kept)", ToastSeverity::Info)
+                } else if needs_reset {
+                    body.push_str(
+                        "\n\n→ right-click → \"Reset stage (keeps branch + commits)\" to clear it.",
+                    );
+                    ("Diagnose — still wedged", ToastSeverity::Warning)
+                } else {
+                    ("Diagnose & fix stage", ToastSeverity::Info)
+                };
+                self.push_toast(title, &body, sev);
+                self.refresh();
             }
             // #264: chain the queued `coord ready` after `coord stop`
             // finished cleanly at the end of a refinement chat.  We only
@@ -37161,6 +37281,35 @@ mod tests {
             "Pipeline:Done menu must offer Open PR; got {:?}",
             action_ids,
         );
+    }
+
+    #[test]
+    fn pipeline_inprogress_row_offers_diagnose_and_reset() {
+        // The per-stage doctor (diagnose + non-destructive reset) is available
+        // on an in-progress row — that's where wedged stages live.
+        let app = make_app_default();
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it.action_id.as_deref())
+            .collect();
+        assert!(
+            ids.contains(&"diagnose-stage"),
+            "InProgress row must offer 'Diagnose & fix stage'; got {:?}",
+            ids,
+        );
+        assert!(
+            ids.contains(&"diagnose-reset"),
+            "InProgress row must offer 'Reset stage'; got {:?}",
+            ids,
+        );
+    }
+
+    #[test]
+    fn diagnose_actions_have_icons() {
+        assert!(icon_for_action("diagnose-stage").is_some());
+        assert!(icon_for_action("diagnose-reset").is_some());
     }
 
     #[test]

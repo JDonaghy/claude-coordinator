@@ -6792,6 +6792,110 @@ def reconcile_merges(repo_name: str | None, dry_run: bool, config_path: Path) ->
         click.echo(action)
 
 
+def _diagnose_via_daemon(svc, params: dict) -> None:
+    """#diagnose: run ``coord diagnose`` on the daemon host (canonical board +
+    gh + ssh access to the fleet) and relay its output, so the per-stage doctor
+    does real work from a thin client instead of no-opping against an empty
+    local board.  Mirrors ``_reconcile_via_daemon``."""
+    from coord.client import post_record  # noqa: PLC0415
+
+    try:
+        resp = post_record(svc, "/diagnose", params, timeout=180.0)
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"error: diagnose via daemon failed: {exc}", err=True)
+        sys.exit(1)
+    output = resp.get("output") or ""
+    if output:
+        click.echo(output, nl=False)
+    if resp.get("error"):
+        click.echo(f"error: {resp['error']}", err=True)
+    code = resp.get("exit_code") or 0
+    if code:
+        sys.exit(int(code))
+
+
+@main.command(
+    help=(
+        "Diagnose and fix a specific pipeline stage of an issue.\n\n"
+        "Inspects the stage (phantom 'running' rows, dropped review findings, "
+        "stale-but-live sessions, merged-but-grey boxes, orphaned worktrees), "
+        "makes a BEST-EFFORT non-destructive recovery (finalize, recover review "
+        "findings from the session transcript, reconcile merges), and ALWAYS "
+        "reconciles this issue's board rows. When recovery isn't possible it "
+        "reports needs_reset=true; re-run with --reset to clear the stage's "
+        "rows/claim/worktree and stop a live session — KEEPING the branch + "
+        "commits, so the stage is re-dispatchable."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--stage",
+    type=click.Choice(["plan", "work", "review", "test", "merge"]),
+    default=None,
+    help="Which stage to diagnose (default: the issue's most-recent stage).",
+)
+@click.option(
+    "--reset",
+    is_flag=True,
+    help="Non-destructive reset: clear the stage's rows/claim/worktree and stop "
+    "a live session, KEEPING the branch + commits (stage re-dispatchable).",
+)
+@click.option("--dry-run", is_flag=True, help="Report findings without writing.")
+@_CONFIG_OPTION
+def diagnose(
+    repo: str,
+    issue: int,
+    stage: str | None,
+    reset: bool,
+    dry_run: bool,
+    config_path: Path,
+) -> None:
+    """Per-stage doctor — diagnose, best-effort recover, optional reset."""
+    # #584: the canonical board + gh + fleet ssh live on the daemon host, so on
+    # a thin client this must run there (an empty local board would no-op).
+    # COORD_DIAGNOSE_ON_DAEMON guards the daemon against re-routing to itself.
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    _svc = resolve_board_service()
+    if _svc is not None and not os.environ.get("COORD_DIAGNOSE_ON_DAEMON"):
+        _diagnose_via_daemon(
+            _svc,
+            {
+                "repo": repo,
+                "issue": issue,
+                "stage": stage,
+                "reset": reset,
+                "dry_run": dry_run,
+            },
+        )
+        return
+
+    from coord.diagnose import current_stage, diagnose_stage  # noqa: PLC0415
+    from coord.state import build_board, save_board  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    board = build_board()
+    resolved_stage = stage or current_stage(board, repo, issue)
+    res = diagnose_stage(
+        board, cfg, repo, issue, resolved_stage, reset=reset, dry_run=dry_run
+    )
+    if not dry_run:
+        # Persist the board mutations the doctor made (mirrors reconcile-merges).
+        save_board(board)
+
+    click.echo(f"diagnose {repo} #{issue} — stage={resolved_stage}"
+               + (" [reset]" if reset else "") + (" [dry-run]" if dry_run else ""))
+    for f in res.findings:
+        click.echo(f"  · {f}")
+    for a in res.actions_taken:
+        click.echo(f"  ✓ {a}")
+    if res.needs_reset and not reset:
+        click.echo("  ⚠ still wedged — re-run with --reset to clear the stage "
+                   "(keeps the branch + commits).")
+    click.echo(res.summary_line())
+
+
 @main.group("context")
 def context_group() -> None:
     """The per-issue rolling context digest (#603).
