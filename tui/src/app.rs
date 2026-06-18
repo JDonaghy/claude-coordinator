@@ -16447,6 +16447,25 @@ impl CoordApp {
         *self.context_menu_layout.borrow_mut() = Vec::new();
     }
 
+    /// Returns `true` if the currently-selected item at the deepest open
+    /// context-menu level has a submenu.  Used by the `Right`-key handler to
+    /// distinguish "open submenu" (submenu parent) from "no-op" (leaf item).
+    fn context_menu_selected_has_submenu(&self) -> bool {
+        let Some(ref state) = self.pending_context_menu else {
+            return false;
+        };
+        let depth = state.submenu_path.len();
+        let sel = if depth == 0 {
+            state.selected_idx
+        } else {
+            *state.submenu_selected.last().unwrap_or(&0)
+        };
+        items_at_depth(state, depth)
+            .get(sel)
+            .map(|i| i.submenu.is_some())
+            .unwrap_or(false)
+    }
+
     // ── #369 / #329: Prompt dialogs ─────────────────────────────────────────
     //
     // Replaces the seven status-bar hint prompts with quadraui `Dialog`
@@ -25482,10 +25501,17 @@ impl ShellApp for CoordApp {
                     Key::Named(NamedKey::Up) | Key::Char('k') => {
                         self.context_menu_move_selection(-1);
                     }
-                    Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Right) => {
+                    Key::Named(NamedKey::Enter) => {
                         // Enter: open submenu if parent, else activate leaf.
-                        // Right: always try to open submenu; no-op on leaf.
                         self.context_menu_activate_selected();
+                    }
+                    Key::Named(NamedKey::Right) => {
+                        // Right: open submenu parent only — no-op on leaf items.
+                        // This prevents accidental dispatch of Stop/Watch/etc.
+                        // when the user arrows past the submenu parents.
+                        if self.context_menu_selected_has_submenu() {
+                            self.context_menu_activate_selected();
+                        }
                     }
                     Key::Named(NamedKey::Left) | Key::Named(NamedKey::Escape) => {
                         // Left / Esc: close deepest submenu or dismiss entirely.
@@ -37644,6 +37670,51 @@ mod tests {
         // Close again (no submenu open) → full dismiss.
         app.context_menu_close_submenu_or_dismiss();
         assert!(app.pending_context_menu.is_none(), "menu must dismiss when no submenu open");
+    }
+
+    #[test]
+    fn right_key_on_leaf_item_is_noop() {
+        // `Right` on a leaf (non-parent) item must be a no-op: the menu stays
+        // open and no action is dispatched.  Only `Enter` fires leaf actions.
+        // This guards against accidental Stop/Watch/Troubleshoot dispatch while
+        // the user is navigating past the submenu parents with arrow keys.
+        let mut app = make_app_default();
+        app.open_context_menu(
+            Point::new(0.0, 0.0),
+            ContextMenuTarget::PipelineRow {
+                issue_number: Some(42),
+                lifecycle: PipelineRowLifecycle::New,
+            },
+        );
+        // Find the first leaf (non-parent) item at root level and select it.
+        let leaf_idx = {
+            let state = app.pending_context_menu.as_ref().unwrap();
+            state
+                .items
+                .iter()
+                .position(|i| i.submenu.is_none() && i.action_id.is_some())
+                .expect("Pipeline:New menu must have at least one leaf item")
+        };
+        if let Some(ref mut s) = app.pending_context_menu {
+            s.selected_idx = leaf_idx;
+        }
+
+        // Verify the helper reports no submenu (sanity-check the predicate).
+        assert!(
+            !app.context_menu_selected_has_submenu(),
+            "selected item at index {leaf_idx} must be a leaf — test setup broken"
+        );
+
+        // Simulate the Right-key handler: only activate when has_submenu.
+        if app.context_menu_selected_has_submenu() {
+            app.context_menu_activate_selected();
+        }
+
+        // The menu must still be open — Right on a leaf is a no-op.
+        assert!(
+            app.pending_context_menu.is_some(),
+            "menu must remain open when Right is pressed on a leaf item"
+        );
     }
 
     #[test]
