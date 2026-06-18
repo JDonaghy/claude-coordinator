@@ -131,6 +131,49 @@ def test_transcript_floor_matches_hash_form_in_body(tmp_path: Path) -> None:
     assert "Right-on-leaf" in findings.body
 
 
+def test_transcript_floor_matches_issue_named_outside_body(tmp_path: Path) -> None:
+    # #362: the review PROSE describes the code and never names the issue, but
+    # the BRIEFING (a user message in the transcript) seeds `issue-362`. The
+    # gate must match the WHOLE transcript, not just the parsed review body —
+    # otherwise a perfectly good review falls back to the operator prompt.
+    proj = tmp_path / "-home-john-src-quadraui"
+    proj.mkdir()
+    briefing = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Review the PR for "
+                     "issue-362-reusable-board-kanban-component."}
+                ],
+            },
+        }
+    )
+    review = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text":
+                        "REVIEW_VERDICT: request-changes\nREVIEW_BODY:\n"
+                        "## Summary\nThe Board primitive needs keyboard-nav tests.\n"
+                        "END_REVIEW"}
+                ],
+            },
+        }
+    )
+    (proj / "sess.jsonl").write_text(briefing + "\n" + review + "\n")
+    f = interactive._review_findings_from_transcript(
+        362, started_at=0.0, projects_dir=tmp_path
+    )
+    assert f is not None
+    assert f.verdict == "request-changes"
+    assert "keyboard-nav tests" in f.body
+    assert "362" not in f.body  # the body never names the issue — matched the briefing
+
+
 def test_remote_transcript_floor_recovers_over_ssh(monkeypatch) -> None:
     """#617/#607: a review that ran on a REMOTE host, reattached + exited from
     another machine, must recover from the SESSION'S OWN host over ssh.  The

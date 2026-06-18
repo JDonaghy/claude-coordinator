@@ -1175,7 +1175,11 @@ def _fetch_remote_review_findings(
                     tmp_path.unlink()
                 except OSError:
                     pass
-        if findings is not None and _transcript_names_issue(findings.body, issue_number):
+        # Gate on the WHOLE transcript, not just the parsed review prose: a
+        # reviewer describes the code, not the issue number, so the body often
+        # never says "#362" (real #362 miss, 2026-06-18) — but the review
+        # BRIEFING seeds the issue/branch (`issue-<N>`), so the transcript does.
+        if findings is not None and _transcript_names_issue(cat.stdout, issue_number):
             return findings
     return None
 
@@ -1242,7 +1246,16 @@ def _review_findings_from_transcript(
 
     for _mtime, p in candidates:
         findings = parse_review_from_log(p)
-        if findings is not None and _transcript_names_issue(findings.body, issue_number):
+        if findings is None:
+            continue
+        # Gate on the WHOLE transcript, not just the parsed review prose (the
+        # body often never names the issue — the reviewer describes the code;
+        # the BRIEFING seeds `issue-<N>`/the branch, so the transcript does).
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raw = findings.body
+        if _transcript_names_issue(raw, issue_number):
             return findings
     return None
 
