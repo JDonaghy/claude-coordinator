@@ -287,6 +287,11 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         "ALTER TABLE assignments ADD COLUMN output_tokens INTEGER DEFAULT 0",
         "ALTER TABLE assignments ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0",
         "ALTER TABLE assignments ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+        # #546: track whether an assignment ran as a human-attended interactive
+        # session (Max/Pro subscription).  Used by the TUI to show
+        # "Max (subscription)" accurately without misidentifying old automated
+        # rows that also lack cost_usd + token data.
+        "ALTER TABLE assignments ADD COLUMN is_interactive INTEGER DEFAULT 0",
     ]
     for sql in migrations:
         try:

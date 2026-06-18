@@ -1064,6 +1064,9 @@ def _finalize_merge_blocked(
     if repo_path is not None and wt_p is not None:
         worktree_removed = _remove_worktree(Path(repo_path), wt_p)
 
+    # #546: mark as interactive + capture tokens from the session transcript.
+    _persist_interactive_tokens(assignment_id, started_at, worktree_path)
+
     return InteractiveFinalizeResult(
         terminal_status=outcome.status,  # "failed" (blocked → failed)
         commits_ahead=merge_verify.default_ahead,
@@ -1184,6 +1187,91 @@ def _fetch_remote_review_findings(
     return None
 
 
+def _tokens_from_transcript(
+    started_at: float | None,
+    *,
+    worktree_path: str | None = None,
+    projects_dir: Path | None = None,
+) -> tuple[int, int, int, int]:
+    """#546: sum token usage from Claude Code session transcripts for this session.
+
+    Claude Code persists every session as a JSONL transcript under
+    ``~/.claude/projects/<cwd>/``.  Each ``assistant`` message carries a
+    ``usage`` dict with ``input_tokens``, ``output_tokens``,
+    ``cache_creation_input_tokens``, and ``cache_read_input_tokens``.
+
+    When *worktree_path* is given, we restrict the scan to the project
+    directory that corresponds to that CWD (the same mapping Claude Code uses:
+    replace ``/`` with ``-``).  This prevents attributing a concurrent
+    unrelated session's tokens to this assignment.  Without *worktree_path*
+    we fall back to scanning ALL project directories that were active since
+    *started_at* — broader but still bounded by the time window.
+
+    Returns ``(input_tokens, output_tokens, cache_creation_tokens,
+    cache_read_tokens)``.  Returns ``(0, 0, 0, 0)`` when no tokens can be
+    recovered — callers treat that as "no data" and skip the write rather
+    than zeroing out existing columns.
+    """
+    if started_at is None:
+        return 0, 0, 0, 0
+
+    base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
+    if not base.is_dir():
+        return 0, 0, 0, 0
+
+    # Determine which project directories to search.  When we have the CWD
+    # (worktree_path) we can be targeted; otherwise we scan all dirs that were
+    # touched during the session window.
+    if worktree_path is not None:
+        # Claude Code names project dirs by replacing every '/' in the CWD
+        # with '-'.  Example: /home/john/.coord/worktrees/abc → -home-john--coord-worktrees-abc
+        proj_name = str(worktree_path).replace("/", "-")
+        proj_dir = base / proj_name
+        search_dirs = [proj_dir] if proj_dir.is_dir() else []
+    else:
+        search_dirs = []
+
+    # Fallback: scan ALL project dirs and filter by file mtime.
+    if not search_dirs:
+        try:
+            search_dirs = [d for d in base.iterdir() if d.is_dir()]
+        except OSError:
+            return 0, 0, 0, 0
+
+    cutoff = started_at - 5.0  # small clock-skew buffer
+    input_tokens = output_tokens = cache_creation = cache_read = 0
+
+    for proj_dir in search_dirs:
+        try:
+            jsonl_files = list(proj_dir.glob("*.jsonl"))
+        except OSError:
+            continue
+        for p in jsonl_files:
+            try:
+                if p.stat().st_mtime < cutoff:
+                    continue
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                msg = obj.get("message") or {}
+                usage = msg.get("usage") or {}
+                input_tokens += int(usage.get("input_tokens") or 0)
+                output_tokens += int(usage.get("output_tokens") or 0)
+                cache_creation += int(usage.get("cache_creation_input_tokens") or 0)
+                cache_read += int(usage.get("cache_read_input_tokens") or 0)
+
+    return input_tokens, output_tokens, cache_creation, cache_read
+
+
 def _review_findings_from_transcript(
     issue_number: int,
     started_at: float | None,
@@ -1258,6 +1346,40 @@ def _review_findings_from_transcript(
         if _transcript_names_issue(raw, issue_number):
             return findings
     return None
+
+
+def _persist_interactive_tokens(
+    assignment_id: str,
+    started_at: float | None,
+    worktree_path: str | None,
+) -> None:
+    """#546: flag as interactive + capture token counts from the session transcript.
+
+    Called before every return in :func:`finalize_interactive_exit`.  Best-effort
+    — any exception is swallowed so the caller's normal finalization path is never
+    blocked.
+    """
+    from coord.state import mark_assignment_interactive, update_assignment_tokens  # noqa: PLC0415
+    try:
+        mark_assignment_interactive(assignment_id)
+    except Exception:  # noqa: BLE001
+        pass
+    if started_at is None:
+        return
+    try:
+        inp, out, cc, cr = _tokens_from_transcript(
+            started_at, worktree_path=worktree_path
+        )
+        if inp + out + cc + cr > 0:
+            update_assignment_tokens(
+                assignment_id,
+                input_tokens=inp,
+                output_tokens=out,
+                cache_creation_tokens=cc,
+                cache_read_tokens=cr,
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def finalize_interactive_exit(
@@ -1367,6 +1489,8 @@ def finalize_interactive_exit(
                 )
         if repo_path is not None and wt_p is not None:
             worktree_removed = _remove_worktree(Path(repo_path), wt_p)
+        # #546: mark as interactive + capture tokens from the session transcript.
+        _persist_interactive_tokens(assignment_id, started_at, worktree_path)
         return InteractiveFinalizeResult(
             terminal_status="report-result",  # informational only
             commits_ahead=None,
@@ -1420,6 +1544,8 @@ def finalize_interactive_exit(
                 if repo_path is not None and _wt is not None and _wt.exists()
                 else False
             )
+            # #546: mark as interactive + capture tokens from the session transcript.
+            _persist_interactive_tokens(assignment_id, started_at, worktree_path)
             return InteractiveFinalizeResult(
                 terminal_status="transcript-floor",
                 commits_ahead=None,
@@ -1510,6 +1636,9 @@ def finalize_interactive_exit(
     worktree_removed = False
     if repo_path is not None and wt_path is not None:
         worktree_removed = _remove_worktree(Path(repo_path), wt_path)
+
+    # #546: mark as interactive + capture tokens from the session transcript.
+    _persist_interactive_tokens(assignment_id, started_at, worktree_path)
 
     return InteractiveFinalizeResult(
         terminal_status=outcome.status,

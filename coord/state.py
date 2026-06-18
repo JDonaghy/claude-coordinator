@@ -957,6 +957,29 @@ def update_assignment_tokens(
         pass
 
 
+def mark_assignment_interactive(assignment_id: str) -> None:
+    """#546: flag the row as a human-attended interactive session.
+
+    Called from :func:`coord.interactive.finalize_interactive_exit` so the
+    TUI can reliably show "Max (subscription)" without misidentifying old
+    automated rows that also lack ``cost_usd`` / token data.  Silently
+    no-ops when the row doesn't exist or the column is missing (pre-migration
+    DB).
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE assignments SET is_interactive=1 WHERE assignment_id=?",
+            (assignment_id,),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Column may not exist on a pre-migration DB.
+        pass
+
+
 def set_test_plan(
     assignment_id: str,
     plan: dict,
