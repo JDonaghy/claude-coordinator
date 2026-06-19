@@ -3,23 +3,26 @@
 > **The living, cross-repo / cross-machine objective for the coordinator and every agent it dispatches.**
 > This is *meta-level*: above any single issue, repo, or session (and broader than Claude's own per-session goal feature). Both humans and agents may edit it as priorities evolve — keep it short, current, and re-date the Status line. `coordinator.yml` is the source of truth for *topology*; **this file is the source of truth for *intent*.**
 >
-> _Last updated: 2026-06-14_
+> _Last updated: 2026-06-19_
 
 ## 🎯 North star
 
-**Make human-attended interactive `claude` sessions drivable end-to-end from the coord-tui board** — run the full lifecycle **Work → Test → Review → Smoke-test → Merge** through interactive sessions, not `claude -p` workers. The board *launches* sessions today; the remaining work is the **stage-to-stage handoff** so each stage's result feeds the next.
+**Make human-attended interactive `claude` sessions drivable end-to-end from the coord-tui board** — run the full lifecycle **Work → Test → Review → Smoke-test → Merge** through interactive sessions, with `claude -p` workers as a **first-class automation path** (not a deprecated one). The board *launches* sessions today; the remaining work is the **stage-to-stage handoff** so each stage's result feeds the next.
 
-## Why now (the deadline)
+## Why this matters (the June-15 metering change is PAUSED)
 
-On **2026-06-15** Anthropic begins billing `claude -p` / Agent SDK at full API rates, which kills the "free subscription" worker model. **Human-attended interactive sessions are the ToS-compliant escape hatch** — interactive means a human is attending; automation stays on metered API-key `claude -p`. So this must work *before* June 15. (See #322, #437; no TTY scraping — #426 closed on ToS.)
+**Update 2026-06-19:** Anthropic has **paused** the planned change that would have billed `claude -p` / Agent SDK at API rates. Per their support note: *"nothing has changed: Claude Agent SDK, `claude -p`, and third-party app usage still draw from your subscription's usage limits"* ([support.claude.com/…/15036540](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)). They'll announce any future change before it takes effect.
 
-## Critical path — the interactive-mode migration (target June 12)
+So this is **no longer a deadline race** — `claude -p` workers remain viable on the subscription, exactly as before. The interactive-from-the-board work still stands on its own merits and stays the north star: it's the **ToS-clean, human-attended** way to drive the lifecycle (a human is genuinely present — #437), a **better operator UX** (watch + steer each stage), and it **de-risks us** if the metering change ever returns. We keep `claude -p` first-class — **no forced cutover**; interactive is the default for *attended* driving, automation can stay on `claude -p`. (Refs #322, #437; no TTY scraping — #426 closed on ToS.)
 
-The active plan is **migrate the metered pipeline stages to human-attended
+## Critical path — interactive driving from the board (largely DONE)
+
+The plan was **make the pipeline stages drivable as human-attended
 interactive sessions** (Claude Max, subscription) launched from the board, with
-auto-dispatched `claude -p` kept as a **#524-capped fallback** (not a hard
-cutover). The big design insight: interactive Review/Smoke report verdicts via
-the already-merged `coord report-result` path — **the #478 MCP server is NOT on
+auto-dispatched `claude -p` as a **#524-capped peer** (now first-class again —
+the metering pause means no cutover pressure). The big design insight:
+interactive Review/Smoke report verdicts via the already-merged
+`coord report-result` path — **the #478 MCP server is NOT on
 the critical path** (demoted to Horizon).
 
 | Leg | State | Issues |
