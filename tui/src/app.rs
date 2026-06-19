@@ -7990,14 +7990,27 @@ impl CoordApp {
 
                 let text = StyledText { spans };
 
-                let detail_str = if let Some(ref age) = contact_str {
+                // #628: live interactive sessions (tmux) are not board `running`
+                // rows, so active_count misses them.  Surface them here so a
+                // machine hosting detached sessions no longer reads "idle".
+                let live = self.live_session_count_for_machine(&m.name);
+                let detail_str = if m.active_count > 0 || live > 0 {
+                    let mut parts: Vec<String> = Vec::new();
+                    if m.active_count > 0 {
+                        parts.push(format!("{} active", m.active_count));
+                    }
+                    if live > 0 {
+                        parts.push(format!("◉ {} live", live));
+                    }
+                    parts.join(" · ")
+                } else if let Some(ref age) = contact_str {
                     age.clone()
-                } else if m.active_count > 0 {
-                    format!("{} active", m.active_count)
                 } else {
                     "idle".to_string()
                 };
-                let detail_col = if m.active_count > 0 {
+                let detail_col = if live > 0 {
+                    Color::rgb(150, 210, 255) // matches the status-bar live badge
+                } else if m.active_count > 0 {
                     Color::rgb(80, 210, 80)
                 } else if contact_str.is_some() {
                     Color::rgb(90, 110, 90)
@@ -22983,6 +22996,24 @@ impl CoordApp {
             .any(|s| self.session_assignment_is_running(&s.assignment_id))
     }
 
+    /// #628 (scope A pt.2): count live interactive sessions on a machine, so the
+    /// Machines tab reflects them.  `active_count` only counts board `running`
+    /// rows, which interactive sessions never create — so the tab read "idle"
+    /// while a machine hosted live sessions.  We recover the machine by joining
+    /// each live session to its assignment (by id) rather than threading a new
+    /// field through ~20 `LiveTmuxSession` constructors.
+    fn live_session_count_for_machine(&self, machine_name: &str) -> usize {
+        self.live_tmux_sessions
+            .iter()
+            .filter(|s| {
+                self.data
+                    .assignments
+                    .iter()
+                    .any(|a| a.id == s.assignment_id && a.machine == machine_name)
+            })
+            .count()
+    }
+
     /// #569: Build a diagnostic snapshot briefing for a Troubleshoot interactive
     /// session.  Assembles the current board state — all assignments for the
     /// issue, the merge_queue entry, CI check summary, and per-stage statuses —
@@ -32921,6 +32952,54 @@ mod tests {
             "expected singular '1 live session', got: {}",
             left_text(&app),
         );
+    }
+
+    #[test]
+    fn live_session_count_for_machine_joins_sessions_to_assignments() {
+        // #628 pt.2: the Machines tab counts live interactive sessions by
+        // joining each session to its assignment's machine — independent of the
+        // assignment's status, so a session whose work already merged (board row
+        // → Done) is still counted while it stays live.
+        let mut app = make_test_app(BoardData::default());
+        let mut a1 = _stage_assignment("s1", "work", 100.0, "done"); // merged → Done
+        a1.machine = "elitebook".to_string();
+        let mut a2 = _stage_assignment("s2", "review", 100.0, "running");
+        a2.machine = "dellserver".to_string();
+        let mut a3 = _stage_assignment("s3", "fix", 100.0, "done");
+        a3.machine = "dellserver".to_string();
+        app.data.assignments = vec![a1, a2, a3];
+
+        app.live_tmux_sessions = vec![
+            LiveTmuxSession {
+                assignment_id: "s1".into(),
+                issue_number: None,
+                repo_name: None,
+                issue_title: None,
+            },
+            LiveTmuxSession {
+                assignment_id: "s2".into(),
+                issue_number: None,
+                repo_name: None,
+                issue_title: None,
+            },
+            LiveTmuxSession {
+                assignment_id: "s3".into(),
+                issue_number: None,
+                repo_name: None,
+                issue_title: None,
+            },
+            // A session with no matching assignment can't be attributed → ignored.
+            LiveTmuxSession {
+                assignment_id: "ghost".into(),
+                issue_number: None,
+                repo_name: None,
+                issue_title: None,
+            },
+        ];
+
+        assert_eq!(app.live_session_count_for_machine("elitebook"), 1);
+        assert_eq!(app.live_session_count_for_machine("dellserver"), 2);
+        assert_eq!(app.live_session_count_for_machine("precision"), 0);
     }
 
     // ── #253: merge-blocked-on-review predicate ────────────────────────────
