@@ -8825,9 +8825,10 @@ impl CoordApp {
         if issue.all_labels.iter().any(|l| l == "status:ready") {
             return "pending";
         }
-        if issue.all_labels.iter().any(|l| l == "status:refining") {
-            return "refining";
-        }
+        // #628: Refining is eliminated (New + Pending only). A legacy
+        // `status:refining` label folds into New — mirroring the Board classifier
+        // (IssueGroup::lifecycle_section). Refining is now an action (Chat about
+        // issue), not a pipeline bucket; the empty "refining" section auto-hides.
         "new"
     }
 
@@ -31139,11 +31140,9 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_groups_for_repo_includes_all_five_lifecycle_sections() {
-        // #194: the Pipeline surfaces the **five lifecycle sections** —
-        // New / Refining / Pending / In-progress / Done.  Pre-pipeline
-        // states (no `status:*` label / `status:refining`) MUST be
-        // visible so the TUI can drive every stage.
+    fn pipeline_groups_for_repo_folds_refining_into_new() {
+        // #628: Refining is eliminated — the Pipeline surfaces New / Pending /
+        // In-progress / Done. A legacy `status:refining` label folds into New.
         let mut app = make_pipeline_app();
         // Issue #42 has status:ready → Pending (already visible).
         // Add issue #43 with no labels → "new" classifier → New section.
@@ -31157,10 +31156,10 @@ mod tests {
             all_labels: vec!["coord".to_string()],
             is_closed: false,
         });
-        // Issue #44 with status:refining → Refining section.
+        // Issue #44 with a legacy status:refining label → folds into New (#628).
         app.pipeline_issues.push(PipelineIssue {
             number: 44,
-            title: "Refining".to_string(),
+            title: "Legacy refining".to_string(),
             body: String::new(),
             repo_slug: "acme/api".to_string(),
             coord_repo: Some("api".to_string()),
@@ -31170,20 +31169,22 @@ mod tests {
         });
 
         let groups = app.pipeline_groups_for_repo("api");
-        // Three non-empty sections in display order: new → refining → pending.
+        // #628: two non-empty sections in display order: new → pending (no
+        // Refining bucket). #43 (no label) and #44 (legacy status:refining) both
+        // land in New.
         let keys: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, vec!["new", "refining", "pending"]);
-        // Each section holds exactly the right issue.
+        assert_eq!(keys, vec!["new", "pending"]);
         let issue_num_in = |sec_idx: usize| -> Vec<u64> {
-            groups[sec_idx]
+            let mut v: Vec<u64> = groups[sec_idx]
                 .1
                 .iter()
                 .map(|i| app.pipeline_issues[*i].number)
-                .collect()
+                .collect();
+            v.sort();
+            v
         };
-        assert_eq!(issue_num_in(0), vec![43]); // New
-        assert_eq!(issue_num_in(1), vec![44]); // Refining
-        assert_eq!(issue_num_in(2), vec![42]); // Pending
+        assert_eq!(issue_num_in(0), vec![43, 44]); // New (incl. legacy refining)
+        assert_eq!(issue_num_in(1), vec![42]); // Pending
     }
 
     #[test]
@@ -31229,13 +31230,11 @@ mod tests {
         assert_eq!(order, vec!["pending", "in-progress", "done"]);
     }
 
-    /// #194: when issues span all five lifecycle states the production
-    /// `rebuild_pipeline_sidebar` path must expose every section, in the
-    /// canonical display order New → Refining → Pending → In-progress →
-    /// Done.  Earlier behavior (#225/#256) filtered out New and Refining;
-    /// the regression guard below pins the lifecycle-driven board down.
+    /// #628: the production `rebuild_pipeline_sidebar` path exposes the FOUR
+    /// lifecycle sections in canonical order New → Pending → In-progress → Done
+    /// (Refining eliminated). A legacy `status:refining` issue folds into New.
     #[test]
-    fn rebuild_pipeline_sidebar_exposes_all_five_lifecycle_sections() {
+    fn rebuild_pipeline_sidebar_exposes_four_lifecycle_sections() {
         let mut app = make_pipeline_app();
         // The fixture starts with two issues, both `status:ready`
         // (Pending).  Add one issue per remaining state.
@@ -31250,10 +31249,10 @@ mod tests {
             all_labels: vec!["coord".to_string()],
             is_closed: false,
         });
-        // Refining: `status:refining` label.
+        // Legacy `status:refining` → folds into New (#628, Refining eliminated).
         app.pipeline_issues.push(PipelineIssue {
             number: 102,
-            title: "Being refined".to_string(),
+            title: "Legacy refining".to_string(),
             body: String::new(),
             repo_slug: "acme/api".to_string(),
             coord_repo: Some("api".to_string()),
@@ -31289,11 +31288,12 @@ mod tests {
 
         app.rebuild_pipeline_sidebar(None);
 
-        // The sidebar must surface every lifecycle state in display order.
+        // #628: four lifecycle sections in display order — no Refining (the
+        // status:refining issue #102 folds into New).
         assert_eq!(
             app.pipeline_state_section_names,
-            vec!["new", "refining", "pending", "in-progress", "done"],
-            "all five lifecycle sections must appear in the canonical order",
+            vec!["new", "pending", "in-progress", "done"],
+            "the four lifecycle sections must appear in canonical order",
         );
     }
 
@@ -31310,9 +31310,10 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_pipeline_sidebar_lifecycle_refining() {
+    fn rebuild_pipeline_sidebar_lifecycle_refining_folds_to_new() {
+        // #628: Refining is eliminated — a legacy `status:refining` label is no
+        // longer its own bucket; it classifies as New.
         let mut app = make_pipeline_app();
-        // #225 fixture seeds `status:ready` — replace with refining.
         app.pipeline_issues[0]
             .all_labels
             .retain(|l| !l.starts_with("status:"));
@@ -31320,7 +31321,7 @@ mod tests {
             .all_labels
             .push("status:refining".to_string());
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
-        assert_eq!(section, "refining");
+        assert_eq!(section, "new");
     }
 
     #[test]
@@ -32062,32 +32063,33 @@ mod tests {
         app.pipeline_sidebar.set_collapsed(1, true);
         assert!(app.pipeline_sidebar.is_collapsed(1));
 
-        // Add a refining issue — per #194 display order "Refining" sits
-        // before "Pending", so the refining section will appear at sidebar
-        // section 1 and push "Pending" to sidebar section 2.
+        // Add a New issue (no status label) — display order puts "New" before
+        // "Pending", so the New section appears at sidebar section 1 and pushes
+        // "Pending" to sidebar section 2. (#628: this slot was "Refining" before
+        // it was eliminated; "New" exercises the same reorder.)
         app.pipeline_issues.push(PipelineIssue {
             number: 77,
-            title: "Refining work".to_string(),
+            title: "New work".to_string(),
             body: String::new(),
             repo_slug: "acme/api".to_string(),
             coord_repo: Some("api".to_string()),
             matched_labels: vec!["coord".to_string()],
-            all_labels: vec!["coord".to_string(), "status:refining".to_string()],
+            all_labels: vec!["coord".to_string()],
             is_closed: false,
         });
 
         app.rebuild_pipeline_sidebar(None);
 
-        // After rebuild: state sections = ["refining", "pending"].
-        // sidebar section 1 = "Refining" (new, expanded by default),
+        // After rebuild: state sections = ["new", "pending"].
+        // sidebar section 1 = "New" (new, expanded by default),
         // sidebar section 2 = "Pending" (was section 1, still collapsed).
         assert_eq!(
             app.pipeline_state_section_names,
-            vec!["refining", "pending"],
+            vec!["new", "pending"],
         );
         assert!(
             !app.pipeline_sidebar.is_collapsed(1),
-            "Refining section (new) must not be retroactively collapsed",
+            "New section must not be retroactively collapsed",
         );
         assert!(
             app.pipeline_sidebar.is_collapsed(2),
