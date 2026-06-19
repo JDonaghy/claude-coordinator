@@ -29473,6 +29473,14 @@ mod tests {
             armed_for_test_verdict: std::collections::HashMap::new(),
             pending_test_fix: None,
             pending_merge: None,
+            // #638
+            kanban_model: BoardModel {
+                id: WidgetId::new("kanban:coord"),
+                columns: Vec::new(),
+                selected_card_id: None,
+                col_scroll_offset: 0,
+            },
+            kanban_layout: std::cell::RefCell::new(None),
         }
     }
 
