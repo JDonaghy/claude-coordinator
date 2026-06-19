@@ -962,8 +962,33 @@ struct Assignment {
     /// (Max / Pro subscription).  Set by `finalize_interactive_exit`; prevents
     /// misidentifying old automated rows (which also have cost_usd=NULL and zero
     /// token counts) as Max sessions.
-    #[serde(default)]
+    //
+    // #628 hotfix: the daemon serializes this SQLite boolean as an int (0/1), so
+    // a strict `bool` here fails the ENTIRE /board parse on `is_interactive:0`,
+    // returning BoardData::default() and blanking every panel. Accept int-or-bool.
+    #[serde(default, deserialize_with = "de_bool_from_int_or_bool")]
     is_interactive: bool,
+}
+
+/// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)
+/// instead of a JSON bool. Accepts bool, int, or null (→ false). One mistyped
+/// boolean would otherwise fail the whole `BoardPayload` parse and blank the
+/// board (the #546 `is_interactive` regression).
+fn de_bool_from_int_or_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrInt {
+        Bool(bool),
+        Int(i64),
+    }
+    Ok(match <Option<BoolOrInt> as serde::Deserialize>::deserialize(d)? {
+        Some(BoolOrInt::Bool(b)) => b,
+        Some(BoolOrInt::Int(n)) => n != 0,
+        None => false,
+    })
 }
 
 impl Assignment {
@@ -28839,6 +28864,29 @@ mod tests {
             payload.machines.iter().all(|m| !m.name.is_empty()),
             "every machine has a name"
         );
+    }
+
+    #[test]
+    fn board_payload_parses_int_valued_is_interactive() {
+        // #628 hotfix: the daemon serializes the SQLite boolean is_interactive
+        // as an int (0/1). A strict `bool` field used to fail the WHOLE
+        // BoardPayload parse on `is_interactive:0`, returning an empty board and
+        // blanking every panel. The payload must parse and the field coerce.
+        let json = r#"{
+            "assignments": [
+                {"assignment_id":"a1","machine_name":"m","repo_name":"r","issue_number":1,
+                 "issue_title":"t","status":"running","type":"work","is_interactive":0},
+                {"assignment_id":"a2","machine_name":"m","repo_name":"r","issue_number":2,
+                 "issue_title":"t","status":"done","type":"work","is_interactive":1}
+            ],
+            "machines": [{"name":"m","host":"h","repos":[]}]
+        }"#;
+        let payload: BoardPayload =
+            serde_json::from_str(json).expect("int-valued is_interactive must not fail the parse");
+        assert_eq!(payload.assignments.len(), 2, "every row parsed (no whole-payload failure)");
+        assert!(!payload.assignments[0].is_interactive, "0 → false");
+        assert!(payload.assignments[1].is_interactive, "1 → true");
+        assert_eq!(payload.machines.len(), 1);
     }
 
     /// The custom `test_plan` deserializer must turn the OBJECT wire shape
