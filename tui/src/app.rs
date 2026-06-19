@@ -67,6 +67,8 @@ use quadraui::{
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
     StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
     ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
+    BadgeStatus, BoardCard, BoardColumn, BoardHit, BoardLayout, BoardModel, MoveDir,
+    Stage,
 };
 use quadraui::terminal_engine::TerminalMouseKind;
 
@@ -856,6 +858,9 @@ enum SidebarView {
     /// pass through to the PTY; when false, normal TUI chrome handles
     /// them. F12 toggles focus.
     Terminal,
+    /// #638: Kanban view — three-column (Backlog / In Flight / Completed)
+    /// rendered via `quadraui::Board`.
+    Kanban,
 }
 
 impl SidebarView {
@@ -866,6 +871,7 @@ impl SidebarView {
             SidebarView::Pipeline => "Pipeline",
             SidebarView::Settings => "Settings",
             SidebarView::Terminal => "Terminal",
+            SidebarView::Kanban => "Kanban",
         }
     }
 }
@@ -5603,6 +5609,10 @@ pub struct CoordApp {
     /// [`PendingMerge`].
     pending_merge: Option<PendingMerge>,
 
+    // ── #638: Kanban view ────────────────────────────────────────────────────
+    kanban_model: BoardModel,
+    kanban_layout: std::cell::RefCell<Option<BoardLayout>>,
+
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
@@ -5656,6 +5666,54 @@ fn key_to_binding_str(key: &Key) -> String {
             _ => String::new(),
         },
     }
+}
+
+/// #638: Derive per-stage badge statuses for a Kanban card from its IssueGroup.
+///
+/// Returns a compact badge row: Plan → Work → Test → Review → Merge.
+/// Status is inferred from the group's status_summary and assignments.
+fn kanban_stage_badges(g: &IssueGroup) -> Vec<(Stage, BadgeStatus)> {
+    // Determine the dominant assignment status.
+    let has_running = g.assignments.iter().any(|a| a.status == "running");
+    let has_failed = g.assignments.iter().any(|a| a.status == "failed");
+    let status = g.status_summary.as_str();
+
+    // Work stage status.
+    let work_status = if has_running {
+        BadgeStatus::Running
+    } else if has_failed {
+        BadgeStatus::Blocked
+    } else if matches!(status, "done" | "merged") {
+        BadgeStatus::Passed
+    } else {
+        BadgeStatus::Pending
+    };
+
+    // Review stage: check review_verdict on any assignment.
+    let review_status = {
+        let verdict = g.assignments.iter()
+            .filter_map(|a| a.review_verdict.as_deref())
+            .last();
+        match verdict {
+            Some("approved") => BadgeStatus::Passed,
+            Some("changes_requested") => BadgeStatus::RequestChanges,
+            Some(_) => BadgeStatus::Running,
+            None => BadgeStatus::Pending,
+        }
+    };
+
+    // Merge stage: passed when status is "merged".
+    let merge_status = if status == "merged" {
+        BadgeStatus::Passed
+    } else {
+        BadgeStatus::Pending
+    };
+
+    vec![
+        (Stage::Work, work_status),
+        (Stage::Review, review_status),
+        (Stage::Merge, merge_status),
+    ]
 }
 
 impl CoordApp {
@@ -5838,6 +5896,14 @@ impl CoordApp {
             armed_for_test_verdict: std::collections::HashMap::new(),
             pending_test_fix: None,
             pending_merge: None,
+            // #638: Kanban view — empty until rebuild_board_sidebar populates it.
+            kanban_model: BoardModel {
+                id: WidgetId::new("kanban:coord"),
+                columns: Vec::new(),
+                selected_card_id: None,
+                col_scroll_offset: 0,
+            },
+            kanban_layout: std::cell::RefCell::new(None),
         };
         // #584: a thin client pulls config from the daemon (no local
         // coordinator.yml) so the status bar doesn't warn and subcommands have
@@ -7760,11 +7826,135 @@ impl CoordApp {
         if self.board_search.focused {
             self.board_sidebar.focus_form(0, true);
         }
+
+        // #638: Keep Kanban model in sync with new board data.
+        let new_kanban = self.build_kanban_model();
+        let old_sel = self.kanban_model.selected_card_id.clone();
+        let old_col_scroll = self.kanban_model.col_scroll_offset;
+        self.kanban_model = new_kanban;
+        if let Some(sel) = &old_sel {
+            let still_exists = self.kanban_model.columns.iter()
+                .any(|c| c.cards.iter().any(|card| &card.id == sel));
+            if still_exists {
+                self.kanban_model.selected_card_id = old_sel;
+            }
+        }
+        self.kanban_model.col_scroll_offset = old_col_scroll;
     }
 
     /// Repo section offset: 1 for the search form + 1 more if proposals exist.
     fn board_repo_offset(&self) -> usize {
         1 + if self.has_proposals_section { 1 } else { 0 }
+    }
+
+    /// #638: Build a fresh `BoardModel` from the current `board_issues_cache`.
+    ///
+    /// Three columns: **Backlog** (backlog + refining + refined),
+    /// **In Flight** (in-flight), **Completed** (completed).
+    /// Each issue group becomes one card; its repo name is prepended as a label.
+    fn build_kanban_model(&self) -> BoardModel {
+        let mut backlog_cards: Vec<BoardCard> = Vec::new();
+        let mut inflight_cards: Vec<BoardCard> = Vec::new();
+        let mut completed_cards: Vec<BoardCard> = Vec::new();
+
+        for (repo, groups) in &self.board_issues_cache {
+            for g in groups {
+                let card_id = WidgetId::new(&format!("card:{}:{}", repo, g.issue_number));
+                let stage_badges = kanban_stage_badges(g);
+                let machine = g.assignments.iter()
+                    .find(|a| a.status == "running")
+                    .map(|a| a.machine.clone());
+                let card = BoardCard {
+                    id: card_id,
+                    title: format!("#{} {}", g.issue_number, g.issue_title),
+                    labels: vec![repo.clone()],
+                    stage_badges,
+                    assignee: None,
+                    machine,
+                    decision_hint: None,
+                };
+                match g.lifecycle_section() {
+                    "in-flight" => inflight_cards.push(card),
+                    "completed" => completed_cards.push(card),
+                    _ => backlog_cards.push(card), // backlog / refining / refined
+                }
+            }
+        }
+
+        BoardModel {
+            id: WidgetId::new("kanban:coord"),
+            columns: vec![
+                BoardColumn {
+                    id: WidgetId::new("kanban-col:backlog"),
+                    title: "Backlog".to_string(),
+                    cards: backlog_cards,
+                    scroll_offset: 0,
+                },
+                BoardColumn {
+                    id: WidgetId::new("kanban-col:inflight"),
+                    title: "In Flight".to_string(),
+                    cards: inflight_cards,
+                    scroll_offset: 0,
+                },
+                BoardColumn {
+                    id: WidgetId::new("kanban-col:completed"),
+                    title: "Completed".to_string(),
+                    cards: completed_cards,
+                    scroll_offset: 0,
+                },
+            ],
+            selected_card_id: None,
+            col_scroll_offset: 0,
+        }
+    }
+
+    /// Clamp the focused column's scroll offset so the selected card is visible.
+    fn kanban_clamp_col_scroll(&mut self) {
+        if let Some(layout) = self.kanban_layout.borrow().as_ref() {
+            for col_layout in &layout.columns {
+                let col = &mut self.kanban_model.columns[col_layout.col_index];
+                let visible = col_layout.visible_cards.max(1);
+                let total = col.cards.len();
+                if total > visible {
+                    col.scroll_offset = col.scroll_offset.min(total - visible);
+                } else {
+                    col.scroll_offset = 0;
+                }
+            }
+        }
+    }
+
+    /// Open the Board view and select the issue represented by a Kanban card id.
+    fn kanban_open_card(&mut self, card_id: &WidgetId) {
+        // card id format: "card:<repo>:<issue_number>"
+        let s = card_id.as_str();
+        if let Some(colon) = s.rfind(':') {
+            let right = &s[colon + 1..];
+            if let Ok(num) = right.parse::<u64>() {
+                let repo_part = &s[..colon];
+                if let Some(repo_colon) = repo_part.rfind(':') {
+                    let repo = &repo_part[repo_colon + 1..];
+                    self.active_view = SidebarView::Board;
+                    self.select_issue(repo, num);
+                }
+            }
+        }
+    }
+
+    /// Empty placeholder list for the Kanban sidebar slot.
+    fn kanban_sidebar_placeholder(&self) -> ListView {
+        ListView {
+            id: WidgetId::new("kanban-sidebar"),
+            title: None,
+            items: vec![],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
     }
 
     /// Return the repo name for the active sidebar section, if any.
@@ -14976,6 +15166,8 @@ impl CoordApp {
             }
             // #424: Terminal sidebar is a hint placeholder; clicks are inert.
             SidebarView::Terminal => false,
+            // #638: Kanban sidebar is a placeholder; clicks are inert.
+            SidebarView::Kanban => false,
         }
     }
 
@@ -15195,6 +15387,24 @@ impl CoordApp {
                         PipelineHit::Empty => return false,
                     }
                 }
+            }
+            return false;
+        }
+        // #638: Kanban view — hit-test click against last known board layout.
+        if self.active_view == SidebarView::Kanban {
+            let hit = self.kanban_layout.borrow().as_ref().map(|l| l.hit_test(pos.x, pos.y));
+            match hit {
+                Some(BoardHit::Card(ref card_id)) => {
+                    // Second click on already-selected card → open in Board view.
+                    if self.kanban_model.selected_card_id.as_ref() == Some(card_id) {
+                        let id = card_id.clone();
+                        self.kanban_open_card(&id);
+                    } else {
+                        self.kanban_model.selected_card_id = Some(card_id.clone());
+                    }
+                    return true;
+                }
+                Some(BoardHit::ColumnHeader(_)) | Some(BoardHit::Empty) | None => {}
             }
             return false;
         }
@@ -15475,6 +15685,8 @@ impl CoordApp {
             // #424: Terminal view's sidebar is just a hint placeholder —
             // no scrollable content, swallow the wheel.
             SidebarView::Terminal => false,
+            // #638: Kanban sidebar is a placeholder — no sidebar scroll.
+            SidebarView::Kanban => false,
         }
     }
 
@@ -15730,6 +15942,8 @@ impl CoordApp {
                 }
                 true
             }
+            // #638: Kanban — wheel events are ignored (Board widget handles its own scrolling).
+            SidebarView::Kanban => true,
         }
     }
 
@@ -20549,13 +20763,14 @@ impl CoordApp {
                     ),
                 ]
             }
-            // Pipeline, Machines, Settings, Terminal: no panel-level toolbar.
+            // Pipeline, Machines, Settings, Terminal, Kanban: no panel-level toolbar.
             // Pipeline verbs are fully covered by keybinds; Terminal is a
-            // pure pass-through pane (#424).
+            // pure pass-through pane (#424); Kanban uses the Board widget natively.
             SidebarView::Pipeline
             | SidebarView::Machines
             | SidebarView::Settings
-            | SidebarView::Terminal => return None,
+            | SidebarView::Terminal
+            | SidebarView::Kanban => return None,
         };
 
         Some(Toolbar {
@@ -24537,6 +24752,10 @@ impl ShellApp for CoordApp {
                     // (TERMINAL / chrome) keeps a stable height.
                     backend.draw_list(sidebar_rect, &self.terminal_sidebar_placeholder());
                 }
+                // #638: Kanban sidebar is a placeholder — all content is in the main panel.
+                SidebarView::Kanban => {
+                    backend.draw_list(sidebar_rect, &self.kanban_sidebar_placeholder());
+                }
             }
         }
 
@@ -24874,6 +25093,11 @@ impl ShellApp for CoordApp {
                         },
                     );
                 }
+            }
+            // #638: Kanban view — render the Board widget into the full main rect.
+            SidebarView::Kanban => {
+                let layout = backend.draw_board(m, &self.kanban_model);
+                *self.kanban_layout.borrow_mut() = Some(layout);
             }
         }
 
@@ -26214,6 +26438,57 @@ impl ShellApp for CoordApp {
                         self.terminal_focused = true;
                         needs_redraw = true;
                     }
+                    // #638: 6 → Kanban view.
+                    Key::Char('6') => {
+                        self.active_view = SidebarView::Kanban;
+                        needs_redraw = true;
+                    }
+
+                    // ── Kanban keyboard nav (#638) ───────────────────────
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Kanban =>
+                    {
+                        self.kanban_model.move_selection(MoveDir::Down);
+                        self.kanban_clamp_col_scroll();
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Kanban =>
+                    {
+                        self.kanban_model.move_selection(MoveDir::Up);
+                        self.kanban_clamp_col_scroll();
+                        needs_redraw = true;
+                    }
+                    Key::Char('h') | Key::Named(NamedKey::Left)
+                        if self.active_view == SidebarView::Kanban =>
+                    {
+                        self.kanban_model.move_selection(MoveDir::Left);
+                        self.kanban_clamp_col_scroll();
+                        needs_redraw = true;
+                    }
+                    Key::Char('l') | Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Kanban =>
+                    {
+                        self.kanban_model.move_selection(MoveDir::Right);
+                        self.kanban_clamp_col_scroll();
+                        needs_redraw = true;
+                    }
+                    Key::Char('g') if self.active_view == SidebarView::Kanban => {
+                        self.kanban_model.jump_to_top();
+                        self.kanban_clamp_col_scroll();
+                        needs_redraw = true;
+                    }
+                    Key::Char('G') if self.active_view == SidebarView::Kanban => {
+                        self.kanban_model.jump_to_bottom();
+                        self.kanban_clamp_col_scroll();
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Enter) if self.active_view == SidebarView::Kanban => {
+                        if let Some(card_id) = self.kanban_model.selected_card_id.clone() {
+                            self.kanban_open_card(&card_id);
+                            needs_redraw = true;
+                        }
+                    }
 
                     // ── Settings panel keyboard nav ──────────────────────
                     // #237: j/k now step through the unified form's
@@ -26532,6 +26807,8 @@ impl ShellApp for CoordApp {
                             // PTY passthrough — bare j/k when unfocused
                             // are inert (no list to navigate).
                             SidebarView::Terminal => {}
+                            // #638: Kanban j/k handled by the earlier guarded arm.
+                            SidebarView::Kanban => {}
                         }
                         needs_redraw = true;
                     }
@@ -26571,6 +26848,8 @@ impl ShellApp for CoordApp {
                             SidebarView::Settings => {}
                             // #424: see Down/j arm above.
                             SidebarView::Terminal => {}
+                            // #638: Kanban k handled by the earlier guarded arm.
+                            SidebarView::Kanban => {}
                         }
                         needs_redraw = true;
                     }
@@ -26785,6 +27064,11 @@ impl ShellApp for CoordApp {
                             }
                             // #424: Terminal — no nav target for Home.
                             SidebarView::Terminal => {}
+                            // #638: Kanban — Home jumps to top of focused column.
+                            SidebarView::Kanban => {
+                                self.kanban_model.jump_to_top();
+                                self.kanban_clamp_col_scroll();
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -26826,6 +27110,11 @@ impl ShellApp for CoordApp {
                             }
                             // #424: Terminal — no nav target for End.
                             SidebarView::Terminal => {}
+                            // #638: Kanban — End jumps to bottom of focused column.
+                            SidebarView::Kanban => {
+                                self.kanban_model.jump_to_bottom();
+                                self.kanban_clamp_col_scroll();
+                            }
                         }
                         needs_redraw = true;
                     }
