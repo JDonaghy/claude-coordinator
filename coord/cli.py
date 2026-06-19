@@ -2152,6 +2152,22 @@ def _prompt_and_relay_review_verdict(
     ),
 )
 @click.option(
+    "--chat",
+    "chat",
+    is_flag=True,
+    default=False,
+    help=(
+        "#628: launch a human-attended 'Chat about issue' session — a live "
+        "interactive `claude` seeded with everything we know about the issue "
+        "(body, comments, board state). Ask open questions ('is this still "
+        "needed?', 'what milestone?', 'sketch the UX'), diagnose a stall, edit "
+        "the issue (via `coord issue edit`), and send it to Pending (`coord "
+        "ready`). Runs in the LIVE checkout with NO claim and NO worktree; "
+        "type=chat. Mutates the ISSUE through coord (never raw gh) and never the "
+        "code/checkout. Requires --interactive; local-only."
+    ),
+)
+@click.option(
     "--rework-of",
     "rework_of",
     default=None,
@@ -2209,6 +2225,7 @@ def assign(
     fix_of: str | None,
     briefing_file: str | None,
     troubleshoot: bool,
+    chat: bool,
     rework_of: str | None,
     smoke_of: str | None,
     merge_of: str | None,
@@ -2301,6 +2318,11 @@ def assign(
         click.echo("error: --troubleshoot requires --interactive", err=True)
         sys.exit(2)
 
+    # #628: --chat (Chat about issue) — human-attended, requires --interactive.
+    if chat and not interactive:
+        click.echo("error: --chat requires --interactive", err=True)
+        sys.exit(2)
+
     # #563: --rework-of — requires --interactive, and --briefing so the operator
     # always supplies explicit rework instructions.
     if rework_of is not None and not interactive:
@@ -2328,6 +2350,7 @@ def assign(
         ("--review-of", review_of is not None),
         ("--fix-of", fix_of is not None),
         ("--troubleshoot", troubleshoot),
+        ("--chat", chat),
         ("--rework-of", rework_of is not None),
         ("--smoke-of", smoke_of is not None),
         ("--merge-of", merge_of is not None),
@@ -3137,7 +3160,7 @@ def assign(
         # or the worker-worktree base — but it carries the caller-supplied
         # diagnostic briefing (--briefing/--briefing-file), uses
         # type="troubleshoot", and has no verdict.  Local-only.
-        if troubleshoot:
+        if troubleshoot or chat:
             from coord.models import Assignment as _AssignmentTs  # noqa: PLC0415
             from coord.state import (  # noqa: PLC0415
                 build_board as _build_board_ts,
@@ -3146,15 +3169,28 @@ def assign(
             )
             from coord.agent import AssignmentSpec as _AssignmentSpecTs  # noqa: PLC0415
 
-            if not (briefing or "").strip():
+            # #628: --chat shares troubleshoot's shape (human-attended, live
+            # checkout, no claim/worktree, briefed-from-file, finalize
+            # worktree_path=None). It differs only in the system prompt/seed
+            # (general Q&A + may EDIT the issue via coord) and type=chat.
+            _is_chat = chat
+            _mode = "chat" if _is_chat else "troubleshoot"
+            if troubleshoot and not (briefing or "").strip():
                 click.echo(
                     "error: --troubleshoot requires a briefing "
                     "(--briefing or --briefing-file).",
                     err=True,
                 )
                 sys.exit(2)
+            if _is_chat and not (briefing or "").strip():
+                # The TUI seeds a rich briefing; a bare CLI --chat gets a minimal
+                # one so the session still knows what issue it's about.
+                briefing = (
+                    f"Chat about {repo} #{issue}. Gather any context you need with "
+                    f"`gh issue view {issue} --comments` and `coord` reads."
+                )
             if not _is_local:
-                click.echo("error: --troubleshoot is local-only for now.", err=True)
+                click.echo(f"error: --{_mode} is local-only for now.", err=True)
                 sys.exit(2)
 
             ts_repo_path = str(
@@ -3164,22 +3200,45 @@ def assign(
             resolved_model = model if model else cfg.models.default
             assignment_id = _uuid.uuid4().hex[:12]
 
-            _ts_system_prompt = (
-                "You are a coordinator troubleshooter in a HUMAN-ATTENDED "
-                "session. You are READ-ONLY in a live checkout: do NOT modify "
-                "files, do NOT commit, do NOT run `gh`. Investigate the stalled "
-                "pipeline item using coord, git, and sqlite3 reads; explain "
-                "what is wrong and what will unstick it; and surface any plan "
-                "for the operator to approve before mutating anything."
-            )
-            ts_reminder = (
-                f"[Coordinator troubleshoot assignment {assignment_id}] "
-                "HUMAN-ATTENDED, READ-ONLY diagnostic for a stalled pipeline "
-                "item. You are in the LIVE checkout — do NOT modify files here "
-                "(it is the editable coordinator and the worker-worktree base). "
-                "If a code fix is needed, surface the plan so the operator can "
-                "dispatch a proper Fix.\n\n"
-            )
+            if _is_chat:
+                _ts_system_prompt = (
+                    "You are a coordinator assistant in a HUMAN-ATTENDED 'chat "
+                    "about this issue' session. Help the operator think it "
+                    "through: answer open questions (is it still needed? what "
+                    "milestone? scope?), sketch designs/UX, and diagnose a stalled "
+                    "pipeline item. You MAY update the issue itself with `coord "
+                    "issue edit <repo> <issue> --title/--body-file` and send it to "
+                    "the Pending stage with `coord ready <repo> <issue>` — confirm "
+                    "with the operator before each write. Do NOT edit files in this "
+                    "live checkout, do NOT commit, and do NOT run `gh` to mutate — "
+                    "go through `coord` so the tracker stays behind the seam."
+                )
+                ts_reminder = (
+                    f"[Coordinator chat assignment {assignment_id}] HUMAN-ATTENDED "
+                    "chat about this issue. You may edit the issue (`coord issue "
+                    "edit`) and send it to Pending (`coord ready`) — confirm first. "
+                    "You are in the LIVE checkout: do NOT modify files or commit "
+                    "here (it is the editable coordinator + worker-worktree base); "
+                    "for a code change, surface a plan so the operator can dispatch "
+                    "Work.\n\n"
+                )
+            else:
+                _ts_system_prompt = (
+                    "You are a coordinator troubleshooter in a HUMAN-ATTENDED "
+                    "session. You are READ-ONLY in a live checkout: do NOT modify "
+                    "files, do NOT commit, do NOT run `gh`. Investigate the stalled "
+                    "pipeline item using coord, git, and sqlite3 reads; explain "
+                    "what is wrong and what will unstick it; and surface any plan "
+                    "for the operator to approve before mutating anything."
+                )
+                ts_reminder = (
+                    f"[Coordinator troubleshoot assignment {assignment_id}] "
+                    "HUMAN-ATTENDED, READ-ONLY diagnostic for a stalled pipeline "
+                    "item. You are in the LIVE checkout — do NOT modify files here "
+                    "(it is the editable coordinator and the worker-worktree base). "
+                    "If a code fix is needed, surface the plan so the operator can "
+                    "dispatch a proper Fix.\n\n"
+                )
             effective_briefing = _issue_ctx + ts_reminder + briefing + _ctx_write_hint
 
             # Pre-fill a SHORT, single-line prompt that points the session at
@@ -3198,29 +3257,42 @@ def assign(
                 import tempfile as _tempfile  # noqa: PLC0415
 
                 _ts_brief_path = str(
-                    Path(_tempfile.gettempdir()) / f"coord-troubleshoot-{issue}.md"
+                    Path(_tempfile.gettempdir()) / f"coord-{_mode}-{issue}.md"
                 )
                 Path(_ts_brief_path).write_text(effective_briefing, encoding="utf-8")
-            seed_prompt = (
-                f"Troubleshoot {repo} #{issue}: read the diagnostic briefing at "
-                f"{_ts_brief_path} (board state, assignments, merge-queue, CI, and a "
-                "playbook of likely causes), then tell me what's wrong and the "
-                "options to unstick it. You are read-only — do not modify files, "
-                "commit, or run gh; surface any fix plan for me to approve."
-            )
+            if _is_chat:
+                seed_prompt = (
+                    f"Chat about {repo} #{issue}: read the full context at "
+                    f"{_ts_brief_path} (the issue, comments, and board state), then "
+                    "let's talk it through. Ask me what I want — questions about "
+                    "scope/milestone/whether it's still needed, a UX sketch, or "
+                    "diagnosing a stall. You can update the issue with `coord issue "
+                    "edit` and send it to Pending with `coord ready` once we've "
+                    "settled it — just confirm with me first."
+                )
+            else:
+                seed_prompt = (
+                    f"Troubleshoot {repo} #{issue}: read the diagnostic briefing at "
+                    f"{_ts_brief_path} (board state, assignments, merge-queue, CI, "
+                    "and a playbook of likely causes), then tell me what's wrong and "
+                    "the options to unstick it. You are read-only — do not modify "
+                    "files, commit, or run gh; surface any fix plan for me to "
+                    "approve."
+                )
 
             spec = _AssignmentSpecTs(
                 repo_name=repo,
                 repo_path=ts_repo_path,
                 issue_number=issue,
-                issue_title=f"[troubleshoot] {issue_title}",
+                issue_title=f"[{_mode}] {issue_title}",
                 briefing=effective_briefing,
                 model=resolved_model,
-                type="troubleshoot",
+                type=_mode,
                 provider="claude-pty",
             )
-            # READ-ONLY: no Edit/Write (the live checkout must not be mutated).
-            # Bash for coord/git/sqlite3 reads; Read/Grep/Glob for inspection.
+            # No Edit/Write — the live checkout must not be mutated. Bash carries
+            # coord/git/sqlite3 reads (and, for chat, the `coord issue edit` /
+            # `coord ready` ISSUE writes); Read/Grep/Glob for inspection.
             argv = provider.build_command(
                 spec,
                 resolved_model=resolved_model,
@@ -3229,11 +3301,13 @@ def assign(
             )
 
             click.echo(
-                f"{machine} (local TTY) → TROUBLESHOOT #{issue}: {issue_title}"
+                f"{machine} (local TTY) → {_mode.upper()} #{issue}: {issue_title}"
             )
             click.echo(
-                "  mode: HUMAN-ATTENDED interactive diagnostic "
-                "(read-only, no claim, no worktree) (#569)"
+                "  mode: HUMAN-ATTENDED interactive "
+                + ("chat about the issue " if _is_chat else "diagnostic ")
+                + "(live checkout, no claim, no worktree) "
+                + ("(#628)" if _is_chat else "(#569)")
             )
             click.echo(f"  assignment id: {assignment_id}")
             click.echo(f"  cwd: {ts_repo_path} (live checkout — read-only)")
@@ -3246,12 +3320,12 @@ def assign(
                 machine_name=machine,
                 repo_name=repo,
                 issue_number=issue,
-                issue_title=f"[troubleshoot] {issue_title}",
+                issue_title=f"[{_mode}] {issue_title}",
                 briefing=effective_briefing,
                 assignment_id=assignment_id,
                 status="running",
                 dispatched_at=_time.time(),
-                type="troubleshoot",
+                type=_mode,
                 model=resolved_model,
                 provider_name="claude-pty",
             )
