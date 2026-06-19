@@ -1699,14 +1699,11 @@ impl IssueGroup {
                 .unwrap_or(true) // None → "work" → workable
         });
         if !has_real_work {
-            // #628: Refining is eliminated — New (Backlog) + Pending (Refined,
-            // status:ready) only. `status:ready` → Pending; everything else
-            // (including a legacy `status:refining` left over from before #628)
-            // → New/Backlog. Refining is now an action (Chat about issue), not a
-            // bucket an issue sits in.
-            if self.labels.iter().any(|l| l == "status:ready") {
-                return "refined";
-            }
+            // #628: a pre-work issue is just Backlog. `status:ready` gates
+            // nothing (no dispatch/plan/merge path reads it), so it no longer
+            // splits a separate "Refined" bucket — and `status:refining` was
+            // eliminated too. The Board is Backlog → In-flight → Completed; the
+            // Pipeline (coord-tracked) is the work queue.
             return "backlog";
         }
         if self.is_closed {
@@ -8822,13 +8819,11 @@ impl CoordApp {
         if has_work_assignment {
             return "in-progress";
         }
-        if issue.all_labels.iter().any(|l| l == "status:ready") {
-            return "pending";
-        }
-        // #628: Refining is eliminated (New + Pending only). A legacy
-        // `status:refining` label folds into New — mirroring the Board classifier
-        // (IssueGroup::lifecycle_section). Refining is now an action (Chat about
-        // issue), not a pipeline bucket; the empty "refining" section auto-hides.
+        // #628: a coord-tracked, not-yet-started issue is just "new". Neither
+        // `status:ready` (Pending) nor `status:refining` (Refining) splits a
+        // separate bucket anymore — they gate no dispatch, so the New/Pending and
+        // Refining distinctions were display-only. The empty pending/refining
+        // sections auto-hide; the Pipeline is New → In-progress → Done.
         "new"
     }
 
@@ -16027,17 +16022,14 @@ impl CoordApp {
         lifecycle: &BoardRowLifecycle,
     ) -> Vec<ContextMenuItem> {
         let mut items: Vec<ContextMenuItem> = Vec::new();
-        // #628: Refining is ELIMINATED — New (Backlog) + Pending (status:ready)
-        // only. A Pending (Refined) row can add itself to the Pipeline or drop
-        // back to New (`coord backlog`, which strips status:ready).
-        if matches!(lifecycle, BoardRowLifecycle::Refined) {
+        // #628: the Board is Backlog → In-flight → Completed (the status:ready
+        // "Refined" split is gone — it gated nothing). "Send to Pipeline"
+        // (coord track) is how a Backlog issue enters the Pipeline as a tracked
+        // card; offered on Backlog rows.
+        if matches!(lifecycle, BoardRowLifecycle::Backlog) {
             items.push(ContextMenuItem::action(
                 "send-to-pipeline",
                 "Send to Pipeline",
-            ));
-            items.push(ContextMenuItem::action(
-                "drop-to-backlog",
-                "Drop to Backlog",
             ));
             items.push(ContextMenuItem::separator());
         }
@@ -16242,7 +16234,10 @@ impl CoordApp {
 
     fn pipeline_row_lifecycle(&self, issue: &PipelineIssue) -> PipelineRowLifecycle {
         match self.pipeline_lifecycle_section(issue) {
-            "pending" => PipelineRowLifecycle::New,
+            // #628: a pre-work tracked issue is "new" now — status:ready and
+            // status:refining no longer split separate Pending / Refining
+            // buckets, so "new" (not "pending") is the New menu state.
+            "new" | "pending" => PipelineRowLifecycle::New,
             "in-progress" => PipelineRowLifecycle::InProgress,
             "done" => PipelineRowLifecycle::Done,
             _ => PipelineRowLifecycle::Other,
@@ -30796,10 +30791,10 @@ mod tests {
     }
 
     #[test]
-    fn board_lifecycle_splits_pending_into_backlog_and_refined() {
-        // #628: Refining is eliminated — open issues without assignments split
-        // into just New (Backlog) + Pending (Refined, status:ready). A legacy
-        // `status:refining` label folds into Backlog (New).
+    fn board_lifecycle_pre_work_issues_are_all_backlog() {
+        // #628: `status:ready` and `status:refining` gate nothing, so neither
+        // splits a separate bucket — every open issue without a work assignment
+        // is Backlog. (Was Backlog/Refining/Refined.)
         let mut app = make_app_default();
         // No labels → Backlog
         app.data.open_issues.push(OpenIssue {
@@ -30839,13 +30834,10 @@ mod tests {
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
         let by_key: std::collections::HashMap<&str, usize> =
             groups.iter().map(|(k, v)| (*k, v.len())).collect();
-        assert_eq!(
-            by_key.get("backlog"),
-            Some(&2),
-            "Backlog/New count (raw + legacy status:refining)",
-        );
-        assert_eq!(by_key.get("refining"), None, "Refining bucket is eliminated");
-        assert_eq!(by_key.get("refined"), Some(&1), "Refined/Pending count");
+        // All three (raw, status:refining, status:ready) are pre-work → Backlog.
+        assert_eq!(by_key.get("backlog"), Some(&3), "every pre-work issue is Backlog");
+        assert_eq!(by_key.get("refining"), None, "no Refining bucket");
+        assert_eq!(by_key.get("refined"), None, "no Refined bucket");
     }
 
     #[test]
@@ -30917,12 +30909,12 @@ mod tests {
         let cache = app.board_issues_cache.clone();
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
         let order: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
-        // #628: Refining is eliminated — order is New (Backlog) → Pending
-        // (Refined) → In-flight → Completed. The legacy status:refining issue
-        // (#2) now sits in Backlog, so there's no "refining" section.
+        // #628: order is Backlog → In-flight → Completed. status:ready and
+        // status:refining gate nothing, so #1/#2/#3 (raw / refining / ready) all
+        // sit in Backlog — no Refined or Refining section.
         assert_eq!(
             order,
-            vec!["backlog", "refined", "in-flight", "completed"],
+            vec!["backlog", "in-flight", "completed"],
         );
     }
 
@@ -31169,31 +31161,24 @@ mod tests {
         });
 
         let groups = app.pipeline_groups_for_repo("api");
-        // #628: two non-empty sections in display order: new → pending (no
-        // Refining bucket). #43 (no label) and #44 (legacy status:refining) both
-        // land in New.
+        // #628: status:ready / status:refining gate nothing, so every
+        // coord-tracked pre-work issue is "new" — a single section. #42
+        // (status:ready), #43 (no label), #44 (status:refining) all land in New.
         let keys: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, vec!["new", "pending"]);
-        let issue_num_in = |sec_idx: usize| -> Vec<u64> {
-            let mut v: Vec<u64> = groups[sec_idx]
-                .1
-                .iter()
-                .map(|i| app.pipeline_issues[*i].number)
-                .collect();
-            v.sort();
-            v
-        };
-        assert_eq!(issue_num_in(0), vec![43, 44]); // New (incl. legacy refining)
-        assert_eq!(issue_num_in(1), vec![42]); // Pending
+        assert_eq!(keys, vec!["new"]);
+        let mut new_issues: Vec<u64> = groups[0]
+            .1
+            .iter()
+            .map(|i| app.pipeline_issues[*i].number)
+            .collect();
+        new_issues.sort();
+        assert_eq!(new_issues, vec![42, 43, 44]);
     }
 
     #[test]
     fn pipeline_groups_for_repo_visible_section_order() {
-        // #194: visible sections render in display order
-        // New → Refining → Pending → In-progress → Done.
-        // This test seeds Pending + In-progress + Done; the other two
-        // states are covered by
-        // `pipeline_groups_for_repo_includes_all_five_lifecycle_sections`.
+        // #628: visible sections render in display order New → In-progress →
+        // Done. #42 (status:ready) is now "new" (status:ready gates nothing).
         let mut app = make_pipeline_app();
         // #42 already has status:ready → New.
         // Add #43 with status:ready + an assignment → In-progress.
@@ -31227,14 +31212,15 @@ mod tests {
 
         let groups = app.pipeline_groups_for_repo("api");
         let order: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
-        assert_eq!(order, vec!["pending", "in-progress", "done"]);
+        assert_eq!(order, vec!["new", "in-progress", "done"]);
     }
 
-    /// #628: the production `rebuild_pipeline_sidebar` path exposes the FOUR
-    /// lifecycle sections in canonical order New → Pending → In-progress → Done
-    /// (Refining eliminated). A legacy `status:refining` issue folds into New.
+    /// #628: the production `rebuild_pipeline_sidebar` path exposes the THREE
+    /// lifecycle sections in canonical order New → In-progress → Done. Neither
+    /// status:ready (Pending) nor status:refining (Refining) splits a bucket —
+    /// they gate nothing — so both fold into New.
     #[test]
-    fn rebuild_pipeline_sidebar_exposes_four_lifecycle_sections() {
+    fn rebuild_pipeline_sidebar_exposes_three_lifecycle_sections() {
         let mut app = make_pipeline_app();
         // The fixture starts with two issues, both `status:ready`
         // (Pending).  Add one issue per remaining state.
@@ -31288,12 +31274,13 @@ mod tests {
 
         app.rebuild_pipeline_sidebar(None);
 
-        // #628: four lifecycle sections in display order — no Refining (the
-        // status:refining issue #102 folds into New).
+        // #628: three lifecycle sections in display order. status:ready and
+        // status:refining gate nothing, so the fixture's status:ready issues +
+        // #101 (no label) + #102 (status:refining) all sit in New.
         assert_eq!(
             app.pipeline_state_section_names,
-            vec!["new", "pending", "in-progress", "done"],
-            "the four lifecycle sections must appear in canonical order",
+            vec!["new", "in-progress", "done"],
+            "the three lifecycle sections must appear in canonical order",
         );
     }
 
@@ -31325,13 +31312,15 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_pipeline_sidebar_lifecycle_pending() {
+    fn rebuild_pipeline_sidebar_lifecycle_status_ready_is_new() {
+        // #628: status:ready no longer maps to a separate "pending" bucket (it
+        // gates nothing) — a coord-tracked, not-yet-started issue is "new".
         let mut app = make_pipeline_app();
         app.pipeline_issues[0]
             .all_labels
             .push("status:ready".to_string());
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
-        assert_eq!(section, "pending");
+        assert_eq!(section, "new");
     }
 
     #[test]
@@ -31471,13 +31460,14 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_pipeline_sidebar_lifecycle_refinement_only_is_pending_not_in_progress() {
+    fn rebuild_pipeline_sidebar_lifecycle_refinement_only_is_new_not_in_progress() {
         let mut app = make_pipeline_app();
         app.pipeline_issues[0]
             .all_labels
             .push("status:ready".to_string());
-        // A done refinement chat is scoping, not work — it must NOT pin a
-        // status:ready issue to in-progress; it belongs in New (pending).
+        // A done refinement chat is scoping, not work — it must NOT pin the
+        // issue to in-progress; it belongs in New (#628: status:ready no longer
+        // means "pending").
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
             repo: "api".to_string(),
@@ -31506,7 +31496,7 @@ mod tests {
             is_interactive: false,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
-        assert_eq!(section, "pending");
+        assert_eq!(section, "new");
     }
 
     #[test]
@@ -32029,10 +32019,10 @@ mod tests {
         // Need an assignment so the closed issue is visible in Done
         // (pipeline_lifecycle_section returns "done" for is_closed=true).
         app.rebuild_pipeline_sidebar(None);
-        // Section 0 = FILTER, 1 = "Pending", 2 = "Done" — per #194 order:
-        // New → Refining → Pending → In-progress → Done (only Pending +
-        // Done are non-empty here).
-        assert_eq!(app.pipeline_state_section_names, vec!["pending", "done"]);
+        // #628: the fixture's status:ready issues are now "new" (status:ready
+        // gates nothing). With the closed #55 → "done", sections are New + Done.
+        // Section 0 = FILTER, 1 = "New", 2 = "Done".
+        assert_eq!(app.pipeline_state_section_names, vec!["new", "done"]);
         app.pipeline_sidebar.set_collapsed(1, true);
         assert!(app.pipeline_sidebar.is_collapsed(1));
         assert!(!app.pipeline_sidebar.is_collapsed(2));
@@ -32042,7 +32032,7 @@ mod tests {
 
         assert!(
             app.pipeline_sidebar.is_collapsed(1),
-            "Pending section collapse state must survive rebuild",
+            "New section collapse state must survive rebuild",
         );
         assert!(
             !app.pipeline_sidebar.is_collapsed(2),
@@ -32057,18 +32047,29 @@ mod tests {
     #[test]
     fn rebuild_pipeline_sidebar_collapse_state_follows_state_through_reorder() {
         let mut app = make_pipeline_app();
-        // Initially only pending issues → "Pending" is state section 0 →
-        // sidebar section 1.  Collapse the Pending section.
-        assert_eq!(app.pipeline_state_section_names, vec!["pending"]);
-        app.pipeline_sidebar.set_collapsed(1, true);
+        // #628: everything pre-work is now "new", so to exercise a section
+        // REORDER we start with a single Done issue, collapse it, then add a New
+        // issue — "new" sorts before "done", pushing Done from section 1 to 2.
+        app.pipeline_issues.clear();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 90,
+            title: "Done".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: true,
+        });
+        app.rebuild_pipeline_sidebar(None);
+        assert_eq!(app.pipeline_state_section_names, vec!["done"]);
+        app.pipeline_sidebar.set_collapsed(1, true); // collapse Done (section 1)
         assert!(app.pipeline_sidebar.is_collapsed(1));
 
-        // Add a New issue (no status label) — display order puts "New" before
-        // "Pending", so the New section appears at sidebar section 1 and pushes
-        // "Pending" to sidebar section 2. (#628: this slot was "Refining" before
-        // it was eliminated; "New" exercises the same reorder.)
+        // Add a New (open) issue — "new" sorts before "done", so Done moves to
+        // section 2. Collapse state is keyed by NAME, so it must follow Done.
         app.pipeline_issues.push(PipelineIssue {
-            number: 77,
+            number: 91,
             title: "New work".to_string(),
             body: String::new(),
             repo_slug: "acme/api".to_string(),
@@ -32077,23 +32078,16 @@ mod tests {
             all_labels: vec!["coord".to_string()],
             is_closed: false,
         });
-
         app.rebuild_pipeline_sidebar(None);
 
-        // After rebuild: state sections = ["new", "pending"].
-        // sidebar section 1 = "New" (new, expanded by default),
-        // sidebar section 2 = "Pending" (was section 1, still collapsed).
-        assert_eq!(
-            app.pipeline_state_section_names,
-            vec!["new", "pending"],
-        );
+        assert_eq!(app.pipeline_state_section_names, vec!["new", "done"]);
         assert!(
             !app.pipeline_sidebar.is_collapsed(1),
             "New section must not be retroactively collapsed",
         );
         assert!(
             app.pipeline_sidebar.is_collapsed(2),
-            "Pending section collapse state followed from section 1 to section 2",
+            "Done section collapse state followed from section 1 to section 2",
         );
     }
 
@@ -32371,9 +32365,9 @@ mod tests {
         });
         app.rebuild_pipeline_sidebar(None);
 
-        // State sections: New (pending) + Done.
+        // State sections: New + Done (#628: status:ready issues are "new").
         assert!(
-            app.pipeline_state_section_names.contains(&"pending"),
+            app.pipeline_state_section_names.contains(&"new"),
             "New section must exist",
         );
         assert!(
@@ -32382,7 +32376,7 @@ mod tests {
         );
 
         // New section has 2 repos with 1 issue each.
-        let new_groups = app.pipeline_repos_for_state("pending");
+        let new_groups = app.pipeline_repos_for_state("new");
         assert_eq!(new_groups.len(), 2, "New section has two repos");
 
         // Done section has 1 repo.
@@ -37731,7 +37725,7 @@ mod tests {
         assert_ne!(app.merge_stage_status_for(&cc276), StageStatus::Done);
         assert_eq!(
             app.pipeline_lifecycle_section(&cc276),
-            "pending",
+            "new",
             "open+ready cc#276 must be Pending, not Done from quadraui#276",
         );
     }
@@ -38384,30 +38378,18 @@ mod tests {
     // ── #261: Send to Pipeline right-click action ───────────────────────
 
     #[test]
-    fn refined_row_context_menu_offers_send_to_pipeline() {
-        // Send to Pipeline is the canonical Refined-row action.
+    fn backlog_row_context_menu_offers_send_to_pipeline() {
+        // #628: "Send to Pipeline" (coord track) is now the Backlog-row action
+        // that puts an issue into the Pipeline — the status:ready "Refined" state
+        // it used to live on is gone (status:ready gates nothing).
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::Refined);
+        let items = app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::Backlog);
         assert!(
             items
                 .iter()
                 .any(|it| it.action_id.as_deref() == Some("send-to-pipeline")),
-            "Refined menu must include Send to Pipeline; got {:?}",
+            "Backlog menu must include Send to Pipeline; got {:?}",
             items.iter().map(|it| &it.label).collect::<Vec<_>>(),
-        );
-    }
-
-    #[test]
-    fn backlog_row_context_menu_omits_send_to_pipeline() {
-        // Pre-Refined rows still need scoping work — sending them to
-        // the Pipeline would dispatch undefined work.
-        let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::Backlog);
-        assert!(
-            !items
-                .iter()
-                .any(|it| it.action_id.as_deref() == Some("send-to-pipeline")),
-            "Send to Pipeline must not appear on Backlog rows",
         );
     }
 
@@ -38453,23 +38435,6 @@ mod tests {
         for gone in ["mark-refined", "drop-to-refining", "refine", "refine-chat"] {
             assert!(!ids.contains(&gone), "{gone} must be eliminated; got {ids:?}");
         }
-    }
-
-    #[test]
-    fn refined_row_context_menu_offers_chat_and_drop_to_backlog() {
-        // #628: a Pending (Refined / status:ready) row can chat, add itself to
-        // the Pipeline, or drop straight back to New (Backlog) — there is no
-        // intermediate Refining state to drop to.
-        let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Refined);
-        let ids: Vec<&str> = items.iter().filter_map(|it| it.action_id.as_deref()).collect();
-        assert!(ids.contains(&"chat-about-issue"), "Pending offers Chat; got {ids:?}");
-        assert!(ids.contains(&"send-to-pipeline"), "Pending offers Send to Pipeline; got {ids:?}");
-        assert!(ids.contains(&"drop-to-backlog"), "Pending offers Drop to Backlog; got {ids:?}");
-        assert!(
-            !ids.contains(&"drop-to-refining"),
-            "Drop to Refining is eliminated; got {ids:?}",
-        );
     }
 
     #[test]
@@ -39370,12 +39335,10 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_row_lifecycle_other_for_status_refining() {
-        // A coord-labelled issue marked back for refinement is Other —
-        // Start is not meaningful, the user should Mark Refined first.
+    fn pipeline_row_lifecycle_new_for_status_refining() {
+        // #628: a legacy status:refining label folds into New (it gates
+        // nothing) — the coord-tracked, not-yet-started issue is a New row.
         let mut app = make_pipeline_app();
-        // #225 fixture seeds `status:ready` — replace with refining so
-        // the classifier sees ONLY status:refining.
         app.pipeline_issues[0]
             .all_labels
             .retain(|l| !l.starts_with("status:"));
@@ -39385,7 +39348,7 @@ mod tests {
         let issue = app.pipeline_issues[0].clone();
         assert_eq!(
             app.pipeline_row_lifecycle(&issue),
-            PipelineRowLifecycle::Other,
+            PipelineRowLifecycle::New,
         );
     }
 
@@ -40045,8 +40008,8 @@ mod tests {
             sections,
         );
         assert!(
-            sections.contains(&"refined"),
-            "#337: refinement-only + status:ready issue must appear in Refined; got {:?}",
+            sections.contains(&"backlog"),
+            "#337/#628: a refinement-only + status:ready issue is Backlog (status:ready gates nothing); got {:?}",
             sections,
         );
     }
@@ -40063,7 +40026,7 @@ mod tests {
             ],
             ..BoardData::default()
         });
-        // Issue 1: test-chat only + status:ready → Refined.
+        // Issue 1: test-chat only + status:ready → Backlog (#628).
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
             number: 1,
@@ -40095,15 +40058,13 @@ mod tests {
             "#337: chat-type assignments must not produce an In-flight section; got {:?}",
             by_key,
         );
-        assert_eq!(
-            by_key.get("refined"),
-            Some(&1),
-            "#337: test-chat + status:ready → Refined",
-        );
+        // #628: status:ready no longer splits a Refined bucket — both chat-only
+        // issues are Backlog.
+        assert_eq!(by_key.get("refined"), None, "no Refined bucket (#628)");
         assert_eq!(
             by_key.get("backlog"),
-            Some(&1),
-            "#337: new-issue-chat + no label → Backlog",
+            Some(&2),
+            "#337/#628: both chat-only issues → Backlog",
         );
     }
 
@@ -43897,7 +43858,7 @@ mod tests {
         // Sanity: the "New" section is present (pipeline fixture has a
         // status:ready issue).
         assert!(
-            app.pipeline_state_section_names.contains(&"pending"),
+            app.pipeline_state_section_names.contains(&"new"),
             "New section must still be present",
         );
     }
@@ -43914,7 +43875,7 @@ mod tests {
         // Should not panic.
         app.rebuild_pipeline_sidebar(None);
         assert!(
-            app.pipeline_state_section_names.contains(&"pending"),
+            app.pipeline_state_section_names.contains(&"new"),
             "New section must still be present",
         );
     }
