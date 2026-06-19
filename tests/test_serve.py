@@ -601,6 +601,69 @@ def test_upsert_open_issues_routes_when_service_set(coord_db, monkeypatch):
     assert coord_db.execute("SELECT COUNT(*) c FROM issues").fetchone()["c"] == 0
 
 
+def test_serve_issue_edit_writes_backend_and_cache(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    # The tracker (gh) write runs on the DAEMON behind the seam — stub it so the
+    # test never shells out, and assert it got the github slug + new content.
+    calls: list = []
+    monkeypatch.setattr(
+        "coord.github_ops.edit_issue",
+        lambda repo, num, *, title=None, body=None: calls.append((repo, num, title, body)),
+    )
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("api", 7, "old title", "old body", "open", "[]", 1.0),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/issue-edit",
+            json={
+                "repo_name": "api",
+                "issue_number": 7,
+                "title": "new title",
+                "body": "new body",
+                "repo_github": "owner/api",
+            },
+        )
+    assert resp.status_code == 200 and resp.json()["updated"] is True
+    assert calls == [("owner/api", 7, "new title", "new body")]
+    # Cache mirrors the edit so the TUI reflects it on the next refresh.
+    row = rw_db.execute(
+        "SELECT title, body FROM issues WHERE repo_name='api' AND number=7"
+    ).fetchone()
+    assert row["title"] == "new title" and row["body"] == "new body"
+
+
+def test_edit_issue_content_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"updated": True},
+    )
+    # When routing to the daemon, the backend write must NOT run client-side.
+    def _boom(*a, **k):
+        raise AssertionError("backend write must run on the daemon, not the client")
+
+    monkeypatch.setattr("coord.github_ops.edit_issue", _boom)
+    assert (
+        state.edit_issue_content("api", 9, title="t", repo_github="owner/api") is True
+    )
+    assert captured["path"] == "/issue-edit"
+    assert captured["payload"]["issue_number"] == 9
+    assert captured["payload"]["repo_github"] == "owner/api"
+
+
 # ── #603: per-issue context store ───────────────────────────────────────────
 
 def test_serve_issue_context_add_get_pin_clear(file_db: Path, valid_config_path: Path, rw_db):

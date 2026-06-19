@@ -6899,6 +6899,63 @@ def diagnose(
     click.echo(res.summary_line())
 
 
+@main.group("issue")
+def issue_group() -> None:
+    """Issue-tracker operations through the backend-agnostic seam.
+
+    The write routes through the daemon (GitHub via `gh` today; GitLab /
+    bare-DB later) so callers — notably the chat-about-issue session — never
+    touch `gh` directly.
+    """
+
+
+@issue_group.command(
+    "edit",
+    help=(
+        "Edit an issue's title and/or body. REPO is the local repo name from "
+        "coordinator.yml; ISSUE is the GH issue number. Provide --title and/or "
+        "--body / --body-file. Routes through the issue-tracker seam."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option("--title", default=None, help="New issue title.")
+@click.option("--body", default=None, help="New issue body (markdown).")
+@click.option(
+    "--body-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Read the new body from a file (preferred for long markdown). '-' = stdin.",
+)
+@_CONFIG_OPTION
+def issue_edit_cmd(
+    repo: str,
+    issue: int,
+    title: str | None,
+    body: str | None,
+    body_file: Path | None,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    if body_file is not None:
+        body = sys.stdin.read() if str(body_file) == "-" else Path(body_file).read_text()
+    if title is None and body is None:
+        click.echo("error: provide --title and/or --body / --body-file", err=True)
+        sys.exit(2)
+    from coord.state import edit_issue_content  # noqa: PLC0415
+
+    try:
+        updated = edit_issue_content(
+            repo, issue, title=title, body=body, repo_github=slug
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: issue edit failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"#{issue} ({slug}) updated" if updated else f"#{issue} ({slug}): no change")
+
+
 @main.group("context")
 def context_group() -> None:
     """The per-issue rolling context digest (#603).

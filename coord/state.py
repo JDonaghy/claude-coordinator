@@ -1256,6 +1256,83 @@ def _update_issue_labels_local(
     return cursor.rowcount > 0
 
 
+def edit_issue_content(
+    repo_name: str,
+    issue_number: int,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    repo_github: str | None = None,
+) -> bool:
+    """Edit an issue's title and/or body through the issue-tracker seam.
+
+    Routes to the daemon (`POST /issue-edit`) when ``board_service`` is set,
+    else writes locally. The actual TRACKER write (GitHub via `gh` today;
+    GitLab / bare-DB-as-tracker later) lives in the ``_local`` impl, so the
+    backend stays behind one seam — the same boundary the chat-about-issue
+    session edits through, never raw `gh`.
+
+    Returns True when something was written, False on a no-op (no fields given).
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        resp = post_record(
+            svc,
+            "/issue-edit",
+            {
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "title": title,
+                "body": body,
+                "repo_github": repo_github,
+            },
+        )
+        return bool(resp.get("updated"))
+    return _edit_issue_content_local(
+        repo_name, issue_number, title=title, body=body, repo_github=repo_github
+    )
+
+
+def _edit_issue_content_local(
+    repo_name: str,
+    issue_number: int,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    repo_github: str | None = None,
+) -> bool:
+    """Backend adapter (GitHub today): write the issue's title/body to the
+    tracker, then mirror it into the local ``issues`` cache so the TUI reflects
+    the edit on its next refresh without waiting for a full `coord sync`."""
+    if title is None and body is None:
+        return False
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    github_ops.edit_issue(slug, issue_number, title=title, body=body)
+
+    # Mirror into the cache (best-effort: the tracker write above is
+    # authoritative; a missing cache row just gets filled on the next sync).
+    conn = get_connection()
+    sets: list[str] = []
+    params: list[object] = []
+    if title is not None:
+        sets.append("title = ?")
+        params.append(title)
+    if body is not None:
+        sets.append("body = ?")
+        params.append(body)
+    params.extend([repo_name, issue_number])
+    conn.execute(
+        f"UPDATE issues SET {', '.join(sets)} WHERE repo_name = ? AND number = ?",
+        tuple(params),
+    )
+    conn.commit()
+    return True
+
+
 def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
     """Persist open issues for a repo into the issues table — routes to the
     daemon when ``board_service`` is set (#601), else writes the local DB.
