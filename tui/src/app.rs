@@ -15754,6 +15754,24 @@ impl CoordApp {
                 });
             }
         }
+        // #628: persistent indicator for live interactive sessions. Detached
+        // sessions create no board `running` row, so they were invisible —
+        // they only showed in the one-time #487 startup toast and then piled
+        // up unseen (burning Claude Max quota, holding worktrees). This durable
+        // badge — refreshed by the background `coord sessions --remote`
+        // discovery, and independent of any board row's status (a merged row
+        // moves to Done but its session may still be live) — means you can
+        // never silently accumulate them again.
+        if !self.live_tmux_sessions.is_empty() {
+            let n = self.live_tmux_sessions.len();
+            left.push(StatusBarSegment {
+                text: format!(" ◉ {} live session{} ", n, if n == 1 { "" } else { "s" }),
+                fg: Color::rgb(150, 210, 255),
+                bg: Color::rgb(20, 45, 70),
+                bold: true,
+                action_id: None,
+            });
+        }
         // #251: persistent warning when coordinator.yml was not located at
         // startup.  Previously surfaced at the top of the bottom COMMANDS
         // panel; the status bar carries it now that the panel is gone.
@@ -32850,6 +32868,58 @@ mod tests {
         assert!(
             app.build_prompt_dialog().is_some(),
             "expected dialog to be Some"
+        );
+    }
+
+    #[test]
+    fn status_bar_surfaces_live_interactive_sessions() {
+        // #628: detached interactive sessions create no board `running` row, so
+        // they were invisible and piled up. They must show as a persistent
+        // status-bar badge whenever any are discovered.
+        let mut app = make_test_app(BoardData::default());
+        let left_text = |a: &CoordApp| {
+            a.status_bar()
+                .left_segments
+                .iter()
+                .map(|s| s.text.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        // No sessions → no badge.
+        assert!(
+            !left_text(&app).contains("live session"),
+            "no badge expected with zero sessions",
+        );
+
+        // Two live sessions → a badge with the count, regardless of board state.
+        app.live_tmux_sessions = vec![
+            LiveTmuxSession {
+                assignment_id: "a".into(),
+                issue_number: Some(1),
+                repo_name: None,
+                issue_title: None,
+            },
+            LiveTmuxSession {
+                assignment_id: "b".into(),
+                issue_number: Some(2),
+                repo_name: None,
+                issue_title: None,
+            },
+        ];
+        assert!(
+            left_text(&app).contains("2 live sessions"),
+            "expected a '2 live sessions' badge, got: {}",
+            left_text(&app),
+        );
+
+        // Singular form for one session.
+        app.live_tmux_sessions.truncate(1);
+        assert!(
+            left_text(&app).contains("1 live session ")
+                && !left_text(&app).contains("1 live sessions"),
+            "expected singular '1 live session', got: {}",
+            left_text(&app),
         );
     }
 
