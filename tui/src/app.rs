@@ -16026,26 +16026,10 @@ impl CoordApp {
         lifecycle: &BoardRowLifecycle,
     ) -> Vec<ContextMenuItem> {
         let mut items: Vec<ContextMenuItem> = Vec::new();
-        // #260: Refine is only meaningful for Backlog rows — adding
-        // `status:refining` to a row that's already In-flight or
-        // Completed would be confusing.
-        if matches!(lifecycle, BoardRowLifecycle::Backlog) {
-            // #628: "Chat about issue" replaces the two refine entries (label-only
-            // "Refine" and the metered claude -p "Refine with chat"). It's a
-            // human-attended session that can edit the issue and send it to
-            // Pending itself (`coord ready`), so refining is now an action, not a
-            // state to walk an issue through.
-            items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
-            items.push(ContextMenuItem::separator());
-        }
         // #628: Refining is ELIMINATED — New (Backlog) + Pending (status:ready)
-        // only. The classifier no longer produces a Refining bucket, so there's
-        // no Refining branch here. A Pending row can chat (which may revise it),
-        // appear in the Pipeline, or drop back to New (`coord backlog`, which
-        // strips status:ready). "Send to Pipeline" stays the explicit add-to-
-        // Pipeline (coord label).
+        // only. A Pending (Refined) row can add itself to the Pipeline or drop
+        // back to New (`coord backlog`, which strips status:ready).
         if matches!(lifecycle, BoardRowLifecycle::Refined) {
-            items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
             items.push(ContextMenuItem::action(
                 "send-to-pipeline",
                 "Send to Pipeline",
@@ -16067,6 +16051,16 @@ impl CoordApp {
                 | BoardRowLifecycle::InFlight
         ) {
             items.push(ContextMenuItem::action("board-send", "Send"));
+            items.push(ContextMenuItem::separator());
+        }
+        // #628: "Chat about issue" on EVERY issue row (any lifecycle) — a
+        // human-attended session seeded with the issue's data that can answer
+        // questions, sketch the UX, diagnose a stall, edit the issue, and send
+        // it to Pending. Replaced the refine entries (and Troubleshoot on the
+        // Pipeline). Placed after the lifecycle actions so the primary action
+        // stays the default-selected item.
+        if issue_number.is_some() {
+            items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
             items.push(ContextMenuItem::separator());
         }
         if let Some(num) = issue_number {
@@ -16362,6 +16356,11 @@ impl CoordApp {
                 ];
                 items.push(ContextMenuItem::parent("Start (automated)", automated_children));
             }
+            // #628: "Chat about issue" on EVERY pipeline row, any lifecycle — a
+            // human-attended session seeded with the issue's data: ask
+            // questions, sketch the UX, diagnose a stall, edit the issue, send it
+            // to Pending. Subsumes the old (InProgress-only) Troubleshoot.
+            items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
             items.push(ContextMenuItem::separator());
         }
         match lifecycle {
@@ -16384,14 +16383,6 @@ impl CoordApp {
                             .with_shortcut("f"),
                     );
                 }
-                // #628: Chat about issue — a human-attended session seeded with
-                // all current data (issue body + board snapshot). Subsumes the
-                // old Troubleshoot: ask anything, sketch the UX, diagnose a
-                // stall, edit the issue, and send it to Pending.
-                items.push(ContextMenuItem::action(
-                    "chat-about-issue",
-                    "Chat about issue",
-                ));
                 // Per-stage doctor: diagnose + best-effort recover + reconcile
                 // this issue's board rows (phantom 'running', dropped review
                 // findings, stale sessions, merged-but-grey).  When it can't
@@ -38211,9 +38202,10 @@ mod tests {
             Point::new(0.0, 0.0),
             board_target(Some(1), BoardRowLifecycle::InFlight),
         );
-        // #410: InFlight layout — Send / separator / Copy / separator / Refresh.
-        // First item (selected) is "board-send"; moving forward should skip
-        // the separator and land on "copy-issue-number".
+        // InFlight layout — Send / sep / Chat about issue / sep / Copy / sep /
+        // Refresh (#628 added the universal Chat after the Send group). First
+        // item (selected) is "board-send"; moving forward skips the separator
+        // and lands on "chat-about-issue".
         let state_before = app.pending_context_menu.clone().unwrap();
         app.context_menu_move_selection(1);
         let state_after = app.pending_context_menu.clone().unwrap();
@@ -38222,7 +38214,7 @@ mod tests {
             state_after.items[state_after.selected_idx]
                 .action_id
                 .as_deref(),
-            Some("copy-issue-number"),
+            Some("chat-about-issue"),
         );
     }
 
@@ -38476,6 +38468,46 @@ mod tests {
             !ids.contains(&"drop-to-refining"),
             "Drop to Refining is eliminated; got {ids:?}",
         );
+    }
+
+    #[test]
+    fn chat_about_issue_is_universal() {
+        // #628: "Chat about issue" must appear on EVERY issue row — every Board
+        // lifecycle and every Pipeline lifecycle (it was reported missing on
+        // InFlight/Refining Board rows and all Pipeline rows when first placed
+        // only on Backlog/Refined + InProgress).
+        let app = make_app_default();
+        let has_chat_board = |lc: &BoardRowLifecycle, issue: Option<u64>| -> bool {
+            app.context_menu_items_for_board_row(issue, lc)
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("chat-about-issue"))
+        };
+        for (name, lc) in [
+            ("Backlog", BoardRowLifecycle::Backlog),
+            ("Refining", BoardRowLifecycle::Refining),
+            ("Refined", BoardRowLifecycle::Refined),
+            ("InFlight", BoardRowLifecycle::InFlight),
+            ("Completed", BoardRowLifecycle::Completed),
+        ] {
+            assert!(has_chat_board(&lc, Some(42)), "Board {name} must offer Chat about issue");
+        }
+        // A section header (no issue number) must NOT offer it.
+        assert!(
+            !has_chat_board(&BoardRowLifecycle::Backlog, None),
+            "no Chat without an issue number",
+        );
+        let has_chat_pipe = |lc: &PipelineRowLifecycle| -> bool {
+            app.context_menu_items_for_pipeline_row(Some(42), lc)
+                .iter()
+                .any(|it| it.action_id.as_deref() == Some("chat-about-issue"))
+        };
+        for (name, lc) in [
+            ("New", PipelineRowLifecycle::New),
+            ("InProgress", PipelineRowLifecycle::InProgress),
+            ("Done", PipelineRowLifecycle::Done),
+        ] {
+            assert!(has_chat_pipe(&lc), "Pipeline {name} must offer Chat about issue");
+        }
     }
 
     #[test]
