@@ -287,6 +287,31 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_issue_edit(request: Request) -> Response:
+        # Edit an issue's title/body through the tracker seam (the backend write
+        # — GitHub via gh today — runs HERE on the daemon, not the client, so the
+        # tracker stays behind one seam for GitLab / bare-DB later).
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            updated = state._edit_issue_content_local(
+                body["repo_name"],
+                body["issue_number"],
+                title=body.get("title"),
+                body=body.get("body"),
+                repo_github=body.get("repo_github"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-edit write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"updated": bool(updated)})
+
     async def get_issue_context(request: Request) -> Response:
         # #603: read an issue's raw context entries (oldest-first) for the
         # briefing read-path / `coord context show` on a thin client.
@@ -572,6 +597,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/issue-labels", post_issue_labels, methods=["POST"]),
         Route("/issues-sync", post_issues_sync, methods=["POST"]),
+        Route("/issue-edit", post_issue_edit, methods=["POST"]),
         Route("/issue-context", get_issue_context, methods=["GET"]),
         Route("/issue-context", post_issue_context, methods=["POST"]),
         Route("/merge", post_merge, methods=["POST"]),

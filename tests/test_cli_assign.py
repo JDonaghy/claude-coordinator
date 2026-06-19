@@ -1250,6 +1250,56 @@ class TestAssignBriefingFileAndTroubleshoot:
         # Read-only tool set — no Edit/Write granted to the live checkout.
         assert "Read,Bash,Grep,Glob" in result.output
 
+    def test_chat_dry_run_is_edit_capable_no_worktree(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        # #628: --chat launches a human-attended chat about the issue — it can
+        # EDIT the issue (via coord, never gh) and send it to Pending, runs with
+        # no claim/worktree in the live checkout, and grants no file Edit/Write.
+        with patch("coord.github_ops.get_issue", return_value={"title": "Surface sessions"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "9",
+                    "--config", str(config_file),
+                    "--interactive", "--chat", "--dry-run",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "CHAT" in result.output
+        assert "chat about the issue" in result.output
+        assert "no worktree" in result.output
+        # Edit-capable through coord (NOT raw gh); no file Edit/Write granted.
+        assert "coord issue edit" in result.output
+        assert "coord ready" in result.output
+        assert "Read,Bash,Grep,Glob" in result.output
+
+    def test_chat_requires_interactive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "9", "--config", str(config_file), "--chat"],
+            )
+        assert result.exit_code == 2
+        assert "requires --interactive" in result.output
+
+    def test_chat_mutually_exclusive_with_troubleshoot(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "9", "--config", str(config_file),
+                    "--interactive", "--chat", "--troubleshoot",
+                ],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
 
 class TestAssignInteractiveFixFromTestFail:
     """#581: `--fix-of <work_aid>` also accepts a WORK row whose Test gate

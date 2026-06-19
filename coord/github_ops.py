@@ -34,6 +34,37 @@ def get_issue(repo: str, issue_number: int) -> dict:
     return json.loads(raw)
 
 
+def edit_issue(
+    repo: str,
+    issue_number: int,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+) -> None:
+    """Edit an issue's title and/or body. The GitHub backend of the
+    issue-tracker seam (`state.edit_issue_content`) — GitLab / bare-DB adapters
+    slot in alongside this later. The body is piped via stdin (`--body-file -`)
+    to avoid arg-length and shell-quoting issues on long markdown bodies."""
+    if title is None and body is None:
+        return
+    args = ["issue", "edit", str(issue_number), "--repo", repo]
+    if title is not None:
+        args += ["--title", title]
+    if body is not None:
+        args += ["--body-file", "-"]
+    result = subprocess.run(
+        ["gh", *args],
+        input=body if body is not None else None,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh issue edit #{issue_number} failed: {result.stderr.strip()}"
+        )
+
+
 def issue_is_closed(repo: str, issue_number: int) -> bool:
     """True when issue ``issue_number`` is closed on GitHub.
 

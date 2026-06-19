@@ -1674,10 +1674,11 @@ impl IssueGroup {
                 .unwrap_or(true) // None → "work" → workable
         });
         if !has_real_work {
-            // #226: split Pending by `status:*` label.
-            if self.labels.iter().any(|l| l == "status:refining") {
-                return "refining";
-            }
+            // #628: Refining is eliminated — New (Backlog) + Pending (Refined,
+            // status:ready) only. `status:ready` → Pending; everything else
+            // (including a legacy `status:refining` left over from before #628)
+            // → New/Backlog. Refining is now an action (Chat about issue), not a
+            // bucket an issue sits in.
             if self.labels.iter().any(|l| l == "status:ready") {
                 return "refined";
             }
@@ -16004,47 +16005,29 @@ impl CoordApp {
         // `status:refining` to a row that's already In-flight or
         // Completed would be confusing.
         if matches!(lifecycle, BoardRowLifecycle::Backlog) {
-            items.push(ContextMenuItem::action("refine", "Refine"));
-            // #264: chat-driven refinement. Spawns a `type="refinement"`
-            // claude -p worker seeded with the issue + CLAUDE.md, opens a
-            // chat overlay bound to it.  Separate from label-only Refine
-            // because it burns agent-pool credits (#264 plan).
-            items.push(ContextMenuItem::action("refine-chat", "Refine with chat"));
+            // #628: "Chat about issue" replaces the two refine entries (label-only
+            // "Refine" and the metered claude -p "Refine with chat"). It's a
+            // human-attended session that can edit the issue and send it to
+            // Pending itself (`coord ready`), so refining is now an action, not a
+            // state to walk an issue through.
+            items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
             items.push(ContextMenuItem::separator());
         }
-        // #266: Refining rows get the forward path (Mark Refined) and
-        // the backward path (Drop to Backlog).  Without these the
-        // Refining state is a dead-end in the TUI — the user has to
-        // shell out to `coord ready` to move forward.
-        //
-        // #315 follow-up: also offer "Refine with chat" here so a row
-        // that's already in Refining (because the user clicked Refine
-        // first, or because `status:refining` was set out of band) can
-        // still spawn a chat session.  The chat doesn't change the
-        // label, so re-opening it on an already-Refining row is fine.
-        if matches!(lifecycle, BoardRowLifecycle::Refining) {
-            items.push(ContextMenuItem::action("mark-refined", "Mark Refined"));
-            items.push(ContextMenuItem::action("refine-chat", "Refine with chat"));
-            items.push(ContextMenuItem::action(
-                "drop-to-backlog",
-                "Drop to Backlog",
-            ));
-            items.push(ContextMenuItem::separator());
-        }
-        // #261: Send to Pipeline is only meaningful for Refined rows
-        // (scope locked, ready to dispatch).  Pre-Refined rows still
-        // need scoping work; In-flight / Completed rows already have
-        // the `coord` label.
+        // #628: Refining is ELIMINATED — New (Backlog) + Pending (status:ready)
+        // only. The classifier no longer produces a Refining bucket, so there's
+        // no Refining branch here. A Pending row can chat (which may revise it),
+        // appear in the Pipeline, or drop back to New (`coord backlog`, which
+        // strips status:ready). "Send to Pipeline" stays the explicit add-to-
+        // Pipeline (coord label).
         if matches!(lifecycle, BoardRowLifecycle::Refined) {
+            items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
             items.push(ContextMenuItem::action(
                 "send-to-pipeline",
                 "Send to Pipeline",
             ));
-            // #266: symmetric to Mark Refined — let the user walk back
-            // to Refining if they want to re-open scoping.
             items.push(ContextMenuItem::action(
-                "drop-to-refining",
-                "Drop to Refining",
+                "drop-to-backlog",
+                "Drop to Backlog",
             ));
             items.push(ContextMenuItem::separator());
         }
@@ -16376,13 +16359,13 @@ impl CoordApp {
                             .with_shortcut("f"),
                     );
                 }
-                // #569: Troubleshoot — launch a human-attended Claude session
-                // pre-loaded with a diagnostic snapshot (assignments, merge_queue,
-                // CI, stage statuses) so the operator can pinpoint why the item
-                // is stalled and either unstick it or get the exact next step.
+                // #628: Chat about issue — a human-attended session seeded with
+                // all current data (issue body + board snapshot). Subsumes the
+                // old Troubleshoot: ask anything, sketch the UX, diagnose a
+                // stall, edit the issue, and send it to Pending.
                 items.push(ContextMenuItem::action(
-                    "troubleshoot-interactive",
-                    "Troubleshoot (interactive)",
+                    "chat-about-issue",
+                    "Chat about issue",
                 ));
                 // Per-stage doctor: diagnose + best-effort recover + reconcile
                 // this issue's board rows (phantom 'running', dropped review
@@ -19994,10 +19977,13 @@ impl CoordApp {
             // #569: Troubleshoot — human-attended diagnostic session for a
             // stalled In-progress item.  Only shown for InProgress rows;
             // the session is seeded with a full board-state snapshot.
-            "troubleshoot-interactive" => {
+            // #628: "Chat about issue" — subsumes the old Troubleshoot. Both
+            // action ids launch the Chat session (any lingering keyboard/menu
+            // path to the old id still works).
+            "chat-about-issue" | "troubleshoot-interactive" => {
                 self.pipeline_detail_tab = PipelineDetailTab::Terminal;
                 self.launch_interactive_session_for_selected_issue(
-                    InteractiveLaunchMode::Troubleshoot,
+                    InteractiveLaunchMode::Chat,
                 );
                 true
             }
@@ -20851,6 +20837,7 @@ fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "start-review-interactive" => Some("⌨"),
         "start-fix-interactive" => Some("⌨"),
         "reattach-live-session" => Some("⌨"),
+        "chat-about-issue" => Some("✦"),
         "troubleshoot-interactive" => Some("⚕"),
         "diagnose-stage" => Some("⚕"),
         "diagnose-reset" => Some("↺"),
@@ -22968,7 +22955,10 @@ impl CoordApp {
         repo: &str,
         mode: InteractiveLaunchMode,
     ) -> Option<String> {
-        if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
+        if matches!(
+            mode,
+            InteractiveLaunchMode::Troubleshoot | InteractiveLaunchMode::Chat
+        ) {
             return None;
         }
         let want_type = interactive_mode_assignment_type(mode);
@@ -23012,6 +23002,32 @@ impl CoordApp {
                     .any(|a| a.id == s.assignment_id && a.machine == machine_name)
             })
             .count()
+    }
+
+    /// #628: assemble the "all current data" briefing for a Chat about issue
+    /// session — the issue's title + body, then the same board snapshot the
+    /// troubleshooter gets (assignments / merge_queue / CI / stage statuses).
+    /// The session fetches the discussion itself (`gh issue view --comments`)
+    /// when useful, and may edit the issue via `coord issue edit` / `coord ready`.
+    fn chat_briefing(&self, coord_repo: &str, issue_num: u64) -> String {
+        let issue = self.pipeline_issues.iter().find(|p| {
+            p.number == issue_num
+                && p.coord_repo.as_deref().map(|r| r == coord_repo).unwrap_or(false)
+        });
+        let title = issue.map(|p| p.title.as_str()).unwrap_or("(title not available)");
+        let body = issue
+            .map(|p| p.body.as_str())
+            .filter(|b| !b.trim().is_empty())
+            .unwrap_or("(no body recorded)");
+        let board = self.troubleshoot_briefing(coord_repo, issue_num);
+        format!(
+            "# Chat about {coord_repo} #{issue_num}: {title}\n\n\
+             ## Issue body\n{body}\n\n\
+             ## Board snapshot\n{board}\n\n\
+             ---\nThis is the current data we have on this issue. Fetch the \
+             discussion with `gh issue view {issue_num} --comments` (read-only) \
+             if useful.\n"
+        )
     }
 
     /// #569: Build a diagnostic snapshot briefing for a Troubleshoot interactive
@@ -23234,8 +23250,12 @@ impl CoordApp {
         // machine choice (and never a reattach).  Always launch on the local
         // machine and skip both the machine picker and the reattach
         // short-circuit below.  (A picker here would offer remote machines that
-        // `coord assign --troubleshoot` rejects with "local-only".)
-        if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
+        // `coord assign --troubleshoot` rejects with "local-only".)  #628: Chat
+        // is the same — local-only, no completed-work target.
+        if matches!(
+            mode,
+            InteractiveLaunchMode::Troubleshoot | InteractiveLaunchMode::Chat
+        ) {
             let machine = self.data.local_machine.clone();
             self.launch_interactive_session_on_machine(mode, machine, None);
             return;
@@ -23786,23 +23806,37 @@ impl CoordApp {
                         _ => String::new(),
                     };
                     format!("coord reattach {}{}\r", cfg, shell_quote_arg(assignment_id))
-                } else if matches!(mode, InteractiveLaunchMode::Troubleshoot) {
-                    // #569: write the multi-line diagnostic briefing to a temp
-                    // file and launch a READ-ONLY diagnostic via
-                    // `coord assign --troubleshoot --briefing-file` as a SINGLE
-                    // physical line.  Inlining a multi-line --briefing here
-                    // would split on newlines and strand the embedded PTY shell
-                    // at `quote>` (bug #2); and --troubleshoot runs with no
-                    // claim / no worktree so it never conflicts with the
-                    // stalled item's own in-progress claim (bug #3).
-                    let briefing = self.troubleshoot_briefing(&repo, issue_num);
-                    let briefing_path = std::env::temp_dir()
-                        .join(format!("coord-troubleshoot-{issue_num}.md"));
+                } else if matches!(
+                    mode,
+                    InteractiveLaunchMode::Troubleshoot | InteractiveLaunchMode::Chat
+                ) {
+                    // #569/#628: write the multi-line briefing to a temp file and
+                    // launch via `coord assign --troubleshoot|--chat --briefing-file`
+                    // as a SINGLE physical line.  Inlining a multi-line --briefing
+                    // would split on newlines and strand the embedded PTY shell at
+                    // `quote>`; and both run with no claim / no worktree so they
+                    // never conflict with the item's in-progress claim.
+                    let is_chat = matches!(mode, InteractiveLaunchMode::Chat);
+                    let (briefing, flag, fname) = if is_chat {
+                        (
+                            self.chat_briefing(&repo, issue_num),
+                            "--chat",
+                            format!("coord-chat-{issue_num}.md"),
+                        )
+                    } else {
+                        (
+                            self.troubleshoot_briefing(&repo, issue_num),
+                            "--troubleshoot",
+                            format!("coord-troubleshoot-{issue_num}.md"),
+                        )
+                    };
+                    let briefing_path = std::env::temp_dir().join(fname);
                     // Best-effort write; if it fails, `coord assign` surfaces a
                     // clear "file not found" error in the terminal rather than
                     // silently launching with no briefing.
                     let _ = std::fs::write(&briefing_path, &briefing);
-                    build_troubleshoot_launch_cmd(
+                    build_briefed_interactive_launch_cmd(
+                        flag,
                         cfg_path.as_deref(),
                         &briefing_path.to_string_lossy(),
                         &machine,
@@ -23859,7 +23893,8 @@ impl CoordApp {
                     InteractiveLaunchMode::Work
                     | InteractiveLaunchMode::Plan
                     | InteractiveLaunchMode::Fix
-                    | InteractiveLaunchMode::Troubleshoot => {
+                    | InteractiveLaunchMode::Troubleshoot
+                    | InteractiveLaunchMode::Chat => {
                         let prior_done_ids = self.done_work_aids_for(&repo, issue_num);
                         self.armed_for_auto_review.insert(
                             issue_key.clone(),
@@ -23923,6 +23958,7 @@ impl CoordApp {
                         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
                         InteractiveLaunchMode::Test => "testing",
                         InteractiveLaunchMode::Merge => "merge",
+                        InteractiveLaunchMode::Chat => "chat",
                     };
                     format!(
                         "Launching interactive {} session for {} #{} …",
@@ -24040,10 +24076,10 @@ enum InteractiveLaunchMode {
     /// the REVIEW id (request-changes path) or the WORK id (test-fail path).
     Fix,
     /// #569: human-attended diagnostic session for a stalled pipeline item.
-    /// Opens an interactive Claude Max session seeded with a snapshot of all
-    /// board state (assignments, merge_queue, CI checks, stage statuses) plus
-    /// a playbook of common stall patterns, so the operator can diagnose and
-    /// unstick the item without manual DB spelunking.
+    /// Superseded by `Chat` (#628), which subsumes diagnosis — the TUI no longer
+    /// constructs this. Retained because the `coord assign --troubleshoot` CLI
+    /// path and the launch helpers still model it.
+    #[allow(dead_code)]
     Troubleshoot,
     /// Leg 3c / A3 (#517, #350, #581): human-attended TESTING agent for a
     /// completed work assignment.  Lists the smoke tests, pulls the artifact,
@@ -24055,6 +24091,13 @@ enum InteractiveLaunchMode {
     /// conflicts, pushes.  Emits `coord assign --interactive --merge-of
     /// <work_aid> …`.  `work_aid` is the WORK id.
     Merge,
+    /// #628: human-attended "Chat about issue" — a live interactive session
+    /// seeded with all current data about the issue (body + board snapshot).
+    /// Open Q&A / UX sketching / stall diagnosis; MAY edit the issue (`coord
+    /// issue edit`) and send it to Pending (`coord ready`). Like Troubleshoot:
+    /// local-only, no claim/worktree, briefed-from-file. Emits `coord assign
+    /// --interactive --chat …`.
+    Chat,
 }
 
 /// #486: short verb for an interactive launch mode — used in the machine-picker
@@ -24068,6 +24111,7 @@ fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str {
         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
         InteractiveLaunchMode::Test => "testing",
         InteractiveLaunchMode::Merge => "merge",
+        InteractiveLaunchMode::Chat => "chat",
     }
 }
 
@@ -24085,6 +24129,8 @@ fn interactive_mode_assignment_type(mode: InteractiveLaunchMode) -> &'static str
         InteractiveLaunchMode::Test => "smoke",
         InteractiveLaunchMode::Merge => "merge",
         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
+        // Chat never reattaches (callers guard); sentinel matches nothing.
+        InteractiveLaunchMode::Chat => "chat",
     }
 }
 
@@ -24183,6 +24229,12 @@ fn build_interactive_launch_cmd(
             "Troubleshoot mode must not reach build_interactive_launch_cmd — \
              handle it in the caller with the troubleshoot_briefing path"
         ),
+        // #628: Chat, like Troubleshoot, is built from the briefing-file path in
+        // the caller (chat_briefing) — never here.
+        InteractiveLaunchMode::Chat => unreachable!(
+            "Chat mode must not reach build_interactive_launch_cmd — \
+             handle it in the caller with the chat_briefing path"
+        ),
         InteractiveLaunchMode::Test => {
             // Leg 3c / A3 (#517): `coord assign --interactive --smoke-of
             // <work_aid>` launches the human-attended testing agent in the live
@@ -24216,20 +24268,24 @@ fn build_interactive_launch_cmd(
 /// no worktree, so it never conflicts with the In-progress item's own claim
 /// (bug #3).  The returned line is a single physical line; the trailing `\r`
 /// is the submit key, not a line break.
-fn build_troubleshoot_launch_cmd(
+fn build_briefed_interactive_launch_cmd(
+    flag: &str,
     config_path: Option<&str>,
     briefing_file: &str,
     machine: &str,
     repo: &str,
     issue_num: u64,
 ) -> String {
+    // Shared launcher for the briefing-file flavours (`--troubleshoot`, `--chat`)
+    // — both pass a SINGLE physical line with the multi-line briefing on disk.
     let cfg = match config_path {
         Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
         _ => String::new(),
     };
     format!(
-        "coord assign {}--interactive --troubleshoot --briefing-file {} {} {} {}\r",
+        "coord assign {}--interactive {} --briefing-file {} {} {} {}\r",
         cfg,
+        flag,
         shell_quote_arg(briefing_file),
         shell_quote_arg(machine),
         shell_quote_arg(repo),
@@ -30700,9 +30756,10 @@ mod tests {
     }
 
     #[test]
-    fn board_lifecycle_splits_pending_into_backlog_refining_refined() {
-        // #226: open issues without assignments split into three
-        // sections by their `status:*` label set.
+    fn board_lifecycle_splits_pending_into_backlog_and_refined() {
+        // #628: Refining is eliminated — open issues without assignments split
+        // into just New (Backlog) + Pending (Refined, status:ready). A legacy
+        // `status:refining` label folds into Backlog (New).
         let mut app = make_app_default();
         // No labels → Backlog
         app.data.open_issues.push(OpenIssue {
@@ -30715,18 +30772,18 @@ mod tests {
             milestone_number: None,
             milestone_title: None,
         });
-        // status:refining → Refining
+        // legacy status:refining → now Backlog (New), no Refining bucket
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
             number: 2,
-            title: "in scoping".to_string(),
+            title: "legacy refining".to_string(),
             body: String::new(),
             state: "open".to_string(),
             labels: vec!["status:refining".to_string()],
             milestone_number: None,
             milestone_title: None,
         });
-        // status:ready → Refined
+        // status:ready → Refined (Pending)
         app.data.open_issues.push(OpenIssue {
             repo_name: "repo-a".to_string(),
             number: 3,
@@ -30742,9 +30799,13 @@ mod tests {
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
         let by_key: std::collections::HashMap<&str, usize> =
             groups.iter().map(|(k, v)| (*k, v.len())).collect();
-        assert_eq!(by_key.get("backlog"), Some(&1), "Backlog count");
-        assert_eq!(by_key.get("refining"), Some(&1), "Refining count");
-        assert_eq!(by_key.get("refined"), Some(&1), "Refined count");
+        assert_eq!(
+            by_key.get("backlog"),
+            Some(&2),
+            "Backlog/New count (raw + legacy status:refining)",
+        );
+        assert_eq!(by_key.get("refining"), None, "Refining bucket is eliminated");
+        assert_eq!(by_key.get("refined"), Some(&1), "Refined/Pending count");
     }
 
     #[test]
@@ -30816,9 +30877,12 @@ mod tests {
         let cache = app.board_issues_cache.clone();
         let groups = app.board_grouped_for_repo(&cache, "repo-a");
         let order: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
+        // #628: Refining is eliminated — order is New (Backlog) → Pending
+        // (Refined) → In-flight → Completed. The legacy status:refining issue
+        // (#2) now sits in Backlog, so there's no "refining" section.
         assert_eq!(
             order,
-            vec!["backlog", "refining", "refined", "in-flight", "completed"],
+            vec!["backlog", "refined", "in-flight", "completed"],
         );
     }
 
@@ -38170,17 +38234,20 @@ mod tests {
     // ── #260: Refine right-click action ─────────────────────────────────
 
     #[test]
-    fn backlog_row_context_menu_offers_refine() {
-        // The Refine action is only meaningful for Backlog rows — it'd
-        // be misleading on In-flight / Completed.
+    fn backlog_row_context_menu_offers_chat_not_refine() {
+        // #628: "Chat about issue" replaces the two refine entries on a New
+        // (Backlog) row; refining is now an action (the chat can `coord ready`),
+        // not a state.
         let app = make_app_default();
         let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Backlog);
+        let ids: Vec<&str> = items.iter().filter_map(|it| it.action_id.as_deref()).collect();
         assert!(
-            items
-                .iter()
-                .any(|it| it.action_id.as_deref() == Some("refine")),
-            "Backlog menu must include Refine; got {:?}",
-            items.iter().map(|it| &it.label).collect::<Vec<_>>(),
+            ids.contains(&"chat-about-issue"),
+            "Backlog menu must include Chat about issue; got {ids:?}",
+        );
+        assert!(
+            !ids.contains(&"refine") && !ids.contains(&"refine-chat"),
+            "the refine entries are gone; got {ids:?}",
         );
     }
 
@@ -38333,41 +38400,33 @@ mod tests {
     // ── #266: Refining row right-click actions ──────────────────────────
 
     #[test]
-    fn refining_row_context_menu_offers_mark_refined_and_drop_to_backlog() {
-        // Refining was a UX dead-end before #266 — users had to shell
-        // out to `coord ready`.  Both directions are now in the menu.
+    fn refining_lifecycle_no_longer_offers_refine_actions() {
+        // #628: Refining is eliminated. The classifier never produces a Refining
+        // row anymore, and even if one is constructed directly, the menu offers
+        // none of the old refine state-transitions (mark-refined / drop-to-refining
+        // / refine / refine-chat) — only the global actions.
         let app = make_app_default();
         let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Refining);
-        let action_ids: Vec<&str> = items
-            .iter()
-            .filter_map(|it| it.action_id.as_deref())
-            .collect();
-        assert!(
-            action_ids.contains(&"mark-refined"),
-            "Refining menu must offer Mark Refined; got {:?}",
-            action_ids,
-        );
-        assert!(
-            action_ids.contains(&"drop-to-backlog"),
-            "Refining menu must offer Drop to Backlog; got {:?}",
-            action_ids,
-        );
+        let ids: Vec<&str> = items.iter().filter_map(|it| it.action_id.as_deref()).collect();
+        for gone in ["mark-refined", "drop-to-refining", "refine", "refine-chat"] {
+            assert!(!ids.contains(&gone), "{gone} must be eliminated; got {ids:?}");
+        }
     }
 
     #[test]
-    fn refined_row_context_menu_offers_drop_to_refining() {
-        // Symmetric escape hatch — let the user re-open scoping on a
-        // Refined row without dropping all the way to Backlog.
+    fn refined_row_context_menu_offers_chat_and_drop_to_backlog() {
+        // #628: a Pending (Refined / status:ready) row can chat, add itself to
+        // the Pipeline, or drop straight back to New (Backlog) — there is no
+        // intermediate Refining state to drop to.
         let app = make_app_default();
         let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Refined);
-        let action_ids: Vec<&str> = items
-            .iter()
-            .filter_map(|it| it.action_id.as_deref())
-            .collect();
+        let ids: Vec<&str> = items.iter().filter_map(|it| it.action_id.as_deref()).collect();
+        assert!(ids.contains(&"chat-about-issue"), "Pending offers Chat; got {ids:?}");
+        assert!(ids.contains(&"send-to-pipeline"), "Pending offers Send to Pipeline; got {ids:?}");
+        assert!(ids.contains(&"drop-to-backlog"), "Pending offers Drop to Backlog; got {ids:?}");
         assert!(
-            action_ids.contains(&"drop-to-refining"),
-            "Refined menu must offer Drop to Refining; got {:?}",
-            action_ids,
+            !ids.contains(&"drop-to-refining"),
+            "Drop to Refining is eliminated; got {ids:?}",
         );
     }
 
@@ -38804,9 +38863,10 @@ mod tests {
     // ── #569: Troubleshoot right-click action ────────────────────────────────
 
     #[test]
-    fn pipeline_in_progress_row_offers_troubleshoot() {
-        // InProgress rows must include the Troubleshoot action so the
-        // operator can launch a diagnostic session for a stalled item.
+    fn pipeline_in_progress_row_offers_chat_about_issue() {
+        // #628: "Chat about issue" subsumes the old Troubleshoot on InProgress
+        // rows — a human-attended session seeded with all the issue's data that
+        // can also diagnose a stall.
         let app = make_app_default();
         let items =
             app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
@@ -38815,8 +38875,13 @@ mod tests {
             .filter_map(|it| it.action_id.as_deref())
             .collect();
         assert!(
-            action_ids.contains(&"troubleshoot-interactive"),
-            "Pipeline:InProgress menu must offer Troubleshoot; got {:?}",
+            action_ids.contains(&"chat-about-issue"),
+            "Pipeline:InProgress menu must offer Chat about issue; got {:?}",
+            action_ids,
+        );
+        assert!(
+            !action_ids.contains(&"troubleshoot-interactive"),
+            "the old Troubleshoot item is replaced by Chat; got {:?}",
             action_ids,
         );
     }
@@ -38877,6 +38942,22 @@ mod tests {
             "briefing must reference repo 'api'; got: {}",
             &briefing[..briefing.len().min(200)],
         );
+    }
+
+    #[test]
+    fn chat_briefing_includes_issue_header_and_board() {
+        // #628: the Chat briefing carries the issue title + body AND reuses the
+        // board snapshot, so the session opens with all current data.
+        let app = make_pipeline_app(); // seeds issue 42 "Add cool thing"
+        let briefing = app.chat_briefing("api", 42);
+        assert!(
+            briefing.contains("Chat about api #42"),
+            "header: {}",
+            &briefing[..briefing.len().min(120)],
+        );
+        assert!(briefing.contains("Add cool thing"), "issue title present");
+        assert!(briefing.contains("Issue body"), "has an issue-body section");
+        assert!(briefing.contains("Board snapshot"), "embeds the board snapshot");
     }
 
     #[test]
@@ -43369,7 +43450,8 @@ mod tests {
         // #569 bugs #2 and #3: Troubleshoot must launch as a single physical
         // line with the briefing passed BY FILE (not inlined) and via the
         // read-only --troubleshoot mode (not a claim-gated work dispatch).
-        let cmd = build_troubleshoot_launch_cmd(
+        let cmd = build_briefed_interactive_launch_cmd(
+            "--troubleshoot",
             None,
             "/tmp/coord-troubleshoot-42.md",
             "elitebook",
