@@ -5695,8 +5695,8 @@ fn kanban_stage_badges(g: &IssueGroup) -> Vec<(Stage, BadgeStatus)> {
             .filter_map(|a| a.review_verdict.as_deref())
             .last();
         match verdict {
-            Some("approved") => BadgeStatus::Passed,
-            Some("changes_requested") => BadgeStatus::RequestChanges,
+            Some("approve") => BadgeStatus::Passed,
+            Some("request-changes") => BadgeStatus::RequestChanges,
             Some(_) => BadgeStatus::Running,
             None => BadgeStatus::Pending,
         }
@@ -7831,6 +7831,12 @@ impl CoordApp {
         let new_kanban = self.build_kanban_model();
         let old_sel = self.kanban_model.selected_card_id.clone();
         let old_col_scroll = self.kanban_model.col_scroll_offset;
+        // Preserve per-column vertical scroll offsets so a background data
+        // refresh does not snap the user's view back to the top (review issue 3).
+        let old_vert_offsets: Vec<(WidgetId, usize)> = self.kanban_model.columns
+            .iter()
+            .map(|c| (c.id.clone(), c.scroll_offset))
+            .collect();
         self.kanban_model = new_kanban;
         if let Some(sel) = &old_sel {
             let still_exists = self.kanban_model.columns.iter()
@@ -7840,6 +7846,12 @@ impl CoordApp {
             }
         }
         self.kanban_model.col_scroll_offset = old_col_scroll;
+        // Restore per-column vertical scroll offsets.
+        for col in &mut self.kanban_model.columns {
+            if let Some((_, offset)) = old_vert_offsets.iter().find(|(id, _)| id == &col.id) {
+                col.scroll_offset = *offset;
+            }
+        }
     }
 
     /// Repo section offset: 1 for the search form + 1 more if proposals exist.
@@ -7910,16 +7922,50 @@ impl CoordApp {
 
     /// Clamp the focused column's scroll offset so the selected card is visible.
     fn kanban_clamp_col_scroll(&mut self) {
+        // Compute the selected card's (col_index, card_index) before the
+        // mutable borrow of kanban_model.columns below.  We replicate the
+        // logic of quadraui's private `BoardModel::selected_position()`.
+        let sel_pos: (Option<usize>, Option<usize>) = {
+            let mut result = (None, None);
+            if let Some(id) = self.kanban_model.selected_card_id.as_ref() {
+                'outer: for (ci, col) in self.kanban_model.columns.iter().enumerate() {
+                    for (ri, c) in col.cards.iter().enumerate() {
+                        if &c.id == id {
+                            result = (Some(ci), Some(ri));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            result
+        };
+        let (sel_col, sel_card_idx) = sel_pos;
+
         if let Some(layout) = self.kanban_layout.borrow().as_ref() {
             for col_layout in &layout.columns {
-                let col = &mut self.kanban_model.columns[col_layout.col_index];
+                let ci = col_layout.col_index;
+                let col = &mut self.kanban_model.columns[ci];
                 let visible = col_layout.visible_cards.max(1);
                 let total = col.cards.len();
-                if total > visible {
-                    col.scroll_offset = col.scroll_offset.min(total - visible);
-                } else {
+                if total == 0 {
                     col.scroll_offset = 0;
+                    continue;
                 }
+                // Scroll-follow: adjust the window so the selected card stays
+                // visible.  Only applies to the column that owns the selection.
+                if sel_col == Some(ci) {
+                    if let Some(idx) = sel_card_idx {
+                        if idx < col.scroll_offset {
+                            // Selection scrolled above the top of the window.
+                            col.scroll_offset = idx;
+                        } else if idx >= col.scroll_offset + visible {
+                            // Selection scrolled below the bottom of the window.
+                            col.scroll_offset = (idx + 1).saturating_sub(visible);
+                        }
+                    }
+                }
+                // Upper-bound clamp so we never show empty rows at the bottom.
+                col.scroll_offset = col.scroll_offset.min(total.saturating_sub(visible));
             }
         }
     }
@@ -15942,7 +15988,8 @@ impl CoordApp {
                 }
                 true
             }
-            // #638: Kanban — wheel events are ignored (Board widget handles its own scrolling).
+            // #638: Kanban — mouse wheel scroll not yet implemented in v1;
+            // keyboard navigation (j/k/h/l) works.
             SidebarView::Kanban => true,
         }
     }
@@ -44489,6 +44536,184 @@ mod tests {
         assert!(
             err.contains("subtract with overflow"),
             "error must include vt100 message; got: {err}"
+        );
+    }
+
+    // ── #638: Kanban view unit tests ─────────────────────────────────────────
+
+    /// Helper: build a minimal `IssueGroup` for tests.
+    fn make_issue_group(status: &str, assignments: Vec<Assignment>) -> IssueGroup {
+        IssueGroup {
+            issue_number: 1,
+            issue_title: "Test issue".to_string(),
+            assignments,
+            status_summary: status.to_string(),
+            is_closed: false,
+            has_open_record: true,
+            labels: vec![],
+            milestone_number: None,
+            milestone_title: None,
+        }
+    }
+
+    /// `kanban_stage_badges` must use the coord-native verdict strings
+    /// (`"approve"` / `"request-changes"`), not the GitHub REST API names
+    /// (`"approved"` / `"changes_requested"`).
+    #[test]
+    fn kanban_stage_badges_review_verdict_approve() {
+        let mut a = make_assignment_typed("done", 1, "repo-a", Some("review"));
+        a.review_verdict = Some("approve".to_string());
+        let g = make_issue_group("done", vec![a]);
+        let badges = kanban_stage_badges(&g);
+        let review = badges.iter().find(|(s, _)| *s == Stage::Review).unwrap();
+        assert_eq!(review.1, BadgeStatus::Passed,
+            "\"approve\" verdict must yield Passed badge");
+    }
+
+    #[test]
+    fn kanban_stage_badges_review_verdict_request_changes() {
+        let mut a = make_assignment_typed("done", 1, "repo-a", Some("review"));
+        a.review_verdict = Some("request-changes".to_string());
+        let g = make_issue_group("done", vec![a]);
+        let badges = kanban_stage_badges(&g);
+        let review = badges.iter().find(|(s, _)| *s == Stage::Review).unwrap();
+        assert_eq!(review.1, BadgeStatus::RequestChanges,
+            "\"request-changes\" verdict must yield RequestChanges badge");
+    }
+
+    /// The GitHub REST names must NOT match the coord-native arms; they should
+    /// fall through to `Some(_)` → `Running`.
+    #[test]
+    fn kanban_stage_badges_github_names_do_not_match_native_arms() {
+        let mut a = make_assignment_typed("done", 1, "repo-a", Some("review"));
+        a.review_verdict = Some("approved".to_string()); // wrong/GitHub name
+        let g = make_issue_group("done", vec![a]);
+        let badges = kanban_stage_badges(&g);
+        let review = badges.iter().find(|(s, _)| *s == Stage::Review).unwrap();
+        assert_eq!(review.1, BadgeStatus::Running,
+            "GitHub-style \"approved\" must not match the coord-native arm");
+    }
+
+    #[test]
+    fn kanban_stage_badges_no_verdict_is_pending() {
+        let a = make_assignment_typed("running", 1, "repo-a", Some("work"));
+        let g = make_issue_group("running", vec![a]);
+        let badges = kanban_stage_badges(&g);
+        let review = badges.iter().find(|(s, _)| *s == Stage::Review).unwrap();
+        assert_eq!(review.1, BadgeStatus::Pending,
+            "no review_verdict must yield Pending badge");
+    }
+
+    #[test]
+    fn kanban_stage_badges_work_running() {
+        let a = make_assignment_typed("running", 1, "repo-a", Some("work"));
+        let g = make_issue_group("running", vec![a]);
+        let badges = kanban_stage_badges(&g);
+        let work = badges.iter().find(|(s, _)| *s == Stage::Work).unwrap();
+        assert_eq!(work.1, BadgeStatus::Running,
+            "running assignment must yield Running work badge");
+    }
+
+    #[test]
+    fn kanban_stage_badges_merge_status_when_merged() {
+        let g = make_issue_group("merged", vec![]);
+        let badges = kanban_stage_badges(&g);
+        let merge = badges.iter().find(|(s, _)| *s == Stage::Merge).unwrap();
+        assert_eq!(merge.1, BadgeStatus::Passed,
+            "merged status must yield Passed merge badge");
+    }
+
+    /// `build_kanban_model` must route issues to the correct Kanban columns
+    /// based on `lifecycle_section()`.
+    ///
+    /// Lifecycle rules (relevant subset):
+    /// - Only workable assignment types (`work`, `review`, `smoke`, `conflict-fix`,
+    ///   `fix-N`) count for routing; non-workable types (`refinement`,
+    ///   `test-chat`, `new-issue-chat`) leave the issue in Backlog.
+    /// - An issue with a running workable assignment AND `is_closed = false`
+    ///   lands in In Flight.
+    /// - An issue with `is_closed = true` lands in Completed.
+    #[test]
+    fn build_kanban_model_buckets_issues_correctly() {
+        // Backlog: only a non-workable (refinement) assignment — does NOT drag
+        // the issue into In-flight (is_workable_type("refinement") == false).
+        let backlog_a = make_assignment_typed("pending", 1, "repo-a", Some("refinement"));
+        // In-flight: running workable assignment on an open issue.
+        let inflight_a = make_assignment_typed("running", 2, "repo-a", Some("work"));
+        // Completed: done workable assignment; issue will be marked closed below.
+        let completed_a = make_assignment_typed("done", 3, "repo-a", Some("work"));
+
+        let assignments = vec![backlog_a, inflight_a, completed_a];
+        let mut app = make_app_with_assignments(assignments);
+
+        // Mark issue 3 as closed in the cache so lifecycle_section → "completed".
+        for (_, groups) in &mut app.board_issues_cache {
+            for g in groups.iter_mut() {
+                if g.issue_number == 3 {
+                    g.is_closed = true;
+                }
+            }
+        }
+
+        let model = app.build_kanban_model();
+        assert_eq!(model.columns.len(), 3, "model must have 3 columns");
+
+        let backlog_col = model.columns.iter().find(|c| c.title == "Backlog").unwrap();
+        let inflight_col = model.columns.iter().find(|c| c.title == "In Flight").unwrap();
+        let completed_col = model.columns.iter().find(|c| c.title == "Completed").unwrap();
+
+        assert_eq!(backlog_col.cards.len(), 1,
+            "backlog column must contain the refinement-only issue (non-workable type)");
+        assert_eq!(inflight_col.cards.len(), 1,
+            "in-flight column must contain the running work issue");
+        assert_eq!(completed_col.cards.len(), 1,
+            "completed column must contain the closed+done issue");
+    }
+
+    /// `build_kanban_model` card ids must follow the `card:<repo>:<issue>` format
+    /// so that `kanban_open_card` can parse them correctly.
+    #[test]
+    fn build_kanban_model_card_id_format() {
+        let a = make_assignment_typed("running", 42, "my-repo", Some("work"));
+        let mut app = make_app_with_assignments(vec![a]);
+        app.rebuild_board_sidebar();
+        let model = app.build_kanban_model();
+        let all_cards: Vec<_> = model.columns.iter().flat_map(|c| c.cards.iter()).collect();
+        assert!(!all_cards.is_empty(), "must have at least one card");
+        for card in &all_cards {
+            let s = card.id.as_str();
+            assert!(s.starts_with("card:"),
+                "card id must start with 'card:'; got: {s}");
+            let parts: Vec<&str> = s.splitn(3, ':').collect();
+            assert_eq!(parts.len(), 3,
+                "card id must have 3 colon-separated parts; got: {s}");
+            // Third part must parse as a number.
+            parts[2].parse::<u64>()
+                .unwrap_or_else(|_| panic!("third part of card id must be u64; got: {s}"));
+        }
+    }
+
+    /// After `rebuild_board_sidebar`, per-column vertical scroll offsets
+    /// must survive the rebuild unchanged (not reset to 0).
+    #[test]
+    fn rebuild_board_sidebar_preserves_kanban_column_scroll() {
+        let a1 = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let a2 = make_assignment_typed("running", 20, "repo-a", Some("work"));
+        let mut app = make_app_with_assignments(vec![a1, a2]);
+        app.rebuild_board_sidebar();
+
+        // Simulate the user having scrolled the In Flight column down.
+        let inflight_idx = app.kanban_model.columns.iter()
+            .position(|c| c.title == "In Flight")
+            .unwrap();
+        app.kanban_model.columns[inflight_idx].scroll_offset = 1;
+
+        // A background data refresh triggers rebuild.
+        app.rebuild_board_sidebar();
+
+        assert_eq!(
+            app.kanban_model.columns[inflight_idx].scroll_offset, 1,
+            "per-column scroll offset must survive rebuild_board_sidebar"
         );
     }
 }
