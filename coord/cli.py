@@ -2888,6 +2888,15 @@ def assign(
                     started_at=started_at,
                     log_path=None,
                     repo_path=None,
+                    # #617: this review ran on the REMOTE host, so its Claude
+                    # session transcript lives THERE — hand the transcript-floor
+                    # the ssh target so it recovers the verdict + findings from
+                    # the session's OWN host instead of scanning this (blind)
+                    # coordinator's `~/.claude/projects`.  Without it the #606
+                    # recovery always misses for a remote review and the exit
+                    # falls straight to the operator prompt (the #607 silent
+                    # drop).  Mirrors the `coord reattach` remote-review path.
+                    ssh_target=machine_obj.host,
                 )
                 if finalize_result.already_recorded:
                     click.echo("  verdict recorded via `coord report-result`")
