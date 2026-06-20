@@ -188,4 +188,55 @@ def _default_branch_lookup(repo_github: str, issue_number: int) -> list[str]:
         ref = r.get("ref", "")
         if isinstance(ref, str) and ref.startswith("refs/heads/"):
             branches.append(ref[len("refs/heads/"):])
-    return branches
+    # Drop branches already fully merged into the default branch — a merged
+    # branch is finished work, not an active claim. A stale merged branch (e.g. a
+    # PR head that wasn't auto-deleted on merge) must not block new work on the
+    # issue forever (the chat→work block on a long-merged issue-N-* branch).
+    return _drop_merged_branches(repo_github, branches)
+
+
+def _repo_default_branch(repo_github: str) -> str | None:
+    """The repo's default branch via the GH API, or None on any error."""
+    from coord import github_ops
+
+    try:
+        data = json.loads(github_ops._gh("api", f"repos/{repo_github}"))
+    except (RuntimeError, ValueError):
+        return None
+    val = data.get("default_branch") if isinstance(data, dict) else None
+    return val if isinstance(val, str) and val else None
+
+
+def _drop_merged_branches(repo_github: str, branches: list[str]) -> list[str]:
+    """Filter out branches fully merged into the repo's default branch.
+
+    A branch with zero commits ahead of the default branch is finished work,
+    not an active claim, so it must not block a fresh dispatch. Conservative on
+    every uncertainty — unknown default branch, compare-API error, or a branch
+    that IS ahead — keeps the branch as a claim (fail toward blocking duplicate
+    work, never toward allowing it).
+    """
+    if not branches:
+        return branches
+    from coord import github_ops
+
+    default_branch = _repo_default_branch(repo_github)
+    if not default_branch:
+        return branches  # can't determine merged-ness → keep all (conservative)
+    kept: list[str] = []
+    for b in branches:
+        if b == default_branch:
+            continue
+        try:
+            cmp = json.loads(
+                github_ops._gh(
+                    "api", f"repos/{repo_github}/compare/{default_branch}...{b}"
+                )
+            )
+            ahead = cmp.get("ahead_by") if isinstance(cmp, dict) else None
+        except (RuntimeError, ValueError):
+            ahead = None
+        if ahead == 0:
+            continue  # fully merged → not an active claim
+        kept.append(b)  # ahead > 0, or unknown → keep (conservative)
+    return kept

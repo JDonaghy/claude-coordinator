@@ -457,3 +457,99 @@ def test_dispatch_review_proceeds_when_no_active_work() -> None:
     )
     assert result is not None
     assert posted, "expected an HTTP POST to dispatch the review"
+
+
+# ── merged-branch filter: stale merged branches don't block work ─────────────
+# A fully-merged issue-N-* branch (e.g. a PR head not auto-deleted) must NOT be
+# treated as an active claim — otherwise it blocks new work on the issue forever
+# (the chat→work block on a long-merged branch).
+
+
+def _gh_stub(default_branch: str, ahead_by: dict[str, int]):
+    """github_ops._gh stub: serves the repo default branch and per-head compare
+    `ahead_by` based on the API path (`_gh("api", "<path>")`)."""
+    import json
+
+    def _fake(*args, **kwargs):
+        path = args[1] if len(args) > 1 else ""
+        if "/compare/" in path:
+            head = path.split("...", 1)[1]
+            return json.dumps({"ahead_by": ahead_by.get(head, 1)})
+        return json.dumps({"default_branch": default_branch})
+
+    return _fake
+
+
+def test_drop_merged_branches_drops_fully_merged(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr("coord.github_ops._gh", _gh_stub("main", {"issue-9-done": 0}))
+    assert claim_mod._drop_merged_branches("acme/api", ["issue-9-done"]) == []
+
+
+def test_drop_merged_branches_keeps_unmerged(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    monkeypatch.setattr("coord.github_ops._gh", _gh_stub("main", {"issue-9-live": 3}))
+    assert claim_mod._drop_merged_branches("acme/api", ["issue-9-live"]) == [
+        "issue-9-live"
+    ]
+
+
+def test_drop_merged_branches_keeps_on_compare_error(monkeypatch) -> None:
+    import json
+
+    import coord.claim as claim_mod
+
+    def _fake(*a, **k):
+        if "/compare/" in a[1]:
+            raise RuntimeError("gh down")
+        return json.dumps({"default_branch": "main"})
+
+    monkeypatch.setattr("coord.github_ops._gh", _fake)
+    assert claim_mod._drop_merged_branches("acme/api", ["issue-9-x"]) == ["issue-9-x"]
+
+
+def test_drop_merged_branches_keeps_when_default_unknown(monkeypatch) -> None:
+    import coord.claim as claim_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("gh down")
+
+    monkeypatch.setattr("coord.github_ops._gh", _boom)
+    assert claim_mod._drop_merged_branches("acme/api", ["issue-9-x"]) == ["issue-9-x"]
+
+
+def test_find_work_claim_skips_merged_remote_branch(monkeypatch) -> None:
+    """End-to-end: a fully-merged issue-N-* branch must NOT claim the issue."""
+    import json
+
+    def _fake(*args, **kwargs):
+        path = args[1]
+        if "matching-refs" in path:
+            return json.dumps([{"ref": "refs/heads/issue-319-old"}])
+        if "/compare/" in path:
+            return json.dumps({"ahead_by": 0})  # fully merged
+        return json.dumps({"default_branch": "main"})
+
+    monkeypatch.setattr("coord.github_ops._gh", _fake)
+    # No branch_lookup override → exercises _default_branch_lookup + the filter.
+    assert find_work_claim(319, "api", "acme/api", Board()) is None
+
+
+def test_find_work_claim_still_blocks_unmerged_remote_branch(monkeypatch) -> None:
+    """An unmerged issue-N-* branch still claims the issue (no regression)."""
+    import json
+
+    def _fake(*args, **kwargs):
+        path = args[1]
+        if "matching-refs" in path:
+            return json.dumps([{"ref": "refs/heads/issue-319-active"}])
+        if "/compare/" in path:
+            return json.dumps({"ahead_by": 2})  # unmerged work
+        return json.dumps({"default_branch": "main"})
+
+    monkeypatch.setattr("coord.github_ops._gh", _fake)
+    claim = find_work_claim(319, "api", "acme/api", Board())
+    assert claim is not None
+    assert claim.branch == "issue-319-active"
