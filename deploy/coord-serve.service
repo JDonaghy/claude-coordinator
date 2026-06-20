@@ -15,8 +15,9 @@
 #   - ~/.coord-venv has a coord BUILD that includes `coord serve` (a release
 #     >= the #584/#590 cut, or an editable checkout of the branch). PyPI
 #     releases before that do NOT have the command.
-#   - ~/coordinator.yml exists (the daemon serves it at GET /config so clients
-#     need none).
+#   - ~/.coord/coordinator.yml exists (canonical location; the daemon serves it
+#     at GET /config so clients need none). Resolution: $COORD_CONFIG →
+#     ~/.coord/coordinator.yml → ./coordinator.yml.
 #   - ~/.coord/coord.db exists (after the one-time cutover/ETL).
 #   - Bearer token (recommended): printf '%s' "<secret>" > ~/.coord/serve_token
 #     && chmod 600 ~/.coord/serve_token   (resolve_serve_token reads it; never
@@ -31,7 +32,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.coord-venv/bin/coord serve --config %h/coordinator.yml --host 0.0.0.0 --port 7435
+ExecStart=%h/.coord-venv/bin/coord serve --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7435
 Restart=on-failure
 RestartSec=3
 
