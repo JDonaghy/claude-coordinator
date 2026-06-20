@@ -3232,12 +3232,16 @@ def assign(
                     "the Pending stage with `coord ready <repo> <issue>` — confirm "
                     "with the operator before each write. Do NOT edit files in this "
                     "live checkout, do NOT commit, and do NOT run `gh` to mutate — "
-                    "go through `coord` so the tracker stays behind the seam."
+                    "go through `coord` so the tracker stays behind the seam. "
+                    "Type /update-issue at any point to synthesize what we agreed "
+                    "and write it back to the issue body."
                 )
                 ts_reminder = (
                     f"[Coordinator chat assignment {assignment_id}] HUMAN-ATTENDED "
                     "chat about this issue. You may edit the issue (`coord issue "
                     "edit`) and send it to Pending (`coord ready`) — confirm first. "
+                    "Type /update-issue to synthesize what we agreed and write it "
+                    "back to the issue body. "
                     "You are in the LIVE checkout: do NOT modify files or commit "
                     "here (it is the editable coordinator + worker-worktree base); "
                     "for a code change, surface a plan so the operator can dispatch "
@@ -10152,6 +10156,90 @@ def resume_stuck(assignment_id: str, config_path: Path, guidance: str) -> None:
     click.echo(f"  branch: {assignment.branch or 'unknown'}")
     click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
     click.echo(f"  guidance: {guidance}")
+
+
+@main.command(
+    "install-skills",
+    help=(
+        "Copy bundled coordinator skills to ~/.claude/skills/ so they are "
+        "available as slash commands inside Claude Code sessions. "
+        "No repo clone required — reads from the installed PyPI package."
+    ),
+)
+@click.option(
+    "--list",
+    "do_list",
+    is_flag=True,
+    default=False,
+    help="Show bundled skills and their installed status without copying.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print what would be installed without writing any files.",
+)
+def install_skills(do_list: bool, dry_run: bool) -> None:  # noqa: FBT001
+    """Install bundled coordinator skills to ~/.claude/skills/ (#319)."""
+    import importlib.resources as _ilr  # noqa: PLC0415
+    import shutil as _shutil  # noqa: PLC0415
+
+    target_root = Path.home() / ".claude" / "skills"
+
+    # Locate the skills directory inside the installed package.
+    try:
+        skills_ref = _ilr.files("coord").joinpath("skills")
+    except (TypeError, ModuleNotFoundError) as e:
+        click.echo(f"error: cannot locate bundled skills: {e}", err=True)
+        sys.exit(1)
+
+    # Enumerate skill directories (each sub-directory that contains SKILL.md).
+    skill_dirs: list[tuple[str, object]] = []
+    try:
+        for entry in skills_ref.iterdir():
+            skill_name = entry.name  # type: ignore[attr-defined]
+            skill_file = entry.joinpath("SKILL.md")
+            try:
+                skill_file.read_text(encoding="utf-8")
+                skill_dirs.append((skill_name, entry))
+            except (FileNotFoundError, IsADirectoryError, TypeError):
+                pass
+    except (FileNotFoundError, NotADirectoryError) as e:
+        click.echo(f"error: bundled skills directory not readable: {e}", err=True)
+        sys.exit(1)
+
+    if not skill_dirs:
+        click.echo("No bundled skills found in the installed package.")
+        return
+
+    if do_list:
+        click.echo("Bundled skills:")
+        for skill_name, _ in sorted(skill_dirs):
+            installed_path = target_root / skill_name / "SKILL.md"
+            status = "installed" if installed_path.exists() else "not installed"
+            click.echo(f"  {skill_name:30s}  {status}")
+        return
+
+    # Install / update each skill.
+    target_root.mkdir(parents=True, exist_ok=True)
+    for skill_name, skill_dir_ref in sorted(skill_dirs):
+        skill_dest = target_root / skill_name
+        skill_file_dest = skill_dest / "SKILL.md"
+        if dry_run:
+            action = "update" if skill_file_dest.exists() else "install"
+            click.echo(f"  would {action}: {skill_file_dest}")
+            continue
+
+        skill_dest.mkdir(parents=True, exist_ok=True)
+        src_text = skill_dir_ref.joinpath("SKILL.md").read_text(encoding="utf-8")
+        action = "updated" if skill_file_dest.exists() else "installed"
+        skill_file_dest.write_text(src_text, encoding="utf-8")
+        click.echo(f"  {action}: {skill_file_dest}")
+
+    if not dry_run:
+        click.echo(
+            "\nDone. Type /update-issue inside a 'Chat about issue' session to use the skill."
+        )
 
 
 if __name__ == "__main__":
