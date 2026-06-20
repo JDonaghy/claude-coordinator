@@ -63,6 +63,38 @@ curl -s http://<host>:7433/health | python3 -m json.tool
 
 The `version` field should match the latest PyPI release.
 
+## Install coordinator skills (`coord install-skills`, #319)
+
+Coordinator ships bundled **Claude Code skills** (slash commands available inside
+any `claude` session).  Install or update them with:
+
+```bash
+coord install-skills              # install/update all bundled skills to ~/.claude/skills/
+coord install-skills --list       # show bundled skills + installed status (no writes)
+coord install-skills --dry-run    # print what would be installed without writing
+```
+
+Skills are read directly from the installed PyPI package via `importlib.resources` —
+no repo clone required.  Run this once after first install and again after each
+`coord agent update` to pick up new or updated skills.
+
+### Available skills
+
+| Skill | Trigger | Purpose |
+|---|---|---|
+| `update-issue` | `/update-issue` | Synthesize what was agreed in a "Chat about issue" session and write it back to the GitHub issue body.  Calls `coord issue edit` after operator confirmation; offers `coord ready` to mark the issue ready for dispatch. |
+
+### Usage (inside a "Chat about issue" session)
+
+```
+/update-issue
+  → agent synthesizes conversation
+  → proposes new issue body in-chat
+  → operator reviews / requests tweaks
+  → agent calls: coord issue edit <repo> <issue> --body-file /tmp/body.md
+  → offers: coord ready <repo> <issue>?
+```
+
 ## Control-center daemon (`coord serve`, #584/#591)
 
 The portable control center runs a **daemon** that fronts the one shared

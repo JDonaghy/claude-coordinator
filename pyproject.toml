@@ -45,6 +45,9 @@ coord = "coord.cli:main"
 include = ["coord*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+coord = ["skills/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
