@@ -22827,6 +22827,24 @@ impl CoordApp {
         }
     }
 
+    /// #648: true when launching a `--fix-of` for this issue would brief the fix
+    /// worker BLIND — i.e. the review the fix actually targets (the LATEST
+    /// request-changes review, the same id `request_changes_review_aid_for`
+    /// resolves and `--fix-of` consumes) has no findings.
+    ///
+    /// Gates ONLY on that latest review.  The old gate used `.any(...
+    /// review_findings.is_none())` across ALL request-changes reviews, so a
+    /// stale OLDER empty review (e.g. the first review's capture missed and was
+    /// recovered only on a re-review) forced the #587 manual-entry dialog even
+    /// when the current review already carried full findings — and confirming
+    /// that dialog overwrote the good findings via `coord set-review-findings`.
+    fn fix_review_needs_findings_capture(&self, coord_repo: &str, issue_num: u64) -> bool {
+        match self.request_changes_review_aid_for(coord_repo, issue_num) {
+            Some(aid) => !self.review_assignment_has_findings(&aid),
+            None => false,
+        }
+    }
+
     /// True when the embedded Terminal pane for issue `key` is showing a still-
     /// LIVE (not exited) interactive session — the operator hasn't `/exit`ed
     /// yet.  All three board-driven stage detectors gate on this so a freshly-
@@ -23579,12 +23597,12 @@ impl CoordApp {
             if let Some((issue_key_repo, issue_key)) = self.selected_issue_repo_and_key() {
                 let issue_num = issue_key.1;
                 let repo_slug = issue_key.0.clone();
-                // Only gate when there's a request-changes review missing findings.
-                let needs_findings = self.data.assignments.iter()
-                    .filter(|a| a.issue_number == issue_num && a.repo == issue_key_repo)
-                    .filter(|a| a.assignment_type.as_deref() == Some("review"))
-                    .filter(|a| a.review_verdict.as_deref() == Some("request-changes"))
-                    .any(|a| a.review_findings.is_none());
+                // #648: gate only when the review the fix is actually briefed
+                // from — the LATEST request-changes review — lacks findings.
+                // (The old `.any(... is_none())` across ALL request-changes
+                // reviews mis-fired when an older review was empty.)
+                let needs_findings =
+                    self.fix_review_needs_findings_capture(&issue_key_repo, issue_num);
                 // Skip the gate when the fix is for a FAILED TEST (not a review) —
                 // the test-fail path is already briefed via the failure reason,
                 // not the review findings.
@@ -30133,6 +30151,42 @@ mod tests {
             app.request_changes_review_aid_for("repo-a", 10),
             None,
             "a later approval resolves the earlier request-changes",
+        );
+    }
+
+    #[test]
+    fn fix_gate_ignores_older_empty_review_when_latest_has_findings() {
+        // #648: two request-changes reviews for the same issue — an OLDER one
+        // with null findings (original capture missed) and a NEWER one carrying
+        // full findings (recovered on re-review).  The fix-launch gate must key
+        // on the LATEST review (the id `--fix-of` resolves), so it must NOT
+        // demand manual findings entry — the old `.any(... is_none())` wrongly
+        // tripped on the stale empty row and (on confirm) overwrote the good
+        // findings via `coord set-review-findings`.
+        let mut older = review_of("id-10-done", 10, "repo-a", Some("request-changes"));
+        older.id = "rev-old".to_string();
+        older.dispatched_at = Some(2_000_000.0);
+        older.review_findings = None; // original capture missed
+        let mut newer = review_of("id-10-done", 10, "repo-a", Some("request-changes"));
+        newer.id = "rev-new".to_string();
+        newer.dispatched_at = Some(2_500_000.0);
+        newer.review_findings =
+            Some(r#"{"verdict":"request-changes","body":"fix render_impl.rs:687"}"#.to_string());
+        let app = make_app_with_assignments(vec![older, newer]);
+        assert!(
+            !app.fix_review_needs_findings_capture("repo-a", 10),
+            "latest review has findings → no manual-entry gate despite the older empty review",
+        );
+
+        // Sanity: when the latest review itself lacks findings, the gate fires.
+        let mut only_empty = review_of("id-11-done", 11, "repo-a", Some("request-changes"));
+        only_empty.id = "rev-empty".to_string();
+        only_empty.dispatched_at = Some(2_000_000.0);
+        only_empty.review_findings = None;
+        let app2 = make_app_with_assignments(vec![only_empty]);
+        assert!(
+            app2.fix_review_needs_findings_capture("repo-a", 11),
+            "latest review without findings → manual-entry gate fires",
         );
     }
 
