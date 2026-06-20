@@ -23,6 +23,7 @@ plumbing — keeping them apart avoids twisting both shapes.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 import uuid
@@ -33,6 +34,8 @@ from pathlib import Path
 import httpx
 
 from coord import github_ops
+
+log = logging.getLogger(__name__)
 from coord.config import Config, ReviewsConfig
 from coord.dispatch import AGENT_PORT
 from coord.models import Assignment, Board, Machine
@@ -727,6 +730,7 @@ def dispatch_review(
     issue_body_fetcher=None,
     now: float | None = None,
     terminal_cache: dict | None = None,
+    remote_branch_checker=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -817,6 +821,51 @@ def dispatch_review(
     )
     if choice is None:
         return None
+
+    # #586: if the reviewer would run on a different machine, the branch must
+    # exist on the remote so that machine can fetch it.  If the original worker
+    # never pushed, route the review back to the worker's own machine (which
+    # already has the branch locally).  If even that fallback is unavailable,
+    # mark the work row with a visible stall state and return None — this
+    # surfaces an actionable error instead of a silent 2-second crash.
+    if not choice.same_as_worker and completed.branch:
+        _check_remote = remote_branch_checker or github_ops.branch_exists_on_remote
+        if not _check_remote(repo.github, completed.branch):
+            log.warning(
+                "[review] branch %r not on remote for %s — routing review back "
+                "to original worker machine %s to avoid cross-machine fetch failure",
+                completed.branch, completed.assignment_id, completed.machine_name,
+            )
+            worker_machine = next(
+                (m for m in config.machines if m.name == completed.machine_name),
+                None,
+            )
+            from coord.machine_pause import paused_set  # noqa: PLC0415
+            paused = paused_set()
+            if (
+                worker_machine is not None
+                and worker_machine.can_work_on(completed.repo_name)
+                and worker_machine.name not in paused
+            ):
+                choice = ReviewerChoice(
+                    machine=worker_machine,
+                    same_as_worker=True,
+                    rationale=(
+                        f"branch {completed.branch!r} not on remote — "
+                        f"routed back to {completed.machine_name}"
+                    ),
+                )
+            else:
+                # Original machine also unavailable — stall visibly rather than
+                # dispatching to a machine that cannot check out the branch.
+                log.error(
+                    "[review] branch %r not on remote for %s and original machine "
+                    "%s is unavailable (paused or not configured) — "
+                    "review BLOCKED until branch is pushed to origin",
+                    completed.branch, completed.assignment_id, completed.machine_name,
+                )
+                completed.review_state = "branch_not_on_remote"
+                return None
 
     repo_path = choice.machine.repo_path(completed.repo_name)
     if repo_path is None:

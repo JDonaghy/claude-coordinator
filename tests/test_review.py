@@ -549,6 +549,8 @@ def test_dispatch_review_sends_to_different_machine_and_appends_to_board(
         claude_md_reader=lambda p: "# Project rules\n",
         issue_body_fetcher=lambda repo, num: "issue body text",
         now=123.0,
+        # Branch check mocked: this test covers routing, not remote-branch detection.
+        remote_branch_checker=lambda repo, branch: True,
     )
 
     assert result is not None
@@ -628,6 +630,8 @@ def test_dispatch_review_records_to_dispatched_ledger(
         },
         claude_md_reader=lambda p: "",
         issue_body_fetcher=lambda repo, num: "",
+        # Branch check mocked: this test covers DB recording, not remote-branch detection.
+        remote_branch_checker=lambda repo, branch: True,
     )
 
     assert result is not None
@@ -1504,3 +1508,94 @@ def test_reviews_config_rejects_bool_for_int_field(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="max_auto_dispatch_per_pass must be a non-negative integer"):
         load(p)
+
+
+# ── #586: branch-not-on-remote guard in dispatch_review ─────────────────────
+
+
+def test_dispatch_review_routes_back_to_worker_when_branch_not_on_remote(
+    two_machine_config: Config,
+) -> None:
+    """When the branch isn't on the remote, review is routed back to the
+    original worker machine (which has it locally) rather than dispatching
+    to a different machine that would crash in 2 seconds."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop", branch="issue-1-fix")
+    client = _FakeHTTPClient({"id": "review-local-1"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 10, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        # Simulate branch absent on remote.
+        remote_branch_checker=lambda repo, branch: False,
+    )
+
+    assert result is not None
+    # Must have routed to the worker's own machine, not the other one.
+    assert result.machine_name == "laptop"
+    # Exactly one HTTP call, to laptop.tail (the worker machine).
+    assert len(client.calls) == 1
+    url, _ = client.calls[0]
+    assert "laptop.tail" in url
+
+
+def test_dispatch_review_blocks_and_sets_state_when_branch_not_on_remote_and_worker_unavailable(
+    two_machine_config: Config,
+) -> None:
+    """When branch isn't on remote AND the original worker machine is absent
+    from config, dispatch_review must return None and set
+    review_state='branch_not_on_remote' so coord status surfaces a visible
+    error instead of silently failing."""
+    # Build a config where only one machine exists (NOT the original worker).
+    from dataclasses import replace as dc_replace
+    single_machine_cfg = dc_replace(
+        two_machine_config,
+        machines=[
+            Machine(
+                name="server", host="server.tail",
+                capabilities=["python"], repos=["api"],
+                repo_paths={"api": "/srv/api"},
+            ),
+        ],
+    )
+    board = Board()
+    # Completed assignment was done on "laptop" which is no longer in config.
+    completed = _completed_assignment(machine="laptop", branch="issue-1-fix")
+
+    result = dispatch_review(
+        completed, board, single_machine_cfg,
+        http_client=_FakeHTTPClient({"id": "should-not-fire"}),
+        pr_lookup=lambda repo_github, **kw: {"number": 10, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: False,
+    )
+
+    assert result is None
+    assert board.active == []
+    assert completed.review_state == "branch_not_on_remote"
+
+
+def test_dispatch_review_passes_through_normally_when_branch_on_remote(
+    two_machine_config: Config,
+) -> None:
+    """When branch IS on remote, the normal cross-machine dispatch path runs."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop", branch="issue-1-fix")
+    client = _FakeHTTPClient({"id": "review-remote-1"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 10, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        # Branch exists on remote — normal cross-machine routing.
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    assert result.machine_name == "server"  # different from worker (laptop)
