@@ -1559,12 +1559,34 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 f" or 'coord merge --force-merge' to merge as-is."
             )
 
+    # #586: branch-not-on-remote blockers — work that completed but the branch
+    # was never pushed.  Downstream review/fix dispatch is blocked until the
+    # operator pushes from the original worker machine.
+    branch_not_pushed = [
+        a for a in board.completed
+        if a.type == "work" and a.review_state == "branch_not_on_remote"
+    ]
+    if branch_not_pushed:
+        click.echo("")
+        click.echo("⚠ Push required (review blocked — branch not on remote):")
+        for a in branch_not_pushed:
+            click.echo(
+                f"  #{a.issue_number}: {a.issue_title} ({a.repo_name})"
+                f"  [branch not on remote]"
+            )
+            click.echo(
+                f"    Branch '{a.branch}' exists only on {a.machine_name}."
+                f" Push it with: ssh {a.machine_name} 'cd <repo-path> && git push origin {a.branch}'"
+                f" then re-run 'coord notify' to retry review dispatch."
+            )
+
     # Show completed work assignments with review lifecycle state.
     _REVIEW_STATE_TAGS = {
         "pending": "[awaiting review]",
         "dispatched": "[review dispatched]",
         "done": "[review done]",
         "cap_hit": "[⚠ iteration cap hit — manual action required]",
+        "branch_not_on_remote": "[⚠ branch not on remote — push required]",
     }
     work_completed = [a for a in board.completed if a.type == "work"]
     if work_completed:

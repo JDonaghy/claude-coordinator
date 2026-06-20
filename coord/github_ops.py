@@ -202,6 +202,32 @@ def list_remote_branch_names(repo: str) -> set[str]:
     }
 
 
+def branch_exists_on_remote(repo: str, branch: str) -> bool:
+    """Return True if `branch` currently exists on `repo` (owner/name) at GitHub.
+
+    Uses a targeted ``gh api`` call rather than listing all branches.  Fails
+    OPEN (returns True) on any infrastructure problem — an unresponsive ``gh``,
+    a network glitch, or an authentication issue must never prevent a legitimate
+    dispatch.  Only returns False when we receive a clear "not found" signal
+    from GitHub (HTTP 4xx in the error output).
+
+    Called by ``dispatch_review`` and ``_dispatch_fix`` (#586) to avoid
+    routing a follow-on assignment to a machine that can't fetch the branch.
+    """
+    try:
+        _gh("api", f"repos/{repo}/git/refs/heads/{branch}")
+        return True
+    except RuntimeError as exc:
+        err = str(exc).lower()
+        # Only return False when GitHub explicitly told us the ref doesn't
+        # exist (HTTP 4xx response).  Any other failure (gh not installed,
+        # not authenticated, network timeout) is treated as "unknown" and we
+        # fail OPEN so the guard doesn't block legitimate dispatch.
+        if "http 4" in err or "could not resolve" in err or "not found" in err:
+            return False
+        return True
+
+
 def delete_remote_branch(repo: str, branch: str) -> bool:
     """Delete a remote branch. Returns True on success, False on failure."""
     try:

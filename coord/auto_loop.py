@@ -42,6 +42,7 @@ import httpx
 
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
+from coord import github_ops
 from coord.models import Assignment, Board
 from coord.review import (
     ReviewFindings,
@@ -567,6 +568,7 @@ def _dispatch_fix(
     *,
     model: str | None = None,
     http_client: httpx.Client | None = None,
+    remote_branch_checker=None,
 ) -> Assignment | None:
     """POST a fix assignment to the agent server.
 
@@ -603,6 +605,24 @@ def _dispatch_fix(
             )
             return None
         machine = candidates[0]
+
+    # #586: if we ended up routing to a different machine than the original
+    # worker, the branch must exist on the remote so the fix worker can fetch
+    # it.  If the worker never pushed, this assignment would crash in 2–3
+    # seconds with no commits and no exit code — the classic branch-absent
+    # silent failure.  Block early and surface a clear log message instead.
+    if machine.name != work.machine_name and work.branch:
+        repo_obj = config.repo(work.repo_name)
+        if repo_obj is not None:
+            _check_remote = remote_branch_checker or github_ops.branch_exists_on_remote
+            if not _check_remote(repo_obj.github, work.branch):
+                log.error(
+                    "auto_loop: branch %r not on remote — cannot dispatch fix "
+                    "to different machine %s; original worker %s must push "
+                    "the branch to origin first",
+                    work.branch, machine.name, work.machine_name,
+                )
+                return None
 
     repo_path = machine.repo_path(work.repo_name)
     if repo_path is None:
