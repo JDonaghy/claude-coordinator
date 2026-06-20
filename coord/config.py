@@ -15,6 +15,32 @@ from coord.models import Machine, Repo, WorkerPermissionsConfig
 
 DEFAULT_CONFIG_PATH = Path("coordinator.yml")
 
+# Canonical config home — works on a machine that has no repo checkout, mirroring
+# where ``~/.coord/coord.db`` and ``~/.coord/client.toml`` already live.  This is
+# the recommended location; ``./coordinator.yml`` stays a development fallback.
+USER_CONFIG_PATH = Path.home() / ".coord" / "coordinator.yml"
+
+
+def resolve_config_path() -> Path:
+    """Resolve which ``coordinator.yml`` to load when no explicit path is given.
+
+    Search order (first existing file wins):
+
+    1. ``$COORD_CONFIG`` (if set) — explicit override.
+    2. ``~/.coord/coordinator.yml`` — the canonical home (no repo checkout needed).
+    3. ``./coordinator.yml`` — CWD, for development / the repo checkout.
+
+    When none exist the canonical home path is returned so the "not found" error
+    points operators at the recommended location rather than at the CWD.
+    """
+    env = os.environ.get("COORD_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    for candidate in (USER_CONFIG_PATH, DEFAULT_CONFIG_PATH):
+        if candidate.exists():
+            return candidate
+    return USER_CONFIG_PATH
+
 # Safety-by-default: repos without explicit worker_permissions get this deny-list.
 DEFAULT_DENY_COMMANDS: list[str] = [
     "Bash(gh *)",
@@ -229,7 +255,7 @@ class PipelineConfig:
     agent falls back to ``claude -p``'s default).
     """
 
-    default_gates: list[str] = field(default_factory=lambda: ["review", "test", "merge"])
+    default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
     labels: dict[str, list[str]] = field(default_factory=dict)
     auto_loop: bool = True
     max_review_iterations: int = 5
@@ -259,6 +285,24 @@ class PipelineConfig:
         if label and label in self.labels:
             return list(self.labels[label])
         return list(self.default_gates)
+
+    def test_precedes_review(self) -> bool:
+        """True when the ``test`` gate is ordered *before* ``review`` in the
+        default gate list — i.e. the smoke/test verdict gates review dispatch
+        (Work → Test → Review), rather than gating only the merge.
+
+        When both gates are present and ``test`` comes first, automatic review
+        dispatch waits for a ``passed``/``skipped`` test verdict (see
+        ``coord.review.dispatch_pending_reviews``); when ``review`` comes first
+        (or either gate is absent) review fires on work completion as before.
+        Consulted on the *default* policy only — mirrors the merge gate's
+        ``requires_smoke``/``requires_review``, which also ignore per-label
+        overrides because they operate on the default gate list.
+        """
+        gates = self.default_gates or []
+        if "test" not in gates or "review" not in gates:
+            return False
+        return gates.index("test") < gates.index("review")
 
 
 @dataclass
@@ -355,11 +399,21 @@ class Config:
         return next((r for r in self.repos if r.name == name), None)
 
 
-def load(path: str | Path = DEFAULT_CONFIG_PATH) -> Config:
-    """Load and validate a coordinator.yml file."""
-    p = Path(path)
+def load(path: str | Path | None = None) -> Config:
+    """Load and validate a coordinator.yml file.
+
+    When ``path`` is None the location is resolved via
+    :func:`resolve_config_path` (``$COORD_CONFIG`` → ``~/.coord/coordinator.yml``
+    → ``./coordinator.yml``), so the tool works on a machine without a repo
+    checkout.
+    """
+    p = Path(path).expanduser() if path is not None else resolve_config_path()
     if not p.exists():
-        raise ConfigError(f"Config file not found: {p}")
+        raise ConfigError(
+            f"Config file not found: {p}. Create it at {USER_CONFIG_PATH} "
+            f"(recommended — works without a repo checkout), pass --config <path>, "
+            f"or set $COORD_CONFIG."
+        )
 
     try:
         raw = yaml.safe_load(p.read_text())

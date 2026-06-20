@@ -78,6 +78,13 @@ machines:
     repo_paths:
       claude-coordinator: ~/src/claude-coordinator
 
+pipeline:
+  # Lifecycle gate order. Test precedes Review so the smoke test runs before the
+  # PR/review (the natural order). This drives both the displayed stage order and
+  # the headless review gate (review is held until the work has a passed/skipped
+  # test verdict). Omit this block to accept the same default.
+  default_gates: [test, review, merge]
+
 concurrency:
   max_workers: 2          # max simultaneous claude -p sessions across all machines
   stagger_seconds: 30     # delay between starting workers

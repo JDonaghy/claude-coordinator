@@ -9,6 +9,7 @@ import pytest
 
 from coord.config import (
     ConfigError,
+    PipelineConfig,
     ProviderDef,
     ProvidersConfig,
     _parse_concurrency,
@@ -262,7 +263,89 @@ def test_artifact_paths_non_string_element(tmp_path: Path) -> None:
         load(p)
 
 
+# ── Config path resolution (~/.coord/coordinator.yml) ────────────────────────
+
+
+def test_resolve_config_path_prefers_env(tmp_path, monkeypatch) -> None:
+    from coord import config as cfgmod
+
+    env_file = tmp_path / "env.yml"
+    env_file.write_text("x")
+    monkeypatch.setenv("COORD_CONFIG", str(env_file))
+    assert cfgmod.resolve_config_path() == env_file
+
+
+def test_resolve_config_path_prefers_user_home_over_cwd(tmp_path, monkeypatch) -> None:
+    from coord import config as cfgmod
+
+    monkeypatch.delenv("COORD_CONFIG", raising=False)
+    home_cfg = tmp_path / "home.yml"
+    home_cfg.write_text("x")
+    cwd_cfg = tmp_path / "coordinator.yml"
+    cwd_cfg.write_text("x")
+    monkeypatch.setattr(cfgmod, "USER_CONFIG_PATH", home_cfg)
+    monkeypatch.setattr(cfgmod, "DEFAULT_CONFIG_PATH", cwd_cfg)
+    assert cfgmod.resolve_config_path() == home_cfg
+
+
+def test_resolve_config_path_falls_back_to_cwd(tmp_path, monkeypatch) -> None:
+    from coord import config as cfgmod
+
+    monkeypatch.delenv("COORD_CONFIG", raising=False)
+    home_cfg = tmp_path / "absent_home.yml"  # does NOT exist
+    cwd_cfg = tmp_path / "coordinator.yml"
+    cwd_cfg.write_text("x")
+    monkeypatch.setattr(cfgmod, "USER_CONFIG_PATH", home_cfg)
+    monkeypatch.setattr(cfgmod, "DEFAULT_CONFIG_PATH", cwd_cfg)
+    assert cfgmod.resolve_config_path() == cwd_cfg
+
+
+def test_resolve_config_path_defaults_to_user_home_when_none_exist(
+    tmp_path, monkeypatch
+) -> None:
+    from coord import config as cfgmod
+
+    monkeypatch.delenv("COORD_CONFIG", raising=False)
+    home_cfg = tmp_path / "absent_home.yml"  # absent
+    cwd_cfg = tmp_path / "absent_cwd.yml"  # absent
+    monkeypatch.setattr(cfgmod, "USER_CONFIG_PATH", home_cfg)
+    monkeypatch.setattr(cfgmod, "DEFAULT_CONFIG_PATH", cwd_cfg)
+    # None exist → the canonical home path is returned so the error points there.
+    assert cfgmod.resolve_config_path() == home_cfg
+
+
+def test_load_with_no_arg_resolves_default(tmp_path, monkeypatch) -> None:
+    from coord import config as cfgmod
+
+    monkeypatch.delenv("COORD_CONFIG", raising=False)
+    cfg_file = tmp_path / "home.yml"
+    cfg_file.write_text(
+        "repos:\n  - name: api\n    github: a/a\n"
+        "machines:\n  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    monkeypatch.setattr(cfgmod, "USER_CONFIG_PATH", cfg_file)
+    cfg = cfgmod.load()  # no arg → resolves to USER_CONFIG_PATH
+    assert cfg.path == cfg_file
+    assert [r.name for r in cfg.repos] == ["api"]
+
+
 # ── PipelineConfig helpers ──────────────────────────────────────────────────
+
+
+def test_pipeline_test_precedes_review() -> None:
+    """test_precedes_review() is True only when both gates are present and
+    'test' is ordered before 'review' (the new default)."""
+    assert PipelineConfig().test_precedes_review()  # new default is test-first
+    assert PipelineConfig(
+        default_gates=["test", "review", "merge"]
+    ).test_precedes_review()
+    assert not PipelineConfig(
+        default_gates=["review", "test", "merge"]
+    ).test_precedes_review()
+    # Either gate absent → not gated.
+    assert not PipelineConfig(default_gates=["review", "merge"]).test_precedes_review()
+    assert not PipelineConfig(default_gates=["test", "merge"]).test_precedes_review()
+    assert not PipelineConfig(default_gates=[]).test_precedes_review()
 
 
 def test_pipeline_tracked_labels_defaults_to_coord(tmp_path: Path) -> None:
@@ -339,9 +422,9 @@ def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
         "  - name: m\n    host: h\n    repos: [api]\n"
     )
     cfg = load(p)
-    # Default default_gates: Review comes before Test in the default order (#520).
-    assert cfg.pipeline.gates_for_label("coord") == ["review", "test", "merge"]
-    assert cfg.pipeline.gates_for_label(None) == ["review", "test", "merge"]
+    # Default default_gates: Test comes before Review (smoke before PR/review).
+    assert cfg.pipeline.gates_for_label("coord") == ["test", "review", "merge"]
+    assert cfg.pipeline.gates_for_label(None) == ["test", "review", "merge"]
 
 
 # ── concurrency: daemon-spawn stall mitigations (#299) ───────────────────────

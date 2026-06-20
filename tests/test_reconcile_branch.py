@@ -217,8 +217,10 @@ def test_reconcile_dispatches_review_when_no_active_work(config: Config) -> None
         machine_name="laptop", repo_name="api", issue_number=42,
         issue_title="t", status="done", branch="issue-42-fix",
         assignment_id="work-done", type="work", review_state="pending",
-        # No test_state — #465 moved the smoke gate to merge, so review fires
-        # regardless of smoke verdict.
+        # Test precedes Review now, so the work must carry a passed/skipped test
+        # verdict before review dispatches.  This test exercises the
+        # no-active-work (#459) path, not the gate, so give it a passed verdict.
+        test_state="passed",
     )
     board = Board(
         repos=[Repo(name="api", github="acme/api")],
@@ -248,13 +250,14 @@ def test_reconcile_dispatches_review_when_no_active_work(config: Config) -> None
     assert completed_work.review_state == "dispatched"
 
 
-# ── #465: review fires without a smoke/test verdict ──────────────────────────
+# ── Test-before-Review: review is HELD until a smoke/test verdict ─────────────
 
 
-def test_reconcile_dispatches_review_without_smoke_verdict(config: Config) -> None:
-    """#465: review must dispatch even when test_state is None (no smoke verdict).
-    The smoke gate was moved to coord merge; review should fire immediately on
-    work completion regardless of the interactive smoke outcome."""
+def test_reconcile_holds_review_until_smoke_verdict(config: Config) -> None:
+    """Test precedes Review: review must be HELD when test_state is None (no
+    smoke verdict yet), and dispatch once a passed/skipped verdict is recorded.
+    (Inverts the old #465 behavior — the smoke gate now sits before review, not
+    only before merge.)"""
     cfg_with_reviews = Config(
         repos=[Repo(name="api", github="acme/api")],
         machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"],
@@ -289,17 +292,26 @@ def test_reconcile_dispatches_review_without_smoke_verdict(config: Config) -> No
          patch("coord.review.dispatch_review", _fake_dispatch_review):
         reconcile(board, cfg_with_reviews)
 
-    assert review_dispatches == ["work-no-smoke"], (
-        "dispatch_review must fire even when test_state is None (#465: smoke "
-        "gate moved to merge, not review)"
+    # Held: no test verdict → no review dispatched yet.
+    assert review_dispatches == [], (
+        "review must be held until the work has a passed/skipped test verdict"
     )
+    assert completed_work.review_state in (None, "pending")
+
+    # Record a passing smoke verdict → the next reconcile dispatches the review.
+    completed_work.test_state = "passed"
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.review.dispatch_review", _fake_dispatch_review):
+        reconcile(board, cfg_with_reviews)
+
+    assert review_dispatches == ["work-no-smoke"]
     assert completed_work.review_state == "dispatched"
 
 
-def test_reconcile_dispatches_review_when_smoke_failed(config: Config) -> None:
-    """#465: review must still dispatch when the smoke test failed (test_state='failed').
-    A failed smoke is not a reason to withhold code review — the reviewer
-    may surface the same issue or provide independent feedback."""
+def test_reconcile_holds_review_when_smoke_failed(config: Config) -> None:
+    """Test precedes Review: a FAILED smoke test must NOT dispatch a review — the
+    failure routes to a fix (interactive fail→fix / re-dispatch Work), not a PR
+    review.  The review stays held until the work passes a smoke test."""
     cfg_with_reviews = Config(
         repos=[Repo(name="api", github="acme/api")],
         machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"],
@@ -311,7 +323,7 @@ def test_reconcile_dispatches_review_when_smoke_failed(config: Config) -> None:
         machine_name="laptop", repo_name="api", issue_number=77,
         issue_title="t", status="done", branch="issue-77-feat",
         assignment_id="work-smoke-failed", type="work", review_state="pending",
-        test_state="failed",  # smoke explicitly failed — review should still fire
+        test_state="failed",  # smoke explicitly failed — review must be withheld
     )
     board = Board(
         repos=[Repo(name="api", github="acme/api")],
@@ -334,10 +346,10 @@ def test_reconcile_dispatches_review_when_smoke_failed(config: Config) -> None:
          patch("coord.review.dispatch_review", _fake_dispatch_review):
         reconcile(board, cfg_with_reviews)
 
-    assert review_dispatches == ["work-smoke-failed"], (
-        "dispatch_review must fire even when test_state='failed' (#465)"
+    assert review_dispatches == [], (
+        "a failed smoke test must NOT dispatch a review (it routes to a fix)"
     )
-    assert completed_work.review_state == "dispatched"
+    assert completed_work.review_state in (None, "pending")
 
 
 # ── #448 fix iter 2: cli.py inline reconcile mirrors reconcile.py for advisory ──

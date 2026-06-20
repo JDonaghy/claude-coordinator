@@ -83,8 +83,14 @@ from the daemon.
   later. A PyPI install older than that has no `serve` command, so the daemon
   host must be on a release `>=` that cut (or, pre-release, an editable checkout
   of the branch — note the editable-drift caveats elsewhere in this doc).
-- **`~/coordinator.yml` present** on the daemon host (it serves this at
-  `/config`; clients then need none — that's the point of #591).
+- **`coordinator.yml` present on the daemon host**, canonically at
+  **`~/.coord/coordinator.yml`** (it serves this at `/config`; clients then need
+  none — that's the point of #591). Path resolution is `$COORD_CONFIG` →
+  `~/.coord/coordinator.yml` → `./coordinator.yml`; the home location means the
+  daemon is independent of its CWD and of any repo checkout. (Older installs kept
+  it at `~/coordinator.yml`, which only loaded when the daemon's CWD was `$HOME` —
+  `mv ~/coordinator.yml ~/.coord/coordinator.yml` to move to the canonical spot.)
+  `coord serve` prints the resolved config path on startup.
 - **`~/.coord/coord.db` present** (after the one-time cutover below).
 
 ### Install the service
@@ -146,7 +152,7 @@ window (no active dispatch):
 #    is self-contained (otherwise also copy coord.db-wal / coord.db-shm).
 ssh elitebook '~/.coord-venv/bin/python -c "import sqlite3;c=sqlite3.connect(\"$HOME/.coord/coord.db\");c.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\");c.close()"'
 scp elitebook:~/.coord/coord.db dellserver:~/.coord/coord.db
-scp elitebook:~/coordinator.yml dellserver:~/coordinator.yml
+scp elitebook:~/.coord/coordinator.yml dellserver:~/.coord/coordinator.yml  # canonical home (was ~/coordinator.yml)
 # 3. Start the daemon on dellserver (service above), verify /board parity:
 #    round_number + assignment count match elitebook's `coord status`.
 # 4. Flip every machine (incl. elitebook) to a thin client: write client.toml
