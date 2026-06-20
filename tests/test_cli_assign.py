@@ -652,6 +652,12 @@ class TestAssignInteractiveReview:
         assert kwargs["worktree_path"] is None
         assert kwargs["repo_path"] is None
         assert kwargs["assignment_id"]  # the recorded review id
+        # #617: the review ran on the REMOTE host ("server"), so finalize must
+        # receive that host as ssh_target — otherwise the #606 transcript-floor
+        # scans this (blind) coordinator's ~/.claude/projects instead of the
+        # session's OWN host, the verdict + findings are silently dropped, and
+        # the exit falls to the operator prompt every time (the #607 drop).
+        assert kwargs["ssh_target"] == "server.tailnet"
         # #486d: non-TTY (CliRunner) → the inline verdict prompt is skipped and
         # the manual `coord report-result` hint is printed instead.
         assert "no verdict reported" in result.output
