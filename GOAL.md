@@ -3,11 +3,11 @@
 > **The living, cross-repo / cross-machine objective for the coordinator and every agent it dispatches.**
 > This is *meta-level*: above any single issue, repo, or session (and broader than Claude's own per-session goal feature). Both humans and agents may edit it as priorities evolve — keep it short, current, and re-date the Status line. `coordinator.yml` is the source of truth for *topology*; **this file is the source of truth for *intent*.**
 >
-> _Last updated: 2026-06-19_
+> _Last updated: 2026-06-20_
 
 ## 🎯 North star
 
-**Make human-attended interactive `claude` sessions drivable end-to-end from the coord-tui board** — run the full lifecycle **Work → Test → Review → Smoke-test → Merge** through interactive sessions, with `claude -p` workers as a **first-class automation path** (not a deprecated one). The board *launches* sessions today; the remaining work is the **stage-to-stage handoff** so each stage's result feeds the next.
+**Make human-attended interactive `claude` sessions drivable end-to-end from the coord-tui board** — run the full lifecycle **Work → Test → Review → Merge** through interactive sessions, with `claude -p` workers as a **first-class automation path** (not a deprecated one). The smoke **Test** stage now runs *before* Review (smoke before PR — reordered 2026-06-20 from the #520 review-first workaround, now that interactive testing is smooth); a failed test routes to a fix exactly as a request-changes review does. The board *launches* sessions today; the remaining work is the **stage-to-stage handoff** so each stage's result feeds the next.
 
 ## Why this matters (the June-15 metering change is PAUSED)
 
@@ -36,7 +36,7 @@ the critical path** (demoted to Horizon).
 | **In-TUI render** — scrub `$TMUX` from the embedded terminal so interactive sessions render in the pane | 🟢 merged | quadraui PR #360 |
 | **A2 — TUI "Review (interactive)" board action** | 🟢 merged | PR #540 |
 | **A3 — interactive Smoke** (`--smoke-of`) — testing agent: lists smoke tests, pulls artifact, records verdict | 🟢 merged | #350, #581 |
-| **leg 3c — guided approve→test→merge** — test-fail→interactive fix dialog, test-pass→interactive merge agent (`--merge-of`, proactive rebase) | 🟢 merged | #306, #581 |
+| **leg 3c — guided test→review→merge** — work-done→test, test-pass→review, review-approve→interactive merge agent (`--merge-of`, proactive rebase); test-fail/request-changes→interactive fix dialog | 🟢 merged | #306, #581 |
 | **Track B — remote Review** (`--review-of` over ssh+tmux, read-only) | 🟢 merged | #486 (`9e0c5d2`) |
 | **Track B — remote Fix** (`--fix-of`: remote worktree + finalize/push-back) | 🟢 merged | #486 (`6c16d3b`) |
 | **Track B — TUI machine picker** (drive remote Review/Fix from a board card) | 🟢 merged | #486, #493/#499 |

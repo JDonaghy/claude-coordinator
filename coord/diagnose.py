@@ -111,7 +111,7 @@ def _latest(assignments: list["Assignment"]) -> "Assignment | None":
 
 
 # Stage ordering used to resolve the "current" stage when none is given.
-_STAGE_ORDER = ["plan", "work", "review", "test", "merge"]
+_STAGE_ORDER = ["plan", "work", "test", "review", "merge"]
 
 
 def current_stage(board: "Board", repo_name: str, issue_number: int) -> str:

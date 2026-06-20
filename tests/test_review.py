@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from coord.config import Config, ReviewsConfig, load
+from coord.config import Config, PipelineConfig, ReviewsConfig, load
 from coord.models import Assignment, Board, Machine, Repo
 from coord.review import (
     REVIEWER_SYSTEM_PROMPT,
@@ -517,7 +517,12 @@ def test_dispatch_pending_reviews_skips_terminal_rows(
     from coord.review import dispatch_pending_reviews
 
     monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
-    completed = replace(_completed_assignment(), review_state="pending")
+    # test_state="passed" so the row clears the Test-before-Review gate and the
+    # bulk loop reaches the #522 terminal check (a merged row was smoke-tested
+    # before it merged).
+    completed = replace(
+        _completed_assignment(), review_state="pending", test_state="passed"
+    )
     board = Board(completed=[completed])
 
     dispatched = dispatch_pending_reviews(board, two_machine_config)
@@ -1249,7 +1254,16 @@ def _pending_work(n: int) -> list[Assignment]:
 
 
 def _flood_config(**review_kw) -> Config:
-    return Config(repos=[], machines=[], reviews=ReviewsConfig(**review_kw))
+    # Pin a review-first gate order so the Test-before-Review gate is OFF for
+    # these flood-guard tests — they exercise the cap / surge / #459 dedupe,
+    # orthogonal to the test gate (which has its own test below, exercised via
+    # the explicit test_gate_active=True parameter).
+    return Config(
+        repos=[],
+        machines=[],
+        reviews=ReviewsConfig(**review_kw),
+        pipeline=PipelineConfig(default_gates=["review", "test", "merge"]),
+    )
 
 
 @pytest.fixture
@@ -1411,6 +1425,28 @@ def test_flood_guard_respects_test_gate(fake_dispatch) -> None:
     out = dispatch_pending_reviews(board, cfg, test_gate_active=True)
     assert len(out) == 2
     assert sorted(fake_dispatch) == ["w1", "w2"]
+
+
+def test_bulk_review_gate_activates_from_test_first_default(fake_dispatch) -> None:
+    """Test-before-Review reorder: when default_gates orders Test before Review,
+    the bulk path holds review until the work has a passed/skipped test verdict
+    — no explicit test_gate_active flag needed."""
+    rows = _pending_work(3)
+    rows[0].test_state = "passed"
+    # rows[1], rows[2] untested → held by the config-driven gate.
+    board = Board(completed=rows)
+    cfg = Config(
+        repos=[],
+        machines=[],
+        reviews=ReviewsConfig(max_auto_dispatch_per_pass=5, flood_threshold=12),
+        pipeline=PipelineConfig(default_gates=["test", "review", "merge"]),
+    )
+    out = dispatch_pending_reviews(board, cfg)
+    assert len(out) == 1
+    assert fake_dispatch == ["w1"]
+    # The untested rows stay pending for a later pass (after they're tested).
+    assert rows[1].review_state in (None, "pending")
+    assert rows[2].review_state in (None, "pending")
 
 
 # ── Flood guard: config parsing ──────────────────────────────────────────────

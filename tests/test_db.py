@@ -280,13 +280,17 @@ class TestJsonMigration:
         )
 
 
-# ── Gate-order migration (#520) ───────────────────────────────────────────────
+# ── Gate-order migration (Test-before-Review reorder) ─────────────────────────
 
 class TestMigrateGateOrder:
-    """_migrate_gate_order rewrites the old default gate JSON in stored rows."""
+    """_migrate_gate_order rewrites the old default gate JSON in stored rows.
 
-    _OLD = '["test", "review", "merge"]'
-    _NEW = '["review", "test", "merge"]'
+    Direction: the #520-era default ``["review", "test", "merge"]`` is rewritten
+    to the new Test-before-Review default ``["test", "review", "merge"]``.
+    """
+
+    _OLD = '["review", "test", "merge"]'
+    _NEW = '["test", "review", "merge"]'
     _CUSTOM = '["review", "merge"]'  # should never be touched
 
     def _insert_assignment(

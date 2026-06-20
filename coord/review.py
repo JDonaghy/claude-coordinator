@@ -959,6 +959,19 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
 
     logger = logging.getLogger("coord.review")
 
+    # Test-before-Review reorder: when the pipeline orders Test ahead of Review,
+    # hold automatic review dispatch until the work carries a passed/skipped
+    # test verdict, so the headless auto-loop matches the displayed
+    # Work → Test → Review order (and never burns a metered review on code the
+    # smoke test hasn't validated yet). Explicit callers can still force the
+    # gate on via ``test_gate_active``; the explicit ``coord review``/``coord
+    # pr`` paths (→ ``dispatch_review`` directly) stay ungated so a human can
+    # always request a review deliberately.
+    gate_test = test_gate_active or (
+        getattr(config, "pipeline", None) is not None
+        and config.pipeline.test_precedes_review()
+    )
+
     eligible = [
         c
         for c in board.completed
@@ -972,7 +985,7 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         # explicit `coord review <id>` escape hatch (→ dispatch_review) still
         # lets a human deliberately request a headless review if they want one.
         and c.provider_name != "claude-pty"
-        and (not test_gate_active or c.test_state in ("passed", "skipped"))
+        and (not gate_test or c.test_state in ("passed", "skipped"))
         and not has_active_work_followup(
             board, repo_name=c.repo_name, issue_number=c.issue_number
         )

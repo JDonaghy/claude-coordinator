@@ -16,7 +16,7 @@ import click
 import httpx
 
 from coord import __version__, github_ops
-from coord.config import Config, ConfigError, DEFAULT_CONFIG_PATH, load
+from coord.config import Config, ConfigError, load, resolve_config_path
 from coord.brain import AGENT_PORT
 
 AGENT_PORT = 7433
@@ -30,9 +30,14 @@ _CONFIG_OPTION = click.option(
     "--config",
     "config_path",
     type=click.Path(path_type=Path),
-    default=DEFAULT_CONFIG_PATH,
-    show_default=True,
-    help="Path to coordinator.yml.",
+    # Callable default: resolved per-invocation to a concrete Path so every
+    # command receives a real path (never None). Resolution order:
+    # $COORD_CONFIG → ~/.coord/coordinator.yml → ./coordinator.yml.
+    default=resolve_config_path,
+    help=(
+        "Path to coordinator.yml. Default resolution: $COORD_CONFIG, then "
+        "~/.coord/coordinator.yml, then ./coordinator.yml."
+    ),
 )
 
 
@@ -134,7 +139,14 @@ def _save_config_snapshot(config: Config) -> None:
                 pass
 
 
-def _load_config(path: Path) -> Config:
+def _load_config(path: Path | None) -> Config:
+    # Resolve the default location ($COORD_CONFIG → ~/.coord/coordinator.yml →
+    # ./coordinator.yml) when no explicit --config was given, so `coord` works on
+    # a machine without a repo checkout and isn't sensitive to the CWD.
+    if path is None:
+        from coord.config import resolve_config_path  # noqa: PLC0415
+
+        path = resolve_config_path()
     # #584/#591: a thin client (board_service set) has no local coordinator.yml.
     # When the path is absent, fetch + cache the daemon's config and load that,
     # so EVERY command — not just `coord status` — is config-portable. On the
@@ -9196,7 +9208,7 @@ def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) 
     auth = "bearer-token" if token else "OPEN (tailnet ACL only)"
     click.echo(
         f"coord serve: control center at http://{bind_host}:{bind_port} "
-        f"(db={DB_PATH}, auth={auth})"
+        f"(config={cfg.path}, db={DB_PATH}, auth={auth})"
     )
     if not token:
         click.echo(

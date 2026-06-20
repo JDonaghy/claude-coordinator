@@ -273,13 +273,14 @@ class TestDispatchedTransition:
         mock_dispatch.assert_not_called()
         assert completed_work.review_state == "dispatched"
 
-    # ── #465: review fires immediately regardless of smoke/test verdict ──
+    # ── Test-before-Review: review is HELD until a passed/skipped verdict ──
 
-    def test_review_dispatches_immediately_despite_missing_smoke(
+    def test_review_held_when_smoke_missing(
         self, two_machine_config: Config
     ) -> None:
-        """#465: review auto-dispatches even when test_state is None (no smoke
-        verdict recorded yet). The smoke gate was moved to merge."""
+        """Test precedes Review: review must NOT dispatch when test_state is None
+        (no smoke verdict yet) — it is held until the work is tested.  (Inverts
+        the old #465 behavior, which fired review regardless of smoke.)"""
         completed_work = _work_assignment(
             status="done", branch="issue-1-fix",
             review_state="pending", test_state=None,
@@ -291,15 +292,15 @@ class TestDispatchedTransition:
              patch("coord.review.dispatch_review", return_value=review_result):
             reconcile(board, two_machine_config)
 
-        assert completed_work.review_state == "dispatched", (
-            "review must dispatch immediately on work completion regardless of "
-            "test_state (#465: smoke gate moved to coord merge)"
+        assert completed_work.review_state in (None, "pending"), (
+            "review must be held until the work has a passed/skipped test verdict"
         )
 
-    def test_review_dispatches_immediately_despite_failed_smoke(
+    def test_review_held_when_smoke_failed(
         self, two_machine_config: Config
     ) -> None:
-        """#465: review auto-dispatches even when test_state is 'failed'."""
+        """Test precedes Review: a FAILED smoke test must NOT dispatch a review —
+        the failure routes to a fix, not a PR review."""
         completed_work = _work_assignment(
             status="done", branch="issue-1-fix",
             review_state="pending", test_state="failed",
@@ -311,8 +312,8 @@ class TestDispatchedTransition:
              patch("coord.review.dispatch_review", return_value=review_result):
             reconcile(board, two_machine_config)
 
-        assert completed_work.review_state == "dispatched", (
-            "review must dispatch even when smoke failed (#465)"
+        assert completed_work.review_state in (None, "pending"), (
+            "a failed smoke test must NOT dispatch a review (it routes to a fix)"
         )
 
     def test_review_dispatches_when_test_gate_skipped(

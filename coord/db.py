@@ -571,25 +571,31 @@ def _migrate_json(conn: sqlite3.Connection) -> None:  # noqa: C901 — acceptabl
                     pass
 
 
-# ── Gate-order migration (#520) ───────────────────────────────────────────────
+# ── Gate-order migration (Test-before-Review reorder) ─────────────────────────
 
 def _migrate_gate_order(conn: sqlite3.Connection) -> None:
-    """#520: rewrite the stale default gate order in stored rows.
+    """Rewrite the stale default gate order in stored rows.
 
-    The default changed from ``["test", "review", "merge"]`` to
-    ``["review", "test", "merge"]``.  Any assignment or proposal that was
-    dispatched with the old implicit default is updated so the pipeline display
-    shows the corrected order.  Only the exact old-default JSON string is
-    touched — user-customised gate lists (anything else) are left unchanged.
+    The default gate order moved Test ahead of Review — from the #520-era
+    ``["review", "test", "merge"]`` to ``["test", "review", "merge"]`` — now
+    that the agent-assisted Testing stage is smooth enough to run as a smoke
+    test *before* the PR/review (the natural order), reversing #520's "get the
+    review over with first" workaround.  Any assignment, proposal, or
+    ``board_meta`` row still carrying the previous implicit default is updated
+    so the pipeline display and the headless review gate
+    (:meth:`PipelineConfig.test_precedes_review`) agree.  Only the exact
+    previous-default JSON string is touched — user-customised gate lists
+    (anything else) are left unchanged.
 
-    The ``board_meta`` entry ``pipeline_default_gates`` is similarly rewritten
-    so the TUI/dashboard picks up the new order without waiting for the next
-    full ``_save_config_snapshot`` call.
+    The target string (``["test", "review", "merge"]``) is also the pre-#520
+    original, so a DB that never migrated forward is already in the desired
+    state and untouched.
 
-    This function is idempotent: if the old string is absent, no rows change.
+    This function is idempotent: if the previous-default string is absent, no
+    rows change.
     """
-    _OLD = '["test", "review", "merge"]'
-    _NEW = '["review", "test", "merge"]'
+    _OLD = '["review", "test", "merge"]'
+    _NEW = '["test", "review", "merge"]'
     conn.execute(
         "UPDATE assignments SET required_gates = ? WHERE required_gates = ?",
         (_NEW, _OLD),

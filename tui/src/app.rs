@@ -4072,8 +4072,11 @@ struct LiveTmuxSession {
     issue_title: Option<String>,
 }
 
-/// Leg 2 (#517): an interactive Work/Plan session the TUI launched this run,
-/// armed to auto-advance to Review once the board shows it finished.
+/// Leg 2 (#517): an interactive Work/Plan/Fix session the TUI launched this
+/// run, armed to auto-advance to **Test** once the board shows it finished
+/// (Test precedes Review — the smoke test runs before the PR/review).  The
+/// struct keeps its `AutoReview` name for continuity, but the stage it now
+/// offers is Test.
 ///
 /// The trigger is strictly **board-driven**, never terminal-scraped (ToS
 /// §3.7 / #437): the embedded shell does NOT exit when the interactive
@@ -4094,28 +4097,31 @@ struct ArmedAutoReview {
     prior_done_ids: std::collections::HashSet<String>,
 }
 
-/// Leg 2 (#517): the issue whose interactive work just finished, awaiting the
-/// operator's one-key confirm to launch the human-attended review.
+/// Leg 2 (#517): the issue whose smoke test just passed/skipped, awaiting the
+/// operator's one-key confirm to launch the human-attended review (Test
+/// precedes Review).  Raised by `detect_test_verdict`.
 struct PendingAutoReview {
     coord_repo: String,
     repo_slug: String,
     issue_num: u64,
 }
 
-/// Which interactive stage a post-review [`PendingStageLaunch`] offer starts.
+/// Which interactive stage a [`PendingStageLaunch`] offer starts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StageLaunchKind {
     /// request-changes review whose findings are already in the DB → `--fix-of`.
     Fix,
-    /// approved review → `--smoke-of` interactive testing (then merge).
+    /// completed work/fix → `--smoke-of` interactive testing (Test precedes
+    /// Review; on pass it then advances to review).
     Test,
 }
 
-/// A one-key offer to launch the next interactive stage for an issue, raised by
-/// `detect_review_verdict` once the review session pane has exited.  Unlike the
-/// #587 rework dialog this carries NO findings input — it's used only when the
-/// next step needs no operator typing: a request-changes review whose findings
-/// the agent already self-reported (kind=Fix), or an approved review (kind=Test).
+/// A one-key offer to launch the next interactive stage for an issue.  Unlike
+/// the #587 rework dialog this carries NO findings input — it's used only when
+/// the next step needs no operator typing: a request-changes review whose
+/// findings the agent already self-reported (kind=Fix, raised by
+/// `detect_review_verdict`), or a freshly-completed work/fix advancing to the
+/// smoke test (kind=Test, raised by `detect_completed_interactive_work`).
 struct PendingStageLaunch {
     coord_repo: String,
     repo_slug: String,
@@ -17208,14 +17214,15 @@ impl CoordApp {
             });
         }
 
-        // ── Leg 2 (#517): auto-advance Work → Review confirm ─────────────
+        // ── Test → Review confirm (Test precedes Review) ─────────────────
+        // Raised by detect_test_verdict once the smoke test passes/skips.
         if let Some(ref p) = self.pending_auto_review {
             return Some(Dialog {
                 id: WidgetId::new("dialog:auto-review"),
-                title: StyledText::plain("Work complete — start review?"),
+                title: StyledText::plain("Test passed — start review?"),
                 body: vec![
                     StyledText::plain(format!(
-                        "Interactive work for {} #{} finished and pushed a branch.",
+                        "The smoke test for {} #{} passed.",
                         p.coord_repo, p.issue_num,
                     )),
                     StyledText::plain(
@@ -17244,21 +17251,30 @@ impl CoordApp {
             });
         }
 
-        // ── Post-review one-key stage offer (Fix / Test) ─────────────────
-        // Raised by detect_review_verdict once the review session has exited.
-        // No findings input — the next stage needs no operator typing.
+        // ── One-key stage offer (Fix / Test) ─────────────────────────────
+        // Fix: raised by detect_review_verdict (request-changes, findings in
+        // the DB).  Test: raised by detect_completed_interactive_work once a
+        // work/fix finishes (Test precedes Review).  No findings input — the
+        // next stage needs no operator typing.
         if let Some(ref p) = self.pending_stage_launch {
-            let (title, verdict_line, action, button) = match p.kind {
+            let (title, intro, action, button) = match p.kind {
                 StageLaunchKind::Fix => (
                     "Review requested changes — start a fix?",
-                    "requested changes (findings already captured in the DB)",
+                    format!(
+                        "The review of {} #{} requested changes (findings already \
+                         captured in the DB).",
+                        p.coord_repo, p.issue_num,
+                    ),
                     "Start an interactive fix on the same branch?",
                     "⏎  Start fix",
                 ),
                 StageLaunchKind::Test => (
-                    "Review approved — start testing?",
-                    "approved the branch",
-                    "Start the human-attended testing session (smoke tests, then merge)?",
+                    "Work complete — start testing?",
+                    format!(
+                        "Interactive work for {} #{} finished and pushed a branch.",
+                        p.coord_repo, p.issue_num,
+                    ),
+                    "Start the human-attended testing session (smoke tests) now?",
                     "⏎  Start testing",
                 ),
             };
@@ -17266,10 +17282,7 @@ impl CoordApp {
                 id: WidgetId::new("dialog:stage-launch"),
                 title: StyledText::plain(title.to_string()),
                 body: vec![
-                    StyledText::plain(format!(
-                        "The review of {} #{} {}.",
-                        p.coord_repo, p.issue_num, verdict_line,
-                    )),
+                    StyledText::plain(intro),
                     StyledText::plain(action.to_string()),
                 ],
                 buttons: vec![
@@ -17387,14 +17400,14 @@ impl CoordApp {
             });
         }
 
-        // ── Leg 3c (#517, #306): test PASSED → start merge agent confirm ─
+        // ── Leg 3c (#517, #306): review APPROVED → start merge agent confirm
         if let Some(ref p) = self.pending_merge {
             return Some(Dialog {
                 id: WidgetId::new("dialog:merge-agent"),
-                title: StyledText::plain("Test passed — start merge agent?"),
+                title: StyledText::plain("Review approved — start merge agent?"),
                 body: vec![
                     StyledText::plain(format!(
-                        "The smoke test for {} #{} passed.",
+                        "The review of {} #{} approved the branch.",
                         p.coord_repo, p.issue_num,
                     )),
                     StyledText::plain(
@@ -17741,7 +17754,7 @@ impl CoordApp {
             return;
         }
 
-        // ── Leg 2 (#517): auto-advance Work → Review ─────────────────────
+        // ── Test → Review confirm (Test precedes Review) ─────────────────
         if self.pending_auto_review.is_some() {
             if id == "review" {
                 self.confirm_auto_review();
@@ -22828,9 +22841,11 @@ impl CoordApp {
     }
 
     /// Leg 2 (#517): scan armed interactive-work sessions for one the board now
-    /// shows finished (a new done-with-branch work aid, no review yet) and, if
-    /// found, raise the confirm prompt.  Strictly board-driven — never reads the
-    /// session TTY (ToS §3.7 / #437).  Returns `true` when a prompt was raised.
+    /// shows finished (a new done-with-branch work aid, not yet tested) and, if
+    /// found, raise the "start testing?" confirm prompt.  Test precedes Review
+    /// now, so a completed work/fix advances to the smoke-test stage first.
+    /// Strictly board-driven — never reads the session TTY (ToS §3.7 / #437).
+    /// Returns `true` when a prompt was raised.
     fn detect_completed_interactive_work(&mut self) -> bool {
         // One stage prompt at a time; don't stack over an open one.
         if self.stage_prompt_open() || self.armed_for_auto_review.is_empty() {
@@ -22847,8 +22862,15 @@ impl CoordApp {
             }
             let aid = self.completed_work_aid_for(&armed.coord_repo, armed.issue_num)?;
             // Only a genuinely new completion (the just-launched work/fix), and
-            // only when that work hasn't already been handed to a review.
+            // only when that work hasn't already progressed past the test stage.
             if armed.prior_done_ids.contains(&aid) {
+                return None;
+            }
+            // Test-before-Review reorder: don't re-offer testing for work that
+            // already carries a test verdict, nor for work already handed to a
+            // review (a review can only exist post-test now).  A freshly-pushed
+            // fix has neither, so the re-test → re-review loop still fires.
+            if self.test_state_for_aid(&aid).is_some() {
                 return None;
             }
             if self.work_has_review(&armed.coord_repo, armed.issue_num, &aid) {
@@ -22861,10 +22883,13 @@ impl CoordApp {
                 // Drop terminal focus so the confirm prompt owns Enter rather
                 // than the live shell that ran `coord assign`.
                 self.detail_terminal_focused = false;
-                self.pending_auto_review = Some(PendingAutoReview {
+                // Test-before-Review reorder: a finished work/fix advances to
+                // the smoke-test stage first (was: straight to review).
+                self.pending_stage_launch = Some(PendingStageLaunch {
                     coord_repo: armed.coord_repo,
                     repo_slug: armed.repo_slug,
                     issue_num: armed.issue_num,
+                    kind: StageLaunchKind::Test,
                 });
                 return true;
             }
@@ -22949,9 +22974,10 @@ impl CoordApp {
 
     /// Leg 3 (#517): scan armed interactive reviews for a freshly-reported
     /// verdict and route it.  request-changes → raise the rework confirm
-    /// prompt; approve → surface a notice pointing at the smoke/merge gate.
-    /// Strictly board-driven (verdict comes from `coord report-result`, never
-    /// the session TTY).  Returns `true` when it raised a prompt or toast.
+    /// prompt; approve → offer the interactive merge agent (the branch was
+    /// already smoke-tested — Test precedes Review).  Strictly board-driven
+    /// (verdict comes from `coord report-result`, never the session TTY).
+    /// Returns `true` when it raised a prompt or toast.
     fn detect_review_verdict(&mut self) -> bool {
         if self.stage_prompt_open() || self.armed_for_verdict.is_empty() {
             return false;
@@ -23002,13 +23028,14 @@ impl CoordApp {
                 });
             }
         } else {
-            // approve (incl. approved-with-nits): offer a one-key "start
-            // testing" launch — the guided smoke → merge flow (leg 3c).
-            self.pending_stage_launch = Some(PendingStageLaunch {
+            // approve (incl. approved-with-nits): the branch was already
+            // smoke-tested before this review (Test precedes Review now), so
+            // offer the interactive merge agent directly — the guided rebase →
+            // merge flow (leg 3c).
+            self.pending_merge = Some(PendingMerge {
                 coord_repo: armed.coord_repo,
                 repo_slug: armed.repo_slug,
                 issue_num: armed.issue_num,
-                kind: StageLaunchKind::Test,
             });
         }
         true
@@ -23685,8 +23712,9 @@ impl CoordApp {
     }
 
     /// Leg 3c / A3 (#517): scan armed interactive testing sessions for a
-    /// freshly-recorded test verdict on the WORK row and route it: `failed`
-    /// → fail→fix confirm prompt; `passed`/`skipped` → pass→merge confirm
+    /// freshly-recorded test verdict on the WORK row and route it (Test
+    /// precedes Review): `failed` → fail→fix confirm prompt (same action a
+    /// request-changes review takes); `passed`/`skipped` → start-review confirm
     /// prompt.  Strictly board-driven — the verdict comes from `coord test`
     /// (written to the DB), never the session TTY.  Returns `true` when it
     /// raised a prompt.
@@ -23737,8 +23765,9 @@ impl CoordApp {
             });
             self.start_fix_briefing_preview(Some(aid));
         } else {
-            // passed / skipped → offer the interactive merge agent.
-            self.pending_merge = Some(PendingMerge {
+            // passed / skipped → the smoke test cleared, so offer the
+            // human-attended review (Test precedes Review now; was: merge).
+            self.pending_auto_review = Some(PendingAutoReview {
                 coord_repo: armed.coord_repo,
                 repo_slug: armed.repo_slug,
                 issue_num: armed.issue_num,
@@ -23868,7 +23897,7 @@ impl CoordApp {
         self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
     }
 
-    /// Leg 3c (#517, #306): the operator confirmed the pass→merge prompt —
+    /// Leg 3c (#517, #306): the operator confirmed the approve→merge prompt —
     /// select the issue's row, open its Terminal tab, and launch the
     /// interactive `--merge-of` merge agent (proactive rebase + conflict
     /// resolution on the approved branch).
@@ -24157,11 +24186,15 @@ impl CoordApp {
                     });
                 }
 
-                // Leg 2/3 (#517): arm the right board-driven watcher.
-                //   Work/Plan/Fix/Troubleshoot → arm auto-advance to Review
-                //     (Troubleshoot may implement a fix, so arm the watcher
-                //     so the pipeline can advance automatically if it does).
-                //   Review → arm verdict-routing; disarm the auto-review watcher
+                // Leg 2/3 (#517): arm the right board-driven watcher.  Test
+                // precedes Review, so the stage chain is
+                // Work → Test → Review → Merge (fail at any stage → Fix):
+                //   Work/Plan/Fix/Troubleshoot → arm the completion watcher,
+                //     which offers the next stage (Test) when it finishes
+                //     (Troubleshoot may implement a fix, so arm it too).
+                //   Test → arm test-verdict routing (pass → Review, fail → Fix).
+                //   Review → arm review-verdict routing (approve → Merge,
+                //     request-changes → Fix); disarm the completion watcher
                 //     (a review is now in flight for this work).
                 match mode {
                     InteractiveLaunchMode::Work
@@ -24201,7 +24234,7 @@ impl CoordApp {
                     }
                     // Leg 3c / A3 (#517): arm the test-verdict watcher so a
                     // `coord test --passed|--fail` recorded by the testing agent
-                    // routes to the fail→fix or pass→merge confirm prompt.
+                    // routes to the fail→fix or pass→review confirm prompt.
                     InteractiveLaunchMode::Test => {
                         let work_aid = work_aid.clone().unwrap_or_default();
                         let prior_test_state = self.test_state_for_aid(&work_aid);
@@ -25324,8 +25357,8 @@ impl ShellApp for CoordApp {
             }
         }
 
-        // ── Leg 2 (#517): auto-advance Work → Review confirm ─────────────
-        // When interactive work finishes (board-driven, never scraped) the
+        // ── Test → Review confirm (Test precedes Review) ─────────────────
+        // When the smoke test passes (board-driven, never scraped) the
         // detector raises `pending_auto_review`.  Own Enter (confirm →
         // launch the interactive review) and Esc/n (dismiss) here, BEFORE
         // the detail-terminal focus block — otherwise a still-focused shell
@@ -29740,7 +29773,9 @@ mod tests {
         let mut app = make_app_with_assignments(vec![done_work_with_branch(10, "repo-a")]);
         arm_auto_review(&mut app, "repo-a", 10, &[]);
         assert!(app.detect_completed_interactive_work());
-        let p = app.pending_auto_review.as_ref().expect("prompt raised");
+        // Test precedes Review: a finished work offers the Test stage first.
+        let p = app.pending_stage_launch.as_ref().expect("prompt raised");
+        assert_eq!(p.kind, StageLaunchKind::Test);
         assert_eq!(p.issue_num, 10);
         assert_eq!(p.coord_repo, "repo-a");
         // Armed entry consumed so the prompt doesn't re-fire next tick.
@@ -29754,7 +29789,7 @@ mod tests {
         let mut app = make_app_with_assignments(vec![done_work_with_branch(10, "repo-a")]);
         arm_auto_review(&mut app, "repo-a", 10, &["id-10-done"]);
         assert!(!app.detect_completed_interactive_work());
-        assert!(app.pending_auto_review.is_none());
+        assert!(app.pending_stage_launch.is_none());
         // Stays armed, waiting for a genuinely new completion.
         assert!(app
             .armed_for_auto_review
@@ -29781,14 +29816,15 @@ mod tests {
         ]);
         arm_auto_review(&mut app, "repo-a", 10, &[]);
         assert!(!app.detect_completed_interactive_work());
-        assert!(app.pending_auto_review.is_none());
+        assert!(app.pending_stage_launch.is_none());
     }
 
     #[test]
-    fn detect_re_review_fires_after_a_fix_even_with_a_prior_review() {
+    fn detect_re_test_fires_after_a_fix_even_with_a_prior_review() {
         // Original work reviewed (request-changes); a FIX produced a NEW done
-        // work aid that has no review yet → re-review must fire (this is the
-        // incremental re-review loop; the old review must NOT block it).
+        // work aid that has no test verdict yet → re-test must fire (Test
+        // precedes Review, so a fix re-tests before its incremental re-review;
+        // the old review must NOT block it).
         let mut fix = make_assignment_typed("done", 10, "repo-a", Some("work"));
         fix.id = "id-10-fix".to_string();
         fix.branch = Some("issue-10-work".to_string());
@@ -29796,12 +29832,14 @@ mod tests {
         let mut app = make_app_with_assignments(vec![
             done_work_with_branch(10, "repo-a"), // id-10-done (original)
             review_of("id-10-done", 10, "repo-a", Some("request-changes")),
-            fix, // id-10-fix — the latest work, not yet reviewed
+            fix, // id-10-fix — the latest work, not yet tested
         ]);
         // Armed at fix-launch time: only the ORIGINAL work was done then.
         arm_auto_review(&mut app, "repo-a", 10, &["id-10-done"]);
         assert!(app.detect_completed_interactive_work());
-        assert_eq!(app.pending_auto_review.as_ref().unwrap().issue_num, 10);
+        let p = app.pending_stage_launch.as_ref().expect("re-test offer raised");
+        assert_eq!(p.kind, StageLaunchKind::Test);
+        assert_eq!(p.issue_num, 10);
     }
 
     #[test]
@@ -29814,7 +29852,7 @@ mod tests {
         )]);
         arm_auto_review(&mut app, "repo-a", 10, &[]);
         assert!(!app.detect_completed_interactive_work());
-        assert!(app.pending_auto_review.is_none());
+        assert!(app.pending_stage_launch.is_none());
     }
 
     #[test]
@@ -29991,14 +30029,16 @@ mod tests {
             review_of("id-10-done", 10, "repo-a", Some("approve")),
         ]);
         arm_verdict(&mut app, "repo-a", 10, &[]);
-        // Approve → a one-key "start testing" stage offer, never a rework prompt.
+        // Approve → a one-key "start merge agent" offer (the branch was already
+        // tested — Test precedes Review), never a rework prompt.
         assert!(app.detect_review_verdict());
         assert!(app.pending_rework.is_none());
+        assert!(app.pending_stage_launch.is_none());
         let p = app
-            .pending_stage_launch
+            .pending_merge
             .as_ref()
-            .expect("a start-testing stage offer is raised");
-        assert_eq!(p.kind, StageLaunchKind::Test);
+            .expect("a start-merge offer is raised");
+        assert_eq!(p.issue_num, 10);
         assert!(app.armed_for_verdict.is_empty());
     }
 
@@ -30292,14 +30332,16 @@ mod tests {
     }
 
     #[test]
-    fn detect_test_verdict_passed_raises_merge() {
+    fn detect_test_verdict_passed_raises_review() {
         let mut app =
             make_app_with_assignments(vec![done_work_with_test_state(10, "repo-a", "passed")]);
         arm_test_verdict(&mut app, "repo-a", 10, "id-10-done", None);
         assert!(app.detect_test_verdict());
-        let p = app.pending_merge.as_ref().expect("merge prompt raised");
+        // Test precedes Review: a passed smoke test offers the review next.
+        let p = app.pending_auto_review.as_ref().expect("review prompt raised");
         assert_eq!(p.issue_num, 10);
         assert!(app.pending_test_fix.is_none());
+        assert!(app.pending_merge.is_none());
         assert!(app.armed_for_test_verdict.is_empty());
     }
 
