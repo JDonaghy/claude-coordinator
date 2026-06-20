@@ -14637,6 +14637,19 @@ impl CoordApp {
                 } else if ctx.in_main(pos.x, pos.y) {
                     let main_b = ctx.main_bounds();
                     let char_w = backend.char_width();
+                    // #646 focus-follows-click: clicking the terminal content area focuses it.
+                    if self.active_view == SidebarView::Terminal && !self.terminal_focused {
+                        self.terminal_focused = true;
+                    }
+                    if self.active_view == SidebarView::Pipeline
+                        && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                    {
+                        // Only focus when clicking below the tab bar (the terminal content).
+                        let tab_h = detail_tab_bar_height(lh);
+                        if pos.y - main_b.y >= tab_h && !self.detail_terminal_focused {
+                            self.detail_terminal_focused = true;
+                        }
+                    }
                     // #464: host-side selection — must check BEFORE the PTY
                     // forwarding path so Shift can override even when the app
                     // has mouse reporting on (e.g. vim visual mode).
@@ -15023,11 +15036,21 @@ impl CoordApp {
         if consumed {
             return true;
         }
+        // #646 focus-follows-click: any sidebar click blurs the terminal.
+        if self.terminal_focused || self.detail_terminal_focused {
+            self.terminal_focused = false;
+            self.detail_terminal_focused = false;
+        }
         match self.active_view {
             SidebarView::Board => {
                 let result = self.board_sidebar.handle(event, backend, sidebar_b);
                 match result {
                     SidebarEvent::RowSelected { section, ref path } => {
+                        // #646 focus-follows-click: row click blurs the search filter.
+                        if self.board_search.focused {
+                            self.board_search.focused = false;
+                            self.board_sidebar.focus_form(0, false);
+                        }
                         if path.len() == 1 {
                             // #410: click on a milestone header — toggle milestone expansion.
                             let offset = self.board_repo_offset();
@@ -15055,6 +15078,11 @@ impl CoordApp {
                         true
                     }
                     SidebarEvent::RowActivated { section, ref path } => {
+                        // #646 focus-follows-click: row activate blurs the search filter.
+                        if self.board_search.focused {
+                            self.board_search.focused = false;
+                            self.board_sidebar.focus_form(0, false);
+                        }
                         if path.len() == 1 {
                             // Activate on a milestone header — toggle expansion.
                             let offset = self.board_repo_offset();
@@ -15198,9 +15226,15 @@ impl CoordApp {
                         }
                         true
                     }
-                    SidebarEvent::RowSelected { .. }
-                    | SidebarEvent::RowActivated { .. }
-                    | SidebarEvent::HeaderActivated { .. }
+                    // #646 focus-follows-click: row click/activate blurs the search filter.
+                    SidebarEvent::RowSelected { .. } | SidebarEvent::RowActivated { .. } => {
+                        if self.pipeline_search.focused {
+                            self.pipeline_search.focused = false;
+                            self.pipeline_sidebar.focus_form(0, false);
+                        }
+                        true
+                    }
+                    SidebarEvent::HeaderActivated { .. }
                     | SidebarEvent::StateChanged
                     | SidebarEvent::Consumed
                     | SidebarEvent::ScrollChanged { .. }
@@ -15243,6 +15277,15 @@ impl CoordApp {
             return true;
         }
         let main_b = content_main_b;
+        // #646 focus-follows-click: click in main area blurs any active filter.
+        if self.board_search.focused {
+            self.board_search.focused = false;
+            self.board_sidebar.focus_form(0, false);
+        }
+        if self.pipeline_search.focused {
+            self.pipeline_search.focused = false;
+            self.pipeline_sidebar.focus_form(0, false);
+        }
 
         if self.active_view == SidebarView::Settings {
             // Route click to FormController. FormController::handle_cached
@@ -26360,6 +26403,17 @@ impl ShellApp for CoordApp {
             UiEvent::KeyPressed { key, .. } => {
                 match key {
                     // ── Board search input ───────────────────────────────
+                    // #646/#566: ESC while the filter is focused blurs it
+                    // (clear + unfocus) — never quits while filter has focus.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Board
+                            && self.board_search.focused =>
+                    {
+                        self.board_search.clear(); // also sets focused = false
+                        self.board_sidebar.focus_form(0, false);
+                        self.rebuild_board_sidebar();
+                        needs_redraw = true;
+                    }
                     // Escape clears search or (if already empty) quits.
                     Key::Named(NamedKey::Escape)
                         if self.active_view == SidebarView::Board
@@ -26398,6 +26452,16 @@ impl ShellApp for CoordApp {
                     // Mirror the Board search arms for the Pipeline view so
                     // typing in the filter never falls through to the
                     // Pipeline keybinds (r/R/D/m/f/…) further down.
+                    // #646/#566: ESC while the filter is focused blurs it.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_search.focused =>
+                    {
+                        self.pipeline_search.clear(); // also sets focused = false
+                        self.pipeline_sidebar.focus_form(0, false);
+                        self.rebuild_pipeline_sidebar(None);
+                        needs_redraw = true;
+                    }
                     // Escape clears search (when non-empty); empty falls
                     // through to the global quit handler.
                     Key::Named(NamedKey::Escape)
@@ -32616,6 +32680,80 @@ mod tests {
         assert_eq!(f.query, "");
         assert_eq!(f.cursor, 0);
         assert!(!f.focused, "clear drops focus");
+    }
+
+    // ── #646/#566: filter blur (ESC, row-click, main-click) ──────────────
+
+    /// ESC while the filter is focused AND non-empty blurs (clear + unfocus).
+    #[test]
+    fn esc_blur_board_filter_focused_with_query() {
+        let mut app = make_app_default();
+        app.board_search.focused = true;
+        app.board_search.insert_char('h');
+        app.board_search.insert_char('i');
+        app.rebuild_board_sidebar();
+        assert!(app.board_sidebar.form_has_focus(0), "precondition: form focused");
+
+        // Replicate what the keyboard ESC arm does:
+        app.board_search.clear(); // sets focused = false
+        app.board_sidebar.focus_form(0, false);
+        app.rebuild_board_sidebar();
+
+        assert!(!app.board_search.focused, "filter must be unfocused after ESC");
+        assert!(app.board_search.is_empty(), "filter must be cleared after ESC");
+        assert!(!app.board_sidebar.form_has_focus(0), "quadraui form must be unfocused");
+    }
+
+    /// ESC while the filter is focused AND empty blurs instead of quitting (#566).
+    #[test]
+    fn esc_blur_board_filter_focused_and_empty() {
+        let mut app = make_app_default();
+        app.board_search.focused = true;
+        app.rebuild_board_sidebar();
+        // filter is empty — old code fell through to quit; new code blurs
+        assert!(app.board_search.is_empty(), "precondition: empty");
+        assert!(app.board_search.focused, "precondition: focused");
+
+        // Replicate the #646 ESC arm:
+        app.board_search.clear();
+        app.board_sidebar.focus_form(0, false);
+        app.rebuild_board_sidebar();
+
+        assert!(!app.board_search.focused, "ESC on empty focused filter must blur, not quit");
+        assert!(!app.board_sidebar.form_has_focus(0), "quadraui form must be unfocused");
+    }
+
+    /// ESC while the pipeline filter is focused blurs it.
+    #[test]
+    fn esc_blur_pipeline_filter_when_focused() {
+        let mut app = make_pipeline_app();
+        app.pipeline_search.focused = true;
+        app.pipeline_search.insert_char('x');
+        app.rebuild_pipeline_sidebar(None);
+
+        // Replicate the #646 ESC arm:
+        app.pipeline_search.clear();
+        app.pipeline_sidebar.focus_form(0, false);
+        app.rebuild_pipeline_sidebar(None);
+
+        assert!(!app.pipeline_search.focused, "pipeline filter must blur on ESC");
+        assert!(!app.pipeline_sidebar.form_has_focus(0), "pipeline quadraui form must be unfocused");
+    }
+
+    /// Focusing the filter, then clearing + rebuilding, leaves it unfocused
+    /// (verifies focus_form survives rebuild).
+    #[test]
+    fn filter_blur_survives_rebuild() {
+        let mut app = make_app_default();
+        // Focus then immediately blur without the sidebar rebuild in between.
+        app.board_search.focused = true;
+        app.board_sidebar.focus_form(0, true);
+        // Now blur:
+        app.board_search.focused = false;
+        app.board_sidebar.focus_form(0, false);
+        app.rebuild_board_sidebar(); // rebuild must not re-focus
+        assert!(!app.board_search.focused);
+        assert!(!app.board_sidebar.form_has_focus(0), "rebuild must not re-apply focus when board_search.focused is false");
     }
 
     // ── Pipeline FILTER box ───────────────────────────────────────────────
