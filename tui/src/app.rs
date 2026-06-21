@@ -5048,6 +5048,10 @@ pub struct CoordApp {
     /// lifecycle-first now that lifecycle is the top-level grouping and repo
     /// is the sub-group.
     pipeline_lifecycle_expanded: std::collections::HashMap<(String, String), bool>,
+    /// #668: Expanded state for milestone sub-headers in Pipeline New/Done
+    /// sections.  Key: `(lifecycle_key, repo_key, milestone_key)`.
+    /// Default: true (expanded).  Persists across rebuilds.
+    pipeline_milestone_expanded: std::collections::HashMap<(String, String, String), bool>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
     /// Selected issue index into `pipeline_issues`, if any.
@@ -5772,6 +5776,7 @@ impl CoordApp {
             pipeline_state_section_names: Vec::new(),
             pipeline_search: SidebarFilter::default(),
             pipeline_lifecycle_expanded: std::collections::HashMap::new(),
+            pipeline_milestone_expanded: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_status: None,
@@ -9398,6 +9403,72 @@ impl CoordApp {
         result
     }
 
+    /// #668: Group a slice of `pipeline_issues` indices by milestone.
+    ///
+    /// Looks up milestone data from `self.data.open_issues` (matched by
+    /// `coord_repo` + `number`).  Issues without an `open_issues` record, or
+    /// whose record has no milestone, fall into the `"no-milestone"` bucket.
+    ///
+    /// Returns `Vec<(milestone_key, display_title, Vec<usize>)>` sorted:
+    /// named milestones by number ASC, `"No milestone"` last.
+    fn pipeline_milestones_for_issues(
+        &self,
+        issue_idxs: &[usize],
+    ) -> Vec<(String, String, Vec<usize>)> {
+        let mut milestone_map: std::collections::BTreeMap<
+            (i64, String),
+            (String, String, Vec<usize>),
+        > = std::collections::BTreeMap::new();
+
+        for &idx in issue_idxs {
+            let issue = &self.pipeline_issues[idx];
+            // Lookup milestone from open_issues by (coord_repo, number).
+            let (mil_num, mil_title) = issue
+                .coord_repo
+                .as_ref()
+                .and_then(|repo_name| {
+                    self.data
+                        .open_issues
+                        .iter()
+                        .find(|oi| oi.repo_name == *repo_name && oi.number == issue.number)
+                })
+                .map(|oi| (oi.milestone_number, oi.milestone_title.clone()))
+                .unwrap_or((None, None));
+
+            match mil_num {
+                Some(n) => {
+                    let title = mil_title.unwrap_or_default();
+                    let key = n.to_string();
+                    let sort_key = (n, title.clone());
+                    milestone_map
+                        .entry(sort_key)
+                        .or_insert_with(|| (key, title, Vec::new()))
+                        .2
+                        .push(idx);
+                }
+                None => {
+                    let sort_key = (i64::MAX, String::new());
+                    milestone_map
+                        .entry(sort_key)
+                        .or_insert_with(|| {
+                            (
+                                "no-milestone".to_string(),
+                                "No milestone".to_string(),
+                                Vec::new(),
+                            )
+                        })
+                        .2
+                        .push(idx);
+                }
+            }
+        }
+
+        milestone_map
+            .into_values()
+            .filter(|(_, _, idxs)| !idxs.is_empty())
+            .collect()
+    }
+
     /// Returns a map from GitHub repo slug (`owner/name`) to the count of
     /// `state='pending'` rows in the in-memory merge-queue snapshot.
     ///
@@ -9629,6 +9700,10 @@ impl CoordApp {
                     // expandable repo sub-headers.  #194 expanded this from
                     // the original three sections to all four non-Active
                     // lifecycle states.
+                    //
+                    // #668: New and Done additionally group by milestone beneath
+                    // the repo level (repo → milestone → issue, 3-level path
+                    // [ri, mi, ii]).  Refining and Pending remain 2-level.
                     let repo_groups: &Vec<(String, Vec<usize>)> = match lc_key {
                         "new" => &new_by_repo,
                         "refining" => &refining_by_repo,
@@ -9644,6 +9719,7 @@ impl CoordApp {
                         section_idx,
                         Some(StyledText::plain(format!("({})", total))),
                     );
+                    let milestone_grouped = lc_key == "new" || lc_key == "done";
                     for (ri, (repo_key, issue_idxs)) in repo_groups.iter().enumerate() {
                         // Repo sub-header: expand/collapse keyed by
                         // (lifecycle_key, repo_key) — lifecycle first, repo
@@ -9702,42 +9778,130 @@ impl CoordApp {
                         if !is_expanded {
                             continue;
                         }
-                        for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
-                            let issue = &self.pipeline_issues[issue_idx];
-                            let stage_name = self.derive_current_stage(issue);
-                            let (badge_text, badge_color) = stage_badge(&stage_name);
-                            let title_color = if issue.coord_repo.is_some() {
-                                Color::rgb(210, 210, 210)
-                            } else {
-                                Color::rgb(140, 140, 140)
-                            };
-                            let has_live_stream = self
-                                .watch_pool
-                                .values()
-                                .any(|ctx| ctx.state.issue_number == issue.number && !ctx.sse.done);
-                            let mut spans = vec![
-                                StyledSpan::with_fg(
-                                    format!("#{:<5}", issue.number),
-                                    Color::rgb(150, 150, 240),
-                                ),
-                                StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
-                            ];
-                            if has_live_stream {
-                                spans.push(StyledSpan::with_fg(
-                                    " ▶".to_string(),
-                                    Color::rgb(60, 200, 80),
-                                ));
+
+                        if milestone_grouped {
+                            // #668: New/Done — 3-level tree: repo → milestone → issue.
+                            // Compute milestones for this repo's issue list.
+                            let milestones =
+                                self.pipeline_milestones_for_issues(issue_idxs);
+                            for (mi, (mil_key, mil_display, mil_issue_idxs)) in
+                                milestones.iter().enumerate()
+                            {
+                                let is_mil_expanded = self
+                                    .pipeline_milestone_expanded
+                                    .get(&(
+                                        lc_key.to_string(),
+                                        repo_key.clone(),
+                                        mil_key.clone(),
+                                    ))
+                                    .copied()
+                                    .unwrap_or(true);
+                                let mil_color = if mil_key == "no-milestone" {
+                                    Color::rgb(100, 100, 120) // dim for unassigned
+                                } else {
+                                    Color::rgb(160, 160, 200) // muted purple for named
+                                };
+                                rows.push(TreeRow {
+                                    path: vec![ri as u16, mi as u16],
+                                    indent: 2,
+                                    icon: None,
+                                    text: StyledText {
+                                        spans: vec![StyledSpan::with_fg(
+                                            format!(
+                                                "{} ({})",
+                                                mil_display,
+                                                mil_issue_idxs.len()
+                                            ),
+                                            mil_color,
+                                        )],
+                                    },
+                                    badge: None,
+                                    is_expanded: Some(is_mil_expanded),
+                                    decoration: Decoration::Header,
+                                    edit: None,
+                                });
+                                if !is_mil_expanded {
+                                    continue;
+                                }
+                                for (ii, &issue_idx) in mil_issue_idxs.iter().enumerate() {
+                                    let issue = &self.pipeline_issues[issue_idx];
+                                    let stage_name = self.derive_current_stage(issue);
+                                    let (badge_text, badge_color) = stage_badge(&stage_name);
+                                    let title_color = if issue.coord_repo.is_some() {
+                                        Color::rgb(210, 210, 210)
+                                    } else {
+                                        Color::rgb(140, 140, 140)
+                                    };
+                                    let has_live_stream = self.watch_pool.values().any(|ctx| {
+                                        ctx.state.issue_number == issue.number && !ctx.sse.done
+                                    });
+                                    let mut spans = vec![
+                                        StyledSpan::with_fg(
+                                            format!("#{:<5}", issue.number),
+                                            Color::rgb(150, 150, 240),
+                                        ),
+                                        StyledSpan::with_fg(
+                                            trunc(&issue.title, 20),
+                                            title_color,
+                                        ),
+                                    ];
+                                    if has_live_stream {
+                                        spans.push(StyledSpan::with_fg(
+                                            " ▶".to_string(),
+                                            Color::rgb(60, 200, 80),
+                                        ));
+                                    }
+                                    rows.push(TreeRow {
+                                        path: vec![ri as u16, mi as u16, ii as u16],
+                                        indent: 3,
+                                        icon: None,
+                                        text: StyledText { spans },
+                                        badge: Some(Badge::colored(&badge_text, badge_color)),
+                                        is_expanded: None,
+                                        decoration: Decoration::Normal,
+                                        edit: None,
+                                    });
+                                }
                             }
-                            rows.push(TreeRow {
-                                path: vec![ri as u16, ii as u16],
-                                indent: 2,
-                                icon: None,
-                                text: StyledText { spans },
-                                badge: Some(Badge::colored(&badge_text, badge_color)),
-                                is_expanded: None,
-                                decoration: Decoration::Normal,
-                                edit: None,
-                            });
+                        } else {
+                            // Refining / Pending — 2-level tree: repo → issue.
+                            for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
+                                let issue = &self.pipeline_issues[issue_idx];
+                                let stage_name = self.derive_current_stage(issue);
+                                let (badge_text, badge_color) = stage_badge(&stage_name);
+                                let title_color = if issue.coord_repo.is_some() {
+                                    Color::rgb(210, 210, 210)
+                                } else {
+                                    Color::rgb(140, 140, 140)
+                                };
+                                let has_live_stream = self
+                                    .watch_pool
+                                    .values()
+                                    .any(|ctx| ctx.state.issue_number == issue.number && !ctx.sse.done);
+                                let mut spans = vec![
+                                    StyledSpan::with_fg(
+                                        format!("#{:<5}", issue.number),
+                                        Color::rgb(150, 150, 240),
+                                    ),
+                                    StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
+                                ];
+                                if has_live_stream {
+                                    spans.push(StyledSpan::with_fg(
+                                        " ▶".to_string(),
+                                        Color::rgb(60, 200, 80),
+                                    ));
+                                }
+                                rows.push(TreeRow {
+                                    path: vec![ri as u16, ii as u16],
+                                    indent: 2,
+                                    icon: None,
+                                    text: StyledText { spans },
+                                    badge: Some(Badge::colored(&badge_text, badge_color)),
+                                    is_expanded: None,
+                                    decoration: Decoration::Normal,
+                                    edit: None,
+                                });
+                            }
                         }
                     }
                 }
@@ -9749,9 +9913,16 @@ impl CoordApp {
         if sidebar.active_section().is_none() && !state_sections.is_empty() {
             let section_idx = search_offset; // first state section
             sidebar.set_active_section(Some(section_idx));
-            // Every section is now sub-header grouped (Active by liveness;
-            // New/Done by repo), so path [0, 0] = first sub-header → first issue.
-            sidebar.set_selected_path(section_idx, Some(vec![0u16, 0u16]));
+            // Active sections use path [group_idx, issue_idx] (2-level).
+            // New/Done now use path [repo_idx, milestone_idx, issue_idx] (3-level).
+            // Refining/Pending use path [repo_idx, issue_idx] (2-level).
+            let first_state_key = state_sections.get(0).map(|&(k, _)| k).unwrap_or("");
+            let default_path = if first_state_key == "new" || first_state_key == "done" {
+                vec![0u16, 0u16, 0u16]
+            } else {
+                vec![0u16, 0u16]
+            };
+            sidebar.set_selected_path(section_idx, Some(default_path));
         }
 
         self.pipeline_repo_names = repos;
@@ -9798,17 +9969,42 @@ impl CoordApp {
                         // Unknown state key — skip selection restore.
                         _ => continue,
                     };
-                    for (ri, (_, issue_idxs)) in repo_groups.iter().enumerate() {
-                        for (ii, &idx) in issue_idxs.iter().enumerate() {
-                            let issue = &self.pipeline_issues[idx];
-                            if issue.repo_slug == repo && issue.number == num {
-                                self.pipeline_sel = Some(idx);
-                                self.pipeline_sidebar.set_active_section(Some(section_idx));
-                                self.pipeline_sidebar.set_selected_path(
-                                    section_idx,
-                                    Some(vec![ri as u16, ii as u16]),
-                                );
-                                break 'outer;
+                    // #668: New and Done use 3-level paths [ri, mi, ii];
+                    // Refining and Pending remain 2-level [ri, ii].
+                    if state_key == "new" || state_key == "done" {
+                        for (ri, (_, issue_idxs)) in repo_groups.iter().enumerate() {
+                            // Compute milestones; owned Vec, so no self borrow persists.
+                            let milestones = self.pipeline_milestones_for_issues(issue_idxs);
+                            for (mi, (_, _, mil_issue_idxs)) in milestones.iter().enumerate() {
+                                for (ii, &idx) in mil_issue_idxs.iter().enumerate() {
+                                    let issue = &self.pipeline_issues[idx];
+                                    if issue.repo_slug == repo && issue.number == num {
+                                        self.pipeline_sel = Some(idx);
+                                        self.pipeline_sidebar
+                                            .set_active_section(Some(section_idx));
+                                        self.pipeline_sidebar.set_selected_path(
+                                            section_idx,
+                                            Some(vec![ri as u16, mi as u16, ii as u16]),
+                                        );
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (ri, (_, issue_idxs)) in repo_groups.iter().enumerate() {
+                            for (ii, &idx) in issue_idxs.iter().enumerate() {
+                                let issue = &self.pipeline_issues[idx];
+                                if issue.repo_slug == repo && issue.number == num {
+                                    self.pipeline_sel = Some(idx);
+                                    self.pipeline_sidebar
+                                        .set_active_section(Some(section_idx));
+                                    self.pipeline_sidebar.set_selected_path(
+                                        section_idx,
+                                        Some(vec![ri as u16, ii as u16]),
+                                    );
+                                    break 'outer;
+                                }
                             }
                         }
                     }
@@ -9852,9 +10048,13 @@ impl CoordApp {
     /// Resolve the SidebarSystem's current selection to a `pipeline_issues`
     /// index.
     ///
-    /// Every section is sub-header grouped, so path = `[group_idx, issue_idx]`:
-    /// Active groups by liveness (Live/Idle), New/Done group by repo.  A
-    /// one-level path (a group/repo sub-header selected) returns `None`.
+    /// Path depth varies by state:
+    /// - `in-progress`: `[group_idx, issue_idx]` (2-level)
+    /// - `new` / `done`: `[repo_idx, milestone_idx, issue_idx]` (3-level, #668)
+    /// - `refining` / `pending`: `[repo_idx, issue_idx]` (2-level)
+    ///
+    /// A path shorter than the minimum for the state (header row selected)
+    /// returns `None`.
     fn selected_pipeline_index(&self) -> Option<usize> {
         // Section 0 is the FILTER form; state sections start at search_offset.
         let search_offset = 1usize;
@@ -9866,18 +10066,39 @@ impl CoordApp {
         let &state_key = self.pipeline_state_section_names.get(state_idx)?;
         let path = self.pipeline_sidebar.selected_path(section)?;
 
-        if path.len() < 2 {
-            return None; // a group / repo sub-header is selected
-        }
-        let gi = path[0] as usize;
-        let ii = path[1] as usize;
-        let groups = if state_key == "in-progress" {
-            self.pipeline_active_by_liveness()
+        if state_key == "new" || state_key == "done" {
+            // #668: 3-level path [repo_idx, milestone_idx, issue_idx].
+            if path.len() < 3 {
+                return None; // repo or milestone header selected
+            }
+            let ri = path[0] as usize;
+            let mi = path[1] as usize;
+            let ii = path[2] as usize;
+            let repo_groups = self.pipeline_repos_for_state(state_key);
+            let (_, repo_issue_idxs) = repo_groups.get(ri)?;
+            let milestones = self.pipeline_milestones_for_issues(repo_issue_idxs);
+            let (_, _, mil_issue_idxs) = milestones.get(mi)?;
+            mil_issue_idxs.get(ii).copied()
+        } else if state_key == "in-progress" {
+            if path.len() < 2 {
+                return None; // liveness group header selected
+            }
+            let gi = path[0] as usize;
+            let ii = path[1] as usize;
+            let groups = self.pipeline_active_by_liveness();
+            let (_, issue_idxs) = groups.get(gi)?;
+            issue_idxs.get(ii).copied()
         } else {
-            self.pipeline_repos_for_state(state_key)
-        };
-        let (_, issue_idxs) = groups.get(gi)?;
-        issue_idxs.get(ii).copied()
+            // refining / pending — 2-level [repo_idx, issue_idx].
+            if path.len() < 2 {
+                return None; // repo sub-header selected
+            }
+            let gi = path[0] as usize;
+            let ii = path[1] as usize;
+            let groups = self.pipeline_repos_for_state(state_key);
+            let (_, issue_idxs) = groups.get(gi)?;
+            issue_idxs.get(ii).copied()
+        }
     }
 
     /// Resolve the per-stage status of an issue from existing assignments.
@@ -15198,8 +15419,8 @@ impl CoordApp {
                         true
                     }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
-                        // A one-level path = a sub-header was toggled.  New/Done
-                        // group by repo; Active groups by liveness (Live/Idle).
+                        // A one-level path = a repo/liveness sub-header was toggled.
+                        // New/Done group by repo; Active groups by liveness (Live/Idle).
                         // Both persist expand state in pipeline_lifecycle_expanded
                         // keyed by (lc_key, group_key).
                         let search_offset = 1usize;
@@ -15221,6 +15442,47 @@ impl CoordApp {
                                         .or_insert(true);
                                     *entry = !*entry;
                                     self.rebuild_pipeline_sidebar(None);
+                                }
+                            }
+                        }
+                        true
+                    }
+                    SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 2 => {
+                        // #668: A two-level path = a milestone sub-header was
+                        // toggled within a New/Done section.  Persist the state in
+                        // pipeline_milestone_expanded keyed by (lc_key, repo_key,
+                        // milestone_key).  Refining/Pending have no milestone tier,
+                        // so a path.len()==2 there is an issue row (not a header) —
+                        // those sections handle selection via RowSelected, not here.
+                        let search_offset = 1usize;
+                        if section >= search_offset {
+                            let state_idx = section - search_offset;
+                            if let Some(&lc_key) = self.pipeline_state_section_names.get(state_idx)
+                            {
+                                if lc_key == "new" || lc_key == "done" {
+                                    let repo_groups = self.pipeline_repos_for_state(lc_key);
+                                    let ri = path[0] as usize;
+                                    let mi = path[1] as usize;
+                                    if let Some((repo_key, repo_issue_idxs)) =
+                                        repo_groups.get(ri)
+                                    {
+                                        let repo_key = repo_key.clone();
+                                        let milestones = self
+                                            .pipeline_milestones_for_issues(repo_issue_idxs);
+                                        if let Some((mil_key, _, _)) = milestones.get(mi) {
+                                            let mil_key = mil_key.clone();
+                                            let entry = self
+                                                .pipeline_milestone_expanded
+                                                .entry((
+                                                    lc_key.to_string(),
+                                                    repo_key,
+                                                    mil_key,
+                                                ))
+                                                .or_insert(true);
+                                            *entry = !*entry;
+                                            self.rebuild_pipeline_sidebar(None);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -29424,6 +29686,7 @@ mod tests {
             pipeline_state_section_names: Vec::new(),
             pipeline_search: SidebarFilter::default(),
             pipeline_lifecycle_expanded: std::collections::HashMap::new(),
+            pipeline_milestone_expanded: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_status: None,
@@ -42032,6 +42295,387 @@ mod tests {
         assert_eq!(milestones.len(), 2);
         assert_eq!(milestones[0].0, "1", "named milestone comes first");
         assert_eq!(milestones[1].0, "no-milestone", "No milestone sorted last");
+    }
+
+    // ── #668: Pipeline milestone grouping ────────────────────────────────────
+
+    /// Helper: build an App with two pipeline issues in different milestones
+    /// and one with no milestone, all in the "new" (open, no work assignment)
+    /// state.  `data.open_issues` is populated so `pipeline_milestones_for_issues`
+    /// can look up milestone data.
+    fn make_pipeline_milestone_app() -> CoordApp {
+        let mut app = make_pipeline_app();
+        // Add open_issues with milestone data — coord_repo "api" maps to
+        // repo_name "api" which is used for the lookup.
+        app.data.open_issues = vec![
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 10,
+                title: "Milestone v1 issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: Some(1),
+                milestone_title: Some("v1.0".to_string()),
+            },
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 20,
+                title: "Milestone v2 issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: Some(2),
+                milestone_title: Some("v2.0".to_string()),
+            },
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 30,
+                title: "No milestone issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            },
+        ];
+        // Set pipeline_issues to match — all in "new" state (no work assignments).
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 10,
+                title: "Milestone v1 issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 20,
+                title: "Milestone v2 issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 30,
+                title: "No milestone issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    #[test]
+    fn pipeline_milestones_for_issues_groups_by_milestone() {
+        // Unit test for the grouping helper: three issues across two named
+        // milestones and a "no-milestone" bucket.
+        let app = make_pipeline_milestone_app();
+        let all_idxs: Vec<usize> = (0..3).collect();
+        let groups = app.pipeline_milestones_for_issues(&all_idxs);
+
+        // Three groups: v1.0 (1), v2.0 (2), No milestone.
+        assert_eq!(
+            groups.len(),
+            3,
+            "expected 3 milestone groups, got {:?}",
+            groups.iter().map(|(k, d, _)| format!("{k}={d}")).collect::<Vec<_>>()
+        );
+        assert_eq!(groups[0].0, "1", "first group key must be milestone 1");
+        assert_eq!(groups[0].1, "v1.0", "first group title must be v1.0");
+        assert_eq!(groups[1].0, "2", "second group key must be milestone 2");
+        assert_eq!(groups[1].1, "v2.0", "second group title must be v2.0");
+        assert_eq!(groups[2].0, "no-milestone", "third group must be No milestone");
+        assert_eq!(groups[2].1, "No milestone");
+    }
+
+    #[test]
+    fn pipeline_milestones_no_milestone_sorted_last() {
+        // Verify "No milestone" always appears after any named milestones even
+        // when the no-milestone issue was pushed first.
+        let mut app = make_pipeline_app();
+        // No-milestone issue first.
+        app.data.open_issues = vec![
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 1,
+                title: "unplanned".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            },
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 2,
+                title: "planned".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: Some(3),
+                milestone_title: Some("v3.0".to_string()),
+            },
+        ];
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 1,
+                title: "unplanned".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 2,
+                title: "planned".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+        let idxs: Vec<usize> = vec![0, 1];
+        let groups = app.pipeline_milestones_for_issues(&idxs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "3", "named milestone must come first");
+        assert_eq!(groups[1].0, "no-milestone", "No milestone must be last");
+    }
+
+    #[test]
+    fn pipeline_new_section_has_milestone_sub_headers() {
+        // New section must render milestone sub-headers between the repo
+        // header and issue rows.  The sidebar selection should resolve to an
+        // issue index via the 3-level path [repo, milestone, issue].
+        let app = make_pipeline_milestone_app();
+
+        // The "new" section should be present.
+        assert!(
+            app.pipeline_state_section_names.contains(&"new"),
+            "New section must be present",
+        );
+
+        // pipeline_sel must resolve to a valid index (first issue).
+        assert!(
+            app.pipeline_sel.is_some(),
+            "pipeline_sel must be set after rebuild with milestone groups",
+        );
+
+        // The helper must return 3 milestone groups for the repo.
+        let new_groups = app.pipeline_repos_for_state("new");
+        assert_eq!(new_groups.len(), 1, "one repo in New");
+        let (_, repo_issue_idxs) = &new_groups[0];
+        let milestones = app.pipeline_milestones_for_issues(repo_issue_idxs);
+        assert_eq!(milestones.len(), 3, "three milestone buckets for the repo");
+        // Named milestones in number order, then "No milestone".
+        assert_eq!(milestones[0].0, "1");
+        assert_eq!(milestones[1].0, "2");
+        assert_eq!(milestones[2].0, "no-milestone");
+        // Each bucket has exactly one issue.
+        assert_eq!(milestones[0].2.len(), 1);
+        assert_eq!(milestones[1].2.len(), 1);
+        assert_eq!(milestones[2].2.len(), 1);
+    }
+
+    #[test]
+    fn pipeline_done_section_has_milestone_sub_headers() {
+        // Done section (closed issues) must also group by milestone.
+        let mut app = make_pipeline_app();
+        app.data.open_issues = vec![
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 50,
+                title: "Done v1".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "closed".to_string(),
+                milestone_number: Some(1),
+                milestone_title: Some("v1.0".to_string()),
+            },
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 60,
+                title: "Done no-milestone".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "closed".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            },
+        ];
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 50,
+                title: "Done v1".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+            PipelineIssue {
+                number: 60,
+                title: "Done no-milestone".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+        ];
+        app.rebuild_pipeline_sidebar(None);
+
+        assert!(
+            app.pipeline_state_section_names.contains(&"done"),
+            "Done section must be present",
+        );
+        let done_groups = app.pipeline_repos_for_state("done");
+        assert_eq!(done_groups.len(), 1);
+        let milestones = app.pipeline_milestones_for_issues(&done_groups[0].1);
+        assert_eq!(milestones.len(), 2, "two milestone buckets in Done");
+        assert_eq!(milestones[0].0, "1");
+        assert_eq!(milestones[1].0, "no-milestone");
+    }
+
+    #[test]
+    fn pipeline_in_progress_not_milestone_grouped() {
+        // In-progress section must remain liveness-grouped (Live/Idle), NOT
+        // milestone-grouped — milestone grouping is New/Done only.
+        let mut app = make_pipeline_milestone_app();
+        // Add an active assignment for issue #10 to put it in-progress.
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 10, "api", Some("work")));
+        app.pipeline_issues[0].is_closed = false; // ensure it's open
+        app.rebuild_pipeline_sidebar(None);
+
+        assert!(
+            app.pipeline_state_section_names.contains(&"in-progress"),
+            "In-progress section must be present",
+        );
+        // The in-progress liveness groups must NOT be milestone buckets.
+        let active = app.pipeline_active_by_liveness();
+        assert!(!active.is_empty(), "must have liveness groups");
+        // Keys must be "live" or "idle", not milestone keys like "1" or "no-milestone".
+        for (key, _) in &active {
+            assert!(
+                key == "live" || key == "idle",
+                "in-progress group key must be 'live' or 'idle', got '{key}'",
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_selected_pipeline_index_resolves_three_level_path() {
+        // After rebuild with milestone groups, selected_pipeline_index must
+        // correctly resolve a 3-level [ri, mi, ii] path to a pipeline_issues index.
+        let app = make_pipeline_milestone_app();
+
+        // The default selection must be set to the first issue in the first
+        // milestone of the first repo.
+        let sel = app.pipeline_sel;
+        assert!(sel.is_some(), "pipeline_sel must be set");
+
+        // The selected index must be a valid pipeline_issues index.
+        let idx = sel.unwrap();
+        assert!(
+            idx < app.pipeline_issues.len(),
+            "selected index {idx} out of bounds (len={})",
+            app.pipeline_issues.len()
+        );
+    }
+
+    #[test]
+    fn pipeline_milestone_collapse_state_persists_across_rebuild() {
+        // Collapsing a milestone sub-header must survive the next rebuild_pipeline_sidebar.
+        let mut app = make_pipeline_milestone_app();
+        // The new section is section index 1 (0 = filter).
+        // Manually set a milestone collapsed in pipeline_milestone_expanded.
+        // Key: (lc_key="new", repo="acme/api", milestone="1").
+        app.pipeline_milestone_expanded
+            .insert(("new".to_string(), "acme/api".to_string(), "1".to_string()), false);
+
+        // Rebuild — the collapsed state must be re-applied.
+        app.rebuild_pipeline_sidebar(None);
+
+        // The state must still be false (collapsed) in the map.
+        let collapsed = app
+            .pipeline_milestone_expanded
+            .get(&("new".to_string(), "acme/api".to_string(), "1".to_string()))
+            .copied()
+            .unwrap_or(true);
+        assert!(
+            !collapsed,
+            "milestone collapse state must persist across rebuild",
+        );
+    }
+
+    #[test]
+    fn pipeline_selection_restores_through_milestone_groups() {
+        // Selection restore must work through the 3-level (repo → milestone → issue)
+        // tree: after swapping pipeline_issues, the previously selected issue
+        // (identified by repo_slug + number) must still be focused.
+        let mut app = make_pipeline_milestone_app();
+        // Default selection is issue at index 0 (#10, milestone v1.0).
+        assert_eq!(app.pipeline_sel, Some(0));
+        assert_eq!(app.pipeline_issues[0].number, 10);
+
+        // Capture BEFORE the swap.
+        let prev_sel = app.capture_pipeline_selection_id();
+        assert_eq!(prev_sel, Some(("acme/api".to_string(), 10)));
+
+        // Prepend a new issue (pushing #10 from index 0 to index 1).
+        let mut new_issues = vec![PipelineIssue {
+            number: 5,
+            title: "New prepended".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        // Also add the open_issue entry for #5 (no milestone) so lookup works.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "api".to_string(),
+            number: 5,
+            title: "New prepended".to_string(),
+            body: String::new(),
+            labels: vec!["coord".to_string()],
+            state: "open".to_string(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        new_issues.extend(app.pipeline_issues.clone());
+        app.pipeline_issues = new_issues;
+        app.rebuild_pipeline_sidebar(prev_sel);
+
+        // Selection must still be on #10 (now at a different index).
+        let selected_number = app
+            .pipeline_sel
+            .and_then(|i| app.pipeline_issues.get(i))
+            .map(|i| i.number);
+        assert_eq!(
+            selected_number,
+            Some(10),
+            "selection must follow #10 through milestone groups even after index shift",
+        );
     }
 
     // ── #349: Test-plan helpers ───────────────────────────────────────────────
