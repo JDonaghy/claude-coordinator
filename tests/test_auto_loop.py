@@ -1801,126 +1801,6 @@ class TestDispatchFixRemoteBranchGuard:
         mock_http = MagicMock()
 
         with (
-            patch("coord.auto_loop.paused_set", return_value={"laptop"}),
-            patch("coord.auto_loop.record_dispatched_assignment"),
-        ):
-            result = _dispatch_fix(
-                work, "Fix briefing.", board, cfg, iteration=1,
-                http_client=mock_http,
-                remote_branch_checker=lambda repo, branch: False,
-            )
-
-        assert result is None
-        # The HTTP post must NOT have been called.
-        mock_http.post.assert_not_called()
-
-    def test_cross_machine_dispatch_proceeds_when_branch_on_remote(self) -> None:
-        """When the fallback machine is different but the branch IS on the
-        remote, the dispatch proceeds normally."""
-        cfg = _two_machine_config()
-        work = self._work(machine="laptop")
-        board = Board(completed=[work])
-        mock_http = MagicMock()
-        mock_http.post.return_value.json.return_value = {"id": "fix-586-c"}
-        mock_http.post.return_value.raise_for_status = MagicMock()
-
-        with (
-            patch("coord.auto_loop.paused_set", return_value={"laptop"}),
-            patch("coord.auto_loop.record_dispatched_assignment"),
-        ):
-            result = _dispatch_fix(
-                work, "Fix briefing.", board, cfg, iteration=1,
-                http_client=mock_http,
-                remote_branch_checker=lambda repo, branch: True,
-            )
-
-        assert result is not None
-        assert result.machine_name == "server"
-
-
-# ── #586: branch-not-on-remote guard in _dispatch_fix ───────────────────────
-
-
-def _two_machine_config_586() -> Config:
-    """Config with 'laptop' + 'server' both capable of 'api'."""
-    return Config(
-        repos=[Repo(name="api", github="acme/api", default_branch="main")],
-        machines=[
-            Machine(
-                name="laptop", host="laptop.tail",
-                capabilities=["python"], repos=["api"],
-                repo_paths={"api": "/work/api"},
-            ),
-            Machine(
-                name="server", host="server.tail",
-                capabilities=["python"], repos=["api"],
-                repo_paths={"api": "/srv/api"},
-            ),
-        ],
-        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
-        pipeline=PipelineConfig(auto_loop=True, max_review_iterations=3),
-    )
-
-
-class TestDispatchFixRemoteBranchGuard:
-    """#586: _dispatch_fix must not route to a different machine when the
-    branch isn't on the remote — that would crash the fix worker in 2 seconds
-    with no commits and no exit code."""
-
-    def _work(self, machine: str = "laptop") -> Assignment:
-        return Assignment(
-            machine_name=machine,
-            repo_name="api",
-            issue_number=5,
-            issue_title="Fix thing",
-            briefing="Original briefing.",
-            assignment_id="work-586",
-            status="done",
-            branch="issue-5-fix-thing",
-            dispatched_at=0.0,
-            finished_at=1.0,
-            type="work",
-        )
-
-    def test_same_machine_dispatch_skips_remote_check(self) -> None:
-        """When the original worker machine is still available, _dispatch_fix
-        routes to it directly — no remote check needed (branch is local)."""
-        cfg = _two_machine_config_586()
-        work = self._work(machine="laptop")
-        board = Board(completed=[work])
-        mock_http = MagicMock()
-        mock_http.post.return_value.json.return_value = {"id": "fix-586-a"}
-        mock_http.post.return_value.raise_for_status = MagicMock()
-        # Checker that always returns False — should NOT be called when same machine.
-        checker_called: list[bool] = []
-
-        def _checker(repo: str, branch: str) -> bool:
-            checker_called.append(True)
-            return False
-
-        with patch("coord.auto_loop.record_dispatched_assignment"):
-            result = _dispatch_fix(
-                work, "Fix briefing.", board, cfg, iteration=1,
-                http_client=mock_http,
-                remote_branch_checker=_checker,
-            )
-
-        assert result is not None
-        assert result.machine_name == "laptop"
-        # The remote check was NOT invoked — routing to same machine is safe.
-        assert checker_called == []
-
-    def test_cross_machine_dispatch_blocked_when_branch_not_on_remote(self) -> None:
-        """When the original machine is paused/unavailable and the fallback
-        machine is different, and the branch isn't on the remote,
-        _dispatch_fix must return None rather than sending the assignment."""
-        cfg = _two_machine_config_586()
-        # Work done on 'laptop'; we'll pause laptop so the fallback picks 'server'.
-        work = self._work(machine="laptop")
-        board = Board(completed=[work])
-        mock_http = MagicMock()
-
-        with (
             patch("coord.machine_pause.paused_set", return_value={"laptop"}),
             patch("coord.auto_loop.record_dispatched_assignment"),
         ):
@@ -1937,7 +1817,7 @@ class TestDispatchFixRemoteBranchGuard:
     def test_cross_machine_dispatch_proceeds_when_branch_on_remote(self) -> None:
         """When the fallback machine is different but the branch IS on the
         remote, the dispatch proceeds normally."""
-        cfg = _two_machine_config_586()
+        cfg = _two_machine_config()
         work = self._work(machine="laptop")
         board = Board(completed=[work])
         mock_http = MagicMock()

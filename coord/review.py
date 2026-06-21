@@ -34,11 +34,11 @@ from pathlib import Path
 import httpx
 
 from coord import github_ops
-
-log = logging.getLogger(__name__)
 from coord.config import Config, ReviewsConfig
 from coord.dispatch import AGENT_PORT
 from coord.models import Assignment, Board, Machine
+
+log = logging.getLogger(__name__)
 
 
 # ── Review output parsing ────────────────────────────────────────────────────
