@@ -887,6 +887,43 @@ class TestCostCapture:
         assert row["cache_creation_tokens"] == 50
         assert row["cache_read_tokens"] == 300
 
+    def test_tokens_fall_back_to_agent_status_entry(
+        self, coord_dir: Path, config: Config,
+    ) -> None:
+        """#667: when the local log is unavailable (worker ran on a remote
+        machine), token counts embedded in the agent /status completed entry
+        are persisted instead.  The log_path points to a file that doesn't
+        exist on this coordinator machine."""
+        _record("cost5")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed(
+                "cost5", "done",
+                log_path="/var/log/remote-does-not-exist.log",
+                total_cost_usd=0.75,
+                input_tokens=2000,
+                output_tokens=400,
+                cache_creation_tokens=100,
+                cache_read_tokens=600,
+            )],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        from coord.db import get_connection
+        row = get_connection().execute(
+            "SELECT cost_usd, input_tokens, output_tokens, "
+            "cache_creation_tokens, cache_read_tokens "
+            "FROM assignments WHERE assignment_id='cost5'"
+        ).fetchone()
+        assert row is not None
+        assert row["cost_usd"] == 0.75
+        assert row["input_tokens"] == 2000
+        assert row["output_tokens"] == 400
+        assert row["cache_creation_tokens"] == 100
+        assert row["cache_read_tokens"] == 600
+
 
 # ── #252: smoke-test list capture on completion ──────────────────────────────
 

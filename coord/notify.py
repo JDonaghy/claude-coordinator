@@ -347,6 +347,18 @@ def _capture_cost(transition: Transition, entry: dict) -> None:
             except (TypeError, ValueError):
                 cost = None
 
+    # #667: token fallback — when the local log was absent/unreadable the
+    # token counts are still 0.  The agent now includes them in the /status
+    # completed entry, so read them from there.
+    if input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens == 0:
+        try:
+            input_tokens = int(entry.get("input_tokens") or 0)
+            output_tokens = int(entry.get("output_tokens") or 0)
+            cache_creation_tokens = int(entry.get("cache_creation_tokens") or 0)
+            cache_read_tokens = int(entry.get("cache_read_tokens") or 0)
+        except (TypeError, ValueError):
+            pass
+
     if cost is not None and cost > 0:
         try:
             update_assignment_cost(transition.assignment_id, cost)

@@ -1861,3 +1861,110 @@ class TestCompletedHistoryCap:
             f"list_assignments() returned {len(listing['completed'])} completed items, "
             f"expected ≤ {_COMPLETED_HISTORY_CAP}"
         )
+
+
+# ── #667: list_assignments includes token counts in completed entries ──────────
+
+
+class TestListAssignmentsTokens:
+    """list_assignments()['completed'] entries include token counts parsed from
+    the worker log so the coordinator can capture them without the log file."""
+
+    def _make_spec(self, repo_path: Path) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+        )
+
+    def _write_stream_json_log(
+        self,
+        log_path: Path,
+        *,
+        cost: float = 0.10,
+        input_tokens: int = 500,
+        output_tokens: int = 100,
+        cache_creation_tokens: int = 20,
+        cache_read_tokens: int = 80,
+    ) -> None:
+        """Write a minimal stream-json result event so parse_log picks it up."""
+        import json as _json
+
+        payload = {
+            "type": "result",
+            "subtype": "success",
+            "result": "done",
+            "total_cost_usd": cost,
+            "num_turns": 2,
+            "duration_ms": 5000,
+            "session_id": "test-session",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "cache_read_tokens": cache_read_tokens,
+        }
+        log_path.write_text(_json.dumps(payload) + "\n", encoding="utf-8")
+
+    def test_token_counts_appear_in_completed_entry(self, tmp_path: Path) -> None:
+        """When a completed assignment's stream-json log has token counts,
+        list_assignments() includes them in the completed entry dict."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        log_path = tmp_path / "tok1.log"
+        self._write_stream_json_log(
+            log_path,
+            input_tokens=1234,
+            output_tokens=567,
+            cache_creation_tokens=89,
+            cache_read_tokens=321,
+        )
+
+        a = AgentAssignment(
+            id="tok1",
+            spec=spec,
+            status=DONE,
+            finished_at=1.0,
+            exit_code=0,
+            log_path=str(log_path),
+        )
+        server._assignments[a.id] = a
+
+        listing = server.list_assignments()
+        completed = listing["completed"]
+        assert len(completed) == 1
+        entry = completed[0]
+        assert entry.get("input_tokens") == 1234
+        assert entry.get("output_tokens") == 567
+        assert entry.get("cache_creation_tokens") == 89
+        assert entry.get("cache_read_tokens") == 321
+
+    def test_no_tokens_when_log_absent(self, tmp_path: Path) -> None:
+        """When the log path is absent, completed entry has no token fields
+        (the coordinator handles missing keys gracefully)."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        a = AgentAssignment(
+            id="tok2",
+            spec=spec,
+            status=DONE,
+            finished_at=1.0,
+            exit_code=0,
+            log_path=None,
+        )
+        server._assignments[a.id] = a
+
+        listing = server.list_assignments()
+        completed = listing["completed"]
+        assert len(completed) == 1
+        entry = completed[0]
+        # No token keys expected when log is absent — coordinator should
+        # treat missing keys as 0, same as older agents.
+        assert entry.get("input_tokens", 0) == 0
+        assert entry.get("output_tokens", 0) == 0

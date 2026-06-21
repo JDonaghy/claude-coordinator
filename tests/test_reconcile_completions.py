@@ -194,6 +194,88 @@ def test_plan_capture_invoked_for_plan_type(monkeypatch) -> None:
     assert captured == {"w1": {"plan": "do the thing"}}
 
 
+def test_token_counts_captured_from_entry(monkeypatch) -> None:
+    """#667: when the /status completed entry carries token counts the
+    reconcile path persists them via update_assignment_tokens."""
+    captured_tokens: list[dict] = []
+
+    def fake_update_tokens(assignment_id, *, input_tokens, output_tokens,
+                           cache_creation_tokens, cache_read_tokens) -> None:
+        captured_tokens.append({
+            "assignment_id": assignment_id,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "cache_read_tokens": cache_read_tokens,
+        })
+
+    monkeypatch.setattr("coord.state.update_assignment_tokens", fake_update_tokens)
+
+    entry = {
+        "id": "w1",
+        "status": "done",
+        "input_tokens": 1500,
+        "output_tokens": 300,
+        "cache_creation_tokens": 50,
+        "cache_read_tokens": 200,
+    }
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [entry]},
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+
+    assert len(captured_tokens) == 1
+    t = captured_tokens[0]
+    assert t["assignment_id"] == "w1"
+    assert t["input_tokens"] == 1500
+    assert t["output_tokens"] == 300
+    assert t["cache_creation_tokens"] == 50
+    assert t["cache_read_tokens"] == 200
+
+
+def test_token_capture_zero_skipped(monkeypatch) -> None:
+    """#667: when the entry has no token fields the update is skipped (not
+    called with zeros)."""
+    update_calls: list[str] = []
+    monkeypatch.setattr(
+        "coord.state.update_assignment_tokens",
+        lambda *a, **kw: update_calls.append(a[0]),
+    )
+    entry = {"id": "w1", "status": "done"}  # no token keys
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [entry]},
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+    assert update_calls == []  # nothing to write → update not called
+
+
+def test_token_capture_failure_does_not_break_status_write(monkeypatch) -> None:
+    """#667: if token persistence raises, the terminal-status write already
+    landed so the board still gets updated."""
+    def boom(*a, **kw) -> None:  # noqa: ANN002, ANN003
+        raise RuntimeError("db gone")
+
+    monkeypatch.setattr("coord.state.update_assignment_tokens", boom)
+
+    rec = _Recorder()
+    entry = {
+        "id": "w1",
+        "status": "done",
+        "input_tokens": 100,
+        "output_tokens": 20,
+    }
+    out = reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [entry]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    # Terminal status still written
+    assert rec.calls[0]["terminal_status"] == "done"
+    assert len(out) == 1
+
+
 def test_plan_capture_failure_does_not_break_status_write(monkeypatch) -> None:
     # If plan parsing blows up, the terminal-status write must still land — the
     # stuck box is fixed regardless of whether the plan body could be recovered.

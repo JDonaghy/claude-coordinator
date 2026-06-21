@@ -1902,6 +1902,12 @@ class AgentServer:
                         d["total_cost_usd"] = summary.total_cost_usd
                         d["num_turns"] = summary.num_turns
                         d["stop_reason"] = summary.stop_reason
+                        # #667: expose token counts so the coordinator can
+                        # persist them even when the log is only on this machine.
+                        d["input_tokens"] = summary.input_tokens
+                        d["output_tokens"] = summary.output_tokens
+                        d["cache_creation_tokens"] = summary.cache_creation_tokens
+                        d["cache_read_tokens"] = summary.cache_read_tokens
                 completed.append(d)
         return {"active": active, "completed": completed}
 
