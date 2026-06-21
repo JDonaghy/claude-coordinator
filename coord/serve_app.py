@@ -251,6 +251,43 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_assignment_usage(request: Request) -> Response:
+        # #665: route cost/token/is_interactive writes through the daemon.
+        # Body: {assignment_id, cost_usd?, input_tokens?, output_tokens?,
+        #        cache_creation_tokens?, cache_read_tokens?, is_interactive?}
+        # One round-trip covers all three update helpers; the daemon calls the
+        # _local forms directly so it never recurses back out over HTTP.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        aid = body.get("assignment_id")
+        if not aid:
+            return JSONResponse({"error": "missing assignment_id"}, status_code=400)
+        try:
+            if "cost_usd" in body and body["cost_usd"] is not None:
+                state._update_assignment_cost_local(aid, body["cost_usd"])
+            if any(
+                k in body
+                for k in ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
+            ):
+                state._update_assignment_tokens_local(
+                    aid,
+                    input_tokens=int(body.get("input_tokens") or 0),
+                    output_tokens=int(body.get("output_tokens") or 0),
+                    cache_creation_tokens=int(body.get("cache_creation_tokens") or 0),
+                    cache_read_tokens=int(body.get("cache_read_tokens") or 0),
+                )
+            if body.get("is_interactive"):
+                state._mark_assignment_interactive_local(aid)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "assignment-usage write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_issue_labels(request: Request) -> Response:
         # #601: update one issue's cached labels (coord ready/backlog/refine/track).
         from coord import state  # noqa: PLC0415
@@ -595,6 +632,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/dispatched-work", post_dispatched_work, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
+        Route("/assignment-usage", post_assignment_usage, methods=["POST"]),
         Route("/issue-labels", post_issue_labels, methods=["POST"]),
         Route("/issues-sync", post_issues_sync, methods=["POST"]),
         Route("/issue-edit", post_issue_edit, methods=["POST"]),

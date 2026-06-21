@@ -923,12 +923,25 @@ def update_assignment_claude_session_id(
 
 
 def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
-    """#208: record the worker's final cost on an existing assignment row.
+    """#208/#665: record the worker's final cost — routes to the daemon when set.
 
-    Idempotent: COALESCE-based UPDATE so calling with the same value
-    twice is a no-op.  Silently does nothing when the row doesn't
-    exist — callers shouldn't have to coordinate.
+    Idempotent: UPDATE fires only when cost_usd is NULL or the stored value
+    is lower (first-writer-wins / monotone).  Silently does nothing when the
+    row doesn't exist — callers shouldn't have to coordinate.
     """
+    if not assignment_id:
+        return
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(svc, "/assignment-usage", {"assignment_id": assignment_id, "cost_usd": cost_usd})
+        return
+    _update_assignment_cost_local(assignment_id, cost_usd)
+
+
+def _update_assignment_cost_local(assignment_id: str, cost_usd: float) -> None:
+    """Write cost_usd directly to the local DB.  Called by the daemon endpoint."""
     if not assignment_id:
         return
     conn = get_connection()
@@ -991,9 +1004,8 @@ def update_assignment_tokens(
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
 ) -> None:
-    """#546: record token counts on an existing assignment row.
+    """#546/#665: record token counts — routes to the daemon when set.
 
-    Captured alongside ``cost_usd`` from the final stream-json result event.
     Only writes when at least one token count is non-zero (interactive/Max
     sessions produce no per-token data and should not overwrite 0 with 0).
     Idempotent: the UPDATE only fires when the row's ``input_tokens`` is still
@@ -1001,6 +1013,45 @@ def update_assignment_tokens(
     pre-migration databases (tests, older installs that haven't restarted the
     coordinator yet) never crash the notify path.
     """
+    if not assignment_id:
+        return
+    total = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
+    if total <= 0:
+        return
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(
+            svc,
+            "/assignment-usage",
+            {
+                "assignment_id": assignment_id,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
+                "cache_read_tokens": cache_read_tokens,
+            },
+        )
+        return
+    _update_assignment_tokens_local(
+        assignment_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
+    )
+
+
+def _update_assignment_tokens_local(
+    assignment_id: str,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> None:
+    """Write token counts directly to the local DB.  Called by the daemon endpoint."""
     if not assignment_id:
         return
     total = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
@@ -1027,7 +1078,7 @@ def update_assignment_tokens(
 
 
 def mark_assignment_interactive(assignment_id: str) -> None:
-    """#546: flag the row as a human-attended interactive session.
+    """#546/#665: flag the row as interactive — routes to the daemon when set.
 
     Called from :func:`coord.interactive.finalize_interactive_exit` so the
     TUI can reliably show "Max (subscription)" without misidentifying old
@@ -1035,6 +1086,23 @@ def mark_assignment_interactive(assignment_id: str) -> None:
     no-ops when the row doesn't exist or the column is missing (pre-migration
     DB).
     """
+    if not assignment_id:
+        return
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(
+            svc,
+            "/assignment-usage",
+            {"assignment_id": assignment_id, "is_interactive": True},
+        )
+        return
+    _mark_assignment_interactive_local(assignment_id)
+
+
+def _mark_assignment_interactive_local(assignment_id: str) -> None:
+    """Write is_interactive=1 directly to the local DB.  Called by the daemon endpoint."""
     if not assignment_id:
         return
     conn = get_connection()

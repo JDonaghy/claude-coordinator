@@ -511,6 +511,231 @@ def test_record_dispatched_assignment_unset_writes_local(coord_db, monkeypatch):
     ).fetchone()["status"] == "running"
 
 
+# ── Write path (#665): assignment-usage (cost / tokens / is_interactive) ──────
+
+
+def test_update_assignment_cost_routes_when_service_set(coord_db, monkeypatch):
+    """update_assignment_cost() POSTs to /assignment-usage when board_service is set."""
+    from coord import client as cc
+    from coord import state
+
+    _seed_running_assignment(coord_db, aid="cu01")
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.update_assignment_cost("cu01", 0.42)
+    assert captured["path"] == "/assignment-usage"
+    assert captured["payload"]["assignment_id"] == "cu01"
+    assert captured["payload"]["cost_usd"] == 0.42
+    # Routed → the local DB row was NOT touched.
+    row = coord_db.execute(
+        "SELECT cost_usd FROM assignments WHERE assignment_id='cu01'"
+    ).fetchone()
+    assert row["cost_usd"] is None
+
+
+def test_update_assignment_cost_unset_writes_local(coord_db, monkeypatch):
+    """update_assignment_cost() writes the local DB when board_service is unset."""
+    from coord import client as cc
+    from coord import state
+
+    _seed_running_assignment(coord_db, aid="cu02")
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+    state.update_assignment_cost("cu02", 1.23)
+    row = coord_db.execute(
+        "SELECT cost_usd FROM assignments WHERE assignment_id='cu02'"
+    ).fetchone()
+    assert row["cost_usd"] == 1.23
+
+
+def test_update_assignment_tokens_routes_when_service_set(coord_db, monkeypatch):
+    """update_assignment_tokens() POSTs to /assignment-usage when board_service is set."""
+    from coord import client as cc
+    from coord import state
+
+    _seed_running_assignment(coord_db, aid="tu01")
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.update_assignment_tokens("tu01", input_tokens=100, output_tokens=50)
+    assert captured["path"] == "/assignment-usage"
+    assert captured["payload"]["assignment_id"] == "tu01"
+    assert captured["payload"]["input_tokens"] == 100
+    assert captured["payload"]["output_tokens"] == 50
+    # Routed → local row untouched.
+    row = coord_db.execute(
+        "SELECT input_tokens FROM assignments WHERE assignment_id='tu01'"
+    ).fetchone()
+    assert row["input_tokens"] is None or row["input_tokens"] == 0
+
+
+def test_update_assignment_tokens_zero_total_skips_route(coord_db, monkeypatch):
+    """update_assignment_tokens() with all-zero counts is a no-op (no POST, no local write)."""
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    called = []
+    monkeypatch.setattr(cc, "post_record", lambda *a, **k: called.append(a) or {"ok": True})
+    state.update_assignment_tokens("tu-noop")  # all defaults are 0
+    assert called == []
+
+
+def test_update_assignment_tokens_unset_writes_local(coord_db, monkeypatch):
+    """update_assignment_tokens() writes the local DB when board_service is unset."""
+    from coord import client as cc
+    from coord import state
+
+    _seed_running_assignment(coord_db, aid="tu02")
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+    state.update_assignment_tokens("tu02", input_tokens=200, output_tokens=75,
+                                   cache_creation_tokens=10, cache_read_tokens=5)
+    row = coord_db.execute(
+        "SELECT input_tokens, output_tokens FROM assignments WHERE assignment_id='tu02'"
+    ).fetchone()
+    assert row["input_tokens"] == 200 and row["output_tokens"] == 75
+
+
+def test_mark_assignment_interactive_routes_when_service_set(coord_db, monkeypatch):
+    """mark_assignment_interactive() POSTs to /assignment-usage when board_service is set."""
+    from coord import client as cc
+    from coord import state
+
+    _seed_running_assignment(coord_db, aid="ia01")
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.mark_assignment_interactive("ia01")
+    assert captured["path"] == "/assignment-usage"
+    assert captured["payload"]["assignment_id"] == "ia01"
+    assert captured["payload"]["is_interactive"] is True
+    # Routed → local row untouched.
+    row = coord_db.execute(
+        "SELECT is_interactive FROM assignments WHERE assignment_id='ia01'"
+    ).fetchone()
+    assert not row["is_interactive"]
+
+
+def test_mark_assignment_interactive_unset_writes_local(coord_db, monkeypatch):
+    """mark_assignment_interactive() writes the local DB when board_service is unset."""
+    from coord import client as cc
+    from coord import state
+
+    _seed_running_assignment(coord_db, aid="ia02")
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+    state.mark_assignment_interactive("ia02")
+    row = coord_db.execute(
+        "SELECT is_interactive FROM assignments WHERE assignment_id='ia02'"
+    ).fetchone()
+    assert row["is_interactive"] == 1
+
+
+def test_serve_assignment_usage_records_cost(file_db, valid_config_path, rw_db):
+    """POST /assignment-usage with cost_usd writes cost to the daemon DB."""
+    _seed_running_assignment(rw_db, aid="du01")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/assignment-usage",
+            json={"assignment_id": "du01", "cost_usd": 0.55},
+        )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    row = rw_db.execute(
+        "SELECT cost_usd FROM assignments WHERE assignment_id='du01'"
+    ).fetchone()
+    assert row["cost_usd"] == 0.55
+
+
+def test_serve_assignment_usage_records_tokens(file_db, valid_config_path, rw_db):
+    """POST /assignment-usage with token fields writes tokens to the daemon DB."""
+    _seed_running_assignment(rw_db, aid="du02")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/assignment-usage",
+            json={
+                "assignment_id": "du02",
+                "input_tokens": 300,
+                "output_tokens": 120,
+                "cache_creation_tokens": 20,
+                "cache_read_tokens": 10,
+            },
+        )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    row = rw_db.execute(
+        "SELECT input_tokens, output_tokens FROM assignments WHERE assignment_id='du02'"
+    ).fetchone()
+    assert row["input_tokens"] == 300 and row["output_tokens"] == 120
+
+
+def test_serve_assignment_usage_records_interactive(file_db, valid_config_path, rw_db):
+    """POST /assignment-usage with is_interactive sets the flag on the daemon DB."""
+    _seed_running_assignment(rw_db, aid="du03")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/assignment-usage",
+            json={"assignment_id": "du03", "is_interactive": True},
+        )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+    row = rw_db.execute(
+        "SELECT is_interactive FROM assignments WHERE assignment_id='du03'"
+    ).fetchone()
+    assert row["is_interactive"] == 1
+
+
+def test_serve_assignment_usage_combined(file_db, valid_config_path, rw_db):
+    """POST /assignment-usage can set cost + tokens + interactive in one request."""
+    _seed_running_assignment(rw_db, aid="du04")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/assignment-usage",
+            json={
+                "assignment_id": "du04",
+                "cost_usd": 0.10,
+                "input_tokens": 50,
+                "output_tokens": 25,
+                "cache_creation_tokens": 5,
+                "cache_read_tokens": 2,
+                "is_interactive": True,
+            },
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT cost_usd, input_tokens, is_interactive FROM assignments "
+        "WHERE assignment_id='du04'"
+    ).fetchone()
+    assert row["cost_usd"] == 0.10
+    assert row["input_tokens"] == 50
+    assert row["is_interactive"] == 1
+
+
+def test_serve_assignment_usage_missing_id(file_db, valid_config_path):
+    """POST /assignment-usage without assignment_id returns 400."""
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/assignment-usage", json={"cost_usd": 1.0})
+    assert resp.status_code == 400
+
+
 # ── Write path (#601): issue-cache (labels + sync) ────────────────────────────
 
 
