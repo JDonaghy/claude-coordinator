@@ -771,6 +771,11 @@ enum BoardDetailTab {
     /// Shows an empty state with Refine / New Issue CTAs when no chat is
     /// open; shows the ChatController when a board chat is live.
     Chat,
+    /// #675: per-issue interactive shell for the Board detail view.
+    /// Mirrors `PipelineDetailTab::Terminal` — spawned by "Chat about issue"
+    /// from the Board context menu.  The same `detail_terminal_sessions` map
+    /// is used; the session key is `(repo_slug, issue_number)`.
+    Terminal,
 }
 
 /// #316 Phase A+C: pending board-chat dispatch.  Armed by
@@ -12959,8 +12964,22 @@ impl CoordApp {
     }
 
     fn board_detail_tab_bar(&self) -> TabBar {
-        // #316: show an active-dot on the Chat tab while a board chat is live.
+        // #316: show an active-dot on the Board Chat tab while a board chat is live.
         let board_chat_live = self.chat_is_board_chat();
+        // #675: dot indicator on the Terminal tab when a session exists for the
+        // selected board issue.
+        let board_terminal_live = self.board_selected_issue().map_or(false, |(repo, num)| {
+            // Resolve the repo_slug so we can look up the session key.
+            let slug = self
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(name, _)| *name == repo)
+                .map(|(_, s)| s.as_str())
+                .unwrap_or(repo.as_str())
+                .to_string();
+            self.detail_terminal_sessions.contains_key(&(slug, num))
+        });
         TabBar {
             id: WidgetId::new("board-detail-tabs"),
             tabs: vec![
@@ -12981,12 +13000,27 @@ impl CoordApp {
                 TabItem {
                     // #316: dot indicator when a board chat is live so the
                     // tab is discoverable without forcing the user back to it.
+                    // #675: renamed "Chat" → "Board Chat" to distinguish it
+                    // from the new per-issue Terminal tab below.
                     label: if board_chat_live {
-                        " Chat ● ".to_string()
+                        " Board Chat ● ".to_string()
                     } else {
-                        " Chat ".to_string()
+                        " Board Chat ".to_string()
                     },
                     is_active: self.board_detail_tab == BoardDetailTab::Chat,
+                    is_dirty: false,
+                    is_preview: false,
+                    is_closable: false,
+                },
+                TabItem {
+                    // #675: per-issue interactive terminal.  Dot when a session
+                    // is live for the selected issue.
+                    label: if board_terminal_live {
+                        " Terminal ● ".to_string()
+                    } else {
+                        " Terminal ".to_string()
+                    },
+                    is_active: self.board_detail_tab == BoardDetailTab::Terminal,
                     is_dirty: false,
                     is_preview: false,
                     is_closable: false,
@@ -15830,12 +15864,14 @@ impl CoordApp {
             if pos.y - main_b.y < tab_h {
                 let bar = self.board_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();
-                // Board has only 3 tabs — never overflows, so scroll_offset is 0.
+                // Board has 4 tabs (#675 added Terminal) — unlikely to overflow at
+                // typical widths, so scroll_offset is 0.
                 if let Some(idx) = hit_tab_index_from_labels(&labels, main_b.x, pos.x, 0) {
                     let new_tab = match idx {
                         0 => BoardDetailTab::Board,
                         1 => BoardDetailTab::Issue,
-                        _ => BoardDetailTab::Chat,
+                        2 => BoardDetailTab::Chat,
+                        _ => BoardDetailTab::Terminal,
                     };
                     if new_tab != self.board_detail_tab {
                         self.board_detail_tab = new_tab;
@@ -16338,6 +16374,7 @@ impl CoordApp {
                     BoardDetailTab::Board => self.detail_list().items.len(),
                     BoardDetailTab::Issue => self.board_issue_body_list().items.len(),
                     BoardDetailTab::Chat => 0,
+                    BoardDetailTab::Terminal => 0, // #675: scroll handled by the PTY session
                 };
                 let max = items.saturating_sub(visible.saturating_sub(1));
                 if delta.y > 0.0 {
@@ -16702,6 +16739,16 @@ impl CoordApp {
                 " PTY focused — F12 / Ctrl-W h = release  (typed keys go to the shell) ".to_string()
             } else {
                 " PTY released — F12 / Ctrl-W l = focus  ·  s = interactive claude  ·  j/k=nav  h/l=tabs  Ctrl-W h=side panel  q=quit ".to_string()
+            }
+        } else if self.active_view == SidebarView::Board
+            && self.board_detail_tab == BoardDetailTab::Terminal
+        {
+            // #675: Board detail Terminal tab — same F12 model as Pipeline.
+            // The `s` shortcut is not available here (Board Terminal is for Chat).
+            if self.detail_terminal_focused {
+                " PTY focused — F12 to release  (typed keys go to the shell) ".to_string()
+            } else {
+                " PTY released — F12 to focus  ·  h/l=tabs  q=quit ".to_string()
             }
         } else if self.active_view == SidebarView::Machines {
             // Machines panel action hints.
@@ -21259,8 +21306,14 @@ impl CoordApp {
             // #628: "Chat about issue" — subsumes the old Troubleshoot. Both
             // action ids launch the Chat session (any lingering keyboard/menu
             // path to the old id still works).
+            // #675: Route to the Board Terminal tab when invoked from the Board
+            // panel, not the Pipeline Terminal tab.
             "chat-about-issue" | "troubleshoot-interactive" => {
-                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                if self.active_view == SidebarView::Board {
+                    self.board_detail_tab = BoardDetailTab::Terminal;
+                } else {
+                    self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                }
                 self.launch_interactive_session_for_selected_issue(
                     InteractiveLaunchMode::Chat,
                 );
@@ -23489,15 +23542,35 @@ impl CoordApp {
     /// Pipeline issue, used to index `detail_terminal_sessions` and
     /// `detail_terminal_spawn_errors` (#455).
     fn selected_issue_key(&self) -> Option<(String, u64)> {
-        self.pipeline_sel
+        // Pipeline selection is the primary source.
+        if let Some(key) = self
+            .pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
             .map(|issue| (issue.repo_slug.clone(), issue.number))
+        {
+            return Some(key);
+        }
+        // #675: fall back to the Board selection when on the Board panel.
+        if self.active_view == SidebarView::Board {
+            if let Some((coord_repo, num)) = self.board_selected_issue() {
+                let slug = self
+                    .data
+                    .pipeline_repos
+                    .iter()
+                    .find(|(name, _)| *name == coord_repo)
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or(coord_repo);
+                return Some((slug, num));
+            }
+        }
+        None
     }
 
     /// Return a sensible cwd for a per-issue detail terminal.  Uses the
     /// repo path from `pipeline_repo_paths` when it exists and is a
     /// directory; falls back to `current_dir()`.
     fn detail_terminal_cwd(&self, issue_key: &(String, u64)) -> std::path::PathBuf {
+        // Pipeline path: look up via the selected PipelineIssue.
         if let Some(issue) = self
             .pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
@@ -23508,6 +23581,17 @@ impl CoordApp {
                 let p = std::path::Path::new(path);
                 if p.is_dir() {
                     return p.to_path_buf();
+                }
+            }
+        }
+        // #675: Board path: look up via board_active_repo() → pipeline_repo_paths.
+        if self.active_view == SidebarView::Board {
+            if let Some(coord_repo) = self.board_active_repo() {
+                if let Some(path) = self.data.pipeline_repo_paths.get(coord_repo) {
+                    let p = std::path::Path::new(path);
+                    if p.is_dir() {
+                        return p.to_path_buf();
+                    }
                 }
             }
         }
@@ -23531,8 +23615,11 @@ impl CoordApp {
         let mut changed = false;
 
         // 1. Lazy spawn for the selected issue when the Terminal tab is shown.
-        if self.active_view == SidebarView::Pipeline
-            && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+        // #675: also covers the Board Terminal tab.
+        if (self.active_view == SidebarView::Pipeline
+            && self.pipeline_detail_tab == PipelineDetailTab::Terminal)
+            || (self.active_view == SidebarView::Board
+                && self.board_detail_tab == BoardDetailTab::Terminal)
         {
             if let Some(issue_key) = self.selected_issue_key() {
                 if !self.detail_terminal_sessions.contains_key(&issue_key)
@@ -23690,17 +23777,32 @@ impl CoordApp {
     /// could resolve the wrong repo and dispatch the wrong issue (#480).
     /// Returns `(coord_repo_name, (repo_slug, number))`.
     fn selected_issue_repo_and_key(&self) -> Option<(String, (String, u64))> {
-        let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i))?;
-        let repo = match issue.coord_repo.as_deref() {
-            Some(cr) if !cr.is_empty() => cr.to_string(),
-            _ => issue
-                .repo_slug
-                .rsplit('/')
-                .next()
-                .filter(|s| !s.is_empty())?
-                .to_string(),
-        };
-        Some((repo, (issue.repo_slug.clone(), issue.number)))
+        // Pipeline selection is the primary source.
+        if let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) {
+            let repo = match issue.coord_repo.as_deref() {
+                Some(cr) if !cr.is_empty() => cr.to_string(),
+                _ => issue
+                    .repo_slug
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())?
+                    .to_string(),
+            };
+            return Some((repo, (issue.repo_slug.clone(), issue.number)));
+        }
+        // #675: fall back to the Board selection when on the Board panel.
+        if self.active_view == SidebarView::Board {
+            let (coord_repo, num) = self.board_selected_issue()?;
+            let slug = self
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(name, _)| *name == coord_repo)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| coord_repo.clone());
+            return Some((coord_repo, (slug, num)));
+        }
+        None
     }
 
     /// #539: Return the `id` of the most-recent completed `type="work"`
@@ -26555,6 +26657,11 @@ impl ShellApp for CoordApp {
                     BoardDetailTab::Chat => {
                         self.render_board_chat_tab(backend, content_rect);
                     }
+                    // #675: Terminal tab — per-issue interactive shell, mirrors
+                    // PipelineDetailTab::Terminal rendering.
+                    BoardDetailTab::Terminal => {
+                        self.render_detail_terminal_tab(backend, content_rect);
+                    }
                 }
                 // #316 Phase B: file-issue modal renders on top of the Chat tab.
                 if self.board_detail_tab == BoardDetailTab::Chat {
@@ -27238,10 +27345,10 @@ impl ShellApp for CoordApp {
             }
         }
 
-        // ── #440: Pipeline detail Terminal tab focus arbitration ─────────
+        // ── #440/#675: Pipeline/Board detail Terminal tab focus arbitration ──
         // PROTOCOL (mirrors the standalone Terminal pane):
-        //   - When `active_view == Pipeline` and
-        //     `pipeline_detail_tab == Terminal`:
+        //   - When `active_view == Pipeline && pipeline_detail_tab == Terminal`
+        //     OR `active_view == Board && board_detail_tab == Terminal` (#675):
         //     * F12 toggles `detail_terminal_focused`.
         //     * When focused, every other keypress is forwarded to the
         //       selected issue's PTY via `key_to_pty_bytes`.  TUI
@@ -27253,10 +27360,13 @@ impl ShellApp for CoordApp {
         // launcher built for #446):
         //   * `s` launches a local human-attended `claude` session via
         //     `coord assign --interactive --repo <repo> <N>` and
-        //     auto-focuses the PTY.
-        if self.active_view == SidebarView::Pipeline
-            && self.pipeline_detail_tab == PipelineDetailTab::Terminal
-        {
+        //     auto-focuses the PTY.  Only available on the Pipeline panel
+        //     (not the Board Terminal — #675 scopes the Board Terminal to Chat).
+        let in_pipeline_terminal = self.active_view == SidebarView::Pipeline
+            && self.pipeline_detail_tab == PipelineDetailTab::Terminal;
+        let in_board_terminal = self.active_view == SidebarView::Board
+            && self.board_detail_tab == BoardDetailTab::Terminal;
+        if in_pipeline_terminal || in_board_terminal {
             if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                 if matches!(key, Key::Named(NamedKey::F(12)))
                     && !modifiers.ctrl
@@ -27273,7 +27383,9 @@ impl ShellApp for CoordApp {
                 // ── #467: `s` = launch local `coord assign --interactive` ──
                 // Only fires when the PTY is *released* (not focused), so the
                 // letter 's' still reaches the live shell when in PTY mode.
-                if matches!(key, Key::Char('s'))
+                // Scoped to Pipeline Terminal only (#675).
+                if in_pipeline_terminal
+                    && matches!(key, Key::Char('s'))
                     && !modifiers.ctrl
                     && !modifiers.alt
                     && !modifiers.shift
@@ -27304,6 +27416,9 @@ impl ShellApp for CoordApp {
                 && self.terminal_focused)
                 || (self.active_view == SidebarView::Pipeline
                     && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                    && self.detail_terminal_focused)
+                || (self.active_view == SidebarView::Board // #675
+                    && self.board_detail_tab == BoardDetailTab::Terminal
                     && self.detail_terminal_focused);
             if matches!(key, Key::Char('p') | Key::Char('P'))
                 && modifiers.ctrl
@@ -28866,16 +28981,20 @@ impl ShellApp for CoordApp {
                     }
 
                     // ── h/l — cycle Board detail tabs ────────────────────
-                    // Board → Issue → Chat → Board (h goes backward, l forward).
+                    // Board → Issue → Board Chat → Terminal → Board
+                    // (l/Right = forward, h/Left = backward).
+                    // #675: Terminal tab added as the 4th tab.
                     Key::Char('l') | Key::Named(NamedKey::Right)
                         if self.active_view == SidebarView::Board
                             && !self.board_search.focused
-                            && self.inject_chat.is_none() =>
+                            && self.inject_chat.is_none()
+                            && !self.detail_terminal_focused =>
                     {
                         self.board_detail_tab = match self.board_detail_tab {
                             BoardDetailTab::Board => BoardDetailTab::Issue,
                             BoardDetailTab::Issue => BoardDetailTab::Chat,
-                            BoardDetailTab::Chat => BoardDetailTab::Board,
+                            BoardDetailTab::Chat => BoardDetailTab::Terminal,
+                            BoardDetailTab::Terminal => BoardDetailTab::Board,
                         };
                         self.detail_scroll = 0;
                         needs_redraw = true;
@@ -28883,12 +29002,14 @@ impl ShellApp for CoordApp {
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Board
                             && !self.board_search.focused
-                            && self.inject_chat.is_none() =>
+                            && self.inject_chat.is_none()
+                            && !self.detail_terminal_focused =>
                     {
                         self.board_detail_tab = match self.board_detail_tab {
-                            BoardDetailTab::Board => BoardDetailTab::Chat,
+                            BoardDetailTab::Board => BoardDetailTab::Terminal,
                             BoardDetailTab::Issue => BoardDetailTab::Board,
                             BoardDetailTab::Chat => BoardDetailTab::Issue,
+                            BoardDetailTab::Terminal => BoardDetailTab::Chat,
                         };
                         self.detail_scroll = 0;
                         needs_redraw = true;
