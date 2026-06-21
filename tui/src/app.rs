@@ -42607,9 +42607,10 @@ mod tests {
         let mut app = make_pipeline_milestone_app();
         // The new section is section index 1 (0 = filter).
         // Manually set a milestone collapsed in pipeline_milestone_expanded.
-        // Key: (lc_key="new", repo="acme/api", milestone="1").
+        // Key: (lc_key="new", repo="api", milestone="1").
+        // pipeline_repo_key() returns coord_repo ("api") not repo_slug ("acme/api").
         app.pipeline_milestone_expanded
-            .insert(("new".to_string(), "acme/api".to_string(), "1".to_string()), false);
+            .insert(("new".to_string(), "api".to_string(), "1".to_string()), false);
 
         // Rebuild — the collapsed state must be re-applied.
         app.rebuild_pipeline_sidebar(None);
@@ -42617,7 +42618,7 @@ mod tests {
         // The state must still be false (collapsed) in the map.
         let collapsed = app
             .pipeline_milestone_expanded
-            .get(&("new".to_string(), "acme/api".to_string(), "1".to_string()))
+            .get(&("new".to_string(), "api".to_string(), "1".to_string()))
             .copied()
             .unwrap_or(true);
         assert!(
