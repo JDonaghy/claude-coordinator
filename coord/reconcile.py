@@ -117,6 +117,10 @@ def reconcile_completed_assignments(
             review_state=None,
         )
 
+        # #666 Gap A: best-effort cost/token capture from the agent completed
+        # entry.  Must never raise — a tick crash breaks the daemon.
+        _capture_cost_from_entry_best_effort(aid, entry)
+
         plan_captured = (
             _capture_plan_best_effort(host, aid)
             if capture_plan and a.type == "plan"
@@ -152,6 +156,54 @@ def _capture_plan_best_effort(host: str, assignment_id: str) -> bool:
         return True
     except Exception:  # noqa: BLE001 — never let plan capture break the reconcile
         return False
+
+
+def _capture_cost_from_entry_best_effort(assignment_id: str, entry: dict) -> None:
+    """#666 Gap A: capture cost (and future tokens) from an agent ``completed``
+    entry when flipping a row terminal.
+
+    Best-effort and silent — any exception is swallowed so a cost-capture
+    failure never crashes the daemon's reconcile tick.
+
+    Cost source: ``total_cost_usd`` (full-log parse, available when the agent
+    serves terminal entries) with ``cost_so_far`` as a fallback.  Either is
+    used only when present and > 0 so an un-measured session isn't written as 0.
+
+    Token fields (``input_tokens`` / ``output_tokens`` / etc.) are wired up
+    here ready for when Gap B (#665 sibling) adds them to the agent
+    ``completed`` entry.  Until then the entry won't carry those keys and the
+    ``update_assignment_tokens`` guard (total > 0) makes this a silent no-op.
+    """
+    try:
+        from coord.state import update_assignment_cost, update_assignment_tokens  # noqa: PLC0415
+
+        raw_cost = entry.get("total_cost_usd") or entry.get("cost_so_far")
+        if raw_cost is not None:
+            try:
+                cost = float(raw_cost)
+            except (TypeError, ValueError):
+                cost = None
+            else:
+                if cost > 0:
+                    update_assignment_cost(assignment_id, cost)
+
+        # Gap B: token counts will be exported in the completed entry once the
+        # agent side is updated — until then these will all be 0/None and the
+        # update_assignment_tokens guard (total > 0) skips the write silently.
+        input_tokens = int(entry.get("input_tokens") or 0)
+        output_tokens = int(entry.get("output_tokens") or 0)
+        cache_creation_tokens = int(entry.get("cache_creation_tokens") or 0)
+        cache_read_tokens = int(entry.get("cache_read_tokens") or 0)
+        if input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens > 0:
+            update_assignment_tokens(
+                assignment_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_tokens=cache_creation_tokens,
+                cache_read_tokens=cache_read_tokens,
+            )
+    except Exception:  # noqa: BLE001 — never let cost capture break the reconcile
+        pass
 
 
 def _reassign(
