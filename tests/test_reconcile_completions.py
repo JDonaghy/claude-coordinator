@@ -212,6 +212,93 @@ def test_plan_capture_failure_does_not_break_status_write(monkeypatch) -> None:
     assert out[0]["plan_captured"] is False
 
 
+# ---------------------------------------------------------------------------
+# #666 Gap A: cost capture from agent completed entry
+# ---------------------------------------------------------------------------
+
+def test_captures_cost_from_total_cost_usd(monkeypatch) -> None:
+    """A completed entry carrying total_cost_usd persists cost via update_assignment_cost."""
+    recorded_costs: list[tuple[str, float]] = []
+
+    monkeypatch.setattr(
+        "coord.state.update_assignment_cost",
+        lambda aid, cost: recorded_costs.append((aid, cost)),
+    )
+    # Stub tokens writer so we don't need a live DB.
+    monkeypatch.setattr("coord.state.update_assignment_tokens", lambda *a, **kw: None)
+
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {
+            "completed": [{"id": "w1", "status": "done", "total_cost_usd": 0.42}]
+        },
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+    assert recorded_costs == [("w1", 0.42)]
+
+
+def test_captures_cost_fallback_to_cost_so_far(monkeypatch) -> None:
+    """When total_cost_usd is absent, cost_so_far is used as a fallback."""
+    recorded_costs: list[tuple[str, float]] = []
+
+    monkeypatch.setattr(
+        "coord.state.update_assignment_cost",
+        lambda aid, cost: recorded_costs.append((aid, cost)),
+    )
+    monkeypatch.setattr("coord.state.update_assignment_tokens", lambda *a, **kw: None)
+
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {
+            "completed": [{"id": "w1", "status": "done", "cost_so_far": 0.17}]
+        },
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+    assert recorded_costs == [("w1", 0.17)]
+
+
+def test_no_cost_write_when_entry_has_no_cost(monkeypatch) -> None:
+    """An entry with no cost fields → no update_assignment_cost call (no zero written)."""
+    recorded_costs: list[tuple[str, float]] = []
+
+    monkeypatch.setattr(
+        "coord.state.update_assignment_cost",
+        lambda aid, cost: recorded_costs.append((aid, cost)),
+    )
+    monkeypatch.setattr("coord.state.update_assignment_tokens", lambda *a, **kw: None)
+
+    reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {
+            "completed": [{"id": "w1", "status": "done"}]
+        },
+        update_state_fn=_Recorder(), capture_plan=False,
+    )
+    assert recorded_costs == []  # no cost data → no write
+
+
+def test_cost_capture_failure_does_not_break_status_write(monkeypatch) -> None:
+    """An exception in cost capture must not prevent the terminal-status write."""
+    rec = _Recorder()
+
+    monkeypatch.setattr(
+        "coord.state.update_assignment_cost",
+        lambda aid, cost: (_ for _ in ()).throw(RuntimeError("db gone")),
+    )
+    monkeypatch.setattr("coord.state.update_assignment_tokens", lambda *a, **kw: None)
+
+    out = reconcile_completed_assignments(
+        _config(), board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {
+            "completed": [{"id": "w1", "status": "done", "total_cost_usd": 0.5}]
+        },
+        update_state_fn=rec, capture_plan=False,
+    )
+    # Status write still landed despite the cost-capture blowup.
+    assert rec.calls[0]["terminal_status"] == "done"
+    assert out[0]["to_status"] == "done"
+
+
 def test_daemon_lifespan_runs_the_passive_reconcile_tick(monkeypatch, tmp_path) -> None:
     # Wiring: `coord serve`'s lifespan must actually run the tick on its interval.
     from starlette.testclient import TestClient
