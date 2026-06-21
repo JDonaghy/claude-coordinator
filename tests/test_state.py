@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import warnings
 
 import pytest
 
@@ -345,3 +346,183 @@ class TestReconcileBoardWriteHelpers:
         from coord.state import mark_assignment_merged
 
         mark_assignment_merged("")  # must not raise
+
+
+class TestThinClientLocalBoardGuard:
+    """#659: save_board/load_board/build_board warn (or raise) on thin clients.
+
+    This is the guard added in #659 so that the remaining local-board
+    write/read sites in cli.py are loud about their un-routed status.
+    Tests here verify:
+    - thin client (board_service set) → UserWarning containing '#615'
+    - thin client + COORD_STRICT_LOCAL_BOARD=1 → RuntimeError
+    - daemon host (board_service unset) → no #615 warning emitted
+    """
+
+    def _make_empty_board(self):
+        from coord.models import Board
+        return Board(active=[], completed=[], round_number=0)
+
+    def _set_thin_client(self, monkeypatch) -> None:
+        """Make _board_service() return a non-None ServiceConfig."""
+        import coord.client as cc
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+
+    def _set_daemon_host(self, monkeypatch) -> None:
+        """Make _board_service() return None (daemon host / standalone)."""
+        import coord.client as cc
+        monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+
+    # ── save_board ────────────────────────────────────────────────────────────
+
+    def test_save_board_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
+        from coord.state import save_board
+
+        self._set_thin_client(monkeypatch)
+        board = self._make_empty_board()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            save_board(board)
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert guard_warns, "save_board on thin client must emit a #615 UserWarning"
+        msg = str(guard_warns[0].message)
+        assert "save_board" in msg
+        assert "wrote" in msg
+        assert "daemon" in msg
+
+    def test_save_board_raises_in_strict_mode(self, coord_db, monkeypatch) -> None:
+        from coord.state import save_board
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+        board = self._make_empty_board()
+
+        with pytest.raises(RuntimeError, match="#615"):
+            save_board(board)
+
+    def test_save_board_no_warning_on_daemon_host(self, coord_db, monkeypatch) -> None:
+        from coord.state import save_board
+
+        self._set_daemon_host(monkeypatch)
+        board = self._make_empty_board()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            save_board(board)
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert not guard_warns, "save_board on daemon host must NOT emit a #615 warning"
+
+    # ── load_board ────────────────────────────────────────────────────────────
+
+    def test_load_board_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
+        from coord.state import load_board
+
+        self._set_thin_client(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            load_board()
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert guard_warns, "load_board on thin client must emit a #615 UserWarning"
+        msg = str(guard_warns[0].message)
+        assert "load_board" in msg
+        assert "read" in msg
+
+    def test_load_board_raises_in_strict_mode(self, coord_db, monkeypatch) -> None:
+        from coord.state import load_board
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+
+        with pytest.raises(RuntimeError, match="#615"):
+            load_board()
+
+    def test_load_board_no_warning_on_daemon_host(self, coord_db, monkeypatch) -> None:
+        from coord.state import load_board
+
+        self._set_daemon_host(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            load_board()
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert not guard_warns, "load_board on daemon host must NOT emit a #615 warning"
+
+    # ── build_board ───────────────────────────────────────────────────────────
+
+    def test_build_board_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
+        from coord.state import build_board
+
+        self._set_thin_client(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            build_board()
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert guard_warns, "build_board on thin client must emit a #615 UserWarning"
+        msg = str(guard_warns[0].message)
+        assert "build_board" in msg
+        assert "read" in msg
+
+    def test_build_board_raises_in_strict_mode(self, coord_db, monkeypatch) -> None:
+        from coord.state import build_board
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+
+        with pytest.raises(RuntimeError, match="#615"):
+            build_board()
+
+    def test_build_board_no_warning_on_daemon_host(self, coord_db, monkeypatch) -> None:
+        from coord.state import build_board
+
+        self._set_daemon_host(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            build_board()
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert not guard_warns, "build_board on daemon host must NOT emit a #615 warning"
+
+    # ── warning content ───────────────────────────────────────────────────────
+
+    def test_warning_carries_caller_info(self, coord_db, monkeypatch) -> None:
+        """The warning message must include a caller-identifying frame string."""
+        from coord.state import save_board
+
+        self._set_thin_client(monkeypatch)
+        board = self._make_empty_board()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            save_board(board)
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert guard_warns
+        msg = str(guard_warns[0].message)
+        # "Caller:" must appear followed by some module/file info.
+        assert "Caller:" in msg
+        assert "(" in msg and ":" in msg  # "module.fn (file.py:NN)"
+
+    def test_strict_mode_does_not_fire_on_daemon_host(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """COORD_STRICT_LOCAL_BOARD=1 must be a no-op on the daemon host."""
+        from coord.state import save_board
+
+        self._set_daemon_host(monkeypatch)
+        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+        board = self._make_empty_board()
+
+        # Must not raise — the guard is inactive on the daemon host.
+        save_board(board)
