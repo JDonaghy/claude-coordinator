@@ -16343,19 +16343,11 @@ impl CoordApp {
             ));
             items.push(ContextMenuItem::separator());
         }
-        // #410: "Send" dispatches the issue as a work assignment directly
-        // (coord assign), regardless of status.  Skipped for Completed
-        // (already done) and Unknown (no issue context).
-        if matches!(
-            lifecycle,
-            BoardRowLifecycle::Backlog
-                | BoardRowLifecycle::Refining
-                | BoardRowLifecycle::Refined
-                | BoardRowLifecycle::InFlight
-        ) {
-            items.push(ContextMenuItem::action("board-send", "Send"));
-            items.push(ContextMenuItem::separator());
-        }
+        // #661: the Board has NO direct dispatch. Choosing HOW to run an issue
+        // (interactive vs automated) is a Pipeline concern — the Board only
+        // pushes an issue into the Pipeline via "Send to Pipeline" above; from
+        // Pipeline:New the Pipeline menu's Start (interactive)/(automated)
+        // submenus pick the execution mode. (Reverses the #410 board "Send".)
         // #628: "Chat about issue" on EVERY issue row (any lifecycle) — a
         // human-attended session seeded with the issue's data that can answer
         // questions, sketch the UX, diagnose a stall, edit the issue, and send
@@ -20050,81 +20042,6 @@ impl CoordApp {
         true
     }
 
-    /// #410: Dispatch a Board row's issue directly as a work assignment
-    /// (`coord assign <machine> <repo> <issue>`), bypassing any label changes
-    /// or refinement steps.  Works regardless of the issue's current status.
-    fn dispatch_board_row_direct(&mut self, target: &ContextMenuTarget) -> bool {
-        let (repo, num) = match target {
-            ContextMenuTarget::BoardRow {
-                issue_number: Some(num),
-                repo_name: Some(repo),
-                ..
-            } => (repo.clone(), *num),
-            _ => {
-                self.push_toast(
-                    "Send unavailable",
-                    "No issue + repo target — focus a row first.",
-                    ToastSeverity::Info,
-                );
-                return false;
-            }
-        };
-        let Some(machine) = self.best_machine_for(&repo).cloned() else {
-            self.push_toast(
-                "Send",
-                &format!(
-                    "#{}: no reachable machine for {} — check coordinator.yml.",
-                    num, repo
-                ),
-                ToastSeverity::Warning,
-            );
-            return false;
-        };
-        let machine_name = machine.name.clone();
-        let issue_str = num.to_string();
-        let model_str = self
-            .settings
-            .machine_model
-            .get(&machine_name)
-            .map(|p| p.as_str().to_string());
-        let mut cmd: Vec<String> = vec![
-            "assign".into(),
-            machine_name.clone(),
-            repo.clone(),
-            issue_str,
-        ];
-        if let Some(ref m) = model_str {
-            cmd.push("--model".into());
-            cmd.push(m.clone());
-        }
-        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        use crate::commands::SpawnQueuedOutcome;
-        let outcome = self.command_runner.spawn_queued(&cmd_refs);
-        match outcome {
-            SpawnQueuedOutcome::Started => {
-                self.push_toast(
-                    "Send",
-                    &format!("#{} dispatched → {}", num, machine_name),
-                    ToastSeverity::Info,
-                );
-                // Kick the pipeline loader so the issue appears in Pipeline:New
-                // (and then In-progress) without waiting for the 60 s refresh.
-                self.maybe_kick_pipeline_loader();
-            }
-            SpawnQueuedOutcome::Queued => {
-                self.push_toast(
-                    "⏳ Queued",
-                    "assign runs after current command",
-                    ToastSeverity::Info,
-                );
-            }
-            SpawnQueuedOutcome::Deduped => {}
-        }
-        matches!(
-            outcome,
-            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
-        )
-    }
 
     /// Route a context-menu `action_id` to the right behaviour.
     /// Stub actions for the MVP (#259); subsequent issues replace with
@@ -20246,9 +20163,6 @@ impl CoordApp {
                 "Mark Refined",
                 "#{} → Refined (tagging status:ready…)",
             ),
-            // #410: Send — dispatch the issue as a work assignment directly
-            // (coord assign <machine> <repo> <issue>), regardless of status.
-            "board-send" => self.dispatch_board_row_direct(target),
             // #266: Refining → Backlog (strips status:refining).
             // Refined → Refining is handled by `coord refine` which
             // also removes status:ready, so `drop-to-refining` reuses
@@ -38752,10 +38666,11 @@ mod tests {
         assert!(opened, "context menu should open for a Board row");
         let state = app.pending_context_menu.expect("state set");
         assert!(!state.items.is_empty());
-        // #410: In-flight rows now get a "Send" action first (direct dispatch).
+        // #661: the Board has no direct dispatch; an in-flight row's first item
+        // is "Chat about issue" (Send to Pipeline only shows for Backlog rows).
         assert_eq!(
             state.items[state.selected_idx].action_id.as_deref(),
-            Some("board-send"),
+            Some("chat-about-issue"),
         );
         assert!(state.items.iter().any(|it| it.label.contains("#42")));
     }
@@ -38776,10 +38691,9 @@ mod tests {
             Point::new(0.0, 0.0),
             board_target(Some(1), BoardRowLifecycle::InFlight),
         );
-        // InFlight layout — Send / sep / Chat about issue / sep / Copy / sep /
-        // Refresh (#628 added the universal Chat after the Send group). First
-        // item (selected) is "board-send"; moving forward skips the separator
-        // and lands on "chat-about-issue".
+        // #661 InFlight layout — Chat about issue / sep / Copy / sep / Refresh
+        // (the Board "Send" is gone). First item (selected) is "chat-about-issue";
+        // moving forward skips the separator and lands on "copy-issue-number".
         let state_before = app.pending_context_menu.clone().unwrap();
         app.context_menu_move_selection(1);
         let state_after = app.pending_context_menu.clone().unwrap();
@@ -38788,25 +38702,51 @@ mod tests {
             state_after.items[state_after.selected_idx]
                 .action_id
                 .as_deref(),
-            Some("chat-about-issue"),
+            Some("copy-issue-number"),
         );
     }
 
     #[test]
     fn context_menu_activate_fires_action_and_dismisses() {
         let mut app = make_app_default();
+        // #661: the Board "Send" is gone. Use an Unknown/no-issue row whose only
+        // item is "Refresh" — activating it fires (kicks a background load) and
+        // dismisses the menu without spawning a coordinator command.
         app.open_context_menu(
             Point::new(0.0, 0.0),
-            board_target(Some(7), BoardRowLifecycle::InFlight),
+            board_target(None, BoardRowLifecycle::Unknown),
         );
-        let before = app.toasts.len();
         let fired = app.context_menu_activate_selected();
         assert!(fired);
-        // Menu dismissed.
+        // Menu dismissed after activating an item.
         assert!(app.pending_context_menu.is_none());
-        // #410: First item is "board-send"; in a test app with no machines it
-        // toasts "no reachable machine" — still exactly one toast emitted.
-        assert_eq!(app.toasts.len(), before + 1);
+    }
+
+    #[test]
+    fn board_menu_offers_send_to_pipeline_never_direct_send() {
+        // #661: the Board has NO direct "Send" dispatch — only "Send to Pipeline".
+        // A Backlog (untracked open) row offers Send to Pipeline; an already-
+        // tracked row (in the Pipeline) offers no Board dispatch at all. The
+        // interactive-vs-automated choice lives in the Pipeline menu.
+        let app = make_app_default();
+        let backlog =
+            app.context_menu_items_for_board_row(Some(7), &BoardRowLifecycle::Backlog);
+        assert!(
+            backlog.iter().any(|i| i.label == "Send to Pipeline"),
+            "Backlog row must offer Send to Pipeline",
+        );
+        assert!(
+            !backlog.iter().any(|i| i.label == "Send"),
+            "Board must never offer the direct Send (#661)",
+        );
+        let refined =
+            app.context_menu_items_for_board_row(Some(7), &BoardRowLifecycle::Refined);
+        assert!(
+            !refined
+                .iter()
+                .any(|i| i.label == "Send" || i.label == "Send to Pipeline"),
+            "an already-tracked row offers no Board dispatch",
+        );
     }
 
     #[test]
@@ -42241,63 +42181,6 @@ mod tests {
         let d_badge = board_row_status_badge("completed");
         assert!(d_badge.is_some(), "completed → Some");
         assert_eq!(d_badge.unwrap().text, "D");
-    }
-
-    // ── #410: dispatch_board_row_direct success path ─────────────────────
-
-    /// `dispatch_board_row_direct` should spawn `coord assign <machine>
-    /// <repo> <issue>` when a reachable machine exists.  The existing test
-    /// (context_menu_activate_fires_action_and_dismisses) only covers the
-    /// "no reachable machine" failure path.  This test covers the happy path.
-    #[test]
-    fn dispatch_board_row_direct_success_path_spawns_coord_assign() {
-        // Build an app that has one reachable machine configured for "repo-a".
-        let mut app = CoordApp {
-            data: BoardData {
-                machines: vec![Machine {
-                    name: "test-machine".to_string(),
-                    host: String::new(),
-                    reachable: true,
-                    active_count: 0,
-                    repos: vec!["repo-a".to_string()],
-                    version: None,
-                    worktree_bytes: 0,
-                }],
-                ..BoardData::default()
-            },
-            ..make_test_app(BoardData::default())
-        };
-
-        // Before: command runner must be idle.
-        assert!(!app.command_runner.is_running(), "runner should start idle");
-
-        let before_toasts = app.toasts.len();
-        let target = board_target(Some(42), BoardRowLifecycle::Backlog);
-        let dispatched = app.dispatch_board_row_direct(&target);
-
-        // dispatch_board_row_direct returns true on success.
-        assert!(
-            dispatched,
-            "dispatch_board_row_direct must return true on success"
-        );
-
-        // A command was actually spawned (coord assign …).
-        assert!(
-            app.command_runner.is_running(),
-            "coord assign must be running after successful dispatch",
-        );
-
-        // Exactly one toast (the "dispatched → test-machine" confirmation).
-        assert_eq!(
-            app.toasts.len(),
-            before_toasts + 1,
-            "exactly one success toast expected",
-        );
-        let toast_body = app.toasts.last().unwrap().0.body.to_string();
-        assert!(
-            toast_body.contains("42") && toast_body.contains("test-machine"),
-            "toast should mention issue #42 and machine, got: {toast_body:?}",
-        );
     }
 
     // ── #424: embedded terminal pane ─────────────────────────────────────
