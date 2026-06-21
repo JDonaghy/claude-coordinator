@@ -1013,6 +1013,7 @@ def _finalize_merge_blocked(
     repo_path: str | None,
     started_at: float | None,
     log_path: str | None,
+    branch: str | None = None,
 ) -> InteractiveFinalizeResult:
     """Record a botched ``--merge-of`` rebase as blocked → ``failed`` (#604).
 
@@ -1056,7 +1057,7 @@ def _finalize_merge_blocked(
             summary=merge_verify.block_summary(base_branch),
             duration_seconds=duration,
             log_path=log_path,
-            branch=branch_now,
+            branch=branch_now or branch,
         )
     )
 
@@ -1413,6 +1414,7 @@ def finalize_interactive_exit(
     artifact_paths: list[str] | None = None,
     verify_merge: bool = False,
     ssh_target: str | None = None,
+    branch: str | None = None,
 ) -> InteractiveFinalizeResult:
     """Git-floor backstop for the interactive launcher exit path (#466).
 
@@ -1477,6 +1479,7 @@ def finalize_interactive_exit(
                     repo_path=repo_path,
                     started_at=started_at,
                     log_path=log_path,
+                    branch=branch,
                 )
 
     # Respect an explicit `coord report-result` from the agent.  Without
@@ -1545,7 +1548,7 @@ def finalize_interactive_exit(
                     summary="Review verdict recovered from the session transcript "
                     "(agent could not run `coord report-result`).",
                     findings_body=_tf.body,
-                    branch=None,
+                    branch=branch,
                 )
             )
         except Exception:  # noqa: BLE001 — best-effort
@@ -1621,7 +1624,7 @@ def finalize_interactive_exit(
         issue_number=issue_number,
         exit_code=exit_code,
         commits_ahead=commits,
-        branch=branch_now,
+        branch=branch_now or branch,
         duration_seconds=duration,
         log_path=log_path,
         summary="",
