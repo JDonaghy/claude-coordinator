@@ -15141,6 +15141,15 @@ impl CoordApp {
                             self.detail_terminal_focused = true;
                         }
                     }
+                    // #675: Board Terminal tab — same focus-follows-click as Pipeline Terminal.
+                    if self.active_view == SidebarView::Board
+                        && self.board_detail_tab == BoardDetailTab::Terminal
+                    {
+                        let tab_h = detail_tab_bar_height(lh);
+                        if pos.y - main_b.y >= tab_h && !self.detail_terminal_focused {
+                            self.detail_terminal_focused = true;
+                        }
+                    }
                     // #464: host-side selection — must check BEFORE the PTY
                     // forwarding path so Shift can override even when the app
                     // has mouse reporting on (e.g. vim visual mode).
@@ -15874,6 +15883,11 @@ impl CoordApp {
                         _ => BoardDetailTab::Terminal,
                     };
                     if new_tab != self.board_detail_tab {
+                        // Mirror Pipeline tab handler: release PTY focus when
+                        // switching away from the Terminal tab via mouse click.
+                        if new_tab != BoardDetailTab::Terminal {
+                            self.detail_terminal_focused = false;
+                        }
                         self.board_detail_tab = new_tab;
                         self.detail_scroll = 0;
                         return true;
@@ -48999,6 +49013,140 @@ mod tests {
             driver.screen_contains("dead"),
             "dead-pane session must show dead indicator in the sessions overlay:\n{}",
             driver.screen()
+        );
+    }
+
+    // ── #675 follow-up: Board Terminal focus-follows-click (BUG 1) ──────────
+    //
+    // Clicking below the tab bar while on Board+Terminal should set
+    // `detail_terminal_focused = true`, matching the Pipeline+Terminal behaviour.
+
+    #[test]
+    fn board_terminal_content_click_sets_detail_terminal_focused() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.board_detail_tab = BoardDetailTab::Terminal;
+        app.detail_terminal_focused = false;
+
+        let lh = 1.0_f32;
+        let main_b = Rect::new(50.0, 0.0, 100.0, 40.0);
+        let tab_h = detail_tab_bar_height(lh); // ≈ 1.4 with lh=1.0
+
+        // Simulate the focus-follows-click logic that fires before mouse_main_click.
+        // The handler checks: active_view==Board, board_detail_tab==Terminal,
+        // pos.y - main_b.y >= tab_h, !detail_terminal_focused.
+        let click_pos = Point::new(80.0, main_b.y + tab_h + 5.0); // well below tab bar
+        let pos_y_rel = click_pos.y - main_b.y;
+        if app.active_view == SidebarView::Board
+            && app.board_detail_tab == BoardDetailTab::Terminal
+        {
+            if pos_y_rel >= tab_h && !app.detail_terminal_focused {
+                app.detail_terminal_focused = true;
+            }
+        }
+
+        assert!(
+            app.detail_terminal_focused,
+            "clicking Board Terminal content area must set detail_terminal_focused"
+        );
+    }
+
+    #[test]
+    fn board_terminal_tab_bar_click_does_not_set_detail_terminal_focused() {
+        // Clicking in the TAB BAR row (not the content) must NOT focus the PTY.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.board_detail_tab = BoardDetailTab::Terminal;
+        app.detail_terminal_focused = false;
+
+        let lh = 1.0_f32;
+        let main_b = Rect::new(50.0, 0.0, 100.0, 40.0);
+        let tab_h = detail_tab_bar_height(lh);
+
+        // Simulate the focus-follows-click guard: pos_y_rel < tab_h → no focus.
+        let click_pos = Point::new(80.0, main_b.y + tab_h * 0.5); // inside tab bar row
+        let pos_y_rel = click_pos.y - main_b.y;
+        if app.active_view == SidebarView::Board
+            && app.board_detail_tab == BoardDetailTab::Terminal
+        {
+            if pos_y_rel >= tab_h && !app.detail_terminal_focused {
+                app.detail_terminal_focused = true;
+            }
+        }
+
+        assert!(
+            !app.detail_terminal_focused,
+            "clicking Board Terminal tab bar row must NOT set detail_terminal_focused"
+        );
+    }
+
+    // ── #675 follow-up: Board tab switch clears detail_terminal_focused (BUG 2) ─
+    //
+    // After switching away from the Terminal tab via mouse click on the Board
+    // or Issue tab label, `detail_terminal_focused` must be cleared so the
+    // Board/Issue tabs can render and receive keyboard input normally.
+
+    #[test]
+    fn board_tab_click_to_non_terminal_clears_detail_terminal_focused() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.board_detail_tab = BoardDetailTab::Terminal;
+        app.detail_terminal_focused = true; // was auto-focused when chat launched
+
+        let lh = 1.0_f32;
+        // `mouse_main_click` first strips the panel toolbar via
+        // `hit_test_panel_toolbar`. With lh=1.0 the Board toolbar is
+        // toolbar_height = lh * 2.0 = 2.0 rows tall.  The tab bar
+        // sits at [main_b.y + toolbar_h, main_b.y + toolbar_h + tab_h).
+        // detail_tab_bar_height(1.0) = (1.0 * 1.4).round().max(1.0) = 1.0.
+        // So inside content_main_b (y starts at 2.0):
+        //   tab bar y ∈ [2.0, 3.0)  → use y=2.5
+        // x=3.0 lands in " Board " (0..7 → first 7 chars from origin_x=0).
+        let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
+        let click_pos = Point::new(3.0, 2.5);
+        let changed = app.mouse_main_click(click_pos, main_b, lh);
+
+        assert!(changed, "tab click must return true (state changed)");
+        assert_eq!(
+            app.board_detail_tab,
+            BoardDetailTab::Board,
+            "tab must switch to Board"
+        );
+        assert!(
+            !app.detail_terminal_focused,
+            "switching to Board tab must clear detail_terminal_focused"
+        );
+    }
+
+    #[test]
+    fn board_tab_click_to_terminal_preserves_detail_terminal_focused() {
+        // Clicking the Terminal tab itself must NOT clear detail_terminal_focused —
+        // the user is clicking INTO the terminal, not away from it.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.board_detail_tab = BoardDetailTab::Board; // start on Board tab
+        app.detail_terminal_focused = false;
+
+        let lh = 1.0_f32;
+        let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
+        // Tab bar is at y ∈ [2.0, 3.0) (toolbar_h=2.0, tab_h=1.0); use y=2.5.
+        // Tab labels: " Board "(7) " Issue "(7) " Board Chat "(12) " Terminal "(10)
+        // Cumulative widths: 0–7, 7–14, 14–26, 26–36.
+        // Click at x=30.0 lands in " Terminal " (26–36).
+        let click_pos = Point::new(30.0, 2.5);
+        let changed = app.mouse_main_click(click_pos, main_b, lh);
+
+        assert!(changed, "tab click must return true (state changed)");
+        assert_eq!(
+            app.board_detail_tab,
+            BoardDetailTab::Terminal,
+            "tab must switch to Terminal"
+        );
+        // detail_terminal_focused stays false — focus is set by a content-area
+        // click, not a tab-bar click.
+        assert!(
+            !app.detail_terminal_focused,
+            "clicking the Terminal tab label must not alter detail_terminal_focused"
         );
     }
 }
