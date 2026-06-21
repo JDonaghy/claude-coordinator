@@ -4602,13 +4602,19 @@ def assign(
             # `coord report-result --assignment $COORD_ASSIGNMENT_ID …` to
             # report a structured result before exiting.  Also prepend a
             # short reminder to the briefing so the operator notices.
+            #
+            # #646: do NOT offer --verdict here — this is a work/plan session.
+            # A verdict belongs only on a review session. Offering it led the
+            # work agent to run `report-result --verdict approve` against its
+            # OWN work id, stamping a bogus verdict and finalizing a still-live
+            # session (the write seam now rejects that too, but don't tempt it).
             os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
             report_reminder = (
                 f"[Coordinator assignment {assignment_id}] "
                 "Before you exit, please run `coord report-result "
                 f"--assignment {assignment_id} --status <done|blocked|"
-                "already-implemented> [--verdict approve|request-changes] "
-                "--summary <text>` so the coordinator records the result.\n\n"
+                "already-implemented> --summary <text>` so the coordinator "
+                "records the result.\n\n"
             )
             effective_briefing = _issue_ctx + report_reminder + briefing + _ctx_write_hint
 
@@ -4772,12 +4778,13 @@ def assign(
             # (for symmetry with local path; the remote process gets it
             # inline via the shell command).
             os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+            # #646: no --verdict for a work/plan session (review-only field).
             report_reminder = (
                 f"[Coordinator assignment {assignment_id}] "
                 "Before you exit, please run `coord report-result "
                 f"--assignment {assignment_id} --status <done|blocked|"
-                "already-implemented> [--verdict approve|request-changes] "
-                "--summary <text>` so the coordinator records the result.\n\n"
+                "already-implemented> --summary <text>` so the coordinator "
+                "records the result.\n\n"
             )
             effective_briefing = _issue_ctx + report_reminder + briefing + _ctx_write_hint
 

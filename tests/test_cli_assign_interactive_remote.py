@@ -144,6 +144,48 @@ class TestLocalVsRemoteSelection:
         mock_local.assert_called_once()
         mock_remote.assert_not_called()
 
+    def test_work_briefing_omits_verdict_in_report_reminder(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#646: the work/plan report-result reminder must NOT offer --verdict.
+        Offering it led the work agent to run `report-result --verdict approve`
+        against its OWN work id, stamping a bogus verdict and finalizing a
+        still-live session — --verdict is a review-only field."""
+        captured: list[str] = []
+
+        def _fake_local(argv: Any, briefing: Any, **kw: Any) -> int:
+            captured.append(briefing or "")
+            return 0
+
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix it"}), \
+             patch("coord.claim.find_work_claim", return_value=None), \
+             patch("coord.agent.setup_interactive_worktree",
+                   return_value=(Path("/tmp/wt"), "issue-42-fix-it")), \
+             patch("coord.state.record_dispatched"), \
+             patch("coord.state.save_board"), \
+             patch("coord.state.build_board", return_value=MagicMock(active=[], completed=[])), \
+             patch("coord.interactive.launch_human_attended_interactive",
+                   side_effect=_fake_local), \
+             patch("coord.interactive._launch_via_tmux"), \
+             patch("coord.interactive.tmux_available", return_value=False), \
+             patch("coord.interactive.tmux_session_alive", return_value=False):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", _LOCAL_HOST, "api", "42",
+                    "--config", str(config_file),
+                    "--interactive",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert len(captured) == 1
+        brief = captured[0]
+        # The result-out reminder is present...
+        assert "coord report-result" in brief
+        # ...but it must NOT offer the review-only --verdict field (#646).
+        assert "--verdict" not in brief
+        assert "approve|request-changes" not in brief
+
     def test_remote_machine_uses_tmux_launch(
         self, remote_config_file: Path, coord_dir: Path
     ) -> None:
