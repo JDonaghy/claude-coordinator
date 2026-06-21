@@ -756,6 +756,42 @@ def test_upsert_open_issues_updates_title_on_resync(coord_db) -> None:
     assert row["title"] == "New title"
 
 
+def test_upsert_open_issues_updates_labels_on_resync(coord_db) -> None:
+    """#658 regression: coord sync must overwrite stale labels for existing rows.
+
+    coord backlog removes a status:* label from GitHub.  The subsequent
+    coord sync must write the updated label set into the local issues cache
+    so the TUI pipeline view stops showing the old status label.
+    """
+    import json
+    from coord.state import upsert_open_issues
+    from coord.db import get_connection
+
+    # First sync: issue arrives with status:ready label.
+    upsert_open_issues(
+        "repo",
+        [{"number": 6, "title": "T", "body": "", "labels": [{"name": "coord"}, {"name": "status:ready"}]}],
+    )
+    row = get_connection().execute(
+        "SELECT labels FROM issues WHERE repo_name='repo' AND number=6"
+    ).fetchone()
+    assert "status:ready" in json.loads(row["labels"])
+
+    # coord backlog removes status:ready on GitHub.  Second sync reflects that.
+    upsert_open_issues(
+        "repo",
+        [{"number": 6, "title": "T", "body": "", "labels": [{"name": "coord"}]}],
+    )
+    row = get_connection().execute(
+        "SELECT labels FROM issues WHERE repo_name='repo' AND number=6"
+    ).fetchone()
+    labels = json.loads(row["labels"])
+    assert "status:ready" not in labels, (
+        "coord sync did not remove the stale status:ready label from the issues cache"
+    )
+    assert "coord" in labels
+
+
 def test_upsert_open_issues_persists_milestone(coord_db) -> None:
     """#406 Phase A: milestone_number + milestone_title survive a coord sync."""
     from coord.state import upsert_open_issues

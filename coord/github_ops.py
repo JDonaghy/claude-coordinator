@@ -17,10 +17,14 @@ def _gh(*args: str) -> str:
 
 
 def get_open_issues(repo: str) -> list[dict]:
+    # #658: raised from 100 → 500 so repos with many open issues don't silently
+    # skip old issue numbers during coord sync.  GitHub paginates the REST list
+    # endpoint at 100 items internally, so this costs ~5 API calls for a large
+    # repo — acceptable for a background sync.
     raw = _gh(
         "issue", "list", "--repo", repo, "--state", "open",
         "--json", "number,title,labels,milestone,body,assignees",
-        "--limit", "100",
+        "--limit", "500",
     )
     return json.loads(raw)
 
