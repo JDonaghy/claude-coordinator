@@ -496,7 +496,7 @@ class TestFinalizeRemovesWorktree:
         )
         assert wt_path.exists()
 
-        _seed_running_assignment("fin03")
+        _seed_running_assignment("fin03", assignment_type="review")
         # Simulate coord report-result having already written DONE.
         with patch("coord.github_ops.post_issue_comment"):
             issue_store.post_result(
@@ -658,7 +658,7 @@ class TestFinalizeStashesArtifacts:
         bin_dir.mkdir(parents=True)
         (bin_dir / "myapp").write_bytes(b"\x7fELF" + b"\x00" * 200)
 
-        _seed_running_assignment("stash03")
+        _seed_running_assignment("stash03", assignment_type="review")
         # Simulate coord report-result having already written DONE.
         with patch("coord.github_ops.post_issue_comment"):
             issue_store.post_result(

@@ -86,8 +86,14 @@ def _seed_running_assignment(
     machine: str = "laptop",
     issue_number: int = 7,
     issue_title: str = "Some work",
+    assignment_type: str = "work",
 ) -> None:
-    """Insert a `running` assignment row so the seam has something to UPDATE."""
+    """Insert a `running` assignment row so the seam has something to UPDATE.
+
+    ``assignment_type`` defaults to ``"work"``; verdict-bearing tests pass
+    ``"review"`` since a review verdict may only be recorded on a review row
+    (the #646 verdict-target invariant rejects a verdict on a work row).
+    """
     from coord.models import Proposal
 
     proposal = Proposal(
@@ -98,7 +104,7 @@ def _seed_running_assignment(
         issue_title=issue_title,
         rationale="test",
         briefing="brief",
-        type="work",
+        type=assignment_type,
     )
     state_mod.record_dispatched(
         assignment_id=assignment_id,
@@ -317,7 +323,7 @@ class TestPostResult:
         a verdict.  `post_result(status=done, verdict=approve)` writes the
         verdict on the assignment row so the merge-gate sees it (mirroring
         what notify.py does for a claude -p reviewer)."""
-        _seed_running_assignment("aid-rev-1")
+        _seed_running_assignment("aid-rev-1", assignment_type="review")
         with patch("coord.github_ops.post_issue_comment"):
             issue_store.post_result(
                 issue_store.ResultRecord(
@@ -345,7 +351,7 @@ class TestPostResult:
         from coord.comments import extract_findings_block
         from coord.state import load_assignment_review_findings
 
-        _seed_running_assignment("aid-rev-bf")
+        _seed_running_assignment("aid-rev-bf", assignment_type="review")
         findings = "- src/foo.rs:10 — missing nil guard\n- src/bar.rs:5 — typo"
         with patch("coord.github_ops.post_issue_comment") as post:
             issue_store.post_result(
@@ -403,6 +409,36 @@ class TestPostResult:
                     summary="",
                 )
             )
+
+    def test_verdict_on_non_review_assignment_refused(self) -> None:
+        """#646: a review verdict may only be recorded on a type="review" row.
+        A `report-result --verdict` misrouted onto a WORK id must be refused —
+        recording it marks the work row done and stamps a bogus review_verdict,
+        which silently finalized a still-live interactive work session and hid
+        the TUI reattach option. The write seam makes that state unrepresentable."""
+        _seed_running_assignment("aid-work-x", assignment_type="work")
+        with patch("coord.github_ops.post_issue_comment") as post:
+            with pytest.raises(ValueError, match="not 'review'"):
+                issue_store.post_result(
+                    issue_store.ResultRecord(
+                        assignment_id="aid-work-x",
+                        machine_name="laptop",
+                        repo_name="api",
+                        repo_github="acme/api",
+                        issue_number=7,
+                        status="done",
+                        verdict="approve",
+                        summary="LGTM",
+                    )
+                )
+        # Nothing was written: no comment posted, row stays running, no verdict.
+        post.assert_not_called()
+        row = state_mod.get_connection().execute(
+            "SELECT status, review_verdict FROM assignments WHERE assignment_id=?",
+            ("aid-work-x",),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["review_verdict"] is None
 
     def test_request_changes_without_body_raises_at_seam(self) -> None:
         """#617 keystone: request-changes with no findings_body is REFUSED at
@@ -499,7 +535,7 @@ class TestReportResultCli:
         assert row["status"] == "failed"
 
     def test_review_verdict_recorded(self, config_file: Path) -> None:
-        _seed_running_assignment("cli-4")
+        _seed_running_assignment("cli-4", assignment_type="review")
         with patch("coord.github_ops.post_issue_comment"):
             result = CliRunner().invoke(
                 main,
@@ -551,7 +587,7 @@ class TestReportResultCli:
 
     def test_approve_without_body_still_ok(self, config_file: Path) -> None:
         """approve needs no findings — there's nothing to fix."""
-        _seed_running_assignment("cli-ap")
+        _seed_running_assignment("cli-ap", assignment_type="review")
         with patch("coord.github_ops.post_issue_comment"):
             result = CliRunner().invoke(
                 main,
@@ -844,7 +880,7 @@ class TestFinalizeBackstop:
         from coord.interactive import finalize_interactive_exit
 
         clone, _origin = repo_with_remote
-        _seed_running_assignment("backstop-3")
+        _seed_running_assignment("backstop-3", assignment_type="review")
         # Simulate `coord report-result` having already written DONE.
         with patch("coord.github_ops.post_issue_comment"):
             issue_store.post_result(

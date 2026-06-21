@@ -355,7 +355,7 @@ class TestFinalizeMergeGate:
         from tests.test_issue_store_seam import _seed_running_assignment
         import coord.issue_store as issue_store
 
-        _seed_running_assignment("rev-x", issue_number=604)
+        _seed_running_assignment("rev-x", issue_number=604, assignment_type="review")
         with patch("coord.github_ops.post_issue_comment"):
             issue_store.post_result(
                 issue_store.ResultRecord(
