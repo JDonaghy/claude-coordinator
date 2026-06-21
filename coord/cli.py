@@ -3706,6 +3706,7 @@ def assign(
                         log_path=None,
                         repo_path=fix_repo_path,
                         artifact_paths=repo_cfg.artifact_paths,
+                        branch=work.branch,
                     )
                     if finalize_result.already_recorded:
                         click.echo(
@@ -4055,6 +4056,7 @@ def assign(
                         log_path=None,
                         repo_path=rw_repo_path,
                         artifact_paths=repo_cfg.artifact_paths,
+                        branch=rw_branch,
                     )
                     if finalize_result.already_recorded:
                         click.echo(
@@ -4434,6 +4436,7 @@ def assign(
                     # #604: git truth overrides the agent's self-report on the
                     # merge path — a botched rebase records `blocked`, not `done`.
                     verify_merge=True,
+                    branch=work.branch,
                 )
                 # Forensics (#604): the worktree + reflog are gone by now, so
                 # this echo is the only post-hoc record of what would merge.
@@ -4692,6 +4695,7 @@ def assign(
                     log_path=None,
                     repo_path=repo_path,
                     artifact_paths=repo_cfg.artifact_paths,
+                    branch=_interactive_branch,
                 )
                 if finalize_result.already_recorded:
                     click.echo(
@@ -9058,6 +9062,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                 log_path=None,
                 repo_path=repo_path_val,
                 artifact_paths=artifact_paths_val,
+                branch=branch_val,
             )
             if finalize_result.already_recorded:
                 click.echo(

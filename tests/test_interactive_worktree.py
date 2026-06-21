@@ -699,3 +699,98 @@ class TestFinalizeStashesArtifacts:
         stash_base = coord_dir / "artifacts" / "myrepo"
         stash_files = list(stash_base.rglob("myapp")) if stash_base.exists() else []
         assert stash_files, "artifact should be stashed even when already_recorded=True"
+
+
+# ── #611 branch-fallback: finalize records dispatch-time branch when worktree gone ──
+
+
+class TestFinalizeBranchFallback:
+    """#611: finalize_interactive_exit must never record branch=None for a done
+    work row when a dispatch-time branch is known, even if the worktree has
+    already been removed when finalize runs."""
+
+    def test_dispatch_branch_recorded_when_worktree_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """When the worktree path doesn't exist at finalize time (already cleaned
+        up), the dispatch-time branch passed as `branch=` is used instead of
+        falling through to None."""
+        from coord.interactive import finalize_interactive_exit
+        from coord.state import get_connection
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("wk-branch-611", issue_number=611)
+
+        # Point finalize at a worktree path that doesn't exist — this is the
+        # scenario where the worktree was already removed before finalize ran.
+        missing_wt = tmp_path / "worktrees" / "wk-branch-611"
+        assert not missing_wt.exists()
+
+        dispatch_branch = "issue-611-branch-fallback-test"
+
+        with patch("coord.github_ops.post_issue_comment"):
+            result = finalize_interactive_exit(
+                assignment_id="wk-branch-611",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=611,
+                machine_name="laptop",
+                worktree_path=str(missing_wt),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                repo_path=None,
+                branch=dispatch_branch,
+            )
+
+        # Finalize should have used the dispatch-time branch, not None.
+        row = get_connection().execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?",
+            ("wk-branch-611",),
+        ).fetchone()
+        assert row is not None
+        assert row["branch"] == dispatch_branch, (
+            f"expected dispatch-time branch {dispatch_branch!r}, got {row['branch']!r}; "
+            "branch=None on a done work row greys the TUI Test/Review/Merge chain"
+        )
+        # The worktree wasn't there to push or read a current branch from.
+        assert result.commits_ahead is None
+
+    def test_review_finalize_no_worktree_records_branch_none(
+        self, tmp_path: Path
+    ) -> None:
+        """A human-attended REVIEW legitimately has no branch — worktree_path is
+        None and no `branch` is passed.  The fallback must not invent one."""
+        from coord.interactive import finalize_interactive_exit
+        from coord.state import get_connection
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("rv-no-branch-611", assignment_type="review", issue_number=611)
+
+        with patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.interactive._git_push") as mock_push:
+            result = finalize_interactive_exit(
+                assignment_id="rv-no-branch-611",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=611,
+                machine_name="laptop",
+                worktree_path=None,   # review runs read-only in the live checkout
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                repo_path=None,
+                # No `branch` kwarg — review callers must never pass one
+            )
+
+        mock_push.assert_not_called()
+        # branch must remain None for a read-only review session.
+        row = get_connection().execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?",
+            ("rv-no-branch-611",),
+        ).fetchone()
+        assert row is not None
+        assert row["branch"] is None, (
+            f"review rows must stay branch=None; got {row['branch']!r}"
+        )
+        assert result.worktree_removed is False
