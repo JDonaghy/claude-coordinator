@@ -10,12 +10,18 @@ isolate tests with an in-memory database.
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
+import os
 import sqlite3
 import time
+import warnings
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 from coord._board_mapping import (
     decode_smoke_tests as _decode_smoke_tests,
@@ -391,6 +397,69 @@ def _board_service():  # -> ServiceConfig | None
     from coord.client import resolve_board_service  # noqa: PLC0415
 
     return resolve_board_service()
+
+
+def _thin_client_local_board_guard(fn_name: str) -> None:
+    """Warn (or raise in strict mode) when a thin client touches the local board.
+
+    Fires only when ``_board_service()`` is set (thin-client mode).  A no-op
+    on the daemon host where the local DB is canonical.
+
+    **Default behaviour (non-breaking):** emits a ``UserWarning`` via
+    :func:`warnings.warn` *and* :func:`logging.warning`, both carrying
+    the ``#615`` tag and a caller-identifying frame so the ``coord.cli``
+    command that still reads/writes the local board can be pinpointed.
+
+    **Strict mode (``COORD_STRICT_LOCAL_BOARD=1``):** raises
+    :class:`RuntimeError` so CI / a deliberate audit run surfaces every
+    remaining offender as a hard failure.
+
+    This is "option B" debt instrumentation for #615: run the coordinator
+    on a thin client, watch what lights up, then migrate each offending
+    ``save_board`` / ``load_board`` / ``build_board`` call to a
+    daemon-routed path incrementally.
+    """
+    if _board_service() is None:
+        return  # daemon host — local DB IS canonical; guard is a no-op
+
+    # Walk the call stack to find the most informative caller frame.
+    # Prefer frames from coord.cli so the message names the subcommand.
+    caller_info = "<unknown>"
+    try:
+        state_module = __name__  # "coord.state"
+        best: inspect.FrameInfo | None = None
+        for fi in inspect.stack()[2:]:  # skip this fn + the board fn that called us
+            mod = fi.frame.f_globals.get("__name__", "")
+            if mod == state_module:
+                continue  # still inside coord.state — keep looking
+            if best is None:
+                best = fi  # first frame outside coord.state
+            if "cli" in mod:
+                best = fi  # prefer coord.cli frames; keep going in case of deeper
+                break
+        if best is not None:
+            caller_info = (
+                f"{best.frame.f_globals.get('__name__', '?')}.{best.function}"
+                f" ({Path(best.filename).name}:{best.lineno})"
+            )
+    except Exception:  # noqa: BLE001 — introspection must never break a command
+        pass
+
+    action = "wrote" if "save" in fn_name else "read"
+    msg = (
+        f"#615: {fn_name}() {action} the local board on a thin client — "
+        f"this command is not yet daemon-routed; its effect will NOT reach "
+        f"the daemon. Caller: {caller_info}."
+    )
+
+    if os.environ.get("COORD_STRICT_LOCAL_BOARD", "").strip() == "1":
+        raise RuntimeError(msg)
+
+    # Warn via both channels: warnings (capturable in tests / -W flags) and
+    # logging (shows up in log files and structured output).
+    # stacklevel=3: attributes the warning to the caller of save/load/build_board.
+    warnings.warn(msg, UserWarning, stacklevel=3)
+    _log.warning(msg)
 
 
 def record_dispatched(
@@ -1119,6 +1188,7 @@ def save_board(board: Board) -> Path:
     generating a deterministic fallback ID and writing it back to the
     assignment object in-place.
     """
+    _thin_client_local_board_guard("save_board")
     conn = get_connection()
     with conn:
         for a in board.active + board.completed:
@@ -1151,6 +1221,7 @@ def load_board() -> Board | None:
     Returns ``None`` if no board has been saved yet (``board_initialized``
     meta key absent), preserving the old "no board.json" → None semantics.
     """
+    _thin_client_local_board_guard("load_board")
     conn = get_connection()
     row = conn.execute(
         "SELECT value FROM board_meta WHERE key = 'board_initialized'"
@@ -1194,6 +1265,7 @@ def build_board() -> Board:
     returns a Board (never None).  Also infers ``review_state`` for completed
     work assignments by joining against review-type assignments.
     """
+    _thin_client_local_board_guard("build_board")
     conn = get_connection()
     board = _query_board(conn)
     _infer_review_state(board, conn)
