@@ -203,7 +203,8 @@ def test_serve_post_result_records_terminal_state(
         "coord.github_ops.post_issue_comment",
         lambda repo, num, body: posted.append((repo, num, body)),
     )
-    _seed_running_assignment(rw_db)
+    # #646 invariant: a verdict may only be recorded on a review row.
+    _seed_running_assignment(rw_db, atype="review")
     app = build_app(SqliteStore(file_db), load_config(valid_config_path))
     with TestClient(app) as cli:
         resp = cli.post(

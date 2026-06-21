@@ -341,6 +341,29 @@ def _post_completion_local(record: CompletionRecord) -> StoreOutcome:
     return _post_done_path(record)
 
 
+def _assignment_type_local(assignment_id: str) -> str | None:
+    """The board ``type`` ("work"/"review"/"smoke"/…) for *assignment_id* from
+    the local DB, or ``None`` when the row is absent or the lookup fails.
+
+    Used by the verdict-target invariant in :func:`_post_result_local`. A lookup
+    failure returns ``None`` (don't gate) so a transient DB hiccup never blocks a
+    legitimate write.
+    """
+    from coord.state import get_connection  # noqa: PLC0415
+
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT type FROM assignments WHERE assignment_id = ?",
+            (assignment_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — a lookup failure must not block the write
+        return None
+    if row is None:
+        return None
+    return row["type"] if hasattr(row, "keys") else row[0]
+
+
 def _post_result_local(record: ResultRecord) -> StoreOutcome:
     """Structured report from the interactive agent (local-DB write).
 
@@ -360,6 +383,28 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
       loop).
     """
     _validate_result(record)
+
+    # Invariant: a review verdict belongs ONLY on a type="review" assignment.
+    # A `report-result --verdict` misrouted onto a work/plan/smoke id would mark
+    # that row done AND stamp a bogus review_verdict — exactly what silently
+    # finalized a still-live interactive WORK session (#646: a claude-pty work
+    # row ended up status=done + review_verdict=approve with no review row in
+    # sight, which hid the TUI reattach option). Refuse the misrouted write at
+    # this single seam so the bad state is unrepresentable and the caller learns
+    # it targeted the wrong id. Only gate when the type is KNOWN and not
+    # "review" — an unknown id (row not yet visible) falls through to the
+    # existing no-op UPDATE rather than erroring on a benign race.
+    if record.verdict is not None:
+        atype = _assignment_type_local(record.assignment_id)
+        if atype is not None and atype != "review":
+            raise ValueError(
+                f"refusing to record a review verdict on assignment "
+                f"{record.assignment_id!r}: it is type={atype!r}, not 'review'. "
+                "A verdict belongs on a review assignment — re-run "
+                "`coord report-result` with the review id. A verdict on a "
+                "non-review row marks it done and stamps a bogus review_verdict "
+                "(the #646 premature-finalize of a live interactive session)."
+            )
 
     if record.status == STATUS_BLOCKED:
         # Render as failure on the issue and in the DB.  This keeps the
