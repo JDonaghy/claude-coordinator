@@ -10182,7 +10182,9 @@ def resume_stuck(assignment_id: str, config_path: Path, guidance: str) -> None:
 def install_skills(do_list: bool, dry_run: bool) -> None:  # noqa: FBT001
     """Install bundled coordinator skills to ~/.claude/skills/ (#319)."""
     import importlib.resources as _ilr  # noqa: PLC0415
-    import shutil as _shutil  # noqa: PLC0415
+
+    if do_list and dry_run:
+        click.echo("warning: --dry-run has no effect when --list is used", err=True)
 
     target_root = Path.home() / ".claude" / "skills"
 
@@ -10221,7 +10223,8 @@ def install_skills(do_list: bool, dry_run: bool) -> None:  # noqa: FBT001
         return
 
     # Install / update each skill.
-    target_root.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        target_root.mkdir(parents=True, exist_ok=True)
     for skill_name, skill_dir_ref in sorted(skill_dirs):
         skill_dest = target_root / skill_name
         skill_file_dest = skill_dest / "SKILL.md"
@@ -10237,9 +10240,10 @@ def install_skills(do_list: bool, dry_run: bool) -> None:  # noqa: FBT001
         click.echo(f"  {action}: {skill_file_dest}")
 
     if not dry_run:
-        click.echo(
-            "\nDone. Type /update-issue inside a 'Chat about issue' session to use the skill."
-        )
+        installed_names = sorted(name for name, _ in skill_dirs)
+        cmd_list = "  ".join(f"/{n}" for n in installed_names)
+        click.echo(f"\nDone. Available skills: {cmd_list}")
+        click.echo("Type a skill name inside a Claude Code session to use it.")
 
 
 if __name__ == "__main__":

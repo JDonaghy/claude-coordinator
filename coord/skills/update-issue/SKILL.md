@@ -20,14 +20,10 @@ If neither is visible, ask the operator: `Which repo and issue number? (e.g. cla
 
 ### 2 — Read the current issue body
 
-The briefing usually includes the issue body.  If it is absent or stale, run:
-
-```bash
-coord issue show <repo> <issue>
-```
-
-(falls back to `gh issue view <issue> --repo <github-slug> --json body,title` if
-`coord issue show` is unavailable).
+The briefing always includes the issue body — read it from there.  If the body
+is genuinely absent (e.g. the skill is used outside a normal briefing context),
+ask the operator to paste the current issue body directly into the chat rather
+than running any external command.
 
 ### 3 — Synthesize what was agreed
 
