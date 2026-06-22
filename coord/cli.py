@@ -9783,6 +9783,71 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
             click.echo("  review not dispatched (no eligible machine or reviews disabled)")
 
 
+@main.command(
+    "dispatch-review",
+    help=(
+        "Dispatch an adversarial review for a completed work assignment.\n\n"
+        "Explicit dispatch — bypasses the auto-dispatch flood guard and the\n"
+        "interactive-session guard so users can always request a review\n"
+        "deliberately (e.g. via the TUI R keybind after a test pass)."
+    ),
+)
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+def dispatch_review_cmd(assignment_id: str, config_path: Path) -> None:
+    """Dispatch a headless review for ASSIGNMENT_ID (a completed work assignment)."""
+    from coord.review import dispatch_review
+    from coord.state import build_board, load_board, save_board
+
+    cfg = _load_config(config_path)
+
+    if not cfg.reviews.enabled:
+        click.echo(
+            "error: reviews are disabled — set reviews.enabled: true in coordinator.yml",
+            err=True,
+        )
+        sys.exit(1)
+
+    board = load_board() or build_board()
+    assignment = board.find_by_id(assignment_id)
+
+    if assignment is None:
+        click.echo(
+            f"error: assignment {assignment_id!r} not found in board", err=True
+        )
+        sys.exit(1)
+
+    if assignment.type != "work":
+        click.echo(
+            f"error: assignment {assignment_id} has type {assignment.type!r}, "
+            "expected 'work'",
+            err=True,
+        )
+        sys.exit(1)
+
+    if assignment.status != "done":
+        click.echo(
+            f"error: assignment {assignment_id} is {assignment.status!r}, "
+            "expected 'done'",
+            err=True,
+        )
+        sys.exit(1)
+
+    review = dispatch_review(assignment, board, cfg)
+    if review is None:
+        click.echo(
+            f"error: could not dispatch review for {assignment_id} "
+            "(no eligible machine, already reviewed, or reviews.auto_dispatch is false)",
+            err=True,
+        )
+        sys.exit(1)
+
+    save_board(board)
+    click.echo(f"Review dispatched (assignment {review.assignment_id})")
+    click.echo(f"  reviewer: {review.machine_name}")
+    click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
+
+
 @main.command(help="Dispatch a fix-up worker for a failed smoke test.")
 @click.argument("assignment_id")
 @_CONFIG_OPTION

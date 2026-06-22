@@ -12008,18 +12008,34 @@ impl CoordApp {
             return false;
         };
         use crate::commands::SpawnQueuedOutcome;
-        let outcome = self.command_runner.spawn_queued(&["notify"]);
+        // #236: Prefer the explicit `coord dispatch-review <work_id>` path so
+        // the dispatch bypasses the auto-path flood guard and the interactive-
+        // session guard (provider_name=="claude-pty" is blocked in
+        // dispatch_pending_reviews but NOT in dispatch_review directly).
+        // Fall back to `coord notify` when no work assignment is available yet.
+        let work_id = self.pipeline_selected_work_id();
+        let (outcome, label) = if let Some(ref wid) = work_id {
+            let o = self.command_runner.spawn_queued(&["dispatch-review", wid]);
+            (o, format!("review dispatched for #{}", issue.number))
+        } else {
+            let o = self.command_runner.spawn_queued(&["notify"]);
+            (o, format!("notify dispatched for #{}", issue.number))
+        };
         match outcome {
             SpawnQueuedOutcome::Started => {
-                self.pipeline_status = Some((
-                    format!("notify dispatched for #{}", issue.number),
-                    Instant::now(),
-                ));
+                self.pipeline_status = Some((label, Instant::now()));
+                // #236: surface a toast so the user sees the dispatch
+                // immediately (not just the status bar which fades).
+                self.push_toast(
+                    "📋 Review dispatched",
+                    &format!("Review queued for #{}", issue.number),
+                    ToastSeverity::Info,
+                );
             }
             SpawnQueuedOutcome::Queued => {
                 self.push_toast(
                     "⏳ Queued",
-                    "notify runs after current command",
+                    "review dispatch runs after current command",
                     ToastSeverity::Info,
                 );
             }
@@ -21157,6 +21173,9 @@ impl CoordApp {
                 if self.active_view == SidebarView::Pipeline {
                     if self.can_bounce_work_after_test_fail() {
                         self.dispatch_pipeline_work();
+                    } else if self.can_dispatch_review_after_test_done() {
+                        // #236: same explicit review-dispatch path as the R keybind.
+                        self.dispatch_pipeline_review();
                     } else {
                         let dispatched = self.dispatch_pipeline_active_go();
                         if !dispatched {
@@ -27839,6 +27858,14 @@ impl ShellApp for CoordApp {
                             // R keybind has no actionable target).
                             if self.can_bounce_work_after_test_fail() {
                                 self.dispatch_pipeline_work();
+                            } else if self.can_dispatch_review_after_test_done() {
+                                // #236: Test passed and Review is still Pending —
+                                // dispatch the review directly via
+                                // `coord dispatch-review <work_id>`.  This is
+                                // explicit and bypasses the auto-path flood guard
+                                // and the interactive-session guard so the keybind
+                                // always works, regardless of provider_name.
+                                self.dispatch_pipeline_review();
                             } else if self.dispatch_pipeline_active_go() {
                                 // In the Pipeline panel, R fires the active
                                 // stage button — Retry on a Failed stage, or
@@ -33660,6 +33687,84 @@ mod tests {
             .push(_work_assignment("w1", 100.0, "done", Some("failed")));
         // No test stage in the pipeline → predicate refuses (nothing to gate on).
         assert!(!app.can_bounce_work_after_test_fail());
+    }
+
+    // ── #236: dispatch_pipeline_review() ────────────────────────────────────
+
+    #[test]
+    fn dispatch_pipeline_review_spawns_dispatch_review_when_work_exists() {
+        // When a completed work assignment is available, dispatch_pipeline_review
+        // should spawn `coord dispatch-review <work_id>` (the explicit path that
+        // bypasses the auto-dispatch flood guard and interactive-session guard).
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data
+            .assignments
+            .push(_work_assignment("w-abc123", 100.0, "done", Some("passed")));
+        assert!(
+            !app.command_runner.is_running(),
+            "runner should start idle",
+        );
+        let dispatched = app.dispatch_pipeline_review();
+        assert!(dispatched, "dispatch_pipeline_review should return true");
+        assert!(
+            app.command_runner.is_running(),
+            "a command should have been spawned",
+        );
+        // The running command label should reference dispatch-review and the
+        // work assignment id, not just 'notify'.
+        let (label, _) = app
+            .command_runner
+            .running_info()
+            .expect("running_info should be set");
+        assert!(
+            label.contains("dispatch-review"),
+            "expected 'dispatch-review' in command label, got: {label:?}",
+        );
+        assert!(
+            label.contains("w-abc123"),
+            "expected work assignment id in command label, got: {label:?}",
+        );
+    }
+
+    #[test]
+    fn dispatch_pipeline_review_falls_back_to_notify_when_no_work() {
+        // When no work assignment exists (issue just entered the pipeline),
+        // fall back to `coord notify` which will handle review dispatch.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        // No work assignment pushed — pipeline_selected_work_id() returns None.
+        let dispatched = app.dispatch_pipeline_review();
+        assert!(dispatched, "dispatch_pipeline_review should return true");
+        assert!(app.command_runner.is_running(), "a command should have been spawned");
+        let (label, _) = app
+            .command_runner
+            .running_info()
+            .expect("running_info should be set");
+        assert!(
+            label.contains("notify"),
+            "expected 'notify' fallback in command label, got: {label:?}",
+        );
+    }
+
+    #[test]
+    fn dispatch_pipeline_review_toasts_on_start() {
+        // A toast must be pushed when the review dispatch starts (not just a
+        // pipeline_status update) so the user sees immediate feedback.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("passed")));
+        let toasts_before = app.toasts.len();
+        let _ = app.dispatch_pipeline_review();
+        assert!(
+            app.toasts.len() > toasts_before,
+            "a toast should be pushed when review dispatch starts",
+        );
     }
 
     // ── #245 / #329: force-merge confirm dialog ─────────────────────────────
