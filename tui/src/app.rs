@@ -24227,20 +24227,17 @@ impl CoordApp {
             Key::Char('K') if !modifiers.ctrl && !modifiers.alt => {
                 // Kill the tmux session (best-effort; prune hint toasted).
                 // Uppercase K avoids conflict with lowercase k (navigate up).
-                let (aid, machine) = self
+                let selected = self
                     .live_sessions_overlay
                     .as_ref()
                     .and_then(|ov| {
                         let idx = ov.selected_idx.min(n.saturating_sub(1));
                         self.live_tmux_sessions.get(idx)
                     })
-                    .map(|s| (s.assignment_id.clone(), s.machine.clone()))
-                    .unzip();
+                    .map(|s| (s.assignment_id.clone(), s.machine.clone()));
                 self.live_sessions_overlay = None;
-                if let Some(aid) = aid {
-                    let machine_ref =
-                        machine.as_ref().and_then(|m: &Option<String>| m.as_deref());
-                    self.kill_session_by_aid(&aid, machine_ref);
+                if let Some((aid, machine)) = selected {
+                    self.kill_session_by_aid(&aid, machine.as_deref());
                 }
             }
             _ => {}
@@ -24315,7 +24312,7 @@ impl CoordApp {
                 .map(|mm| mm.host.as_str())
                 .unwrap_or(m);
             std::process::Command::new("ssh")
-                .args([host, "tmux", "kill-session", "-t", &session_name])
+                .args(["-o", "ConnectTimeout=5", host, "tmux", "kill-session", "-t", &session_name])
                 .status()
                 .ok()
         } else {
