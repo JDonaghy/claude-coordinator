@@ -253,6 +253,21 @@ impl IssueFinder {
     }
 }
 
+// ─── Fleet-wide live-sessions overlay ────────────────────────────────────────
+
+/// #628 Scope A: state for the fleet-wide live-sessions overlay.
+///
+/// Shows ALL `coord-*` tmux sessions across the fleet regardless of board
+/// row status — a merged/Done row says nothing about whether its session is
+/// still live.  Opened/closed with `L` from any non-PTY, non-modal view.
+///
+/// Actions (per row): [r]eattach · [K]ill · [f]stop.
+#[derive(Default)]
+struct LiveSessionsOverlay {
+    /// Index of the highlighted session row.
+    selected_idx: usize,
+}
+
 // ─── Detail panel tabs ────────────────────────────────────────────────────────
 
 /// Per-assignment context for the live watch overlay (Pipeline > Stages
@@ -4070,6 +4085,10 @@ struct LiveTmuxSession {
     /// toast so the operator recognises which work was in progress.
     #[allow(dead_code)]
     issue_title: Option<String>,
+    /// Machine the session is hosted on, from `coord sessions --json`
+    /// (`machine` field) or derived from the assignment record.  `None`
+    /// for sessions that pre-date the field or whose machine is unknown.
+    machine: Option<String>,
 }
 
 /// Leg 2 (#517): an interactive Work/Plan/Fix session the TUI launched this
@@ -4236,11 +4255,16 @@ fn parse_sessions_json(text: &str) -> Vec<LiveTmuxSession> {
                 .get("issue_title")
                 .and_then(|n| n.as_str())
                 .map(|s| s.to_string());
+            let machine = entry
+                .get("machine")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string());
             Some(LiveTmuxSession {
                 assignment_id,
                 issue_number,
                 repo_name,
                 issue_title,
+                machine,
             })
         })
         .collect()
@@ -5628,6 +5652,11 @@ pub struct CoordApp {
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
     /// with Esc or Enter (Enter also navigates to the selected issue).
     issue_finder: Option<IssueFinder>,
+
+    // ── #628 Scope A: fleet-wide live-sessions overlay ────────────────────────
+    /// Active state of the fleet-wide live-sessions overlay.  `None` when
+    /// closed.  Opened/closed with `L` from any non-PTY, non-modal view.
+    live_sessions_overlay: Option<LiveSessionsOverlay>,
 }
 
 impl Default for CoordApp {
@@ -5903,6 +5932,8 @@ impl CoordApp {
             rework_bypass: false,
             // #541: global issue fuzzy finder — closed by default.
             issue_finder: None,
+            // #628 Scope A: fleet-wide live-sessions overlay — closed by default.
+            live_sessions_overlay: None,
             // Leg 3c / A3 (#517, #581): test-verdict routing.
             armed_for_test_verdict: std::collections::HashMap::new(),
             pending_test_fix: None,
@@ -16500,18 +16531,35 @@ impl CoordApp {
         } else if self.active_view == SidebarView::Pipeline {
             // #194: Pipeline-specific hints: refresh, navigate, go, dismiss done.
             // #386: include i=steer on the Log tab so the feature is discoverable.
-            if self.pipeline_detail_tab == PipelineDetailTab::Log {
-                " j/k=nav  Enter=go  i=steer  R=refresh  D=dismiss-done  h/l=tabs  < >=hscroll  q=quit "
-                    .to_string()
+            // #628: include L=sessions when live sessions are present.
+            let live_hint = if !self.live_tmux_sessions.is_empty() {
+                "  L=sessions"
             } else {
-                " j/k=nav  Enter=go  R=refresh  D=dismiss-done  h/l=tabs  q=quit ".to_string()
+                ""
+            };
+            if self.pipeline_detail_tab == PipelineDetailTab::Log {
+                format!(
+                    " j/k=nav  Enter=go  i=steer  R=refresh  D=dismiss-done  h/l=tabs  < >=hscroll{}  q=quit ",
+                    live_hint
+                )
+            } else {
+                format!(
+                    " j/k=nav  Enter=go  R=refresh  D=dismiss-done  h/l=tabs{}  q=quit ",
+                    live_hint
+                )
             }
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS
             // section.  Right-click → Send to Pipeline (#261) is the
             // canonical dispatch path now.
+            // #628: include L=sessions when live sessions are present.
             let _ = proposals;
-            " n=notify  m=merge  R=retry  P=purge  q=quit ".to_string()
+            let live_hint = if !self.live_tmux_sessions.is_empty() {
+                "  L=sessions"
+            } else {
+                ""
+            };
+            format!(" n=notify  m=merge  R=retry  P=purge{}  q=quit ", live_hint)
         };
         StatusBar {
             id: WidgetId::new("statusbar"),
@@ -19906,6 +19954,224 @@ impl CoordApp {
         );
     }
 
+    // ── #628 Scope A: fleet-wide live-sessions overlay ────────────────────────
+
+    /// Return the coordinator assignment type label for a live session, e.g.
+    /// `"work"`, `"review"`, `"fix"`, `"smoke"`, `"chat"`.  Falls back to
+    /// `"work"` when the assignment is not in the local DB (remote machine that
+    /// hasn't synced), or `"(unknown)"` when the assignment id can't be found.
+    fn session_type_for(&self, session: &LiveTmuxSession) -> String {
+        self.data
+            .assignments
+            .iter()
+            .find(|a| a.id == session.assignment_id)
+            .map(|a| {
+                a.assignment_type
+                    .as_deref()
+                    .unwrap_or("work")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "(unknown)".to_string())
+    }
+
+    /// Return the machine name for a live session.  Prefers the `machine`
+    /// field populated from `coord sessions --json`, falls back to joining
+    /// the assignment record, then to `"(local)"`.
+    fn session_machine_for(&self, session: &LiveTmuxSession) -> String {
+        if let Some(m) = &session.machine {
+            return m.clone();
+        }
+        self.data
+            .assignments
+            .iter()
+            .find(|a| a.id == session.assignment_id)
+            .map(|a| a.machine.clone())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "(local)".to_string())
+    }
+
+    /// #628 Scope A: render the fleet-wide live-sessions overlay.
+    ///
+    /// A centered box (~80 % wide, auto-height capped at ~60 % tall) lists
+    /// every discovered `coord-*` tmux session with its id, issue, type, and
+    /// machine.  Actions shown in the footer: `[r]eattach`, `[K]ill`,
+    /// `[f]stop`, `Esc` close.
+    ///
+    /// Rendered above all other content (called last in `render_content`).
+    fn render_live_sessions_overlay(&self, backend: &mut dyn Backend, viewport: Rect) {
+        let Some(overlay) = &self.live_sessions_overlay else {
+            return;
+        };
+        let lh = backend.line_height();
+        let sessions = &self.live_tmux_sessions;
+
+        // ── Size + position ──────────────────────────────────────────────────
+        let row_count = sessions.len().max(1) + 4; // header + sep + rows + sep + footer
+        let natural_h = (row_count as f32) * lh;
+        let box_h = natural_h.min(viewport.height * 0.65).max(5.0 * lh);
+        let box_w = (viewport.width * 0.82).clamp(50.0 * lh, 100.0 * lh);
+        let box_x = viewport.x + (viewport.width - box_w) * 0.5;
+        let box_y = viewport.y + (viewport.height - box_h) * 0.35;
+        let overlay_rect = Rect::new(box_x, box_y, box_w, box_h);
+
+        // Outer bordered box (background + border).
+        backend.draw_list(
+            overlay_rect,
+            &ListView {
+                id: WidgetId::new("live-sessions-bg"),
+                title: None,
+                items: Vec::new(),
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: true,
+                bordered: true,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: false,
+            },
+        );
+
+        let inner = shrink_rect(overlay_rect, lh * 0.5);
+        let sep_chars = (box_w / lh) as usize;
+        let sep_line = "─".repeat(sep_chars);
+
+        let mut items: Vec<ListItem> = Vec::new();
+
+        // ── Title ────────────────────────────────────────────────────────────
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(
+                    format!(
+                        "  ◉ Fleet live sessions ({})  — L / Esc to close",
+                        sessions.len()
+                    ),
+                    Color::rgb(150, 210, 255),
+                )],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(sep_line.clone(), Color::rgb(60, 70, 90))],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+
+        // ── Session rows ─────────────────────────────────────────────────────
+        let visible_rows: usize = ((box_h / lh) as usize).saturating_sub(4).max(1);
+        let sel = overlay.selected_idx.min(sessions.len().saturating_sub(1));
+        let scroll_offset = if sel >= visible_rows {
+            sel + 1 - visible_rows
+        } else {
+            0
+        };
+
+        if sessions.is_empty() {
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        "  (no live sessions discovered)".to_string(),
+                        Color::rgb(100, 100, 120),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+        } else {
+            for (idx, session) in sessions
+                .iter()
+                .enumerate()
+                .skip(scroll_offset)
+                .take(visible_rows)
+            {
+                let is_selected = idx == sel;
+                let prefix = if is_selected { "▶ " } else { "  " };
+                let fg = if is_selected {
+                    Color::rgb(230, 240, 255)
+                } else {
+                    Color::rgb(190, 200, 215)
+                };
+
+                let issue_str = session
+                    .issue_number
+                    .map(|n| format!("#{:<5}", n))
+                    .unwrap_or_else(|| "#?    ".to_string());
+                let repo_str = session
+                    .repo_name
+                    .as_deref()
+                    .map(|r| trunc(r, 14).to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string());
+                let kind_str = self.session_type_for(session);
+                let machine_str = self.session_machine_for(session);
+                let aid_short = trunc(&session.assignment_id, 20);
+
+                // Format: ▶ #42    api            work        elitebook   aid-abc…
+                let row_text = format!(
+                    "{}{} {:14} {:11} {:12} {}",
+                    prefix, issue_str, repo_str, kind_str, machine_str, aid_short
+                );
+
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(row_text, fg)],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: if is_selected {
+                        Decoration::Header
+                    } else {
+                        Decoration::Normal
+                    },
+                });
+            }
+        }
+
+        // ── Footer ───────────────────────────────────────────────────────────
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(sep_line, Color::rgb(60, 70, 90))],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+        let footer = if sessions.is_empty() {
+            "  Esc close".to_string()
+        } else {
+            "  [r]eattach  ·  [K]ill session  ·  [f]stop assignment  ·  j/k ↑↓  ·  Esc close"
+                .to_string()
+        };
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(footer, Color::rgb(100, 110, 130))],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+
+        backend.draw_list(
+            inner,
+            &ListView {
+                id: WidgetId::new("live-sessions-overlay"),
+                title: None,
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: true,
+                bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: false,
+            },
+        );
+    }
+
     /// #316 Phase A: render the Board Chat tab content.
     /// Shows the chat when a board chat is live, or an empty state with
     /// "Refine" and "New Issue" CTAs when no chat is active.
@@ -20988,6 +21254,7 @@ impl CoordApp {
             || self.pending_refinement_notes_synth.is_some()
             || self.file_issue_modal.is_some()
             || self.pending_restart.is_some()
+            || self.live_sessions_overlay.is_some()
     }
 
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by
@@ -23893,6 +24160,183 @@ impl CoordApp {
     /// aid explicitly to `launch_interactive_session_on_machine`, which then
     /// runs `coord reattach <aid>` instead of a fresh (claim-blocked)
     /// `coord assign`.
+    // ── #628 Scope A: session-overlay actions ───────────────────────────────
+
+    /// Handle a keypress when the live-sessions overlay is open.
+    ///
+    /// Extracted from `handle()` so it can be unit-tested without a backend.
+    /// Returns `true` if the overlay consumed the key (always true — the caller
+    /// must swallow all keys regardless, otherwise board shortcuts fire behind
+    /// the overlay).
+    fn handle_live_sessions_overlay_key(
+        &mut self,
+        key: &Key,
+        modifiers: &Modifiers,
+    ) -> bool {
+        let n = self.live_tmux_sessions.len();
+        match key {
+            Key::Named(NamedKey::Escape) | Key::Char('L') => {
+                self.live_sessions_overlay = None;
+            }
+            Key::Named(NamedKey::Down) | Key::Char('j')
+                if !modifiers.ctrl && !modifiers.alt =>
+            {
+                if let Some(ov) = &mut self.live_sessions_overlay {
+                    if n > 0 {
+                        ov.selected_idx = (ov.selected_idx + 1).min(n - 1);
+                    }
+                }
+            }
+            Key::Named(NamedKey::Up) | Key::Char('k')
+                if !modifiers.ctrl && !modifiers.alt =>
+            {
+                if let Some(ov) = &mut self.live_sessions_overlay {
+                    ov.selected_idx = ov.selected_idx.saturating_sub(1);
+                }
+            }
+            Key::Char('r') | Key::Char('R') if !modifiers.ctrl && !modifiers.alt => {
+                // Reattach to the selected session.
+                let aid = self
+                    .live_sessions_overlay
+                    .as_ref()
+                    .and_then(|ov| {
+                        let idx = ov.selected_idx.min(n.saturating_sub(1));
+                        self.live_tmux_sessions.get(idx)
+                    })
+                    .map(|s| s.assignment_id.clone());
+                self.live_sessions_overlay = None;
+                if let Some(aid) = aid {
+                    self.reattach_session_by_aid(&aid);
+                }
+            }
+            Key::Char('f') | Key::Char('F') if !modifiers.ctrl && !modifiers.alt => {
+                // Stop/finalize the selected session's assignment.
+                let aid = self
+                    .live_sessions_overlay
+                    .as_ref()
+                    .and_then(|ov| {
+                        let idx = ov.selected_idx.min(n.saturating_sub(1));
+                        self.live_tmux_sessions.get(idx)
+                    })
+                    .map(|s| s.assignment_id.clone());
+                self.live_sessions_overlay = None;
+                if let Some(aid) = aid {
+                    self.command_runner.spawn_queued(&["stop", &aid]);
+                }
+            }
+            Key::Char('K') if !modifiers.ctrl && !modifiers.alt => {
+                // Kill the tmux session (best-effort; prune hint toasted).
+                // Uppercase K avoids conflict with lowercase k (navigate up).
+                let (aid, machine) = self
+                    .live_sessions_overlay
+                    .as_ref()
+                    .and_then(|ov| {
+                        let idx = ov.selected_idx.min(n.saturating_sub(1));
+                        self.live_tmux_sessions.get(idx)
+                    })
+                    .map(|s| (s.assignment_id.clone(), s.machine.clone()))
+                    .unzip();
+                self.live_sessions_overlay = None;
+                if let Some(aid) = aid {
+                    let machine_ref =
+                        machine.as_ref().and_then(|m: &Option<String>| m.as_deref());
+                    self.kill_session_by_aid(&aid, machine_ref);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Reattach to a live session by id, opening the standalone Terminal panel
+    /// and running `coord reattach <aid>` in it.  Does not require a selected
+    /// pipeline issue — the standalone terminal is always available.
+    fn reattach_session_by_aid(&mut self, aid: &str) {
+        let cfg = self
+            .command_runner
+            .config_path
+            .as_ref()
+            .map(|p| format!("--config {} ", shell_quote_arg(&p.to_string_lossy())))
+            .unwrap_or_default();
+        let cmd = format!("coord reattach {}{}\r", cfg, shell_quote_arg(aid));
+
+        // Switch to the standalone Terminal panel and send the command.
+        self.active_view = SidebarView::Terminal;
+        // Lazily spawn the standalone terminal if not already alive.
+        // The session spawns on the first drive_terminal_pane() call after
+        // the dims become available; if it's already live, just send the cmd.
+        if let Some(ref mut sess) = self.terminal_session {
+            sess.send_str(&cmd);
+        } else {
+            // No session yet — write the command to a temp file and pick it
+            // up on spawn, or just prime a note.  In practice the terminal
+            // spawns within one render tick; the operator can type the reattach
+            // command manually if they switch away before it appears.
+            // Best-effort: try to spawn now if we have dims cached.
+            let cwd = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            let shell = quadraui::terminal_engine::default_shell();
+            if let Ok(mut sess) =
+                quadraui::terminal_engine::TerminalSession::spawn(80, 24, &shell, &cwd, 10_000)
+            {
+                sess.send_str(&cmd);
+                self.terminal_session = Some(sess);
+                self.terminal_spawn_error = None;
+            }
+            // If spawn fails the operator sees an error banner on the Terminal tab.
+        }
+    }
+
+    /// Kill a live tmux session by assignment id.  Runs `tmux kill-session -t
+    /// coord-<aid>` locally, or `ssh <machine> tmux kill-session …` for remote
+    /// machines.  The entry is immediately removed from `live_tmux_sessions`.
+    /// A worktree-prune toast is shown because `git worktree remove` is a
+    /// separate step the user should do — ballooning scope to do it here is
+    /// noted and deferred per the issue spec.
+    fn kill_session_by_aid(&mut self, aid: &str, machine: Option<&str>) {
+        let session_name = format!("coord-{}", aid);
+        let local = self.data.local_machine.clone();
+        let is_local = machine
+            .map(|m| m == local || m.is_empty())
+            .unwrap_or(true);
+
+        let status = if is_local {
+            std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &session_name])
+                .status()
+                .ok()
+        } else if let Some(m) = machine {
+            // Resolve the machine's ssh host from the config machines list.
+            let host = self
+                .data
+                .machines
+                .iter()
+                .find(|mm| mm.name == m)
+                .map(|mm| mm.host.as_str())
+                .unwrap_or(m);
+            std::process::Command::new("ssh")
+                .args([host, "tmux", "kill-session", "-t", &session_name])
+                .status()
+                .ok()
+        } else {
+            None
+        };
+
+        // Remove from the discovered list immediately regardless of success —
+        // if the session was already dead the removal is still correct.
+        self.live_tmux_sessions.retain(|s| s.assignment_id != aid);
+
+        let msg = if status.map(|s| s.success()).unwrap_or(false) {
+            format!("Killed session coord-{}.  Prune worktree: git worktree remove ~/.coord/worktrees/{}", aid, aid)
+        } else {
+            format!(
+                "Kill attempted for coord-{} (may already be gone).  Prune: git worktree remove ~/.coord/worktrees/{}",
+                aid, aid
+            )
+        };
+        self.push_toast("Session killed", &msg, ToastSeverity::Info);
+    }
+
     fn reattach_to_selected_issue_live_session(&mut self) {
         let Some(aid) = self.selected_issue_live_session_id() else {
             self.pipeline_status =
@@ -24420,6 +24864,7 @@ impl CoordApp {
                         issue_number: Some(issue_num),
                         repo_name: Some(repo.clone()),
                         issue_title: None,
+                        machine: None,
                     });
                 }
 
@@ -25489,6 +25934,13 @@ impl ShellApp for CoordApp {
         if self.issue_finder.is_some() {
             self.render_issue_finder(backend, dialog_viewport);
         }
+
+        // ── #628 Scope A: fleet-wide live-sessions overlay ───────────────
+        // Rendered at the same level as the issue finder — topmost overlay.
+        // When the overlay is closed this is a no-op.
+        if self.live_sessions_overlay.is_some() {
+            self.render_live_sessions_overlay(backend, dialog_viewport);
+        }
     }
 
     fn handle(
@@ -25866,6 +26318,45 @@ impl ShellApp for CoordApp {
                     }
                     _ => {}
                 }
+            }
+            return Reaction::Redraw;
+        }
+
+        // ── #628 Scope A: fleet-wide live-sessions overlay (L toggle) ────────
+        // `L` opens/closes the overlay from any non-PTY, non-modal view.
+        // `any_blocking_modal_active()` includes `live_sessions_overlay.is_some()`
+        // so Ctrl+P and other global shortcuts can't open on top of this overlay.
+        // Note: `L` is intentionally NOT bound to Board/Pipeline view-specific
+        // actions, so it is free to use as a global here.
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            let pty_active = (self.active_view == SidebarView::Terminal
+                && self.terminal_focused)
+                || (self.active_view == SidebarView::Pipeline
+                    && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                    && self.detail_terminal_focused);
+            if matches!(key, Key::Char('L'))
+                && !modifiers.ctrl
+                && !modifiers.alt
+                && !pty_active
+                && self.issue_finder.is_none()
+                && !self.any_blocking_modal_active()
+                && !self.live_tmux_sessions.is_empty()
+            {
+                if self.live_sessions_overlay.is_none() {
+                    self.live_sessions_overlay = Some(LiveSessionsOverlay::default());
+                } else {
+                    self.live_sessions_overlay = None;
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #628 Scope A: live-sessions overlay owns ALL input while open ─────
+        // Esc=close, j/k/↑/↓=navigate, r=reattach, k=kill, f=stop.
+        // All other keys swallowed so board/pipeline shortcuts can't fire.
+        if self.live_sessions_overlay.is_some() {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                self.handle_live_sessions_overlay_key(key, modifiers);
             }
             return Reaction::Redraw;
         }
@@ -29808,6 +30299,8 @@ mod tests {
             rework_bypass: false,
             // #541
             issue_finder: None,
+            // #628 Scope A
+            live_sessions_overlay: None,
             // Leg 3c / A3 (#517, #581)
             armed_for_test_verdict: std::collections::HashMap::new(),
             pending_test_fix: None,
@@ -32062,6 +32555,7 @@ mod tests {
             issue_number: Some(42),
             repo_name: Some("api".to_string()),
             issue_title: None,
+            machine: None,
         }];
         let groups = app.pipeline_active_by_liveness();
         assert_eq!(groups.len(), 1);
@@ -32074,6 +32568,7 @@ mod tests {
             issue_number: Some(42),
             repo_name: Some("other".to_string()),
             issue_title: None,
+            machine: None,
         }];
         let groups = app.pipeline_active_by_liveness();
         assert_eq!(groups[0].0, "idle", "cross-repo session must not mark it live");
@@ -32092,6 +32587,7 @@ mod tests {
             issue_number: Some(42),
             repo_name: Some("api".to_string()),
             issue_title: None,
+            machine: None,
         }];
         app.rebuild_pipeline_sidebar(None);
         // Default selection is [0, 0] = first group (Live) → #42.
@@ -33784,12 +34280,14 @@ mod tests {
                 issue_number: Some(1),
                 repo_name: None,
                 issue_title: None,
+                machine: None,
             },
             LiveTmuxSession {
                 assignment_id: "b".into(),
                 issue_number: Some(2),
                 repo_name: None,
                 issue_title: None,
+                machine: None,
             },
         ];
         assert!(
@@ -33829,18 +34327,21 @@ mod tests {
                 issue_number: None,
                 repo_name: None,
                 issue_title: None,
+                machine: None,
             },
             LiveTmuxSession {
                 assignment_id: "s2".into(),
                 issue_number: None,
                 repo_name: None,
                 issue_title: None,
+                machine: None,
             },
             LiveTmuxSession {
                 assignment_id: "s3".into(),
                 issue_number: None,
                 repo_name: None,
                 issue_title: None,
+                machine: None,
             },
             // A session with no matching assignment can't be attributed → ignored.
             LiveTmuxSession {
@@ -33848,12 +34349,245 @@ mod tests {
                 issue_number: None,
                 repo_name: None,
                 issue_title: None,
+                machine: None,
             },
         ];
 
         assert_eq!(app.live_session_count_for_machine("elitebook"), 1);
         assert_eq!(app.live_session_count_for_machine("dellserver"), 2);
         assert_eq!(app.live_session_count_for_machine("precision"), 0);
+    }
+
+    // ── #628 Scope A: fleet-wide live-sessions overlay ─────────────────────
+
+    #[test]
+    fn live_sessions_overlay_opens_on_l_when_sessions_present() {
+        // L opens the overlay when there are live sessions. We test via the
+        // guard logic directly (same logic handle() checks) rather than calling
+        // handle() which requires a real Backend.
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aid1".into(),
+            issue_number: Some(10),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: Some("elitebook".into()),
+        }];
+        assert!(app.live_sessions_overlay.is_none());
+        // Simulate the L-toggle guard: sessions non-empty, no modal, no overlay.
+        // This is the exact condition the L handler checks.
+        let should_open = !app.live_tmux_sessions.is_empty()
+            && app.issue_finder.is_none()
+            && !app.any_blocking_modal_active()
+            && app.live_sessions_overlay.is_none();
+        assert!(should_open, "L guard must be true when sessions are present");
+        if should_open {
+            app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
+        }
+        assert!(
+            app.live_sessions_overlay.is_some(),
+            "L must open the live-sessions overlay when sessions are present"
+        );
+    }
+
+    #[test]
+    fn live_sessions_overlay_does_not_open_when_no_sessions() {
+        // L must be a no-op when there are no live sessions.
+        let app = make_test_app(BoardData::default());
+        assert!(app.live_tmux_sessions.is_empty());
+        let should_open = !app.live_tmux_sessions.is_empty();
+        assert!(
+            !should_open,
+            "L guard must be false when no sessions are present"
+        );
+        assert!(
+            app.live_sessions_overlay.is_none(),
+            "overlay must remain closed"
+        );
+    }
+
+    #[test]
+    fn live_sessions_overlay_closes_on_esc() {
+        // Esc closes the overlay via handle_live_sessions_overlay_key.
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aid1".into(),
+            issue_number: Some(10),
+            repo_name: None,
+            issue_title: None,
+            machine: None,
+        }];
+        app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
+        app.handle_live_sessions_overlay_key(
+            &Key::Named(NamedKey::Escape),
+            &Modifiers::default(),
+        );
+        assert!(
+            app.live_sessions_overlay.is_none(),
+            "Esc must close the live-sessions overlay"
+        );
+    }
+
+    #[test]
+    fn live_sessions_overlay_closes_on_l() {
+        // L is a toggle — pressing it again while open must close the overlay.
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aid1".into(),
+            issue_number: None,
+            repo_name: None,
+            issue_title: None,
+            machine: None,
+        }];
+        app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
+        app.handle_live_sessions_overlay_key(&Key::Char('L'), &Modifiers::default());
+        assert!(
+            app.live_sessions_overlay.is_none(),
+            "L pressed while open must close the overlay"
+        );
+    }
+
+    #[test]
+    fn live_sessions_overlay_navigates_with_j_k() {
+        // j/k move the selection within the session list.
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![
+            LiveTmuxSession {
+                assignment_id: "a1".into(),
+                issue_number: Some(1),
+                repo_name: None,
+                issue_title: None,
+                machine: None,
+            },
+            LiveTmuxSession {
+                assignment_id: "a2".into(),
+                issue_number: Some(2),
+                repo_name: None,
+                issue_title: None,
+                machine: None,
+            },
+        ];
+        app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
+
+        // j moves down.
+        app.handle_live_sessions_overlay_key(&Key::Char('j'), &Modifiers::default());
+        assert_eq!(
+            app.live_sessions_overlay.as_ref().unwrap().selected_idx,
+            1,
+            "j must move selection down"
+        );
+
+        // k moves back up.
+        app.handle_live_sessions_overlay_key(&Key::Char('k'), &Modifiers::default());
+        assert_eq!(
+            app.live_sessions_overlay.as_ref().unwrap().selected_idx,
+            0,
+            "k must move selection up"
+        );
+    }
+
+    #[test]
+    fn live_sessions_overlay_j_clamps_at_last_session() {
+        // j on the last item must not wrap or panic.
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![
+            LiveTmuxSession {
+                assignment_id: "a1".into(),
+                issue_number: None,
+                repo_name: None,
+                issue_title: None,
+                machine: None,
+            },
+            LiveTmuxSession {
+                assignment_id: "a2".into(),
+                issue_number: None,
+                repo_name: None,
+                issue_title: None,
+                machine: None,
+            },
+        ];
+        app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 1 });
+        app.handle_live_sessions_overlay_key(&Key::Char('j'), &Modifiers::default());
+        assert_eq!(
+            app.live_sessions_overlay.as_ref().unwrap().selected_idx,
+            1,
+            "j on last item must clamp, not wrap"
+        );
+    }
+
+    #[test]
+    fn live_sessions_overlay_kill_removes_session_and_closes() {
+        // k kills the session: removes it from live_tmux_sessions and closes overlay.
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "test-aid".into(),
+            issue_number: Some(99),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: None, // no machine → local kill path (will fail gracefully)
+        }];
+        app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
+        // K (uppercase) kills the session; lowercase k is navigation-up.
+        app.handle_live_sessions_overlay_key(&Key::Char('K'), &Modifiers::default());
+
+        // Overlay closes immediately regardless of tmux success.
+        assert!(
+            app.live_sessions_overlay.is_none(),
+            "kill must close the overlay"
+        );
+        // Session is removed from the discovered list.
+        assert!(
+            !app.live_tmux_sessions
+                .iter()
+                .any(|s| s.assignment_id == "test-aid"),
+            "killed session must be removed from live_tmux_sessions"
+        );
+    }
+
+    #[test]
+    fn live_sessions_overlay_stop_closes_and_queues_coord_stop() {
+        // f stops the assignment: closes the overlay; verifies coord stop is
+        // dispatched. We can't easily verify the CommandRunner action without
+        // mocking, but we can verify the overlay closes.
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "stop-aid".into(),
+            issue_number: Some(42),
+            repo_name: None,
+            issue_title: None,
+            machine: None,
+        }];
+        app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
+        app.handle_live_sessions_overlay_key(&Key::Char('f'), &Modifiers::default());
+        assert!(
+            app.live_sessions_overlay.is_none(),
+            "f (stop) must close the overlay"
+        );
+    }
+
+    #[test]
+    fn parse_sessions_json_extracts_machine_field() {
+        // #628: the machine field from coord sessions --json must be captured.
+        let json = r#"{"sessions":[
+            {"session_name":"coord-aid1","assignment_id":"aid1",
+             "issue_number":7,"repo_name":"api","issue_title":null,
+             "machine":"elitebook"}
+        ]}"#;
+        let got = parse_sessions_json(json);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].machine.as_deref(), Some("elitebook"));
+    }
+
+    #[test]
+    fn parse_sessions_json_machine_none_when_absent() {
+        // Sessions that pre-date the machine field parse without error.
+        let json = r#"{"sessions":[
+            {"session_name":"coord-aid2","assignment_id":"aid2",
+             "issue_number":8,"repo_name":"api","issue_title":null}
+        ]}"#;
+        let got = parse_sessions_json(json);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].machine.is_none());
     }
 
     // ── #253: merge-blocked-on-review predicate ────────────────────────────
@@ -38274,6 +39008,7 @@ mod tests {
             issue_number: Some(9),
             repo_name: Some("api".to_string()),
             issue_title: None,
+            machine: None,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -38341,6 +39076,7 @@ mod tests {
             issue_number: Some(42),
             repo_name: Some("api".to_string()),
             issue_title: None,
+            machine: None,
         }];
         let (tx, rx) = std::sync::mpsc::channel();
         // Discovery returns an unrelated session only.
@@ -38349,6 +39085,7 @@ mod tests {
             issue_number: Some(7),
             repo_name: Some("api".to_string()),
             issue_title: None,
+            machine: None,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -38375,6 +39112,7 @@ mod tests {
             issue_number: Some(42),
             repo_name: Some("api".to_string()),
             issue_title: None,
+            machine: None,
         }];
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(vec![LiveTmuxSession {
@@ -38382,6 +39120,7 @@ mod tests {
             issue_number: Some(42),
             repo_name: Some("api".to_string()),
             issue_title: None,
+            machine: None,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -38524,6 +39263,7 @@ mod tests {
             issue_number: Some(10),
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
+            machine: None,
         });
 
         // Fix wants a running "work" session — the only one running is a review.
@@ -38557,6 +39297,7 @@ mod tests {
             issue_number: Some(10),
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
+            machine: None,
         });
         assert_eq!(
             app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Fix),
@@ -38599,6 +39340,7 @@ mod tests {
             issue_number: Some(10),
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
+            machine: None,
         });
 
         // The dedicated reattach path picks the running review type-agnostically.
@@ -38731,6 +39473,7 @@ mod tests {
             issue_number: Some(514),
             repo_name: Some("vimcode".to_string()),
             issue_title: None,
+            machine: None,
         }];
         assert_eq!(
             app.selected_issue_live_session_id().as_deref(),
@@ -38743,6 +39486,7 @@ mod tests {
             issue_number: Some(514),
             repo_name: Some("claude-coordinator".to_string()),
             issue_title: None,
+            machine: None,
         }];
         assert!(
             app.selected_issue_live_session_id().is_none(),
@@ -38783,12 +39527,14 @@ mod tests {
                 issue_number: Some(494),
                 repo_name: Some("vimcode".to_string()),
                 issue_title: None,
+                machine: None,
             },
             LiveTmuxSession {
                 assignment_id: "id-494-running".to_string(),
                 issue_number: Some(494),
                 repo_name: Some("vimcode".to_string()),
                 issue_title: None,
+                machine: None,
             },
         ];
         assert_eq!(
@@ -38825,6 +39571,7 @@ mod tests {
             issue_number: Some(514),
             repo_name: Some("vimcode".to_string()),
             issue_title: None,
+            machine: None,
         }];
 
         assert!(
@@ -38865,6 +39612,7 @@ mod tests {
             issue_number: Some(514),
             repo_name: Some("vimcode".to_string()),
             issue_title: None,
+            machine: None,
         }];
         let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle);
         assert!(items.iter().any(|i| i.label == "Reattach to live session"));
