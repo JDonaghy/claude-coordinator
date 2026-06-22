@@ -14,13 +14,17 @@ These tests pin the floor that catches that:
    coordinator-side gate, which must record ``blocked`` (→ ``failed``) for a
    botched rebase, OVERRIDING any ``done`` the agent self-reported, and leave a
    clean rebase as ``done``.
+3. ``coord verify-merge`` CLI — thin-client routing (#681): when a board
+   service is configured the board is fetched from the daemon; when the
+   assignment is still not found, ``--repo`` / ``--issue-number`` supply the
+   values directly.
 """
 
 from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -386,3 +390,147 @@ class TestFinalizeMergeGate:
         assert result.already_recorded is True
         assert result.merge_verify is None
         assert _read_status("rev-x") == "done"
+
+
+# ── coord verify-merge CLI — thin-client routing (#681) ──────────────────────
+
+
+CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+reviews:
+  enabled: false
+"""
+
+_CLEAN_VERIFY = None  # filled in each test via MagicMock
+
+
+class TestVerifyMergeCli:
+    """CLI routing tests for ``coord verify-merge`` (#681)."""
+
+    @pytest.fixture
+    def config_file(self, tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(CONFIG_YAML)
+        return p
+
+    def _fake_ok_verify(self, *_a, **_kw):
+        """Return a clean MergeVerify (ok=True, 0 added, 0 foreign)."""
+        from coord.agent import MergeVerify
+        return MergeVerify(default_ahead=0, added=[], foreign=[])
+
+    def test_thin_client_uses_remote_board(
+        self, config_file: Path, monkeypatch
+    ) -> None:
+        """When resolve_board_service() returns a ServiceConfig, the board is
+        fetched from the daemon and build_board is never called (#681)."""
+        from click.testing import CliRunner
+
+        from coord import client as cc
+        from coord.cli import main
+        from coord.models import Assignment, Board
+
+        work = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=681,
+            issue_title="verify-merge thin-client fix",
+            assignment_id="mg-thin",
+            status="running",
+            branch="issue-681-fix",
+        )
+        remote_board = Board(active=[work], completed=[])
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+        )
+        monkeypatch.setattr(cc, "fetch_remote_board", lambda *a, **k: remote_board)
+
+        build_board_called = []
+
+        def _should_not_call():
+            build_board_called.append(True)
+            return Board()
+
+        monkeypatch.setattr("coord.state.build_board", _should_not_call)
+
+        with patch("coord.agent.verify_merge_branch", side_effect=self._fake_ok_verify):
+            result = CliRunner().invoke(
+                main,
+                ["verify-merge", "mg-thin", "--config", str(config_file)],
+            )
+
+        assert build_board_called == [], "build_board must not be called on a thin client"
+        assert result.exit_code == 0, result.output
+        assert "✓ merge-ready" in result.output
+        assert "issue-681-fix" in result.output  # branch name from the assignment
+
+    def test_explicit_flags_bypass_empty_board(
+        self, config_file: Path, monkeypatch
+    ) -> None:
+        """--repo / --issue-number work as fallback when the board lookup yields
+        nothing (e.g. empty local DB on a thin client with no daemon, #681)."""
+        from click.testing import CliRunner
+
+        from coord import client as cc
+        from coord.cli import main
+        from coord.models import Board
+
+        # No daemon configured; local board is empty.
+        monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+
+        captured: dict = {}
+
+        def fake_verify(wt_path, *, base, issue_number):
+            captured["base"] = base
+            captured["issue_number"] = issue_number
+            from coord.agent import MergeVerify
+            return MergeVerify(default_ahead=0, added=[], foreign=[])
+
+        with patch("coord.agent.verify_merge_branch", side_effect=fake_verify):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "verify-merge", "mg-missing",
+                    "--repo", "api",
+                    "--issue-number", "681",
+                    "--config", str(config_file),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["issue_number"] == 681
+        assert captured["base"] == "main"  # resolved from config for repo "api"
+        assert "✓ merge-ready" in result.output
+
+    def test_no_board_no_flags_exits_with_error(
+        self, config_file: Path, monkeypatch
+    ) -> None:
+        """Without a daemon and without --repo/--issue-number, the command must
+        exit(2) with a clear error message."""
+        from click.testing import CliRunner
+
+        from coord import client as cc
+        from coord.cli import main
+        from coord.models import Board
+
+        monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+
+        result = CliRunner().invoke(
+            main,
+            ["verify-merge", "mg-gone", "--config", str(config_file)],
+        )
+
+        assert result.exit_code == 2
+        assert "mg-gone" in result.output
+        assert "--repo" in result.output  # error message mentions the fallback flags
