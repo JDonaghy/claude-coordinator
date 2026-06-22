@@ -5862,8 +5862,33 @@ def report_result(
     default=None,
     help="Worktree to check (default: current directory).",
 )
+@click.option(
+    "--repo",
+    "repo_opt",
+    default=None,
+    help=(
+        "Repo name — fallback when the assignment is not found on the board "
+        "(thin-client machines where the board lives on the daemon, #681)."
+    ),
+)
+@click.option(
+    "--issue-number",
+    "issue_number_opt",
+    type=int,
+    default=None,
+    help=(
+        "Issue number — fallback when the assignment is not found on the board "
+        "(thin-client machines where the board lives on the daemon, #681)."
+    ),
+)
 @_CONFIG_OPTION
-def verify_merge(work_aid: str, path_opt: str | None, config_path: Path) -> None:
+def verify_merge(
+    work_aid: str,
+    path_opt: str | None,
+    repo_opt: str | None,
+    issue_number_opt: int | None,
+    config_path: Path,
+) -> None:
     """``coord verify-merge <work_aid>`` — git-truth check of a merge-prep branch.
 
     Resolves the issue + default branch from the *work* assignment id (the same
@@ -5872,30 +5897,50 @@ def verify_merge(work_aid: str, path_opt: str | None, config_path: Path) -> None
     merge agent is sitting in.  This is the defense-in-depth twin of the
     coordinator-side gate in :func:`coord.interactive.finalize_interactive_exit`:
     same check, available to the agent before it self-reports.
+
+    On thin-client machines (where the canonical board lives on a daemon) the
+    board is fetched from the daemon automatically (#681).  As a last-resort
+    fallback, supply ``--repo`` and ``--issue-number`` explicitly so the check
+    can run even when the board lookup returns nothing.
     """
     from coord.agent import verify_merge_branch  # noqa: PLC0415
+    from coord.client import fetch_remote_board, resolve_board_service  # noqa: PLC0415
     from coord.state import build_board  # noqa: PLC0415
 
     cfg = _load_config(config_path)
-    board = build_board()
+    svc = resolve_board_service()
+    board = fetch_remote_board(svc) if svc is not None else build_board()
     work = board.find_by_id(work_aid)
     if work is None:
-        click.echo(
-            f"error: no assignment {work_aid!r} on the board (use the work id "
-            "from `coord status`).",
-            err=True,
-        )
-        sys.exit(2)
+        if repo_opt and issue_number_opt is not None:
+            # Thin-client fallback: the board lookup found nothing (empty local
+            # DB or daemon didn't carry this aid), but the caller supplied the
+            # known values explicitly via --repo / --issue-number (#681).
+            repo_name = repo_opt
+            issue_num = issue_number_opt
+            branch_display = "(unknown)"
+        else:
+            click.echo(
+                f"error: no assignment {work_aid!r} on the board "
+                "(use the work id from `coord status`, or supply "
+                "--repo and --issue-number as a fallback).",
+                err=True,
+            )
+            sys.exit(2)
+    else:
+        repo_name = work.repo_name
+        issue_num = int(work.issue_number)
+        branch_display = work.branch or "(unknown)"
 
-    repo_cfg = cfg.repo(work.repo_name)
+    repo_cfg = cfg.repo(repo_name)
     base = (repo_cfg.default_branch if repo_cfg else None) or "main"
     wt_path = Path(path_opt).expanduser() if path_opt else Path.cwd()
 
     mv = verify_merge_branch(
-        wt_path, base=base, issue_number=int(work.issue_number)
+        wt_path, base=base, issue_number=issue_num
     )
 
-    click.echo(f"branch:        {work.branch or '(unknown)'}")
+    click.echo(f"branch:        {branch_display}")
     click.echo(f"target base:   {base}")
     click.echo(f"{base}-ahead:   {mv.default_ahead}  (must be 0)")
     click.echo(f"adds {len(mv.added)} commit(s) over {base}:")
