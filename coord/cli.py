@@ -7448,6 +7448,46 @@ def backlog(repo: str, issue: int, config_path: Path) -> None:
     )
 
 
+@main.command(
+    "set-test-mode",
+    help=(
+        "Set the per-issue test-mode policy for headless Work sessions.\n\n"
+        "MODE must be 'smoke' (pause at the Test gate for a human-attended\n"
+        "interactive smoke agent, the default) or 'auto' (run the smoke test\n"
+        "headless and continue toward merge without stopping).\n\n"
+        "The policy is persisted as a 'test-mode:smoke' / 'test-mode:auto'\n"
+        "GitHub label.  The TUI reads this label when a headless Work session\n"
+        "completes to decide whether to offer the interactive smoke agent or\n"
+        "auto-dispatch smoke.py.  The label can be flipped at any time before\n"
+        "the issue reaches the Test gate.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the GH\n"
+        "issue number."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.argument("mode", type=click.Choice(["smoke", "auto"]))
+@_CONFIG_OPTION
+def set_test_mode(repo: str, issue: int, mode: str, config_path: Path) -> None:
+    """#685: TUI test-mode dialog and right-click flip fire this command."""
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r} (not in coordinator.yml)", err=True)
+        sys.exit(1)
+    slug = repo_entry.github
+    _apply_label_change(
+        repo, issue, config_path,
+        add={f"test-mode:{mode}"},
+        remove_if_present={
+            lbl for lbl in ("test-mode:smoke", "test-mode:auto")
+            if lbl != f"test-mode:{mode}"
+        },
+        success_message=f"#{issue} ({slug}) test mode set to '{mode}'",
+        no_op_message=f"#{issue} ({slug}) already has test-mode:{mode}",
+    )
+
+
 @main.command(help="Poll agents and post completion/failure comments on GitHub.")
 @_CONFIG_OPTION
 def notify(config_path: Path) -> None:

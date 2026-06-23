@@ -502,3 +502,96 @@ class TestBranchReconciliation:
         assert result.exit_code != 0
         assert "could not create test worktree" in result.output
         assert "drift reconciled" not in result.output
+
+
+# ── #685: coord set-test-mode ────────────────────────────────────────────────
+
+
+class TestSetTestModeCommand:
+    """Tests for `coord set-test-mode REPO ISSUE MODE`."""
+
+    def _fake_gh_view(self, labels: list[str]):
+        """Return a mock subprocess.run result for `gh issue view --json labels`."""
+        import json
+        return MagicMock(returncode=0, stdout=json.dumps({"labels": [{"name": l} for l in labels]}), stderr="")
+
+    @patch("subprocess.run")
+    def test_set_test_mode_smoke(
+        self,
+        mock_run: MagicMock,
+        config_file: Path,
+        coord_db,
+    ) -> None:
+        """set-test-mode smoke adds the test-mode:smoke label."""
+        import json
+        # gh view returns no existing test-mode label; gh edit succeeds.
+        mock_run.side_effect = [
+            self._fake_gh_view([]),          # gh issue view
+            MagicMock(returncode=0, stdout="", stderr=""),  # gh issue edit
+        ]
+        result = CliRunner().invoke(main, [
+            "set-test-mode", "api", "42", "smoke", "--config", str(config_file),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "smoke" in result.output
+
+        # Should have called `gh issue edit --add-label test-mode:smoke`.
+        edit_call = mock_run.call_args_list[1]
+        edit_args = edit_call[0][0]
+        assert "--add-label" in edit_args
+        assert "test-mode:smoke" in edit_args
+
+    @patch("subprocess.run")
+    def test_set_test_mode_auto(
+        self,
+        mock_run: MagicMock,
+        config_file: Path,
+        coord_db,
+    ) -> None:
+        """set-test-mode auto adds the test-mode:auto label."""
+        import json
+        mock_run.side_effect = [
+            self._fake_gh_view([]),          # gh issue view
+            MagicMock(returncode=0, stdout="", stderr=""),  # gh issue edit
+        ]
+        result = CliRunner().invoke(main, [
+            "set-test-mode", "api", "42", "auto", "--config", str(config_file),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "auto" in result.output
+
+        edit_call = mock_run.call_args_list[1]
+        edit_args = edit_call[0][0]
+        assert "--add-label" in edit_args
+        assert "test-mode:auto" in edit_args
+
+    @patch("subprocess.run")
+    def test_set_test_mode_removes_old_label(
+        self,
+        mock_run: MagicMock,
+        config_file: Path,
+        coord_db,
+    ) -> None:
+        """set-test-mode smoke removes an existing test-mode:auto label."""
+        mock_run.side_effect = [
+            self._fake_gh_view(["coord", "test-mode:auto"]),  # gh issue view
+            MagicMock(returncode=0, stdout="", stderr=""),     # gh issue edit
+        ]
+        result = CliRunner().invoke(main, [
+            "set-test-mode", "api", "42", "smoke", "--config", str(config_file),
+        ])
+        assert result.exit_code == 0, result.output
+        edit_call = mock_run.call_args_list[1]
+        edit_args = edit_call[0][0]
+        assert "--remove-label" in edit_args
+        assert "test-mode:auto" in edit_args
+
+    def test_set_test_mode_rejects_invalid_mode(
+        self,
+        config_file: Path,
+    ) -> None:
+        """Passing an invalid mode should fail with a non-zero exit."""
+        result = CliRunner().invoke(main, [
+            "set-test-mode", "api", "42", "invalid", "--config", str(config_file),
+        ])
+        assert result.exit_code != 0

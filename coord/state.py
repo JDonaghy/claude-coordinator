@@ -1396,6 +1396,36 @@ def _update_issue_labels_local(
     return cursor.rowcount > 0
 
 
+def get_issue_test_mode(repo_name: str, issue_number: int) -> str | None:
+    """Return the test-mode policy for an issue from the local issues cache.
+
+    Reads the ``test-mode:smoke`` / ``test-mode:auto`` label from the ``issues``
+    table row.  Returns ``"smoke"``, ``"auto"``, or ``None`` (no label set — the
+    caller should treat ``None`` as *old behaviour*, i.e. respect
+    ``smoke_tests.auto_queue`` from the config).
+
+    Always reads the local SQLite DB directly — does not call GitHub.  The cache
+    is kept current by ``github_ops.set_test_mode_label``, so the value is fresh
+    whenever the TUI has dispatched a headless session after #685.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT labels FROM issues WHERE repo_name = ? AND number = ?",
+        (repo_name, issue_number),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        labels: list[str] = json.loads(row["labels"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if "test-mode:auto" in labels:
+        return "auto"
+    if "test-mode:smoke" in labels:
+        return "smoke"
+    return None
+
+
 def edit_issue_content(
     repo_name: str,
     issue_number: int,
