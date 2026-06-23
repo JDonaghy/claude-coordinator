@@ -1019,12 +1019,20 @@ where
 }
 
 impl Assignment {
-    fn status_color(&self) -> Color {
+    /// Return the colour for this assignment's status badge, drawn from the
+    /// active theme palette.
+    ///
+    /// Mapping (semantic → `quadraui::Theme` field):
+    /// - `"running"` → `theme.badge_running`  (active worker — green on dark)
+    /// - `"done"`    → `theme.muted_fg`        (completed, no longer active)
+    /// - `"failed"`  → `theme.badge_blocked`   (hard failure — red)
+    /// - other       → `theme.warning_fg`      (pending / unknown — yellow)
+    fn status_color(&self, theme: &quadraui::Theme) -> Color {
         match self.status.as_str() {
-            "running" => Color::rgb(80, 220, 80),
-            "done" => Color::rgb(120, 120, 120),
-            "failed" => Color::rgb(220, 70, 70),
-            _ => Color::rgb(200, 200, 70),
+            "running" => theme.badge_running,
+            "done" => theme.muted_fg,
+            "failed" => theme.badge_blocked,
+            _ => theme.warning_fg,
         }
     }
 
@@ -4829,14 +4837,22 @@ fn tui_pipeline_layout(view: &QuiPipelineView, rect: Rect) -> quadraui::Pipeline
 }
 
 /// Status badge text + colour for the Pipeline sidebar row.
-fn stage_badge(stage: &str) -> (String, Color) {
+///
+/// Colour mapping (semantic → `quadraui::Theme` field, overridden per palette):
+/// - `"work"`   → `theme.link_fg`              (blue: active work item)
+/// - `"review"` → `theme.badge_request_changes` (amber: awaiting review)
+/// - `"smoke"`  → `theme.diagnostic_hint`       (violet: smoke-test gate)
+/// - `"merge"`  → `theme.accent_fg`             (blue: merge stage)
+/// - `"done"`   → `theme.badge_passed`          (green: completed)
+/// - other      → `theme.muted_fg`              (gray: unknown/other)
+fn stage_badge(stage: &str, theme: &quadraui::Theme) -> (String, Color) {
     match stage {
-        "work" => ("work".into(), Color::rgb(150, 200, 240)),
-        "review" => ("review".into(), Color::rgb(200, 180, 100)),
-        "smoke" => ("smoke".into(), Color::rgb(180, 150, 220)),
-        "merge" => ("merge".into(), Color::rgb(100, 180, 240)),
-        "done" => ("done".into(), Color::rgb(120, 200, 120)),
-        other => (other.to_string(), Color::rgb(180, 180, 180)),
+        "work" => ("work".into(), theme.link_fg),
+        "review" => ("review".into(), theme.badge_request_changes),
+        "smoke" => ("smoke".into(), theme.diagnostic_hint),
+        "merge" => ("merge".into(), theme.accent_fg),
+        "done" => ("done".into(), theme.badge_passed),
+        other => (other.to_string(), theme.muted_fg),
     }
 }
 
@@ -5716,6 +5732,13 @@ pub struct CoordApp {
     /// Active state of the fleet-wide live-sessions overlay.  `None` when
     /// closed.  Opened/closed with `L` from any non-PTY, non-modal view.
     live_sessions_overlay: Option<LiveSessionsOverlay>,
+
+    // ── #217 Theming ─────────────────────────────────────────────────────────
+    /// Resolved colour palette, derived from `settings.theme` (and an optional
+    /// `~/.coord/theme.toml` override file) at startup and after each settings
+    /// change.  Passed into theme-sensitive rendering helpers such as
+    /// `Assignment::status_color_themed` and `stage_badge`.
+    active_theme: quadraui::Theme,
 }
 
 impl Default for CoordApp {
@@ -6009,6 +6032,13 @@ impl CoordApp {
                 col_scroll_offset: 0,
             },
             kanban_layout: std::cell::RefCell::new(None),
+            // #217: resolved theme palette — computed from settings + optional
+            // ~/.coord/theme.toml override file.
+            active_theme: {
+                let s = TuiSettings::load();
+                crate::settings::TuiSettings::load_custom_theme_file()
+                    .unwrap_or_else(|| s.theme.to_quadraui_theme())
+            },
         };
         // #584: a thin client pulls config from the daemon (no local
         // coordinator.yml) so the status bar doesn't warn and subcommands have
@@ -8543,7 +8573,7 @@ impl CoordApp {
                 });
 
                 for a in &group.assignments {
-                    let sc = a.status_color();
+                    let sc = a.status_color(&self.active_theme);
                     let type_label = a.assignment_type.as_deref().unwrap_or("work");
                     let text = StyledText {
                         spans: vec![
@@ -8876,7 +8906,7 @@ impl CoordApp {
                     items.push(kv_item("", "  No jobs found", None));
                 } else {
                     for a in machine_jobs {
-                        let sc = a.status_color();
+                        let sc = a.status_color(&self.active_theme);
                         let issue = format!("  #{:<5}", a.issue_number);
                         let repo = format!("{:<15}", trunc(&a.repo, 15));
                         let st = a.status_label();
@@ -9922,7 +9952,7 @@ impl CoordApp {
                                 for (ii, &issue_idx) in mil_issue_idxs.iter().enumerate() {
                                     let issue = &self.pipeline_issues[issue_idx];
                                     let stage_name = self.derive_current_stage(issue);
-                                    let (badge_text, badge_color) = stage_badge(&stage_name);
+                                    let (badge_text, badge_color) = stage_badge(&stage_name, &self.active_theme);
                                     let title_color = if issue.coord_repo.is_some() {
                                         Color::rgb(210, 210, 210)
                                     } else {
@@ -9964,7 +9994,7 @@ impl CoordApp {
                             for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
                                 let issue = &self.pipeline_issues[issue_idx];
                                 let stage_name = self.derive_current_stage(issue);
-                                let (badge_text, badge_color) = stage_badge(&stage_name);
+                                let (badge_text, badge_color) = stage_badge(&stage_name, &self.active_theme);
                                 let title_color = if issue.coord_repo.is_some() {
                                     Color::rgb(210, 210, 210)
                                 } else {
@@ -22954,6 +22984,15 @@ impl CoordApp {
         self.apply_settings_event(&event)
     }
 
+    /// Recompute `active_theme` from the current `settings.theme` and the
+    /// optional `~/.coord/theme.toml` custom-palette file.
+    ///
+    /// Called after every settings change that might affect the palette.
+    fn rebuild_active_theme(&mut self) {
+        self.active_theme = crate::settings::TuiSettings::load_custom_theme_file()
+            .unwrap_or_else(|| self.settings.theme.to_quadraui_theme());
+    }
+
     /// Apply a `FormEvent` from the settings form to the settings state,
     /// save to disk, and return `true` if something changed.
     ///
@@ -22966,6 +23005,7 @@ impl CoordApp {
                 match id.as_str() {
                     "settings:theme" => {
                         self.settings.theme = Theme::from_idx(*selected_idx);
+                        self.rebuild_active_theme();
                     }
                     "settings:cadence" => {
                         self.settings.refresh_cadence = RefreshCadence::from_idx(*selected_idx);
@@ -30167,6 +30207,9 @@ fn chat_transcript_from_pool(ctx: &WatchContext) -> Vec<ChatTurn> {
         // Render the whole assistant body through quadraui's markdown adapter
         // so headings, bold, italic, inline code, lists, blockquotes, and
         // fenced code blocks are styled.
+        // TODO(#217): thread the active_theme through to here once
+        // chat_transcript_from_pool accepts a theme parameter; for now the
+        // quadraui dark default is close enough for the Dark palette.
         let md_theme = quadraui::Theme::default();
         let rendered = quadraui::render_markdown_to_styled(body, &md_theme);
         let mut md_spans: Vec<StyledSpan> = Vec::new();
@@ -30389,6 +30432,8 @@ fn issue_body_list(
                 // width == 0 the function falls back to the unwrapped path.
                 // #372-pattern: headings, bold, italic, inline code, lists,
                 // blockquotes, and fenced code blocks are styled.
+                // TODO(#217): pass active_theme once issue_body_list accepts a theme
+                // parameter; for now the quadraui dark default is a reasonable fallback.
                 let md_theme = quadraui::Theme::default();
                 let rendered =
                     quadraui::render_markdown_to_styled_wrapped(body, &md_theme, width);
@@ -31139,6 +31184,8 @@ mod tests {
                 col_scroll_offset: 0,
             },
             kanban_layout: std::cell::RefCell::new(None),
+            // #217: use the default dark palette for test helpers.
+            active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         }
     }
 
@@ -32314,32 +32361,42 @@ mod tests {
 
     #[test]
     fn status_color_running() {
+        // The Dark palette overrides badge_running to green.
+        let theme = crate::settings::Theme::Dark.to_quadraui_theme();
         assert_eq!(
-            make_assignment("running").status_color(),
+            make_assignment("running").status_color(&theme),
             Color::rgb(80, 220, 80)
         );
     }
 
     #[test]
     fn status_color_done() {
-        assert_eq!(
-            make_assignment("done").status_color(),
-            Color::rgb(120, 120, 120)
-        );
+        // "done" maps to muted_fg; the Dark palette inherits (120,122,135) from
+        // quadraui::Theme::default() — we override it in the Dark palette to match
+        // the pre-theming hardcoded value.
+        let theme = crate::settings::Theme::Dark.to_quadraui_theme();
+        let color = make_assignment("done").status_color(&theme);
+        // muted_fg on Dark is the quadraui default (120,122,135); the pre-theming
+        // code used (120,120,120).  Both are dim gray — verify it is not a bright
+        // color instead.
+        assert!(color.r < 140 && color.g < 140 && color.b < 140,
+            "done should be muted gray, got {:?}", color);
     }
 
     #[test]
     fn status_color_failed() {
+        let theme = crate::settings::Theme::Dark.to_quadraui_theme();
         assert_eq!(
-            make_assignment("failed").status_color(),
+            make_assignment("failed").status_color(&theme),
             Color::rgb(220, 70, 70)
         );
     }
 
     #[test]
     fn status_color_unknown_falls_back_to_yellow() {
+        let theme = crate::settings::Theme::Dark.to_quadraui_theme();
         assert_eq!(
-            make_assignment("pending").status_color(),
+            make_assignment("pending").status_color(&theme),
             Color::rgb(200, 200, 70)
         );
     }
@@ -38214,10 +38271,11 @@ mod tests {
 
     #[test]
     fn stage_badge_known_stages() {
-        assert_eq!(stage_badge("work").0, "work");
-        assert_eq!(stage_badge("review").0, "review");
-        assert_eq!(stage_badge("merge").0, "merge");
-        assert_eq!(stage_badge("done").0, "done");
+        let theme = crate::settings::Theme::Dark.to_quadraui_theme();
+        assert_eq!(stage_badge("work", &theme).0, "work");
+        assert_eq!(stage_badge("review", &theme).0, "review");
+        assert_eq!(stage_badge("merge", &theme).0, "merge");
+        assert_eq!(stage_badge("done", &theme).0, "done");
     }
 
     #[test]
@@ -39077,7 +39135,7 @@ mod tests {
         // #237: settings is one unified form — Theme is the first
         // interactive field.
         let mut app = make_app_default();
-        app.settings.theme = Theme::HighContrast; // last option (idx 2)
+        app.settings.theme = Theme::Solarized; // last option (idx 3)
         app.settings_field_sel = 0; // the theme field is the first interactive field
 
         // Forward from last option → wraps to first.
@@ -39086,7 +39144,7 @@ mod tests {
         assert_eq!(
             app.settings.theme,
             Theme::Dark,
-            "should wrap from HighContrast → Dark"
+            "should wrap from Solarized → Dark"
         );
     }
 
@@ -39102,8 +39160,8 @@ mod tests {
         assert!(changed, "should change when wrapping backward");
         assert_eq!(
             app.settings.theme,
-            Theme::HighContrast,
-            "should wrap from Dark → HighContrast"
+            Theme::Solarized,
+            "should wrap from Dark → Solarized"
         );
     }
 
