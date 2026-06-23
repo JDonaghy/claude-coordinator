@@ -46223,4 +46223,135 @@ mod tests {
             "per-column scroll offset must survive rebuild_board_sidebar"
         );
     }
+
+    // ─── TuiDriver black-box screen tests (#690 / #691) ───────────────────────
+    //
+    // These tests drive the full CoordApp → ShellAdapter → dispatch_event →
+    // render_frame pipeline via quadraui's `driver_with_shell`, which uses an
+    // in-memory `TestBackend` instead of a live terminal.  No network, no
+    // daemon, no TTY — deterministic `cargo test`-native.
+    //
+    // The API:
+    //   `find("text")` → `Option<(f32,f32)>` — cell coords of a painted string.
+    //   `click(x,y)`                          — routes through hit-test → handle.
+    //   `press_named(NamedKey::...)`           — keyboard event round-trip.
+    //   `type_char(c)`                         — single character key press.
+    //   `screen_contains(needle)` / `screen()` — inspect the rendered buffer.
+
+    /// Test 1 (most important — exercises the `issue_body_list` render path
+    /// that #669 touches):
+    ///
+    /// Board view + Issue detail tab + a synced `open_issues` row → the issue
+    /// body text must appear on screen.  The setup pre-selects the sidebar row
+    /// and switches the detail tab programmatically (both are private state
+    /// accessible from the in-crate test module) so the test stays focused on
+    /// the render path rather than on sidebar-navigation sequencing.
+    #[test]
+    fn tuidriver_board_issue_body_renders() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        const BODY: &str =
+            "This fix addresses a critical rendering bug visible in the dashboard panel";
+
+        // App with one running issue and a synced open_issues row bearing the body.
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 10,
+            title: "Fix dashboard rendering".to_string(),
+            body: BODY.to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+
+        // Pre-select the issue in the sidebar (milestone 0, issue 0 within that
+        // milestone — matches the single "No milestone" group rebuild_board_sidebar
+        // creates for a single running issue).  After rebuild_board_sidebar the
+        // active section is already 1 (repo-a); we just need the row path.
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+        // Switch to the Issue detail tab so render_content draws board_issue_body_list.
+        app.board_detail_tab = BoardDetailTab::Issue;
+
+        // Wrap in the full ShellAdapter → TestBackend driver.
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        assert!(
+            driver.screen_contains(BODY),
+            "Issue body must render on the Board > Issue tab:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Test 2 — list rendering:
+    ///
+    /// An issue with a known title must appear in the Board sidebar tree.
+    /// Verifies that `rebuild_board_sidebar` + `draw_sidebar_panel` + the
+    /// initial `render_frame` call all wire together correctly end-to-end.
+    #[test]
+    fn tuidriver_board_sidebar_shows_issue_title() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // make_assignment_typed sets issue_title = "Issue <N>".
+        let assignments = vec![make_assignment_typed("running", 42, "test-repo", Some("work"))];
+        let app = make_app_with_assignments(assignments);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // The sidebar tree row is formatted as "#42   Issue 42" (issue number
+        // left-padded to 5 chars + truncated title).  Either fragment is enough.
+        assert!(
+            driver.screen_contains("Issue 42") || driver.screen_contains("#42"),
+            "Issue title / number must appear in the board sidebar:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Test 3 — event round-trip:
+    ///
+    /// Clicking the "Issue" tab in the Board detail panel (located via `find`)
+    /// must switch the active tab and re-render the content area.  This
+    /// exercises the full `UiEvent::MouseDown` → `handle` → `Reaction::Redraw`
+    /// → `render_frame` path — the same path that every real user click takes.
+    #[test]
+    fn tuidriver_clicking_issue_tab_changes_screen() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // App with one running issue and a synced body, starting on the default
+        // "Board" detail tab (no pre-selection needed — we just want to confirm
+        // that a click on "Issue" triggers a visible change).
+        let assignments = vec![make_assignment_typed("running", 7, "click-repo", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "click-repo".to_string(),
+            number: 7,
+            title: "click round-trip test".to_string(),
+            body: "Event round-trip verified via TuiDriver click".to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        // Pre-select the issue row so the Issue tab has content to switch to.
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        let screen_before = driver.screen();
+
+        // Locate the "Issue" tab label in the tab bar and click it.
+        // `find` returns None if the label isn't painted — fail clearly.
+        let (x, y) = driver
+            .find("Issue")
+            .unwrap_or_else(|| panic!("'Issue' tab label not found on initial render:\n{screen_before}"));
+        driver.click(x, y);
+
+        let screen_after = driver.screen();
+        assert_ne!(
+            screen_before, screen_after,
+            "clicking 'Issue' tab must trigger a re-render that changes the screen"
+        );
+    }
 }
