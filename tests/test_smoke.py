@@ -426,3 +426,132 @@ def test_dispatch_smoke_returns_none_when_no_capable_machine(
         diff_lookup=lambda repo, branch: ["src/gtk/x.c"],
     )
     assert result is None
+
+
+# ── #685: get_issue_test_mode ───────────────────────────────────────────────
+
+
+def test_get_issue_test_mode_returns_none_when_no_row(coord_db) -> None:
+    """Returns None when the issue isn't in the local cache."""
+    from coord.state import get_issue_test_mode
+
+    assert get_issue_test_mode("api", 42) is None
+
+
+def test_get_issue_test_mode_returns_none_when_no_label(coord_db) -> None:
+    """Returns None when the issue row has no test-mode label."""
+    import json
+    from coord.state import get_issue_test_mode
+
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("api", 42, "Fix bug", "", "open", json.dumps(["coord", "status:ready"]), 1.0),
+    )
+    coord_db.commit()
+    assert get_issue_test_mode("api", 42) is None
+
+
+def test_get_issue_test_mode_returns_smoke(coord_db) -> None:
+    """Returns 'smoke' when the test-mode:smoke label is present."""
+    import json
+    from coord.state import get_issue_test_mode
+
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("api", 42, "Fix bug", "", "open", json.dumps(["coord", "test-mode:smoke"]), 1.0),
+    )
+    coord_db.commit()
+    assert get_issue_test_mode("api", 42) == "smoke"
+
+
+def test_get_issue_test_mode_returns_auto(coord_db) -> None:
+    """Returns 'auto' when the test-mode:auto label is present."""
+    import json
+    from coord.state import get_issue_test_mode
+
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("api", 42, "Fix bug", "", "open", json.dumps(["coord", "test-mode:auto"]), 1.0),
+    )
+    coord_db.commit()
+    assert get_issue_test_mode("api", 42) == "auto"
+
+
+# ── #685: reconcile smoke-gate respects test-mode:smoke ───────────────────
+
+
+def test_reconcile_skips_auto_smoke_for_smoke_mode_issue(
+    gtk_and_server_config: Config, coord_db
+) -> None:
+    """reconcile() must NOT auto-dispatch smoke when the issue has test-mode:smoke."""
+    import json
+    from unittest.mock import patch as _patch
+    from coord.reconcile import reconcile
+    from coord.state import save_board
+
+    # Seed the issue with test-mode:smoke.
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("api", 287, "GTK fix", "", "open", json.dumps(["coord", "test-mode:smoke"]), 1.0),
+    )
+    coord_db.commit()
+
+    completed_work = _completed(machine="server")
+    board = Board(active=[completed_work])
+    save_board(board)
+
+    def _fake_agent(_host: str, _port: int = 7433, **kw):
+        return {
+            "completed": [
+                {"id": "abc123", "status": "done", "branch": "issue-287-fix"}
+            ]
+        }
+
+    with _patch("coord.reconcile._query_agent", side_effect=_fake_agent):
+        reconcile(board, gtk_and_server_config)
+
+    # A smoke assignment must NOT have been appended to the board.
+    smoke_assignments = [a for a in board.active if a.type == "smoke"]
+    assert smoke_assignments == [], (
+        "Expected no auto-smoke dispatch for test-mode:smoke issue; "
+        f"got {smoke_assignments}"
+    )
+
+
+def test_reconcile_dispatches_auto_smoke_for_auto_mode_issue(
+    gtk_and_server_config: Config, coord_db
+) -> None:
+    """reconcile() MUST call dispatch_smoke when the issue has test-mode:auto."""
+    import json
+    from unittest.mock import patch as _patch
+    from coord.reconcile import reconcile
+    from coord.state import save_board
+
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("api", 287, "GTK fix", "", "open", json.dumps(["coord", "test-mode:auto"]), 1.0),
+    )
+    coord_db.commit()
+
+    completed_work = _completed(machine="server")
+    board = Board(active=[completed_work])
+    save_board(board)
+
+    def _fake_agent(_host: str, _port: int = 7433, **kw):
+        return {
+            "completed": [
+                {"id": "abc123", "status": "done", "branch": "issue-287-fix"}
+            ]
+        }
+
+    with _patch("coord.reconcile._query_agent", side_effect=_fake_agent), \
+         _patch("coord.smoke.dispatch_smoke", return_value=None) as mock_dispatch:
+        reconcile(board, gtk_and_server_config)
+        assert mock_dispatch.called, (
+            "Expected dispatch_smoke to be called for test-mode:auto issue"
+        )

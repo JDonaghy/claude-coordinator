@@ -167,6 +167,59 @@ def add_issue_labels(repo: str, issue_number: int, labels: list[str]) -> None:
     _gh(*args)
 
 
+def remove_issue_label(repo: str, issue_number: int, label: str) -> None:
+    """Remove a label from an issue via ``gh issue edit --remove-label``.
+
+    Idempotent — ``gh`` silently no-ops if the label is not present.
+    Raises RuntimeError on ``gh`` failure.
+    """
+    _gh("issue", "edit", str(issue_number), "--repo", repo, "--remove-label", label)
+
+
+_TEST_MODE_LABELS = ("test-mode:smoke", "test-mode:auto")
+
+
+def set_test_mode_label(
+    repo_github: str,
+    repo_name: str,
+    issue_number: int,
+    mode: str,
+) -> None:
+    """Persist the per-issue test-mode policy as a GitHub label.
+
+    Removes any existing ``test-mode:*`` label then adds ``test-mode:{mode}``.
+    Also updates the local issues cache so the TUI pipeline reflects the change
+    without waiting for the next ``coord sync``.
+
+    ``repo_github`` — ``owner/name`` slug for the ``gh`` CLI.
+    ``repo_name``   — coordinator-local repo name for the DB cache.
+    ``mode``        — ``"smoke"`` or ``"auto"``.
+    """
+    from coord import state as _state  # noqa: PLC0415
+
+    if mode not in ("smoke", "auto"):
+        raise ValueError(f"mode must be 'smoke' or 'auto', got {mode!r}")
+
+    # Step 1: remove any stale test-mode:* labels.
+    for old_label in _TEST_MODE_LABELS:
+        try:
+            remove_issue_label(repo_github, issue_number, old_label)
+        except RuntimeError:
+            pass  # already absent — not an error
+
+    # Step 2: add the new label (idempotent).
+    new_label = f"test-mode:{mode}"
+    add_issue_labels(repo_github, issue_number, [new_label])
+
+    # Step 3: refresh the local cache so the TUI sees the update.
+    try:
+        issue_data = get_issue(repo_github, issue_number)
+        current_labels = [lbl.get("name", "") for lbl in issue_data.get("labels", [])]
+        _state.update_issue_labels(repo_name, issue_number, current_labels)
+    except Exception:
+        pass  # cache update is best-effort
+
+
 def get_repo_file(repo: str, path: str, branch: str = "develop") -> str:
     import base64
     raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")

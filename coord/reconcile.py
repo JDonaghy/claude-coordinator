@@ -506,11 +506,23 @@ def reconcile(board: Board, config: Config) -> list[str]:
 
     # Auto-queue smoke tests for any work assignments that just finished.
     # Independent of review dispatch — both can fire for the same completion.
+    #
+    # #685: per-issue test-mode policy gates auto-smoke dispatch.
+    #   test-mode:auto  → headless smoke (auto-dispatch here, current behaviour).
+    #   test-mode:smoke → skip; the TUI will offer the interactive smoke agent.
+    #   no label        → no policy set (pre-#685 dispatch) → respect auto_queue
+    #                     as before (backward-compatible).
     smoke_cfg = getattr(config, "smoke_tests", None)
     if smoke_cfg is not None and smoke_cfg.auto_queue:
         from coord.smoke import dispatch_smoke
+        from coord.state import get_issue_test_mode
 
         for completed in newly_done_work:
+            test_mode = get_issue_test_mode(completed.repo_name, completed.issue_number)
+            if test_mode == "smoke":
+                # Interactive-smoke mode: the TUI raises the --smoke-of offer;
+                # don't auto-dispatch here.
+                continue
             smoke = dispatch_smoke(completed, board, config)
             if smoke is not None and smoke.assignment_id is not None:
                 changed.append(smoke.assignment_id)

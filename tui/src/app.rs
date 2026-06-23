@@ -4148,6 +4148,39 @@ struct PendingStageLaunch {
     kind: StageLaunchKind,
 }
 
+/// #685: action performed when the test-mode choice is confirmed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TestModeChoiceAction {
+    /// Dispatch a headless Work assignment (`start-skip-plan`) after setting
+    /// the label.
+    DispatchWork,
+    /// Just update the label without dispatching (right-click "Set test mode").
+    SetOnly,
+}
+
+/// #685: pending dialog asking the operator to choose the test-mode policy
+/// before a headless Work session starts (or to flip it via right-click).
+///
+/// `[1] Pause for smoke test` (default) → `test-mode:smoke`.
+/// `[2] Fully automated` → `test-mode:auto`.
+///
+/// On confirm the TUI queues `coord set-test-mode` then `coord assign`
+/// (for DispatchWork) or only `coord set-test-mode` (for SetOnly).
+#[derive(Clone)]
+struct PendingTestModeChoice {
+    coord_repo: String,
+    repo_slug: String,
+    issue_num: u64,
+    /// What to do after the mode is chosen.
+    action: TestModeChoiceAction,
+    /// Currently set test-mode (from `all_labels`), used to pre-select the default.
+    current_mode: Option<String>,
+    /// `coord assign` machine name (used for DispatchWork).
+    machine_name: Option<String>,
+    /// `coord assign` model override (used for DispatchWork).
+    model_override: Option<String>,
+}
+
 /// Leg 3 (#517): an interactive review the TUI launched this run, armed to
 /// route on its verdict (board-driven, via `coord report-result`).  Fires once
 /// when a NEW verdict appears (a review id not in `prior_verdicted_ids`):
@@ -5619,6 +5652,14 @@ pub struct CoordApp {
     pending_auto_review: Option<PendingAutoReview>,
     /// Post-review one-key stage offer (Fix / Test) — see [`PendingStageLaunch`].
     pending_stage_launch: Option<PendingStageLaunch>,
+    /// #685: pending test-mode choice dialog.  Armed when the operator picks
+    /// "Start (automated) > Work/Plan" from the Pipeline context menu or the
+    /// "Set test mode" right-click item; cleared on confirm or Esc.
+    pending_test_mode_choice: Option<PendingTestModeChoice>,
+    /// #685: set of work assignment IDs for which the TUI already raised the
+    /// interactive-smoke offer (via `detect_headless_smoke_work_done`).  Prevents
+    /// the offer from re-firing on every tick after the user dismisses it.
+    offered_smoke_for_headless_work: std::collections::HashSet<String>,
 
     // ── Leg 3 (#517): verdict-driven routing ───────────────────────────────
     /// Interactive reviews launched this run, keyed by `(repo_slug,
@@ -5932,6 +5973,9 @@ impl CoordApp {
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
             pending_stage_launch: None,
+            // #685: per-issue test-mode policy choice dialog.
+            pending_test_mode_choice: None,
+            offered_smoke_for_headless_work: std::collections::HashSet::new(),
             // Leg 3 (#517): verdict-driven routing.
             armed_for_verdict: std::collections::HashMap::new(),
             pending_rework: None,
@@ -11835,6 +11879,10 @@ impl CoordApp {
     /// `coord approve-plan <plan_id>` — which uses the plan output as the
     /// briefing for the new work assignment.  Otherwise falls back to a
     /// fresh `coord assign <machine> <repo> <issue>`.
+    ///
+    /// #685: always arms the test-mode choice dialog first; the dialog's
+    /// confirm path calls `dispatch_pipeline_work_with_mode` to do the
+    /// actual dispatch after `coord set-test-mode` runs.
     fn dispatch_pipeline_work(&mut self) -> bool {
         let Some(idx) = self.pipeline_sel else {
             return false;
@@ -11853,76 +11901,123 @@ impl CoordApp {
             return false;
         };
 
-        // If a done plan exists for this issue, approve it — that path
-        // dispatches the work assignment with the plan output baked into
-        // the briefing.
-        if let Some(plan_id) = self.find_done_plan_assignment_id(&issue, &coord_repo) {
-            use crate::commands::SpawnQueuedOutcome;
-            let outcome = self
-                .command_runner
-                .spawn_queued(&["approve-plan", &plan_id]);
-            match outcome {
-                SpawnQueuedOutcome::Started => {
-                    self.pipeline_status = Some((
-                        format!(
-                            "approving plan {} → dispatching work for #{}",
-                            &plan_id[..plan_id.len().min(8)],
-                            issue.number
-                        ),
-                        Instant::now(),
-                    ));
+        // For the approve-plan path we still need a machine to be reachable.
+        let machine_name = if self.find_done_plan_assignment_id(&issue, &coord_repo).is_none() {
+            let Some(machine) = self.best_machine_for(&coord_repo) else {
+                self.pipeline_status = Some((
+                    format!(
+                        "no reachable machine for {} — queued (issue #{})",
+                        coord_repo, issue.number
+                    ),
+                    Instant::now(),
+                ));
+                return false;
+            };
+            Some(machine.name.clone())
+        } else {
+            None // approve-plan resolves its own machine
+        };
+
+        // Inject session-level model override when the user configured one for
+        // this machine in Settings → Dispatch → Per-Machine Model Overrides.
+        let model_str = machine_name.as_ref().and_then(|mn| {
+            self.settings
+                .machine_model
+                .get(mn)
+                .map(|p| p.as_str().to_string())
+        });
+
+        // Read the current test-mode label (if any) to pre-select the default.
+        let current_mode = issue
+            .all_labels
+            .iter()
+            .find(|l| l.starts_with("test-mode:"))
+            .map(|l| l.trim_start_matches("test-mode:").to_string());
+
+        // #685: arm the test-mode choice dialog.  The dialog's confirm path
+        // will call `dispatch_pipeline_work_with_mode` with the chosen mode.
+        self.pending_test_mode_choice = Some(PendingTestModeChoice {
+            coord_repo,
+            repo_slug: issue.repo_slug.clone(),
+            issue_num: issue.number,
+            action: TestModeChoiceAction::DispatchWork,
+            current_mode,
+            machine_name,
+            model_override: model_str,
+        });
+        true
+    }
+
+    /// #685: called by the test-mode dialog confirm path.  Dispatches the
+    /// headless Work assignment after `coord set-test-mode` has run.
+    fn dispatch_pipeline_work_with_mode(
+        &mut self,
+        coord_repo: &str,
+        issue_num: u64,
+        machine_name: Option<&str>,
+        model_override: Option<&str>,
+    ) -> bool {
+        use crate::commands::SpawnQueuedOutcome;
+
+        // Resolve the issue from pipeline_issues to check for a done plan.
+        let issue_clone = self
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == issue_num && i.coord_repo.as_deref() == Some(coord_repo))
+            .cloned();
+
+        // If a done plan exists for this issue, approve it.
+        if let Some(ref issue) = issue_clone {
+            if let Some(plan_id) = self.find_done_plan_assignment_id(issue, coord_repo) {
+                let outcome = self.command_runner.spawn_queued(&["approve-plan", &plan_id]);
+                match outcome {
+                    SpawnQueuedOutcome::Started => {
+                        self.pipeline_status = Some((
+                            format!(
+                                "approving plan {} → dispatching work for #{}",
+                                &plan_id[..plan_id.len().min(8)],
+                                issue_num
+                            ),
+                            Instant::now(),
+                        ));
+                    }
+                    SpawnQueuedOutcome::Queued => {
+                        self.push_toast(
+                            "⏳ Queued",
+                            "approve-plan runs after current command",
+                            ToastSeverity::Info,
+                        );
+                    }
+                    SpawnQueuedOutcome::Deduped => {}
                 }
-                SpawnQueuedOutcome::Queued => {
-                    self.push_toast(
-                        "⏳ Queued",
-                        "approve-plan runs after current command",
-                        ToastSeverity::Info,
-                    );
-                }
-                SpawnQueuedOutcome::Deduped => {}
+                return matches!(
+                    outcome,
+                    SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+                );
             }
-            return matches!(
-                outcome,
-                SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
-            );
         }
 
-        let Some(machine) = self.best_machine_for(&coord_repo) else {
+        let Some(mn) = machine_name else {
             self.pipeline_status = Some((
-                format!(
-                    "no reachable machine for {} — queued (issue #{})",
-                    coord_repo, issue.number
-                ),
+                format!("no machine for {} (issue #{})", coord_repo, issue_num),
                 Instant::now(),
             ));
             return false;
         };
-        let machine_name = machine.name.clone();
-        let issue_str = issue.number.to_string();
-        // Inject session-level model override when the user configured one for
-        // this machine in Settings → Dispatch → Per-Machine Model Overrides.
-        let model_str = self
-            .settings
-            .machine_model
-            .get(&machine_name)
-            .map(|p| p.as_str().to_string());
-        let mut cmd: Vec<String> = vec![
-            "assign".into(),
-            machine_name.clone(),
-            coord_repo.clone(),
-            issue_str.clone(),
-        ];
-        if let Some(ref m) = model_str {
+
+        let issue_str = issue_num.to_string();
+        let mut cmd: Vec<String> =
+            vec!["assign".into(), mn.to_string(), coord_repo.to_string(), issue_str];
+        if let Some(m) = model_override {
             cmd.push("--model".into());
-            cmd.push(m.clone());
+            cmd.push(m.to_string());
         }
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        use crate::commands::SpawnQueuedOutcome;
         let outcome = self.command_runner.spawn_queued(&cmd_refs);
         match outcome {
             SpawnQueuedOutcome::Started => {
                 self.pipeline_status = Some((
-                    format!("dispatched #{} → {}", issue.number, machine_name),
+                    format!("dispatched #{} → {}", issue_num, mn),
                     Instant::now(),
                 ));
             }
@@ -16978,6 +17073,33 @@ impl CoordApp {
                     ContextMenuItem::action("start-with-plan", "Plan"),
                 ];
                 items.push(ContextMenuItem::parent("Start (automated)", automated_children));
+
+                // #685: "Set test mode" — pick smoke vs auto policy for headless Work.
+                if let Some(num) = issue_number {
+                    // Find current mode from pipeline issue labels.
+                    let current_mode = self
+                        .pipeline_issues
+                        .iter()
+                        .find(|iss| iss.number == num)
+                        .and_then(|iss| {
+                            if iss.all_labels.iter().any(|l| l == "test-mode:auto") {
+                                Some("auto")
+                            } else if iss.all_labels.iter().any(|l| l == "test-mode:smoke") {
+                                Some("smoke")
+                            } else {
+                                None
+                            }
+                        });
+                    let mode_suffix = match current_mode {
+                        Some("auto") => " (auto)",
+                        Some("smoke") => " (smoke)",
+                        _ => "",
+                    };
+                    items.push(ContextMenuItem::action(
+                        "set-test-mode",
+                        &format!("Set test mode…{}", mode_suffix),
+                    ));
+                }
             }
             // #628: "Chat about issue" on EVERY pipeline row, any lifecycle — a
             // human-attended session seeded with the issue's data: ask
@@ -17909,6 +18031,68 @@ impl CoordApp {
             });
         }
 
+        // ── #685: Test-mode choice (headless Work/Plan start or right-click flip)
+        if let Some(ref p) = self.pending_test_mode_choice {
+            let is_smoke_default = p
+                .current_mode
+                .as_deref()
+                .map(|m| m != "auto")
+                .unwrap_or(true); // default is smoke
+            let action_label = match p.action {
+                TestModeChoiceAction::DispatchWork => "starting Work",
+                TestModeChoiceAction::SetOnly => "this issue",
+            };
+            let smoke_label = if is_smoke_default {
+                "1 ⏎  Pause for my smoke test (default)".to_string()
+            } else {
+                "1    Pause for my smoke test".to_string()
+            };
+            let auto_label = if !is_smoke_default {
+                "2 ⏎  Fully automated (default)".to_string()
+            } else {
+                "2    Fully automated".to_string()
+            };
+            return Some(Dialog {
+                id: WidgetId::new("dialog:test-mode-choice"),
+                title: StyledText::plain(format!(
+                    "Test mode for {} #{} ({})",
+                    p.coord_repo, p.issue_num, action_label,
+                )),
+                body: vec![
+                    StyledText::plain(format!(
+                        "When headless Work completes, how should the Test gate proceed for #{}?",
+                        p.issue_num,
+                    )),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("mode:smoke"),
+                        label: smoke_label,
+                        is_default: is_smoke_default,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("mode:auto"),
+                        label: auto_label,
+                        is_default: !is_smoke_default,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: true,
+                input: None,
+            });
+        }
+
         // ── Artifact-pull result (#532) ─────────────────────────────────────
         // Info dialog shown after `coord pull-artifact` completes, and
         // re-openable at any time by pressing `a` on the same pipeline row.
@@ -18061,6 +18245,8 @@ impl CoordApp {
     fn dismiss_prompt_dialog(&mut self) {
         if self.pending_quit_confirm {
             self.pending_quit_confirm = false;
+        } else if self.pending_test_mode_choice.is_some() {
+            self.pending_test_mode_choice = None;
         } else if self.pending_auto_review.is_some() {
             self.pending_auto_review = None;
         } else if self.pending_stage_launch.is_some() {
@@ -18142,6 +18328,24 @@ impl CoordApp {
                 self.confirm_rework();
             } else {
                 self.pending_rework = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #685: test-mode choice ────────────────────────────────────────
+        if self.pending_test_mode_choice.is_some() {
+            let mode = match id {
+                "mode:smoke" => Some("smoke"),
+                "mode:auto" => Some("auto"),
+                _ => None, // "cancel" or anything else → dismiss
+            };
+            if let Some(mode) = mode {
+                if let Some(choice) = self.pending_test_mode_choice.take() {
+                    self.confirm_test_mode_choice(choice, mode);
+                }
+            } else {
+                self.pending_test_mode_choice = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -20877,6 +21081,18 @@ impl CoordApp {
                 }
                 true
             }
+            // #685: open the test-mode choice dialog (SetOnly — no dispatch).
+            "set-test-mode" => {
+                let result = self.arm_set_test_mode_for_selected();
+                if !result {
+                    self.push_toast(
+                        "Set test mode",
+                        "No issue selected or no repo mapping found.",
+                        ToastSeverity::Warning,
+                    );
+                }
+                true
+            }
             _ => {
                 self.push_toast(
                     "Unknown context-menu action",
@@ -23452,6 +23668,7 @@ impl CoordApp {
             || self.pending_rework.is_some()
             || self.pending_test_fix.is_some()
             || self.pending_merge.is_some()
+            || self.pending_test_mode_choice.is_some()
     }
 
     /// True when the Pipeline detail Terminal tab is showing a LIVE (not
@@ -23668,6 +23885,171 @@ impl CoordApp {
                 self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Test);
             }
         }
+    }
+
+    /// #685: arm the test-mode choice dialog in SetOnly mode (right-click flip).
+    fn arm_set_test_mode_for_selected(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(coord_repo) = issue.coord_repo.clone() else {
+            return false;
+        };
+        let current_mode = issue
+            .all_labels
+            .iter()
+            .find(|l| l.starts_with("test-mode:"))
+            .map(|l| l.trim_start_matches("test-mode:").to_string());
+        self.pending_test_mode_choice = Some(PendingTestModeChoice {
+            coord_repo,
+            repo_slug: issue.repo_slug.clone(),
+            issue_num: issue.number,
+            action: TestModeChoiceAction::SetOnly,
+            current_mode,
+            machine_name: None,
+            model_override: None,
+        });
+        true
+    }
+
+    /// #685: confirm the test-mode choice dialog.
+    ///
+    /// 1. Queues `coord set-test-mode <repo_slug> <issue> <mode>` to persist
+    ///    the label on the GitHub issue.
+    /// 2. For `DispatchWork`, queues the dispatch command so that it runs
+    ///    automatically after the label update completes.
+    fn confirm_test_mode_choice(&mut self, choice: PendingTestModeChoice, mode: &str) {
+        use crate::commands::SpawnQueuedOutcome;
+
+        // Step 1: persist the label.
+        let set_mode_cmd = vec![
+            "set-test-mode".to_string(),
+            choice.repo_slug.clone(),
+            choice.issue_num.to_string(),
+            mode.to_string(),
+        ];
+        let set_cmd_refs: Vec<&str> = set_mode_cmd.iter().map(|s| s.as_str()).collect();
+        let label_outcome = self.command_runner.spawn_queued(&set_cmd_refs);
+
+        // Step 2: dispatch work if requested (queues after the label update).
+        let dispatched = match choice.action {
+            TestModeChoiceAction::DispatchWork => {
+                self.dispatch_pipeline_work_with_mode(
+                    &choice.coord_repo.clone(),
+                    choice.issue_num,
+                    choice.machine_name.as_deref(),
+                    choice.model_override.as_deref(),
+                )
+            }
+            TestModeChoiceAction::SetOnly => {
+                // Label-only flip (right-click "Set test mode") — no dispatch.
+                true
+            }
+        };
+
+        let mode_verb = if mode == "smoke" { "smoke (pause for testing)" } else { "auto (fully automated)" };
+        if dispatched || matches!(choice.action, TestModeChoiceAction::SetOnly) {
+            match label_outcome {
+                SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued => {
+                    self.pipeline_status = Some((
+                        format!(
+                            "#{} test mode → {} (label updating…)",
+                            choice.issue_num, mode_verb,
+                        ),
+                        Instant::now(),
+                    ));
+                }
+                SpawnQueuedOutcome::Deduped => {}
+            }
+        }
+    }
+
+    /// #685: scan for completed headless (non-interactive) work assignments
+    /// whose issue carries the `test-mode:smoke` label and no test verdict yet.
+    ///
+    /// When found, raises a `PendingStageLaunch { kind: Test }` so the TUI
+    /// offers the interactive smoke agent (same UX as interactive Work → Test).
+    /// Tracks already-offered IDs in `offered_smoke_for_headless_work` so the
+    /// offer fires exactly once per work assignment.
+    fn detect_headless_smoke_work_done(&mut self) -> bool {
+        if self.stage_prompt_open() {
+            return false;
+        }
+        // Build a quick lookup: coord_repo → label list for pipeline issues.
+        // We match by (repo_slug, issue_number) to check the test-mode label.
+        let issue_label_map: std::collections::HashMap<(String, u64), Vec<String>> = self
+            .pipeline_issues
+            .iter()
+            .map(|iss| ((iss.repo_slug.clone(), iss.number), iss.all_labels.clone()))
+            .collect();
+
+        let fire = self.data.assignments.iter().find_map(|a| {
+            // Must be a completed (done) non-interactive work assignment.
+            if a.status != "done" {
+                return None;
+            }
+            if a.assignment_type.as_deref().unwrap_or("work") != "work" {
+                return None;
+            }
+            if a.is_interactive {
+                return None; // interactive work is handled by detect_completed_interactive_work
+            }
+            let aid = &a.id;
+            if self.offered_smoke_for_headless_work.contains(aid) {
+                return None; // already offered
+            }
+            if a.test_state.is_some() {
+                return None; // test verdict already recorded
+            }
+            // Check that this issue has the test-mode:smoke label.
+            // We match by (repo_slug, issue_number).
+            let repo_slug = self
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(coord_name, _)| coord_name == &a.repo)
+                .map(|(_, slug)| slug.clone());
+            let slug = repo_slug.as_deref().unwrap_or(&a.repo);
+            let labels = issue_label_map.get(&(slug.to_string(), a.issue_number));
+            let is_smoke_mode = labels
+                .map(|lbls| lbls.iter().any(|l| l == "test-mode:smoke"))
+                .unwrap_or(false);
+            if !is_smoke_mode {
+                return None;
+            }
+            // Don't fire over a live pane (same guard as detect_completed_interactive_work).
+            if self.session_pane_live(&(slug.to_string(), a.issue_number)) {
+                return None;
+            }
+            // Check no review has been dispatched yet.
+            let coord_repo = self
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(_, rs)| rs == slug)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| a.repo.clone());
+            if self.work_has_review(&coord_repo, a.issue_number, aid) {
+                return None;
+            }
+            Some((aid.clone(), coord_repo, slug.to_string(), a.issue_number))
+        });
+
+        if let Some((aid, coord_repo, repo_slug, issue_num)) = fire {
+            self.offered_smoke_for_headless_work.insert(aid);
+            self.detail_terminal_focused = false;
+            self.pending_stage_launch = Some(PendingStageLaunch {
+                coord_repo,
+                repo_slug,
+                issue_num,
+                kind: StageLaunchKind::Test,
+            });
+            return true;
+        }
+        false
     }
 
     /// #486 Leg 4: fleet machines that can run `repo`, ordered local-first,
@@ -26647,6 +27029,39 @@ impl ShellApp for CoordApp {
         let list_b = ctx.sidebar_bounds().unwrap_or(ctx.main_bounds());
         let lh = backend.line_height();
 
+        // ── #685: Test-mode choice dialog ─────────────────────────────────────
+        // 1/Enter = default (smoke or existing mode), 2 = the other option, Esc = cancel.
+        if self.pending_test_mode_choice.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                let chosen: Option<&str> = match key {
+                    Key::Named(NamedKey::Enter) => {
+                        // Enter confirms the default (pre-selected) option.
+                        let is_smoke_default = self
+                            .pending_test_mode_choice
+                            .as_ref()
+                            .map(|p| p.current_mode.as_deref().map(|m| m != "auto").unwrap_or(true))
+                            .unwrap_or(true);
+                        if is_smoke_default { Some("smoke") } else { Some("auto") }
+                    }
+                    Key::Char('1') => Some("smoke"),
+                    Key::Char('2') => Some("auto"),
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_test_mode_choice = None;
+                        *self.dialog_layout.borrow_mut() = None;
+                        return Reaction::Redraw;
+                    }
+                    _ => None,
+                };
+                if let Some(mode) = chosen {
+                    if let Some(choice) = self.pending_test_mode_choice.take() {
+                        self.confirm_test_mode_choice(choice, mode);
+                    }
+                    *self.dialog_layout.borrow_mut() = None;
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #486 Leg 4: Pending fleet-machine picker ───────────────────────────
         // Armed for a remote Review/Fix launch when >1 machine can run the repo.
         // Numeric keys (1, 2, …) pick the machine and launch; Esc cancels.
@@ -28632,6 +29047,10 @@ impl ShellApp for CoordApp {
         // finished (board-driven — never scrapes the session TTY) and, if
         // so, raise the one-key confirm prompt to start its review.
         needs_redraw |= self.detect_completed_interactive_work();
+        // ── #685: headless work with test-mode:smoke → interactive smoke ──
+        // When headless Work completes on an issue carrying test-mode:smoke,
+        // raise the interactive-smoke offer (same UX as interactive Work → Test).
+        needs_redraw |= self.detect_headless_smoke_work_done();
         // ── Leg 3 (#517): verdict-driven routing ────────────────────────
         // Route a freshly-reported review verdict: request-changes → rework
         // prompt; approve → smoke/merge notice.  Board-driven, never scraped.
@@ -30320,6 +30739,9 @@ mod tests {
             armed_for_auto_review: std::collections::HashMap::new(),
             pending_auto_review: None,
             pending_stage_launch: None,
+            // #685: per-issue test-mode policy choice dialog.
+            pending_test_mode_choice: None,
+            offered_smoke_for_headless_work: std::collections::HashSet::new(),
             // Leg 3 (#517)
             armed_for_verdict: std::collections::HashMap::new(),
             pending_rework: None,
