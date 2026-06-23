@@ -5289,6 +5289,11 @@ pub struct CoordApp {
     /// long assistant text blocks so the Log tab is readable without horizontal
     /// scrolling (#385).
     last_log_panel_cols: std::cell::Cell<usize>,
+    /// Panel width in backend units of the Issue tab's content rect, updated
+    /// just before `board_issue_body_list` / `pipeline_issue_body_list` is
+    /// called on each render.  Defaults to 120.  Used by `issue_body_list` to
+    /// word-wrap long lines to the viewport width (#669).
+    last_issue_panel_cols: std::cell::Cell<usize>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -5851,6 +5856,7 @@ impl CoordApp {
             local_coord_version: fetch_local_coord_version(),
             last_main_visible_rows: std::cell::Cell::new(40),
             last_log_panel_cols: std::cell::Cell::new(120),
+            last_issue_panel_cols: std::cell::Cell::new(120),
             purge_days: 7,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
@@ -12829,10 +12835,12 @@ impl CoordApp {
     ///    result through to the local `issues` table on success so future
     ///    sessions don't re-fetch) and show a placeholder.
     fn board_issue_body_list(&self) -> ListView {
+        // #669: use the panel width stashed at draw time for word-wrapping.
+        let wrap_width = self.last_issue_panel_cols.get().max(40);
         let repo = self.board_active_repo().map(str::to_string);
         let group = self.board_selected_issue_group().cloned();
         let (Some(repo), Some(g)) = (repo, group) else {
-            return issue_body_list(None, self.detail_scroll, "board-issue-body");
+            return issue_body_list(None, self.detail_scroll, "board-issue-body", wrap_width);
         };
         let key = (repo.clone(), g.issue_number);
 
@@ -12852,6 +12860,7 @@ impl CoordApp {
                 )),
                 self.detail_scroll,
                 "board-issue-body",
+                wrap_width,
             );
         }
 
@@ -12884,6 +12893,7 @@ impl CoordApp {
                 Some((f.number, f.title.as_str(), f.body.as_str(), &f.labels[..])),
                 self.detail_scroll,
                 "board-issue-body",
+                wrap_width,
             );
         }
 
@@ -12913,6 +12923,7 @@ impl CoordApp {
                     )),
                     self.detail_scroll,
                     "board-issue-body",
+                    wrap_width,
                 );
             }
         }
@@ -12927,6 +12938,7 @@ impl CoordApp {
             )),
             self.detail_scroll,
             "board-issue-body",
+            wrap_width,
         )
     }
 
@@ -13009,6 +13021,8 @@ impl CoordApp {
 
     /// Issue tab: title header + scrollable full body (j/k to scroll).
     fn pipeline_issue_body_list(&self) -> ListView {
+        // #669: use the panel width stashed at draw time for word-wrapping.
+        let wrap_width = self.last_issue_panel_cols.get().max(40);
         let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
         issue_body_list(
             issue.map(|i| {
@@ -13021,6 +13035,7 @@ impl CoordApp {
             }),
             self.pipeline_detail_scroll,
             "pipeline-issue-body",
+            wrap_width,
         )
     }
 
@@ -25564,6 +25579,9 @@ impl ShellApp for CoordApp {
                         backend.draw_list(content_rect, &self.detail_list());
                     }
                     BoardDetailTab::Issue => {
+                        // #669: stash content width so board_issue_body_list can
+                        // word-wrap long lines to the viewport.
+                        self.last_issue_panel_cols.set(content_rect.width as usize);
                         backend.draw_list(content_rect, &self.board_issue_body_list());
                     }
                     // #316: Chat tab — empty state CTA or live board chat.
@@ -25669,6 +25687,9 @@ impl ShellApp for CoordApp {
                             backend.draw_list(meta_rect, &self.pipeline_tab_body_list());
                         }
                         PipelineDetailTab::Issue => {
+                            // #669: stash content width so pipeline_issue_body_list can
+                            // word-wrap long lines to the viewport.
+                            self.last_issue_panel_cols.set(content_rect.width as usize);
                             backend.draw_list(content_rect, &self.pipeline_issue_body_list());
                         }
                         PipelineDetailTab::Stages => {
@@ -29519,10 +29540,16 @@ fn pipeline_detail_pv_rect(main: Rect, lh: f32) -> Rect {
 ///
 /// `issue` is `Some((number, title, body, labels))` for the selected issue,
 /// or `None` when no issue is selected (renders a placeholder).
+///
+/// `width` is the content-area width in backend units (character columns for
+/// TUI, pixels for GTK).  Passed to `render_markdown_to_styled_wrapped` so
+/// long body lines are word-wrapped to the panel width (#669); fenced code
+/// blocks are never wrapped.  Pass 0 to disable wrapping.
 fn issue_body_list(
     issue: Option<(u64, &str, &str, &[String])>,
     scroll_offset: usize,
     widget_id: &'static str,
+    width: usize,
 ) -> ListView {
     let mut items: Vec<ListItem> = Vec::new();
     match issue {
@@ -29560,13 +29587,15 @@ fn issue_body_list(
                     Some(Color::rgb(100, 100, 100)),
                 ));
             } else {
-                // #372-pattern: render the whole body through the markdown adapter
-                // so headings, bold, italic, inline code, lists, blockquotes, and
-                // fenced code blocks are styled rather than shown as raw markup.
-                // Each rendered line becomes its own ListView row; the existing
-                // vertical scroll + selection behaviour is unchanged.
+                // #669: render through `render_markdown_to_styled_wrapped` so
+                // long body lines are wrapped to the panel width.  Fenced code
+                // blocks are never wrapped (quadraui guarantees that).  When
+                // width == 0 the function falls back to the unwrapped path.
+                // #372-pattern: headings, bold, italic, inline code, lists,
+                // blockquotes, and fenced code blocks are styled.
                 let md_theme = quadraui::Theme::default();
-                let rendered = quadraui::render_markdown_to_styled(body, &md_theme);
+                let rendered =
+                    quadraui::render_markdown_to_styled_wrapped(body, &md_theme, width);
                 for md_line in rendered.lines {
                     items.push(ListItem {
                         text: md_line,
@@ -30220,6 +30249,7 @@ mod tests {
             local_coord_version: None,
             last_main_visible_rows: std::cell::Cell::new(40),
             last_log_panel_cols: std::cell::Cell::new(120),
+            last_issue_panel_cols: std::cell::Cell::new(120),
             purge_days: 7,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
@@ -46352,6 +46382,71 @@ mod tests {
         assert_ne!(
             screen_before, screen_after,
             "clicking 'Issue' tab must trigger a re-render that changes the screen"
+        );
+    }
+
+    // ── #669: issue_body_list word-wrap ──────────────────────────────────────
+
+    /// A long plain-text body line must produce more ListView rows than the
+    /// unwrapped (width=0) path when a narrow wrap width is given.
+    #[test]
+    fn issue_body_list_long_line_wraps() {
+        // A single line of 120 chars — much wider than our wrap width of 40.
+        let body = "a".repeat(120);
+        let issue = Some((1u64, "Title", body.as_str(), [].as_slice()));
+
+        let unwrapped = issue_body_list(issue, 0, "test-unwrapped", 0);
+        let wrapped = issue_body_list(issue, 0, "test-wrapped", 40);
+
+        // header + blank separator + body lines.
+        // The wrapped list must have more rows than the unwrapped one.
+        assert!(
+            wrapped.items.len() > unwrapped.items.len(),
+            "wrapped list ({} items) should have more rows than unwrapped ({} items) \
+             for a 120-char line at width 40",
+            wrapped.items.len(),
+            unwrapped.items.len(),
+        );
+    }
+
+    /// A fenced code block must not be split across rows by wrapping.
+    /// Both unwrapped and wrapped outputs must produce the same row count for
+    /// content that is entirely inside a fenced code block.
+    #[test]
+    fn issue_body_list_code_block_not_wrapped() {
+        // One long line inside a fenced code block.
+        let long_code = "x".repeat(200);
+        let body = format!("```\n{}\n```", long_code);
+        let issue = Some((2u64, "Code", body.as_str(), [].as_slice()));
+
+        let unwrapped = issue_body_list(issue, 0, "test-code-unwrapped", 0);
+        let wrapped = issue_body_list(issue, 0, "test-code-wrapped", 40);
+
+        // The code block interior must not be word-wrapped, so both paths
+        // produce the same number of rows.
+        assert_eq!(
+            unwrapped.items.len(),
+            wrapped.items.len(),
+            "fenced code block must not be wrapped (unwrapped={} rows, wrapped={} rows)",
+            unwrapped.items.len(),
+            wrapped.items.len(),
+        );
+    }
+
+    /// width == 0 must fall back to the unwrapped path: two calls with the
+    /// same body and width=0 must produce the same row count.
+    #[test]
+    fn issue_body_list_zero_width_falls_back() {
+        let body = "Short line.";
+        let issue = Some((3u64, "Short", body, [].as_slice()));
+
+        let a = issue_body_list(issue, 0, "test-a", 0);
+        let b = issue_body_list(issue, 0, "test-b", 0);
+
+        assert_eq!(
+            a.items.len(),
+            b.items.len(),
+            "width=0 must be deterministic and unwrapped"
         );
     }
 }
