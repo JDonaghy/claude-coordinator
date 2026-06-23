@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -409,9 +409,6 @@ machines:
 reviews:
   enabled: false
 """
-
-_CLEAN_VERIFY = None  # filled in each test via MagicMock
-
 
 class TestVerifyMergeCli:
     """CLI routing tests for ``coord verify-merge`` (#681)."""
