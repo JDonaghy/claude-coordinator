@@ -45478,4 +45478,118 @@ mod tests {
             "per-column scroll offset must survive rebuild_board_sidebar"
         );
     }
+
+    // ── TuiDriver black-box screen tests (#690 slice 1) ──────────────────────
+    //
+    // These tests drive a real CoordApp through the full
+    // `ShellApp → ShellAdapter → paint → hit_test → handle → render` pipeline
+    // using quadraui's `TuiDriver` against a headless `TestBackend`.  No live
+    // daemon, no network, no disk I/O beyond the graceful no-op in
+    // `read_paused_machines`.
+    //
+    // All three tests use the high-level API (`find` / `screen_contains`) with
+    // no hardcoded coordinates (quadraui policy).
+
+    /// Test 1 — list rendering: a running (in-flight) assignment causes its
+    /// milestone group to auto-expand in the Board sidebar.  The issue title
+    /// must appear in the painted grid before any interaction.
+    #[test]
+    fn driver_board_shows_in_flight_issue_in_sidebar() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_app_with_assignments(vec![make_assignment_typed(
+            "running",
+            10,
+            "myrepo",
+            Some("work"),
+        )]);
+        app.rebuild_board_sidebar();
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        let screen = driver.screen();
+        assert!(
+            driver.screen_contains("Issue 10"),
+            "in-flight issue title must appear in Board sidebar:\n{screen}"
+        );
+    }
+
+    /// Test 2 — issue-detail rendering (most important, covers the #669 path):
+    /// construct a board with a known issue body, drive to the Board detail
+    /// "Issue" tab, and assert the body renders.  Exercises `issue_body_list`
+    /// end-to-end (paint → hit_test → handle → render).
+    #[test]
+    fn driver_board_issue_body_renders_on_issue_tab() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // A marker substring that will only appear if the body actually renders.
+        const BODY_NEEDLE: &str = "deterministic-render-algo";
+
+        // Running assignment → milestone auto-expanded so the issue is visible.
+        let mut app = make_app_with_assignments(vec![make_assignment_typed(
+            "running",
+            7,
+            "bodyrepo",
+            Some("work"),
+        )]);
+        // Populate the open_issues cache so board_issue_body_list takes the
+        // fast path (layer 1: synced row) and never spawns a gh subprocess.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "bodyrepo".to_string(),
+            number: 7,
+            title: "Issue 7".to_string(),
+            body: format!("This feature needs the {BODY_NEEDLE} in place."),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        app.rebuild_board_sidebar();
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        // The issue title is visible in the sidebar because the milestone is
+        // auto-expanded (running assignment → in-flight → m_has_inflight=true).
+        // Use find() so we click the actual painted coordinates, not hardcoded
+        // offsets (quadraui policy).
+        let (x, y) = driver
+            .find("Issue 7")
+            .unwrap_or_else(|| panic!(
+                "issue title must be visible in Board sidebar:\n{}",
+                driver.screen()
+            ));
+        driver.click(x, y);
+
+        // 'l' / Right cycles Board detail tabs: Board → Issue → Chat.
+        // We're starting on the default Board tab, so one press reaches Issue.
+        driver.type_char('l');
+
+        let screen = driver.screen();
+        assert!(
+            driver.screen_contains(BODY_NEEDLE),
+            "issue body must render on the Issue tab:\n{screen}"
+        );
+    }
+
+    /// Test 3 — event round-trip: pressing '2' changes `active_view` to
+    /// Machines, triggers a redraw, and the rendered screen visibly differs.
+    /// Proves the real event → handle → render path, not just a static paint.
+    #[test]
+    fn driver_pressing_2_switches_board_to_machines_view() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut driver = driver_with_shell(
+            make_test_app(BoardData::default()),
+            CoordApp::shell_config(),
+            160,
+            40,
+        );
+        let before = driver.screen();
+        driver.type_char('2');
+        let after = driver.screen();
+        assert_ne!(
+            before,
+            after,
+            "pressing '2' must change the rendered screen (Board → Machines view)"
+        );
+    }
 }
