@@ -72,17 +72,28 @@ class TestClaudeFails:
         mock_result.stderr = "claude error: no subscription"
 
         with patch("coord.brain.subprocess.run", return_value=mock_result):
-            with pytest.raises(RuntimeError, match="claude -p failed"):
+            # Error message is now provider-agnostic ("brain provider call failed")
+            # because call_claude can route through any configured backend.
+            with pytest.raises(RuntimeError, match="brain provider call failed"):
                 call_claude("system", "user")
 
-    def test_invalid_json_response_raises(self) -> None:
+    def test_invalid_json_response_returns_raw_stdout(self) -> None:
+        """Non-JSON output is now returned as raw stdout rather than raising.
+
+        call_claude was updated to fall back to raw stdout when the provider
+        does not emit a claude-style ``{"result": ...}`` JSON envelope.  This
+        allows non-claude backends (e.g. OpenCodeProvider) to return their
+        native output without the brain raising.  For the default ClaudeProvider
+        the JSON failure is unusual but handled gracefully.
+        """
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = "not json at all"
 
         with patch("coord.brain.subprocess.run", return_value=mock_result):
-            with pytest.raises(json.JSONDecodeError):
-                call_claude("system", "user")
+            result = call_claude("system", "user")
+
+        assert result == "not json at all"
 
     def test_subprocess_timeout_raises(self) -> None:
         with patch(

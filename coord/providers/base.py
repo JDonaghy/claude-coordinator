@@ -178,3 +178,41 @@ class Provider(ABC):
     def capabilities(self) -> Capabilities:
         """Return a descriptor of what this provider can actually do."""
         ...
+
+    @abstractmethod
+    def oneshot_command(
+        self,
+        *,
+        system_prompt: str,
+        output_format: str | None = "json",
+    ) -> list[str]:
+        """Return the argv for a non-looping, one-shot prompt call.
+
+        This is distinct from :meth:`build_command`, which produces the
+        streaming worker command (``--input-format stream-json``, etc.).
+        One-shot calls are used by coordinator-side code — brain planning
+        and the dashboard assistant — that needs a single prompt/response
+        round, not a full streaming worker session.
+
+        The caller is responsible for piping the user message via *stdin*
+        (for :class:`~.claude.ClaudeProvider`).  Providers where stdin
+        delivery is not applicable (e.g.
+        :class:`~.opencode.OpenCodeProvider`) silently ignore the user
+        message and the *output_format* kwarg; callers should document
+        that the one-shot path is best-effort for those backends.
+
+        Args:
+            system_prompt: The system prompt for the call.
+            output_format: Requested output format.  ``"json"`` asks for a
+                structured JSON response (as the brain expects);
+                ``None`` omits any output-format flag so the backend
+                streams plain text (used by the dashboard assistant).
+                Providers that do not support the requested format
+                silently ignore this kwarg.
+
+        Returns:
+            A list of strings suitable for passing to
+            :func:`subprocess.run` or
+            :func:`asyncio.create_subprocess_exec`.
+        """
+        ...

@@ -154,6 +154,42 @@ class ClaudeProvider(Provider):
             argv.extend(["--resume", spec.resume_session_id])
         return argv
 
+    def oneshot_command(
+        self,
+        *,
+        system_prompt: str,
+        output_format: str | None = "json",
+    ) -> list[str]:
+        """Build the argv for a one-shot ``claude -p`` call.
+
+        Returns ``[binary, "-p", "--system-prompt", system_prompt]`` plus
+        ``["--output-format", output_format]`` when *output_format* is
+        non-``None``.
+
+        Unlike :meth:`build_command`, this does **not** add
+        ``--input-format stream-json``, ``--verbose``,
+        ``--allowedTools``, or ``--permission-mode`` — those flags are
+        only meaningful for streaming worker sessions.
+
+        The user message is expected to arrive via *stdin* (the caller
+        passes ``input=`` to :func:`subprocess.run` or writes to
+        ``proc.stdin`` in the async path).
+
+        Args:
+            system_prompt: The system prompt for the one-shot call.
+            output_format: Output format flag value.  ``"json"`` produces
+                ``--output-format json`` (brain planning expects this so
+                it can extract the ``result`` field from the outer JSON
+                object).  ``None`` omits the flag (dashboard assistant
+                streams the raw text response line-by-line).
+        """
+        from coord.agent import DEFAULT_WORKER_BINARY  # noqa: PLC0415
+        binary = self._binary if self._binary is not None else DEFAULT_WORKER_BINARY
+        cmd = [binary, "-p", "--system-prompt", system_prompt]
+        if output_format is not None:
+            cmd.extend(["--output-format", output_format])
+        return cmd
+
     def initial_input(self, spec: "AssignmentSpec") -> bytes:
         """Return the briefing encoded as a stream-json user message."""
         from coord.agent import _user_message_line  # noqa: PLC0415

@@ -823,3 +823,95 @@ def test_build_provider_error_message_lists_opencode() -> None:
     defn = ProviderDef(type="mystery-backend")
     with pytest.raises(ValueError, match="opencode"):
         build_provider("x", defn, None)
+
+
+# ── oneshot_command: ClaudeProvider ──────────────────────────────────────────
+
+
+def test_claude_oneshot_command_default_json_format() -> None:
+    """Default call returns [..., '--output-format', 'json'] for brain use."""
+    cmd = ClaudeProvider().oneshot_command(system_prompt="sys")
+    assert cmd[0] == "claude"
+    assert "-p" in cmd
+    assert "--system-prompt" in cmd
+    idx = cmd.index("--system-prompt")
+    assert cmd[idx + 1] == "sys"
+    assert "--output-format" in cmd
+    oi = cmd.index("--output-format")
+    assert cmd[oi + 1] == "json"
+
+
+def test_claude_oneshot_command_no_output_format() -> None:
+    """output_format=None omits --output-format (dashboard streaming path)."""
+    cmd = ClaudeProvider().oneshot_command(system_prompt="sys", output_format=None)
+    assert "--output-format" not in cmd
+
+
+def test_claude_oneshot_command_custom_output_format() -> None:
+    """Custom output_format value is forwarded verbatim."""
+    cmd = ClaudeProvider().oneshot_command(system_prompt="sp", output_format="text")
+    assert "--output-format" in cmd
+    oi = cmd.index("--output-format")
+    assert cmd[oi + 1] == "text"
+
+
+def test_claude_oneshot_command_no_stream_flags() -> None:
+    """oneshot_command must NOT include stream-json worker flags."""
+    cmd = ClaudeProvider().oneshot_command(system_prompt="sp")
+    assert "--input-format" not in cmd
+    assert "--verbose" not in cmd
+    assert "--allowedTools" not in cmd
+    assert "--permission-mode" not in cmd
+
+
+def test_claude_oneshot_command_custom_binary() -> None:
+    """ClaudeProvider(binary='my-claude') is reflected in oneshot_command."""
+    cmd = ClaudeProvider(binary="my-claude").oneshot_command(system_prompt="sp")
+    assert cmd[0] == "my-claude"
+
+
+def test_claude_oneshot_command_returns_list_of_strings() -> None:
+    """oneshot_command always returns list[str]."""
+    cmd = ClaudeProvider().oneshot_command(system_prompt="sp")
+    assert isinstance(cmd, list)
+    for item in cmd:
+        assert isinstance(item, str)
+
+
+# ── oneshot_command: OpenCodeProvider ────────────────────────────────────────
+
+
+def test_opencode_oneshot_command_returns_run_subcommand() -> None:
+    """OpenCode oneshot uses 'run' subcommand (best-effort headless mode)."""
+    cmd = OpenCodeProvider().oneshot_command(system_prompt="sp")
+    assert cmd[0] == DEFAULT_OPENCODE_BINARY
+    assert cmd[1] == "run"
+
+
+def test_opencode_oneshot_command_ignores_system_prompt() -> None:
+    """system_prompt is silently dropped — OpenCode has no --system-prompt."""
+    cmd = OpenCodeProvider().oneshot_command(system_prompt="My system prompt")
+    assert "--system-prompt" not in cmd
+    assert "My system prompt" not in cmd
+
+
+def test_opencode_oneshot_command_ignores_output_format() -> None:
+    """output_format is silently ignored — OpenCode has no --output-format."""
+    cmd_json = OpenCodeProvider().oneshot_command(system_prompt="sp", output_format="json")
+    cmd_none = OpenCodeProvider().oneshot_command(system_prompt="sp", output_format=None)
+    assert "--output-format" not in cmd_json
+    assert cmd_json == cmd_none
+
+
+def test_opencode_oneshot_command_custom_binary() -> None:
+    """OpenCodeProvider(binary=...) is reflected in oneshot_command."""
+    cmd = OpenCodeProvider(binary="/opt/oc").oneshot_command(system_prompt="sp")
+    assert cmd[0] == "/opt/oc"
+
+
+def test_opencode_oneshot_command_returns_list_of_strings() -> None:
+    """oneshot_command always returns list[str]."""
+    cmd = OpenCodeProvider().oneshot_command(system_prompt="sp")
+    assert isinstance(cmd, list)
+    for item in cmd:
+        assert isinstance(item, str)

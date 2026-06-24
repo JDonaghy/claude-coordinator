@@ -241,6 +241,39 @@ class ClaudePtyProvider(Provider):
             argv.extend(["--model", effective_model])
         return argv
 
+    def oneshot_command(
+        self,
+        *,
+        system_prompt: str,
+        output_format: str | None = "json",
+    ) -> list[str]:
+        """Best-effort one-shot argv for the PTY provider.
+
+        Interactive ``claude`` does not support the non-interactive ``-p``
+        mode one-shot pattern.  However, because
+        ``capabilities().human_attended_only=True``, the coordinator
+        NEVER routes brain planning or dashboard assistant calls through
+        this provider — those paths use :func:`coord.providers.build_provider`
+        and then check ``capabilities()`` before calling
+        ``oneshot_command()``.
+
+        This implementation falls back to the ``claude -p`` style argv
+        (identical to :class:`~.claude.ClaudeProvider`) as a
+        belt-and-suspenders measure so that any accidental call still
+        produces a valid command list rather than raising.
+
+        Args:
+            system_prompt: The system prompt for the call.
+            output_format: Forwarded to the argv exactly as for
+                :class:`~.claude.ClaudeProvider`.
+        """
+        from coord.agent import DEFAULT_WORKER_BINARY  # noqa: PLC0415
+        binary = self._binary if self._binary is not None else DEFAULT_WORKER_BINARY
+        cmd = [binary, "-p", "--system-prompt", system_prompt]
+        if output_format is not None:
+            cmd.extend(["--output-format", output_format])
+        return cmd
+
     def initial_input(self, spec: "AssignmentSpec") -> bytes:
         """Return the briefing wrapped in a bracketed-paste block.
 
