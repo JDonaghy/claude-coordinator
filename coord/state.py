@@ -510,14 +510,24 @@ def _record_dispatched_local(
             default precedence chain).  ``None`` for callers that predate
             #324 — the TUI shows the implicit default ("claude") when NULL.
     """
+    # #706: compute the deterministic branch name at dispatch time so the row
+    # is never branch=NULL.  Mirrors agent.py:1021 exactly:
+    #   branch_name = existing_branch or f"issue-{issue_number}-{_slugify(issue_title)}"
+    # where proposal.target_branch maps to existing_branch.
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    branch = proposal.target_branch or (
+        f"issue-{proposal.issue_number}-{_slugify(proposal.issue_title)}"
+    )
+
     conn = get_connection()
     conn.execute(
         """INSERT INTO assignments (
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, required_gates,
-            provider_name
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+            provider_name, branch
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO NOTHING""",
         (
             assignment_id,
@@ -533,6 +543,7 @@ def _record_dispatched_local(
             time.time(),
             json.dumps(list(proposal.required_gates)),
             provider_name,
+            branch,
         ),
     )
     conn.commit()
