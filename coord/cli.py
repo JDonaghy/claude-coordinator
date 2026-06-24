@@ -3256,7 +3256,14 @@ def assign(
                     "live checkout, do NOT commit, and do NOT run `gh` to mutate — "
                     "go through `coord` so the tracker stays behind the seam. "
                     "Type /update-issue at any point to synthesize what we agreed "
-                    "and write it back to the issue body."
+                    "and write it back to the issue body. "
+                    "CRITICAL — this session is diagnostic-only: do NOT run "
+                    "`coord report-result --status done` or `--status blocked` "
+                    "(you have no committed work to back a success claim, and doing "
+                    "so leaves a false-done box on the pipeline). "
+                    "For a stalled item, start with `coord diagnose <repo> <issue>` "
+                    "— it auto-recovers phantoms, orphaned worktrees, and dropped "
+                    "findings; confirm any --reset with the operator first."
                 )
                 ts_reminder = (
                     f"[Coordinator chat assignment {assignment_id}] HUMAN-ATTENDED "
@@ -3267,7 +3274,10 @@ def assign(
                     "You are in the LIVE checkout: do NOT modify files or commit "
                     "here (it is the editable coordinator + worker-worktree base); "
                     "for a code change, surface a plan so the operator can dispatch "
-                    "Work.\n\n"
+                    "Work. "
+                    "IMPORTANT: do NOT run `coord report-result --status done` — "
+                    "this session has no committed work and claiming done would "
+                    "leave a false-good-to-go box on the pipeline (#676).\n\n"
                 )
             else:
                 _ts_system_prompt = (
@@ -3276,7 +3286,14 @@ def assign(
                     "files, do NOT commit, do NOT run `gh`. Investigate the stalled "
                     "pipeline item using coord, git, and sqlite3 reads; explain "
                     "what is wrong and what will unstick it; and surface any plan "
-                    "for the operator to approve before mutating anything."
+                    "for the operator to approve before mutating anything. "
+                    "Start with `coord diagnose <repo> <issue>` — it auto-recovers "
+                    "phantoms, orphaned worktrees, and dropped findings; confirm "
+                    "any --reset with the operator first. "
+                    "CRITICAL: do NOT run `coord report-result --status done` or "
+                    "`--status blocked` — this session is diagnostic-only with no "
+                    "committed work, and claiming done leaves a false status on the "
+                    "pipeline (#676)."
                 )
                 ts_reminder = (
                     f"[Coordinator troubleshoot assignment {assignment_id}] "
@@ -3284,7 +3301,9 @@ def assign(
                     "item. You are in the LIVE checkout — do NOT modify files here "
                     "(it is the editable coordinator and the worker-worktree base). "
                     "If a code fix is needed, surface the plan so the operator can "
-                    "dispatch a proper Fix.\n\n"
+                    "dispatch a proper Fix. "
+                    "IMPORTANT: do NOT run `coord report-result --status done` — "
+                    "this session has no committed work (#676).\n\n"
                 )
             effective_briefing = _issue_ctx + ts_reminder + briefing + _ctx_write_hint
 

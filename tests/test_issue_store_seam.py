@@ -213,6 +213,83 @@ class TestPostCompletion:
             )
         assert outcome.status == "failed"
 
+    # ── #676: chat and troubleshoot sessions are diagnostic-only ──────────────
+
+    def test_chat_session_nonzero_exit_is_advisory_not_failed(self) -> None:
+        """#676: a 'chat' session that crashes or closes non-zero must NOT leave
+        a red failed box on the pipeline — it is a diagnostic, not a work unit."""
+        _seed_running_assignment("aid-chat-fail", assignment_type="chat")
+        with patch("coord.github_ops.post_issue_comment") as post:
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-chat-fail",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=1,          # non-zero — would be "failed" for work
+                    commits_ahead=0,
+                )
+            )
+        assert outcome.status == "advisory", (
+            f"chat session crash should be advisory, got {outcome.status!r}"
+        )
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("aid-chat-fail",),
+        ).fetchone()
+        assert row["status"] == "advisory"
+        # Comment is still posted so the operator sees the session ended.
+        post.assert_called_once()
+
+    def test_troubleshoot_session_clean_exit_is_advisory_not_done(self) -> None:
+        """#676: a 'troubleshoot' session with commits=None (no worktree) must not
+        be marked 'done' (which would trigger review dispatch)."""
+        _seed_running_assignment("aid-ts-clean", assignment_type="troubleshoot")
+        with patch("coord.github_ops.post_issue_comment"):
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-ts-clean",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=None,  # no worktree — would be "done" for work
+                )
+            )
+        assert outcome.status == "advisory", (
+            f"troubleshoot session should be advisory, got {outcome.status!r}"
+        )
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("aid-ts-clean",),
+        ).fetchone()
+        assert row["status"] == "advisory"
+
+    def test_chat_completion_summary_describes_diagnostic_session(self) -> None:
+        """#676: the advisory GitHub comment for a chat session names it as
+        diagnostic-only, not a generic advisory."""
+        _seed_running_assignment("aid-chat-msg", assignment_type="chat")
+        with patch("coord.github_ops.post_issue_comment") as post:
+            issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-chat-msg",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=0,
+                )
+            )
+        _repo, _issue, body = post.call_args.args
+        # The comment body should mention diagnostic-only or chat so the human
+        # knows what closed rather than seeing a generic "0 commits" advisory.
+        assert "diagnostic" in body.lower() or "chat" in body.lower(), (
+            f"expected diagnostic/chat in advisory body, got: {body[:300]!r}"
+        )
+
     def test_github_post_failure_does_not_undo_state(self) -> None:
         """Comment-post failure is non-fatal — the DB write is the
         authoritative record."""
@@ -439,6 +516,83 @@ class TestPostResult:
         ).fetchone()
         assert row["status"] == "running"
         assert row["review_verdict"] is None
+
+    # ── #676: chat / troubleshoot may not claim done or blocked ──────────────
+
+    def test_chat_session_done_status_refused(self) -> None:
+        """#676: a type=chat session must not claim 'done' — it has no committed
+        work to back a success, and doing so would fake a pipeline advance."""
+        _seed_running_assignment("aid-chat-done", assignment_type="chat")
+        with patch("coord.github_ops.post_issue_comment") as post:
+            with pytest.raises(ValueError, match="#676"):
+                issue_store.post_result(
+                    issue_store.ResultRecord(
+                        assignment_id="aid-chat-done",
+                        machine_name="laptop",
+                        repo_name="api",
+                        repo_github="acme/api",
+                        issue_number=7,
+                        status="done",
+                        verdict=None,
+                        summary="issue is good to go",
+                    )
+                )
+        # Nothing was written: no comment posted, row stays running.
+        post.assert_not_called()
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("aid-chat-done",),
+        ).fetchone()
+        assert row["status"] == "running"
+
+    def test_troubleshoot_session_blocked_status_refused(self) -> None:
+        """#676: a type=troubleshoot session must not claim 'blocked' either —
+        'blocked' → failed in the pipeline and would stall work needlessly."""
+        _seed_running_assignment("aid-ts-block", assignment_type="troubleshoot")
+        with patch("coord.github_ops.post_issue_comment") as post:
+            with pytest.raises(ValueError, match="#676"):
+                issue_store.post_result(
+                    issue_store.ResultRecord(
+                        assignment_id="aid-ts-block",
+                        machine_name="laptop",
+                        repo_name="api",
+                        repo_github="acme/api",
+                        issue_number=7,
+                        status="blocked",
+                        verdict=None,
+                        summary="can't reproduce",
+                    )
+                )
+        post.assert_not_called()
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("aid-ts-block",),
+        ).fetchone()
+        assert row["status"] == "running"
+
+    def test_chat_session_already_implemented_is_allowed(self) -> None:
+        """#676: 'already-implemented' → advisory is the one neutral signal
+        a chat session may send ('no work was needed' — not a false done)."""
+        _seed_running_assignment("aid-chat-ai", assignment_type="chat")
+        with patch("coord.github_ops.post_issue_comment"):
+            outcome = issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-chat-ai",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="already-implemented",
+                    verdict=None,
+                    summary="confirmed already fixed in #100",
+                )
+            )
+        assert outcome.status == "advisory"
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("aid-chat-ai",),
+        ).fetchone()
+        assert row["status"] == "advisory"
 
     def test_request_changes_without_body_raises_at_seam(self) -> None:
         """#617 keystone: request-changes with no findings_body is REFUSED at

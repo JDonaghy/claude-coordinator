@@ -24409,7 +24409,17 @@ impl CoordApp {
              ## Board snapshot\n{board}\n\n\
              ---\nThis is the current data we have on this issue. Fetch the \
              discussion with `gh issue view {issue_num} --comments` (read-only) \
-             if useful.\n"
+             if useful.\n\n\
+             ## Rules for this session\n\
+             - **Diagnostic-only** — you have no worktree and no committed work.\n\
+             - **Do NOT run `coord report-result --status done` or `--status blocked`.**\n\
+               Claiming done without committed work leaves a false-good-to-go box on\n\
+               the pipeline and masks the real problem (#676).\n\
+             - For a stalled item: start with `coord diagnose {coord_repo} {issue_num}`\n\
+               (auto-recovers phantoms, orphaned worktrees, dropped findings).\n\
+               Confirm any `--reset` with the operator before running it.\n\
+             - To actually fix something, surface a plan — the operator will dispatch\n\
+               a proper Work session.\n"
         )
     }
 
@@ -24559,7 +24569,18 @@ impl CoordApp {
             \n\
             CI CHECKS:\n{ci}\n\
             \n\
-            TASK: Diagnose the specific stall. Check each pattern in order:\n\
+            CRITICAL RULES FOR THIS SESSION (#676):\n\
+            - This is a READ-ONLY diagnostic session — no committed work.\n\
+            - Do NOT run `coord report-result --status done` or `--status blocked`.\n\
+              You have no committed work to back a success claim; doing so leaves\n\
+              a false status on the pipeline that masks the real problem.\n\
+            - For actual fixes, surface a plan — the operator will dispatch a Work session.\n\
+            \n\
+            TASK: Diagnose the specific stall. ALWAYS START HERE:\n\
+            0. Run the real doctor first: coord diagnose {repo} {n}\n   \
+               (auto-recovers phantoms, orphaned worktrees #618, dropped findings).\n   \
+               If it reports needs_reset=true, confirm with the operator before --reset.\n\
+            Then check each pattern in order:\n\
             1. Test gate not recorded (smoke test required but no verdict)\n   \
                -> coord test --passed <aid>\n\
             2. Verdict keyed to wrong assignment after a bounce (#567)\n   \
@@ -24588,13 +24609,15 @@ impl CoordApp {
                -> coord backlog {repo} {n}\n\
             \n\
             TOOLS:\n\
+            - coord diagnose {repo} {n}  ← START HERE\n\
             - sqlite3 ~/.coord/coord.db\n\
             - gh pr view {pr} --repo {slug}\n\
             - gh pr checks --repo {slug} {pr}\n\
             - coord merge --repo {repo} --dry-run\n\
             - docs/ARCHITECTURE.md (section: When a merge isn't happening)\n\
             \n\
-            Start with: coord merge --repo {repo} --dry-run\n\
+            Start with: coord diagnose {repo} {n}\n\
+            Then coord merge --repo {repo} --dry-run\n\
             Then inspect the merge_queue error and assignment statuses above.\n\
             \n\
             For read-only diagnostics: act immediately.\n\
@@ -41487,6 +41510,76 @@ mod tests {
             briefing.contains("CI check failed"),
             "briefing must include merge_queue error; got: {}",
             &briefing[..briefing.len().min(400)],
+        );
+    }
+
+    // ── #676: chat_briefing / troubleshoot_briefing must have safety guardrails
+
+    #[test]
+    fn chat_briefing_includes_report_result_prohibition() {
+        // #676: the chat briefing must explicitly tell the session not to run
+        // `coord report-result --status done` — the hard seam guard backs this
+        // up, but the prompt-level prohibition reduces the chance the agent
+        // even tries.
+        let app = make_pipeline_app();
+        let briefing = app.chat_briefing("api", 42);
+        assert!(
+            briefing.contains("report-result"),
+            "briefing must mention report-result prohibition; got: {}",
+            &briefing[..briefing.len().min(300)],
+        );
+        assert!(
+            briefing.to_lowercase().contains("do not") || briefing.contains("NOT"),
+            "briefing must express the prohibition; got: {}",
+            &briefing[..briefing.len().min(300)],
+        );
+    }
+
+    #[test]
+    fn chat_briefing_includes_coord_diagnose_instruction() {
+        // #676: for a stalled item the chat session must be directed to run
+        // `coord diagnose` first (auto-recovers phantoms, orphaned worktrees).
+        let app = make_pipeline_app();
+        let briefing = app.chat_briefing("api", 42);
+        assert!(
+            briefing.contains("coord diagnose"),
+            "chat briefing must mention `coord diagnose`; got: {}",
+            &briefing[..briefing.len().min(500)],
+        );
+    }
+
+    #[test]
+    fn troubleshoot_briefing_includes_coord_diagnose_as_first_step() {
+        // #676: `coord diagnose` must appear as the first step in the
+        // troubleshoot briefing so the session doesn't improvise its own
+        // diagnostic that may mask the real problem.
+        let app = make_pipeline_app();
+        let briefing = app.troubleshoot_briefing("api", 42);
+        assert!(
+            briefing.contains("coord diagnose"),
+            "troubleshoot briefing must mention `coord diagnose`; got: {}",
+            &briefing[..briefing.len().min(500)],
+        );
+        // The diagnose step must precede the numbered checklist — i.e., it
+        // appears before "1. Test gate".
+        let diag_pos = briefing.find("coord diagnose").unwrap();
+        let list_pos = briefing.find("1. Test gate").unwrap_or(briefing.len());
+        assert!(
+            diag_pos < list_pos,
+            "`coord diagnose` ({diag_pos}) must precede the numbered checklist ({list_pos})",
+        );
+    }
+
+    #[test]
+    fn troubleshoot_briefing_includes_report_result_prohibition() {
+        // #676: the troubleshoot briefing must also prohibit `coord report-result
+        // --status done` so the session cannot fake a pipeline advance.
+        let app = make_pipeline_app();
+        let briefing = app.troubleshoot_briefing("api", 42);
+        assert!(
+            briefing.contains("report-result"),
+            "troubleshoot briefing must mention report-result prohibition; got: {}",
+            &briefing[..briefing.len().min(300)],
         );
     }
 

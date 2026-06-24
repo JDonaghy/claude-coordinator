@@ -309,8 +309,23 @@ def post_result(record: ResultRecord) -> StoreOutcome:
     if svc is None:
         return _post_result_local(record)
     from coord.client import post_record  # noqa: PLC0415
+    import httpx as _httpx  # noqa: PLC0415
 
-    return StoreOutcome(**post_record(svc, "/result", asdict(record)))
+    try:
+        return StoreOutcome(**post_record(svc, "/result", asdict(record)))
+    except _httpx.HTTPStatusError as exc:
+        # #676: the daemon's _post_result_local can raise ValueError for
+        # guard violations (e.g. chat session attempting to claim done).
+        # The daemon serialises ValueError → HTTP 400 {"error": "..."}; convert
+        # it back to ValueError here so the CLI's `except ValueError` catches it
+        # and shows a clean error instead of a raw HTTPStatusError traceback.
+        if exc.response.status_code == 400:
+            try:
+                detail = exc.response.json().get("error", str(exc))
+            except Exception:  # noqa: BLE001
+                detail = str(exc)
+            raise ValueError(detail) from exc
+        raise
 
 
 def _post_completion_local(record: CompletionRecord) -> StoreOutcome:
@@ -326,9 +341,32 @@ def _post_completion_local(record: CompletionRecord) -> StoreOutcome:
     * ``exit_code == 0``, commits is None → ``done``  (git failed; do not
       falsely flag advisory — same policy as #448 in agent.py:_reap)
 
+    **Exception — chat / troubleshoot sessions (#676):** these are
+    non-mutating diagnostics that never produce committed work, so they are
+    *always* recorded as ``advisory`` regardless of exit code.  A non-zero
+    exit from a chat session (e.g. the claude process crashed) must not leave
+    a red ``failed`` box on the pipeline.
+
     Always writes a local state transition.  Always attempts to post a
     coordinator-authored comment.  Comment-post failure is non-fatal.
     """
+    # #676: chat and troubleshoot sessions are non-mutating diagnostics.
+    # Always mark them advisory — never done or failed — so a crash or
+    # abnormal close doesn't create a red box that blocks the pipeline.
+    import dataclasses as _dc  # noqa: PLC0415
+
+    atype = _assignment_type_local(record.assignment_id)
+    if atype in ("chat", "troubleshoot"):
+        if not record.summary:
+            record = _dc.replace(
+                record,
+                summary=(
+                    f"Human-attended {atype} session closed"
+                    " (diagnostic-only — no committed work)."
+                ),
+            )
+        return _post_advisory_path(record)
+
     if record.exit_code != 0:
         return _post_failure_path(record)
 
@@ -404,6 +442,26 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
                 "`coord report-result` with the review id. A verdict on a "
                 "non-review row marks it done and stamps a bogus review_verdict "
                 "(the #646 premature-finalize of a live interactive session)."
+            )
+
+    # #676: chat and troubleshoot sessions are non-mutating diagnostics — they
+    # never produce committed work and therefore must never claim `done` or
+    # `blocked` (both map to a terminal state that can advance or stall the
+    # pipeline).  A chat session claiming `done` without committed work is a
+    # false success that masks the real problem (#676 root-mechanism comment).
+    # `already-implemented` → `advisory` is the one neutral signal allowed,
+    # because it expresses "no work was needed" without a false done/fail.
+    # Only gate when the type is KNOWN — an unknown row falls through so a
+    # transient DB lookup failure never blocks a legitimate write.
+    if record.status in (STATUS_DONE, STATUS_BLOCKED):
+        atype = _assignment_type_local(record.assignment_id)
+        if atype in ("chat", "troubleshoot"):
+            raise ValueError(
+                f"refusing to record status={record.status!r} on assignment "
+                f"{record.assignment_id!r}: it is type={atype!r}, a non-mutating "
+                "diagnostic session. A chat/troubleshoot session cannot claim "
+                "'done' or 'blocked' without committed+pushed work — use "
+                "`coord assign --work` to dispatch actual work (#676)."
             )
 
     if record.status == STATUS_BLOCKED:
