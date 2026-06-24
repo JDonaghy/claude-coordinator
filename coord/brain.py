@@ -1,4 +1,4 @@
-"""Coordinator brain — gathers context and calls claude -p to propose assignments."""
+"""Coordinator brain — gathers context and calls the configured provider to propose assignments."""
 
 from __future__ import annotations
 
@@ -6,10 +6,14 @@ import json
 import re
 import subprocess
 import httpx
+from typing import TYPE_CHECKING
 
 from coord.config import Config
 from coord.models import Proposal, SplitChunk, SplitProposal
 from coord import github_ops
+
+if TYPE_CHECKING:
+    from coord.providers.base import Provider
 
 AGENT_PORT = 7433
 
@@ -176,20 +180,85 @@ def build_prompt(config: Config, context: dict) -> str:
     return "\n".join(lines)
 
 
-def call_claude(system: str, user: str) -> str:
-    """Run claude -p and return the text response."""
+def _resolve_default_provider(config: Config) -> "Provider":
+    """Instantiate the coordinator's default provider from *config*.
+
+    Uses the precedence chain ``providers.default → "claude"`` (no per-spec
+    or per-repo override at the brain level — brain calls are
+    coordinator-global).  Falls back to :class:`~coord.providers.claude.ClaudeProvider`
+    when the resolved name is not found in ``providers.definitions``
+    (shouldn't happen because ``ProvidersConfig.__post_init__`` always
+    materialises the implicit ``"claude"`` entry).
+
+    Args:
+        config: The coordinator config.
+
+    Returns:
+        A ready-to-use :class:`~coord.providers.base.Provider` instance.
+    """
+    from coord.providers import build_provider  # noqa: PLC0415
+    from coord.providers.claude import ClaudeProvider  # noqa: PLC0415
+
+    providers_cfg = config.providers
+    name = providers_cfg.default
+    definition = providers_cfg.definitions.get(name)
+    if definition is None:
+        return ClaudeProvider()
+    return build_provider(name, definition, config.models)
+
+
+def call_claude(system: str, user: str, *, provider: "Provider | None" = None) -> str:
+    """Run the configured provider in one-shot mode and return the text response.
+
+    Builds the subprocess argv via ``provider.oneshot_command()`` so that
+    brain planning honours the coordinator's configured backend rather than
+    hard-coding ``claude``.
+
+    When *provider* is ``None`` a :class:`~coord.providers.claude.ClaudeProvider`
+    is used — matching the historical behaviour (``claude -p``).  Callers
+    that want to honour the coordinator's configured backend should pass
+    the result of :func:`_resolve_default_provider`.
+
+    Args:
+        system: The system prompt for the brain's planning call.
+        user: The user message (piped to the subprocess via stdin).
+        provider: Provider whose ``oneshot_command()`` is called to build
+            the argv.  ``None`` falls back to
+            :class:`~coord.providers.claude.ClaudeProvider`.
+
+    Returns:
+        The text response string.
+
+    Raises:
+        RuntimeError: When the subprocess exits with a non-zero return code.
+    """
+    if provider is None:
+        from coord.providers.claude import ClaudeProvider  # noqa: PLC0415
+        provider = ClaudeProvider()
+
+    cmd = provider.oneshot_command(system_prompt=system, output_format="json")
     result = subprocess.run(
-        ["claude", "-p", "--system-prompt", system, "--output-format", "json"],
+        cmd,
         input=user,
         capture_output=True,
         text=True,
         timeout=300,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"claude -p failed (exit {result.returncode}): {result.stderr.strip()}")
+        raise RuntimeError(
+            f"brain provider call failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
 
-    outer = json.loads(result.stdout)
-    return outer.get("result", result.stdout)
+    # Try to extract the "result" field from a claude -p JSON envelope.
+    # Falls back to raw stdout for providers that don't emit this shape
+    # (e.g. OpenCodeProvider, whose output is unstructured).
+    try:
+        outer = json.loads(result.stdout)
+        if isinstance(outer, dict) and "result" in outer:
+            return outer["result"]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return result.stdout
 
 
 def _strip_fences(text: str) -> str:
@@ -314,10 +383,11 @@ def _apply_require_plan(proposals: list[Proposal], config: Config) -> None:
 
 
 def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
-    """Full brain cycle: gather context, call Claude, return proposals and splits."""
+    """Full brain cycle: gather context, call the provider, return proposals and splits."""
+    provider = _resolve_default_provider(config)
     context = gather_context(config)
     prompt = build_prompt(config, context)
-    response = call_claude(SYSTEM_PROMPT, prompt)
+    response = call_claude(SYSTEM_PROMPT, prompt, provider=provider)
     proposals = parse_proposals(response)
     _apply_require_plan(proposals, config)
     resolve_required_gates(proposals, config, context["issues_by_repo"])

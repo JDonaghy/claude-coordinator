@@ -9,14 +9,17 @@ import pytest
 
 from coord.brain import (
     _apply_require_plan,
+    _resolve_default_provider,
     build_prompt,
+    call_claude,
     gather_context,
     parse_proposals,
     propose,
     resolve_required_gates,
 )
-from coord.config import Config, DispatchConfig, PipelineConfig
+from coord.config import Config, DispatchConfig, PipelineConfig, ProviderDef, ProvidersConfig
 from coord.models import Machine, Proposal, Repo
+from coord.providers.claude import ClaudeProvider
 
 
 @pytest.fixture
@@ -517,3 +520,141 @@ class TestProposeRequirePlan:
 
         assert len(proposals) == 1
         assert proposals[0].type == "work"
+
+
+# ---------------------------------------------------------------------------
+# call_claude provider routing
+# ---------------------------------------------------------------------------
+
+
+class TestCallClaudeProvider:
+    """Tests verifying that call_claude routes through the provider layer."""
+
+    def _fake_run_result(self, stdout: str, returncode: int = 0) -> MagicMock:
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        m.stderr = ""
+        return m
+
+    def test_default_path_uses_claude_provider(self) -> None:
+        """Without a provider arg, call_claude uses ClaudeProvider (claude -p)."""
+        with patch("subprocess.run", return_value=self._fake_run_result('{"result": "ok"}')) as mock_run:
+            result = call_claude("sys", "user")
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "claude"
+        assert "-p" in cmd
+        assert "--system-prompt" in cmd
+        assert "--output-format" in cmd
+        assert "json" in cmd
+        assert result == "ok"
+
+    def test_custom_provider_command_is_used(self) -> None:
+        """When a provider is passed, its oneshot_command builds the argv."""
+        fake_provider = MagicMock()
+        fake_provider.oneshot_command.return_value = [
+            "my-claude", "-p", "--system-prompt", "sys", "--output-format", "json"
+        ]
+        with patch("subprocess.run", return_value=self._fake_run_result('{"result": "hello"}')) as mock_run:
+            result = call_claude("sys", "user", provider=fake_provider)
+
+        fake_provider.oneshot_command.assert_called_once_with(
+            system_prompt="sys", output_format="json"
+        )
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "my-claude"
+        assert result == "hello"
+
+    def test_json_result_extraction_from_envelope(self) -> None:
+        """call_claude extracts 'result' from the claude -p JSON envelope."""
+        with patch("subprocess.run", return_value=self._fake_run_result(
+            '{"type": "result", "result": "extracted text", "session_id": "s"}'
+        )):
+            result = call_claude("sys", "user")
+        assert result == "extracted text"
+
+    def test_fallback_to_raw_stdout_when_no_result_key(self) -> None:
+        """call_claude falls back to raw stdout when JSON has no 'result' key."""
+        raw = '{"type": "something_else", "data": "x"}'
+        with patch("subprocess.run", return_value=self._fake_run_result(raw)):
+            result = call_claude("sys", "user")
+        assert result == raw
+
+    def test_fallback_to_raw_stdout_when_not_json(self) -> None:
+        """call_claude falls back to raw stdout when output is not JSON at all."""
+        raw = "plain text output from provider"
+        with patch("subprocess.run", return_value=self._fake_run_result(raw)):
+            result = call_claude("sys", "user")
+        assert result == raw
+
+    def test_nonzero_returncode_raises_runtime_error(self) -> None:
+        """call_claude raises RuntimeError on subprocess failure."""
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = "some error"
+        with patch("subprocess.run", return_value=mock_result):
+            with pytest.raises(RuntimeError, match="brain provider call failed"):
+                call_claude("sys", "user")
+
+    def test_user_message_passed_as_stdin(self) -> None:
+        """call_claude passes the user message to the subprocess via stdin."""
+        with patch("subprocess.run", return_value=self._fake_run_result('{"result": "r"}')) as mock_run:
+            call_claude("sys", "my user message")
+        assert mock_run.call_args.kwargs.get("input") == "my user message"
+
+    def test_propose_passes_provider_to_call_claude(self) -> None:
+        """propose() resolves the default provider and passes it to call_claude."""
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        )
+        context = {
+            "issues_by_repo": {"api": []},
+            "machine_status": {"laptop": {"status": "idle"}},
+        }
+        with patch("coord.brain.gather_context", return_value=context), \
+             patch("coord.brain.call_claude", return_value="[]") as mock_cc:
+            propose(cfg)
+
+        # call_claude must be called with a provider kwarg, not None.
+        _, kwargs = mock_cc.call_args
+        assert "provider" in kwargs
+        assert kwargs["provider"] is not None
+        assert isinstance(kwargs["provider"], ClaudeProvider)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_default_provider
+# ---------------------------------------------------------------------------
+
+
+class TestResolveDefaultProvider:
+    """Tests for the _resolve_default_provider helper."""
+
+    def test_default_config_returns_claude_provider(self) -> None:
+        """Default Config (no providers block) resolves to ClaudeProvider."""
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="localhost", repos=["api"])],
+        )
+        provider = _resolve_default_provider(cfg)
+        assert isinstance(provider, ClaudeProvider)
+
+    def test_explicit_claude_provider_definition(self) -> None:
+        """An explicit claude definition resolves to ClaudeProvider."""
+        from coord.config import ProviderDef, ProvidersConfig
+        providers = ProvidersConfig(
+            default="my-claude",
+            definitions={"my-claude": ProviderDef(type="claude", binary="claude2")},
+        )
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="m", host="h", repos=["api"])],
+            providers=providers,
+        )
+        provider = _resolve_default_provider(cfg)
+        assert isinstance(provider, ClaudeProvider)
+        # Verify the custom binary is threaded through.
+        cmd = provider.oneshot_command(system_prompt="sp")
+        assert cmd[0] == "claude2"

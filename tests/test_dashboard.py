@@ -305,6 +305,54 @@ class TestChatAPI:
         r = client.post("/api/chat", content="bad", headers={"content-type": "application/json"})
         assert r.status_code == 400
 
+    def test_chat_uses_default_provider_command(self) -> None:
+        """api_chat builds its subprocess command via the config's default provider.
+
+        Verifies that the command handed to create_subprocess_exec comes from
+        the provider layer (no hard-coded "claude" string), and that the
+        output_format flag is NOT added (dashboard streams plain text, not JSON).
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        # Minimal async process stub
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.close = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        # Async iterator that yields nothing (empty response)
+        async def _empty_aiter():
+            return
+            yield  # make it an async generator
+
+        mock_proc.stdout = _empty_aiter()
+
+        captured_cmd: list = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_cmd.extend(args)
+            return mock_proc
+
+        with (
+            patch("coord.dashboard.server.load_board", return_value=Board()),
+            patch("coord.dashboard.server.build_board", return_value=Board()),
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+        ):
+            client = _client()
+            # The streaming response is consumed fully by TestClient
+            r = client.post("/api/chat", json={"message": "hello"})
+
+        # The command must be derived from the provider (ClaudeProvider default).
+        assert captured_cmd[0] == "claude", (
+            f"Expected 'claude' binary, got {captured_cmd[0]!r}; "
+            "the dashboard chat must route through the provider layer"
+        )
+        assert "-p" in captured_cmd
+        assert "--system-prompt" in captured_cmd
+        # output_format=None path: no --output-format flag for plain-text streaming.
+        assert "--output-format" not in captured_cmd
+
 
 class TestPipelineAction:
     """Tests for /api/pipeline/action — dispatch feedback fields."""

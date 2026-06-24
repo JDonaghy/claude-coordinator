@@ -264,6 +264,44 @@ class OpenCodeProvider(Provider):
         argv.append(spec.briefing)
         return argv
 
+    def oneshot_command(
+        self,
+        *,
+        system_prompt: str,
+        output_format: str | None = "json",
+    ) -> list[str]:
+        """Best-effort one-shot argv for the OpenCode backend.
+
+        LIMITATION: OpenCode has no ``--system-prompt`` flag and takes its
+        briefing as a positional argv argument rather than via stdin.  The
+        *system_prompt* and *output_format* kwargs are therefore silently
+        ignored — OpenCode will not receive the system prompt and will not
+        emit the ``{"result": ...}`` JSON shape that the brain expects.
+
+        This method returns ``[binary, "run"]`` without the user message
+        because ``oneshot_command()`` does not receive the user message as
+        an argument.  The brain's ``call_claude()`` pipes the user message
+        via stdin; OpenCode will ignore it and produce its own output
+        (which :func:`coord.brain.call_claude` returns as raw stdout after
+        the JSON-extraction fallback path).
+
+        Callers that need a fully functional one-shot path should configure
+        a :class:`~.claude.ClaudeProvider` backend instead of OpenCode.
+
+        ASSUMPTION: ``opencode run`` is the headless subcommand.  This
+        must be verified against a real ``opencode`` binary.
+
+        Args:
+            system_prompt: Accepted but **ignored** — OpenCode has no
+                ``--system-prompt`` equivalent.
+            output_format: Accepted but **ignored** — OpenCode does not
+                emit ``{"result": ...}`` JSON.
+        """
+        binary = self._binary if self._binary is not None else DEFAULT_OPENCODE_BINARY
+        # ASSUMPTION: 'run' is the non-interactive / headless subcommand.
+        # system_prompt and output_format are silently dropped; see docstring.
+        return [binary, "run"]
+
     def initial_input(self, spec: "AssignmentSpec") -> bytes:
         """Return an empty bytes object — the briefing travels on argv.
 

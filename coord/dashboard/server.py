@@ -356,9 +356,26 @@ def build_app(config: Config) -> Starlette:
             f"Current board state:\n{board_context}"
         )
 
+        # Resolve the coordinator's default provider so the dashboard chat
+        # honours the configured backend rather than hard-coding "claude".
+        from coord.providers import build_provider  # noqa: PLC0415
+        from coord.providers.claude import ClaudeProvider  # noqa: PLC0415
+
+        providers_cfg = config.providers
+        _pname = providers_cfg.default
+        _pdef = providers_cfg.definitions.get(_pname)
+        _provider = (
+            build_provider(_pname, _pdef, config.models)
+            if _pdef is not None
+            else ClaudeProvider()
+        )
+        # output_format=None → no --output-format flag; dashboard streams
+        # plain-text lines, not a JSON envelope.
+        _chat_cmd = _provider.oneshot_command(system_prompt=system, output_format=None)
+
         async def stream():
             proc = await asyncio.create_subprocess_exec(
-                "claude", "-p", "--system-prompt", system,
+                *_chat_cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
