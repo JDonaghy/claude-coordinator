@@ -107,6 +107,8 @@ def row_to_assignment(row: object) -> Assignment:
         output_tokens=int(d.get("output_tokens") or 0),
         cache_creation_tokens=int(d.get("cache_creation_tokens") or 0),
         cache_read_tokens=int(d.get("cache_read_tokens") or 0),
+        # #618: short launch-failure reason; None for successfully-launched rows.
+        failure_reason=d.get("failure_reason"),
     )
 
 

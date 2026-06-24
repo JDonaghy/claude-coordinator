@@ -1187,6 +1187,36 @@ def get_test_plan(assignment_id: str) -> dict | None:
     return value
 
 
+def set_assignment_failure_reason(assignment_id: str, reason: str) -> None:
+    """#618: persist a short launch-failure reason on the assignment row.
+
+    Called immediately when an interactive session fails to start (e.g.
+    ``git worktree add`` raises "branch already checked out at <path>") so
+    the TUI can explain the red box even without a log file.
+
+    Also marks the row terminal (``status='failed'``, ``finished_at=now``) so
+    the stale-session reaper does not have to pick it up later — the operator
+    sees the failure immediately without waiting for the next reconcile sweep.
+
+    Silently no-ops when the column is missing (pre-migration DB) or when
+    the row doesn't exist.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    now = time.time()
+    try:
+        conn.execute(
+            "UPDATE assignments SET failure_reason=?, status='failed', finished_at=? "
+            "WHERE assignment_id=?",
+            (reason[:512], now, assignment_id),  # cap at 512 chars — one-liner
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Column may not exist on a pre-migration DB — best-effort.
+        pass
+
+
 def mark_review_posted(assignment_id: str) -> None:
     """Record that this review assignment's findings have been successfully posted.
 
