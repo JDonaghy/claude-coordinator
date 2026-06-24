@@ -408,6 +408,324 @@ class TestPipelineAction:
         assert r.status_code == 400
 
 
+class TestPipelineActionTestVerdict:
+    """Tests for /api/pipeline/action action='test-verdict'."""
+
+    def _board_with_done(self) -> "Board":
+        return Board(
+            active=[],
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="work001", status="done",
+                    branch="issue-42-fix-auth",
+                    finished_at=1.0,
+                ),
+            ],
+        )
+
+    def test_pass_verdict_records_passed(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.state.record_test_verdict") as mock_rtv,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "pass",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["test_state"] == "passed"
+        mock_rtv.assert_called_once_with(
+            assignment_id="work001",
+            test_state="passed",
+            test_reason=None,
+            smoke_test="pass",
+            smoke_test_reason=None,
+        )
+
+    def test_fail_verdict_records_failed_with_reason(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.state.record_test_verdict") as mock_rtv,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "fail",
+                "reason": "cargo test failed on line 42",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["test_state"] == "failed"
+        mock_rtv.assert_called_once_with(
+            assignment_id="work001",
+            test_state="failed",
+            test_reason="cargo test failed on line 42",
+            smoke_test="fail",
+            smoke_test_reason="cargo test failed on line 42",
+        )
+
+    def test_skip_verdict_records_skipped(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.state.record_test_verdict") as mock_rtv,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "skip",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["test_state"] == "skipped"
+        # skip does not mirror to smoke_test
+        mock_rtv.assert_called_once_with(
+            assignment_id="work001",
+            test_state="skipped",
+            test_reason=None,
+            smoke_test=None,
+            smoke_test_reason=None,
+        )
+
+    def test_invalid_verdict_returns_400(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=self._board_with_done()):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "notaverdict",
+            })
+        assert r.status_code == 400
+        assert "error" in r.json()
+
+    def test_exception_returns_500(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.state.record_test_verdict", side_effect=RuntimeError("db locked")),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "pass",
+            })
+        assert r.status_code == 500
+        data = r.json()
+        assert data["ok"] is False
+        assert "db locked" in data["error"]
+
+
+class TestPipelineActionRecordReviewVerdict:
+    """Tests for /api/pipeline/action action='record-review-verdict'.
+
+    The phone client sends the WORK assignment id (as returned by GET
+    /api/pipeline).  The handler must look up the linked review assignment and
+    write to THAT row — not the work row — because compute_pipeline reads
+    findings back from the review assignment.
+    """
+
+    def _board_with_work_and_review(self) -> "Board":
+        """A completed work assignment with a linked completed review assignment."""
+        return Board(
+            active=[],
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="work001", status="done",
+                    finished_at=1.0,
+                ),
+                Assignment(
+                    machine_name="desktop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="rev001", status="done",
+                    type="review",
+                    review_of_assignment_id="work001",
+                    finished_at=2.0,
+                ),
+            ],
+        )
+
+    def _board_with_work_only(self) -> "Board":
+        """A work assignment with NO linked review assignment."""
+        return Board(
+            active=[],
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="work001", status="done",
+                    finished_at=1.0,
+                ),
+            ],
+        )
+
+    def test_approve_verdict_persists_to_review_id(self) -> None:
+        """The mock must be called with the review assignment id, not the work id."""
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()),
+            patch("coord.notify._persist_review_findings") as mock_prf,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "record-review-verdict",
+                "verdict": "approve",
+                "body": "LGTM — code is clean.",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        # Key assertion: written to rev001 (the review row), NOT work001.
+        mock_prf.assert_called_once_with("rev001", "approve", "LGTM — code is clean.")
+
+    def test_request_changes_verdict_persists_to_review_id(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()),
+            patch("coord.notify._persist_review_findings") as mock_prf,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "record-review-verdict",
+                "verdict": "request-changes",
+                "body": "Missing tests on the new endpoint.",
+            })
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        mock_prf.assert_called_once_with(
+            "rev001", "request-changes", "Missing tests on the new endpoint.",
+        )
+
+    def test_no_review_assignment_returns_404(self) -> None:
+        """404 when the work assignment has no linked review assignment."""
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=self._board_with_work_only()):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "record-review-verdict",
+                "verdict": "approve",
+                "body": "LGTM",
+            })
+        assert r.status_code == 404
+        assert "no review assignment" in r.json()["error"]
+
+    def test_invalid_verdict_returns_400(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "record-review-verdict",
+                "verdict": "reject",
+                "body": "Some body",
+            })
+        assert r.status_code == 400
+        assert "error" in r.json()
+
+    def test_missing_body_returns_400(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "record-review-verdict",
+                "verdict": "approve",
+            })
+        assert r.status_code == 400
+        assert "body" in r.json()["error"]
+
+    def test_exception_returns_500(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()),
+            patch("coord.notify._persist_review_findings", side_effect=RuntimeError("db locked")),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "record-review-verdict",
+                "verdict": "approve",
+                "body": "LGTM",
+            })
+        assert r.status_code == 500
+        assert r.json()["ok"] is False
+
+
+class TestPipelineReviewFindings:
+    """Tests that GET /api/pipeline includes review_verdict and review_findings_body."""
+
+    def _board_with_review(self) -> "Board":
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="Fix auth",
+            assignment_id="work001", status="done",
+            branch="issue-42-fix-auth",
+            finished_at=1.0,
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="Fix auth",
+            assignment_id="rev001", status="done",
+            type="review",
+            review_of_assignment_id="work001",
+            review_verdict="approve",
+            review_posted_at=2.0,
+            finished_at=2.0,
+        )
+        return Board(active=[], completed=[work, review])
+
+    def test_review_verdict_and_body_in_pipeline_response(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_review()),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch(
+                "coord.state.load_assignment_review_findings",
+                return_value=("approve", "LGTM — clean diff."),
+            ),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        items = r.json()
+        # Only work assignments appear in the pipeline view.
+        assert len(items) == 1
+        item = items[0]
+        assert item["assignment_id"] == "work001"
+        assert item["review_verdict"] == "approve"
+        assert item["review_findings_body"] == "LGTM — clean diff."
+
+    def test_no_review_assignment_yields_none_findings(self) -> None:
+        """A work assignment with no review yet has None verdict + body."""
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=99, issue_title="Standalone",
+            assignment_id="work002", status="done",
+            finished_at=1.0,
+        )
+        board = Board(active=[], completed=[work])
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.state.load_assignment_review_findings") as mock_lrf,
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        items = r.json()
+        assert len(items) == 1
+        assert items[0]["review_verdict"] is None
+        assert items[0]["review_findings_body"] is None
+        # load_assignment_review_findings must not be called when there's no review.
+        mock_lrf.assert_not_called()
+
+
 class TestDashboardDispatchUI:
     """Tests confirming the HTML includes the new dispatch-feedback elements."""
 

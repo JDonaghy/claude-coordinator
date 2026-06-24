@@ -428,18 +428,38 @@ def build_app(config: Config) -> Starlette:
 
         from coord.pipeline import compute_pipeline
         from coord.merge_queue import load_queue
+        from coord.state import load_assignment_review_findings
 
         board = load_board() or build_board()
         mq_items = load_queue()
 
+        # Build a lookup of review assignment id per work assignment_id so we can
+        # fetch the review findings body with one pass instead of N nested loops.
+        all_assignments = list(board.active) + list(board.completed)
+        review_by_work: dict[str, str] = {}   # work_aid → review aid
+        for a in all_assignments:
+            if a.type == "review" and a.review_of_assignment_id and a.assignment_id:
+                review_by_work[a.review_of_assignment_id] = a.assignment_id
+
         pipelines = []
-        for a in list(board.active) + list(board.completed):
+        for a in all_assignments:
             if a.type not in ("work", None, ""):
                 continue
             # Exclude assignments with no id (shouldn't normally happen).
             if not a.assignment_id:
                 continue
-            pv = compute_pipeline(a, board, mq_items, config)
+            # Pre-load review findings body (DB call; pure-computation path kept
+            # clean by passing it as a parameter rather than inside compute_pipeline).
+            findings_body: str | None = None
+            rev_aid = review_by_work.get(a.assignment_id)
+            if rev_aid:
+                found = load_assignment_review_findings(rev_aid)
+                if found:
+                    _, findings_body = found
+            pv = compute_pipeline(
+                a, board, mq_items, config,
+                review_findings_body=findings_body,
+            )
             pipelines.append(asdict(pv))
 
         return JSONResponse(pipelines)
@@ -594,6 +614,84 @@ def build_app(config: Config) -> Starlette:
             board.mark_failed_by_id(assignment_id, finished_at=time.time())
             save_board(board)
             return JSONResponse({"ok": True, "cancelled_on_agent": cancelled_on_agent})
+
+        elif action == "test-verdict":
+            # Record a human Test-gate verdict for a work assignment.
+            # Body: {assignment_id, verdict: "pass"|"fail"|"skip", reason?}
+            verdict = body.get("verdict")
+            reason = body.get("reason") or None
+            _VALID_VERDICTS = {"pass", "fail", "skip"}
+            if verdict not in _VALID_VERDICTS:
+                return JSONResponse(
+                    {"error": f"verdict must be one of {sorted(_VALID_VERDICTS)!r}"},
+                    status_code=400,
+                )
+            # Map short form to the canonical test_state values used by the TUI
+            # and reconcile gating logic.
+            test_state_map = {"pass": "passed", "fail": "failed", "skip": "skipped"}
+            test_state = test_state_map[verdict]
+            test_reason = reason if verdict == "fail" else None
+            # Mirror to legacy smoke_test column for the smoke-stage scoring in
+            # pipeline.py (predates the human Test gate — same mirror as cli.py).
+            smoke_test: str | None = verdict if verdict in ("pass", "fail") else None
+            smoke_test_reason: str | None = reason if verdict == "fail" else None
+            from coord.state import record_test_verdict as _record_test_verdict
+
+            try:
+                _record_test_verdict(
+                    assignment_id=assignment_id,
+                    test_state=test_state,
+                    test_reason=test_reason,
+                    smoke_test=smoke_test,
+                    smoke_test_reason=smoke_test_reason,
+                )
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            return JSONResponse({"ok": True, "test_state": test_state})
+
+        elif action == "record-review-verdict":
+            # Persist a parsed review verdict + findings body to the DB cache so
+            # the phone can record results from a manual review session without
+            # going through the full notify/auto_loop path.
+            # Body: {assignment_id, verdict: "approve"|"request-changes", body}
+            # NOTE: assignment_id here is the WORK assignment id (as exposed by
+            # GET /api/pipeline).  We must look up the linked review assignment
+            # before writing, since _persist_review_findings writes to the review
+            # row and compute_pipeline reads findings back from the review row.
+            verdict = body.get("verdict")
+            findings_body = body.get("body")
+            _VALID_REVIEW_VERDICTS = {"approve", "request-changes"}
+            if verdict not in _VALID_REVIEW_VERDICTS:
+                return JSONResponse(
+                    {"error": f"verdict must be one of {sorted(_VALID_REVIEW_VERDICTS)!r}"},
+                    status_code=400,
+                )
+            if not findings_body:
+                return JSONResponse(
+                    {"error": "body is required for record-review-verdict"},
+                    status_code=400,
+                )
+            # Look up the review assignment linked to this work assignment.
+            all_assignments = list(board.active) + list(board.completed)
+            review_a = next(
+                (
+                    a for a in all_assignments
+                    if a.review_of_assignment_id == assignment_id and a.type == "review"
+                ),
+                None,
+            )
+            if review_a is None:
+                return JSONResponse(
+                    {"error": "no review assignment found for this work assignment"},
+                    status_code=404,
+                )
+            from coord.notify import _persist_review_findings  # noqa: PLC0415
+
+            try:
+                _persist_review_findings(review_a.assignment_id, verdict, findings_body)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            return JSONResponse({"ok": True})
 
         elif action in ("retry", "dispatch_fix"):
             return JSONResponse(
