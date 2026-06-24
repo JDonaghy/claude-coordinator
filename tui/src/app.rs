@@ -46868,6 +46868,77 @@ mod tests {
         );
     }
 
+    // ── #717: a done work row un-greys the interactive Testing action ─────────
+
+    /// #717 gate (builder-level — the precise regression guard): the interactive
+    /// "Testing" launcher is enabled only when there is a completed (`done`)
+    /// work row WITH a branch.  Before #717 an interactive session that pushed
+    /// its branch could finalize as `failed`, leaving Testing greyed; this
+    /// asserts the failed→done transition flips the gate.
+    #[test]
+    fn context_menu_testing_enabled_only_for_done_work_with_branch() {
+        fn testing_disabled(app: &CoordApp) -> bool {
+            let items = app
+                .context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Other);
+            let parent = items
+                .iter()
+                .find(|i| i.label == "Start (interactive)")
+                .expect("Start (interactive) submenu must exist");
+            let children = parent.submenu.as_ref().expect("interactive submenu");
+            children
+                .iter()
+                .find(|i| i.action_id.as_deref() == Some("start-testing-interactive"))
+                .expect("Testing item must exist")
+                .disabled
+        }
+
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        // Pre-#717 bug state: the work pushed a branch but the row is `failed`.
+        let mut row = _work_assignment("w1", 100.0, "failed", None);
+        row.branch = Some("issue-42-add-cool-thing".to_string());
+        app.data.assignments.push(row);
+        assert!(
+            testing_disabled(&app),
+            "a failed work row must leave the interactive Testing action greyed"
+        );
+
+        // Post-#717: finalize records `done` → Testing must be enabled.
+        app.data.assignments[0].status = "done".into();
+        assert!(
+            !testing_disabled(&app),
+            "#717: a done work row with a branch must ENABLE the interactive Testing action"
+        );
+    }
+
+    /// #717 black-box (TuiDriver): with a completed work row, opening the
+    /// Pipeline row's context menu renders the interactive launcher menu through
+    /// the real event → render path against the headless `TestBackend`.
+    #[test]
+    fn tuidriver_done_work_row_renders_interactive_menu() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let mut row = _work_assignment("w1", 100.0, "done", None);
+        row.branch = Some("issue-42-add-cool-thing".to_string());
+        app.data.assignments.push(row);
+
+        // Open the row's context menu (the same state a right-click produces).
+        let opened = app.open_context_menu(Point::new(4.0, 4.0), pipeline_target(Some(42)));
+        assert!(opened, "context menu should open for the pipeline row");
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("Start (interactive)"),
+            "the interactive launcher menu must render for a done work row:\n{}",
+            driver.screen()
+        );
+    }
+
     // ── #669: issue_body_list word-wrap ──────────────────────────────────────
 
     /// A long plain-text body line must produce more ListView rows than the

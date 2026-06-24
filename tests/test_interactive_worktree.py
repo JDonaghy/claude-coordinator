@@ -963,3 +963,45 @@ class TestFinalizeExitCodeNormalization:
             "non-interactive worker exit_code != 0 must still yield 'failed'; "
             f"got {outcome.status!r}"
         )
+
+    def test_remote_nonzero_exit_with_commits_yields_done(self) -> None:
+        """#717 remote path: ``finalize_remote_interactive_exit`` with exit_code=1
+        and commits_ahead>=1 (push succeeded) → done.
+
+        Mirrors :meth:`test_nonzero_exit_with_commits_yields_done` for the SSH
+        finalize used by remote ``--fix-of`` sessions — the path #698's failure
+        was originally traced to (an ssh session that exited non-zero after the
+        push landed). The remote git ops are mocked; only the exit-code
+        normalisation is under test.
+        """
+        from coord.interactive import finalize_remote_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("exit-norm-remote-717", issue_number=717)
+        with patch("coord.github_ops.post_issue_comment"), patch(
+            "coord.interactive._remote_push_and_count",
+            return_value=(True, None, 2, "issue-717-remote-norm"),
+        ), patch(
+            "coord.interactive._remote_worktree_remove", return_value=True
+        ):
+            result = finalize_remote_interactive_exit(
+                assignment_id="exit-norm-remote-717",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=717,
+                machine_name="precision",
+                ssh_target="john@precision",
+                remote_worktree_sh="/home/john/.coord/worktrees/exit-norm-remote-717",
+                remote_repo_sh="/home/john/src/api",
+                branch="issue-717-remote-norm",
+                base_branch="main",
+                exit_code=1,  # ssh session exited non-zero after the push
+                started_at=None,
+            )
+
+        assert result.terminal_status == "done", (
+            "expected 'done' for a remote interactive session with commits_ahead>=1 "
+            f"and non-zero exit_code; got {result.terminal_status!r} — the "
+            "Test/Review/Merge chain would be greyed"
+        )
+        assert result.commits_ahead == 2
