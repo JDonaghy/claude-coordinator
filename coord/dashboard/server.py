@@ -11,8 +11,9 @@ from pathlib import Path
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
-from starlette.routing import Route
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
@@ -27,6 +28,10 @@ from coord.network import check_all, fetch_status
 from coord.state import build_board, load_board, load_proposals, save_board
 
 DASHBOARD_DIR = Path(__file__).parent
+# Built React webapp lives here after `npm run build` inside coord/dashboard/webapp/.
+# When this directory is absent the server falls back to the legacy index.html so
+# that existing behaviour (and the test suite) is completely unaffected.
+WEBAPP_DIST = DASHBOARD_DIR / "webapp" / "dist"
 
 # How often (seconds) the background poller queries agent servers.
 _POLL_INTERVAL = 30.0
@@ -213,7 +218,10 @@ def build_app(config: Config) -> Starlette:
         yield
 
     async def index(request: Request) -> HTMLResponse:
-        html = (DASHBOARD_DIR / "index.html").read_text()
+        # Serve the built React webapp when available; fall back to the legacy
+        # single-file dashboard so existing behaviour is entirely unchanged.
+        spa_index = WEBAPP_DIST / "index.html"
+        html = spa_index.read_text() if spa_index.exists() else (DASHBOARD_DIR / "index.html").read_text()
         return HTMLResponse(html)
 
     async def api_board(request: Request) -> JSONResponse:
@@ -717,4 +725,35 @@ def build_app(config: Config) -> Starlette:
         Route("/api/pipeline/action", api_pipeline_action, methods=["POST"]),
         build_events_route(event_source),
     ]
+
+    # ── Static file serving for the built React webapp ─────────────────────
+    # Only activated when `coord/dashboard/webapp/dist/` exists (i.e. after
+    # `npm run build`).  When absent the routes list is unchanged and the
+    # legacy dashboard serves normally — no test-suite impact.
+    if WEBAPP_DIST.exists():
+        # /assets/ — Vite hashed JS/CSS bundles (immutable; safe to cache).
+        _assets = WEBAPP_DIST / "assets"
+        if _assets.exists():
+            routes.append(
+                Mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
+            )
+
+        async def _spa_catch_all(request: Request) -> FileResponse | HTMLResponse:
+            """Serve exact static files from dist/ or SPA index.html fallback.
+
+            Handles three cases:
+            - Known static roots (sw.js, manifest.webmanifest, icons/, …)
+              → served as the actual file so the browser gets correct MIME types.
+            - SPA client-side routes (/issues/42, /pipeline, …)
+              → serve index.html; the React router takes over.
+            """
+            path = request.path_params.get("path", "")
+            candidate = WEBAPP_DIST / path
+            if candidate.is_file():
+                return FileResponse(str(candidate))
+            # SPA fallback — let the React router handle the path.
+            return HTMLResponse((WEBAPP_DIST / "index.html").read_text())
+
+        routes.append(Route("/{path:path}", _spa_catch_all, methods=["GET"]))
+
     return Starlette(routes=routes, lifespan=_lifespan)

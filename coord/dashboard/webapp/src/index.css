@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark theme matching coord's existing colour palette */
+    --background: 220 13% 7%;        /* #0d1117 */
+    --foreground: 213 31% 91%;       /* #c9d1d9 */
+    --card: 222 47% 10%;             /* #161b22 */
+    --card-foreground: 213 31% 91%;
+    --popover: 222 47% 10%;
+    --popover-foreground: 213 31% 91%;
+    --primary: 212 100% 56%;         /* #1f6feb */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 20% 17%;        /* #21262d */
+    --secondary-foreground: 213 31% 91%;
+    --muted: 222 20% 17%;
+    --muted-foreground: 215 13% 55%; /* #8b949e */
+    --accent: 222 20% 17%;
+    --accent-foreground: 213 31% 91%;
+    --destructive: 0 63% 50%;        /* #da3633 */
+    --destructive-foreground: 0 0% 100%;
+    --border: 215 13% 22%;           /* #30363d */
+    --input: 215 13% 22%;
+    --ring: 212 100% 56%;
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
