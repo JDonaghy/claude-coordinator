@@ -798,3 +798,210 @@ class TestFinalizeBranchFallback:
             f"got {row['branch']!r}"
         )
         assert result.worktree_removed is False
+
+
+# ── #717 exit-code normalisation for interactive sessions ────────────────────
+
+
+class TestFinalizeExitCodeNormalization:
+    """#717: a non-zero session exit_code must NOT force ``failed`` when the
+    branch already has ≥1 commit (work was pushed before the session died).
+
+    Non-interactive workers and zero-commit sessions must keep the existing
+    exit-code-driven policy unchanged.
+    """
+
+    def test_nonzero_exit_with_commits_yields_done(
+        self, repo_with_remote: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """Interactive WORK session: exit_code=1, commits_ahead>=1 → done."""
+        from coord.interactive import finalize_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        local, _ = repo_with_remote
+        state_dir = tmp_path / "state"
+        wt_path, _ = setup_interactive_worktree(
+            local,
+            issue_number=717,
+            issue_title="exit code normalise",
+            assignment_id="exit-norm-717",
+            default_branch="main",
+            state_dir=state_dir,
+        )
+
+        # Add a commit to the worktree so commits_ahead >= 1.
+        (wt_path / "work.txt").write_text("done\n")
+        _git(wt_path, "add", "work.txt")
+        _git(wt_path, "commit", "-m", "work done")
+
+        _seed_running_assignment("exit-norm-717", issue_number=717)
+        with patch("coord.github_ops.post_issue_comment"):
+            result = finalize_interactive_exit(
+                assignment_id="exit-norm-717",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=717,
+                machine_name="laptop",
+                worktree_path=str(wt_path),
+                base_branch="main",
+                exit_code=1,  # non-zero — simulates Ctrl-C / tmux kill / gh deny
+                started_at=None,
+                repo_path=str(local),
+            )
+
+        assert result.terminal_status == "done", (
+            f"expected 'done' when commits_ahead>=1 even with non-zero exit_code; "
+            f"got {result.terminal_status!r} — Test/Review/Merge chain would be greyed"
+        )
+        assert result.commits_ahead is not None and result.commits_ahead >= 1
+
+    def test_zero_commits_nonzero_exit_still_fails(
+        self, repo_with_remote: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """Interactive WORK session: exit_code=1, commits_ahead==0 → still failed.
+
+        No work was produced, so the session exit_code remains authoritative.
+        """
+        from coord.interactive import finalize_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        local, _ = repo_with_remote
+        state_dir = tmp_path / "state"
+        wt_path, _ = setup_interactive_worktree(
+            local,
+            issue_number=718,
+            issue_title="zero commit fail",
+            assignment_id="exit-norm-718",
+            default_branch="main",
+            state_dir=state_dir,
+        )
+        # No commit added — commits_ahead == 0.
+
+        _seed_running_assignment("exit-norm-718", issue_number=718)
+        with patch("coord.github_ops.post_issue_comment"):
+            result = finalize_interactive_exit(
+                assignment_id="exit-norm-718",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=718,
+                machine_name="laptop",
+                worktree_path=str(wt_path),
+                base_branch="main",
+                exit_code=1,
+                started_at=None,
+                repo_path=str(local),
+            )
+
+        assert result.terminal_status == "failed", (
+            f"expected 'failed' when commits_ahead==0 and exit_code!=0; "
+            f"got {result.terminal_status!r}"
+        )
+
+    def test_zero_commits_clean_exit_is_advisory(
+        self, repo_with_remote: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """Interactive WORK session: exit_code=0, commits_ahead==0 → advisory (#448)."""
+        from coord.interactive import finalize_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        local, _ = repo_with_remote
+        state_dir = tmp_path / "state"
+        wt_path, _ = setup_interactive_worktree(
+            local,
+            issue_number=719,
+            issue_title="zero commit advisory",
+            assignment_id="exit-norm-719",
+            default_branch="main",
+            state_dir=state_dir,
+        )
+        # No commit added — commits_ahead == 0.
+
+        _seed_running_assignment("exit-norm-719", issue_number=719)
+        with patch("coord.github_ops.post_issue_comment"):
+            result = finalize_interactive_exit(
+                assignment_id="exit-norm-719",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=719,
+                machine_name="laptop",
+                worktree_path=str(wt_path),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                repo_path=str(local),
+            )
+
+        assert result.terminal_status == "advisory", (
+            f"expected 'advisory' when commits_ahead==0 and exit_code==0; "
+            f"got {result.terminal_status!r}"
+        )
+
+    def test_noninteractive_worker_nonzero_exit_still_fails(self) -> None:
+        """Regression: the non-interactive worker seam (_post_completion_local)
+        must NOT be affected — exit_code != 0 with commits_ahead >= 1 → failed.
+
+        This tests the seam DIRECTLY (not via finalize_interactive_exit) to
+        confirm that the normalisation is scoped to the interactive path only.
+        """
+        import coord.issue_store as issue_store
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("exit-norm-nonint", issue_number=717)
+        with patch("coord.github_ops.post_issue_comment"):
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="exit-norm-nonint",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=717,
+                    exit_code=1,
+                    commits_ahead=3,
+                )
+            )
+        assert outcome.status == "failed", (
+            "non-interactive worker exit_code != 0 must still yield 'failed'; "
+            f"got {outcome.status!r}"
+        )
+
+    def test_remote_nonzero_exit_with_commits_yields_done(self) -> None:
+        """#717 remote path: ``finalize_remote_interactive_exit`` with exit_code=1
+        and commits_ahead>=1 (push succeeded) → done.
+
+        Mirrors :meth:`test_nonzero_exit_with_commits_yields_done` for the SSH
+        finalize used by remote ``--fix-of`` sessions — the path #698's failure
+        was originally traced to (an ssh session that exited non-zero after the
+        push landed). The remote git ops are mocked; only the exit-code
+        normalisation is under test.
+        """
+        from coord.interactive import finalize_remote_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("exit-norm-remote-717", issue_number=717)
+        with patch("coord.github_ops.post_issue_comment"), patch(
+            "coord.interactive._remote_push_and_count",
+            return_value=(True, None, 2, "issue-717-remote-norm"),
+        ), patch(
+            "coord.interactive._remote_worktree_remove", return_value=True
+        ):
+            result = finalize_remote_interactive_exit(
+                assignment_id="exit-norm-remote-717",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=717,
+                machine_name="precision",
+                ssh_target="john@precision",
+                remote_worktree_sh="/home/john/.coord/worktrees/exit-norm-remote-717",
+                remote_repo_sh="/home/john/src/api",
+                branch="issue-717-remote-norm",
+                base_branch="main",
+                exit_code=1,  # ssh session exited non-zero after the push
+                started_at=None,
+            )
+
+        assert result.terminal_status == "done", (
+            "expected 'done' for a remote interactive session with commits_ahead>=1 "
+            f"and non-zero exit_code; got {result.terminal_status!r} — the "
+            "Test/Review/Merge chain would be greyed"
+        )
+        assert result.commits_ahead == 2

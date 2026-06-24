@@ -1616,13 +1616,26 @@ def finalize_interactive_exit(
     # processes that just want the constants).
     from coord.issue_store import CompletionRecord, post_completion  # noqa: PLC0415
 
+    # #717: For interactive WORK sessions the session exit_code is unreliable
+    # (operator Ctrl-C after the push landed, tmux kill, a deny-listed `gh`
+    # command at the tail end of the session, etc.).  When commits_ahead >= 1
+    # the branch IS pushed and the work IS reviewable — normalise to exit_code=0
+    # so _post_completion_local takes the DONE path and the Test → Review →
+    # Merge chain stays alive.
+    # commits_ahead == 0 (no work produced) and None (git unreachable / no
+    # worktree — covers review sessions) keep the original exit_code so:
+    #   • exit_code != 0, commits == 0  → still recorded as FAILED
+    #   • exit_code == 0, commits == 0  → still recorded as ADVISORY (#448)
+    #   • exit_code == 0, commits is None → still recorded as DONE (unknown-commit heuristic)
+    effective_exit_code = 0 if (commits is not None and commits >= 1) else exit_code
+
     record = CompletionRecord(
         assignment_id=assignment_id,
         machine_name=machine_name,
         repo_name=repo_name,
         repo_github=repo_github,
         issue_number=issue_number,
-        exit_code=exit_code,
+        exit_code=effective_exit_code,
         commits_ahead=commits,
         branch=branch_now or branch,
         duration_seconds=duration,
@@ -1918,13 +1931,18 @@ def finalize_remote_interactive_exit(
 
     from coord.issue_store import CompletionRecord, post_completion  # noqa: PLC0415
 
+    # #717: same normalisation as the local path — a remote interactive session
+    # that pushed ≥1 commit must not land as FAILED because the ssh session
+    # exited non-zero (e.g. tmux kill after the push finished).
+    effective_exit_code = 0 if (commits is not None and commits >= 1) else exit_code
+
     record = CompletionRecord(
         assignment_id=assignment_id,
         machine_name=machine_name,
         repo_name=repo_name,
         repo_github=repo_github,
         issue_number=issue_number,
-        exit_code=exit_code,
+        exit_code=effective_exit_code,
         commits_ahead=commits,
         branch=branch_now or branch,
         duration_seconds=duration,
