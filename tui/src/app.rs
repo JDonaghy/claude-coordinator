@@ -1839,7 +1839,10 @@ enum PipelineMergeState {
     /// `pending_force_merge` confirm prompt so the user can opt in.
     BlockedOnCi { issue: u64, repo: String },
     /// Safe to dispatch `coord merge --repo <repo>`.
-    Ready { issue: u64, repo: String },
+    /// `repo_slug` is the GitHub `owner/name` slug used to key
+    /// `pipeline_inflight_merges`; `repo` is the coord-local name passed to
+    /// `--repo`.
+    Ready { issue: u64, repo: String, repo_slug: String },
 }
 
 /// #259: one item in an open context menu.  Lightweight engine-side
@@ -12421,6 +12424,7 @@ impl CoordApp {
                 return PipelineMergeState::Ready {
                     issue: issue.number,
                     repo: issue.coord_repo.clone().unwrap_or_default(),
+                    repo_slug: issue.repo_slug.clone(),
                 };
             }
             return PipelineMergeState::NoQueue {
@@ -12476,6 +12480,7 @@ impl CoordApp {
         PipelineMergeState::Ready {
             issue: issue.number,
             repo: issue.coord_repo.clone().unwrap_or_default(),
+            repo_slug: issue.repo_slug.clone(),
         }
     }
 
@@ -12542,12 +12547,22 @@ impl CoordApp {
                 self.pending_force_merge = Some(repo);
                 true
             }
-            PipelineMergeState::Ready { issue: _, repo } => {
+            PipelineMergeState::Ready { issue, repo, repo_slug } => {
                 if repo.is_empty() {
                     // No coord_repo mapping — fall back to unscoped
                     // merge so power users with cross-repo work can
                     // still drive it from the TUI.
                     match self.command_runner.spawn_queued(&["merge"]) {
+                        SpawnQueuedOutcome::Started => {
+                            // #347: no coord_repo so we can't key the inflight
+                            // set (merge_stage_status_for keys on repo_slug),
+                            // but at least show a status-bar toast so there's
+                            // some feedback.
+                            self.pipeline_status = Some((
+                                format!("merge dispatched (#{issue})"),
+                                Instant::now(),
+                            ));
+                        }
                         SpawnQueuedOutcome::Queued => {
                             self.push_toast(
                                 "⏳ Queued",
@@ -12555,13 +12570,27 @@ impl CoordApp {
                                 ToastSeverity::Info,
                             );
                         }
-                        SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
+                        SpawnQueuedOutcome::Deduped => {}
                     }
                 } else {
                     match self
                         .command_runner
                         .spawn_queued(&["merge", "--repo", &repo])
                     {
+                        SpawnQueuedOutcome::Started => {
+                            // #347: mirror the optimistic update that
+                            // dispatch_pipeline_merge (per-stage [Go]) does —
+                            // set the inflight flag so merge_stage_status_for
+                            // returns Active immediately, and surface a toast
+                            // via pipeline_status, all within the same frame as
+                            // the user action.
+                            self.pipeline_inflight_merges
+                                .insert((repo_slug, issue));
+                            self.pipeline_status = Some((
+                                format!("merge dispatched for {} (#{})", repo, issue),
+                                Instant::now(),
+                            ));
+                        }
                         SpawnQueuedOutcome::Queued => {
                             self.push_toast(
                                 "⏳ Queued",
@@ -12569,7 +12598,7 @@ impl CoordApp {
                                 ToastSeverity::Info,
                             );
                         }
-                        SpawnQueuedOutcome::Deduped | SpawnQueuedOutcome::Started => {}
+                        SpawnQueuedOutcome::Deduped => {}
                     }
                 }
                 true
@@ -34778,7 +34807,7 @@ mod tests {
         review.review_verdict = Some("approve".to_string());
         app.data.assignments.push(review);
         match app.pipeline_merge_state() {
-            PipelineMergeState::Ready { issue, repo } => {
+            PipelineMergeState::Ready { issue, repo, .. } => {
                 assert_eq!(issue, 42);
                 assert_eq!(repo, "api");
             }
@@ -34819,7 +34848,7 @@ mod tests {
         app.data.assignments.push(work);
         // Classifier must return Ready, not BlockedOnReview.
         match app.pipeline_merge_state() {
-            PipelineMergeState::Ready { issue, repo } => {
+            PipelineMergeState::Ready { issue, repo, .. } => {
                 assert_eq!(issue, 42);
                 assert_eq!(repo, "api");
             }
@@ -35007,7 +35036,7 @@ mod tests {
         app.data.assignments.push(re_review);
 
         match app.pipeline_merge_state() {
-            PipelineMergeState::Ready { issue, repo } => {
+            PipelineMergeState::Ready { issue, repo, .. } => {
                 assert_eq!(issue, 42);
                 assert_eq!(repo, "api");
             }
@@ -35036,7 +35065,7 @@ mod tests {
         app.data.assignments.push(re_review);
 
         match app.pipeline_merge_state() {
-            PipelineMergeState::Ready { issue, repo } => {
+            PipelineMergeState::Ready { issue, repo, .. } => {
                 assert_eq!(issue, 42);
                 assert_eq!(repo, "api");
             }
@@ -35153,6 +35182,70 @@ mod tests {
         assert!(
             app.command_runner.is_running(),
             "coord merge must be spawned after bounce approve",
+        );
+    }
+
+    #[test]
+    fn dispatch_pipeline_merge_for_selected_issue_ready_sets_inflight_flag() {
+        // #347: when dispatch_pipeline_merge_for_selected_issue dispatches
+        // coord merge (Ready state, SpawnQueuedOutcome::Started), it must
+        // insert the issue into pipeline_inflight_merges immediately — the
+        // same optimistic update that dispatch_pipeline_merge (per-stage [Go])
+        // performs.  Without this, the Merge box stays grey until the next DB
+        // refresh, while the "merge dispatched" toast has already appeared.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0); // issue 42, repo_slug "acme/api", coord_repo "api"
+
+        // Set up a review-approved merge_queue entry so the classifier
+        // returns Ready.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+        });
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        // Pre-condition: pipeline_merge_state is Ready.
+        assert!(
+            matches!(
+                app.pipeline_merge_state(),
+                PipelineMergeState::Ready { .. }
+            ),
+            "pre-condition: should be Ready",
+        );
+
+        // Pre-condition: no inflight flag set yet.
+        assert!(
+            app.pipeline_inflight_merges.is_empty(),
+            "pre-condition: no inflight flag before dispatch",
+        );
+
+        // Dispatch — command_runner is idle so this will return Started.
+        let acted = app.dispatch_pipeline_merge_for_selected_issue();
+        assert!(acted, "dispatcher must act when Ready");
+
+        // #347: the inflight flag must be set immediately so
+        // merge_stage_status_for returns Active in the same render frame.
+        assert!(
+            app.pipeline_inflight_merges
+                .contains(&("acme/api".to_string(), 42u64)),
+            "#347: pipeline_inflight_merges must contain (repo_slug, issue) \
+             after Ready dispatch so the Merge box flips blue immediately",
+        );
+
+        // And pipeline_status (auto-promoted to toast) must be set.
+        assert!(
+            app.pipeline_status.is_some(),
+            "#347: pipeline_status must be set so a toast appears in the same frame",
         );
     }
 
