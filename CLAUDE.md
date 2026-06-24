@@ -21,6 +21,7 @@ line-level confirmation — not the first move.
 coordinator.yml           — Single config file: repos, machines, dependencies
 coord CLI                  — User-facing commands (plan, approve, assign, status, etc.)
 coord agent (per-machine)  — HTTP server (port 7433) that runs claude -p
+coord serve                — Board daemon (port 7435): canonical board state for thin clients
 coord web                  — Lightweight dashboard (port 7434)
 claude -p                  — The actual worker (runs locally on each machine)
 GitHub issues              — Work source + message bus (via issue comments)
@@ -29,86 +30,25 @@ Tailscale                  — Networking between machines
 
 ## Project Structure
 
-```
-coord/
-  __init__.py        — Package init, version string
-  cli.py             — Click CLI entry point and all subcommands
-  config.py          — coordinator.yml parsing and validation (Config, HooksConfig, ReviewsConfig, ConcurrencyConfig, SmokeTestsConfig)
-  models.py          — Dataclasses: Machine, Repo, Assignment, Proposal, SplitProposal, Board
-  agent.py           — AgentServer: subprocess management for claude -p workers
-  agent_app.py       — Starlette HTTP app for the agent server (routes, health, status)
-  brain.py           — Coordinator brain: gathers context, calls claude -p for planning, parses proposals
-  github_ops.py      — GitHub operations via gh CLI (issues, PRs, branches, comments)
-  dispatch.py        — Assignment routing: POST to agent servers, briefing formatting, retry logic
-  state.py           — Board state persistence and recovery (~/.coord/)
-  claim.py           — Issue claim detection: prevents two agents picking the same issue
-  comments.py        — Format/parse coordinator-authored issue comments (the message bus)
-  deps.py            — Dependency graph: transitive deps, blocked repos, cycle detection
-  events.py          — SSE event source for dashboard and live-log streaming
-  freshness.py       — Compare agent-reported repo state against GitHub HEADs
-  hooks.py           — Session lifecycle hooks (on_round_complete, on_session_end)
-  merge_queue.py     — Merge queue: sequence completed branches into target branches via PRs
-  network.py         — Network health checks for agent servers over Tailscale
-  notify.py          — Poll agents, post completion/failure comments to GitHub
-  progress.py        — Parse worker STATUS/STUCK signals from log output
-  reconcile.py       — Reconcile board with live agent state, auto-reassign failures
-  review.py          — Adversarial code review: dispatch independent reviewer on completion
-  smoke.py           — Smoke-test orchestration: auto-queue validation on capable machines
-  dashboard/
-    __init__.py
-    server.py        — Web dashboard HTTP server (Starlette + uvicorn)
-    index.html       — Single-file dashboard (HTML + CSS + JS)
-pyproject.toml
-coordinator.yml      — Example config (also used for development)
-tests/
-  conftest.py
-  test_agent.py, test_agent_app.py, test_agent_branch_capture.py, test_agent_repos_and_pull.py
-  test_board_state.py, test_brain.py, test_claim.py
-  test_cli_assign.py, test_cli_merge.py, test_cli_network.py
-  test_comments.py, test_config.py, test_coord_test.py
-  test_dashboard.py, test_deps.py, test_dispatch.py
-  test_errors.py, test_events.py, test_freshness.py
-  test_handoff.py, test_hooks.py, test_integration.py
-  test_merge_queue.py, test_models.py, test_network.py
-  test_notify.py, test_progress.py
-  test_reconcile_branch.py, test_retry.py, test_review.py
-  test_smoke.py, test_split.py, test_state.py
-```
+Query the **graphify graph** (`graphify-out/`) for the full module map + relationships — it's authoritative and auto-updated. Key entry points: `coord/cli.py` (Click CLI + all subcommands), `coord/agent.py` (`AgentServer`: `claude -p` subprocess mgmt) + `coord/agent_app.py` / `coord/serve_app.py` (agent + board-daemon HTTP apps), `coord/brain.py` (planning), `coord/dispatch.py` (routing: POST to agents, briefings), `coord/review.py` (adversarial review), `coord/merge_queue.py` (merge sequencing) + `coord/reconcile.py` (board↔agent), `coord/state.py` (board persistence in `~/.coord/`), `coord/models.py` (dataclasses), `coord/config.py` (`coordinator.yml` parsing), `coord/dashboard/` (web dashboard + `webapp/` phone PWA). Tests: `tests/test_<module>.py` (pytest; fixtures in `conftest.py`).
 
 ## Commands
 
+`coord <cmd> --help` documents every command + flags. The core loop:
+
 ```bash
-# Core workflow
-coord plan                       # Brain proposes assignments for idle machines
-coord approve 1,3                # Dispatch approved assignments (comma-separated IDs)
-coord assign <machine> <repo> <issue> [--briefing TEXT] [--dry-run]
-                                 # Direct dispatch, bypasses the brain
-coord status                     # Show all machines, assignments, connectivity
-coord status --freshness         # Also report per-machine repo freshness vs GitHub HEADs
-coord log <id> [-f]              # View claude -p output for an assignment (--follow for tail)
-
-# Post-completion
-coord notify                     # Poll agents, post completion/failure comments to GitHub
-coord test <id>                  # Pull worker's branch locally, run build + tests
-coord test --passed <id>         # Record smoke test as passed
-coord test --fail <id> --reason "..."  # Record smoke test as failed
-coord merge [--dry-run] [--repo NAME] [--method rebase|squash|merge] [--order IDs]
-                                 # Process the merge queue: open PRs and merge in sequence
-coord split S1,S2                # Create sub-issues from split proposals
-
-# Recovery and lifecycle
-coord retry <id>                 # Re-dispatch a failed assignment to a different machine
-coord stop <id>                  # Cancel a running assignment
-coord resume                     # Recover board state after crash, reconcile with agents
-coord done                       # End session, run housekeeping hooks, show summary
-
-# Setup and diagnostics
-coord agent [--machine NAME]     # Start agent server on this machine (port 7433)
-coord web                        # Start web dashboard (port 7434)
-coord config                     # Pretty-print parsed coordinator.yml
-coord version                    # Print version
-coord init                       # Interactive setup: detects repos + capabilities, writes coordinator.yml
+coord plan                 # Brain proposes assignments for idle machines
+coord approve 1,3          # Dispatch approved proposals (comma-separated IDs)
+coord assign <machine> <repo> <issue> [--briefing TEXT | --briefing-file F] [--dry-run]  # Direct dispatch
+coord status [--freshness] # Machines, assignments, connectivity (+ repo freshness vs GitHub HEADs)
+coord log <id> [-f] [--machine NAME]            # claude -p output (remote logs need --machine)
+coord notify               # Poll agents, post completion/failure comments to GitHub
+coord test --passed|--fail|--skipped <id>       # Record the Test-gate verdict (bare `coord test <id>` builds+tests locally)
+coord merge [--dry-run] [--repo NAME] [--method rebase|squash|merge] [--order IDs] [--force-merge]
+coord reconcile-merges     # Backfill missing branches + record out-of-band merges (#609/#611)
+coord retry|stop|resume <id>                    # Recovery; `coord done` ends the session
 ```
+Setup / diagnostics (discoverable via `--help`): `coord init`, `coord config`, `coord agent`, `coord serve`, `coord web`, `coord diagnose`, `coord sessions [--remote]`, `coord split`.
 
 ## Development
 
@@ -142,7 +82,7 @@ coord assign --dry-run precision claude-coordinator 42
 - **Mechanical merge conflicts auto-rebase (#241).** When `coord merge` fails because the worker's branch is out of date on a rebaseable conflict, the coordinator dispatches a `type="conflict-fix"` worker that rebases, resolves obvious additive merges, runs tests, and `git push --force-with-lease`. On success the merge re-enqueues automatically; on failure the entry is marked `HUMAN_REQUIRED` and surfaced in the TUI. Semantic conflicts (same function modified two ways) are not attempted — the worker exits and posts a comment for manual resolution. `gh` is denied for `conflict-fix` workers; only the coordinator drives merge retries.
 - **Smoke tests validate on capable hardware.** When a worker finishes, `capability_rules` in `smoke_tests` config map changed files to required machine capabilities (e.g. GTK changes → machine with GTK). A `type="smoke"` assignment runs build + tests on the right machine.
 - **Test precedes Review — the pipeline order is `Work → Test → Review → Merge`.** The smoke test runs *before* the PR/review (the natural order: smoke before PR), reversing the #520 "get the review over with first" workaround now that the agent-assisted Testing stage is smooth. This is enforced in two places that must stay in sync: (1) the **displayed** stage order comes from `pipeline.default_gates = ["test","review","merge"]` (`coord/config.py`; an old DB carrying the #520-era `["review","test","merge"]` is migrated in `coord/db.py`); (2) the **headless** auto-loop holds review dispatch until the work has a `passed`/`skipped` test verdict whenever `default_gates` orders test before review — `PipelineConfig.test_precedes_review()` drives `dispatch_pending_reviews` (`coord/review.py`). The explicit `coord review`/`coord pr` paths stay ungated so a human can always force a review. (The merge gate already required a test verdict — `requires_smoke` — so the human test touchpoint just moved earlier, and review cycles are no longer burned on untested code.)
-- **Interactive testing + merge agents drive the Test → Review → Merge handoff (leg 3c / A3, #350/#581/#306).** From a Pipeline row's right-click menu: **Start testing (interactive)** launches `coord assign --interactive --smoke-of <work_aid>` — a human-attended, read-only testing agent in the live checkout that surfaces the cached smoke-test plan, offers `coord pull-artifact`, interviews the operator, and records the verdict via `coord test --passed|--fail <work_aid>`. The TUI routes verdicts **board-driven (never TTY-scraped, ToS §3.7)** along `Work → Test → Review → Merge`: a finished work/fix raises a one-key **start-testing** offer (`--smoke-of`); a `passed`/`skipped` test raises a **pass→review** dialog that launches the interactive review; an approved review raises an **approve→merge** dialog that launches **Start merge (interactive)** = `coord assign --interactive --merge-of <work_aid>` — a merge agent that worktrees the branch, **proactively rebases onto the default branch (#306)**, resolves mechanical conflicts (semantic with the operator), runs tests, `git push --force-with-lease`, then runs `coord verify-merge` and — if clean — **`coord merge` itself to COMPLETE the merge** (#606 / v0.4.36; enabled by the v0.4.35 in-session `coord` PATH fix). A `failed` test **or** a request-changes review raises a one-key **fail→fix** dialog that launches interactive `--fix-of` on the same branch — **a test fail takes the identical action a review request-changes does** (and a fix re-tests before its re-review). `--fix-of` accepts either a request-changes **review** id or a test-failed **work** id (the #581 test-fail fix front door). The merge agent **completes the merge itself** — it is still gated on CI/review/smoke (a gate failure is reported, not forced) and the #604 anti-pollution `verify-merge` runs first, and a semantic conflict still pauses for the operator; but on a clean branch the operator no longer needs to press Go / run `coord merge` by hand. (`coord merge` is repo-wide + gated, so it merges whatever is ready in dependency order — usually just this branch.)
+- **Interactive testing + merge agents drive the Test → Review → Merge handoff (leg 3c / A3, #350/#581/#306/#606).** From a Pipeline row's right-click menu, the TUI routes **board-driven** verdicts (never TTY-scraped, ToS §3.7) along `Work → Test → Review → Merge`: **Start testing** = `coord assign --interactive --smoke-of <work_aid>` (read-only testing agent in the live checkout; records the verdict via `coord test --passed|--fail`); a `passed`/`skipped` test → **pass→review** (launches the interactive review); an approved review → **Start merge** = `--merge-of <work_aid>` (worktrees + proactively rebases onto the default branch #306, resolves mechanical conflicts (semantic with the operator), runs tests, `git push --force-with-lease`, then `coord verify-merge` and — if clean — `coord merge` itself to complete it #606); a `failed` test **or** request-changes review → one-key **`--fix-of`** on the same branch (a test-fail takes the identical action as a request-changes; `--fix-of` accepts a review id **or** a test-failed work id, the #581 front door). The merge agent is still gated on CI/review/smoke (a gate failure is reported, not forced) and `verify-merge` (#604) runs first. Full walkthrough: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - **Progress streaming from workers.** Workers emit `STATUS:` and `STUCK:` lines in their logs. The coordinator parses these for real-time progress reporting in `coord status` and the dashboard.
 - **Failure reassignment.** Failed assignments can be retried on a different machine via `coord retry`. With `concurrency.auto_reassign: true`, reconciliation auto-retries on a different machine.
 - **Dependency freshness checks.** Before dispatching, `coord approve` checks whether upstream repos are up-to-date on the target machine. Stale dependencies trigger warnings or auto-pull with `--auto-pull`.
@@ -198,7 +138,7 @@ The coordinator session (typically Opus) costs ~10x more per token than Sonnet w
 - No Anthropic SDK — all Claude interaction is via `claude -p` subprocess
 - Tests use pytest with fixtures in conftest.py
 - State files go in `~/.coord/` — including `coordinator.yml` (canonical: `~/.coord/coordinator.yml`; override with `$COORD_CONFIG` or `--config`; `./coordinator.yml` is a dev fallback)
-- Agent server port: 7433, dashboard port: 7434
+- Agent server port: 7433, dashboard port: 7434, board daemon port: 7435
 - GitHub issue comments carry `<!-- coord:event=... assignment=... -->` markers for machine parsing
 
 ## Operational guides
@@ -207,27 +147,10 @@ The coordinator session (typically Opus) costs ~10x more per token than Sonnet w
 - **Why a merge/review isn't happening**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#when-a-merge-isnt-happening) — the Test gate (manual `coord test --passed`/P-S verdict) that silently blocks review→merge, plus a gate-by-gate checklist (review approved? CI green? PR conflict? queue clog / `--order`? post-bounce keying?). **Check here first when "Go does nothing" or a story stalls with no review.**
 - **Why an issue is in the Pipeline you never dispatched**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#when-an-issue-is-sitting-in-the-pipeline-you-never-dispatched) — Board vs Pipeline membership is **label-driven**: an open issue with a `status:ready` label (set by `coord ready`, and by the refinement / new-issue chat finalize step) shows as a Pipeline "ready" card even with zero assignments. **Drop it back with `coord backlog <repo> <issue>`** (strips `status:*`). This is the `status:ready` limbo → see #359.
 - **Releasing to PyPI is a tag push, not `twine upload`.** Bump `pyproject.toml` + `coord/__init__.py` (must match), push main, then push a `vX.Y.Z` tag — `.github/workflows/publish.yml` builds and publishes with the `PYPI_API_TOKEN` repo secret (not available locally). **Agent-side changes (anything in `coord/agent.py`, e.g. worker prompts) only reach agents after a release + `coord agent update`;** coordinator-only code is live from the editable install immediately. Full steps in [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md#publishing-a-release-pypi).
-- **INVARIANT: every remote agent's `~/.coord-venv` MUST be a PyPI install (`pip install claude-coordinator`), never editable.** This is the single most-recurring fleet failure — it has bitten us repeatedly (precision again on 2026-06-07). When the install is PyPI, `coord agent update` runs `pip install --upgrade` and a released `vX.Y.Z` lands cleanly. When it's editable, update silently downgrades to **`editable (git pull)` mode** — it `git pull`s a local checkout instead of pulling the release, so version bumps never propagate and the agent often "did not come back."
-  - **Root cause (what keeps undoing it):** someone ran `pip install -e .` into `~/.coord-venv` (a setup or troubleshooting step) — the editable **install** is the problem, **not** the `~/src/<repo>` checkout itself. The #402 PATH-strip only stops *workers* from poisoning the venv via bare `pip`; it does **nothing** about a pre-existing editable install or a deliberate `pip install -e .`.
-  - **DO NOT "fix" drift by deleting `~/src/<repo>`.** That checkout is the **worker worktree base** — the agent runs `git worktree add` from it (worker worktrees in `~/.coord/worktrees/` are worktrees *of* `~/src/<repo>`), so deleting it breaks every task for that repo on that machine (only machines that still have the checkout can run work — bit us on dellserver+precision 2026-06-07). The checkout is required and harmless; **fix only the install.** (`docs/AGENT_OPERATIONS.md`'s old "the clone can be deleted" line referred to the *editable-install source*, not the worktree base — don't read it as "delete the repo.")
-  - **Detect drift (do this proactively, e.g. at session start / before relying on a release):**
-    ```bash
-    ssh <host> '~/.coord-venv/bin/pip show claude-coordinator | grep -i "editable\|location"'
-    # Any "Editable project location:" line  ⇒  drift. PyPI installs show only a site-packages Location.
-    ```
-  - **Fix (convert the install only — KEEP the `~/src/<repo>` checkout):**
-    ```bash
-    ssh <host> '~/.coord-venv/bin/pip uninstall -y claude-coordinator \
-      && ~/.coord-venv/bin/pip install --upgrade claude-coordinator'
-    # then restart so the new code loads (the /update self-restart does NOT take under systemd — #404):
-    ssh <host> 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent'
-    ```
-    Never `rm -rf ~/src/<repo>` to fix drift — it's the worker worktree base (see above).
-  **Before touching any agent install, READ [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md) end-to-end — do not re-derive it.** It already has: the exact convert-to-PyPI commands (§"Convert an editable install to PyPI"), the restart — the agent is a **systemd user service**, so use `systemctl --user restart coord-agent` (§"Manual restart"; the `/update` in-process `os.execv` restart does **not** reliably take under systemd — it leaves the **same PID + stale version**), and the fact that **`✗ did not come back` is usually a false negative** (the agent is online; the restart just didn't take — §"Upgrade via the raw /update endpoint"). So: `did not come back` / version-won't-advance ≠ automatically editable drift — check the running version/PID first, then pick drift-fix vs. plain `systemctl --user restart coord-agent`.
-- New machines: `docs/AGENT_OPERATIONS.md` also covers first-time install and verification.
+- **INVARIANT: every remote agent's `~/.coord-venv` MUST be a PyPI install (`pip install claude-coordinator`), never editable.** The single most-recurring fleet failure. PyPI → `coord agent update` does `pip install --upgrade` and a released `vX.Y.Z` lands cleanly; editable → update silently `git pull`s a local checkout instead, so version bumps never propagate and the agent often "did not come back." **Root cause:** someone ran `pip install -e .` into `~/.coord-venv` — the editable **install** is the problem, **not** the `~/src/<repo>` checkout. #402's PATH-strip only stops *workers*' bare-pip, not a deliberate editable install.
+  - **DO NOT delete `~/src/<repo>` to "fix" drift** — it's the **worker worktree base** (`git worktree add` runs from it; worktrees in `~/.coord/worktrees/` are worktrees *of* it), so deleting it breaks every task for that repo on that machine. Fix **only the install**.
+  - **Detect:** `ssh <host> '~/.coord-venv/bin/pip show claude-coordinator | grep -i "editable\|location"'` — any `Editable project location:` line ⇒ drift (PyPI shows only a site-packages `Location`).
+  - **Fix (keep the checkout):** in `~/.coord-venv`, `pip uninstall -y claude-coordinator && pip install --upgrade claude-coordinator`, then `XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent` (the `/update` `os.execv` self-restart does **not** take under systemd — #404, leaves same PID + stale version).
+  - **`✗ did not come back` is usually a FALSE NEGATIVE** (agent online, restart just didn't take) — check the running version/PID first, then pick drift-fix vs. plain `systemctl --user restart coord-agent`. **Before touching any agent install, READ [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md) end-to-end** (exact convert-to-PyPI commands, systemd restart, first-time install) — don't re-derive it.
 - **`coord-tui` depends on `quadraui` by a relative path (`../../quadraui/quadraui`).** Workers touching `tui/src/**` or `tui/Cargo.toml` build against whatever branch is currently checked out in `~/src/quadraui`. If a `tui/` task consumes a not-yet-merged quadraui feature, the briefing **must** name the quadraui PR/branch — the worker is expected to `git -C ~/src/quadraui fetch && git -C ~/src/quadraui checkout <branch>` before `cargo build`, and restore the original branch before finishing. Without this, the worker's build silently picks up the wrong `quadraui` and produces a PR that won't compile on anyone else's checkout once that quadraui PR moves. **Verify build EXIT=0 from `tui/` after restoring the original branch.**
 - **`coord-tui` ships as a locally-built binary, not via PyPI.** After a tui/ PR merges, the user needs to rebuild and reinstall locally: `cd tui && cargo build && cp target/debug/coord-tui ~/.local/bin/coord-tui`. The PyPI release flow above does not apply to coord-tui. Workers should not attempt to bump versions for tui-only changes.
-
-## Status
-
-Issues #1-19 are closed. The core loop, multi-machine dispatch, Tailscale networking, adversarial reviews, merge queue, smoke testing, progress streaming, claim detection, and failure reassignment are all implemented. Remaining work is tracked in the [GitHub issue tracker](https://github.com/JDonaghy/claude-coordinator/issues).
