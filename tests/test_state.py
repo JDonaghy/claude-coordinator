@@ -348,6 +348,128 @@ class TestReconcileBoardWriteHelpers:
         mark_assignment_merged("")  # must not raise
 
 
+class TestRecordDispatchedBranch:
+    """#706: _record_dispatched_local must persist the branch column so
+    completed work rows are never branch=NULL in the TUI."""
+
+    def test_branch_derived_from_issue_title(self, coord_db) -> None:
+        """branch is set to issue-{N}-{slug} when target_branch is not set."""
+        from coord.agent import _slugify
+        from coord.db import get_connection
+        from coord.state import record_dispatched
+
+        proposal = Proposal(
+            id=1,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=706,
+            issue_title="Record the work branch at dispatch",
+            rationale="test",
+            briefing="fix it",
+            type="work",
+        )
+        assignment_id = "aid-706-auto"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/myrepo",
+        )
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row is not None
+        expected = f"issue-706-{_slugify('Record the work branch at dispatch')}"
+        assert row[0] == expected, (
+            f"branch should be {expected!r}, got {row[0]!r}"
+        )
+
+    def test_explicit_target_branch_is_used(self, coord_db) -> None:
+        """When proposal.target_branch is set, that branch is recorded instead."""
+        from coord.db import get_connection
+        from coord.state import record_dispatched
+
+        proposal = Proposal(
+            id=2,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=706,
+            issue_title="This title would normally be slugified",
+            rationale="test",
+            briefing="fix it",
+            type="work",
+            target_branch="issue-706-explicit-branch-override",
+        )
+        assignment_id = "aid-706-explicit"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/myrepo",
+        )
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "issue-706-explicit-branch-override", (
+            "proposal.target_branch must be persisted verbatim"
+        )
+
+    def test_redispatch_does_not_clobber_branch(self, coord_db) -> None:
+        """ON CONFLICT(assignment_id) DO NOTHING: a second call with the same
+        assignment_id must NOT overwrite the branch that was already stored."""
+        from coord.db import get_connection
+        from coord.state import record_dispatched
+
+        proposal_v1 = Proposal(
+            id=3,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=706,
+            issue_title="First dispatch",
+            rationale="test",
+            type="work",
+        )
+        assignment_id = "aid-706-nodupe"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal_v1,
+            repo_github="acme/myrepo",
+        )
+
+        # Second call with a different title (would produce a different slug).
+        proposal_v2 = Proposal(
+            id=3,
+            machine_name="precision",
+            repo_name="myrepo",
+            issue_number=706,
+            issue_title="Different title on redispatch",
+            rationale="test",
+            type="work",
+        )
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal_v2,
+            repo_github="acme/myrepo",
+        )
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT branch FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row is not None
+        # Must still carry the FIRST dispatch's branch.
+        from coord.agent import _slugify
+        assert row[0] == f"issue-706-{_slugify('First dispatch')}", (
+            "ON CONFLICT DO NOTHING must leave the original branch untouched"
+        )
+
+
 class TestThinClientLocalBoardGuard:
     """#659: save_board/load_board/build_board warn (or raise) on thin clients.
 

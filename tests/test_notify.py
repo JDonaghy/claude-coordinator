@@ -286,7 +286,10 @@ class TestBranchCapture:
             notify_mod.run(config)
         board = state_mod.build_board()
         assert len(board.completed) == 1
-        assert board.completed[0].branch is None
+        # #706: branch is now recorded at dispatch time, so the row carries the
+        # derived name even when the agent completion didn't report one explicitly.
+        # _record() uses issue_number=42, issue_title="t" → "issue-42-t".
+        assert board.completed[0].branch == "issue-42-t"
 
 
 class TestDispatchedLedger:

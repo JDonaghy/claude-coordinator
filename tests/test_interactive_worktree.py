@@ -784,13 +784,17 @@ class TestFinalizeBranchFallback:
             )
 
         mock_push.assert_not_called()
-        # branch must remain None for a read-only review session.
+        # #706: branch is now recorded at dispatch time by _record_dispatched_local.
+        # The seed used issue_number=611, issue_title="Some work" →
+        # "issue-611-some-work".  finalize_interactive_exit must NOT clear or
+        # overwrite it for a read-only review (worktree_path=None, no branch kwarg).
         row = get_connection().execute(
             "SELECT branch FROM assignments WHERE assignment_id=?",
             ("rv-no-branch-611",),
         ).fetchone()
         assert row is not None
-        assert row["branch"] is None, (
-            f"review rows must stay branch=None; got {row['branch']!r}"
+        assert row["branch"] == "issue-611-some-work", (
+            f"finalize_interactive_exit must preserve the dispatch-time branch; "
+            f"got {row['branch']!r}"
         )
         assert result.worktree_removed is False
