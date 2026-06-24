@@ -233,6 +233,11 @@ class Assignment:
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    # #618: short one-liner written immediately when an interactive session
+    # fails to launch (e.g. "branch already checked out at <path>").  Lets
+    # the TUI explain the red box without any log file being present.
+    # None for assignments that launched successfully.
+    failure_reason: str | None = None
 
 
 @dataclass

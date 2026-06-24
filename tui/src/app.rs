@@ -989,6 +989,12 @@ struct Assignment {
     // returning BoardData::default() and blanking every panel. Accept int-or-bool.
     #[serde(default, deserialize_with = "de_bool_from_int_or_bool")]
     is_interactive: bool,
+    /// #618: short human-readable reason written immediately when an interactive
+    /// session fails to launch (e.g. "branch already checked out at <path>").
+    /// `None` for assignments that launched successfully.  Shown in the
+    /// assignment detail panel so the TUI explains the red box without a log file.
+    #[serde(default)]
+    failure_reason: Option<String>,
 }
 
 /// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)
@@ -3438,7 +3444,7 @@ fn load_data() -> BoardData {
              smoke_tests, review_findings, test_plan, test_plan_branch_head, \
              COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), \
              COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0), \
-             COALESCE(is_interactive, 0) \
+             COALESCE(is_interactive, 0), failure_reason \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -3487,6 +3493,10 @@ fn load_data() -> BoardData {
                 // #546: is_interactive distinguishes Max-subscription sessions from
                 // old automated rows that also have cost_usd=NULL + zero tokens.
                 is_interactive: row.get::<_, i64>(24)? != 0,
+                // #618: short launch-failure reason; NULL for successful launches.
+                // The column may be absent on pre-migration DBs — gracefully
+                // degrade to None rather than failing the whole query.
+                failure_reason: row.get::<_, Option<String>>(25).unwrap_or(None),
             })
         }) {
             Ok(r) => r,
@@ -14767,6 +14777,19 @@ impl CoordApp {
                 _ => Color::rgb(180, 180, 180),
             };
             items.push(kv_item("Status", &a.status, Some(status_color)));
+            // #618: when an interactive session fails at launch (e.g. branch
+            // already checked out) no log file is produced.  Surface the
+            // reason string recorded at failure time so the operator can see
+            // WHY the box is red without having to run `coord diagnose`.
+            if a.status == "failed" {
+                if let Some(reason) = &a.failure_reason {
+                    items.push(kv_item(
+                        "Failure",
+                        reason,
+                        Some(Color::rgb(220, 100, 100)),
+                    ));
+                }
+            }
             if let Some(branch) = &a.branch {
                 items.push(kv_item("Branch", branch, Some(Color::rgb(200, 200, 200))));
             }
@@ -31177,6 +31200,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         }
     }
 
@@ -31954,6 +31978,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         }
     }
 
@@ -33231,6 +33256,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -33373,6 +33399,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -33443,6 +33470,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -34375,6 +34403,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         }
     }
 
@@ -36147,6 +36176,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -36192,6 +36222,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
                 is_interactive: false,
+                failure_reason: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -36231,6 +36262,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -36259,6 +36291,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -36298,6 +36331,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -36326,6 +36360,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: true,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -36370,6 +36405,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
                 is_interactive: false,
+                failure_reason: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -36408,6 +36444,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -36436,6 +36473,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -36483,6 +36521,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -36530,6 +36569,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -36657,6 +36697,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -36748,6 +36789,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -36795,6 +36837,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -36829,6 +36872,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -36868,6 +36912,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -36896,6 +36941,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -36932,6 +36978,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -36997,6 +37044,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -37043,6 +37091,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -37070,6 +37119,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Done);
@@ -37261,6 +37311,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         }
     }
 
@@ -37600,6 +37651,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
                 is_interactive: false,
+                failure_reason: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -37649,6 +37701,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -37696,6 +37749,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
                 is_interactive: false,
+                failure_reason: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -37745,6 +37799,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -37831,6 +37886,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -37873,6 +37929,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -37909,6 +37966,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -37945,6 +38003,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -42072,6 +42131,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -42191,6 +42251,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -42551,6 +42612,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             is_interactive: false,
+            failure_reason: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],

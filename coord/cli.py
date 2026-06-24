@@ -3439,6 +3439,7 @@ def assign(
                 build_board as _build_board_fx,
                 record_dispatched_assignment as _record_fx,
                 save_board as _save_board_fx,
+                set_assignment_failure_reason as _set_fail_reason_fx,
             )
 
             # Track B / #486: a fix runs on the LOCAL TTY or on a REMOTE
@@ -3666,11 +3667,13 @@ def assign(
                     )
                     worktree_path = str(_wt_path)
                 except (_AgentGitErrorFx, OSError) as _wt_err:
-                    click.echo(
-                        f"  error: could not create fix worktree on branch "
-                        f"{work.branch}: {_wt_err}",
-                        err=True,
+                    _reason_fx = (
+                        f"worktree-add failed for branch {work.branch}: {_wt_err}"
                     )
+                    click.echo(f"  error: {_reason_fx}", err=True)
+                    # #618: persist reason + mark terminal immediately so the
+                    # TUI shows WHY the box is red (no log file on this path).
+                    _set_fail_reason_fx(assignment_id, _reason_fx)
                     sys.exit(1)
                 click.echo(f"  worktree: {worktree_path} (branch: {work.branch})")
 
@@ -3869,6 +3872,7 @@ def assign(
                 build_board as _build_board_rw,
                 record_dispatched_assignment as _record_rw,
                 save_board as _save_board_rw,
+                set_assignment_failure_reason as _set_fail_reason_rw,
             )
 
             # Resolve branch: try to find a work assignment by ID first, then
@@ -4016,11 +4020,13 @@ def assign(
                     )
                     worktree_path = str(_wt_path)
                 except (_AgentGitErrorRw, OSError) as _wt_err:
-                    click.echo(
-                        f"  error: could not create rework worktree on branch "
-                        f"{rw_branch}: {_wt_err}",
-                        err=True,
+                    _reason_rw = (
+                        f"worktree-add failed for branch {rw_branch}: {_wt_err}"
                     )
+                    click.echo(f"  error: {_reason_rw}", err=True)
+                    # #618: persist reason + mark terminal immediately so the
+                    # TUI shows WHY the box is red (no log file on this path).
+                    _set_fail_reason_rw(assignment_id, _reason_rw)
                     sys.exit(1)
                 click.echo(f"  worktree: {worktree_path} (branch: {rw_branch})")
 
@@ -7004,11 +7010,14 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
         "reconciles this issue's board rows. When recovery isn't possible it "
         "reports needs_reset=true; re-run with --reset to clear the stage's "
         "rows/claim/worktree and stop a live session — KEEPING the branch + "
-        "commits, so the stage is re-dispatchable."
+        "commits, so the stage is re-dispatchable.\n\n"
+        "Pass --orphan-worktrees instead of REPO/ISSUE to run a local fleet sweep "
+        "that removes coordinator worktrees with no live tmux session and no "
+        "uncommitted work.  Dirty worktrees are reported but never auto-deleted."
     )
 )
-@click.argument("repo")
-@click.argument("issue", type=int)
+@click.argument("repo", required=False, default=None)
+@click.argument("issue", type=int, required=False, default=None)
 @click.option(
     "--stage",
     type=click.Choice(["plan", "work", "review", "test", "merge"]),
@@ -7022,16 +7031,38 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
     "a live session, KEEPING the branch + commits (stage re-dispatchable).",
 )
 @click.option("--dry-run", is_flag=True, help="Report findings without writing.")
+@click.option(
+    "--orphan-worktrees",
+    is_flag=True,
+    help=(
+        "#618: local fleet sweep — find and remove coordinator worktrees "
+        "(~/.coord/worktrees/*) whose assignment has no live tmux session and "
+        "no uncommitted work.  Dirty worktrees are reported but never deleted."
+    ),
+)
 @_CONFIG_OPTION
 def diagnose(
-    repo: str,
-    issue: int,
+    repo: str | None,
+    issue: int | None,
     stage: str | None,
     reset: bool,
     dry_run: bool,
+    orphan_worktrees: bool,
     config_path: Path,
 ) -> None:
     """Per-stage doctor — diagnose, best-effort recover, optional reset."""
+    # ── #618: --orphan-worktrees fleet sweep ─────────────────────────────────
+    if orphan_worktrees:
+        _diagnose_orphan_worktrees(config_path, dry_run=dry_run)
+        return
+
+    if repo is None or issue is None:
+        click.echo(
+            "error: REPO and ISSUE are required (or pass --orphan-worktrees for a fleet sweep).",
+            err=True,
+        )
+        sys.exit(2)
+
     # #584: the canonical board + gh + fleet ssh live on the daemon host, so on
     # a thin client this must run there (an empty local board would no-op).
     # COORD_DIAGNOSE_ON_DAEMON guards the daemon against re-routing to itself.
@@ -7077,6 +7108,141 @@ def diagnose(
         click.echo("  ⚠ still wedged — re-run with --reset to clear the stage "
                    "(keeps the branch + commits).")
     click.echo(res.summary_line())
+
+
+def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
+    """#618: local fleet sweep — find and prune orphaned coordinator worktrees.
+
+    An orphaned worktree is one under ``~/.coord/worktrees/`` whose
+    assignment_id has no live tmux session and no running/pending DB row.
+    Dirty worktrees (uncommitted changes) are reported but never deleted.
+    """
+    from coord.diagnose import (  # noqa: PLC0415
+        _active_assignment_ids_for_repo,
+        _find_orphaned_worktrees,
+        _prune_orphaned_worktrees,
+    )
+    from coord.interactive import (  # noqa: PLC0415
+        tmux_available,
+        tmux_session_name,
+        tmux_session_alive,
+    )
+    from coord.state import COORD_DIR, build_board  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    board = build_board()
+    worktrees_dir = COORD_DIR / "worktrees"
+
+    if not worktrees_dir.exists():
+        click.echo("~/.coord/worktrees/ does not exist — nothing to sweep.")
+        return
+
+    # Collect all assignment_ids with live tmux sessions.
+    tmux_ok = tmux_available()
+    live_tmux: set[str] = set()
+    if tmux_ok:
+        for entry in worktrees_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            aid = entry.name
+            if tmux_session_alive(tmux_session_name(aid)):
+                live_tmux.add(aid)
+
+    # All running/pending assignment_ids from the board.
+    running_ids: set[str] = {
+        a.assignment_id
+        for a in board.active
+        if a.assignment_id
+    }
+    active_ids = running_ids | live_tmux
+
+    total_removed: list[Path] = []
+    total_skipped: list[Path] = []
+
+    for repo in cfg.repos:
+        # Find any local checkout for this repo.
+        repo_path: Path | None = None
+        for machine in cfg.machines:
+            rp = machine.repo_path(repo.name)
+            if rp:
+                candidate = Path(rp).expanduser()
+                if candidate.exists():
+                    repo_path = candidate
+                    break
+        if repo_path is None:
+            continue
+
+        # Collect all worktree dirs under worktrees_dir, find the ones checked out
+        # in this repo's worktree list and not in active_ids.
+        try:
+            import subprocess as _sp  # noqa: PLC0415
+            result = _sp.run(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if result.returncode != 0:
+            continue
+
+        orphans: list[Path] = []
+        current: dict[str, str] = {}
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                if current:
+                    wt_str = current.get("worktree", "")
+                    if wt_str:
+                        wt_path = Path(wt_str)
+                        try:
+                            aid = wt_path.relative_to(worktrees_dir).parts[0]
+                        except ValueError:
+                            pass
+                        else:
+                            if aid not in active_ids and wt_path.exists():
+                                orphans.append(wt_path)
+                    current = {}
+            elif line.startswith("worktree "):
+                current["worktree"] = line[len("worktree "):]
+        if current:
+            wt_str = current.get("worktree", "")
+            if wt_str:
+                wt_path = Path(wt_str)
+                try:
+                    aid = wt_path.relative_to(worktrees_dir).parts[0]
+                except ValueError:
+                    pass
+                else:
+                    if aid not in active_ids and wt_path.exists():
+                        orphans.append(wt_path)
+
+        if not orphans:
+            continue
+
+        click.echo(f"{repo.name}: found {len(orphans)} orphaned worktree(s)")
+        for wt in orphans:
+            click.echo(f"  {wt}")
+        if dry_run:
+            click.echo(f"  (dry-run) would prune {len(orphans)} worktree(s)")
+            total_skipped.extend(orphans)
+            continue
+
+        removed, skipped = _prune_orphaned_worktrees(repo_path, orphans)
+        for wt in removed:
+            click.echo(f"  ✓ removed {wt}")
+        for wt in skipped:
+            click.echo(f"  ⚠ skipped (uncommitted work) {wt}")
+        total_removed.extend(removed)
+        total_skipped.extend(skipped)
+
+    click.echo(
+        f"orphan-worktrees sweep: {len(total_removed)} removed"
+        + (f", {len(total_skipped)} skipped (dirty — inspect manually)" if total_skipped else "")
+        + (" [dry-run]" if dry_run else "")
+    )
 
 
 @main.group("issue")

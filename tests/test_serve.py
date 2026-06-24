@@ -1353,6 +1353,7 @@ def test_diagnose_cli_never_calls_save_board(valid_config_path: Path, coord_db, 
     diagnose_cmd.callback(
         repo="api", issue=42, stage="work", reset=False, dry_run=False,
         config_path=valid_config_path,
+        orphan_worktrees=False,  # #618: new flag; default False for this test
     )
 
 

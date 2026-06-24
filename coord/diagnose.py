@@ -32,8 +32,11 @@ orchestration in :func:`diagnose_stage` is unit-testable by monkeypatching them.
 
 from __future__ import annotations
 
+import logging
+import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
@@ -457,6 +460,16 @@ def _recover_work_like(
         if not dry_run:
             res.actions_taken.append(f"finalized phantom session ({_finalize_dead(latest, config)})")
             res.recovered = True
+    elif latest.status == "failed" and latest.failure_reason:
+        # #618: assignment failed at launch (worktree-add or similar).  The
+        # failure_reason tells us what happened; if it's a "branch already checked
+        # out" error we can detect and prune the blocking orphaned worktree.
+        res.findings.append(
+            f"launch-failed: {latest.failure_reason}"
+        )
+        if latest.branch:
+            _prune_orphan_for_failed(board, config, latest, res, dry_run=dry_run)
+        res.recovered = True  # stage row is already terminal — nothing more needed
     elif state == "live" and _is_stale(latest):
         res.findings.append("session is LIVE but stale (idle days) — reset to clear it")
         res.needs_reset = True
@@ -466,6 +479,61 @@ def _recover_work_like(
     else:
         res.findings.append("stage looks healthy")
         res.recovered = True
+
+
+def _prune_orphan_for_failed(
+    board, config, latest: "Assignment", res: DiagnoseResult, *, dry_run: bool
+) -> None:
+    """#618: if *latest* is a failed launch, detect and prune the orphaned
+    worktree that caused the "branch already checked out" collision."""
+    branch = latest.branch
+    if not branch:
+        return
+    repo_name = latest.repo_name
+    repo_cfg = next((r for r in config.repos if r.name == repo_name), None)
+    if repo_cfg is None:
+        return
+
+    # Find the repo path on the local machine.
+    repo_path: Path | None = None
+    for machine in config.machines:
+        rp = machine.repo_path(repo_name)
+        if rp:
+            candidate = Path(rp).expanduser()
+            if candidate.exists():
+                repo_path = candidate
+                break
+    if repo_path is None:
+        return
+
+    active_ids = _active_assignment_ids_for_repo(board, repo_name)
+    orphans = _find_orphaned_worktrees(repo_path, branch, active_assignment_ids=active_ids)
+    if not orphans:
+        return
+
+    res.findings.append(
+        f"found {len(orphans)} orphaned worktree(s) holding branch {branch!r}: "
+        + ", ".join(str(p) for p in orphans)
+    )
+    if dry_run:
+        res.findings.append(
+            f"(dry-run) would prune {len(orphans)} orphaned worktree(s) "
+            "(re-run without --dry-run to remove)"
+        )
+        return
+
+    removed, skipped = _prune_orphaned_worktrees(repo_path, orphans)
+    if removed:
+        res.actions_taken.append(
+            f"pruned {len(removed)} orphaned worktree(s): "
+            + ", ".join(str(p) for p in removed)
+        )
+    if skipped:
+        res.findings.append(
+            f"{len(skipped)} worktree(s) skipped (uncommitted work — inspect manually): "
+            + ", ".join(str(p) for p in skipped)
+        )
+        res.needs_reset = True
 
 
 def _do_reset(
@@ -596,3 +664,201 @@ def _is_stale(assignment: "Assignment", *, max_age_hours: float = 12.0) -> bool:
     if not assignment.dispatched_at:
         return False
     return (time.time() - assignment.dispatched_at) > max_age_hours * 3600.0
+
+
+# ── #618: orphaned worktree detection + pruning ──────────────────────────────
+
+
+def _find_orphaned_worktrees(
+    repo_path: Path,
+    branch: str,
+    *,
+    active_assignment_ids: set[str],
+    worktrees_dir: Path | None = None,
+) -> list[Path]:
+    """Return worktree paths under *worktrees_dir* that hold *branch* but belong
+    to no active (live-tmux OR running-DB) assignment.
+
+    A worktree is "orphaned" when ALL of:
+    * Its directory is under ``~/.coord/worktrees/`` (coordinator-managed).
+    * Its git checkout has *branch* checked out.
+    * Its assignment_id (derived from the directory name) is NOT in
+      *active_assignment_ids* — i.e. no live tmux session and no running DB row.
+
+    Dirty worktrees (uncommitted changes) are listed but callers must skip
+    force-remove — they'd lose uncommitted work.  Use ``_prune_orphaned_worktrees``
+    to prune them with an uncommitted-work guard.
+    """
+    if worktrees_dir is None:
+        from coord.state import COORD_DIR  # noqa: PLC0415
+        worktrees_dir = COORD_DIR / "worktrees"
+
+    orphans: list[Path] = []
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    # Parse the porcelain output into blocks.
+    current: dict[str, str] = {}
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current:
+                _maybe_orphan(current, branch, worktrees_dir, active_assignment_ids, orphans)
+                current = {}
+        elif line.startswith("worktree "):
+            current["worktree"] = line[len("worktree "):]
+        elif line.startswith("branch "):
+            raw_branch = line[len("branch "):]
+            current["branch"] = (
+                raw_branch[len("refs/heads/"):] if raw_branch.startswith("refs/heads/") else raw_branch
+            )
+    if current:
+        _maybe_orphan(current, branch, worktrees_dir, active_assignment_ids, orphans)
+
+    return orphans
+
+
+def _maybe_orphan(
+    entry: dict[str, str],
+    branch: str,
+    worktrees_dir: Path,
+    active_assignment_ids: set[str],
+    out: list[Path],
+) -> None:
+    """Append to *out* if *entry* is an orphaned worktree for *branch*."""
+    wt_str = entry.get("worktree", "")
+    if not wt_str:
+        return
+    if entry.get("branch", "") != branch:
+        return
+    wt_path = Path(wt_str)
+    # Only consider coordinator-managed worktrees (under ~/.coord/worktrees/).
+    try:
+        wt_path.relative_to(worktrees_dir)
+    except ValueError:
+        return
+    # The assignment_id is the directory name component immediately under worktrees_dir.
+    aid = wt_path.relative_to(worktrees_dir).parts[0]
+    if aid in active_assignment_ids:
+        return
+    out.append(wt_path)
+
+
+def _prune_orphaned_worktrees(
+    repo_path: Path,
+    orphans: list[Path],
+    *,
+    force: bool = False,
+) -> tuple[list[Path], list[Path]]:
+    """Remove *orphans* from *repo_path* via ``git worktree remove``.
+
+    Returns ``(removed, skipped)``.  Worktrees with uncommitted changes are
+    skipped when *force* is ``False`` (default) so no uncommitted work is lost.
+    After removal, runs ``git worktree prune`` to clean admin entries.
+    """
+    removed: list[Path] = []
+    skipped: list[Path] = []
+    for wt in orphans:
+        if not wt.exists():
+            removed.append(wt)
+            continue
+        if not force:
+            # Check for uncommitted changes — skip dirty worktrees.
+            try:
+                dirty = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(wt),
+                    capture_output=True,
+                    text=True,
+                    timeout=10.0,
+                )
+                if dirty.returncode == 0 and dirty.stdout.strip():
+                    skipped.append(wt)
+                    continue
+            except (subprocess.SubprocessError, OSError):
+                skipped.append(wt)
+                continue
+        try:
+            r = subprocess.run(
+                ["git", "worktree", "remove", str(wt), "--force"],
+                cwd=str(repo_path),
+                capture_output=True,
+                timeout=15.0,
+            )
+            if r.returncode == 0:
+                removed.append(wt)
+            else:
+                skipped.append(wt)
+        except (subprocess.SubprocessError, OSError):
+            skipped.append(wt)
+    # Prune stale git admin entries regardless of what was removed.
+    try:
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=str(repo_path),
+            capture_output=True,
+            timeout=10.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return removed, skipped
+
+
+def _active_assignment_ids_for_repo(
+    board: "Board", repo_name: str
+) -> set[str]:
+    """Return assignment IDs for *repo_name* that are still running/pending."""
+    return {
+        a.assignment_id
+        for a in board.active
+        if a.repo_name == repo_name and a.assignment_id
+    }
+
+
+def find_and_prune_orphaned_worktrees(
+    board: "Board",
+    config: "Config",
+    repo_name: str,
+    branch: str,
+) -> tuple[list[Path], list[Path]]:
+    """Detect and prune orphaned coordinator worktrees holding *branch*.
+
+    Public entry point used by :func:`diagnose_stage` (Gap 2 of #618) and
+    by the ``coord diagnose --orphan-worktrees`` fleet sweep.
+
+    Returns ``(removed, skipped)`` path lists.  The *skipped* list contains
+    worktrees that have uncommitted changes — the operator must inspect and
+    clean them manually.
+    """
+    repo_cfg = next((r for r in config.repos if r.name == repo_name), None)
+    if repo_cfg is None:
+        return [], []
+
+    # Find the local checkout path for this repo.  We need it to run git commands.
+    # On a thin client the local checkout may not exist; fall back gracefully.
+    repo_path: Path | None = None
+    for machine in config.machines:
+        rp = machine.repo_path(repo_name)
+        if rp:
+            candidate = Path(rp).expanduser()
+            if candidate.exists():
+                repo_path = candidate
+                break
+    if repo_path is None:
+        return [], []
+
+    active_ids = _active_assignment_ids_for_repo(board, repo_name)
+    orphans = _find_orphaned_worktrees(repo_path, branch, active_assignment_ids=active_ids)
+    if not orphans:
+        return [], []
+    return _prune_orphaned_worktrees(repo_path, orphans)

@@ -292,6 +292,12 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # "Max (subscription)" accurately without misidentifying old automated
         # rows that also lack cost_usd + token data.
         "ALTER TABLE assignments ADD COLUMN is_interactive INTEGER DEFAULT 0",
+        # #618: short human-readable reason for a launch failure (e.g.
+        # "branch already checked out at ~/.coord/worktrees/<old-aid>").
+        # Written by the CLI immediately when an interactive session can't
+        # start so the TUI can explain the red box without any log file.
+        # NULL for assignments that launched successfully.
+        "ALTER TABLE assignments ADD COLUMN failure_reason TEXT",
     ]
     for sql in migrations:
         try:
