@@ -450,7 +450,7 @@ def build_app(config: Config) -> Starlette:
         Body: {"assignment_id": "...", "action": "..."}
 
         Supported actions: dispatch_review, dispatch_smoke, enqueue, merge,
-        retry (501), dispatch_fix (501).
+        test-verdict, record-review-verdict, retry (501), dispatch_fix (501).
         """
         try:
             body = await request.json()
@@ -594,6 +594,47 @@ def build_app(config: Config) -> Starlette:
             board.mark_failed_by_id(assignment_id, finished_at=time.time())
             save_board(board)
             return JSONResponse({"ok": True, "cancelled_on_agent": cancelled_on_agent})
+
+        elif action == "test-verdict":
+            # Record a Test-gate verdict: pass / fail / skip.
+            # Body: {assignment_id, verdict: "pass"|"fail"|"skip", reason?}
+            verdict_raw = body.get("verdict")
+            reason = body.get("reason")
+            _verdict_map = {"pass": "passed", "fail": "failed", "skip": "skipped"}
+            test_state = _verdict_map.get(verdict_raw)
+            if test_state is None:
+                return JSONResponse(
+                    {"error": "verdict must be 'pass', 'fail', or 'skip'"},
+                    status_code=400,
+                )
+            from coord.state import record_test_verdict  # noqa: PLC0415
+            try:
+                record_test_verdict(
+                    assignment_id=assignment_id,
+                    test_state=test_state,
+                    test_reason=reason,
+                )
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            return JSONResponse({"ok": True, "test_state": test_state})
+
+        elif action == "record-review-verdict":
+            # Persist a review verdict + findings body cached locally so the
+            # phone detail screen can render them without a slow GitHub re-fetch.
+            # Body: {assignment_id, verdict: "approve"|"request-changes", body}
+            verdict_raw = body.get("verdict")
+            findings_body = body.get("body", "")
+            if verdict_raw not in ("approve", "request-changes"):
+                return JSONResponse(
+                    {"error": "verdict must be 'approve' or 'request-changes'"},
+                    status_code=400,
+                )
+            from coord.notify import _persist_review_findings  # noqa: PLC0415
+            try:
+                _persist_review_findings(assignment_id, verdict_raw, findings_body)
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            return JSONResponse({"ok": True})
 
         elif action in ("retry", "dispatch_fix"):
             return JSONResponse(

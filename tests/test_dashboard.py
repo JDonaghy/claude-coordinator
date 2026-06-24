@@ -408,6 +408,254 @@ class TestPipelineAction:
         assert r.status_code == 400
 
 
+class TestPipelineActionTestVerdict:
+    """Tests for /api/pipeline/action action=test-verdict."""
+
+    def _board_with_done(self) -> "Board":
+        return Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="work001", status="done",
+                    branch="issue-42-fix-auth",
+                    finished_at=1.0,
+                ),
+            ],
+        )
+
+    def test_test_verdict_pass(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.state.record_test_verdict") as mock_rtv,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "pass",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["test_state"] == "passed"
+        mock_rtv.assert_called_once_with(
+            assignment_id="work001",
+            test_state="passed",
+            test_reason=None,
+        )
+
+    def test_test_verdict_fail_with_reason(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.state.record_test_verdict") as mock_rtv,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "fail",
+                "reason": "cargo test blew up",
+            })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["test_state"] == "failed"
+        mock_rtv.assert_called_once_with(
+            assignment_id="work001",
+            test_state="failed",
+            test_reason="cargo test blew up",
+        )
+
+    def test_test_verdict_skip(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.state.record_test_verdict"),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "skip",
+            })
+        assert r.status_code == 200
+        assert r.json()["test_state"] == "skipped"
+
+    def test_test_verdict_invalid_verdict(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=self._board_with_done()):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "maybe",
+            })
+        assert r.status_code == 400
+        assert "verdict" in r.json()["error"]
+
+    def test_test_verdict_exception_returns_500(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.state.record_test_verdict", side_effect=RuntimeError("db locked")),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "work001",
+                "action": "test-verdict",
+                "verdict": "pass",
+            })
+        assert r.status_code == 500
+        assert "db locked" in r.json()["error"]
+
+
+class TestPipelineActionRecordReviewVerdict:
+    """Tests for /api/pipeline/action action=record-review-verdict."""
+
+    def _board_with_review(self) -> "Board":
+        return Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="rev001", status="done", type="review",
+                    finished_at=1.0,
+                ),
+            ],
+        )
+
+    def test_record_review_verdict_approve(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_review()),
+            patch("coord.notify._persist_review_findings") as mock_prf,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "rev001",
+                "action": "record-review-verdict",
+                "verdict": "approve",
+                "body": "LGTM — clean diff, tests pass.",
+            })
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        mock_prf.assert_called_once_with("rev001", "approve", "LGTM — clean diff, tests pass.")
+
+    def test_record_review_verdict_request_changes(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_review()),
+            patch("coord.notify._persist_review_findings") as mock_prf,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "rev001",
+                "action": "record-review-verdict",
+                "verdict": "request-changes",
+                "body": "Missing tests for error path.",
+            })
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        mock_prf.assert_called_once_with("rev001", "request-changes", "Missing tests for error path.")
+
+    def test_record_review_verdict_invalid_verdict(self) -> None:
+        client = _client()
+        with patch("coord.dashboard.server.load_board", return_value=self._board_with_review()):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "rev001",
+                "action": "record-review-verdict",
+                "verdict": "meh",
+                "body": "",
+            })
+        assert r.status_code == 400
+        assert "verdict" in r.json()["error"]
+
+    def test_record_review_verdict_exception_returns_500(self) -> None:
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_review()),
+            patch("coord.notify._persist_review_findings", side_effect=RuntimeError("db error")),
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "rev001",
+                "action": "record-review-verdict",
+                "verdict": "approve",
+                "body": "",
+            })
+        assert r.status_code == 500
+        assert "db error" in r.json()["error"]
+
+    def test_record_review_verdict_empty_body_defaults(self) -> None:
+        """body field is optional — omitting it defaults to empty string."""
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=self._board_with_review()),
+            patch("coord.notify._persist_review_findings") as mock_prf,
+        ):
+            r = client.post("/api/pipeline/action", json={
+                "assignment_id": "rev001",
+                "action": "record-review-verdict",
+                "verdict": "approve",
+            })
+        assert r.status_code == 200
+        mock_prf.assert_called_once_with("rev001", "approve", "")
+
+
+class TestPipelineViewReviewFields:
+    """Tests that /api/pipeline includes review_verdict + review_findings_body."""
+
+    def test_pipeline_includes_review_verdict_and_body(self) -> None:
+        """When a review assignment has cached findings, the pipeline payload
+        surfaces review_verdict and review_findings_body on the work item."""
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=7, issue_title="New feature",
+            assignment_id="work007", status="done",
+            branch="issue-7-new-feature", finished_at=1.0,
+            required_gates=["review", "merge"],
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=7, issue_title="New feature",
+            assignment_id="rev007", status="done", type="review",
+            review_of_assignment_id="work007", finished_at=2.0,
+            review_verdict="approve",
+        )
+        board = Board(completed=[work, review])
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.state.load_assignment_review_findings",
+                  return_value=("approve", "Looks great!")),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        items = r.json()
+        assert len(items) == 1
+        item = items[0]
+        assert item["assignment_id"] == "work007"
+        assert item["review_verdict"] == "approve"
+        assert item["review_findings_body"] == "Looks great!"
+
+    def test_pipeline_review_fields_none_when_no_review(self) -> None:
+        """Without a review assignment the fields are None."""
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=8, issue_title="Another feature",
+            assignment_id="work008", status="done",
+            branch="issue-8-another", finished_at=1.0,
+        )
+        board = Board(completed=[work])
+        client = _client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        items = r.json()
+        assert len(items) == 1
+        assert items[0]["review_verdict"] is None
+        assert items[0]["review_findings_body"] is None
+
+
 class TestDashboardDispatchUI:
     """Tests confirming the HTML includes the new dispatch-feedback elements."""
 

@@ -63,6 +63,11 @@ class PipelineView:
     # been posted to GitHub (review_posted_at is None on the review assignment).
     # The dashboard shows a ⚠ indicator and a "Post Findings" retry button.
     review_findings_pending: bool = False
+    # Cached review verdict and findings body from the linked review assignment.
+    # review_verdict: None | "approve" | "request-changes"
+    # review_findings_body: the reviewer's prose (markdown) or None if not yet cached.
+    review_verdict: str | None = None
+    review_findings_body: str | None = None
 
 
 # ── Stage progression constants ──────────────────────────────────────────────
@@ -267,6 +272,17 @@ def compute_pipeline(
         and review_assignment.review_posted_at is None
     )
 
+    # Read cached review verdict + body from the review assignment row so the
+    # phone detail screen can render them without a slow GitHub re-fetch.
+    review_verdict: str | None = None
+    review_findings_body: str | None = None
+    if review_assignment is not None and review_assignment.assignment_id:
+        review_verdict = review_assignment.review_verdict
+        from coord.state import load_assignment_review_findings  # noqa: PLC0415
+        cached = load_assignment_review_findings(review_assignment.assignment_id)
+        if cached is not None:
+            review_findings_body = cached[1]
+
     return PipelineView(
         assignment_id=aid,
         issue_number=assignment.issue_number,
@@ -276,4 +292,6 @@ def compute_pipeline(
         available_gates=available_gates,
         progress_pct=progress_pct,
         review_findings_pending=review_findings_pending,
+        review_verdict=review_verdict,
+        review_findings_body=review_findings_body,
     )
