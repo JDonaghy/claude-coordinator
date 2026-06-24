@@ -1166,3 +1166,78 @@ class TestUnstickAction:
                 "action": "unstick",
             })
         assert r.status_code == 404
+
+
+class TestSPAServing:
+    """Verify the built React webapp is served correctly when dist/ exists."""
+
+    def _make_dist(self, tmp_path: Path, index_content: str = "<html><title>coord dashboard</title></html>") -> Path:
+        """Create a minimal fake dist/ directory."""
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text(index_content)
+        return dist
+
+    def test_serves_webapp_index_when_dist_exists(self, tmp_path: Path) -> None:
+        """When webapp/dist/ is present, GET / returns the SPA index.html."""
+        dist = self._make_dist(tmp_path, "<html><title>coord dashboard spa</title></html>")
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            r = client.get("/")
+        assert r.status_code == 200
+        assert "coord dashboard spa" in r.text
+
+    def test_api_routes_unaffected_when_dist_exists(self, tmp_path: Path) -> None:
+        """All /api/* routes continue to work normally when the webapp dist is present."""
+        dist = self._make_dist(tmp_path)
+        board = Board(round_number=99)
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            with patch("coord.dashboard.server.load_board", return_value=board):
+                r = client.get("/api/board")
+        assert r.status_code == 200
+        assert r.json()["round_number"] == 99
+
+    def test_spa_catch_all_serves_index_for_unknown_paths(self, tmp_path: Path) -> None:
+        """SPA client-side routes (e.g. /pipeline) return index.html for React Router."""
+        dist = self._make_dist(tmp_path, "<html><title>coord spa route</title></html>")
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            r = client.get("/pipeline")
+        assert r.status_code == 200
+        assert "coord spa route" in r.text
+
+    def test_static_assets_served_from_dist_assets(self, tmp_path: Path) -> None:
+        """Vite hashed bundles under /assets/ are served directly."""
+        dist = self._make_dist(tmp_path)
+        assets = dist / "assets"
+        assets.mkdir()
+        (assets / "index.abc123.js").write_text("// bundle")
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            r = client.get("/assets/index.abc123.js")
+        assert r.status_code == 200
+
+    def test_dist_root_static_files_served(self, tmp_path: Path) -> None:
+        """sw.js and manifest.webmanifest from dist/ root are served as files."""
+        dist = self._make_dist(tmp_path)
+        (dist / "sw.js").write_text("// service worker")
+        (dist / "manifest.webmanifest").write_text('{"name":"coord"}')
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            sw = client.get("/sw.js")
+            mf = client.get("/manifest.webmanifest")
+        assert sw.status_code == 200
+        assert "service worker" in sw.text
+        assert mf.status_code == 200
+        assert "coord" in mf.text
+
+    def test_falls_back_to_legacy_dashboard_when_no_dist(self) -> None:
+        """When webapp/dist/ is absent, the legacy index.html is served unchanged."""
+        # WEBAPP_DIST points to a non-existent path by default in tests
+        # (the real dist/ is gitignored and not committed).
+        client = _client()
+        r = client.get("/")
+        assert r.status_code == 200
+        # The legacy dashboard always contains "coord dashboard" in its markup.
+        assert "coord dashboard" in r.text
