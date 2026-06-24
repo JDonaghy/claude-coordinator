@@ -23556,15 +23556,10 @@ impl CoordApp {
     /// Pipeline issue, used to index `detail_terminal_sessions` and
     /// `detail_terminal_spawn_errors` (#455).
     fn selected_issue_key(&self) -> Option<(String, u64)> {
-        // Pipeline selection is the primary source.
-        if let Some(key) = self
-            .pipeline_sel
-            .and_then(|i| self.pipeline_issues.get(i))
-            .map(|issue| (issue.repo_slug.clone(), issue.number))
-        {
-            return Some(key);
-        }
-        // #675: fall back to the Board selection when on the Board panel.
+        // #675 BUG 3: When on the Board panel, use the Board selection so
+        // each board row has its OWN per-issue terminal slot.  Falling back
+        // to `pipeline_sel` here caused every board row to share the same
+        // pipeline terminal (the "singleton" symptom).
         if self.active_view == SidebarView::Board {
             if let Some((coord_repo, num)) = self.board_selected_issue() {
                 let slug = self
@@ -23576,8 +23571,13 @@ impl CoordApp {
                     .unwrap_or(coord_repo);
                 return Some((slug, num));
             }
+            return None;
         }
-        None
+        // For all other views (Pipeline, Terminal, etc.) use the pipeline
+        // selection as the primary source.
+        self.pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))
+            .map(|issue| (issue.repo_slug.clone(), issue.number))
     }
 
     /// Return a sensible cwd for a per-issue detail terminal.  Uses the
@@ -46320,7 +46320,10 @@ mod tests {
         );
         assert_eq!(app.detail_terminal_spawn_errors.len(), 2, "must have two distinct entries");
 
-        // selected_issue_key() returns the right composite key.
+        // selected_issue_key() returns the right composite key when on Pipeline.
+        // #675 BUG 3 fix: must be on Pipeline view — Board view uses the board
+        // selection, not pipeline_sel.
+        app.active_view = SidebarView::Pipeline;
         app.pipeline_issues = vec![
             PipelineIssue {
                 number: 336,
@@ -47334,6 +47337,9 @@ mod tests {
         let mut app = make_app_default();
 
         // Set up a selected pipeline issue so selected_issue_key() works.
+        // #675 BUG 3 fix: must be on Pipeline view — Board view uses the board
+        // selection, not pipeline_sel.
+        app.active_view = SidebarView::Pipeline;
         app.pipeline_issues = vec![PipelineIssue {
             number: 468,
             title: "paste test".to_string(),
@@ -49147,6 +49153,115 @@ mod tests {
         assert!(
             !app.detail_terminal_focused,
             "clicking the Terminal tab label must not alter detail_terminal_focused"
+        );
+    }
+
+    // ── #675 BUG 3: Board Terminal is per-issue, not a shared singleton ─────────
+    //
+    // When `active_view == Board`, `selected_issue_key()` must return the
+    // currently-selected BOARD issue — not `pipeline_sel` — so that switching
+    // between Board rows shows each issue's own terminal session.
+
+    #[test]
+    fn selected_issue_key_on_board_view_uses_board_selection_not_pipeline_sel() {
+        // Set up a board with one running issue (repo-a #10).
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+
+        // Select the board issue.
+        // Section 0 = search form; section 1 = first repo (repo-a).
+        // Path is 3-level: [milestone_idx=0, status_idx=0 (In-flight), issue_idx=0].
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0, 0]));
+
+        // Also set a pipeline selection that differs from the board issue.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 999,
+            title: "pipeline distractor".to_string(),
+            body: String::new(),
+            repo_slug: "owner/other".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+
+        // On Board view: board selection wins.
+        app.active_view = SidebarView::Board;
+        let key = app.selected_issue_key();
+        assert!(key.is_some(), "expected board issue key, got None");
+        let (slug, num) = key.unwrap();
+        assert_eq!(num, 10, "board issue number must be 10, not the pipeline issue 999");
+        assert_eq!(slug, "repo-a", "slug must come from the board selection");
+    }
+
+    #[test]
+    fn selected_issue_key_on_board_view_returns_none_when_no_board_selection() {
+        // Board view with no board selection, but pipeline_sel set.
+        // selected_issue_key() must return None — not the pipeline issue.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "pipeline issue".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+
+        // No board selection set up → must return None, even with pipeline_sel.
+        assert!(
+            app.selected_issue_key().is_none(),
+            "Board view with no board selection must return None even when pipeline_sel is set"
+        );
+    }
+
+    // ── #675 BUG 4: type="chat" must not drag issues into Pipeline In-progress ──
+    //
+    // A Board "Chat about issue" session creates a `type="chat"` assignment.
+    // This must be treated as a conversational session (like refinement/new-issue-chat)
+    // and must NOT cause the issue to appear in Pipeline In-progress.
+
+    #[test]
+    fn chat_type_assignment_does_not_drag_issue_into_in_progress() {
+        let mut app = make_test_app(BoardData {
+            assignments: vec![make_assignment_typed("running", 675, "repo-a", Some("chat"))],
+            ..BoardData::default()
+        });
+        // Open issue with status:ready label → should stay in New/Pending, not In-progress.
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 675,
+            title: "chat about issue".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec![],
+            milestone_number: None,
+            milestone_title: None,
+        });
+
+        // Add a pipeline issue so pipeline_lifecycle_section has data to check.
+        let issue = PipelineIssue {
+            number: 675,
+            title: "chat about issue".to_string(),
+            body: String::new(),
+            repo_slug: "repo-a".to_string(),
+            coord_repo: Some("repo-a".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        };
+        let section = app.pipeline_lifecycle_section(&issue);
+        assert_eq!(
+            section, "new",
+            "#675 BUG 4 regression: type=chat assignment must not promote issue to in-progress; \
+             got {:?}",
+            section
         );
     }
 }
