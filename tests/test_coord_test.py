@@ -515,6 +515,10 @@ class TestSetTestModeCommand:
         import json
         return MagicMock(returncode=0, stdout=json.dumps({"labels": [{"name": l} for l in labels]}), stderr="")
 
+    def _fake_label_create(self):
+        """Return a mock subprocess.run result for `gh label create --force`."""
+        return MagicMock(returncode=0, stdout="", stderr="")
+
     @patch("subprocess.run")
     def test_set_test_mode_smoke(
         self,
@@ -524,8 +528,10 @@ class TestSetTestModeCommand:
     ) -> None:
         """set-test-mode smoke adds the test-mode:smoke label."""
         import json
-        # gh view returns no existing test-mode label; gh edit succeeds.
+        # Two `gh label create --force` calls precede gh issue view and gh issue edit.
         mock_run.side_effect = [
+            self._fake_label_create(),       # gh label create test-mode:smoke --force
+            self._fake_label_create(),       # gh label create test-mode:auto --force
             self._fake_gh_view([]),          # gh issue view
             MagicMock(returncode=0, stdout="", stderr=""),  # gh issue edit
         ]
@@ -535,8 +541,14 @@ class TestSetTestModeCommand:
         assert result.exit_code == 0, result.output
         assert "smoke" in result.output
 
+        # Should have called `gh label create --force` for both test-mode labels.
+        label_calls = [c[0][0] for c in mock_run.call_args_list[:2]]
+        label_names = {args[3] for args in label_calls}
+        assert label_names == {"test-mode:smoke", "test-mode:auto"}
+        assert all("--force" in args for args in label_calls)
+
         # Should have called `gh issue edit --add-label test-mode:smoke`.
-        edit_call = mock_run.call_args_list[1]
+        edit_call = mock_run.call_args_list[3]
         edit_args = edit_call[0][0]
         assert "--add-label" in edit_args
         assert "test-mode:smoke" in edit_args
@@ -551,6 +563,8 @@ class TestSetTestModeCommand:
         """set-test-mode auto adds the test-mode:auto label."""
         import json
         mock_run.side_effect = [
+            self._fake_label_create(),       # gh label create test-mode:smoke --force
+            self._fake_label_create(),       # gh label create test-mode:auto --force
             self._fake_gh_view([]),          # gh issue view
             MagicMock(returncode=0, stdout="", stderr=""),  # gh issue edit
         ]
@@ -560,7 +574,7 @@ class TestSetTestModeCommand:
         assert result.exit_code == 0, result.output
         assert "auto" in result.output
 
-        edit_call = mock_run.call_args_list[1]
+        edit_call = mock_run.call_args_list[3]
         edit_args = edit_call[0][0]
         assert "--add-label" in edit_args
         assert "test-mode:auto" in edit_args
@@ -574,6 +588,8 @@ class TestSetTestModeCommand:
     ) -> None:
         """set-test-mode smoke removes an existing test-mode:auto label."""
         mock_run.side_effect = [
+            self._fake_label_create(),                         # gh label create test-mode:smoke --force
+            self._fake_label_create(),                         # gh label create test-mode:auto --force
             self._fake_gh_view(["coord", "test-mode:auto"]),  # gh issue view
             MagicMock(returncode=0, stdout="", stderr=""),     # gh issue edit
         ]
@@ -581,7 +597,7 @@ class TestSetTestModeCommand:
             "set-test-mode", "api", "42", "smoke", "--config", str(config_file),
         ])
         assert result.exit_code == 0, result.output
-        edit_call = mock_run.call_args_list[1]
+        edit_call = mock_run.call_args_list[3]
         edit_args = edit_call[0][0]
         assert "--remove-label" in edit_args
         assert "test-mode:auto" in edit_args
