@@ -172,6 +172,23 @@ The coordinator session (typically Opus) costs ~10x more per token than Sonnet w
 - **Catch platform violations at review time.** The adversarial reviewer should check for platform-specific code in shared/cross-platform paths. Catching after merge costs an entire round-trip.
 - **Never dispatch reviews via `coord assign`.** Workers have `gh` on the deny-list, so a worker dispatched with `coord assign` cannot run `gh pr diff` or `gh pr review`. Reviews must go through the review pipeline (`coord review` or auto-dispatch on completion) which uses `type="review"` and grants GitHub access.
 
+## Testing — black-box coverage is the acceptance bar
+
+**Every PR that changes user-visible behavior must ship a black-box test** that drives the *running app* and asserts on its rendered output — not just unit tests on internal functions. The adversarial reviewer reads this file and **rejects behavior-changing PRs that lack one** (pure refactors / internal-only changes are exempt — say so in the PR if that applies). Build the **harness once per repo**; add **tests incrementally, one (or a few) per behavior-changing issue** — do *not* big-bang a full suite. Coverage then grows with churn and ratchets up (PRs add coverage, never remove it). Keep a thin **core smoke set** over the few most-trafficked screens so critical flows stay guarded even by unrelated changes.
+
+**How it runs:** black-box tests are part of the repo's normal test command, so the **Test stage** executes them on a capability-matched machine — `smoke_tests.capability_rules` route platform-specific suites to capable hardware (a GTK box; a machine with a browser). Favor the automated pre-review gate; the point is to trust the suite so manual/interactive smoke (incl. driving from a phone) is rarely needed.
+
+### coord-tui — quadraui `TuiDriver` (harness shipped: #690 / #691)
+- Drives the whole app through the real `event → handle → render` path against ratatui's headless `TestBackend` and asserts on the screen grid. `cargo test`-native, deterministic, no TTY.
+- `CoordApp` implements quadraui's `ShellApp`, so use `quadraui::tui::testing::driver_with_shell(app, CoordApp::shell_config(), w, h)`. API: `find("text")` → coords, `click(x, y)`, `press`, `type_char`, `screen()`, `screen_contains(needle)`. **Locate targets with `find` — never hardcode coordinates.**
+- **Reuse the existing fixtures** — `make_test_app(data: BoardData) -> CoordApp` (and `make_app_with_assignments`, `make_app_with_one_completed_issue`, …) in `tui/src/app.rs` build a full app from in-memory `BoardData`, no live daemon. Put the tests **in-crate** (`#[cfg(test)]`), **not** in `tui/tests/` — the fixtures are `#[cfg(test)]`/private and an integration-test crate can't see them.
+- Limit: `TuiDriver` renders to `TestBackend`, so it does **not** parse real ANSI — terminal-protocol bugs (raw-mode, SGR mouse, the embedded `claude` PTY pane) are out of reach and still need a live smoke. A native pty + vt100 tier is tracked in quadraui#302 (unbuilt).
+
+### coord web (Phone Control Center) — browser E2E (forthcoming: #700 milestone)
+- The phone web app lives in `coord/dashboard/webapp/` (React / Vite / TS PWA, served by `coord/dashboard/server.py`; scaffold = **#700**, docs/release = **#703**, milestone *Web: Phone Control Center v1*).
+- Its black-box harness is **Playwright** (or equivalent) E2E: start the dashboard server against a **seeded board** (the web parallel of `make_test_app(BoardData)`), drive a real headless browser, assert on the rendered DOM / screenshots. Same acceptance bar — every user-facing webapp feature ships an E2E test.
+- These run in the **Test stage**, fully automated, routed to a **browser-capable machine**: add a `browser`/`playwright` capability in `coordinator.yml` and a `smoke_tests.capability_rules` entry mapping `coord/dashboard/webapp/**` → that capability (Node/npm + a headless browser must be on the build machine). Browsers headless-test more cleanly than terminals, so the webapp should lean almost entirely on this automated gate rather than interactive smoke.
+
 ## Conventions
 
 - Python 3.12+, type hints everywhere
