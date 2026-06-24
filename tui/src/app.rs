@@ -23011,9 +23011,17 @@ impl CoordApp {
         match terminal_poll {
             Some(Ok(c)) => changed |= c,
             Some(Err(e)) => {
+                // #672: renderer-only fault — the session is treated as
+                // terminated so the pane shows a clean "session ended"
+                // notice rather than a scary panic string.  Board-driven
+                // post-exit actions (detect_completed_interactive_work etc.)
+                // fire independently on the next tick because they check
+                // session_pane_live(), which returns false when the session
+                // is gone — regardless of whether it exited normally or was
+                // evicted here.
                 self.terminal_session = None;
                 self.terminal_spawn_error = Some(format!(
-                    "Terminal emulator panicked: {}",
+                    "Session ended (renderer fault: {})",
                     vt100_panic_to_string(&e)
                 ));
                 changed = true;
@@ -23295,10 +23303,18 @@ impl CoordApp {
         }
         // Evict sessions that panicked (done outside the borrow to avoid
         // simultaneous mutable borrows of detail_terminal_sessions).
+        //
+        // #672: store a clean "session ended" notice rather than a raw
+        // panic string.  Evicting the session (not leaving it as exited)
+        // has the same effect on session_pane_live() — it returns false
+        // — so the board-driven detection functions
+        // (detect_completed_interactive_work, detect_review_verdict,
+        // detect_test_verdict) fire on the next tick exactly as they
+        // would for a normally-exited session.
         for (key, msg) in panicked {
             self.detail_terminal_sessions.remove(&key);
             self.detail_terminal_spawn_errors
-                .insert(key, format!("Terminal emulator panicked: {msg}"));
+                .insert(key, format!("Session ended (renderer fault: {msg})"));
         }
 
         changed
@@ -46435,10 +46451,10 @@ mod tests {
         // poll internals.
         let fake_payload: Box<dyn std::any::Any + Send> =
             Box::new("called Option::unwrap() on a None value");
-        // Mimic what drive_terminal_pane does on Err:
+        // Mimic what drive_terminal_pane does on Err (#672: clean message):
         app.terminal_session = None;
         app.terminal_spawn_error = Some(format!(
-            "Terminal emulator panicked: {}",
+            "Session ended (renderer fault: {})",
             super::vt100_panic_to_string(&fake_payload)
         ));
 
@@ -46448,8 +46464,8 @@ mod tests {
         );
         let err = app.terminal_spawn_error.as_deref().unwrap_or("");
         assert!(
-            err.starts_with("Terminal emulator panicked:"),
-            "error must start with sentinel; got: {err}"
+            err.starts_with("Session ended (renderer fault:"),
+            "error must start with clean sentinel; got: {err}"
         );
         assert!(
             err.contains("unwrap"),
@@ -46466,14 +46482,14 @@ mod tests {
         let key = ("owner/repo".to_string(), 123u64);
 
         // Simulate a panicked session: apply the same mutations that
-        // drive_detail_terminals performs in the Err branch.
+        // drive_detail_terminals performs in the Err branch (#672: clean message).
         let fake_payload: Box<dyn std::any::Any + Send> =
             Box::new("attempt to subtract with overflow");
         app.detail_terminal_sessions.remove(&key); // was removed by error path
         app.detail_terminal_spawn_errors.insert(
             key.clone(),
             format!(
-                "Terminal emulator panicked: {}",
+                "Session ended (renderer fault: {})",
                 super::vt100_panic_to_string(&fake_payload)
             ),
         );
@@ -46488,13 +46504,59 @@ mod tests {
             .map(String::as_str)
             .unwrap_or("");
         assert!(
-            err.starts_with("Terminal emulator panicked:"),
-            "error entry must carry sentinel; got: {err}"
+            err.starts_with("Session ended (renderer fault:"),
+            "error entry must carry clean sentinel; got: {err}"
         );
         assert!(
             err.contains("subtract with overflow"),
             "error must include vt100 message; got: {err}"
         );
+    }
+
+    /// #672: After a vt100 parser panic evicts a detail-terminal session, the
+    /// standard exit-handoff detection must still fire on the next tick.
+    ///
+    /// Normal exit: `is_exited()` returns true → `session_pane_live()` returns
+    /// false → detection proceeds.  Panic exit: session evicted from
+    /// `detail_terminal_sessions` → `session_pane_live()` returns false (no
+    /// entry) → detection proceeds.  The two paths are equivalent from the
+    /// detector's perspective.
+    #[test]
+    fn panic_on_exiting_session_still_fires_exit_handoff() {
+        // Board shows a done work assignment with a branch (work succeeded).
+        let mut app = make_app_with_assignments(vec![done_work_with_branch(10, "repo-a")]);
+        let key = ("repo-a".to_string(), 10u64);
+
+        // Arm the auto-review watcher (simulates: user launched interactive Work).
+        arm_auto_review(&mut app, "repo-a", 10, &[]);
+
+        // Simulate the vt100 panic: evict the session and record the error,
+        // mirroring what drive_detail_terminals does in its Err branch (#597/#672).
+        app.detail_terminal_sessions.remove(&key);
+        app.detail_terminal_spawn_errors.insert(
+            key.clone(),
+            "Session ended (renderer fault: simulated vt100 panic)".to_string(),
+        );
+
+        // session_pane_live now returns false (no entry in the sessions map).
+        // detect_completed_interactive_work must fire the work→test handoff.
+        assert!(
+            app.detect_completed_interactive_work(),
+            "exit handoff must fire after parser panic evicts the session"
+        );
+        let p = app
+            .pending_stage_launch
+            .as_ref()
+            .expect("stage-launch prompt must be raised");
+        assert_eq!(
+            p.kind,
+            StageLaunchKind::Test,
+            "work→test offer must be the first stage after a panic-exit"
+        );
+        assert_eq!(p.issue_num, 10);
+        assert_eq!(p.coord_repo, "repo-a");
+        // App survived without crashing.
+        assert!(app.armed_for_auto_review.is_empty(), "arm consumed on fire");
     }
 
     // ── #638: Kanban view unit tests ─────────────────────────────────────────
