@@ -29652,23 +29652,101 @@ fn parse_json_events_readable(
     }
 }
 
+/// Pre-compute per-turn timing anchors from embedded `user.timestamp` fields.
+///
+/// Scans `lines` and returns one entry per `"type":"assistant"` event found:
+/// the epoch-seconds of the **last** `"type":"user"` event seen *before* that
+/// assistant turn.  Entries are `None` when no user event preceded the turn
+/// (i.e. the very first turn, or a turn reached without any tool-result in
+/// between).
+///
+/// `user` events in the `claude -p --output-format stream-json` protocol carry
+/// an ISO-8601 `"timestamp"` field recording when the tool result was submitted.
+/// Because these timestamps are **embedded in the log content** rather than
+/// derived from reception time, they survive byte-0 SSE replay intact — all
+/// historical lines arrive in one burst sharing a single `Instant::now()`, but
+/// the JSON timestamps inside each line are real wall-clock values.
+///
+/// Using these timestamps to drive the `+Ns` inter-turn display (instead of
+/// arrival `Instant`s) fixes the #309 regression where replayed logs showed
+/// every delta as 0 and suppressed all timing labels.
+fn user_epoch_per_turn<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Option<f64>> {
+    let mut result: Vec<Option<f64>> = Vec::new();
+    let mut last_user_epoch: Option<f64> = None;
+    for line in lines {
+        match json_str(line, "type").as_deref() {
+            Some("user") => {
+                if let Some(ts) = json_str(line, "timestamp") {
+                    last_user_epoch = parse_iso8601_to_epoch(&ts);
+                }
+            }
+            Some("assistant") => {
+                result.push(last_user_epoch);
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// Compute the inter-turn `Duration` for assistant turn `idx` using the
+/// pre-computed `user_epochs` table from [`user_epoch_per_turn`].
+///
+/// Returns `Some(d)` only when both this turn and the previous turn have a
+/// recorded user-event epoch AND the difference is ≥ 1 s (same suppression
+/// threshold used for arrival-`Instant` timing).  Returns `None` otherwise —
+/// callers fall back to arrival-`Instant` deltas in that case.
+fn user_epoch_elapsed(user_epochs: &[Option<f64>], idx: usize) -> Option<std::time::Duration> {
+    if idx == 0 {
+        return None;
+    }
+    let this_epoch = (*user_epochs.get(idx)?)?;
+    let prev_epoch = (*user_epochs.get(idx - 1)?)?;
+    if this_epoch > prev_epoch {
+        let secs = (this_epoch - prev_epoch) as u64;
+        if secs >= 1 {
+            return Some(std::time::Duration::from_secs(secs));
+        }
+    }
+    None
+}
+
 /// Render SSE log lines using the readable (#385) format: wrapped prose,
 /// arrow-prefixed tool calls, one line per tool call, thinking on separate
 /// wrapped lines.  Used by both the Log tab and the live watch overlay.
 /// `wrap_width == 0` disables wrapping.
+///
+/// Inter-turn `+Ns` timing is derived from `user.timestamp` fields embedded in
+/// the stream-json (fix for #309: byte-0 SSE replay collapses all arrival
+/// `Instant`s to ~now, so timing must come from the log content itself).
+/// Arrival-`Instant` deltas are used as fallback for turns that have no
+/// preceding user event (e.g. the first inter-turn gap on live streams before
+/// the second user event arrives).
 fn parse_sse_log_readable(
     lines: &[String],
     times: &[std::time::Instant],
     wrap_width: usize,
 ) -> Vec<ListItem> {
+    // Pre-pass: extract the last user.timestamp before each assistant turn so
+    // that per-turn deltas are computed from content timestamps, not from the
+    // moment of SSE reception (which collapses to a single Instant on replay).
+    let user_epochs = user_epoch_per_turn(lines.iter().map(|s| s.as_str()));
+
     let mut items = Vec::new();
     let mut turn_n: usize = 0;
+    let mut assistant_idx: usize = 0;
     let mut last_assistant_time: Option<std::time::Instant> = None;
     for (i, line) in lines.iter().enumerate() {
         let t = times.get(i).copied();
         let elapsed = if json_str(line, "type").as_deref() == Some("assistant") {
-            let e = t.and_then(|now| last_assistant_time.map(|prev| now.duration_since(prev)));
+            // Prefer content-embedded user timestamps (survive replay bursts).
+            // Fall back to arrival-Instant for turns with no preceding user
+            // event (typically the very first inter-turn gap on a live stream).
+            let e = user_epoch_elapsed(&user_epochs, assistant_idx).or_else(|| {
+                t.and_then(|now| last_assistant_time.map(|prev| now.duration_since(prev)))
+            });
             last_assistant_time = t;
+            assistant_idx += 1;
             e
         } else {
             None
@@ -29689,6 +29767,9 @@ fn parse_sse_log_readable(
 
 /// Like `parse_log_content` but renders using the readable (#385) format.
 /// Used for file-based logs shown in the Pipeline Log tab.
+///
+/// Timing for `+Ns` labels is derived from `user.timestamp` fields in the
+/// stream-json (same fix as `parse_sse_log_readable` for #309).
 fn parse_log_content_readable(content: &str, wrap_width: usize) -> Vec<ListItem> {
     let is_json = content
         .lines()
@@ -29696,18 +29777,33 @@ fn parse_log_content_readable(content: &str, wrap_width: usize) -> Vec<ListItem>
         .map(|l| l.trim_start().starts_with('{'))
         .unwrap_or(false);
 
+    // Pre-pass: extract per-turn user timestamps for timing labels.
+    let user_epochs = if is_json {
+        user_epoch_per_turn(content.lines())
+    } else {
+        Vec::new()
+    };
+
     let mut items: Vec<ListItem> = Vec::new();
     let mut turn_n: usize = 0;
+    let mut assistant_idx: usize = 0;
 
     for line in content.lines() {
         if line.starts_with('#') || line.trim().is_empty() {
             continue;
         }
         if is_json {
+            let elapsed = if json_str(line, "type").as_deref() == Some("assistant") {
+                let e = user_epoch_elapsed(&user_epochs, assistant_idx);
+                assistant_idx += 1;
+                e
+            } else {
+                None
+            };
             items.extend(parse_json_events_readable(
                 line,
                 &mut turn_n,
-                None,
+                elapsed,
                 wrap_width,
             ));
             if line.contains("\"type\":\"result\"") {
@@ -43434,6 +43530,130 @@ mod tests {
             arrow_count >= 2,
             "mixed-content turn with 2 tools should have ≥2 arrow lines, got {}: {all_text:?}",
             arrow_count
+        );
+    }
+
+    // ── user_epoch_per_turn / user_epoch_elapsed (#309) ─────────────────────
+
+    #[test]
+    fn user_epoch_per_turn_extracts_last_user_ts_before_each_assistant_turn() {
+        // Two assistant turns each preceded by one user (tool-result) event.
+        // The timestamps are synthetic ISO-8601 strings spaced 30 s apart.
+        let lines = vec![
+            r#"{"type":"system","subtype":"init","model":"claude-test"}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Bash","input":{"command":"ls"}}]}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:10Z","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"ok"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"pwd"}}]}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:40Z","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"ok"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done"}]}}"#.to_string(),
+            r#"{"type":"result","num_turns":3,"total_cost_usd":0.01,"duration_ms":50000,"stop_reason":"end_turn"}"#.to_string(),
+        ];
+        let epochs = user_epoch_per_turn(lines.iter().map(|s| s.as_str()));
+        // Turn 1 has no prior user event.
+        assert_eq!(epochs.len(), 3, "one entry per assistant turn");
+        assert!(
+            epochs[0].is_none(),
+            "turn 1 has no preceding user event: {:?}",
+            epochs[0]
+        );
+        // Turn 2 should have the T=10 epoch.
+        let turn2 = epochs[1].expect("turn 2 should have user epoch");
+        // Turn 3 should have the T=40 epoch.
+        let turn3 = epochs[2].expect("turn 3 should have user epoch");
+        assert!(
+            turn2 < turn3,
+            "turn 2 epoch should be earlier than turn 3: {turn2} vs {turn3}"
+        );
+        // The 30-second gap should be visible in the epoch values.
+        assert!(
+            (turn3 - turn2).round() as i64 == 30,
+            "expected 30 s gap between user events, got {}",
+            turn3 - turn2
+        );
+    }
+
+    #[test]
+    fn user_epoch_elapsed_returns_none_for_first_turn() {
+        let epochs = vec![None, Some(1_000.0_f64), Some(1_030.0_f64)];
+        // Turn 0: no delta (first turn has no prior reference).
+        assert!(
+            user_epoch_elapsed(&epochs, 0).is_none(),
+            "first turn has no elapsed"
+        );
+    }
+
+    #[test]
+    fn user_epoch_elapsed_returns_none_when_prev_epoch_missing() {
+        // Turn 1 has a timestamp but turn 0 does not — delta is unavailable.
+        let epochs = vec![None, Some(1_010.0_f64)];
+        assert!(
+            user_epoch_elapsed(&epochs, 1).is_none(),
+            "no prev epoch → no elapsed"
+        );
+    }
+
+    #[test]
+    fn user_epoch_elapsed_returns_correct_duration() {
+        let epochs = vec![Some(1_000.0_f64), Some(1_045.0_f64)];
+        let d = user_epoch_elapsed(&epochs, 1).expect("should have elapsed");
+        assert_eq!(
+            d.as_secs(),
+            45,
+            "expected 45 s elapsed, got {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn user_epoch_elapsed_suppresses_sub_second_delta() {
+        let epochs = vec![Some(1_000.0_f64), Some(1_000.5_f64)];
+        assert!(
+            user_epoch_elapsed(&epochs, 1).is_none(),
+            "sub-second delta should be suppressed"
+        );
+    }
+
+    #[test]
+    fn parse_sse_log_readable_shows_timing_on_burst_replay() {
+        // Simulate a byte-0 SSE replay: all lines arrive simultaneously so
+        // their arrival Instants are identical — timing must come from
+        // user.timestamp fields instead (#309).
+        let lines: Vec<String> = vec![
+            r#"{"type":"system","subtype":"init","model":"claude-test"}"#.to_string(),
+            // Turn 1 — tool call.
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#.to_string(),
+            // User event 30 s after session start.
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:30Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#.to_string(),
+            // Turn 2 — text response (60 s after session start → 30 s after turn 1).
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"pwd"}}]}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2024-01-01T00:01:00Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"/home"}]}}"#.to_string(),
+            // Turn 3.
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All done"}]}}"#.to_string(),
+            r#"{"type":"result","num_turns":3,"total_cost_usd":0.01,"duration_ms":90000,"stop_reason":"end_turn"}"#.to_string(),
+        ];
+        // All lines share the same arrival Instant (burst replay scenario).
+        let now = std::time::Instant::now();
+        let times: Vec<std::time::Instant> = vec![now; lines.len()];
+
+        let items = parse_sse_log_readable(&lines, &times, 80);
+        // Collect all visible text.
+        let all_text: String = items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Turn 3 must show a +Ns suffix derived from user timestamps (30 s gap).
+        // Turn 2 falls back to Instant (no prior user epoch for turn 1); turn 3
+        // is the first turn with both prev and this epoch available.
+        assert!(
+            all_text.contains("+30s"),
+            "burst-replay log should show +30s delta for turn 3, got:\n{all_text}"
+        );
+        // Turn 1 and 2 should NOT show a spurious huge or zero delta from burst.
+        assert!(
+            !all_text.contains("+0s"),
+            "should not show +0s deltas from collapsed Instants:\n{all_text}"
         );
     }
 
