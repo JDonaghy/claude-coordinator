@@ -4169,7 +4169,6 @@ enum TestModeChoiceAction {
 #[derive(Clone)]
 struct PendingTestModeChoice {
     coord_repo: String,
-    repo_slug: String,
     issue_num: u64,
     /// What to do after the mode is chosen.
     action: TestModeChoiceAction,
@@ -11938,7 +11937,6 @@ impl CoordApp {
         // will call `dispatch_pipeline_work_with_mode` with the chosen mode.
         self.pending_test_mode_choice = Some(PendingTestModeChoice {
             coord_repo,
-            repo_slug: issue.repo_slug.clone(),
             issue_num: issue.number,
             action: TestModeChoiceAction::DispatchWork,
             current_mode,
@@ -23905,7 +23903,6 @@ impl CoordApp {
             .map(|l| l.trim_start_matches("test-mode:").to_string());
         self.pending_test_mode_choice = Some(PendingTestModeChoice {
             coord_repo,
-            repo_slug: issue.repo_slug.clone(),
             issue_num: issue.number,
             action: TestModeChoiceAction::SetOnly,
             current_mode,
@@ -23925,9 +23922,11 @@ impl CoordApp {
         use crate::commands::SpawnQueuedOutcome;
 
         // Step 1: persist the label.
+        // coord set-test-mode expects the LOCAL coordinator repo name (from
+        // coordinator.yml), not the GitHub slug — use coord_repo, not repo_slug.
         let set_mode_cmd = vec![
             "set-test-mode".to_string(),
-            choice.repo_slug.clone(),
+            choice.coord_repo.clone(),
             choice.issue_num.to_string(),
             mode.to_string(),
         ];

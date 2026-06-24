@@ -7470,12 +7470,32 @@ def backlog(repo: str, issue: int, config_path: Path) -> None:
 @_CONFIG_OPTION
 def set_test_mode(repo: str, issue: int, mode: str, config_path: Path) -> None:
     """#685: TUI test-mode dialog and right-click flip fire this command."""
+    import subprocess as _sp  # noqa: PLC0415
+
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
     if repo_entry is None:
         click.echo(f"error: unknown repo {repo!r} (not in coordinator.yml)", err=True)
         sys.exit(1)
     slug = repo_entry.github
+
+    # Ensure the test-mode:* labels exist in the repo before we try to add
+    # them — `gh issue edit --add-label` fails with "label not found" when the
+    # label has never been created.  `gh label create --force` is idempotent
+    # (no-ops if the label already exists, creates it if absent).
+    _TEST_MODE_LABEL_COLOR = "0075ca"  # default blue; matches GitHub's "documentation" label
+    for lbl in ("test-mode:smoke", "test-mode:auto"):
+        try:
+            _sp.run(
+                ["gh", "label", "create", lbl, "--repo", slug,
+                 "--color", _TEST_MODE_LABEL_COLOR,
+                 "--description", "coord: per-issue test-mode policy",
+                 "--force"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (_sp.TimeoutExpired, OSError):
+            pass  # best-effort — label creation failure is surfaced when add-label fails
+
     _apply_label_change(
         repo, issue, config_path,
         add={f"test-mode:{mode}"},
