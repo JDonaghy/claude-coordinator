@@ -63,6 +63,15 @@ class PipelineView:
     # been posted to GitHub (review_posted_at is None on the review assignment).
     # The dashboard shows a ⚠ indicator and a "Post Findings" retry button.
     review_findings_pending: bool = False
+    # Cached review verdict from the linked review assignment
+    # ("approve" | "request-changes" | None).  Populated when the reviewer has
+    # completed and emitted a structured REVIEW_VERDICT block.
+    review_verdict: str | None = None
+    # Full text body of the review findings as cached by notify/auto_loop.
+    # Populated from the DB review_findings column so the phone detail screen
+    # can render them without a slow GitHub re-fetch.  None when no findings
+    # have been cached yet.
+    review_findings_body: str | None = None
 
 
 # ── Stage progression constants ──────────────────────────────────────────────
@@ -109,6 +118,8 @@ def compute_pipeline(
     board: "Board",
     merge_queue_items: list,   # list[QueuedMerge]
     config: "Config",
+    *,
+    review_findings_body: str | None = None,
 ) -> PipelineView:
     """Return a PipelineView for a type='work' assignment.
 
@@ -267,6 +278,10 @@ def compute_pipeline(
         and review_assignment.review_posted_at is None
     )
 
+    # Derive the cached review verdict from the in-memory review assignment
+    # (no I/O — review_assignment is already fetched from the board above).
+    review_verdict = review_assignment.review_verdict if review_assignment else None
+
     return PipelineView(
         assignment_id=aid,
         issue_number=assignment.issue_number,
@@ -276,4 +291,6 @@ def compute_pipeline(
         available_gates=available_gates,
         progress_pct=progress_pct,
         review_findings_pending=review_findings_pending,
+        review_verdict=review_verdict,
+        review_findings_body=review_findings_body,
     )
