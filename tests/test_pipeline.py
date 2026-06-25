@@ -111,6 +111,14 @@ class TestComputePipeline:
         assert coding.status == "active"
         assert coding.is_current
 
+    def test_pipeline_view_carries_issue_title_and_machine_name(self) -> None:
+        """PipelineView must expose issue_title and machine_name so the dashboard
+        card can render without a second API call."""
+        a = _work(status="running")
+        pv = compute_pipeline(a, _board(a), [], _config())
+        assert pv.issue_title == "Fix auth"
+        assert pv.machine_name == "laptop"
+
     def test_done_no_downstream_gives_done_stage(self) -> None:
         a = _work(status="done")
         pv = compute_pipeline(a, _board(a), [], _config())
@@ -414,6 +422,9 @@ class TestPipelineAPI:
         assert "stages" in pv
         assert "available_gates" in pv
         assert "progress_pct" in pv
+        # Fields added in #701 so the dashboard card renders without a 2nd call.
+        assert pv["issue_title"] == "Running"
+        assert pv["machine_name"] == "laptop"
 
     def test_get_pipeline_excludes_review_type(self) -> None:
         board = Board(
