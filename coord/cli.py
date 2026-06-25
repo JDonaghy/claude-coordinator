@@ -8834,9 +8834,10 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
     """Kill dead-pane sessions and finalize their board assignments.
 
     Called from ``coord sessions --prune`` (#491).  Only processes LOCAL
-    dead-pane sessions (``pane_dead == "1"`` AND no machine name, i.e. the
-    session lives on this host).  Remote dead sessions are handled by
-    ``reap_stale_remote_interactive_sessions`` (called from ``coord reconcile``).
+    dead-pane sessions (``pane_dead == "1"`` whose machine resolves to this
+    host, or sessions with no machine name).  Remote dead sessions are handled
+    by ``reap_stale_remote_interactive_sessions`` (called from ``coord
+    reconcile``).
 
     For each dead-pane local session the function:
 
@@ -8850,7 +8851,6 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
     from coord.state import COORD_DIR, get_connection  # noqa: PLC0415
     from coord.agent import _commits_ahead  # noqa: PLC0415
     from coord.interactive import (  # noqa: PLC0415
-        TMUX_SESSION_PREFIX,
         tmux_session_name,
         _remove_worktree,
     )
@@ -8922,7 +8922,7 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
                     )
                 except Exception:  # noqa: BLE001
                     click.echo(
-                        f"  push failed  {s['session_name']}  (worktree kept)"
+                        f"  push failed  {s['session_name']}  (worktree will be removed)"
                     )
 
         terminal_status = "advisory" if commits == 0 else "failed"
@@ -9152,6 +9152,12 @@ def sessions_cmd(
         )
 
     if output_json:
+        if prune:
+            click.echo(
+                "Warning: --prune is ignored when --json is used; "
+                "run 'coord sessions --prune' separately.",
+                err=True,
+            )
         click.echo(_json.dumps({"sessions": enriched}))
         return
 
