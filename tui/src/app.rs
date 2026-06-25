@@ -9126,11 +9126,13 @@ impl CoordApp {
         if self.merge_stage_status_for(issue) == StageStatus::Done {
             return "done";
         }
-        // Only *work* assignments make an issue in-progress. Refinement /
-        // new-issue-chat / test-chat are scoping conversations, not pipeline
-        // execution — a refined-but-unstarted issue (status:ready + N done
-        // refinements, zero work) belongs in New, not Active. Counting any
-        // assignment pinned such issues to "in-progress" with grey stage boxes.
+        // Only *workable* assignments make an issue in-progress.  Scoping
+        // conversations — `refinement`, `new-issue-chat`, `test-chat`, and the
+        // #628 "Chat about issue" (`chat`) — are NOT pipeline execution, so a
+        // chat-/refinement-only issue belongs in New, not Active.  Use the same
+        // `is_workable_type` predicate as the Board classifier; the old inline
+        // list omitted `chat`, which pinned chat-only issues (e.g. #258) to
+        // In-progress:Idle and made "Drop to backlog" appear to do nothing.
         let has_work_assignment = self.data.assignments.iter().any(|a| {
             a.issue_number == issue.number
                 && issue
@@ -9138,10 +9140,10 @@ impl CoordApp {
                     .as_deref()
                     .map(|r| r == a.repo)
                     .unwrap_or(true)
-                && !matches!(
-                    a.assignment_type.as_deref(),
-                    Some("refinement") | Some("new-issue-chat") | Some("test-chat")
-                )
+                && a.assignment_type
+                    .as_deref()
+                    .map(is_workable_type)
+                    .unwrap_or(true)
         });
         if has_work_assignment {
             return "in-progress";
@@ -17107,7 +17109,13 @@ impl CoordApp {
             items.push(ContextMenuItem::separator());
         }
         match lifecycle {
-            PipelineRowLifecycle::New => {}
+            PipelineRowLifecycle::New => {
+                // #266: Drop a not-yet-started pipeline item back to Backlog
+                // (strips `status:ready`).  Always enabled for New — no work
+                // has been dispatched, so there is nothing to interrupt.
+                items.push(ContextMenuItem::action("drop-to-backlog", "Drop to backlog"));
+                items.push(ContextMenuItem::separator());
+            }
             PipelineRowLifecycle::InProgress => {
                 // Watch is also reachable via Enter on the row; surfacing
                 // it here gives the no-right-click / Android-over-SSH
@@ -17139,6 +17147,20 @@ impl CoordApp {
                     "diagnose-reset",
                     "Reset stage (keeps branch + commits)",
                 ));
+                // #266: Drop an In-progress *idle* item back to Backlog (strips
+                // `status:ready`).  Disabled when (a) a live session is attached
+                // — a row whose work is actively running must not be yanked out
+                // from under it — or (b) the issue already has real pipeline
+                // work to preserve (a workable assignment that is done / merged
+                // / running, e.g. #618).  Rows whose only assignments are
+                // scoping chats or *failed* attempts stay droppable.
+                let mut drop_item =
+                    ContextMenuItem::action("drop-to-backlog", "Drop to backlog");
+                drop_item.disabled = issue_number
+                    .map(|n| self.issue_has_live_session(n))
+                    .unwrap_or(false)
+                    || self.selected_issue_has_work_progress();
+                items.push(drop_item);
                 items.push(ContextMenuItem::separator());
             }
             PipelineRowLifecycle::Done => {
@@ -20912,12 +20934,29 @@ impl CoordApp {
             // Refined → Refining is handled by `coord refine` which
             // also removes status:ready, so `drop-to-refining` reuses
             // the same command.
-            "drop-to-backlog" => self.dispatch_board_row_command(
-                target,
-                "backlog",
-                "Drop to Backlog",
-                "#{}: stripping status:* label…",
-            ),
+            // #266: shared by the Board row menu (Refining/Refined → Backlog)
+            // and the Pipeline row menu (New / In-progress:Idle → Backlog).
+            // Board rows carry repo+num on the target; Pipeline rows resolve
+            // them from the selected pipeline issue instead.
+            "drop-to-backlog" => match target {
+                ContextMenuTarget::PipelineRow { .. } => {
+                    let ok = self.drop_selected_to_backlog();
+                    if !ok {
+                        self.push_toast(
+                            "Drop to backlog",
+                            "No issue selected or no repo mapping found.",
+                            ToastSeverity::Warning,
+                        );
+                    }
+                    ok
+                }
+                _ => self.dispatch_board_row_command(
+                    target,
+                    "backlog",
+                    "Drop to Backlog",
+                    "#{}: stripping status:* label…",
+                ),
+            },
             "drop-to-refining" => self.dispatch_board_row_command(
                 target,
                 "refine",
@@ -23413,6 +23452,28 @@ impl CoordApp {
         self.completed_work_aid_for(&repo, issue_key.1)
     }
 
+    /// #266: true when the selected pipeline issue has real pipeline execution
+    /// worth preserving — a *workable* assignment (work / review / smoke /
+    /// conflict-fix / fix-*) that is `done`, `merged`, or `running`.  Gates
+    /// "Drop to backlog" off for such rows so completed or in-flight work is
+    /// never silently orphaned (#618).  Rows whose only assignments are scoping
+    /// chats or *failed* attempts have nothing to preserve and stay droppable.
+    fn selected_issue_has_work_progress(&self) -> bool {
+        let Some((repo, issue_key)) = self.selected_issue_repo_and_key() else {
+            return false;
+        };
+        let issue_num = issue_key.1;
+        self.data.assignments.iter().any(|a| {
+            a.issue_number == issue_num
+                && a.repo == repo
+                && a.assignment_type
+                    .as_deref()
+                    .map(is_workable_type)
+                    .unwrap_or(true)
+                && matches!(a.status.as_str(), "done" | "merged" | "running")
+        })
+    }
+
     /// Leg 2 (#517): the most-recent `done` `type="work"` assignment id with a
     /// non-empty branch for `(coord_repo, issue_num)`, or `None`.  Generalises
     /// [`selected_completed_work_aid`] to an arbitrary issue so the auto-advance
@@ -23925,6 +23986,58 @@ impl CoordApp {
             machine_name: None,
             model_override: None,
         });
+        true
+    }
+
+    /// #266: Drop the selected pipeline row back to Backlog by spawning
+    /// `coord backlog <repo> <issue>`, which strips the `status:ready` /
+    /// `status:refining` label.  Wired to the "Drop to backlog" context-menu
+    /// action, enabled only for New and In-progress *idle* rows.
+    fn drop_selected_to_backlog(&mut self) -> bool {
+        use crate::commands::SpawnQueuedOutcome;
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(coord_repo) = issue.coord_repo.clone() else {
+            return false;
+        };
+        let num_str = issue.number.to_string();
+        // Pipeline membership is the `coord` label, so dropping a card to
+        // Backlog must REMOVE it — stripping `status:*` alone (the Board's
+        // `coord backlog`) leaves the card in Pipeline:New.  `coord untrack`
+        // removes `coord` + any `status:*`, so the issue leaves the Pipeline
+        // and lands in the Board's Backlog.  Inverse of `track` (Send to
+        // Pipeline).
+        let outcome = self
+            .command_runner
+            .spawn_queued(&["untrack", &coord_repo, &num_str]);
+        match outcome {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "Drop to backlog",
+                    &format!(
+                        "#{}: queued — will run after the current command.",
+                        issue.number
+                    ),
+                    ToastSeverity::Info,
+                );
+                self.maybe_kick_pipeline_loader();
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Drop to backlog",
+                    &format!("#{}: removing from Pipeline → Backlog…", issue.number),
+                    ToastSeverity::Info,
+                );
+                // Refresh so the card disappears without waiting for the
+                // auto-refresh (mirrors Send to Pipeline).
+                self.maybe_kick_pipeline_loader();
+            }
+        }
         true
     }
 
@@ -40586,6 +40699,105 @@ mod tests {
         assert!(child_ids.contains(&"start-review-interactive"), "Review must be in interactive submenu");
         assert!(child_ids.contains(&"start-testing-interactive"), "Testing must be in interactive submenu");
         assert!(child_ids.contains(&"start-merge-interactive"), "Merge must be in interactive submenu");
+    }
+
+    /// #266: "Drop to backlog" is offered for New and In-progress rows, enabled
+    /// only when there is nothing to preserve — disabled when a live session is
+    /// attached or the issue already has completed/in-flight work (#618).  Not
+    /// offered on Done rows.
+    #[test]
+    fn pipeline_drop_to_backlog_gating() {
+        // Returns Some(disabled) when the item exists, else None.
+        fn drop_disabled(app: &CoordApp, lifecycle: PipelineRowLifecycle) -> Option<bool> {
+            app.context_menu_items_for_pipeline_row(Some(42), &lifecycle)
+                .iter()
+                .find(|i| i.action_id.as_deref() == Some("drop-to-backlog"))
+                .map(|i| i.disabled)
+        }
+
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+
+        // New (moved to pipeline, not started) → present + enabled.
+        assert_eq!(
+            drop_disabled(&app, PipelineRowLifecycle::New),
+            Some(false),
+            "New row must offer an enabled Drop to backlog"
+        );
+
+        // In-progress:Idle with only a FAILED work attempt (nothing to
+        // preserve, no live session) → present + enabled.
+        app.data
+            .assignments
+            .push(make_assignment_typed("failed", 42, "api", Some("work")));
+        assert_eq!(
+            drop_disabled(&app, PipelineRowLifecycle::InProgress),
+            Some(false),
+            "In-progress:Idle with no completed work must allow Drop to backlog"
+        );
+
+        // #618: a COMPLETED Work stage (done) → present but DISABLED.
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 42, "api", Some("work")));
+        assert_eq!(
+            drop_disabled(&app, PipelineRowLifecycle::InProgress),
+            Some(true),
+            "#618: a completed Work stage must DISABLE Drop to backlog"
+        );
+
+        // A live session → DISABLED (independent of work status).
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 42, "api", Some("work")));
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "id-42-running".to_string(), // make_assignment_typed id
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+            machine: None,
+        }];
+        assert_eq!(
+            drop_disabled(&app, PipelineRowLifecycle::InProgress),
+            Some(true),
+            "a live In-progress row must DISABLE Drop to backlog"
+        );
+
+        // Done → not offered at all.
+        assert_eq!(
+            drop_disabled(&app, PipelineRowLifecycle::Done),
+            None,
+            "Done rows must not offer Drop to backlog"
+        );
+    }
+
+    /// #258: a "Chat about issue" session (type=`chat`) is a scoping
+    /// conversation, not pipeline work — a chat-only issue must classify as New,
+    /// not In-progress, so it leaves the Active/Idle group (and stripping
+    /// status:ready actually moves it out of the active pipeline).
+    #[test]
+    fn chat_only_issue_classifies_as_new_not_in_progress() {
+        let mut app = make_pipeline_app();
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 42, "api", Some("chat")));
+        let issue = app.pipeline_issues[0].clone();
+        assert_eq!(
+            app.pipeline_lifecycle_section(&issue),
+            "new",
+            "a chat-only issue must classify as New, not in-progress"
+        );
+
+        // Sanity: a real work assignment DOES make it in-progress.
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 42, "api", Some("work")));
+        let issue = app.pipeline_issues[0].clone();
+        assert_eq!(
+            app.pipeline_lifecycle_section(&issue),
+            "in-progress",
+            "a work assignment must make the issue in-progress"
+        );
     }
 
     #[test]

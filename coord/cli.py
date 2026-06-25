@@ -7422,6 +7422,39 @@ def track(repo: str, issue: int, config_path: Path) -> None:
 
 @main.command(
     help=(
+        "Remove an issue from the Pipeline, returning it to the Board's "
+        "Backlog.  Strips the `coord` label (Pipeline membership is the "
+        "`coord` label, so this is the only way to evict a card) plus any "
+        "`status:*` label, so the issue lands in Backlog rather than "
+        "Refined/Refining.\n\n"
+        "Inverse of `coord track` (Send to Pipeline).  The TUI right-click "
+        "'Drop to backlog' on a Pipeline row fires this.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the "
+        "GH issue number."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def untrack(repo: str, issue: int, config_path: Path) -> None:
+    """#266: TUI right-click 'Drop to backlog' on a Pipeline row fires this to
+    evict the issue from the coord Pipeline (removes `coord` + any `status:*`)."""
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    _apply_label_change(
+        repo, issue, config_path,
+        add=set(),
+        remove_if_present={
+            "coord", "status:ready", "status:refining", "status:backlog",
+        },
+        success_message=f"#{issue} ({slug}) dropped to Backlog (removed from Pipeline)",
+        no_op_message=f"#{issue} ({slug}) not in the Pipeline (no coord label)",
+    )
+
+
+@main.command(
+    help=(
         "Drop an issue back to Backlog by removing its `status:*` label.\n\n"
         "Symmetric with `coord refine` / `coord ready` — strips both "
         "`status:refining` and `status:ready` if present, returning the "
