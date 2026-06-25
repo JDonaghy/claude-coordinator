@@ -26180,7 +26180,21 @@ impl ShellApp for CoordApp {
     /// - The status bar into `layout.status_bar_bounds`.
     /// - The list (tree/machines/pipeline) into `layout.sidebar_content_bounds`.
     /// - The detail panel into `layout.main_content_bounds`.
+    /// Push `active_theme` to the backend on first startup so the shell
+    /// chrome (activity bar, sidebar) uses the user's saved theme from
+    /// frame 0 rather than quadraui's built-in dark defaults.
+    fn setup(&mut self, backend: &mut dyn Backend) {
+        backend.set_theme(self.active_theme.clone());
+    }
+
     fn render_content(&self, backend: &mut dyn Backend, layout: &AppShellLayout) {
+        // Push the active theme to the backend at the start of every frame.
+        // This ensures (a) content is always painted with the user's chosen
+        // palette, and (b) the shell chrome (drawn by ShellAdapter *before*
+        // render_content) uses the correct theme on the *next* frame — so
+        // theme switches are visible within one redraw cycle.
+        backend.set_theme(self.active_theme.clone());
+
         let lh = backend.line_height();
 
         // ── Status bar ────────────────────────────────────────────────
