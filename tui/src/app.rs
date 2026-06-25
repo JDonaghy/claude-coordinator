@@ -8224,8 +8224,8 @@ impl CoordApp {
 
     /// Return the IssueGroup currently selected in the board sidebar.
     ///
-    /// Paths are now three-level: `[milestone_idx, status_idx, issue_idx]`.
-    /// Shorter paths (milestone or status header selected) return `None`.
+    /// Paths are two-level: `[milestone_idx, issue_idx]`.
+    /// A one-level path (milestone header selected) returns `None`.
     fn board_selected_issue_group(&self) -> Option<&IssueGroup> {
         let section = self.board_sidebar.active_section()?;
         let offset = self.board_repo_offset();
@@ -49170,9 +49170,10 @@ mod tests {
 
         // Select the board issue.
         // Section 0 = search form; section 1 = first repo (repo-a).
-        // Path is 3-level: [milestone_idx=0, status_idx=0 (In-flight), issue_idx=0].
+        // Board issue rows use 2-level paths: [milestone_idx, issue_idx].
+        // (Extra elements are ignored, so vec![0, 0, 0] is equivalent to vec![0, 0].)
         app.board_sidebar.set_active_section(Some(1));
-        app.board_sidebar.set_selected_path(1, Some(vec![0, 0, 0]));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
 
         // Also set a pipeline selection that differs from the board issue.
         app.pipeline_issues = vec![PipelineIssue {
