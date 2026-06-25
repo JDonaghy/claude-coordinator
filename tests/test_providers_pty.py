@@ -279,6 +279,54 @@ def test_pty_parse_log_handles_non_json_bytes(tmp_path: Path) -> None:
     assert summary.total_cost_usd == 0.0
 
 
+# ── ClaudePtyProvider: oneshot_command ───────────────────────────────────────
+
+
+def test_pty_oneshot_command_returns_list() -> None:
+    """oneshot_command returns a non-empty list (valid argv)."""
+    cmd = ClaudePtyProvider().oneshot_command(system_prompt="sys")
+    assert isinstance(cmd, list)
+    assert len(cmd) > 0
+
+
+def test_pty_oneshot_command_starts_with_binary() -> None:
+    """First element is the claude binary."""
+    cmd = ClaudePtyProvider().oneshot_command(system_prompt="sys")
+    assert cmd[0] == "claude"
+
+
+def test_pty_oneshot_command_custom_binary() -> None:
+    """Binary override is respected in oneshot_command."""
+    cmd = ClaudePtyProvider(binary="my-claude").oneshot_command(system_prompt="sys")
+    assert cmd[0] == "my-claude"
+
+
+def test_pty_oneshot_command_includes_dash_p() -> None:
+    """Fallback argv uses the claude -p style (belt-and-suspenders for unguarded calls)."""
+    cmd = ClaudePtyProvider().oneshot_command(system_prompt="sys")
+    assert "-p" in cmd
+
+
+def test_pty_oneshot_command_includes_system_prompt() -> None:
+    """system_prompt is passed to the argv."""
+    cmd = ClaudePtyProvider().oneshot_command(system_prompt="my system")
+    assert "--system-prompt" in cmd
+    assert cmd[cmd.index("--system-prompt") + 1] == "my system"
+
+
+def test_pty_oneshot_command_includes_output_format_when_set() -> None:
+    """output_format is included when not None."""
+    cmd = ClaudePtyProvider().oneshot_command(system_prompt="sys", output_format="json")
+    assert "--output-format" in cmd
+    assert cmd[cmd.index("--output-format") + 1] == "json"
+
+
+def test_pty_oneshot_command_omits_output_format_when_none() -> None:
+    """output_format=None suppresses the flag (used by dashboard streaming)."""
+    cmd = ClaudePtyProvider().oneshot_command(system_prompt="sys", output_format=None)
+    assert "--output-format" not in cmd
+
+
 # ── Registry registration ────────────────────────────────────────────────────
 
 

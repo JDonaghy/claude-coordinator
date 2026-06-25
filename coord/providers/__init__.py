@@ -34,6 +34,7 @@ __all__ = [
     "WorkerSummary",
     "build_provider",
     "guard_unattended_dispatch",
+    "resolve_default_provider",
     "resolve_provider_name",
 ]
 
@@ -113,6 +114,65 @@ def resolve_provider_name(
     if repo_provider is not None:
         return repo_provider
     return providers_cfg.default
+
+
+def resolve_default_provider(
+    providers_cfg: "ProvidersConfig",
+    models_cfg: "ModelsConfig | None" = None,
+) -> Provider:
+    """Instantiate the coordinator's default provider for unattended oneshot use.
+
+    Resolves the effective provider name from ``providers_cfg.default``,
+    instantiates it via :func:`build_provider`, then checks
+    ``capabilities().human_attended_only``.  Raises :class:`ValueError` if
+    the resolved provider is human-attended-only (e.g.
+    :class:`~coord.providers.claude_pty.ClaudePtyProvider`) — oneshot callers
+    (brain planning, dashboard assistant) are unattended and must never route
+    through such a provider.
+
+    Falls back to a plain :class:`ClaudeProvider` when the resolved name is
+    not found in ``providers_cfg.definitions`` (which shouldn't happen in
+    practice because :class:`~coord.config.ProvidersConfig` always materialises
+    the implicit ``"claude"`` entry).
+
+    This is the **shared** implementation used by both :mod:`coord.brain` and
+    :mod:`coord.dashboard.server`.  Any change to default-provider resolution
+    or the human-attended guard belongs here — not duplicated in callers.
+
+    Args:
+        providers_cfg: The coordinator's
+            :class:`~coord.config.ProvidersConfig`.
+        models_cfg: Optional :class:`~coord.config.ModelsConfig`, forwarded
+            to :func:`build_provider`.
+
+    Returns:
+        A ready-to-use :class:`Provider` instance whose
+        ``capabilities().human_attended_only`` is ``False``.
+
+    Raises:
+        ValueError: When the resolved provider reports
+            ``capabilities().human_attended_only=True``.  The error message
+            names the provider and points the operator at
+            ``coord assign --interactive``.
+    """
+    name = providers_cfg.default
+    definition = providers_cfg.definitions.get(name)
+    if definition is None:
+        return ClaudeProvider()
+    provider = build_provider(name, definition, models_cfg)
+    caps = provider.capabilities()
+    if caps.human_attended_only:
+        raise ValueError(
+            f"refusing unattended oneshot call: provider {name!r} reports "
+            f"capabilities().human_attended_only=True — this backend is "
+            f"licensed only for human-attended interactive use (Anthropic "
+            f"ToS §3.7) and must NEVER be selected for unattended "
+            f"automation (brain planning, dashboard assistant).  Configure "
+            f"a non-human-attended provider (e.g. 'claude') as "
+            f"providers.default, or launch a human-attended session with "
+            f"`coord assign --interactive`."
+        )
+    return provider
 
 
 def guard_unattended_dispatch(

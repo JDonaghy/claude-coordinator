@@ -358,17 +358,16 @@ def build_app(config: Config) -> Starlette:
 
         # Resolve the coordinator's default provider so the dashboard chat
         # honours the configured backend rather than hard-coding "claude".
-        from coord.providers import build_provider  # noqa: PLC0415
-        from coord.providers.claude import ClaudeProvider  # noqa: PLC0415
+        # Uses resolve_default_provider (shared with brain.py) which also
+        # enforces the human_attended_only guard — raises ValueError if the
+        # configured default is a human-attended-only backend such as
+        # ClaudePtyProvider, preventing unattended use of those providers.
+        from coord.providers import resolve_default_provider  # noqa: PLC0415
 
-        providers_cfg = config.providers
-        _pname = providers_cfg.default
-        _pdef = providers_cfg.definitions.get(_pname)
-        _provider = (
-            build_provider(_pname, _pdef, config.models)
-            if _pdef is not None
-            else ClaudeProvider()
-        )
+        try:
+            _provider = resolve_default_provider(config.providers, config.models)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         # output_format=None → no --output-format flag; dashboard streams
         # plain-text lines, not a JSON envelope.
         _chat_cmd = _provider.oneshot_command(system_prompt=system, output_format=None)
