@@ -701,11 +701,47 @@ def build_app(config: Config) -> Starlette:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             return JSONResponse({"ok": True})
 
-        elif action in ("retry", "dispatch_fix"):
+        elif action == "retry":
             return JSONResponse(
-                {"ok": False, "error": f"{action!r} is not yet implemented in the dashboard"},
+                {"ok": False, "error": "'retry' is not yet implemented in the dashboard"},
                 status_code=501,
             )
+
+        elif action == "dispatch_fix":
+            parent_type = body.get("parent_type", "work")
+            if parent_type not in ("work", "review"):
+                return JSONResponse(
+                    {"error": f"parent_type must be 'work' or 'review', got {parent_type!r}"},
+                    status_code=400,
+                )
+            if not assignment.branch:
+                return JSONResponse(
+                    {"ok": False, "error": "work assignment has no branch to fix"},
+                    status_code=400,
+                )
+            from coord.review import dispatch_headless_fix  # noqa: PLC0415
+
+            try:
+                result = dispatch_headless_fix(
+                    assignment, board, config, parent_type=parent_type
+                )
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            if result:
+                save_board(board)
+                return JSONResponse({
+                    "ok": True,
+                    "machine_name": result.machine_name,
+                    "assignment_id": result.assignment_id,
+                    "branch": result.branch,
+                })
+            return JSONResponse({
+                "ok": False,
+                "error": (
+                    "could not dispatch fix — no capable machine, branch missing, "
+                    "findings unresolvable, or max review iterations reached"
+                ),
+            })
 
         else:
             return JSONResponse(

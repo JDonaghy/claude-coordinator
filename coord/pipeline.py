@@ -260,6 +260,13 @@ def compute_pipeline(
         available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
         if review_assignment is not None and review_assignment.review_posted_at is None:
             available_gates.append(PipelineGate("post_findings", "Post Findings", _EP))
+        # Offer a headless fix when the review returned request-changes (#699):
+        # the phone can dispatch a fix worker without attending a terminal.
+        if (
+            review_assignment is not None
+            and review_assignment.review_verdict == "request-changes"
+        ):
+            available_gates.append(PipelineGate("dispatch_fix", "Dispatch Fix", _EP))
     elif current_stage == "smoke_passed":
         available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
     elif current_stage == "merge_ready":
