@@ -48816,4 +48816,68 @@ mod tests {
             "width=0 must be deterministic and unwrapped"
         );
     }
+
+    // ── #491: dead-pane TuiDriver black-box tests ────────────────────────────
+
+    /// #491 black-box (TuiDriver): when at least one session has `pane_dead =
+    /// true` the status bar must show an amber badge containing "dead".
+    ///
+    /// The rendered text for N sessions with M dead is:
+    ///   " ◉ N session(s) (M dead) "
+    /// Any fragment that includes "dead" is sufficient.
+    ///
+    /// Note: the terminal must be wide enough (200 cols) to accommodate both
+    /// the left-side badge (" ◉ 1 session (1 dead) " ≈ 22 chars) and the
+    /// right-side keyboard-hint segment without truncation.  At 120 cols the
+    /// hints fill the row and squeeze out the badge.
+    #[test]
+    fn tuidriver_dead_pane_shows_amber_badge_in_status_bar() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aid-dead".into(),
+            issue_number: Some(99),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: None,
+            pane_dead: true,
+        }];
+
+        // Use a wider terminal so the badge isn't squeezed out by the right-
+        // side keyboard-hint segment.
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 200, 40);
+        assert!(
+            driver.screen_contains("dead"),
+            "status bar must show a dead-pane badge when a session has pane_dead=true:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #491 black-box (TuiDriver): when the live-sessions overlay is open and
+    /// a session has `pane_dead = true`, the overlay row must show the "(dead)"
+    /// tag so the operator can identify dead sessions at a glance.
+    #[test]
+    fn tuidriver_dead_pane_shows_dead_tag_in_overlay() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aid-dead".into(),
+            issue_number: Some(99),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: None,
+            pane_dead: true,
+        }];
+        // Open the overlay (same state as pressing L with sessions present).
+        app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("dead"),
+            "dead-pane session must show dead indicator in the sessions overlay:\n{}",
+            driver.screen()
+        );
+    }
 }
