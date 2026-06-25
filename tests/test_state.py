@@ -648,3 +648,85 @@ class TestThinClientLocalBoardGuard:
 
         # Must not raise — the guard is inactive on the daemon host.
         save_board(board)
+
+
+class TestSetAssignmentFailureReason:
+    """#618: set_assignment_failure_reason() persists launch-failure info on the row."""
+
+    def _insert_assignment(self, coord_db, assignment_id: str) -> None:
+        """Insert a minimal running assignment row for testing."""
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        a = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="test issue",
+            assignment_id=assignment_id,
+            status="running",
+            branch="issue-42-foo",
+            type="work",
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(assignment=a, repo_github="acme/api")
+
+    def test_schema_has_failure_reason_column(self, coord_db) -> None:
+        """The assignments table must have a failure_reason column (#618)."""
+        from coord.db import get_connection
+
+        conn = get_connection()
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()}
+        assert "failure_reason" in cols, (
+            "assignments table is missing failure_reason column — "
+            "check _migrate_add_columns in coord/db.py"
+        )
+
+    def test_persists_reason_and_marks_failed(self, coord_db) -> None:
+        """set_assignment_failure_reason writes reason + flips status to 'failed'."""
+        from coord.db import get_connection
+        from coord.state import set_assignment_failure_reason
+
+        aid = "test-fail-001"
+        self._insert_assignment(coord_db, aid)
+        set_assignment_failure_reason(aid, "branch already checked out at /some/path")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT status, failure_reason, finished_at FROM assignments WHERE assignment_id=?",
+            (aid,),
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == "failed"
+        assert row["failure_reason"] == "branch already checked out at /some/path"
+        assert row["finished_at"] is not None
+
+    def test_long_reason_is_truncated_to_512_chars(self, coord_db) -> None:
+        """Reasons longer than 512 chars are truncated, not rejected."""
+        from coord.db import get_connection
+        from coord.state import set_assignment_failure_reason
+
+        aid = "test-fail-002"
+        self._insert_assignment(coord_db, aid)
+        long_reason = "x" * 1000
+        set_assignment_failure_reason(aid, long_reason)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT failure_reason FROM assignments WHERE assignment_id=?",
+            (aid,),
+        ).fetchone()
+        assert row is not None
+        assert len(row[0]) == 512
+
+    def test_noop_on_empty_assignment_id(self, coord_db) -> None:
+        """Calling with empty string silently does nothing."""
+        from coord.state import set_assignment_failure_reason
+
+        set_assignment_failure_reason("", "reason")  # must not raise
+
+    def test_noop_on_missing_assignment_id(self, coord_db) -> None:
+        """Calling with a non-existent ID silently does nothing."""
+        from coord.state import set_assignment_failure_reason
+
+        set_assignment_failure_reason("no-such-id", "reason")  # must not raise

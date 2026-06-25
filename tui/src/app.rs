@@ -3494,8 +3494,9 @@ fn load_data() -> BoardData {
                 // old automated rows that also have cost_usd=NULL + zero tokens.
                 is_interactive: row.get::<_, i64>(24)? != 0,
                 // #618: short launch-failure reason; NULL for successful launches.
-                // The column may be absent on pre-migration DBs — gracefully
-                // degrade to None rather than failing the whole query.
+                // unwrap_or(None) absorbs a row.get() type-conversion error (e.g.
+                // unexpected NULL type); a missing column causes conn.prepare() to
+                // fail before any row is fetched, not here.
                 failure_reason: row.get::<_, Option<String>>(25).unwrap_or(None),
             })
         }) {

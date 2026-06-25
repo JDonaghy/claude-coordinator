@@ -8,6 +8,7 @@ orchestration is exercised here without touching git/tmux/the network.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +34,7 @@ def _assign(
     branch: str | None = "issue-42-foo",
     verdict: str | None = None,
     dispatched_at: float | None = None,
+    failure_reason: str | None = None,
 ) -> Assignment:
     return Assignment(
         machine_name="precision",
@@ -45,6 +47,7 @@ def _assign(
         branch=branch,
         review_verdict=verdict,
         dispatched_at=dispatched_at if dispatched_at is not None else time.time(),
+        failure_reason=failure_reason,
     )
 
 
@@ -304,3 +307,443 @@ def test_stage_assignments_newest_first(config) -> None:
     board = Board(completed=[old, new])
     rows = diagnose.stage_assignments(board, "api", 42, "review")
     assert [a.assignment_id for a in rows] == ["r-new", "r-old"]
+
+
+# ── #618: active_assignment_ids_for_repo ────────────────────────────────────
+
+
+def test_active_assignment_ids_for_repo_returns_running(config) -> None:
+    running = _assign(aid="w1", status="running")
+    done = _assign(aid="w2", status="done")
+    board = Board(active=[running], completed=[done])
+    ids = diagnose._active_assignment_ids_for_repo(board, "api")
+    assert ids == {"w1"}
+
+
+def test_active_assignment_ids_for_repo_excludes_other_repos(config) -> None:
+    a = _assign(aid="w1", status="running")
+    board = Board(active=[a])
+    ids = diagnose._active_assignment_ids_for_repo(board, "other-repo")
+    assert ids == set()
+
+
+def test_active_assignment_ids_for_repo_skips_none_ids(config) -> None:
+    """Assignments without an assignment_id must be excluded."""
+    a = Assignment(
+        machine_name="precision",
+        repo_name="api",
+        issue_number=42,
+        issue_title="t",
+        assignment_id=None,  # type: ignore[arg-type]
+        type="work",
+        status="running",
+    )
+    board = Board(active=[a])
+    ids = diagnose._active_assignment_ids_for_repo(board, "api")
+    assert ids == set()
+
+
+# ── #618: _find_orphaned_worktrees ──────────────────────────────────────────
+
+
+def _make_porcelain_output(entries: list[dict]) -> str:
+    """Build a fake ``git worktree list --porcelain`` output."""
+    blocks = []
+    for e in entries:
+        lines = [f"worktree {e['path']}"]
+        if "branch" in e:
+            lines.append(f"branch refs/heads/{e['branch']}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n\n"
+
+
+def test_find_orphaned_worktrees_returns_orphan(tmp_path, monkeypatch) -> None:
+    """A worktree under worktrees_dir with no active assignment is an orphan."""
+    import subprocess
+
+    worktrees_dir = tmp_path / "worktrees"
+    orphan_path = worktrees_dir / "dead-aid" / "repo"
+    orphan_path.mkdir(parents=True)
+
+    porcelain = _make_porcelain_output([
+        {"path": str(orphan_path), "branch": "issue-99-foo"},
+    ])
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": porcelain}
+    )())
+
+    result = diagnose._find_orphaned_worktrees(
+        tmp_path / "repo",
+        "issue-99-foo",
+        active_assignment_ids=set(),
+        worktrees_dir=worktrees_dir,
+    )
+    assert result == [orphan_path]
+
+
+def test_find_orphaned_worktrees_skips_active(tmp_path, monkeypatch) -> None:
+    """Active assignments are not reported as orphans."""
+    import subprocess
+
+    worktrees_dir = tmp_path / "worktrees"
+    wt_path = worktrees_dir / "live-aid" / "repo"
+    wt_path.mkdir(parents=True)
+
+    porcelain = _make_porcelain_output([
+        {"path": str(wt_path), "branch": "issue-99-foo"},
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": porcelain}
+    )())
+
+    result = diagnose._find_orphaned_worktrees(
+        tmp_path / "repo",
+        "issue-99-foo",
+        active_assignment_ids={"live-aid"},
+        worktrees_dir=worktrees_dir,
+    )
+    assert result == []
+
+
+def test_find_orphaned_worktrees_branch_none_matches_all(tmp_path, monkeypatch) -> None:
+    """branch=None acts as a wildcard — both worktrees are found regardless of branch."""
+    import subprocess
+
+    worktrees_dir = tmp_path / "worktrees"
+    wt1 = worktrees_dir / "aid-a" / "r"
+    wt2 = worktrees_dir / "aid-b" / "r"
+    wt1.mkdir(parents=True)
+    wt2.mkdir(parents=True)
+
+    porcelain = _make_porcelain_output([
+        {"path": str(wt1), "branch": "issue-1-foo"},
+        {"path": str(wt2), "branch": "issue-2-bar"},
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": porcelain}
+    )())
+
+    result = diagnose._find_orphaned_worktrees(
+        tmp_path / "repo",
+        None,
+        active_assignment_ids=set(),
+        worktrees_dir=worktrees_dir,
+    )
+    assert set(result) == {wt1, wt2}
+
+
+def test_find_orphaned_worktrees_filters_non_coord_paths(tmp_path, monkeypatch) -> None:
+    """Worktrees outside ~/.coord/worktrees/ are ignored (not coordinator-managed)."""
+    import subprocess
+
+    worktrees_dir = tmp_path / "worktrees"
+    outside = tmp_path / "other" / "checkout"
+    outside.mkdir(parents=True)
+
+    porcelain = _make_porcelain_output([
+        {"path": str(outside), "branch": "issue-99-foo"},
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": porcelain}
+    )())
+
+    result = diagnose._find_orphaned_worktrees(
+        tmp_path / "repo",
+        "issue-99-foo",
+        active_assignment_ids=set(),
+        worktrees_dir=worktrees_dir,
+    )
+    assert result == []
+
+
+def test_find_orphaned_worktrees_git_failure_returns_empty(tmp_path, monkeypatch) -> None:
+    """A non-zero git exit code returns an empty list gracefully."""
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 1, "stdout": ""}
+    )())
+
+    result = diagnose._find_orphaned_worktrees(
+        tmp_path / "repo",
+        "issue-99-foo",
+        active_assignment_ids=set(),
+    )
+    assert result == []
+
+
+# ── #618: _prune_orphaned_worktrees ─────────────────────────────────────────
+
+
+def test_prune_orphaned_worktrees_removes_clean(tmp_path, monkeypatch) -> None:
+    """Clean worktrees (no uncommitted changes) are removed."""
+    import subprocess
+
+    removed_paths: list = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return type("R", (), {"returncode": 0, "stdout": ""})()
+        if cmd[:3] == ["git", "worktree", "remove"]:
+            removed_paths.append(cmd[3])
+            return type("R", (), {"returncode": 0})()
+        return type("R", (), {"returncode": 0})()  # prune
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    removed, skipped = diagnose._prune_orphaned_worktrees(tmp_path, [wt])
+    assert removed == [wt]
+    assert skipped == []
+
+
+def test_prune_orphaned_worktrees_skips_dirty(tmp_path, monkeypatch) -> None:
+    """Worktrees with uncommitted changes are skipped (never deleted)."""
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "status", "--porcelain"]:
+            return type("R", (), {"returncode": 0, "stdout": "M changed.py\n"})()
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    removed, skipped = diagnose._prune_orphaned_worktrees(tmp_path, [wt])
+    assert removed == []
+    assert skipped == [wt]
+
+
+def test_prune_orphaned_worktrees_nonexistent_counted_as_removed(tmp_path, monkeypatch) -> None:
+    """A worktree path that no longer exists is treated as already removed."""
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0}
+    )())
+    gone = tmp_path / "gone-wt"
+    removed, skipped = diagnose._prune_orphaned_worktrees(tmp_path, [gone])
+    assert removed == [gone]
+    assert skipped == []
+
+
+# ── #618: launch-failed branch in _recover_work_like ────────────────────────
+
+
+def test_launch_failed_with_clean_orphan_is_recovered(monkeypatch, config) -> None:
+    """A failed-at-launch assignment whose orphan can be pruned → recovered=True."""
+    _stub(monkeypatch, session="dead")
+    # Stub _prune_orphan_for_failed to do nothing (clean prune, no needs_reset).
+    monkeypatch.setattr(diagnose, "_prune_orphan_for_failed", lambda *a, **k: None)
+
+    a = _assign(
+        aid="w-fail",
+        status="failed",
+        branch="issue-42-foo",
+        failure_reason="branch already checked out at /some/path",
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+    assert res.recovered is True
+    assert res.needs_reset is False
+    assert any("launch-failed" in f for f in res.findings)
+
+
+def test_launch_failed_with_dirty_orphan_not_recovered(monkeypatch, config) -> None:
+    """A failed-at-launch assignment with dirty (unskippable) orphan → needs_reset=True,
+    recovered=False (the contradictory state the reviewer flagged in the review)."""
+    _stub(monkeypatch, session="dead")
+
+    def _set_needs_reset(board, config, latest, res, *, dry_run):
+        # Simulate dirty worktree: _prune_orphan_for_failed could not remove it.
+        res.needs_reset = True
+
+    monkeypatch.setattr(diagnose, "_prune_orphan_for_failed", _set_needs_reset)
+
+    a = _assign(
+        aid="w-fail",
+        status="failed",
+        branch="issue-42-foo",
+        failure_reason="branch already checked out at /some/path",
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+    # needs_reset set by the stub → recovered must NOT also be True.
+    assert res.needs_reset is True
+    assert res.recovered is False
+
+
+def test_launch_failed_no_branch_still_shows_finding(monkeypatch, config) -> None:
+    """A failed assignment with no branch still reports the failure_reason finding."""
+    _stub(monkeypatch, session="dead")
+    prune_called: list = []
+    monkeypatch.setattr(
+        diagnose, "_prune_orphan_for_failed",
+        lambda *a, **k: prune_called.append(True)
+    )
+
+    a = _assign(
+        aid="w-fail",
+        status="failed",
+        branch=None,
+        failure_reason="git error: no such branch",
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+    # No branch → _prune_orphan_for_failed should not be called.
+    assert prune_called == []
+    assert any("launch-failed" in f for f in res.findings)
+    assert res.recovered is True
+
+
+# ── #618: _prune_orphan_for_failed integration ──────────────────────────────
+
+
+def test_prune_orphan_for_failed_no_repo_cfg(monkeypatch, config) -> None:
+    """If repo is unknown in config, _prune_orphan_for_failed returns silently."""
+    a = Assignment(
+        machine_name="precision",
+        repo_name="unknown-repo",  # not in config
+        issue_number=42,
+        issue_title="t",
+        assignment_id="w1",
+        type="work",
+        status="failed",
+        branch="issue-42-foo",
+        dispatched_at=time.time(),
+        failure_reason="some error",
+    )
+    res = diagnose.DiagnoseResult(repo_name="unknown-repo", issue_number=42, stage="work")
+    board = Board()
+    # Must not raise.
+    diagnose._prune_orphan_for_failed(board, config, a, res, dry_run=False)
+    # No findings added (exited early before finding orphans).
+    assert not any("orphan" in f.lower() for f in res.findings)
+
+
+def test_prune_orphan_for_failed_dry_run_reports_but_does_not_remove(
+    monkeypatch, config, tmp_path
+) -> None:
+    """dry_run=True: orphans are listed but not removed."""
+    import subprocess
+
+    worktrees_dir = tmp_path / "worktrees"
+    orphan = worktrees_dir / "dead-aid" / "r"
+    orphan.mkdir(parents=True)
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+
+    # Stub COORD_DIR so _find_orphaned_worktrees uses our tmp worktrees_dir.
+    import coord.state as state_mod
+    monkeypatch.setattr(state_mod, "COORD_DIR", tmp_path)
+
+    # Stub machine.repo_path to return our tmp repo.
+    monkeypatch.setattr(
+        config.machines[0], "repo_path", lambda repo_name: str(repo_path)
+    )
+
+    porcelain = _make_porcelain_output([{"path": str(orphan), "branch": "issue-42-foo"}])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": porcelain}
+    )())
+
+    a = Assignment(
+        machine_name="precision",
+        repo_name="api",
+        issue_number=42,
+        issue_title="t",
+        assignment_id="w1",
+        type="work",
+        status="failed",
+        branch="issue-42-foo",
+        dispatched_at=time.time(),
+        failure_reason="branch already checked out",
+    )
+    board = Board()
+    res = diagnose.DiagnoseResult(repo_name="api", issue_number=42, stage="work")
+    diagnose._prune_orphan_for_failed(board, config, a, res, dry_run=True)
+    assert any("dry-run" in f for f in res.findings)
+    assert res.actions_taken == []  # nothing was actually removed
+
+
+# ── #618: --orphan-worktrees CLI flag ────────────────────────────────────────
+
+
+CONFIG_YAML_FOR_DIAGNOSE = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+"""
+
+
+def test_diagnose_orphan_worktrees_flag_dry_run(monkeypatch, tmp_path) -> None:
+    """``coord diagnose --orphan-worktrees --dry-run`` runs the sweep without removing."""
+    import subprocess
+
+    from click.testing import CliRunner
+
+    from coord.cli import main
+
+    cfg_file = tmp_path / "coordinator.yml"
+    cfg_file.write_text(CONFIG_YAML_FOR_DIAGNOSE)
+
+    worktrees_dir = tmp_path / "coord_home" / "worktrees"
+    orphan = worktrees_dir / "dead-aid" / "r"
+    orphan.mkdir(parents=True)
+
+    # Stub COORD_DIR so the sweep finds our tmp worktrees.
+    monkeypatch.setattr("coord.state.COORD_DIR", tmp_path / "coord_home")
+
+    # Stub build_board to return an empty board (no active assignments).
+    monkeypatch.setattr("coord.state.build_board", lambda: Board())
+
+    # Stub tmux so no sessions are considered live.
+    monkeypatch.setattr("coord.interactive.tmux_available", lambda: False)
+
+    # Stub git worktree list to return one orphan.
+    repo_path = Path("/tmp/api")
+    porcelain = _make_porcelain_output([{"path": str(orphan), "branch": "issue-1-foo"}])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": porcelain}
+    )())
+
+    # Stub machine.repo_path in the loaded config so it resolves to tmp_path/api.
+    api_path = tmp_path / "api"
+    api_path.mkdir()
+
+    def _patched_repo_path(self, repo_name):  # type: ignore[no-untyped-def]
+        return str(api_path) if repo_name == "api" else None
+
+    monkeypatch.setattr("coord.config.Machine.repo_path", _patched_repo_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["diagnose", "--config", str(cfg_file), "--orphan-worktrees", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    # Dry-run must mention the orphan but not remove it.
+    assert "dry-run" in result.output
+    assert orphan.exists(), "dry-run must not remove the orphan worktree"
+
+
+def test_diagnose_missing_repo_and_issue_errors(monkeypatch, tmp_path) -> None:
+    """``coord diagnose`` without REPO/ISSUE and without --orphan-worktrees exits 2."""
+    from click.testing import CliRunner
+
+    from coord.cli import main
+
+    cfg_file = tmp_path / "coordinator.yml"
+    cfg_file.write_text(CONFIG_YAML_FOR_DIAGNOSE)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["diagnose", "--config", str(cfg_file)])
+    assert result.exit_code == 2

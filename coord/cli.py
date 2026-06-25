@@ -7118,7 +7118,6 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     Dirty worktrees (uncommitted changes) are reported but never deleted.
     """
     from coord.diagnose import (  # noqa: PLC0415
-        _active_assignment_ids_for_repo,
         _find_orphaned_worktrees,
         _prune_orphaned_worktrees,
     )
@@ -7148,7 +7147,9 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
             if tmux_session_alive(tmux_session_name(aid)):
                 live_tmux.add(aid)
 
-    # All running/pending assignment_ids from the board.
+    # All running/pending assignment_ids from the board (includes live tmux ones
+    # from the board's active set; combine with live_tmux for sessions whose DB
+    # rows may already be gone).
     running_ids: set[str] = {
         a.assignment_id
         for a in board.active
@@ -7172,53 +7173,10 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
         if repo_path is None:
             continue
 
-        # Collect all worktree dirs under worktrees_dir, find the ones checked out
-        # in this repo's worktree list and not in active_ids.
-        try:
-            import subprocess as _sp  # noqa: PLC0415
-            result = _sp.run(
-                ["git", "worktree", "list", "--porcelain"],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
-                timeout=10.0,
-            )
-        except Exception:  # noqa: BLE001
-            continue
-        if result.returncode != 0:
-            continue
-
-        orphans: list[Path] = []
-        current: dict[str, str] = {}
-        for raw_line in result.stdout.splitlines():
-            line = raw_line.strip()
-            if not line:
-                if current:
-                    wt_str = current.get("worktree", "")
-                    if wt_str:
-                        wt_path = Path(wt_str)
-                        try:
-                            aid = wt_path.relative_to(worktrees_dir).parts[0]
-                        except ValueError:
-                            pass
-                        else:
-                            if aid not in active_ids and wt_path.exists():
-                                orphans.append(wt_path)
-                    current = {}
-            elif line.startswith("worktree "):
-                current["worktree"] = line[len("worktree "):]
-        if current:
-            wt_str = current.get("worktree", "")
-            if wt_str:
-                wt_path = Path(wt_str)
-                try:
-                    aid = wt_path.relative_to(worktrees_dir).parts[0]
-                except ValueError:
-                    pass
-                else:
-                    if aid not in active_ids and wt_path.exists():
-                        orphans.append(wt_path)
-
+        # Delegate porcelain parsing to the shared helper (branch=None → any branch).
+        orphans = _find_orphaned_worktrees(
+            repo_path, None, active_assignment_ids=active_ids, worktrees_dir=worktrees_dir
+        )
         if not orphans:
             continue
 
