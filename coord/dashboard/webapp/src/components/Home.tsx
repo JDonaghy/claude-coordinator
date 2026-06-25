@@ -1,135 +1,237 @@
 /**
- * Home — placeholder screen that proves the /api/board data path.
+ * Home — the main screen of the Phone Control Center.
  *
- * This is the scaffold view; full Pipeline UI is in subsequent issues
- * (Home / Detail screens of the Phone Control Center milestone).
+ * Shows in-flight pipeline items as tappable cards, auto-refreshing every 4 s.
+ * Two filter tabs:
+ *   Active    — everything currently in the pipeline (not yet merged)
+ *   Needs me  — items with at least one available gate action (need human input)
+ *
+ * Pull-to-refresh: drag down from the top (when already scrolled to top) to
+ * trigger an immediate refetch.
  */
+import { useCallback, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { fetchBoard, type Assignment } from '@/api/client'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Badge } from '@/components/ui/badge'
+import { fetchPipeline, type PipelineView } from '@/api/client'
+import { PipelineCard } from '@/components/PipelineCard'
 
-function statusVariant(
-  status: string,
-): 'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline' {
-  switch (status) {
-    case 'running':
-      return 'default'
-    case 'done':
-      return 'success'
-    case 'failed':
-      return 'destructive'
-    case 'cancelled':
-      return 'warning'
-    case 'advisory':
-      return 'warning'
-    default:
-      return 'secondary'
-  }
+// ── Filter logic ──────────────────────────────────────────────────────────────
+
+type FilterTab = 'active' | 'needs-me'
+
+/**
+ * "Active": items that haven't finished (current_stage !== "merged").
+ * This keeps the list focused on in-flight work without cluttering with history.
+ */
+function isActive(view: PipelineView): boolean {
+  return view.current_stage !== 'merged'
 }
 
-function AssignmentRow({ a }: { a: Assignment }) {
+/**
+ * "Needs me": items where at least one human gate action is available.
+ * E.g.: work done (needs test dispatch), review approved (needs merge queue),
+ * smoke passed (needs merge queue), merge ready (needs merge), failures (need retry/fix).
+ */
+function needsMe(view: PipelineView): boolean {
+  return view.available_gates.length > 0
+}
+
+const FILTER_FNS: Record<FilterTab, (v: PipelineView) => boolean> = {
+  'active': isActive,
+  'needs-me': needsMe,
+}
+
+// ── Pull-to-refresh ───────────────────────────────────────────────────────────
+
+const PTR_THRESHOLD_PX = 80
+
+interface UsePullToRefreshOptions {
+  onRefresh: () => void
+}
+
+function usePullToRefresh({ onRefresh }: UsePullToRefreshOptions) {
+  const startYRef = useRef(0)
+
+  const onTouchStart = useCallback((e: React.TouchEvent) => {
+    startYRef.current = e.touches[0].clientY
+  }, [])
+
+  const onTouchEnd = useCallback(
+    (e: React.TouchEvent) => {
+      const dy = e.changedTouches[0].clientY - startYRef.current
+      if (dy > PTR_THRESHOLD_PX && window.scrollY === 0) {
+        onRefresh()
+      }
+    },
+    [onRefresh],
+  )
+
+  return { onTouchStart, onTouchEnd }
+}
+
+// ── Filter tab component ──────────────────────────────────────────────────────
+
+interface FilterTabsProps {
+  active: FilterTab
+  counts: Record<FilterTab, number>
+  onChange: (tab: FilterTab) => void
+}
+
+function FilterTabs({ active: activeTab, counts, onChange }: FilterTabsProps) {
+  const tabs: Array<{ id: FilterTab; label: string }> = [
+    { id: 'active', label: 'Active' },
+    { id: 'needs-me', label: 'Needs me' },
+  ]
+
   return (
-    <Card>
-      <CardContent className="pt-4">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-medium">
-              #{a.issue_number} {a.issue_title}
-            </p>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              {a.machine_name} · {a.repo_name}
-            </p>
-          </div>
-          <Badge variant={statusVariant(a.status)} className="shrink-0">
-            {a.status}
-          </Badge>
-        </div>
-      </CardContent>
-    </Card>
+    <div className="flex gap-2" role="tablist" aria-label="Pipeline filters">
+      {tabs.map(({ id, label }) => {
+        const isSelected = id === activeTab
+        const count = counts[id]
+        return (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={isSelected}
+            onClick={() => onChange(id)}
+            className={
+              isSelected
+                ? 'flex items-center gap-1.5 rounded-full bg-primary px-3 py-1 text-xs font-semibold text-primary-foreground'
+                : 'flex items-center gap-1.5 rounded-full border border-border px-3 py-1 text-xs font-medium text-muted-foreground'
+            }
+          >
+            {label}
+            {count > 0 && (
+              <span
+                className={
+                  isSelected
+                    ? 'rounded-full bg-primary-foreground/20 px-1.5 text-xs font-mono'
+                    : 'rounded-full bg-secondary px-1.5 text-xs font-mono'
+                }
+              >
+                {count}
+              </span>
+            )}
+          </button>
+        )
+      })}
+    </div>
   )
 }
 
+// ── Home screen ───────────────────────────────────────────────────────────────
+
 export default function Home() {
-  const { data, isLoading, isError, dataUpdatedAt } = useQuery({
-    queryKey: ['board'],
-    queryFn: fetchBoard,
+  const navigate = useNavigate()
+  const [filterTab, setFilterTab] = useState<FilterTab>('active')
+
+  const { data, isLoading, isError, isFetching, dataUpdatedAt, refetch } = useQuery({
+    queryKey: ['pipeline'],
+    queryFn: fetchPipeline,
     refetchInterval: 4_000,
   })
+
+  const handleRefresh = useCallback(() => {
+    void refetch()
+  }, [refetch])
+
+  const { onTouchStart, onTouchEnd } = usePullToRefresh({ onRefresh: handleRefresh })
+
+  const filtered = data ? data.filter(FILTER_FNS[filterTab]) : []
+
+  const counts: Record<FilterTab, number> = {
+    'active': data ? data.filter(isActive).length : 0,
+    'needs-me': data ? data.filter(needsMe).length : 0,
+  }
 
   const updatedLabel = dataUpdatedAt
     ? new Date(dataUpdatedAt).toLocaleTimeString()
     : null
 
   return (
-    <div className="mx-auto max-w-lg px-4 py-6">
+    <div
+      className="mx-auto max-w-lg px-4 py-6"
+      onTouchStart={onTouchStart}
+      onTouchEnd={onTouchEnd}
+    >
       {/* Header */}
-      <header className="mb-6 flex items-baseline justify-between">
+      <header className="mb-5 flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold text-primary">coord</h1>
-          <p className="text-xs text-muted-foreground">dashboard</p>
+          <p className="text-xs text-muted-foreground">pipeline</p>
         </div>
-        {updatedLabel && (
-          <span className="text-xs text-muted-foreground">updated {updatedLabel}</span>
-        )}
+        <div className="flex items-center gap-2">
+          {isFetching && !isLoading && (
+            <span className="h-2 w-2 animate-pulse rounded-full bg-primary" aria-label="Refreshing" />
+          )}
+          {updatedLabel && (
+            <span className="text-xs text-muted-foreground">{updatedLabel}</span>
+          )}
+        </div>
       </header>
 
-      {/* Loading / error states */}
-      {isLoading && (
-        <p className="py-8 text-center text-sm text-muted-foreground">Loading board…</p>
+      {/* Filter tabs */}
+      {data && (
+        <div className="mb-4">
+          <FilterTabs active={filterTab} counts={counts} onChange={setFilterTab} />
+        </div>
       )}
-      {isError && (
-        <p className="py-8 text-center text-sm text-destructive">
-          Failed to load board — is the dashboard server running?
+
+      {/* Loading state */}
+      {isLoading && (
+        <p className="py-12 text-center text-sm text-muted-foreground">
+          Loading pipeline…
         </p>
       )}
 
-      {/* Board summary */}
-      {data && (
-        <div className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Board</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <dl className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <dt className="text-muted-foreground">Active</dt>
-                  <dd>
-                    <Badge variant="secondary">{data.active.length}</Badge>
-                  </dd>
-                </div>
-                <div className="flex justify-between">
-                  <dt className="text-muted-foreground">Completed (last 20)</dt>
-                  <dd>
-                    <Badge variant="outline">{data.completed.length}</Badge>
-                  </dd>
-                </div>
-                <div className="flex justify-between">
-                  <dt className="text-muted-foreground">Round</dt>
-                  <dd className="font-mono">#{data.round_number}</dd>
-                </div>
-              </dl>
-            </CardContent>
-          </Card>
+      {/* Error state */}
+      {isError && (
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-6 text-center">
+          <p className="text-sm text-destructive">Failed to load pipeline</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Is the dashboard server running?
+          </p>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            className="mt-3 rounded-full border border-border px-3 py-1 text-xs text-muted-foreground"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
-          {/* Active assignments */}
-          {data.active.length > 0 && (
-            <section className="space-y-2">
-              <h2 className="text-xs font-medium uppercase tracking-widest text-muted-foreground">
-                Active
-              </h2>
-              {data.active.map((a) => (
-                <AssignmentRow key={a.assignment_id} a={a} />
-              ))}
-            </section>
-          )}
+      {/* Card list */}
+      {data && filtered.length > 0 && (
+        <section className="space-y-3" aria-label={filterTab === 'active' ? 'Active items' : 'Items needing attention'}>
+          {filtered.map((view) => (
+            <PipelineCard
+              key={view.assignment_id}
+              view={view}
+              onClick={() => navigate(`/detail/${view.assignment_id}`)}
+            />
+          ))}
+        </section>
+      )}
 
-          {/* Empty state */}
-          {data.active.length === 0 && (
-            <p className="py-4 text-center text-sm text-muted-foreground">
-              No active assignments
-            </p>
+      {/* Empty state */}
+      {data && filtered.length === 0 && (
+        <div className="py-12 text-center">
+          {filterTab === 'needs-me' ? (
+            <>
+              <p className="text-sm font-medium text-foreground">All clear</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                No items are waiting for your input right now.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm font-medium text-foreground">No active pipeline items</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Dispatch a worker to get started.
+              </p>
+            </>
           )}
         </div>
       )}

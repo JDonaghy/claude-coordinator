@@ -54,7 +54,9 @@ class PipelineGate:
 class PipelineView:
     assignment_id: str
     issue_number: int
+    issue_title: str
     repo_name: str
+    machine_name: str
     stages: list[PipelineStage]
     current_stage: str
     available_gates: list[PipelineGate]
@@ -285,7 +287,9 @@ def compute_pipeline(
     return PipelineView(
         assignment_id=aid,
         issue_number=assignment.issue_number,
+        issue_title=assignment.issue_title,
         repo_name=assignment.repo_name,
+        machine_name=assignment.machine_name,
         stages=stages,
         current_stage=current_stage,
         available_gates=available_gates,

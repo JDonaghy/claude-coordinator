@@ -58,20 +58,59 @@ export interface BoardData {
 
 // ── GET /api/pipeline ─────────────────────────────────────────────────────────
 
+/**
+ * One stage in the pipeline (coding → review → smoke → merge).
+ * Mirrors coord/pipeline.py:PipelineStage.
+ */
+export interface PipelineStage {
+  /** Stage key: "coding" | "review" | "smoke" | "merge" */
+  name: string
+  /** "active" | "completed" | "skipped" | "waiting" */
+  status: string
+  is_current: boolean
+}
+
+/**
+ * An available gate action on a pipeline item.
+ * Mirrors coord/pipeline.py:PipelineGate.
+ */
+export interface PipelineGate {
+  action: PipelineAction
+  label: string
+  endpoint: string
+}
+
+/**
+ * Pipeline state for one work-type assignment.
+ * Mirrors coord/pipeline.py:PipelineView (serialised via dataclasses.asdict).
+ */
 export interface PipelineView {
   assignment_id: string
-  repo_name: string
   issue_number: number
   issue_title: string
-  /** Current pipeline stage name, e.g. "work", "test", "review", "merge". */
-  stage: string
-  /** Stage-level status, e.g. "running", "done", "waiting". */
-  status: string
-  /** Gate states keyed by gate name. */
-  gates: Record<string, string>
-  branch?: string | null
-  review_assignment_id?: string | null
-  smoke_assignment_id?: string | null
+  repo_name: string
+  machine_name: string
+  stages: PipelineStage[]
+  /**
+   * Fine-grained current stage name used for colour-coding.
+   * One of: "coding" | "failed" | "done" | "review_running" | "review_done" |
+   * "review_failed" | "smoke_running" | "smoke_passed" | "smoke_failed" |
+   * "merge_ready" | "merging" | "merged"
+   */
+  current_stage: string
+  /** Gate actions currently available (empty when no human action is needed). */
+  available_gates: PipelineGate[]
+  /** Overall progress 0-100. */
+  progress_pct: number
+  /**
+   * True when the review assignment completed but its findings have not yet
+   * been posted to GitHub (review_posted_at is None on the review assignment).
+   */
+  review_findings_pending: boolean
+  /** "approve" | "request-changes" | null */
+  review_verdict: 'approve' | 'request-changes' | null
+  /** Cached review findings body from the DB; null when not yet available. */
+  review_findings_body: string | null
 }
 
 // ── GET /api/diff/{id} ────────────────────────────────────────────────────────
