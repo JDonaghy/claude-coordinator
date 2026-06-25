@@ -1005,3 +1005,123 @@ class TestFinalizeExitCodeNormalization:
             "Test/Review/Merge chain would be greyed"
         )
         assert result.commits_ahead == 2
+
+
+# ── #560: remote_worktree_exists + find_remote_branch_holder helpers ──────────
+
+
+class TestRemoteWorktreeExists:
+    """Unit tests for :func:`coord.interactive.remote_worktree_exists`."""
+
+    def _make_run_result(self, stdout: str, returncode: int = 0):
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        m.stderr = ""
+        return m
+
+    def test_returns_true_when_directory_exists(self) -> None:
+        from coord.interactive import remote_worktree_exists
+
+        with patch("subprocess.run",
+                   return_value=self._make_run_result("__WT_EXISTS\n")):
+            assert remote_worktree_exists("host", "$HOME/.coord/worktrees/abc") is True
+
+    def test_returns_false_when_directory_missing(self) -> None:
+        from coord.interactive import remote_worktree_exists
+
+        with patch("subprocess.run",
+                   return_value=self._make_run_result("__WT_MISSING\n")):
+            assert remote_worktree_exists("host", "$HOME/.coord/worktrees/abc") is False
+
+    def test_returns_true_on_ssh_error(self) -> None:
+        """SSH failures must be treated as 'probably exists' to avoid false
+        'setup failed' diagnoses when connectivity is the real problem."""
+        from coord.interactive import remote_worktree_exists
+
+        with patch("subprocess.run", side_effect=OSError("connection refused")):
+            # Safe fallback: treat as exists so we don't suppress real error info.
+            assert remote_worktree_exists("host", "$HOME/.coord/worktrees/abc") is True
+
+
+class TestFindRemoteBranchHolder:
+    """Unit tests for :func:`coord.interactive.find_remote_branch_holder`."""
+
+    _PORCELAIN = """\
+worktree /home/john/src/api
+HEAD abc123def456
+branch refs/heads/main
+
+worktree /home/john/.coord/worktrees/971a1947ad91
+HEAD dead0000cafe
+branch refs/heads/issue-514-migrate-terminal
+
+worktree /home/john/.coord/worktrees/aabbccdd1234
+HEAD 00000000cafe
+branch refs/heads/issue-999-other-feature
+
+"""
+
+    def _make_run_result(self, stdout: str, returncode: int = 0):
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        m.stderr = ""
+        return m
+
+    def test_finds_the_right_worktree_path(self) -> None:
+        from coord.interactive import find_remote_branch_holder
+
+        with patch("subprocess.run",
+                   return_value=self._make_run_result(self._PORCELAIN)):
+            path = find_remote_branch_holder(
+                "host", "$HOME/src/api", "issue-514-migrate-terminal",
+            )
+        assert path == "/home/john/.coord/worktrees/971a1947ad91"
+
+    def test_returns_none_when_branch_not_found(self) -> None:
+        from coord.interactive import find_remote_branch_holder
+
+        with patch("subprocess.run",
+                   return_value=self._make_run_result(self._PORCELAIN)):
+            path = find_remote_branch_holder(
+                "host", "$HOME/src/api", "issue-42-nonexistent",
+            )
+        assert path is None
+
+    def test_does_not_match_prefix(self) -> None:
+        """Partial branch name must not match a longer branch name."""
+        from coord.interactive import find_remote_branch_holder
+
+        with patch("subprocess.run",
+                   return_value=self._make_run_result(self._PORCELAIN)):
+            # "issue-514" is a prefix of "issue-514-migrate-terminal" — must not match.
+            path = find_remote_branch_holder("host", "$HOME/src/api", "issue-514")
+        assert path is None
+
+    def test_returns_none_on_ssh_error(self) -> None:
+        from coord.interactive import find_remote_branch_holder
+
+        with patch("subprocess.run", side_effect=OSError("timed out")):
+            path = find_remote_branch_holder("host", "$HOME/src/api", "any-branch")
+        assert path is None
+
+    def test_skips_main_worktree(self) -> None:
+        """The main repo worktree (first entry) must be matched too if it holds
+        the branch — this is an edge case but the function must handle it."""
+        from coord.interactive import find_remote_branch_holder
+
+        porcelain = """\
+worktree /home/john/src/api
+HEAD abc123
+branch refs/heads/issue-99-main-checkout
+
+"""
+        with patch("subprocess.run",
+                   return_value=self._make_run_result(porcelain)):
+            path = find_remote_branch_holder(
+                "host", "$HOME/src/api", "issue-99-main-checkout",
+            )
+        assert path == "/home/john/src/api"
