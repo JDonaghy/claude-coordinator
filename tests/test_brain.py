@@ -643,7 +643,6 @@ class TestResolveDefaultProvider:
 
     def test_explicit_claude_provider_definition(self) -> None:
         """An explicit claude definition resolves to ClaudeProvider."""
-        from coord.config import ProviderDef, ProvidersConfig
         providers = ProvidersConfig(
             default="my-claude",
             definitions={"my-claude": ProviderDef(type="claude", binary="claude2")},
@@ -658,3 +657,21 @@ class TestResolveDefaultProvider:
         # Verify the custom binary is threaded through.
         cmd = provider.oneshot_command(system_prompt="sp")
         assert cmd[0] == "claude2"
+
+    def test_human_attended_only_provider_raises(self) -> None:
+        """_resolve_default_provider raises when the default is human-attended-only.
+
+        Brain planning is an unattended path — ClaudePtyProvider must never
+        be selected for it (Anthropic ToS §3.7).
+        """
+        providers = ProvidersConfig(
+            default="my-pty",
+            definitions={"my-pty": ProviderDef(type="claude-pty")},
+        )
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="m", host="h", repos=["api"])],
+            providers=providers,
+        )
+        with pytest.raises(ValueError, match="human_attended_only=True"):
+            _resolve_default_provider(cfg)

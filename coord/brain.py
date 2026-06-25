@@ -183,28 +183,27 @@ def build_prompt(config: Config, context: dict) -> str:
 def _resolve_default_provider(config: Config) -> "Provider":
     """Instantiate the coordinator's default provider from *config*.
 
-    Uses the precedence chain ``providers.default → "claude"`` (no per-spec
-    or per-repo override at the brain level — brain calls are
-    coordinator-global).  Falls back to :class:`~coord.providers.claude.ClaudeProvider`
-    when the resolved name is not found in ``providers.definitions``
-    (shouldn't happen because ``ProvidersConfig.__post_init__`` always
-    materialises the implicit ``"claude"`` entry).
+    Thin wrapper around :func:`coord.providers.resolve_default_provider` —
+    all logic (precedence chain, ``human_attended_only`` guard, fallback to
+    :class:`~coord.providers.claude.ClaudeProvider`) lives there so that brain
+    planning and the dashboard assistant share a single implementation.
 
     Args:
         config: The coordinator config.
 
     Returns:
-        A ready-to-use :class:`~coord.providers.base.Provider` instance.
-    """
-    from coord.providers import build_provider  # noqa: PLC0415
-    from coord.providers.claude import ClaudeProvider  # noqa: PLC0415
+        A ready-to-use :class:`~coord.providers.base.Provider` instance whose
+        ``capabilities().human_attended_only`` is ``False``.
 
-    providers_cfg = config.providers
-    name = providers_cfg.default
-    definition = providers_cfg.definitions.get(name)
-    if definition is None:
-        return ClaudeProvider()
-    return build_provider(name, definition, config.models)
+    Raises:
+        ValueError: When the configured default provider reports
+            ``capabilities().human_attended_only=True``.  Brain planning is
+            an unattended path and must not route through a human-attended
+            backend such as :class:`~coord.providers.claude_pty.ClaudePtyProvider`.
+    """
+    from coord.providers import resolve_default_provider  # noqa: PLC0415
+
+    return resolve_default_provider(config.providers, config.models)
 
 
 def call_claude(system: str, user: str, *, provider: "Provider | None" = None) -> str:

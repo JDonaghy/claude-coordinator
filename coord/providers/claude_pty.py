@@ -250,17 +250,17 @@ class ClaudePtyProvider(Provider):
         """Best-effort one-shot argv for the PTY provider.
 
         Interactive ``claude`` does not support the non-interactive ``-p``
-        mode one-shot pattern.  However, because
-        ``capabilities().human_attended_only=True``, the coordinator
-        NEVER routes brain planning or dashboard assistant calls through
-        this provider — those paths use :func:`coord.providers.build_provider`
-        and then check ``capabilities()`` before calling
-        ``oneshot_command()``.
+        mode one-shot pattern.
 
-        This implementation falls back to the ``claude -p`` style argv
-        (identical to :class:`~.claude.ClaudeProvider`) as a
-        belt-and-suspenders measure so that any accidental call still
-        produces a valid command list rather than raising.
+        The coordinator's unattended oneshot paths (brain planning,
+        dashboard assistant) guard against human-attended-only providers
+        via :func:`coord.providers.resolve_default_provider`, which raises
+        :class:`ValueError` before ``oneshot_command()`` is reached when
+        ``capabilities().human_attended_only=True``.  This method is
+        therefore a belt-and-suspenders fallback: if it is somehow invoked
+        despite the guard, it returns a valid ``claude -p`` style argv (the
+        same shape as :class:`~.claude.ClaudeProvider`) rather than raising,
+        so callers still get a workable command list.
 
         Args:
             system_prompt: The system prompt for the call.

@@ -26,7 +26,7 @@ from coord.agent import (
     default_worker_command,
 )
 from coord.config import ModelsConfig, ProviderDef, ProvidersConfig
-from coord.providers import build_provider, resolve_provider_name
+from coord.providers import build_provider, resolve_default_provider, resolve_provider_name
 from coord.providers.base import Capabilities, Provider, WorkerSummary
 from coord.providers.claude import ClaudeProvider
 from coord.providers.opencode import (
@@ -915,3 +915,78 @@ def test_opencode_oneshot_command_returns_list_of_strings() -> None:
     assert isinstance(cmd, list)
     for item in cmd:
         assert isinstance(item, str)
+
+
+# ── resolve_default_provider ──────────────────────────────────────────────────
+
+
+def test_resolve_default_provider_default_returns_claude_provider() -> None:
+    """Default ProvidersConfig resolves to ClaudeProvider (no guard raised)."""
+    cfg = ProvidersConfig()
+    provider = resolve_default_provider(cfg)
+    assert isinstance(provider, ClaudeProvider)
+
+
+def test_resolve_default_provider_explicit_claude_returns_claude_provider() -> None:
+    """An explicit claude definition resolves to ClaudeProvider."""
+    cfg = ProvidersConfig(
+        default="my-claude",
+        definitions={"my-claude": ProviderDef(type="claude", binary="claude2")},
+    )
+    provider = resolve_default_provider(cfg)
+    assert isinstance(provider, ClaudeProvider)
+    # Binary override is threaded through.
+    cmd = provider.oneshot_command(system_prompt="sp")
+    assert cmd[0] == "claude2"
+
+
+def test_resolve_default_provider_unknown_name_falls_back_to_claude() -> None:
+    """When the default name is not in definitions, falls back to ClaudeProvider."""
+    cfg = ProvidersConfig(default="missing", definitions={})
+    provider = resolve_default_provider(cfg)
+    assert isinstance(provider, ClaudeProvider)
+
+
+def test_resolve_default_provider_raises_for_human_attended_only() -> None:
+    """Raises ValueError when the resolved provider reports human_attended_only=True.
+
+    This is the STRUCTURAL gate that prevents brain planning and dashboard
+    assistant calls from routing through ClaudePtyProvider (subscription-billed
+    interactive Claude) — Anthropic ToS §3.7 forbids unattended use.
+    """
+    from coord.providers.claude_pty import ClaudePtyProvider
+
+    cfg = ProvidersConfig(
+        default="my-pty",
+        definitions={"my-pty": ProviderDef(type="claude-pty")},
+    )
+    with pytest.raises(ValueError, match="human_attended_only=True"):
+        resolve_default_provider(cfg)
+
+
+def test_resolve_default_provider_raises_names_the_provider() -> None:
+    """The ValueError names the provider so the operator knows which one to reconfigure."""
+    cfg = ProvidersConfig(
+        default="named-pty",
+        definitions={"named-pty": ProviderDef(type="claude-pty")},
+    )
+    with pytest.raises(ValueError, match="named-pty"):
+        resolve_default_provider(cfg)
+
+
+def test_resolve_default_provider_with_models_cfg() -> None:
+    """resolve_default_provider accepts an optional models_cfg without error."""
+    cfg = ProvidersConfig()
+    models = ModelsConfig()
+    provider = resolve_default_provider(cfg, models)
+    assert isinstance(provider, ClaudeProvider)
+
+
+def test_resolve_default_provider_opencode_allowed() -> None:
+    """OpenCodeProvider (human_attended_only=False) does not trigger the guard."""
+    cfg = ProvidersConfig(
+        default="my-oc",
+        definitions={"my-oc": ProviderDef(type="opencode")},
+    )
+    provider = resolve_default_provider(cfg)
+    assert isinstance(provider, OpenCodeProvider)
