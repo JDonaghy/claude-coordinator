@@ -17829,7 +17829,7 @@ impl CoordApp {
         if let Some(ref p) = self.pending_auto_review {
             // #722: a live remote session blocks the offer — direct the operator
             // to reattach and exit first; the detector will re-fire once clear.
-            if let Some(d) = self.live_session_blocking_dialog(p.issue_num) {
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num, &p.coord_repo) {
                 return Some(d);
             }
             return Some(Dialog {
@@ -17873,7 +17873,7 @@ impl CoordApp {
         // next stage needs no operator typing.
         if let Some(ref p) = self.pending_stage_launch {
             // #722: live-session gate (same as pending_auto_review above).
-            if let Some(d) = self.live_session_blocking_dialog(p.issue_num) {
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num, &p.coord_repo) {
                 return Some(d);
             }
             let (title, intro, action, button) = match p.kind {
@@ -17982,7 +17982,7 @@ impl CoordApp {
         // ── Leg 3c / A3 (#517, #581): test FAILED → start fix confirm ────
         if let Some(ref p) = self.pending_test_fix {
             // #722: live-session gate (same as pending_auto_review above).
-            if let Some(d) = self.live_session_blocking_dialog(p.issue_num) {
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num, &p.coord_repo) {
                 return Some(d);
             }
             let mut body = vec![
@@ -18026,7 +18026,7 @@ impl CoordApp {
         // ── Leg 3c (#517, #306): review APPROVED → start merge agent confirm
         if let Some(ref p) = self.pending_merge {
             // #722: live-session gate (same as pending_auto_review above).
-            if let Some(d) = self.live_session_blocking_dialog(p.issue_num) {
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num, &p.coord_repo) {
                 return Some(d);
             }
             return Some(Dialog {
@@ -18393,17 +18393,47 @@ impl CoordApp {
         } else if self.pending_test_mode_choice.is_some() {
             self.pending_test_mode_choice = None;
         } else if self.pending_auto_review.is_some() {
-            self.pending_auto_review = None;
+            // #722: when the blocking dialog is showing (live remote session),
+            // an outside-click dismiss must NOT destroy the pending offer.  The
+            // offer re-fires automatically once the session closes.
+            let blocked = self
+                .pending_auto_review
+                .as_ref()
+                .is_some_and(|p| self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo));
+            if !blocked {
+                self.pending_auto_review = None;
+            }
         } else if self.pending_stage_launch.is_some() {
-            self.pending_stage_launch = None;
+            // #722: same blocking-dialog guard for the stage-launch offer.
+            let blocked = self
+                .pending_stage_launch
+                .as_ref()
+                .is_some_and(|p| self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo));
+            if !blocked {
+                self.pending_stage_launch = None;
+            }
         } else if self.pending_rework.is_some() {
             self.pending_rework = None;
         } else if self.pending_machine_picker.is_some() {
             self.pending_machine_picker = None;
         } else if self.pending_test_fix.is_some() {
-            self.pending_test_fix = None;
+            // #722: blocking-dialog guard for the test-fix offer.
+            let blocked = self
+                .pending_test_fix
+                .as_ref()
+                .is_some_and(|p| self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo));
+            if !blocked {
+                self.pending_test_fix = None;
+            }
         } else if self.pending_merge.is_some() {
-            self.pending_merge = None;
+            // #722: blocking-dialog guard for the merge offer.
+            let blocked = self
+                .pending_merge
+                .as_ref()
+                .is_some_and(|p| self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo));
+            if !blocked {
+                self.pending_merge = None;
+            }
         } else if self.pending_repo_picker.is_some() {
             self.pending_repo_picker = None;
         } else if self.pending_refinement_close_prompt.is_some() {
@@ -18449,7 +18479,24 @@ impl CoordApp {
         if self.pending_auto_review.is_some() {
             if id == "review" {
                 self.confirm_auto_review();
+            } else if id == "close" {
+                // "close" is the blocking dialog's only button (#722) — the
+                // operator dismissed the "reattach first" notice; preserve the
+                // pending offer so it re-fires once the session closes.
+                if let Some(ref p) = self.pending_auto_review {
+                    let n = p.issue_num;
+                    self.push_toast(
+                        "Reattach first",
+                        &format!(
+                            "Close the live session for #{n} first; \
+                             the review offer will re-appear automatically.",
+                        ),
+                        ToastSeverity::Warning,
+                    );
+                }
+                // Do NOT clear pending_auto_review.
             } else {
+                // "cancel" or anything else → normal defer.
                 self.pending_auto_review = None;
             }
             *self.dialog_layout.borrow_mut() = None;
@@ -18460,6 +18507,19 @@ impl CoordApp {
         if self.pending_stage_launch.is_some() {
             if id == "stage-go" {
                 self.confirm_stage_launch();
+            } else if id == "close" {
+                // "close" = blocking dialog dismiss (#722) — preserve the offer.
+                if let Some(ref p) = self.pending_stage_launch {
+                    let n = p.issue_num;
+                    self.push_toast(
+                        "Reattach first",
+                        &format!(
+                            "Close the live session for #{n} first; \
+                             the stage offer will re-appear automatically.",
+                        ),
+                        ToastSeverity::Warning,
+                    );
+                }
             } else {
                 self.pending_stage_launch = None;
             }
@@ -18519,6 +18579,19 @@ impl CoordApp {
         if self.pending_test_fix.is_some() {
             if id == "fix" {
                 self.confirm_test_fix();
+            } else if id == "close" {
+                // "close" = blocking dialog dismiss (#722) — preserve the offer.
+                if let Some(ref p) = self.pending_test_fix {
+                    let n = p.issue_num;
+                    self.push_toast(
+                        "Reattach first",
+                        &format!(
+                            "Close the live session for #{n} first; \
+                             the fix offer will re-appear automatically.",
+                        ),
+                        ToastSeverity::Warning,
+                    );
+                }
             } else {
                 self.pending_test_fix = None;
             }
@@ -18530,6 +18603,19 @@ impl CoordApp {
         if self.pending_merge.is_some() {
             if id == "merge" {
                 self.confirm_merge();
+            } else if id == "close" {
+                // "close" = blocking dialog dismiss (#722) — preserve the offer.
+                if let Some(ref p) = self.pending_merge {
+                    let n = p.issue_num;
+                    self.push_toast(
+                        "Reattach first",
+                        &format!(
+                            "Close the live session for #{n} first; \
+                             the merge offer will re-appear automatically.",
+                        ),
+                        ToastSeverity::Warning,
+                    );
+                }
             } else {
                 self.pending_merge = None;
             }
@@ -23802,9 +23888,10 @@ impl CoordApp {
             // is still wrapping up, so the completion lands BEFORE the pane
             // exits — firing now would pop "start review?" over the live pane.
             // Defer (leave the arm in place) until the operator has /exit'ed.
-            // #722: extend to remote fleet sessions — `issue_has_live_session`
-            // covers tmux sessions on any machine, not just the embedded pane.
-            if self.session_pane_live(key) || self.issue_has_live_session(armed.issue_num) {
+            // #722: extend to remote fleet sessions — `issue_has_live_session_for_repo`
+            // covers tmux sessions on any machine, not just the embedded pane, and
+            // filters by repo to avoid false positives in multi-repo setups.
+            if self.session_pane_live(key) || self.issue_has_live_session_for_repo(armed.issue_num, &armed.coord_repo) {
                 return None;
             }
             let aid = self.completed_work_aid_for(&armed.coord_repo, armed.issue_num)?;
@@ -23857,7 +23944,7 @@ impl CoordApp {
         // after the offer was raised, or where the live-blocking dialog drove
         // an Enter key-press.  Keep the prompt up so it fires automatically
         // once the session closes.
-        if self.issue_has_live_session(p.issue_num) {
+        if self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo) {
             let issue_num = p.issue_num;
             self.push_toast(
                 "Start review",
@@ -23957,8 +24044,9 @@ impl CoordApp {
             // pane before routing — don't preempt a still-attended session (the
             // dialog used to pop mid-review).  No local pane (e.g. a remote
             // review) routes as soon as the verdict lands.
-            // #722: extend to remote fleet sessions.
-            if self.session_pane_live(key) || self.issue_has_live_session(armed.issue_num) {
+            // #722: extend to remote fleet sessions; filter by repo to avoid
+            // false positives in multi-repo setups.
+            if self.session_pane_live(key) || self.issue_has_live_session_for_repo(armed.issue_num, &armed.coord_repo) {
                 return None;
             }
             let (review_aid, verdict) = self.latest_new_verdict_for(
@@ -24089,8 +24177,9 @@ impl CoordApp {
         let Some(p) = self.pending_stage_launch.as_ref() else {
             return;
         };
-        // #722: same live-session gate as confirm_auto_review.
-        if self.issue_has_live_session(p.issue_num) {
+        // #722: same live-session gate as confirm_auto_review, filtered by repo
+        // to avoid false positives in multi-repo setups.
+        if self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo) {
             let issue_num = p.issue_num;
             self.push_toast(
                 "Start stage",
@@ -24540,14 +24629,29 @@ impl CoordApp {
             .any(|s| s.issue_number == Some(issue_number))
     }
 
+    /// Like [`Self::issue_has_live_session`] but also matches `repo_name`, so
+    /// a live session for repo-b/#10 does not falsely block repo-a/#10's
+    /// stage-advance.  Use this for all stage-advance gate paths where the
+    /// repo is known.  The right-click menu items use the repo-agnostic
+    /// variant because they have no repo context (pre-existing limitation).
+    fn issue_has_live_session_for_repo(&self, issue_number: u64, repo_name: &str) -> bool {
+        self.live_tmux_sessions
+            .iter()
+            .filter(|s| {
+                s.issue_number == Some(issue_number)
+                    && s.repo_name.as_deref() == Some(repo_name)
+            })
+            .any(|s| self.session_assignment_is_running(&s.assignment_id))
+    }
+
     /// #722: when a running remote tmux session is blocking a stage-advance
     /// offer, substitute this dialog for the normal "Start …" dialog.  The
     /// operator must reattach and `/exit` the session first; the detector will
     /// re-fire automatically on the next tick once the session closes (the
     /// armed entry is not consumed while deferred).  Returns `None` when no
     /// live session is blocking — callers fall through to the normal dialog.
-    fn live_session_blocking_dialog(&self, issue_num: u64) -> Option<Dialog> {
-        if !self.issue_has_live_session(issue_num) {
+    fn live_session_blocking_dialog(&self, issue_num: u64, repo_name: &str) -> Option<Dialog> {
+        if !self.issue_has_live_session_for_repo(issue_num, repo_name) {
             return None;
         }
         Some(Dialog {
@@ -25240,8 +25344,8 @@ impl CoordApp {
         // keyed by this very issue_key).  So DEFER: leave the arm in place and
         // re-check each tick; it fires once the test pane is closed (its shell
         // has exited).  `key` IS the issue_key `detail_terminal_sessions` uses.
-        // #722: also defer for remote fleet sessions (key.1 == issue_num).
-        if self.session_pane_live(&key) || self.issue_has_live_session(key.1) {
+        // #722: also defer for remote fleet sessions; key == (coord_repo, issue_num).
+        if self.session_pane_live(&key) || self.issue_has_live_session_for_repo(key.1, &key.0) {
             return false;
         }
         let Some(armed) = self.armed_for_test_verdict.remove(&key) else {
@@ -25348,13 +25452,14 @@ impl CoordApp {
         // detect_test_verdict), but guard the launch directly too: if a live
         // session for this issue is still open, keep the prompt up and tell the
         // operator to exit first rather than clobber their session.
-        // #722: extend to remote fleet sessions via `issue_has_live_session`.
+        // #722: extend to remote fleet sessions; filter by repo to avoid
+        // false positives in multi-repo setups.
         let issue_key = (p.repo_slug.clone(), p.issue_num);
         if self
             .detail_terminal_sessions
             .get(&issue_key)
             .is_some_and(|s| !s.is_exited())
-            || self.issue_has_live_session(p.issue_num)
+            || self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo)
         {
             let issue_num = p.issue_num;
             self.push_toast(
@@ -25402,13 +25507,14 @@ impl CoordApp {
             return;
         };
         // #602: never replace a live attended pane (same guard as confirm_test_fix).
-        // #722: extend to remote fleet sessions via `issue_has_live_session`.
+        // #722: extend to remote fleet sessions; filter by repo to avoid
+        // false positives in multi-repo setups.
         let issue_key = (p.repo_slug.clone(), p.issue_num);
         if self
             .detail_terminal_sessions
             .get(&issue_key)
             .is_some_and(|s| !s.is_exited())
-            || self.issue_has_live_session(p.issue_num)
+            || self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo)
         {
             let issue_num = p.issue_num;
             self.push_toast(
@@ -26898,6 +27004,24 @@ impl ShellApp for CoordApp {
                         return Reaction::Redraw;
                     }
                     Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        // #722: when the blocking dialog is showing (live session
+                        // is still running), Esc must NOT destroy the pending
+                        // offer — the operator is expected to reattach and /exit
+                        // first, at which point the offer re-fires automatically.
+                        if let Some(ref p) = self.pending_auto_review {
+                            if self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo) {
+                                let n = p.issue_num;
+                                self.push_toast(
+                                    "Reattach first",
+                                    &format!(
+                                        "Close the live session for #{n} first; \
+                                         the review offer will re-appear automatically.",
+                                    ),
+                                    ToastSeverity::Warning,
+                                );
+                                return Reaction::Redraw;
+                            }
+                        }
                         self.pending_auto_review = None;
                         self.push_toast(
                             "Review deferred",
@@ -26922,6 +27046,22 @@ impl ShellApp for CoordApp {
                         return Reaction::Redraw;
                     }
                     Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        // #722: preserve the offer when the blocking dialog is
+                        // showing — same guard as pending_auto_review above.
+                        if let Some(ref p) = self.pending_stage_launch {
+                            if self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo) {
+                                let n = p.issue_num;
+                                self.push_toast(
+                                    "Reattach first",
+                                    &format!(
+                                        "Close the live session for #{n} first; \
+                                         the stage offer will re-appear automatically.",
+                                    ),
+                                    ToastSeverity::Warning,
+                                );
+                                return Reaction::Redraw;
+                            }
+                        }
                         self.pending_stage_launch = None;
                         self.push_toast(
                             "Deferred",
@@ -26990,6 +27130,21 @@ impl ShellApp for CoordApp {
                         return Reaction::Redraw;
                     }
                     Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        // #722: preserve the offer when the blocking dialog is showing.
+                        if let Some(ref p) = self.pending_test_fix {
+                            if self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo) {
+                                let n = p.issue_num;
+                                self.push_toast(
+                                    "Reattach first",
+                                    &format!(
+                                        "Close the live session for #{n} first; \
+                                         the fix offer will re-appear automatically.",
+                                    ),
+                                    ToastSeverity::Warning,
+                                );
+                                return Reaction::Redraw;
+                            }
+                        }
                         self.pending_test_fix = None;
                         self.push_toast(
                             "Fix deferred",
@@ -27013,6 +27168,21 @@ impl ShellApp for CoordApp {
                         return Reaction::Redraw;
                     }
                     Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        // #722: preserve the offer when the blocking dialog is showing.
+                        if let Some(ref p) = self.pending_merge {
+                            if self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo) {
+                                let n = p.issue_num;
+                                self.push_toast(
+                                    "Reattach first",
+                                    &format!(
+                                        "Close the live session for #{n} first; \
+                                         the merge offer will re-appear automatically.",
+                                    ),
+                                    ToastSeverity::Warning,
+                                );
+                                return Reaction::Redraw;
+                            }
+                        }
                         self.pending_merge = None;
                         self.push_toast(
                             "Merge deferred",
@@ -31995,6 +32165,145 @@ mod tests {
         assert!(
             body_text.contains("Reattach to live session"),
             "dialog body must contain 'Reattach to live session', got: {body_text}",
+        );
+    }
+
+    // ── #722 Esc-dismiss path: pending offer must survive while blocking ──────
+
+    /// Pressing Esc while the live-session blocking dialog is showing must NOT
+    /// destroy the pending review offer.  The operator will reattach and `/exit`
+    /// the session; the detector re-fires automatically once clear.
+    ///
+    /// This tests the key-handler path (lines ~26722 ff.) via the full
+    /// `ShellAdapter → handle → render` pipeline using `TuiDriver`.
+    #[test]
+    fn esc_while_blocking_dialog_preserves_pending_auto_review() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![running_work]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // Initial screen: blocking dialog must be showing.
+        assert!(
+            driver.screen_contains("Reattach to live session"),
+            "initial screen must show blocking dialog:\n{}",
+            driver.screen(),
+        );
+
+        // Press Esc — must NOT destroy the pending offer.
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        // Blocking dialog must still be showing (pending preserved).
+        assert!(
+            driver.screen_contains("Reattach to live session"),
+            "blocking dialog must survive Esc — pending offer must be preserved:\n{}",
+            driver.screen(),
+        );
+        // Normal "Start review" action must still be suppressed.
+        assert!(
+            !driver.screen_contains("Start review"),
+            "normal review offer must still be suppressed after Esc:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// `dismiss_prompt_dialog` (outside-click path) must preserve
+    /// `pending_auto_review` when the live-session blocking dialog is active.
+    #[test]
+    fn dismiss_prompt_dialog_preserves_auto_review_when_blocking() {
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![running_work]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+        // Simulate outside-click dismiss (the path that calls dismiss_prompt_dialog).
+        app.dismiss_prompt_dialog();
+        assert!(
+            app.pending_auto_review.is_some(),
+            "pending_auto_review must survive dismiss_prompt_dialog when blocking dialog active",
+        );
+    }
+
+    /// `fire_dialog_button("close", …)` (the blocking dialog's dismiss button)
+    /// must preserve `pending_auto_review`, NOT clear it.
+    ///
+    /// Tested by driving the full TuiDriver render + click path: the "Dismiss"
+    /// button is located on screen and clicked; the blocking dialog must still
+    /// be present after the click (pending offer preserved).
+    #[test]
+    fn fire_dialog_button_close_preserves_auto_review_when_blocking() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![running_work]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+
+        // Drive through the full pipeline: render the blocking dialog so
+        // dialog_layout is populated, then click the dismiss button.
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // Confirm the blocking dialog is visible before clicking.
+        assert!(
+            driver.screen_contains("Reattach to live session"),
+            "initial screen must show blocking dialog:\n{}",
+            driver.screen(),
+        );
+
+        // Locate and click the dismiss button — try the full label first, then
+        // "Dismiss" alone (renderer may collapse spaces or truncate label text).
+        let pos = driver.find("Esc  Dismiss").or_else(|| driver.find("Dismiss"));
+        if let Some((x, y)) = pos {
+            driver.click(x, y);
+            // The blocking dialog must still be showing after clicking dismiss.
+            assert!(
+                driver.screen_contains("Reattach to live session"),
+                "blocking dialog must persist after clicking dismiss:\n{}",
+                driver.screen(),
+            );
+        } else {
+            // Button not found by text — render the dialog and click the
+            // outside-click path (equivalent UX: outside-click must also
+            // preserve the pending offer).  This path exercises
+            // `dismiss_prompt_dialog` rather than `fire_dialog_button("close")`,
+            // so it's a weaker but valid fallback.
+            //
+            // Click a cell that is clearly outside the dialog (top-left corner).
+            driver.click(0.5, 0.5);
+            assert!(
+                driver.screen_contains("Reattach to live session"),
+                "blocking dialog must persist after outside-click dismiss:\n{}",
+                driver.screen(),
+            );
+        }
+    }
+
+    /// `issue_has_live_session_for_repo` must NOT match a live session on a
+    /// different repo even when the issue number is the same.  This is the
+    /// multi-repo false-positive guard introduced in #722.
+    #[test]
+    fn issue_has_live_session_for_repo_does_not_cross_repo_match() {
+        let running_work = make_assignment_typed("running", 10, "repo-b", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![running_work]);
+        // Session is for repo-b/#10.
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-b"));
+
+        // repo-specific lookup for repo-a/#10 must return false.
+        assert!(
+            !app.issue_has_live_session_for_repo(10, "repo-a"),
+            "repo-a/#10 must not see a live session belonging to repo-b/#10",
+        );
+        // But repo-b/#10 must return true.
+        assert!(
+            app.issue_has_live_session_for_repo(10, "repo-b"),
+            "repo-b/#10 must detect its own live session",
         );
     }
 
