@@ -1045,3 +1045,215 @@ class TestRemoteStashArtifactsPathExpansion:
             f"artifact not stashed; expandvars probably did not resolve $HOME.\n"
             f"worktree_home_form={worktree_home_form!r}, resolved wt={wt}"
         )
+
+
+# ── #560: remote interactive setup-failure detection ─────────────────────────
+
+
+def _seed_fix_board(work_id: str, review_id: str, branch: str) -> None:
+    """Seed a completed work + request-changes review for `--fix-of` tests."""
+    from coord.models import Assignment, Board, Repo
+    from coord.state import save_board
+
+    work = Assignment(
+        machine_name="precision",
+        repo_name="api",
+        issue_number=1,
+        issue_title="Fix bug",
+        assignment_id=work_id,
+        status="done",
+        branch=branch,
+        type="work",
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    review = Assignment(
+        machine_name="precision",
+        repo_name="api",
+        issue_number=1,
+        issue_title="[review] Fix bug",
+        assignment_id=review_id,
+        status="done",
+        branch=branch,
+        type="review",
+        review_of_assignment_id=work_id,
+        review_verdict="request-changes",
+        dispatched_at=2.0,
+        finished_at=3.0,
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[],
+        active=[],
+        completed=[work, review],
+    )
+    save_board(board)
+
+
+def _make_finalize_result(
+    *,
+    push_ok: bool = False,
+    push_error: str | None = None,
+    already_recorded: bool = False,
+) -> Any:
+    """Build a mock InteractiveFinalizeResult for finalize_remote_interactive_exit."""
+    from coord.interactive import InteractiveFinalizeResult
+    return InteractiveFinalizeResult(
+        terminal_status="failed" if not push_ok else "done",
+        commits_ahead=None,
+        push_ok=push_ok,
+        push_error=push_error,
+        already_recorded=already_recorded,
+    )
+
+
+class TestRemoteFixWorktreeCollision:
+    """#560: the remote interactive launcher must detect setup failures (worktree
+    never created) and print an actionable error instead of the misleading
+    'can't find session' / 'fix commits preserved' output."""
+
+    def test_setup_failure_with_live_holder_session(
+        self, remote_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """When git worktree add fails because a live session holds the branch,
+        the launcher must surface the live session and suggest reattach — NOT
+        print 'commits preserved' for a directory that never existed."""
+        _seed_fix_board("work-c1", "rev-c1", "issue-1-fix-bug")
+        holder_path = "/home/john/.coord/worktrees/971a1947ad91"
+
+        # _tmux_alive is called twice: first for the new session (dead), then
+        # for the holder session (live).
+        alive_calls: list[str] = []
+        def _alive(sname: str, **_kw: Any) -> bool:
+            alive_calls.append(sname)
+            # 2nd call: the holder session — it IS alive.
+            return len(alive_calls) > 1
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux", return_value=1), \
+             patch("coord.interactive.tmux_session_alive", side_effect=_alive), \
+             patch("coord.interactive.remote_worktree_exists", return_value=False), \
+             patch("coord.interactive.find_remote_branch_holder",
+                   return_value=holder_path), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=_make_finalize_result(
+                       push_ok=False,
+                       push_error="zsh:cd:1: no such file or directory: ..."
+                   )):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_config_file),
+                 "--interactive", "--fix-of", "rev-c1"],
+            )
+
+        out = result.output
+        # Must describe the collision.
+        assert "already checked out" in out, out
+        assert holder_path in out, out
+        # Must name the live tmux session.
+        assert "971a1947ad91" in out, out
+        assert "reattach" in out, out
+        # Must NOT print the misleading "commits preserved" message.
+        assert "commits preserved" not in out, out
+        # Must NOT print "claude exited" (claude never ran).
+        assert "claude exited" not in out, out
+
+    def test_setup_failure_with_stale_holder(
+        self, remote_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """When a stale worktree (no live session) holds the branch, the launcher
+        must print the worktree path and a prune command — NOT 'commits preserved'."""
+        _seed_fix_board("work-c2", "rev-c2", "issue-1-fix-bug")
+        holder_path = "/home/john/.coord/worktrees/deadbeefcafe"
+
+        # Both _tmux_alive calls return False: main session dead, holder also dead.
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux", return_value=1), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.remote_worktree_exists", return_value=False), \
+             patch("coord.interactive.find_remote_branch_holder",
+                   return_value=holder_path), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=_make_finalize_result(
+                       push_ok=False,
+                       push_error="no such file or directory: ..."
+                   )):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_config_file),
+                 "--interactive", "--fix-of", "rev-c2"],
+            )
+
+        out = result.output
+        assert "already checked out" in out, out
+        assert holder_path in out, out
+        # Stale → must mention pruning, not reattach.
+        assert "prune" in out or "worktree remove" in out, out
+        assert "commits preserved" not in out, out
+        assert "claude exited" not in out, out
+
+    def test_setup_failure_no_holder_found(
+        self, remote_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """When git worktree list finds nothing (unknown reason for failure),
+        a generic 'setup failed' message is printed — NOT 'commits preserved'."""
+        _seed_fix_board("work-c3", "rev-c3", "issue-1-fix-bug")
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux", return_value=1), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.remote_worktree_exists", return_value=False), \
+             patch("coord.interactive.find_remote_branch_holder", return_value=None), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=_make_finalize_result(
+                       push_ok=False,
+                       push_error="no such file or directory: ..."
+                   )):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_config_file),
+                 "--interactive", "--fix-of", "rev-c3"],
+            )
+
+        out = result.output
+        assert "setup failed" in out, out
+        assert "commits preserved" not in out, out
+        assert "claude exited" not in out, out
+
+    def test_worker_failure_worktree_exists_still_prints_preserved(
+        self, remote_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """When the worktree WAS created (setup succeeded) but the worker exited
+        non-zero and the push failed, 'commits preserved' MUST still be printed —
+        the commits are actually there and need manual recovery."""
+        _seed_fix_board("work-c4", "rev-c4", "issue-1-fix-bug")
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux", return_value=1), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.remote_worktree_exists", return_value=True), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=_make_finalize_result(
+                       push_ok=False,
+                       push_error="push rejected: non-fast-forward"
+                   )):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_config_file),
+                 "--interactive", "--fix-of", "rev-c4"],
+            )
+
+        out = result.output
+        # Worker ran, push failed — commits ARE preserved.
+        assert "commits preserved" in out, out
+        assert "push rejected" in out or "remote push failed" in out, out
+        # Must NOT print the "setup failed" error.
+        assert "setup failed" not in out, out

@@ -1780,6 +1780,98 @@ def _remote_worktree_remove(
     return "__WT_DONE" in (result.stdout or "")
 
 
+def remote_worktree_exists(
+    ssh_target: str,
+    remote_worktree_sh: str,
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """Return ``True`` if *remote_worktree_sh* exists as a directory on *ssh_target*.
+
+    Used by the remote interactive launch paths (#560) to distinguish a setup
+    failure (git worktree add was refused — directory never created) from a
+    worker failure (the directory was created but ``claude`` exited non-zero).
+
+    ``remote_worktree_sh`` is a ``$HOME``-form path (e.g.
+    ``$HOME/.coord/worktrees/<id>``); the remote shell expands ``$HOME``
+    correctly because the argument is passed as a single unquoted token inside
+    a double-quoted string.
+
+    Returns ``True`` on SSH/timeout errors — safe fallback that prevents false
+    "setup failed" diagnoses when connectivity is the real problem.
+    """
+    # We intentionally pass remote_worktree_sh un-quoted so $HOME expands.
+    # coord always generates this path from a hex assignment_id, so there is
+    # no injection risk.
+    remote_cmd = f"test -d {remote_worktree_sh} && echo __WT_EXISTS || echo __WT_MISSING"
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return True  # assume exists; prevents false "setup failed" on SSH error
+    return "__WT_EXISTS" in (result.stdout or "")
+
+
+def find_remote_branch_holder(
+    ssh_target: str,
+    remote_repo_sh: str,
+    branch: str,
+    *,
+    timeout: float = 15.0,
+) -> str | None:
+    """Return the worktree path that has *branch* checked out on *ssh_target*.
+
+    Runs ``git worktree prune`` then ``git worktree list --porcelain`` in
+    *remote_repo_sh*; parses the output to find an entry whose ``branch``
+    field matches ``refs/heads/<branch>``.  Returns the worktree path string
+    (as reported by git — a fully expanded absolute path, not a
+    ``$HOME``-style shell path) or ``None`` if the branch is not locked.
+
+    Used by the interactive launch paths (#560) to produce an actionable
+    "branch already checked out at <path>" error instead of the raw git
+    error surfaced via the tmux session exit.
+
+    ``remote_repo_sh`` is a ``$HOME``-form path passed un-quoted so the
+    remote shell expands ``$HOME``.
+    """
+    remote_cmd = (
+        f"cd {remote_repo_sh} 2>/dev/null || exit 0; "
+        f"git worktree prune 2>/dev/null; "
+        f"git worktree list --porcelain 2>/dev/null"
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    # Parse porcelain output.  Each worktree block is separated by a blank
+    # line; within a block the fields appear in order: worktree, HEAD,
+    # branch (or "detached" / "bare").
+    current_path: str | None = None
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("worktree "):
+            current_path = line[len("worktree "):].strip()
+        elif line.startswith("branch ") and current_path is not None:
+            branch_ref = line[len("branch "):].strip()
+            if branch_ref == f"refs/heads/{branch}":
+                return current_path
+        elif not line:
+            current_path = None  # blank line: end of a worktree block
+    return None
+
+
 def _remote_stash_artifacts(
     ssh_target: str,
     remote_worktree_sh: str,

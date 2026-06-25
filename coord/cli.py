@@ -2426,9 +2426,11 @@ def assign(
         from coord.interactive import (  # noqa: PLC0415
             TmuxHost,
             _launch_via_tmux as _tmux_launch,
+            find_remote_branch_holder as _find_branch_holder,
             finalize_interactive_exit,
             finalize_remote_interactive_exit,
             launch_human_attended_interactive,
+            remote_worktree_exists as _remote_wt_exists,
             tmux_available as _tmux_avail,
             tmux_session_alive as _tmux_alive,
             tmux_session_name as _tmux_name,
@@ -3814,8 +3816,6 @@ def assign(
                 )
                 sys.exit(1)
             exit_code = _rc
-            if exit_code != 0:
-                click.echo(f"  claude exited with status {exit_code}", err=True)
 
             if _tmux_alive(_sname, host=_tmux_host):
                 click.echo(
@@ -3827,8 +3827,60 @@ def assign(
                 )
                 sys.exit(0)
 
+            # ── #560: detect setup failures (worktree never created) ──────
+            # If the session exited non-zero AND the remote worktree directory
+            # was never created, the failure is a setup error — most commonly
+            # git worktree add refused because the branch is already checked
+            # out in another worktree (a leftover interactive session or
+            # orphaned non-interactive worktree).  Print an actionable message
+            # and skip the misleading "commits preserved" noise.  The finalize
+            # call below still records the failure on the board so the pipeline
+            # shows "failed" rather than leaving the row as "running".
+            _wt_setup_ok: bool = True
+            if exit_code != 0:
+                if not _remote_wt_exists(machine_obj.host, _remote_wt):
+                    _wt_setup_ok = False
+                    _holder = _find_branch_holder(
+                        machine_obj.host, _rp_sh, work.branch,
+                    )
+                    if _holder:
+                        _holder_aid = Path(_holder).name
+                        _holder_sname = f"coord-{_holder_aid}"
+                        _holder_live = _tmux_alive(_holder_sname, host=_tmux_host)
+                        _err_lines = [
+                            f"  error: setup failed — branch {work.branch!r} is "
+                            f"already checked out at {_holder} on {machine_obj.host}.",
+                        ]
+                        if _holder_live:
+                            _err_lines += [
+                                f"  active tmux session: {_holder_sname}",
+                                f"  reattach:  coord reattach {_holder_aid}",
+                                "  exit the session first, then retry this fix.",
+                            ]
+                        else:
+                            _err_lines += [
+                                "  stale worktree — prune it first:",
+                                f"    ssh {machine_obj.host} 'cd {_rp_sh}"
+                                f" && git worktree remove --force"
+                                f" {_shlex_fx.quote(_holder)}'",
+                            ]
+                        click.echo("\n".join(_err_lines), err=True)
+                    else:
+                        click.echo(
+                            f"  error: setup failed — the remote worktree was "
+                            f"never created (git worktree add refused on "
+                            f"{machine_obj.host}).",
+                            err=True,
+                        )
+                else:
+                    click.echo(
+                        f"  claude exited with status {exit_code}", err=True,
+                    )
+
             # Remote finalize (#486d): push the fix commits to origin/<branch>,
-            # record the completion, and clean up the remote worktree.
+            # record the completion, and clean up the remote worktree.  Safe
+            # even when the worktree was never created — _remote_push_and_count
+            # detects the missing directory (exit 91) and marks push_ok=False.
             try:
                 _fr = finalize_remote_interactive_exit(
                     assignment_id=assignment_id,
@@ -3855,7 +3907,9 @@ def assign(
                         f"  remote backstop: status={_fr.terminal_status} "
                         f"commits_ahead={_fr.commits_ahead} pushed={_fr.push_ok}"
                     )
-                    if not _fr.push_ok:
+                    if not _fr.push_ok and _wt_setup_ok:
+                        # Worker ran but push failed — commits ARE preserved in
+                        # the worktree (which was successfully created).
                         click.echo(
                             f"  warning: remote push failed: {_fr.push_error}",
                             err=True,
@@ -3865,6 +3919,8 @@ def assign(
                             f"{machine_obj.host} (worktree NOT removed)",
                             err=True,
                         )
+                    # else _wt_setup_ok is False: setup never happened; error
+                    # already printed above — no "commits preserved" noise.
             except Exception as exc:  # noqa: BLE001 — best-effort backstop
                 click.echo(
                     f"  warning: remote backstop failed to record fix exit: {exc}",
@@ -4162,8 +4218,6 @@ def assign(
                 )
                 sys.exit(1)
             exit_code = _rc
-            if exit_code != 0:
-                click.echo(f"  claude exited with status {exit_code}", err=True)
 
             if _tmux_alive(_sname, host=_tmux_host):
                 click.echo(
@@ -4174,6 +4228,48 @@ def assign(
                     "the coordinator finalizes)"
                 )
                 sys.exit(0)
+
+            # ── #560: detect setup failures (worktree never created) ──────
+            _wt_setup_ok_rw: bool = True
+            if exit_code != 0:
+                if not _remote_wt_exists(machine_obj.host, _remote_wt):
+                    _wt_setup_ok_rw = False
+                    _holder = _find_branch_holder(
+                        machine_obj.host, _rp_sh, rw_branch,
+                    )
+                    if _holder:
+                        _holder_aid = Path(_holder).name
+                        _holder_sname = f"coord-{_holder_aid}"
+                        _holder_live = _tmux_alive(_holder_sname, host=_tmux_host)
+                        _err_lines = [
+                            f"  error: setup failed — branch {rw_branch!r} is "
+                            f"already checked out at {_holder} on {machine_obj.host}.",
+                        ]
+                        if _holder_live:
+                            _err_lines += [
+                                f"  active tmux session: {_holder_sname}",
+                                f"  reattach:  coord reattach {_holder_aid}",
+                                "  exit the session first, then retry this rework.",
+                            ]
+                        else:
+                            _err_lines += [
+                                "  stale worktree — prune it first:",
+                                f"    ssh {machine_obj.host} 'cd {_rp_sh}"
+                                f" && git worktree remove --force"
+                                f" {_shlex_rw.quote(_holder)}'",
+                            ]
+                        click.echo("\n".join(_err_lines), err=True)
+                    else:
+                        click.echo(
+                            f"  error: setup failed — the remote worktree was "
+                            f"never created (git worktree add refused on "
+                            f"{machine_obj.host}).",
+                            err=True,
+                        )
+                else:
+                    click.echo(
+                        f"  claude exited with status {exit_code}", err=True,
+                    )
 
             # Remote finalize: push the rework commits to origin/<branch>,
             # record the completion, and clean up the remote worktree.
@@ -4203,7 +4299,7 @@ def assign(
                         f"  remote backstop: status={_fr.terminal_status} "
                         f"commits_ahead={_fr.commits_ahead} pushed={_fr.push_ok}"
                     )
-                    if not _fr.push_ok:
+                    if not _fr.push_ok and _wt_setup_ok_rw:
                         click.echo(
                             f"  warning: remote push failed: {_fr.push_error}",
                             err=True,
@@ -4213,6 +4309,8 @@ def assign(
                             f"{machine_obj.host} (worktree NOT removed)",
                             err=True,
                         )
+                    # else _wt_setup_ok_rw is False: setup never happened; error
+                    # already printed above — no "commits preserved" noise.
             except Exception as exc:  # noqa: BLE001 — best-effort backstop
                 click.echo(
                     f"  warning: remote backstop failed to record rework exit: {exc}",
@@ -4881,8 +4979,6 @@ def assign(
                 )
                 sys.exit(1)
             exit_code = _rc
-            if exit_code != 0:
-                click.echo(f"  claude exited with status {exit_code}", err=True)
 
             # Check if the remote session is still alive (user detached).
             if _tmux_alive(_sname, host=_tmux_host):
@@ -4893,6 +4989,48 @@ def assign(
                     "coordinator finalizes)"
                 )
                 sys.exit(0)
+
+            # ── #560: detect setup failures (worktree never created) ──────
+            _wt_setup_ok_work: bool = True
+            if exit_code != 0:
+                if not _remote_wt_exists(machine_obj.host, _remote_wt):
+                    _wt_setup_ok_work = False
+                    _holder = _find_branch_holder(
+                        machine_obj.host, _rp_sh, _remote_branch,
+                    )
+                    if _holder:
+                        _holder_aid = Path(_holder).name
+                        _holder_sname = f"coord-{_holder_aid}"
+                        _holder_live = _tmux_alive(_holder_sname, host=_tmux_host)
+                        _err_lines = [
+                            f"  error: setup failed — branch {_remote_branch!r} is "
+                            f"already checked out at {_holder} on {machine_obj.host}.",
+                        ]
+                        if _holder_live:
+                            _err_lines += [
+                                f"  active tmux session: {_holder_sname}",
+                                f"  reattach:  coord reattach {_holder_aid}",
+                                "  exit the session first, then retry this work.",
+                            ]
+                        else:
+                            _err_lines += [
+                                "  stale worktree — prune it first:",
+                                f"    ssh {machine_obj.host} 'cd {_rp_sh}"
+                                f" && git worktree remove --force"
+                                f" {_shlex.quote(_holder)}'",
+                            ]
+                        click.echo("\n".join(_err_lines), err=True)
+                    else:
+                        click.echo(
+                            f"  error: setup failed — the remote worktree was "
+                            f"never created (git worktree add refused on "
+                            f"{machine_obj.host}).",
+                            err=True,
+                        )
+                else:
+                    click.echo(
+                        f"  claude exited with status {exit_code}", err=True,
+                    )
 
             # Remote finalize (#486d): push the work commits to origin/<branch>,
             # record the completion (so the pipeline advances + a re-review can
@@ -4925,7 +5063,7 @@ def assign(
                         f"  remote backstop: status={_fr.terminal_status} "
                         f"commits_ahead={_fr.commits_ahead} pushed={_fr.push_ok}"
                     )
-                    if not _fr.push_ok:
+                    if not _fr.push_ok and _wt_setup_ok_work:
                         click.echo(
                             f"  warning: remote push failed: {_fr.push_error}",
                             err=True,
@@ -4935,6 +5073,8 @@ def assign(
                             f"{machine_obj.host} (worktree NOT removed)",
                             err=True,
                         )
+                    # else _wt_setup_ok_work is False: setup never happened; error
+                    # already printed above — no "commits preserved" noise.
             except Exception as exc:  # noqa: BLE001 — best-effort backstop
                 click.echo(
                     f"  warning: remote backstop failed to record work exit: {exc}",
