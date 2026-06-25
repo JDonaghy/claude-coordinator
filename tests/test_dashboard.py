@@ -6,12 +6,32 @@ import asyncio
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
 from starlette.testclient import TestClient
 
 from coord.config import Config
 from coord.dashboard.server import build_app
 from coord.models import Assignment, Board, Machine, Proposal, Repo
 from coord.state import save_board
+
+
+@pytest.fixture(autouse=True)
+def _no_spa_dist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the legacy dashboard in every test in this module.
+
+    server.py activates SPA serving at ``/`` when
+    ``coord/dashboard/webapp/dist/`` exists (created by ``npm run build``).
+    Without this patch, tests that assert on legacy dashboard HTML fail
+    after the React app has been built because GET ``/`` returns the SPA
+    shell (``<div id='root'>``) instead of the legacy ``index.html``.
+
+    The server logic is correct — the test suite just needs isolation from
+    the real filesystem state.
+    """
+    monkeypatch.setattr(
+        "coord.dashboard.server.WEBAPP_DIST",
+        Path("/nonexistent/dist"),
+    )
 
 
 def _config() -> Config:
