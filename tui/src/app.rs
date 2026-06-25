@@ -17074,13 +17074,38 @@ impl CoordApp {
             // every mode would attach to the same session, and you can't start a
             // review/fix while the work session is still live.  Offer one clear
             // "Reattach" item (flat, no submenu) and hide the Start variants.
-            let has_live = issue_number.map(|n| self.issue_has_live_session(n)).unwrap_or(false);
-            if has_live {
+            //
+            // #727: extend to zombie sessions — a tmux session that is still
+            // alive (shown as In-progress:Live by `issue_session_is_live`) but
+            // whose board assignment has already been finalised (`done`/`failed`)
+            // or is absent.  The zombie case adds "Reattach" alongside the Start
+            // actions rather than hard-locking the menu, so the operator can
+            // still access Kill/Diagnose/Drop-to-backlog (#676 guard).
+            let has_running = issue_number
+                .map(|n| self.issue_has_live_session(n))
+                .unwrap_or(false);
+            let has_zombie = !has_running
+                && issue_number
+                    .map(|n| self.issue_has_any_discovered_session(n))
+                    .unwrap_or(false);
+            if has_running {
+                // Running session — collapse the entire launcher block to a
+                // single Reattach item; everything else is unreachable anyway.
                 items.push(ContextMenuItem::action(
                     "reattach-live-session",
                     "Reattach to live session",
                 ));
             } else {
+                // Zombie session — offer Reattach alongside Start launchers so
+                // the operator can reach both the still-alive tmux session AND
+                // the normal pipeline actions.
+                if has_zombie {
+                    items.push(ContextMenuItem::action(
+                        "reattach-live-session",
+                        "Reattach to live session",
+                    ));
+                }
+
                 // ── Start (interactive) submenu ───────────────────────────
                 let mut interactive_children: Vec<ContextMenuItem> = Vec::new();
                 interactive_children.push(ContextMenuItem::action(
@@ -24298,6 +24323,38 @@ impl CoordApp {
             .find(|aid| self.session_assignment_is_running(aid))
     }
 
+    /// Assignment id of **any** discovered tmux session for the selected issue
+    /// (matched precisely by repo + issue number), preferring a running session
+    /// over a zombie (finalized-assignment-but-live-tmux) session.
+    ///
+    /// Used by the dedicated "Reattach to live session" menu action for the
+    /// zombie case (#727): when the board assignment is already `done`/`failed`
+    /// but the tmux session is still alive (the human left without finalising),
+    /// the classifier shows the row as **In-progress:Live** and the right-click
+    /// menu must offer Reattach.  `selected_issue_live_session_id` returns `None`
+    /// in that case (running-only), so this wider lookup is the correct resolver.
+    ///
+    /// Falls through to `selected_issue_live_session_id` when a running session
+    /// exists, so the caller never needs to choose between the two.
+    fn selected_issue_any_session_id(&self) -> Option<String> {
+        let (repo, issue_key) = self.selected_issue_repo_and_key()?;
+        let issue_num = issue_key.1;
+        let matching: Vec<_> = self
+            .live_tmux_sessions
+            .iter()
+            .filter(|s| {
+                s.issue_number == Some(issue_num)
+                    && s.repo_name.as_deref() == Some(repo.as_str())
+            })
+            .collect();
+        // Prefer a running session (same semantics as selected_issue_live_session_id).
+        matching
+            .iter()
+            .find(|s| self.session_assignment_is_running(&s.assignment_id))
+            .or_else(|| matching.first())
+            .map(|s| s.assignment_id.clone())
+    }
+
     /// True when the session identified by `assignment_id` is still
     /// *reattachable* — the board has its assignment as `running`.  A
     /// finalized assignment (done/merged/advisory/failed) means the tmux
@@ -24367,6 +24424,22 @@ impl CoordApp {
             .iter()
             .filter(|s| s.issue_number == Some(issue_number))
             .any(|s| self.session_assignment_is_running(&s.assignment_id))
+    }
+
+    /// Whether `issue_number` has *any* discovered tmux session — regardless of
+    /// board assignment status.  Used to detect "zombie" sessions: a tmux session
+    /// that is still alive (and classified as **In-progress:Live** by
+    /// `issue_session_is_live`) even though the board assignment has already
+    /// been finalized (`done`/`failed`) or is absent.
+    ///
+    /// Mirrors the liveness predicate used by the **Live classifier**
+    /// (`issue_session_is_live`), so the menu gate and the classifier can never
+    /// disagree about whether a session exists.  The reattach *target* is resolved
+    /// repo-precisely by [`Self::selected_issue_any_session_id`].
+    fn issue_has_any_discovered_session(&self, issue_number: u64) -> bool {
+        self.live_tmux_sessions
+            .iter()
+            .any(|s| s.issue_number == Some(issue_number))
     }
 
     /// #628 (scope A pt.2): count live interactive sessions on a machine, so the
@@ -24936,7 +25009,11 @@ impl CoordApp {
     }
 
     fn reattach_to_selected_issue_live_session(&mut self) {
-        let Some(aid) = self.selected_issue_live_session_id() else {
+        // #727: use the wider resolver so zombie sessions (tmux alive but board
+        // assignment already done/failed) are also reachable from the menu.
+        // `selected_issue_any_session_id` prefers a running session when one
+        // exists, falling back to any discovered session (the zombie case).
+        let Some(aid) = self.selected_issue_any_session_id() else {
             self.pipeline_status =
                 Some(("No live session to reattach to.".to_string(), Instant::now()));
             return;
@@ -40394,11 +40471,19 @@ mod tests {
     }
 
     #[test]
-    fn finalized_session_is_not_reattachable() {
-        // #514: a live_tmux_sessions entry left over after a session finalized
-        // (board assignment status != running) must NOT be treated as
-        // reattachable — else a stale entry drives a dead `coord reattach`
-        // ("session not alive") when the user advances to review.
+    fn finalized_session_running_gate_still_blocks_running_resolver() {
+        // #514: `selected_issue_live_session_id` must still return None when
+        // the board assignment is finalized (done) — the running-only resolver
+        // is preserved so the type-gated Start launchers never reattach into a
+        // stale/dead session.
+        //
+        // #727: however the menu now DOES offer "Reattach to live session" for
+        // this zombie case (done assignment but live_tmux_sessions entry present),
+        // because the In-progress:Live classifier already shows the row as Live —
+        // the menu and the classifier must not disagree.  The reattach action
+        // itself resolves the aid via the wider `selected_issue_any_session_id`,
+        // and `coord reattach <aid>` fails gracefully if the session turns out to
+        // be stale ("session not alive").
         let mut app = make_app_default();
         app.pipeline_issues.push(PipelineIssue {
             number: 514,
@@ -40411,7 +40496,7 @@ mod tests {
             is_closed: false,
         });
         app.pipeline_sel = Some(0);
-        // Work DONE (finalized) + a stale live-session entry pointing at it.
+        // Work DONE (finalized) + a live-session entry pointing at it (zombie).
         app.data
             .assignments
             .push(make_assignment_typed("done", 514, "vimcode", Some("work")));
@@ -40423,18 +40508,223 @@ mod tests {
             machine: None,
         }];
 
+        // Running-only resolver returns None (assignment not running).
         assert!(
             app.selected_issue_live_session_id().is_none(),
-            "a finalized session must not be reattachable"
+            "running-only resolver must still return None for a finalized session"
         );
-        // The menu offers Start (interactive) + Start (automated) submenus, not Reattach.
+        // Wider resolver finds the zombie aid.
+        assert_eq!(
+            app.selected_issue_any_session_id().as_deref(),
+            Some("id-514-done"),
+            "#727: selected_issue_any_session_id must resolve a zombie session"
+        );
+        // #727: the menu offers BOTH Reattach (zombie) AND Start launchers.
         let items =
             app.context_menu_items_for_pipeline_row(Some(514), &PipelineRowLifecycle::InProgress);
         assert!(
-            items.iter().any(|i| i.label == "Start (interactive)"),
-            "#607: Start (interactive) parent must be present when no live session"
+            items.iter().any(|i| i.label == "Reattach to live session"),
+            "#727: zombie session must offer Reattach in the right-click menu"
         );
-        assert!(!items.iter().any(|i| i.label == "Reattach to live session"));
+        assert!(
+            items.iter().any(|i| i.label == "Start (interactive)"),
+            "#727: zombie menu must still include Start (interactive) — not hard-locked"
+        );
+        assert!(
+            items.iter().any(|i| i.label == "Start (automated)"),
+            "#727: zombie menu must still include Start (automated) — not hard-locked"
+        );
+    }
+
+    // ── #727: zombie-session reattach ────────────────────────────────────────
+
+    #[test]
+    fn zombie_session_menu_offers_reattach_alongside_start_actions() {
+        // #727: a "zombie" — tmux session alive, board assignment already
+        // done/failed — must appear as reattachable in the right-click menu.
+        // The classifier (`issue_session_is_live`) already shows the row as
+        // In-progress:Live; the menu gate must not contradict it.
+        //
+        // Key constraint (#676): a zombie is NOT a running session, so the
+        // menu must NOT hard-lock to Reattach-only.  Both "Reattach" and the
+        // Start launchers must appear together.
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 42,
+            title: "zombie test".to_string(),
+            body: String::new(),
+            repo_slug: "acme/repo-a".to_string(),
+            coord_repo: Some("repo-a".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+        // Zombie: assignment is done, but a live tmux session is still discovered.
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 42, "repo-a", Some("work")));
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "zombie-aid".to_string(),
+            issue_number: Some(42),
+            repo_name: Some("repo-a".to_string()),
+            issue_title: None,
+            machine: None,
+        }];
+
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+        assert!(
+            items.iter().any(|i| i.label == "Reattach to live session"),
+            "#727: zombie must offer 'Reattach to live session' in the right-click menu"
+        );
+        assert!(
+            items.iter().any(|i| i.label == "Start (interactive)"),
+            "#727: zombie menu must include Start (interactive) alongside Reattach"
+        );
+        assert!(
+            items.iter().any(|i| i.label == "Start (automated)"),
+            "#727: zombie menu must include Start (automated) alongside Reattach"
+        );
+    }
+
+    #[test]
+    fn zombie_session_absent_from_board_offers_reattach() {
+        // #727: zombie session whose assignment_id is not on the board at all
+        // (assignment purged or from a previous coordinator session) must still
+        // offer Reattach — the `live_tmux_sessions` entry is the sole signal.
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 77,
+            title: "absent assignment".to_string(),
+            body: String::new(),
+            repo_slug: "acme/repo-a".to_string(),
+            coord_repo: Some("repo-a".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+        // No assignments at all, but a live tmux session is discovered.
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "orphan-aid".to_string(),
+            issue_number: Some(77),
+            repo_name: Some("repo-a".to_string()),
+            issue_title: None,
+            machine: None,
+        }];
+
+        assert!(
+            app.issue_has_any_discovered_session(77),
+            "#727: absent-from-board session must count as a discovered session"
+        );
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(77), &PipelineRowLifecycle::InProgress);
+        assert!(
+            items.iter().any(|i| i.label == "Reattach to live session"),
+            "#727: absent-from-board session must still offer Reattach"
+        );
+    }
+
+    #[test]
+    fn selected_issue_any_session_id_prefers_running_then_zombie() {
+        // #727: `selected_issue_any_session_id` must:
+        //   (a) return the RUNNING session when both running and zombie exist, and
+        //   (b) fall back to the zombie session when no running session exists.
+        //
+        // Note: `make_assignment_typed(status, issue, repo, _)` generates
+        // `id = "id-{issue}-{status}"`, so the matching live_tmux_sessions
+        // entries must use those same IDs.
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 200,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/repo-a".to_string(),
+            coord_repo: Some("repo-a".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+
+        // Only a zombie (done) session.  make_assignment_typed → id="id-200-done".
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 200, "repo-a", Some("work")));
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "id-200-done".to_string(),
+            issue_number: Some(200),
+            repo_name: Some("repo-a".to_string()),
+            issue_title: None,
+            machine: None,
+        }];
+        assert_eq!(
+            app.selected_issue_any_session_id().as_deref(),
+            Some("id-200-done"),
+            "#727: must resolve zombie session aid when no running session exists"
+        );
+
+        // Add a running session — must be preferred over the zombie.
+        // make_assignment_typed("running", 200, ...) → id="id-200-running".
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 200, "repo-a", Some("review")));
+        app.live_tmux_sessions.push(LiveTmuxSession {
+            assignment_id: "id-200-running".to_string(),
+            issue_number: Some(200),
+            repo_name: Some("repo-a".to_string()),
+            issue_title: None,
+            machine: None,
+        });
+        assert_eq!(
+            app.selected_issue_any_session_id().as_deref(),
+            Some("id-200-running"),
+            "#727: must prefer the running session when one exists alongside a zombie"
+        );
+    }
+
+    #[test]
+    fn reattach_action_with_zombie_session_resolves_aid() {
+        // #727: the dedicated "Reattach to live session" action must resolve
+        // the aid via `selected_issue_any_session_id` — not the running-only
+        // resolver — so it succeeds for zombie sessions.
+        let mut app = make_app_default();
+        app.pipeline_issues.push(PipelineIssue {
+            number: 300,
+            title: "zombie reattach".to_string(),
+            body: String::new(),
+            repo_slug: "acme/repo-a".to_string(),
+            coord_repo: Some("repo-a".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.pipeline_sel = Some(0);
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 300, "repo-a", Some("work")));
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "zombie-300".to_string(),
+            issue_number: Some(300),
+            repo_name: Some("repo-a".to_string()),
+            issue_title: None,
+            machine: None,
+        }];
+
+        let target = pipeline_target(Some(300));
+        let handled = app.dispatch_context_menu_action("reattach-live-session", &target);
+        assert!(handled, "reattach-live-session action must be handled");
+        // Must NOT have set the "No live session" error status.
+        let status = app
+            .pipeline_status
+            .as_ref()
+            .map(|(s, _)| s.clone())
+            .unwrap_or_default();
+        assert!(
+            !status.contains("No live session"),
+            "#727: reattach-live-session must not fail for a zombie session; got: {status:?}"
+        );
     }
 
     #[test]
@@ -47616,6 +47906,55 @@ mod tests {
         assert!(
             driver.screen_contains("Start (interactive)"),
             "the interactive launcher menu must render for a done work row:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #727 black-box (TuiDriver): a work row with `status=done` AND a
+    /// matching `live_tmux_sessions` entry (zombie — assignment finalised but
+    /// tmux still alive) must render **both** "Reattach to live session" AND
+    /// "Start (interactive)" in its right-click context menu.
+    ///
+    /// This drives the full `open_context_menu → render_frame` path against
+    /// the headless `TestBackend`, confirming the menu gate change
+    /// (`issue_has_any_discovered_session`) is reflected on screen.
+    #[test]
+    fn tuidriver_zombie_session_menu_shows_reattach_and_start() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        // Zombie: work is done (finalised), but the tmux session is still alive.
+        // `_work_assignment` / `_stage_assignment` already sets issue_number=42
+        // and repo="api", which matches make_pipeline_app_with_test_gate's issue.
+        let mut row = _work_assignment("w-zombie", 100.0, "done", None);
+        row.branch = Some("issue-42-zombie".to_string());
+        app.data.assignments.push(row);
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "w-zombie".to_string(),
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+            machine: None,
+        }];
+
+        // Open the context menu for the pipeline row (same state as right-click).
+        let opened = app.open_context_menu(Point::new(4.0, 4.0), pipeline_target(Some(42)));
+        assert!(opened, "context menu should open for the pipeline row");
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        assert!(
+            driver.screen_contains("Reattach to live session"),
+            "#727: zombie row must render 'Reattach to live session' in the context menu:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("Start (interactive)"),
+            "#727: zombie right-click menu must also render 'Start (interactive)' \
+             (not hard-locked to Reattach-only):\n{}",
             driver.screen()
         );
     }
