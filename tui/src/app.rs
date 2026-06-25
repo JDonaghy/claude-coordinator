@@ -17827,6 +17827,11 @@ impl CoordApp {
         // ── Test → Review confirm (Test precedes Review) ─────────────────
         // Raised by detect_test_verdict once the smoke test passes/skips.
         if let Some(ref p) = self.pending_auto_review {
+            // #722: a live remote session blocks the offer — direct the operator
+            // to reattach and exit first; the detector will re-fire once clear.
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num) {
+                return Some(d);
+            }
             return Some(Dialog {
                 id: WidgetId::new("dialog:auto-review"),
                 title: StyledText::plain("Test passed — start review?"),
@@ -17867,6 +17872,10 @@ impl CoordApp {
         // work/fix finishes (Test precedes Review).  No findings input — the
         // next stage needs no operator typing.
         if let Some(ref p) = self.pending_stage_launch {
+            // #722: live-session gate (same as pending_auto_review above).
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num) {
+                return Some(d);
+            }
             let (title, intro, action, button) = match p.kind {
                 StageLaunchKind::Fix => (
                     "Review requested changes — start a fix?",
@@ -17972,6 +17981,10 @@ impl CoordApp {
 
         // ── Leg 3c / A3 (#517, #581): test FAILED → start fix confirm ────
         if let Some(ref p) = self.pending_test_fix {
+            // #722: live-session gate (same as pending_auto_review above).
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num) {
+                return Some(d);
+            }
             let mut body = vec![
                 StyledText::plain(format!(
                     "The manual smoke test for {} #{} failed.",
@@ -18012,6 +18025,10 @@ impl CoordApp {
 
         // ── Leg 3c (#517, #306): review APPROVED → start merge agent confirm
         if let Some(ref p) = self.pending_merge {
+            // #722: live-session gate (same as pending_auto_review above).
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num) {
+                return Some(d);
+            }
             return Some(Dialog {
                 id: WidgetId::new("dialog:merge-agent"),
                 title: StyledText::plain("Review approved — start merge agent?"),
@@ -23785,7 +23802,9 @@ impl CoordApp {
             // is still wrapping up, so the completion lands BEFORE the pane
             // exits — firing now would pop "start review?" over the live pane.
             // Defer (leave the arm in place) until the operator has /exit'ed.
-            if self.session_pane_live(key) {
+            // #722: extend to remote fleet sessions — `issue_has_live_session`
+            // covers tmux sessions on any machine, not just the embedded pane.
+            if self.session_pane_live(key) || self.issue_has_live_session(armed.issue_num) {
                 return None;
             }
             let aid = self.completed_work_aid_for(&armed.coord_repo, armed.issue_num)?;
@@ -23829,6 +23848,28 @@ impl CoordApp {
     /// issue's pipeline row, open its Terminal tab, and launch the interactive
     /// review (reuses the manual `--review-of` launch path).
     fn confirm_auto_review(&mut self) {
+        let Some(p) = self.pending_auto_review.as_ref() else {
+            return;
+        };
+        // #722: belt-and-suspenders — never launch the next stage while a
+        // remote tmux session for this issue is still live.  The detector
+        // already defers, but this guards the race where a session appears
+        // after the offer was raised, or where the live-blocking dialog drove
+        // an Enter key-press.  Keep the prompt up so it fires automatically
+        // once the session closes.
+        if self.issue_has_live_session(p.issue_num) {
+            let issue_num = p.issue_num;
+            self.push_toast(
+                "Start review",
+                &format!(
+                    "A live session for #{issue_num} is still open — reattach \
+                     (right-click → Reattach to live session) and type /exit, \
+                     then the review offer will re-appear automatically.",
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        }
         let Some(p) = self.pending_auto_review.take() else {
             return;
         };
@@ -23916,7 +23957,8 @@ impl CoordApp {
             // pane before routing — don't preempt a still-attended session (the
             // dialog used to pop mid-review).  No local pane (e.g. a remote
             // review) routes as soon as the verdict lands.
-            if self.session_pane_live(key) {
+            // #722: extend to remote fleet sessions.
+            if self.session_pane_live(key) || self.issue_has_live_session(armed.issue_num) {
                 return None;
             }
             let (review_aid, verdict) = self.latest_new_verdict_for(
@@ -24044,6 +24086,22 @@ impl CoordApp {
     /// stage: a `--fix-of` (request-changes, findings already in the DB) or a
     /// `--smoke-of` testing session (approved).
     fn confirm_stage_launch(&mut self) {
+        let Some(p) = self.pending_stage_launch.as_ref() else {
+            return;
+        };
+        // #722: same live-session gate as confirm_auto_review.
+        if self.issue_has_live_session(p.issue_num) {
+            let issue_num = p.issue_num;
+            self.push_toast(
+                "Start stage",
+                &format!(
+                    "A live session for #{issue_num} is still open — reattach \
+                     (right-click → Reattach to live session) and type /exit first.",
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        }
         let Some(p) = self.pending_stage_launch.take() else {
             return;
         };
@@ -24480,6 +24538,45 @@ impl CoordApp {
         self.live_tmux_sessions
             .iter()
             .any(|s| s.issue_number == Some(issue_number))
+    }
+
+    /// #722: when a running remote tmux session is blocking a stage-advance
+    /// offer, substitute this dialog for the normal "Start …" dialog.  The
+    /// operator must reattach and `/exit` the session first; the detector will
+    /// re-fire automatically on the next tick once the session closes (the
+    /// armed entry is not consumed while deferred).  Returns `None` when no
+    /// live session is blocking — callers fall through to the normal dialog.
+    fn live_session_blocking_dialog(&self, issue_num: u64) -> Option<Dialog> {
+        if !self.issue_has_live_session(issue_num) {
+            return None;
+        }
+        Some(Dialog {
+            id: WidgetId::new("dialog:reattach-first"),
+            title: StyledText::plain(format!(
+                "Live session still running — #{issue_num}",
+            )),
+            body: vec![
+                StyledText::plain(format!(
+                    "An interactive session for #{issue_num} is still running.",
+                )),
+                StyledText::plain(
+                    "Reattach to live session (right-click → Reattach to live \
+                     session), type /exit, and the stage offer will re-appear \
+                     automatically once the session closes."
+                        .to_string(),
+                ),
+            ],
+            buttons: vec![DialogButton {
+                id: WidgetId::new("close"),
+                label: "Esc  Dismiss".into(),
+                is_default: true,
+                is_cancel: true,
+                tint: None,
+            }],
+            severity: Some(DialogSeverity::Warning),
+            vertical_buttons: false,
+            input: None,
+        })
     }
 
     /// #628 (scope A pt.2): count live interactive sessions on a machine, so the
@@ -25143,7 +25240,8 @@ impl CoordApp {
         // keyed by this very issue_key).  So DEFER: leave the arm in place and
         // re-check each tick; it fires once the test pane is closed (its shell
         // has exited).  `key` IS the issue_key `detail_terminal_sessions` uses.
-        if self.session_pane_live(&key) {
+        // #722: also defer for remote fleet sessions (key.1 == issue_num).
+        if self.session_pane_live(&key) || self.issue_has_live_session(key.1) {
             return false;
         }
         let Some(armed) = self.armed_for_test_verdict.remove(&key) else {
@@ -25250,11 +25348,13 @@ impl CoordApp {
         // detect_test_verdict), but guard the launch directly too: if a live
         // session for this issue is still open, keep the prompt up and tell the
         // operator to exit first rather than clobber their session.
+        // #722: extend to remote fleet sessions via `issue_has_live_session`.
         let issue_key = (p.repo_slug.clone(), p.issue_num);
         if self
             .detail_terminal_sessions
             .get(&issue_key)
             .is_some_and(|s| !s.is_exited())
+            || self.issue_has_live_session(p.issue_num)
         {
             let issue_num = p.issue_num;
             self.push_toast(
@@ -25302,11 +25402,13 @@ impl CoordApp {
             return;
         };
         // #602: never replace a live attended pane (same guard as confirm_test_fix).
+        // #722: extend to remote fleet sessions via `issue_has_live_session`.
         let issue_key = (p.repo_slug.clone(), p.issue_num);
         if self
             .detail_terminal_sessions
             .get(&issue_key)
             .is_some_and(|s| !s.is_exited())
+            || self.issue_has_live_session(p.issue_num)
         {
             let issue_num = p.issue_num;
             self.push_toast(
@@ -31738,6 +31840,162 @@ mod tests {
         assert!(app
             .armed_for_verdict
             .contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    // ── #722: live remote session gates ──────────────────────────────────────
+    //
+    // A running tmux session on a remote fleet machine (`live_tmux_sessions`)
+    // must defer stage-advance detectors and block confirm handlers, mirroring
+    // the existing `session_pane_live` guard for embedded panes (#602).
+
+    /// Build a `LiveTmuxSession` for `issue` on `repo`, backed by a "running"
+    /// assignment already present in the app's board data.  `assignment_id`
+    /// must match an entry in `data.assignments` with `status == "running"` so
+    /// that `session_assignment_is_running` returns true and
+    /// `issue_has_live_session` counts the entry.
+    fn make_live_tmux_session(
+        assignment_id: &str,
+        issue: u64,
+        repo: &str,
+    ) -> LiveTmuxSession {
+        LiveTmuxSession {
+            assignment_id: assignment_id.to_string(),
+            issue_number: Some(issue),
+            repo_name: Some(repo.to_string()),
+            issue_title: None,
+            machine: Some("precision".to_string()),
+        }
+    }
+
+    #[test]
+    fn live_session_defers_detect_completed_interactive_work() {
+        // Work is done (has a branch) AND a running tmux session exists for the
+        // issue — the detector must defer (leave the armed entry for re-check
+        // on the next tick when the session closes).
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"),
+            running_work,
+        ]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        arm_auto_review(&mut app, "repo-a", 10, &[]);
+        // Detector must NOT fire while the remote session is live.
+        assert!(!app.detect_completed_interactive_work());
+        assert!(app.pending_stage_launch.is_none());
+        // Armed entry preserved so the offer re-fires once the session closes.
+        assert!(app.armed_for_auto_review.contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    #[test]
+    fn live_session_defers_detect_review_verdict() {
+        // A review approved AND a running tmux session exists — detector defers.
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_branch(10, "repo-a"),
+            review_of("id-10-done", 10, "repo-a", Some("approve")),
+            running_work,
+        ]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        arm_verdict(&mut app, "repo-a", 10, &[]);
+        assert!(!app.detect_review_verdict());
+        assert!(app.pending_merge.is_none());
+        assert!(app.armed_for_verdict.contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    #[test]
+    fn live_session_defers_detect_test_verdict() {
+        // Test passed AND a running tmux session exists — detector defers.
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![
+            done_work_with_test_state(10, "repo-a", "passed"),
+            running_work,
+        ]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        arm_test_verdict(&mut app, "repo-a", 10, "id-10-done", None);
+        assert!(!app.detect_test_verdict());
+        assert!(app.pending_auto_review.is_none());
+        // Armed entry preserved for re-fire once the session closes.
+        assert!(app.armed_for_test_verdict.contains_key(&("repo-a".to_string(), 10)));
+    }
+
+    #[test]
+    fn confirm_auto_review_refuses_when_remote_session_live() {
+        // confirm_auto_review must push a warning toast and keep the prompt
+        // up rather than launch a new session over the live one.
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![running_work]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+        app.confirm_auto_review();
+        // Prompt must still be set (not dismissed).
+        assert!(app.pending_auto_review.is_some(), "pending_auto_review must stay set");
+        // A warning toast must have been pushed.
+        assert!(
+            app.toasts.iter().any(|t| t.0.body.contains("live session")),
+            "expected a 'live session' warning toast, got: {:?}",
+            app.toasts.iter().map(|t| &t.0.body).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn confirm_merge_refuses_when_remote_session_live() {
+        // confirm_merge must toast and keep the pending merge prompt, not
+        // launch a merge agent over the live session.
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![running_work]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        app.pending_merge = Some(PendingMerge {
+            coord_repo: "repo-a".to_string(),
+            repo_slug: "repo-a".to_string(),
+            issue_num: 10,
+        });
+        app.confirm_merge();
+        assert!(app.pending_merge.is_some(), "pending_merge must stay set");
+        // The guard message uses "interactive session" (shared with the
+        // embedded-pane branch); just verify a relevant toast was pushed.
+        assert!(
+            app.toasts.iter().any(|t| t.0.body.contains("interactive session") || t.0.body.contains("#10")),
+            "expected a session-blocking warning toast, got: {:?}",
+            app.toasts.iter().map(|t| &t.0.body).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn build_prompt_dialog_shows_reattach_when_auto_review_blocked_by_live_session() {
+        // When pending_auto_review is set but a live session is present,
+        // build_prompt_dialog must substitute the "Reattach to live session"
+        // dialog rather than the normal "Start review" dialog.
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+        let mut app = make_app_with_assignments(vec![running_work]);
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+        let dialog = app.build_prompt_dialog().expect("dialog must be present");
+        // Must NOT be the normal "Start review" dialog.
+        assert_ne!(
+            dialog.id,
+            WidgetId::new("dialog:auto-review"),
+            "normal 'Start review' dialog must be suppressed",
+        );
+        // Must be the live-session-blocking dialog.
+        assert_eq!(dialog.id, WidgetId::new("dialog:reattach-first"));
+        // Body must mention "Reattach to live session".
+        let body_text: String = dialog
+            .body
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            body_text.contains("Reattach to live session"),
+            "dialog body must contain 'Reattach to live session', got: {body_text}",
+        );
     }
 
     #[test]
@@ -48028,6 +48286,45 @@ mod tests {
             "#727: zombie right-click menu must also render 'Start (interactive)' \
              (not hard-locked to Reattach-only):\n{}",
             driver.screen()
+        );
+    }
+
+    // ── #722: live-session gate — TuiDriver black-box screen test ───────────
+
+    /// When `pending_auto_review` is set but a running remote tmux session
+    /// exists for the same issue, the TUI must render the "Reattach to live
+    /// session" dialog — NOT the normal "Start review" dialog.
+    ///
+    /// This exercises the full `build_prompt_dialog` → `render_prompt_dialog`
+    /// path via the real `ShellAdapter` → `TestBackend` pipeline.
+    #[test]
+    fn tuidriver_live_session_blocks_auto_review_dialog() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Running assignment that backs the live tmux session.
+        let running_work = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        let running_aid = running_work.id.clone();
+
+        let mut app = make_app_with_assignments(vec![running_work]);
+        // Add the synthetic live tmux session (simulates a remote fleet machine).
+        app.live_tmux_sessions.push(make_live_tmux_session(&running_aid, 10, "repo-a"));
+        // Directly set the pending offer (simulates the detector having fired in
+        // a race before the session appeared, or manual advance).
+        app.pending_auto_review = Some(mk_pending_auto_review("repo-a", 10));
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen = driver.screen();
+
+        // The live-session-blocking dialog body must mention reattaching.
+        assert!(
+            driver.screen_contains("Reattach to live session"),
+            "screen must contain 'Reattach to live session' when a live session is \
+             blocking the offer:\n{screen}",
+        );
+        // The normal "Start review" button must NOT be present.
+        assert!(
+            !driver.screen_contains("Start review"),
+            "normal 'Start review' action must be suppressed while session is live:\n{screen}",
         );
     }
 
