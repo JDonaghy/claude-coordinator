@@ -469,7 +469,10 @@ def _recover_work_like(
         )
         if latest.branch:
             _prune_orphan_for_failed(board, config, latest, res, dry_run=dry_run)
-        res.recovered = True  # stage row is already terminal — nothing more needed
+        # Only mark recovered when _prune_orphan_for_failed did NOT set needs_reset
+        # (dirty worktrees that couldn't be pruned mean the block is still present).
+        if not res.needs_reset:
+            res.recovered = True  # stage row is already terminal — nothing more needed
     elif state == "live" and _is_stale(latest):
         res.findings.append("session is LIVE but stale (idle days) — reset to clear it")
         res.needs_reset = True
@@ -671,7 +674,7 @@ def _is_stale(assignment: "Assignment", *, max_age_hours: float = 12.0) -> bool:
 
 def _find_orphaned_worktrees(
     repo_path: Path,
-    branch: str,
+    branch: str | None,
     *,
     active_assignment_ids: set[str],
     worktrees_dir: Path | None = None,
@@ -681,7 +684,8 @@ def _find_orphaned_worktrees(
 
     A worktree is "orphaned" when ALL of:
     * Its directory is under ``~/.coord/worktrees/`` (coordinator-managed).
-    * Its git checkout has *branch* checked out.
+    * Its git checkout has *branch* checked out (or *branch* is ``None``,
+      meaning any branch — used for fleet sweeps).
     * Its assignment_id (derived from the directory name) is NOT in
       *active_assignment_ids* — i.e. no live tmux session and no running DB row.
 
@@ -730,16 +734,19 @@ def _find_orphaned_worktrees(
 
 def _maybe_orphan(
     entry: dict[str, str],
-    branch: str,
+    branch: str | None,
     worktrees_dir: Path,
     active_assignment_ids: set[str],
     out: list[Path],
 ) -> None:
-    """Append to *out* if *entry* is an orphaned worktree for *branch*."""
+    """Append to *out* if *entry* is an orphaned worktree for *branch*.
+
+    When *branch* is ``None`` any branch matches (fleet sweep).
+    """
     wt_str = entry.get("worktree", "")
     if not wt_str:
         return
-    if entry.get("branch", "") != branch:
+    if branch is not None and entry.get("branch", "") != branch:
         return
     wt_path = Path(wt_str)
     # Only consider coordinator-managed worktrees (under ~/.coord/worktrees/).
