@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 
@@ -644,6 +645,96 @@ def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> Non
     )
 
 
+def _extract_issue_number(branch: str) -> int | None:
+    """Extract N from ``issue-{N}-*`` branch names; returns None if no match."""
+    m = re.match(r"issue-(\d+)-", branch)
+    return int(m.group(1)) if m else None
+
+
+def close_stale_prs(
+    config: Config,
+    *,
+    repo: str | None = None,
+    issue: int | None = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """Close open PRs whose work is already on main or whose issue is closed.
+
+    Sweeps every coord-tracked repo (filtered by *repo* / *issue* when given)
+    for OPEN PRs with ``issue-{N}-*`` head branches.  Each PR is classified as
+    stale when either condition holds:
+
+      1. The linked issue N is CLOSED on GitHub.
+      2. The branch has 0 commits ahead of the repo's default branch (catches
+         fast-forward merges; squash/rebase cases are caught by condition 1
+         because coord closes the issue when squash-merging).
+
+    Stale PRs are closed with an explanatory comment.  Non-stale PRs are left
+    untouched.  *dry_run* lists what would change without writing.  Idempotent.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    actions: list[str] = []
+
+    for repo_cfg in config.repos:
+        if repo is not None and repo_cfg.name != repo:
+            continue
+
+        try:
+            open_prs = github_ops.list_open_prs(repo_cfg.github)
+        except Exception as exc:  # noqa: BLE001
+            actions.append(
+                f"skip stale-PR sweep for {repo_cfg.name}: could not list PRs ({exc})"
+            )
+            continue
+
+        default_branch = repo_cfg.default_branch or "main"
+
+        for pr in open_prs:
+            branch = pr.get("headRefName") or ""
+            pr_number = pr.get("number")
+            if not branch or pr_number is None:
+                continue
+
+            issue_number = _extract_issue_number(branch)
+            if issue_number is None:
+                continue  # not a coord-managed branch — skip
+            if issue is not None and issue_number != issue:
+                continue
+
+            # Fail-safe classification: when uncertain, leave the PR open.
+            stale_reason: str | None = None
+
+            if github_ops.issue_is_closed(repo_cfg.github, issue_number):
+                stale_reason = f"issue #{issue_number} is closed"
+            elif github_ops.branch_is_fully_merged(
+                repo_cfg.github, branch, default_branch
+            ):
+                stale_reason = f"all commits already on {default_branch}"
+
+            if stale_reason is None:
+                continue  # live PR — leave it alone
+
+            actions.append(
+                f"close PR #{pr_number} "
+                f"({repo_cfg.name} #{issue_number}, {branch}): {stale_reason}"
+                + (" [dry-run]" if dry_run else "")
+            )
+
+            if not dry_run:
+                comment = (
+                    f"Closing stale PR — {stale_reason}. "
+                    f"The work for issue #{issue_number} has already landed.\n\n"
+                    f"<!-- coord:stale-close issue={issue_number} -->"
+                )
+                try:
+                    github_ops.close_pr(repo_cfg.github, pr_number, comment=comment)
+                except Exception as exc:  # noqa: BLE001
+                    actions.append(f"  ↳ error closing PR #{pr_number}: {exc}")
+
+    return actions
+
+
 def reconcile_board_merges(
     board: Board,
     config: Config,
@@ -757,5 +848,8 @@ def reconcile_board_merges(
             if not dry_run:
                 a.status = "merged"
                 state.mark_assignment_merged(a.assignment_id or "")
+
+    # (c) #721 — close open PRs whose work has already landed.
+    actions.extend(close_stale_prs(config, repo=repo, issue=issue, dry_run=dry_run))
 
     return actions

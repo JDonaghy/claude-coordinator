@@ -6924,13 +6924,16 @@ def refine(repo: str, issue: int, config_path: Path) -> None:
     "reconcile-merges",
     help=(
         "Reconcile done work assignments against git/GitHub reality.\n\n"
-        "Two conservative sweeps over done work assignments:\n"
+        "Three conservative sweeps:\n"
         "  #611 — backfill a missing branch from a matching `issue-N-*` remote "
         "branch (a remote interactive session can finish done with branch=None, "
         "greying the TUI Start review/test/merge buttons);\n"
         "  #609 — flip work merged out-of-band (direct GitHub merge or a drained "
         "merge_queue row) to status='merged' so the TUI stops showing a grey "
-        "merge box forever.\n\n"
+        "merge box forever;\n"
+        "  #721 — close open PRs whose work has already landed (issue closed or "
+        "branch fully on the default branch) — review-PRs accumulate forever "
+        "after squash merges otherwise.\n\n"
         "Acts only when certain; skips and explains otherwise."
     ),
 )

@@ -431,6 +431,43 @@ def update_issue_body(repo: str, issue_number: int, body: str) -> None:
     )
 
 
+def close_pr(repo: str, number: int, *, comment: str | None = None) -> None:
+    """Close an open PR, optionally posting a comment first.
+
+    Posts *comment* (if given) via ``gh issue comment`` — PRs share the GitHub
+    issue comment stream — then closes the PR via ``gh pr close``.  Raises
+    RuntimeError on ``gh`` failure.
+    """
+    if comment:
+        post_issue_comment(repo, number, comment)
+    _gh("pr", "close", str(number), "--repo", repo)
+
+
+def branch_is_fully_merged(
+    repo: str,
+    branch: str,
+    default_branch: str = "main",
+) -> bool:
+    """Return True when *branch* has 0 commits ahead of *default_branch*.
+
+    Uses the GitHub three-dot compare API.  Returns False on any error —
+    fail-safe so we never accidentally close a live PR.
+
+    Note: only detects **fast-forward** merges.  After a squash or rebase
+    merge the branch's original commits remain "ahead" (different SHAs) even
+    though the work has landed.  The ``issue_is_closed`` check is the primary
+    stale-PR signal for those cases.
+    """
+    if not branch or not default_branch or branch == default_branch:
+        return False
+    try:
+        raw = _gh("api", f"repos/{repo}/compare/{default_branch}...{branch}")
+        cmp = json.loads(raw)
+        return isinstance(cmp, dict) and cmp.get("ahead_by") == 0
+    except Exception:  # noqa: BLE001 — fail-safe: keep the PR open on any error
+        return False
+
+
 def post_pr_review(repo: str, number: int, verdict: str, body: str) -> None:
     """Post a PR review via the gh CLI.
 

@@ -1,4 +1,4 @@
-"""Tests for reconcile_board_merges: branch backfill (#611) + record merged (#609)."""
+"""Tests for reconcile_board_merges: branch backfill (#611) + record merged (#609) + close stale PRs (#721)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pytest
 
 from coord.config import Config
 from coord.models import Assignment, Board, Repo
-from coord.reconcile import reconcile_board_merges
+from coord.reconcile import close_stale_prs, reconcile_board_merges
 
 
 @pytest.fixture
@@ -42,7 +42,12 @@ def _patch_probes(
     remote_branches: set[str] | None = None,
     terminal: bool = False,
 ):
-    """Stub the git/gh probes + record state writes; never hit the network."""
+    """Stub the git/gh probes + record state writes; never hit the network.
+
+    Also stubs ``list_open_prs`` to return an empty list so the stale-PR
+    sweep (#721) does not fire for tests that only care about the earlier
+    reconcile sweeps (branch backfill, record-merged).
+    """
     from coord import github_ops, state
 
     monkeypatch.setattr(
@@ -53,6 +58,8 @@ def _patch_probes(
         github_ops, "work_is_terminal",
         lambda repo, issue, branch, cache=None: terminal,
     )
+    # Suppress the stale-PR sweep for tests that don't need it.
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
 
     writes: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -198,3 +205,125 @@ def test_skips_non_work_and_non_done(monkeypatch, config) -> None:
 
     assert writes == []
     assert actions == []
+
+
+# ── #721 close stale PRs ──────────────────────────────────────────────────────
+
+
+def _patch_stale_pr_probes(
+    monkeypatch,
+    *,
+    open_prs: list[dict] | None = None,
+    issue_closed: bool = False,
+    fully_merged: bool = False,
+) -> list[tuple]:
+    """Stub the github_ops probes for the stale-PR sweep; record close calls."""
+    from coord import github_ops
+
+    monkeypatch.setattr(
+        github_ops, "list_open_prs",
+        lambda repo: list(open_prs or []),
+    )
+    monkeypatch.setattr(
+        github_ops, "issue_is_closed",
+        lambda repo, num: issue_closed,
+    )
+    monkeypatch.setattr(
+        github_ops, "branch_is_fully_merged",
+        lambda repo, branch, default_branch: fully_merged,
+    )
+
+    closed: list[tuple] = []
+    monkeypatch.setattr(
+        github_ops, "close_pr",
+        lambda repo, number, comment=None: closed.append((repo, number)),
+    )
+    return closed
+
+
+def test_stale_pr_closed_when_issue_is_closed(monkeypatch, config) -> None:
+    """A PR linked to a closed issue must be closed by the sweep."""
+    prs = [{"number": 99, "headRefName": "issue-42-the-fix"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=True, fully_merged=False
+    )
+
+    actions = close_stale_prs(config)
+
+    assert ("acme/api", 99) in closed
+    assert any("close PR #99" in s and "issue #42 is closed" in s for s in actions)
+
+
+def test_stale_pr_closed_when_branch_fully_merged(monkeypatch, config) -> None:
+    """A PR whose branch is fully on the default branch must be closed."""
+    prs = [{"number": 77, "headRefName": "issue-10-feature"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=False, fully_merged=True
+    )
+
+    actions = close_stale_prs(config)
+
+    assert ("acme/api", 77) in closed
+    assert any("close PR #77" in s and "already on" in s for s in actions)
+
+
+def test_live_pr_not_closed(monkeypatch, config) -> None:
+    """A PR whose issue is open and branch still has commits ahead must be left alone."""
+    prs = [{"number": 55, "headRefName": "issue-7-wip"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=False, fully_merged=False
+    )
+
+    actions = close_stale_prs(config)
+
+    assert closed == []
+    assert not any("close PR" in s for s in actions)
+
+
+def test_stale_pr_dry_run_no_close(monkeypatch, config) -> None:
+    """dry_run=True must list stale PRs without closing them."""
+    prs = [{"number": 33, "headRefName": "issue-5-done"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=True, fully_merged=False
+    )
+
+    actions = close_stale_prs(config, dry_run=True)
+
+    assert closed == []
+    assert any("[dry-run]" in s for s in actions)
+    assert any("close PR #33" in s for s in actions)
+
+
+def test_non_coord_branch_skipped(monkeypatch, config) -> None:
+    """PRs whose head branch does not follow issue-{N}-* must be ignored."""
+    prs = [
+        {"number": 11, "headRefName": "feature/some-thing"},
+        {"number": 12, "headRefName": "dependabot/pip/requests-2.32"},
+    ]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=True, fully_merged=True
+    )
+
+    actions = close_stale_prs(config)
+
+    assert closed == []
+    assert not any("close PR" in s for s in actions)
+
+
+def test_stale_pr_sweep_integrated_into_reconcile_board_merges(
+    monkeypatch, config
+) -> None:
+    """reconcile_board_merges must include stale-PR actions in its output."""
+    # Empty board — all three earlier sweeps produce nothing.
+    board = Board(completed=[], active=[])
+    # Patch the board-level probes so reconcile_board_merges doesn't error.
+    _patch_probes(monkeypatch, remote_branches=set(), terminal=False)
+
+    prs = [{"number": 44, "headRefName": "issue-9-old-work"}]
+    _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=True, fully_merged=False
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert any("close PR #44" in s for s in actions)
