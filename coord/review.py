@@ -1102,3 +1102,125 @@ def _fetch_issue_body(repo_github: str, issue_number: int) -> str:
         return json.loads(raw).get("body", "") or ""
     except (RuntimeError, ValueError):
         return ""
+
+
+# ── Headless fix dispatch (dashboard / phone API) ────────────────────────────
+
+
+def dispatch_headless_fix(
+    work: Assignment,
+    board: Board,
+    config: "Config",
+    *,
+    parent_type: str = "work",
+    http_client=None,
+) -> Assignment | None:
+    """Dispatch a headless (``claude -p``) fix worker for a stalled pipeline item.
+
+    Called from ``POST /api/pipeline/action action=dispatch_fix`` so the phone
+    can unstick a test-fail or request-changes item without attending an
+    interactive terminal session.
+
+    ``work`` must be a ``type='work'`` assignment that already has a branch.
+    ``parent_type`` selects which failure to address:
+
+    * ``"work"`` — fix a test-gate failure.  The briefing is built from
+      ``work.test_reason`` (recorded via ``coord test --fail --reason``).
+    * ``"review"`` — fix a request-changes review verdict.  The linked review
+      assignment is located on the board and its findings are loaded via the
+      multi-source chain in ``_load_review_findings`` (DB cache → local log →
+      agent HTTP → GitHub message bus).
+
+    The fix worker is dispatched with ``target_branch=work.branch`` in the
+    agent payload so it adds commits to the **existing** ``issue-N-*`` branch
+    rather than branching fresh off main.
+
+    Returns the new fix ``Assignment`` (already added to ``board.active``),
+    or ``None`` on failure (no capable machine, branch missing, findings
+    unresolvable, or iteration limit reached).
+    """
+    from types import SimpleNamespace as _NS  # noqa: PLC0415
+
+    # Deferred imports to avoid a circular-import cycle:
+    # review.py is imported at module level by auto_loop.py, so we cannot
+    # import auto_loop at review.py's module level.
+    from coord.auto_loop import (  # noqa: PLC0415
+        _build_fix_briefing,
+        _dispatch_fix,
+        _fix_model_for_iteration,
+        _load_review_findings,
+        _work_is_terminal,
+    )
+    from coord.state import issue_context_block  # noqa: PLC0415
+
+    if not work.branch:
+        return None
+
+    if _work_is_terminal(work, config):
+        return None
+
+    next_iteration = (work.review_iteration or 0) + 1
+    max_iter = config.pipeline.max_review_iterations
+    if next_iteration > max_iter:
+        return None
+
+    if parent_type == "review":
+        # Find the review assignment linked to this work and load its findings.
+        all_assignments = list(board.active) + list(board.completed)
+        review_a: Assignment | None = next(
+            (
+                a for a in all_assignments
+                if a.review_of_assignment_id == work.assignment_id
+                and a.type == "review"
+            ),
+            None,
+        )
+        if review_a is None:
+            return None
+
+        repo = config.repo(work.repo_name)
+        repo_github = repo.github if repo is not None else None
+        findings = _load_review_findings(
+            review_a,
+            None,          # no local log path on the dashboard machine
+            None,          # no remote agent host — let GitHub fallback handle it
+            repo_github=repo_github,
+        )
+        if findings is not None:
+            findings_obj = findings
+        else:
+            # Fallback: generic pointer so the worker can still proceed.
+            verdict = getattr(review_a, "review_verdict", None) or "request-changes"
+            findings_obj = _NS(body=(
+                f"(No structured findings were captured for review "
+                f"{review_a.assignment_id}.) "
+                f"The review verdict was {verdict!r}. "
+                "Read the reviewer's feedback on the PR / issue comments and "
+                "address every blocking item before pushing."
+            ))
+    else:
+        # parent_type == "work": test-gate failure.
+        test_story = (getattr(work, "test_reason", None) or "").strip()
+        if test_story:
+            findings_obj = _NS(body=(
+                "The manual smoke test FAILED.  The operator reported:\n\n"
+                f"> {test_story}\n\n"
+                "Reproduce the failure, fix the root cause, and re-validate "
+                "before pushing."
+            ))
+        else:
+            findings_obj = _NS(body=(
+                "The manual smoke test FAILED (no reason text was recorded). "
+                "Pull the branch, reproduce the failure the operator hit, "
+                "and fix the root cause before pushing."
+            ))
+
+    briefing = (
+        issue_context_block(work.repo_name, work.issue_number)
+        + _build_fix_briefing(work, findings_obj, next_iteration, max_iter)
+    )
+    model = _fix_model_for_iteration(config, next_iteration)
+    return _dispatch_fix(
+        work, briefing, board, config, next_iteration,
+        model=model, http_client=http_client,
+    )

@@ -607,3 +607,506 @@ class TestPipelineActionAPI:
             )
         assert r.status_code == 200
         assert r.json()["ok"] is True
+
+    def test_dispatch_fix_from_test_fail_succeeds(self) -> None:
+        """dispatch_fix with parent_type=work dispatches a headless fix worker."""
+        a = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Break auth",
+            assignment_id="w1", status="done", type="work",
+            branch="issue-1-break-auth",
+            smoke_test="fail",
+            test_reason="AssertionError on line 42",
+        )
+        board = Board(completed=[a])
+        mock_fix = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="[fix-1] Break auth",
+            assignment_id="fix-1", status="running", type="work",
+            branch="issue-1-break-auth",
+        )
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.save_board"),
+            patch("coord.review.dispatch_headless_fix", return_value=mock_fix) as mock_dhf,
+        ):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "w1", "action": "dispatch_fix",
+                      "parent_type": "work"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["branch"] == "issue-1-break-auth"
+        assert data["assignment_id"] == "fix-1"
+        mock_dhf.assert_called_once()
+        _, call_kwargs = mock_dhf.call_args
+        assert call_kwargs["parent_type"] == "work"
+
+    def test_dispatch_fix_from_request_changes_succeeds(self) -> None:
+        """dispatch_fix with parent_type=review dispatches a headless fix worker."""
+        a = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=2, issue_title="Add logging",
+            assignment_id="w2", status="done", type="work",
+            branch="issue-2-add-logging",
+        )
+        board = Board(completed=[a])
+        mock_fix = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=2, issue_title="[fix-1] Add logging",
+            assignment_id="fix-2", status="running", type="work",
+            branch="issue-2-add-logging",
+        )
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.save_board"),
+            patch("coord.review.dispatch_headless_fix", return_value=mock_fix) as mock_dhf,
+        ):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "w2", "action": "dispatch_fix",
+                      "parent_type": "review"},
+            )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert data["branch"] == "issue-2-add-logging"
+        _, call_kwargs = mock_dhf.call_args
+        assert call_kwargs["parent_type"] == "review"
+
+    def test_dispatch_fix_invalid_parent_type_returns_400(self) -> None:
+        a = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="t",
+            assignment_id="w1", status="done", type="work",
+            branch="issue-1-t",
+        )
+        board = Board(completed=[a])
+        client = _dashboard_client()
+        with patch("coord.dashboard.server.load_board", return_value=board):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "w1", "action": "dispatch_fix",
+                      "parent_type": "bogus"},
+            )
+        assert r.status_code == 400
+
+    def test_dispatch_fix_no_branch_returns_400(self) -> None:
+        a = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="t",
+            assignment_id="w1", status="done", type="work",
+            branch=None,
+        )
+        board = Board(completed=[a])
+        client = _dashboard_client()
+        with patch("coord.dashboard.server.load_board", return_value=board):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "w1", "action": "dispatch_fix"},
+            )
+        assert r.status_code == 400
+
+    def test_dispatch_fix_returns_501_replaced_by_implementation(self) -> None:
+        """Confirm the old 501 stub is gone — dispatch_fix no longer returns 501."""
+        a = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="t",
+            assignment_id="w1", status="done", type="work",
+            branch="issue-1-t",
+        )
+        board = Board(completed=[a])
+        client = _dashboard_client()
+        mock_fix = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="[fix-1] t",
+            assignment_id="fx-1", status="running", type="work",
+            branch="issue-1-t",
+        )
+        with (
+            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.save_board"),
+            patch("coord.review.dispatch_headless_fix", return_value=mock_fix),
+        ):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "w1", "action": "dispatch_fix"},
+            )
+        assert r.status_code != 501
+
+
+# ── dispatch_headless_fix unit tests ────────────────────────────────────────
+
+
+class TestDispatchHeadlessFix:
+    """Unit tests for coord.review.dispatch_headless_fix.
+
+    These tests mock _dispatch_fix (the agent HTTP call) and verify that:
+    - The correct briefing text is assembled for each parent_type.
+    - The existing branch is passed as target_branch (not a fresh branch).
+    - Iteration accounting is correct.
+    - Guard conditions (no branch, terminal, max-iter) short-circuit cleanly.
+    """
+
+    def _make_config(self) -> Config:
+        from coord.config import PipelineConfig
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/tmp/api"},
+            )],
+            pipeline=PipelineConfig(default_gates=["review", "merge"]),
+        )
+
+    def test_test_fail_briefing_contains_reason(self) -> None:
+        """Briefing for parent_type=work includes the operator's test_reason."""
+        from coord.review import dispatch_headless_fix
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=5, issue_title="Cache bug",
+            assignment_id="w5", status="done", type="work",
+            branch="issue-5-cache-bug",
+            smoke_test="fail",
+            test_reason="KeyError in cache.get()",
+        )
+        board = Board(completed=[work])
+        config = self._make_config()
+
+        captured: dict = {}
+
+        def fake_dispatch(w, briefing, b, cfg, iteration, *, model=None, http_client=None):
+            captured["briefing"] = briefing
+            captured["branch"] = w.branch
+            captured["iteration"] = iteration
+            fix = Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=5, issue_title="[fix-1] Cache bug",
+                assignment_id="fx-5", status="running", type="work",
+                branch=w.branch,
+            )
+            b.active.append(fix)
+            return fix
+
+        with (
+            patch("coord.auto_loop._dispatch_fix", fake_dispatch),
+            patch("coord.auto_loop._work_is_terminal", return_value=False),
+            patch("coord.state.issue_context_block", return_value=""),
+        ):
+            result = dispatch_headless_fix(work, board, config, parent_type="work")
+
+        assert result is not None
+        assert result.branch == "issue-5-cache-bug"
+        assert "KeyError in cache.get()" in captured["briefing"]
+        assert "FAILED" in captured["briefing"]
+        assert captured["iteration"] == 1
+
+    def test_test_fail_briefing_fallback_when_no_reason(self) -> None:
+        """Briefing for parent_type=work without test_reason uses generic text."""
+        from coord.review import dispatch_headless_fix
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=6, issue_title="Slow query",
+            assignment_id="w6", status="done", type="work",
+            branch="issue-6-slow-query",
+            smoke_test="fail",
+            test_reason=None,
+        )
+        board = Board(completed=[work])
+        config = self._make_config()
+
+        captured: dict = {}
+
+        def fake_dispatch(w, briefing, b, cfg, iteration, *, model=None, http_client=None):
+            captured["briefing"] = briefing
+            fix = Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=6, issue_title="[fix-1] Slow query",
+                assignment_id="fx-6", status="running", type="work",
+                branch=w.branch,
+            )
+            b.active.append(fix)
+            return fix
+
+        with (
+            patch("coord.auto_loop._dispatch_fix", fake_dispatch),
+            patch("coord.auto_loop._work_is_terminal", return_value=False),
+            patch("coord.state.issue_context_block", return_value=""),
+        ):
+            result = dispatch_headless_fix(work, board, config, parent_type="work")
+
+        assert result is not None
+        assert "FAILED" in captured["briefing"]
+        assert "no reason" in captured["briefing"]
+
+    def test_review_parent_type_loads_findings_and_builds_briefing(self) -> None:
+        """Briefing for parent_type=review contains the review findings body."""
+        from coord.review import dispatch_headless_fix, ReviewFindings
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=7, issue_title="Auth fix",
+            assignment_id="w7", status="done", type="work",
+            branch="issue-7-auth-fix",
+        )
+        rev = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=7, issue_title="[review] Auth fix",
+            assignment_id="rev-7", status="done", type="review",
+            review_of_assignment_id="w7",
+            review_verdict="request-changes",
+        )
+        board = Board(completed=[work, rev])
+        config = self._make_config()
+
+        captured: dict = {}
+
+        def fake_dispatch(w, briefing, b, cfg, iteration, *, model=None, http_client=None):
+            captured["briefing"] = briefing
+            fix = Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=7, issue_title="[fix-1] Auth fix",
+                assignment_id="fx-7", status="running", type="work",
+                branch=w.branch,
+            )
+            b.active.append(fix)
+            return fix
+
+        fake_findings = ReviewFindings(
+            verdict="request-changes",
+            body="## Blocking\n- Missing input validation on /login",
+        )
+
+        with (
+            patch("coord.auto_loop._dispatch_fix", fake_dispatch),
+            patch("coord.auto_loop._work_is_terminal", return_value=False),
+            patch("coord.auto_loop._load_review_findings", return_value=fake_findings),
+            patch("coord.state.issue_context_block", return_value=""),
+        ):
+            result = dispatch_headless_fix(work, board, config, parent_type="review")
+
+        assert result is not None
+        assert result.branch == "issue-7-auth-fix"
+        assert "Missing input validation" in captured["briefing"]
+        # Verify the briefing instructs to stay on the same branch.
+        assert "issue-7-auth-fix" in captured["briefing"]
+
+    def test_review_parent_type_fallback_briefing_when_no_findings(self) -> None:
+        """When findings can't be loaded, a generic fallback briefing is used."""
+        from coord.review import dispatch_headless_fix
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=8, issue_title="Rate limiting",
+            assignment_id="w8", status="done", type="work",
+            branch="issue-8-rate-limiting",
+        )
+        rev = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=8, issue_title="[review] Rate limiting",
+            assignment_id="rev-8", status="done", type="review",
+            review_of_assignment_id="w8",
+            review_verdict="request-changes",
+        )
+        board = Board(completed=[work, rev])
+        config = self._make_config()
+
+        captured: dict = {}
+
+        def fake_dispatch(w, briefing, b, cfg, iteration, *, model=None, http_client=None):
+            captured["briefing"] = briefing
+            fix = Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=8, issue_title="[fix-1] Rate limiting",
+                assignment_id="fx-8", status="running", type="work",
+                branch=w.branch,
+            )
+            b.active.append(fix)
+            return fix
+
+        with (
+            patch("coord.auto_loop._dispatch_fix", fake_dispatch),
+            patch("coord.auto_loop._work_is_terminal", return_value=False),
+            patch("coord.auto_loop._load_review_findings", return_value=None),
+            patch("coord.state.issue_context_block", return_value=""),
+        ):
+            result = dispatch_headless_fix(work, board, config, parent_type="review")
+
+        assert result is not None
+        # Fallback text should mention the review assignment and the verdict.
+        assert "rev-8" in captured["briefing"]
+        assert "request-changes" in captured["briefing"]
+
+    def test_no_branch_returns_none(self) -> None:
+        """Returns None when work has no branch (can't continue)."""
+        from coord.review import dispatch_headless_fix
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=9, issue_title="No branch",
+            assignment_id="w9", status="done", type="work",
+            branch=None,
+        )
+        board = Board(completed=[work])
+        config = self._make_config()
+
+        result = dispatch_headless_fix(work, board, config, parent_type="work")
+        assert result is None
+
+    def test_max_iterations_returns_none(self) -> None:
+        """Returns None when the review_iteration has already hit the limit."""
+        from coord.review import dispatch_headless_fix
+        from coord.config import PipelineConfig
+
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/tmp/api"},
+            )],
+            pipeline=PipelineConfig(
+                default_gates=["review", "merge"],
+                max_review_iterations=2,
+            ),
+        )
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Maxed out",
+            assignment_id="w10", status="done", type="work",
+            branch="issue-10-maxed-out",
+            # Already at 2 fix iterations; next would be 3 > max=2.
+            review_iteration=2,
+        )
+        board = Board(completed=[work])
+
+        with patch("coord.auto_loop._work_is_terminal", return_value=False):
+            result = dispatch_headless_fix(work, board, config, parent_type="work")
+        assert result is None
+
+    def test_review_parent_type_no_linked_review_returns_none(self) -> None:
+        """Returns None when parent_type=review but no linked review on board."""
+        from coord.review import dispatch_headless_fix
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=11, issue_title="Orphaned",
+            assignment_id="w11", status="done", type="work",
+            branch="issue-11-orphaned",
+        )
+        # No review assignment on the board linked to w11.
+        board = Board(completed=[work])
+        config = self._make_config()
+
+        with patch("coord.auto_loop._work_is_terminal", return_value=False):
+            result = dispatch_headless_fix(work, board, config, parent_type="review")
+        assert result is None
+
+    def test_target_branch_is_existing_branch_not_fresh(self) -> None:
+        """The fix worker targets the EXISTING issue branch, not a fresh one.
+
+        This is the core correctness guarantee: the agent payload must carry
+        ``target_branch=work.branch`` so the worker adds commits to the
+        reviewed branch rather than branching off main.  We verify by
+        inspecting what _dispatch_fix receives as its first argument (work)
+        and confirming the branch matches the original work branch.
+        """
+        from coord.review import dispatch_headless_fix
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=12, issue_title="Branch check",
+            assignment_id="w12", status="done", type="work",
+            branch="issue-12-branch-check",
+            smoke_test="fail",
+            test_reason="test broke",
+        )
+        board = Board(completed=[work])
+        config = self._make_config()
+
+        dispatched_work_branch: list[str] = []
+
+        def fake_dispatch(w, briefing, b, cfg, iteration, *, model=None, http_client=None):
+            dispatched_work_branch.append(w.branch or "")
+            fix = Assignment(
+                machine_name="laptop", repo_name="api",
+                issue_number=12, issue_title="[fix-1] Branch check",
+                assignment_id="fx-12", status="running", type="work",
+                branch=w.branch,
+            )
+            b.active.append(fix)
+            return fix
+
+        with (
+            patch("coord.auto_loop._dispatch_fix", fake_dispatch),
+            patch("coord.auto_loop._work_is_terminal", return_value=False),
+            patch("coord.state.issue_context_block", return_value=""),
+        ):
+            result = dispatch_headless_fix(work, board, config, parent_type="work")
+
+        assert result is not None
+        # The work object passed to _dispatch_fix must carry the ORIGINAL branch —
+        # _dispatch_fix sets target_branch=work.branch in the agent payload.
+        assert dispatched_work_branch == ["issue-12-branch-check"]
+        assert result.branch == "issue-12-branch-check"
+
+
+# ── pipeline.py gate: dispatch_fix for request-changes review ───────────────
+
+
+class TestDispatchFixGateForRequestChanges:
+    """Verify compute_pipeline exposes dispatch_fix when review verdict is
+    request-changes so the phone knows the action is available (#699)."""
+
+    def test_review_done_request_changes_shows_dispatch_fix(self) -> None:
+        """dispatch_fix gate appears when review verdict is request-changes."""
+        work = _work(aid="w1", status="done")
+        rev = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="[review] Fix auth",
+            assignment_id="rev-1", status="done", type="review",
+            review_of_assignment_id="w1",
+            review_verdict="request-changes",
+        )
+        board = Board(completed=[work, rev])
+        pv = compute_pipeline(work, board, [], _config())
+        assert pv.current_stage == "review_done"
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "dispatch_fix" in gate_actions
+
+    def test_review_done_approved_does_not_show_dispatch_fix(self) -> None:
+        """dispatch_fix gate must NOT appear when review verdict is approve."""
+        work = _work(aid="w1", status="done")
+        rev = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="[review] Fix auth",
+            assignment_id="rev-1", status="done", type="review",
+            review_of_assignment_id="w1",
+            review_verdict="approve",
+        )
+        board = Board(completed=[work, rev])
+        pv = compute_pipeline(work, board, [], _config())
+        assert pv.current_stage == "review_done"
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "dispatch_fix" not in gate_actions
+        assert "enqueue" in gate_actions  # Merge gate still available.
+
+    def test_review_done_no_verdict_does_not_show_dispatch_fix(self) -> None:
+        """dispatch_fix gate must NOT appear when review verdict is unknown/None."""
+        work = _work(aid="w1", status="done")
+        rev = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="[review] Fix auth",
+            assignment_id="rev-1", status="done", type="review",
+            review_of_assignment_id="w1",
+            review_verdict=None,
+        )
+        board = Board(completed=[work, rev])
+        pv = compute_pipeline(work, board, [], _config())
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "dispatch_fix" not in gate_actions
