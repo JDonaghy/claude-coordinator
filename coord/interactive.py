@@ -106,6 +106,7 @@ __all__ = [
     "tmux_session_name",
     "tmux_available",
     "tmux_session_alive",
+    "tmux_pane_dead",
     "list_coord_tmux_sessions",
 ]
 
@@ -251,38 +252,106 @@ def tmux_session_alive(
         return False
 
 
+def tmux_pane_dead(
+    session_name: str,
+    *,
+    host: TmuxHost = TmuxHost(None),
+) -> bool:
+    """Return ``True`` when the named session exists but its pane process has exited.
+
+    A "dead pane" means the tmux session is still up (``tmux has-session``
+    returns 0) but the child process that was running inside the pane —
+    typically ``claude`` — has exited.  This happens when the operator detaches
+    while the session is running and claude finishes in the background.
+
+    Uses ``tmux list-panes -F "#{pane_dead}" -t <session>``, which emits
+    ``1`` when a pane's child process has exited and ``0`` while it is still
+    running.  Returns ``True`` only when **all** panes in the session report
+    dead (i.e. at least one alive pane keeps the session active).
+
+    Subprocess / OS errors return ``False`` (treat as alive to avoid spurious
+    reaping of sessions we can't probe).
+
+    Args:
+        session_name: The tmux session name to probe.
+        host: Target host.  Defaults to ``TmuxHost(None)`` (local).
+    """
+    try:
+        result = subprocess.run(
+            host.cmd(["list-panes", "-F", "#{pane_dead}", "-t", session_name]),
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        if result.returncode != 0:
+            return False
+        lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+        if not lines:
+            return False
+        # All panes must be dead for the session to be considered dead-pane.
+        return all(ln == "1" for ln in lines)
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
 def list_coord_tmux_sessions(
     *,
     host: TmuxHost = TmuxHost(None),
 ) -> list[dict[str, str]]:
     """Return a list of live ``coord-*`` tmux sessions.
 
-    Each entry is a ``dict`` with at least the key ``"session_name"``.
+    Each entry is a ``dict`` with keys:
+
+    * ``"session_name"`` — the tmux session name (``coord-<assignment_id>``).
+    * ``"pane_dead"`` — ``"1"`` when the session's pane process has exited
+      (``claude`` finished but the tmux session is still up — the
+      detach-and-abandon case), ``"0"`` while the pane is still running.
+
     Returns an empty list when tmux is not available, not running, or has
     no matching sessions.
+
+    Uses ``tmux list-panes -a -F "#{session_name}\t#{pane_dead}"`` to fetch
+    both the session name and pane-dead status in a single subprocess call.
+    When a session has multiple panes the *most conservative* (alive=0) value
+    wins — i.e. the session is only marked dead when every pane has exited.
 
     Args:
         host: Target host.  Defaults to ``TmuxHost(None)`` (local).
 
     Example::
 
-        [{"session_name": "coord-abc123def456"}]
+        [
+            {"session_name": "coord-abc123", "pane_dead": "0"},
+            {"session_name": "coord-def456", "pane_dead": "1"},
+        ]
     """
     try:
         result = subprocess.run(
-            host.cmd(["ls", "-F", "#{session_name}"]),
+            host.cmd(["list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}"]),
             capture_output=True,
             text=True,
             timeout=5.0,
         )
         if result.returncode != 0:
             return []
-        sessions: list[dict[str, str]] = []
-        for name in result.stdout.splitlines():
-            name = name.strip()
-            if name.startswith(TMUX_SESSION_PREFIX):
-                sessions.append({"session_name": name})
-        return sessions
+        # Collect per-session: "0" (alive) beats "1" (dead) — any alive pane
+        # keeps the session active.
+        pane_dead_per_session: dict[str, str] = {}
+        for raw_line in result.stdout.splitlines():
+            parts = raw_line.split("\t", 1)
+            if len(parts) < 2:
+                continue
+            name, pane_dead = parts[0].strip(), parts[1].strip()
+            if not name.startswith(TMUX_SESSION_PREFIX):
+                continue
+            existing = pane_dead_per_session.get(name)
+            # "0" (alive) wins over "1" (dead).
+            if existing is None or pane_dead == "0":
+                pane_dead_per_session[name] = pane_dead
+        return [
+            {"session_name": name, "pane_dead": pd}
+            for name, pd in pane_dead_per_session.items()
+        ]
     except (subprocess.SubprocessError, OSError):
         return []
 
@@ -2093,8 +2162,11 @@ def reap_stale_interactive_sessions(
 
     * ``provider_name == "claude-pty"`` (i.e. dispatched via ``--interactive``)
     * ``status`` is ``"running"`` or ``"pending"`` in the in-memory board
-    * tmux is available on the local machine AND ``coord-<assignment_id>``
-      is NOT alive
+    * tmux is available on the local machine AND EITHER:
+
+      - ``coord-<assignment_id>`` is NOT alive (session gone), OR
+      - the session IS alive but its pane has exited (dead-pane case — claude
+        finished while the operator was detached).
 
     When tmux is NOT available the function returns immediately — the PTY
     relay is handled synchronously inside ``coord assign``, so no orphan
@@ -2113,6 +2185,9 @@ def reap_stale_interactive_sessions(
 
     1. Counts commits the worktree is ahead of the base branch (before
        removing the worktree, so git can still run).
+    1a. (Dead-pane only) Pushes any commits to the remote with
+       ``git push -u origin HEAD`` (best-effort) so the work is not lost when
+       the worktree is removed.  Failures are silently ignored.
     2. Removes the interactive worktree at
        ``~/.coord/worktrees/<assignment_id>`` (best-effort via
        :func:`_remove_worktree`; falls back to ``shutil.rmtree``).
@@ -2127,6 +2202,9 @@ def reap_stale_interactive_sessions(
 
     4. Moves the assignment from ``board.active`` to ``board.completed``
        and sets the in-memory status to match the DB value.
+    4a. (Dead-pane only) Kills the now-empty tmux session with
+       ``tmux kill-session`` (best-effort) so ``coord sessions`` stops
+       listing it.
 
     Returns the assignment IDs that were reaped.  The caller should include
     these in its ``changed`` list so ``save_board`` is triggered.
@@ -2154,10 +2232,20 @@ def reap_stale_interactive_sessions(
             continue
 
         sname = tmux_session_name(a.assignment_id)
+        _dead_pane_kill_needed = False
         if tmux_session_alive(sname):
-            continue  # session is live — leave it alone
+            # Session is alive — but check whether the claude pane has already
+            # exited (dead pane).  This is the detach-and-abandon case: the
+            # operator detached while claude was running, and claude finished in
+            # the background.  The tmux session is still up but the work is
+            # stranded without finalize.
+            if not tmux_pane_dead(sname):
+                continue  # session alive AND pane running — genuinely in progress
+            # Pane exited; the session is now an empty shell.  Fall through to
+            # the reap logic and kill the session at the end of this iteration.
+            _dead_pane_kill_needed = True
 
-        # ── Session is dead locally: check it's actually a LOCAL session ──
+        # ── Session is dead (or dead-pane) locally: check locality ──────────
 
         # Reconstruct machine info for locality check and repo path lookup.
         machine = machines_by_name.get(a.machine_name or "")
@@ -2203,6 +2291,22 @@ def reap_stale_interactive_sessions(
             commits = _commits_ahead(wt_path, base_branch)
         terminal_status = "advisory" if commits == 0 else "failed"
 
+        # 1a. (Dead-pane only) Push commits before removing the worktree so
+        #     that any work the operator produced survives.  Best-effort: a push
+        #     failure does NOT abort the reap — the worktree is still removed
+        #     and the DB still updated.  Skipped for the all-dead-session case
+        #     (where the session is already gone) and when there are no commits.
+        if _dead_pane_kill_needed and wt_path.exists() and commits:
+            try:
+                subprocess.run(
+                    ["git", "push", "-u", "origin", "HEAD"],
+                    cwd=str(wt_path),
+                    capture_output=True,
+                    timeout=30.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass  # non-fatal — work may already be on the remote
+
         # 1. Remove worktree (best-effort).
         if wt_path.exists():
             if repo_path_val is not None:
@@ -2240,6 +2344,21 @@ def reap_stale_interactive_sessions(
         # when the commit count shows no work was produced.
         if moved is not None and terminal_status == "advisory":
             moved.status = "advisory"
+
+        # 4a. (Dead-pane only) Kill the now-empty tmux session so it disappears
+        #     from ``coord sessions`` immediately.  Best-effort — if kill fails
+        #     the session will be gone on its own eventually (or the operator
+        #     can kill it manually).
+        if _dead_pane_kill_needed:
+            try:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", sname],
+                    capture_output=True,
+                    timeout=5.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass  # non-fatal
+
         reaped.append(a.assignment_id)
 
     return reaped
