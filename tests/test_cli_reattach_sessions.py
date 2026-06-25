@@ -215,11 +215,145 @@ class TestSessionsCmd:
         assert "No running interactive sessions" in result.output
 
     def test_text_includes_reattach_hint(self, coord_db: Any) -> None:
-        raw = [{"session_name": "coord-aid-42"}]
+        raw = [{"session_name": "coord-aid-42", "pane_dead": "0"}]
         with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
             result = CliRunner().invoke(main, ["sessions"])
         assert result.exit_code == 0
         assert "coord reattach" in result.output
+
+    def test_text_no_pipe_in_reattach_line(self, coord_db: Any) -> None:
+        """#491 fix: the two reattach options are labeled, not separated by '|'."""
+        raw = [{"session_name": "coord-aid-42", "pane_dead": "0"}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions"])
+        assert result.exit_code == 0
+        # The old format used '|' which reads as a shell pipe; it must be gone.
+        assert "  |  " not in result.output
+        # Both options must be present as separate labeled lines.
+        assert "Option 1" in result.output
+        assert "Option 2" in result.output
+
+    def test_json_includes_pane_dead_field(self, coord_db: Any) -> None:
+        """#491: JSON output includes pane_dead so the TUI can show dead sessions."""
+        raw = [{"session_name": "coord-myaid", "pane_dead": "0"}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        s = data["sessions"][0]
+        assert "pane_dead" in s, "pane_dead must appear in JSON output"
+        assert s["pane_dead"] == "0"
+
+    def test_json_pane_dead_one_for_dead_pane(self, coord_db: Any) -> None:
+        """pane_dead='1' is preserved in JSON output."""
+        raw = [{"session_name": "coord-deadaid", "pane_dead": "1"}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["sessions"][0]["pane_dead"] == "1"
+
+    def test_text_dead_pane_shows_dead_tag(self, coord_db: Any) -> None:
+        """Dead-pane sessions show a [DEAD PANE] tag in text output."""
+        raw = [{"session_name": "coord-deadaid", "pane_dead": "1"}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions"])
+        assert result.exit_code == 0
+        assert "DEAD PANE" in result.output or "dead" in result.output.lower()
+
+    def test_text_dead_pane_suggests_prune(self, coord_db: Any) -> None:
+        """Text output for dead-pane sessions suggests coord sessions --prune."""
+        raw = [{"session_name": "coord-deadaid", "pane_dead": "1"}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions"])
+        assert result.exit_code == 0
+        assert "--prune" in result.output
+
+    def test_prune_kills_dead_local_session(self, coord_db: Any, tmp_path: Path) -> None:
+        """--prune kills dead-pane local sessions and marks them in the DB."""
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(_CONFIG_YAML)
+        _insert_assignment(coord_db, "deadaid", status="running")
+        # Enriched session dict with machine="mymachine" (local in config).
+        # We patch socket.gethostname so the locality check passes.
+        raw_enriched = [{
+            "session_name": "coord-deadaid",
+            "assignment_id": "deadaid",
+            "issue_number": 42,
+            "repo_name": "myrepo",
+            "issue_title": None,
+            "machine": "mymachine",
+            "pane_dead": "1",
+        }]
+
+        killed: list[str] = []
+
+        def _fake_run(cmd: Any, **kwargs: Any) -> Any:
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = b""
+            if isinstance(cmd, list) and "kill-session" in cmd:
+                killed.append(str(cmd))
+            return m
+
+        from coord.cli import _prune_dead_sessions  # noqa: PLC0415
+        # Patch gethostname to "mymachine" so the locality check sees it as local.
+        with patch("socket.gethostname", return_value="mymachine"), \
+             patch("subprocess.run", side_effect=_fake_run):
+            _prune_dead_sessions(raw_enriched, cfg)
+
+        # A kill-session command must have been issued.
+        assert any("kill-session" in k for k in killed), \
+            f"expected tmux kill-session, got: {killed}"
+        # The session should be marked in DB as advisory or failed.
+        row = coord_db.execute(
+            "SELECT status FROM assignments WHERE assignment_id='deadaid'"
+        ).fetchone()
+        assert row is not None
+        assert row["status"] in ("advisory", "failed"), \
+            f"unexpected status: {row['status']}"
+
+    def test_prune_skips_alive_sessions(self, coord_db: Any, tmp_path: Path) -> None:
+        """--prune must not kill sessions whose pane is still alive."""
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(_CONFIG_YAML)
+        raw_enriched = [{
+            "session_name": "coord-liveaid",
+            "assignment_id": "liveaid",
+            "issue_number": 1,
+            "repo_name": "myrepo",
+            "issue_title": None,
+            "machine": None,
+            "pane_dead": "0",  # alive
+        }]
+
+        killed: list[str] = []
+
+        def _fake_run(cmd: Any, **kwargs: Any) -> Any:
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = b""
+            if isinstance(cmd, list) and "kill-session" in cmd:
+                killed.append(str(cmd))
+            return m
+
+        from coord.cli import _prune_dead_sessions  # noqa: PLC0415
+        with patch("socket.gethostname", return_value="mymachine"), \
+             patch("subprocess.run", side_effect=_fake_run):
+            _prune_dead_sessions(raw_enriched, cfg)
+
+        assert not killed, f"kill-session must not fire for alive session; got: {killed}"
+
+    def test_prune_no_sessions_prints_message(self, tmp_path: Path) -> None:
+        """--prune with no sessions outputs a user-friendly message."""
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(_CONFIG_YAML)
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=[]):
+            result = CliRunner().invoke(
+                main, ["sessions", "--prune", "--config", str(cfg)]
+            )
+        assert result.exit_code == 0
+        assert "No dead-pane" in result.output or "no" in result.output.lower()
 
     # -- #486 Leg 4: remote discovery (--remote) -------------------------------
 

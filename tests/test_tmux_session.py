@@ -4,8 +4,9 @@ Covers:
 1. ``tmux_session_name`` — canonical session-name construction
 2. ``tmux_available`` — PATH probe for ``tmux``
 3. ``tmux_session_alive`` — ``tmux has-session`` wrapper
-4. ``list_coord_tmux_sessions`` — filter for ``coord-*`` sessions
-5. ``launch_human_attended_interactive`` with ``assignment_id`` — tmux
+4. ``list_coord_tmux_sessions`` — filter for ``coord-*`` sessions + pane_dead (#491)
+5. ``tmux_pane_dead`` — pane-level dead detection (#491)
+6. ``launch_human_attended_interactive`` with ``assignment_id`` — tmux
    path taken when tmux is available, PTY fallback when unavailable.
 """
 
@@ -21,6 +22,7 @@ from coord.interactive import (
     TMUX_SESSION_PREFIX,
     list_coord_tmux_sessions,
     tmux_available,
+    tmux_pane_dead,
     tmux_session_alive,
     tmux_session_name,
 )
@@ -124,6 +126,10 @@ class TestTmuxSessionAlive:
 
 
 # ── list_coord_tmux_sessions ──────────────────────────────────────────────────
+#
+# The function now uses ``tmux list-panes -a -F "#{session_name}\t#{pane_dead}"``
+# to fetch both session name and pane-dead status in a single call (#491).
+# Mock output must use the TAB-delimited format.
 
 
 class TestListCoordTmuxSessions:
@@ -135,7 +141,7 @@ class TestListCoordTmuxSessions:
         with patch("subprocess.run", side_effect=OSError):
             assert list_coord_tmux_sessions() == []
 
-    def test_returns_empty_list_when_tmux_ls_fails(self) -> None:
+    def test_returns_empty_list_when_list_panes_fails(self) -> None:
         m = MagicMock()
         m.returncode = 1
         m.stdout = ""
@@ -145,7 +151,8 @@ class TestListCoordTmuxSessions:
     def test_filters_non_coord_sessions(self) -> None:
         m = MagicMock()
         m.returncode = 0
-        m.stdout = "coord-abc123\nother-session\ncoord-def456\n"
+        # Tab-separated: session_name\tpane_dead
+        m.stdout = "coord-abc123\t0\nother-session\t0\ncoord-def456\t0\n"
         with patch("subprocess.run", return_value=m):
             sessions = list_coord_tmux_sessions()
         names = [s["session_name"] for s in sessions]
@@ -153,16 +160,38 @@ class TestListCoordTmuxSessions:
         assert "coord-def456" in names
         assert "other-session" not in names
 
-    def test_returns_session_name_key(self) -> None:
+    def test_returns_session_name_and_pane_dead_keys(self) -> None:
         m = MagicMock()
         m.returncode = 0
-        m.stdout = "coord-myaid\n"
+        m.stdout = "coord-myaid\t0\n"
         with patch("subprocess.run", return_value=m):
             sessions = list_coord_tmux_sessions()
         assert len(sessions) == 1
         assert sessions[0]["session_name"] == "coord-myaid"
+        assert sessions[0]["pane_dead"] == "0"
 
-    def test_empty_tmux_output_returns_empty_list(self) -> None:
+    def test_pane_dead_one_for_dead_pane(self) -> None:
+        """pane_dead='1' when the pane process has exited."""
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "coord-deadaid\t1\n"
+        with patch("subprocess.run", return_value=m):
+            sessions = list_coord_tmux_sessions()
+        assert len(sessions) == 1
+        assert sessions[0]["pane_dead"] == "1"
+
+    def test_alive_pane_wins_when_session_has_multiple_panes(self) -> None:
+        """If any pane is alive (0), the session pane_dead stays '0'."""
+        m = MagicMock()
+        m.returncode = 0
+        # Two panes: one dead (1), one alive (0) → session should show '0'.
+        m.stdout = "coord-multiaid\t1\ncoord-multiaid\t0\n"
+        with patch("subprocess.run", return_value=m):
+            sessions = list_coord_tmux_sessions()
+        assert len(sessions) == 1
+        assert sessions[0]["pane_dead"] == "0"
+
+    def test_empty_output_returns_empty_list(self) -> None:
         m = MagicMock()
         m.returncode = 0
         m.stdout = "\n"
@@ -172,10 +201,92 @@ class TestListCoordTmuxSessions:
     def test_strips_whitespace_from_session_names(self) -> None:
         m = MagicMock()
         m.returncode = 0
-        m.stdout = "  coord-trimme  \n"
+        m.stdout = "  coord-trimme  \t0\n"
         with patch("subprocess.run", return_value=m):
             sessions = list_coord_tmux_sessions()
         assert sessions[0]["session_name"] == "coord-trimme"
+
+    def test_uses_list_panes_subcommand(self) -> None:
+        """Verify the tmux list-panes -a subcommand is used (not ls)."""
+        captured: list[list[str]] = []
+
+        def _mock_run(cmd: list[str], **_kwargs: Any) -> Any:
+            captured.append(cmd)
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            return m
+
+        with patch("subprocess.run", side_effect=_mock_run):
+            list_coord_tmux_sessions()
+
+        assert captured, "subprocess.run was not called"
+        cmd = captured[0]
+        assert "tmux" in cmd[0] or "list-panes" in cmd
+        assert "list-panes" in cmd
+        assert "-a" in cmd
+
+
+# ── tmux_pane_dead (#491) ─────────────────────────────────────────────────────
+
+
+class TestTmuxPaneDead:
+    def _mock_run(self, returncode: int, stdout: str) -> Any:
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        return m
+
+    def test_returns_false_when_pane_is_alive(self) -> None:
+        with patch("subprocess.run", return_value=self._mock_run(0, "0\n")):
+            assert tmux_pane_dead("coord-abc") is False
+
+    def test_returns_true_when_pane_is_dead(self) -> None:
+        with patch("subprocess.run", return_value=self._mock_run(0, "1\n")):
+            assert tmux_pane_dead("coord-abc") is True
+
+    def test_returns_false_when_session_not_found(self) -> None:
+        """Non-zero returncode means the session doesn't exist — not dead."""
+        with patch("subprocess.run", return_value=self._mock_run(1, "")):
+            assert tmux_pane_dead("coord-notexist") is False
+
+    def test_returns_false_on_subprocess_error(self) -> None:
+        with patch("subprocess.run", side_effect=subprocess.SubprocessError):
+            assert tmux_pane_dead("coord-abc") is False
+
+    def test_returns_false_on_os_error(self) -> None:
+        with patch("subprocess.run", side_effect=OSError):
+            assert tmux_pane_dead("coord-abc") is False
+
+    def test_all_panes_must_be_dead_for_true(self) -> None:
+        """Returns True only when EVERY pane reports dead."""
+        with patch("subprocess.run", return_value=self._mock_run(0, "1\n1\n")):
+            assert tmux_pane_dead("coord-multi") is True
+
+    def test_one_alive_pane_returns_false(self) -> None:
+        """A single alive pane keeps the session active."""
+        with patch("subprocess.run", return_value=self._mock_run(0, "1\n0\n")):
+            assert tmux_pane_dead("coord-multi") is False
+
+    def test_uses_list_panes_subcommand(self) -> None:
+        """Verify list-panes -F #{pane_dead} -t <session> is called."""
+        captured: list[list[str]] = []
+
+        def _mock_run(cmd: list[str], **_kwargs: Any) -> Any:
+            captured.append(cmd)
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = "0\n"
+            return m
+
+        with patch("subprocess.run", side_effect=_mock_run):
+            tmux_pane_dead("coord-testme")
+
+        assert captured, "subprocess.run was not called"
+        cmd = captured[0]
+        assert "list-panes" in cmd
+        assert "#{pane_dead}" in cmd
+        assert "coord-testme" in cmd
 
 
 # ── launch_human_attended_interactive — tmux path selection ──────────────────

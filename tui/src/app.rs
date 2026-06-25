@@ -4111,6 +4111,11 @@ struct LiveTmuxSession {
     /// (`machine` field) or derived from the assignment record.  `None`
     /// for sessions that pre-date the field or whose machine is unknown.
     machine: Option<String>,
+    /// `true` when the session's pane process (claude) has exited but the
+    /// tmux session is still up — the detach-and-abandon / dead-pane case
+    /// (#491).  `false` while the pane is still running or status is unknown
+    /// (sessions that pre-date the `pane_dead` field default to `false`).
+    pane_dead: bool,
 }
 
 /// Leg 2 (#517): an interactive Work/Plan/Fix session the TUI launched this
@@ -4313,12 +4318,19 @@ fn parse_sessions_json(text: &str) -> Vec<LiveTmuxSession> {
                 .get("machine")
                 .and_then(|n| n.as_str())
                 .map(|s| s.to_string());
+            // #491: "1" = pane process has exited; "0" or absent = alive.
+            let pane_dead = entry
+                .get("pane_dead")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "1")
+                .unwrap_or(false);
             Some(LiveTmuxSession {
                 assignment_id,
                 issue_number,
                 repo_name,
                 issue_title,
                 machine,
+                pane_dead,
             })
         })
         .collect()
@@ -16593,12 +16605,32 @@ impl CoordApp {
         // discovery, and independent of any board row's status (a merged row
         // moves to Done but its session may still be live) — means you can
         // never silently accumulate them again.
+        // #491: dead-pane sessions are shown with an amber warning badge;
+        // alive sessions keep the normal blue badge.
         if !self.live_tmux_sessions.is_empty() {
             let n = self.live_tmux_sessions.len();
+            let n_dead = self.live_tmux_sessions.iter().filter(|s| s.pane_dead).count();
+            let badge_text = if n_dead > 0 {
+                format!(
+                    " ◉ {} session{} ({} dead) ",
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    n_dead
+                )
+            } else {
+                format!(" ◉ {} live session{} ", n, if n == 1 { "" } else { "s" })
+            };
+            let (badge_fg, badge_bg) = if n_dead > 0 {
+                // Amber: dead-pane sessions need attention.
+                (Color::rgb(255, 210, 100), Color::rgb(70, 45, 10))
+            } else {
+                // Normal blue for all-alive sessions.
+                (Color::rgb(150, 210, 255), Color::rgb(20, 45, 70))
+            };
             left.push(StatusBarSegment {
-                text: format!(" ◉ {} live session{} ", n, if n == 1 { "" } else { "s" }),
-                fg: Color::rgb(150, 210, 255),
-                bg: Color::rgb(20, 45, 70),
+                text: badge_text,
+                fg: badge_fg,
+                bg: badge_bg,
                 bold: true,
                 action_id: None,
             });
@@ -20541,7 +20573,14 @@ impl CoordApp {
             {
                 let is_selected = idx == sel;
                 let prefix = if is_selected { "▶ " } else { "  " };
-                let fg = if is_selected {
+                // #491: dead-pane sessions appear dimmed + tagged.
+                let fg = if session.pane_dead {
+                    if is_selected {
+                        Color::rgb(200, 170, 170)  // muted red-ish when selected
+                    } else {
+                        Color::rgb(140, 110, 110)  // dim red-ish for dead sessions
+                    }
+                } else if is_selected {
                     Color::rgb(230, 240, 255)
                 } else {
                     Color::rgb(190, 200, 215)
@@ -20559,11 +20598,13 @@ impl CoordApp {
                 let kind_str = self.session_type_for(session);
                 let machine_str = self.session_machine_for(session);
                 let aid_short = trunc(&session.assignment_id, 20);
+                // Append "(dead)" tag so dead-pane sessions are unmistakable.
+                let dead_tag = if session.pane_dead { " (dead)" } else { "" };
 
-                // Format: ▶ #42    api            work        elitebook   aid-abc…
+                // Format: ▶ #42    api            work        elitebook   aid-abc… (dead)
                 let row_text = format!(
-                    "{}{} {:14} {:11} {:12} {}",
-                    prefix, issue_str, repo_str, kind_str, machine_str, aid_short
+                    "{}{} {:14} {:11} {:12} {}{}",
+                    prefix, issue_str, repo_str, kind_str, machine_str, aid_short, dead_tag
                 );
 
                 items.push(ListItem {
@@ -25788,6 +25829,7 @@ impl CoordApp {
                         repo_name: Some(repo.clone()),
                         issue_title: None,
                         machine: None,
+                        pane_dead: false,
                     });
                 }
 
@@ -34023,6 +34065,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         let groups = app.pipeline_active_by_liveness();
         assert_eq!(groups.len(), 1);
@@ -34036,6 +34079,7 @@ mod tests {
             repo_name: Some("other".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         let groups = app.pipeline_active_by_liveness();
         assert_eq!(groups[0].0, "idle", "cross-repo session must not mark it live");
@@ -34055,6 +34099,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         app.rebuild_pipeline_sidebar(None);
         // Default selection is [0, 0] = first group (Live) → #42.
@@ -35751,6 +35796,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
             LiveTmuxSession {
                 assignment_id: "b".into(),
@@ -35758,6 +35804,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
         ];
         assert!(
@@ -35798,6 +35845,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
             LiveTmuxSession {
                 assignment_id: "s2".into(),
@@ -35805,6 +35853,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
             LiveTmuxSession {
                 assignment_id: "s3".into(),
@@ -35812,6 +35861,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
             // A session with no matching assignment can't be attributed → ignored.
             LiveTmuxSession {
@@ -35820,6 +35870,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
         ];
 
@@ -35842,6 +35893,7 @@ mod tests {
             repo_name: Some("api".into()),
             issue_title: None,
             machine: Some("elitebook".into()),
+            pane_dead: false,
         }];
         assert!(app.live_sessions_overlay.is_none());
         // Simulate the L-toggle guard: sessions non-empty, no modal, no overlay.
@@ -35886,6 +35938,7 @@ mod tests {
             repo_name: None,
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
         app.handle_live_sessions_overlay_key(
@@ -35908,6 +35961,7 @@ mod tests {
             repo_name: None,
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
         app.handle_live_sessions_overlay_key(&Key::Char('L'), &Modifiers::default());
@@ -35928,6 +35982,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
             LiveTmuxSession {
                 assignment_id: "a2".into(),
@@ -35935,6 +35990,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
         ];
         app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
@@ -35967,6 +36023,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
             LiveTmuxSession {
                 assignment_id: "a2".into(),
@@ -35974,6 +36031,7 @@ mod tests {
                 repo_name: None,
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
         ];
         app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 1 });
@@ -35995,6 +36053,7 @@ mod tests {
             repo_name: Some("api".into()),
             issue_title: None,
             machine: None, // no machine → local kill path (will fail gracefully)
+            pane_dead: false,
         }];
         app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
         // K (uppercase) kills the session; lowercase k is navigation-up.
@@ -36026,6 +36085,7 @@ mod tests {
             repo_name: None,
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
         app.handle_live_sessions_overlay_key(&Key::Char('f'), &Modifiers::default());
@@ -36058,6 +36118,46 @@ mod tests {
         let got = parse_sessions_json(json);
         assert_eq!(got.len(), 1);
         assert!(got[0].machine.is_none());
+    }
+
+    // ── #491: pane_dead field in parse_sessions_json ─────────────────────
+
+    #[test]
+    fn parse_sessions_json_pane_dead_false_when_alive() {
+        // pane_dead="0" → pane_dead: false.
+        let json = r#"{"sessions":[
+            {"session_name":"coord-aid","assignment_id":"aid",
+             "issue_number":1,"repo_name":"r","issue_title":null,
+             "machine":null,"pane_dead":"0"}
+        ]}"#;
+        let got = parse_sessions_json(json);
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].pane_dead, "pane_dead must be false for '0'");
+    }
+
+    #[test]
+    fn parse_sessions_json_pane_dead_true_when_dead() {
+        // pane_dead="1" → pane_dead: true.
+        let json = r#"{"sessions":[
+            {"session_name":"coord-aid","assignment_id":"aid",
+             "issue_number":1,"repo_name":"r","issue_title":null,
+             "machine":null,"pane_dead":"1"}
+        ]}"#;
+        let got = parse_sessions_json(json);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].pane_dead, "pane_dead must be true for '1'");
+    }
+
+    #[test]
+    fn parse_sessions_json_pane_dead_defaults_to_false_when_absent() {
+        // Sessions that pre-date the pane_dead field default to false (alive).
+        let json = r#"{"sessions":[
+            {"session_name":"coord-aid","assignment_id":"aid",
+             "issue_number":1,"repo_name":"r","issue_title":null}
+        ]}"#;
+        let got = parse_sessions_json(json);
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].pane_dead, "absent pane_dead must default to false");
     }
 
     // ── #253: merge-blocked-on-review predicate ────────────────────────────
@@ -40574,6 +40674,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -40642,6 +40743,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         let (tx, rx) = std::sync::mpsc::channel();
         // Discovery returns an unrelated session only.
@@ -40651,6 +40753,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -40678,6 +40781,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(vec![LiveTmuxSession {
@@ -40686,6 +40790,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -40829,6 +40934,7 @@ mod tests {
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         });
 
         // Fix wants a running "work" session — the only one running is a review.
@@ -40863,6 +40969,7 @@ mod tests {
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         });
         assert_eq!(
             app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Fix),
@@ -40906,6 +41013,7 @@ mod tests {
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         });
 
         // The dedicated reattach path picks the running review type-agnostically.
@@ -41039,6 +41147,7 @@ mod tests {
             repo_name: Some("vimcode".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         assert_eq!(
             app.selected_issue_live_session_id().as_deref(),
@@ -41052,6 +41161,7 @@ mod tests {
             repo_name: Some("claude-coordinator".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         assert!(
             app.selected_issue_live_session_id().is_none(),
@@ -41093,6 +41203,7 @@ mod tests {
                 repo_name: Some("vimcode".to_string()),
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
             LiveTmuxSession {
                 assignment_id: "id-494-running".to_string(),
@@ -41100,6 +41211,7 @@ mod tests {
                 repo_name: Some("vimcode".to_string()),
                 issue_title: None,
                 machine: None,
+                pane_dead: false,
             },
         ];
         assert_eq!(
@@ -41145,6 +41257,7 @@ mod tests {
             repo_name: Some("vimcode".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
 
         // Running-only resolver returns None (assignment not running).
@@ -41391,6 +41504,7 @@ mod tests {
             repo_name: Some("vimcode".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle);
         assert!(items.iter().any(|i| i.label == "Reattach to live session"));
@@ -41957,6 +42071,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         assert_eq!(
             drop_disabled(&app, PipelineRowLifecycle::InProgress),

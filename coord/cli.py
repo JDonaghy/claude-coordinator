@@ -8830,6 +8830,153 @@ def session() -> None:
 # ── #487: tmux session management ────────────────────────────────────────────
 
 
+def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
+    """Kill dead-pane sessions and finalize their board assignments.
+
+    Called from ``coord sessions --prune`` (#491).  Only processes LOCAL
+    dead-pane sessions (``pane_dead == "1"`` AND no machine name, i.e. the
+    session lives on this host).  Remote dead sessions are handled by
+    ``reap_stale_remote_interactive_sessions`` (called from ``coord reconcile``).
+
+    For each dead-pane local session the function:
+
+    1. Resolves the worktree path (``~/.coord/worktrees/<assignment_id>``).
+    2. Pushes any commits with ``git push -u origin HEAD`` (best-effort).
+    3. Counts commits ahead of the base branch to decide the terminal status.
+    4. Updates the DB: ``advisory`` (0 commits) or ``failed`` (≥1 commits).
+    5. Removes the worktree (best-effort).
+    6. Kills the tmux session with ``tmux kill-session -t coord-<id>``.
+    """
+    from coord.state import COORD_DIR, get_connection  # noqa: PLC0415
+    from coord.agent import _commits_ahead  # noqa: PLC0415
+    from coord.interactive import (  # noqa: PLC0415
+        TMUX_SESSION_PREFIX,
+        tmux_session_name,
+        _remove_worktree,
+    )
+
+    _local_hn = socket.gethostname().split(".")[0].lower()
+    worktrees_dir = COORD_DIR / "worktrees"
+    now = time.time()
+
+    # Load config so we can resolve repo_path for git worktree remove.
+    try:
+        cfg = _load_config(config_path)
+        machines_by_name = {m.name: m for m in cfg.machines}
+        repos_by_name = {r.name: r for r in cfg.repos}
+    except Exception:  # noqa: BLE001
+        machines_by_name = {}
+        repos_by_name = {}
+
+    pruned = 0
+    for s in enriched:
+        if s.get("pane_dead") != "1":
+            continue  # only dead-pane sessions
+
+        # Only prune local sessions — remote ones stay for the reconcile reaper.
+        raw_machine = s.get("machine")
+        if raw_machine is not None:
+            mobj = machines_by_name.get(raw_machine)
+            if mobj is not None:
+                _is_local = (
+                    mobj.name.lower() == _local_hn
+                    or mobj.host.split(".")[0].lower() == _local_hn
+                )
+            else:
+                # Machine name set but not in config — treat as remote to be safe.
+                _is_local = False
+            if not _is_local:
+                click.echo(
+                    f"  skip  {s['session_name']}  (remote machine: {raw_machine})"
+                )
+                continue
+
+        assignment_id = s["assignment_id"]
+        sname = tmux_session_name(assignment_id)
+        wt_path = worktrees_dir / assignment_id
+
+        # Resolve repo_path for worktree removal.
+        repo_path_val: str | None = None
+        machine_obj = machines_by_name.get(s.get("machine") or "")
+        if machine_obj is not None and s.get("repo_name"):
+            rp = machine_obj.repo_path(s["repo_name"])
+            if rp:
+                repo_path_val = str(Path(rp).expanduser())
+
+        # 2. Push commits (best-effort) so the work is not lost.
+        commits: int | None = None
+        if wt_path.exists():
+            repo = repos_by_name.get(s.get("repo_name") or "")
+            base_branch = repo.default_branch if repo is not None else "main"
+            commits = _commits_ahead(wt_path, base_branch)
+            if commits:
+                try:
+                    subprocess.run(
+                        ["git", "push", "-u", "origin", "HEAD"],
+                        cwd=str(wt_path),
+                        capture_output=True,
+                        timeout=30.0,
+                    )
+                    click.echo(
+                        f"  pushed  {s['session_name']}  ({commits} commit(s))"
+                    )
+                except Exception:  # noqa: BLE001
+                    click.echo(
+                        f"  push failed  {s['session_name']}  (worktree kept)"
+                    )
+
+        terminal_status = "advisory" if commits == 0 else "failed"
+
+        # 3. Update DB.
+        try:
+            conn = get_connection()
+            conn.execute(
+                "UPDATE assignments SET status=?, finished_at=? "
+                "WHERE assignment_id=? AND status IN ('running', 'pending')",
+                (terminal_status, now, assignment_id),
+            )
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 4. Remove worktree (best-effort).
+        if wt_path.exists():
+            if repo_path_val is not None:
+                try:
+                    _remove_worktree(Path(repo_path_val), wt_path)
+                except Exception:  # noqa: BLE001
+                    try:
+                        shutil.rmtree(wt_path, ignore_errors=True)
+                    except OSError:
+                        pass
+            else:
+                try:
+                    shutil.rmtree(wt_path, ignore_errors=True)
+                except OSError:
+                    pass
+
+        # 5. Kill the tmux session.
+        try:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", sname],
+                capture_output=True,
+                timeout=5.0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        click.echo(
+            f"  pruned  {s['session_name']}  "
+            f"({terminal_status}, {commits or 0} commit(s))"
+        )
+        pruned += 1
+
+    if pruned == 0:
+        click.echo("No dead-pane local sessions to prune.")
+    else:
+        click.echo(f"\nPruned {pruned} dead-pane session(s).")
+
+
 @main.command(
     "sessions",
     help=(
@@ -8853,8 +9000,20 @@ def session() -> None:
         "(#486 Leg 4).  Parallelised; bounded by a 5 s per-host probe."
     ),
 )
+@click.option(
+    "--prune",
+    is_flag=True,
+    default=False,
+    help=(
+        "Kill dead-pane sessions (where claude has exited but tmux is still up) "
+        "and finalize their assignments.  Only local sessions are pruned; remote "
+        "dead sessions are handled by ``coord reconcile`` (#491)."
+    ),
+)
 @_CONFIG_OPTION
-def sessions_cmd(output_json: bool, remote: bool, config_path: Path) -> None:
+def sessions_cmd(
+    output_json: bool, remote: bool, prune: bool, config_path: Path
+) -> None:
     """List live coord-* tmux sessions with their assignment metadata."""
     import json as _json  # noqa: PLC0415
 
@@ -8976,6 +9135,10 @@ def sessions_cmd(output_json: bool, remote: bool, config_path: Path) -> None:
         # Prefer the DB's machine_name (authoritative); fall back to the host
         # the session was discovered on (#486 Leg 4).
         machine = machine_name or session_machine.get(session_name)
+        # pane_dead: "1" when the claude process inside the pane has exited but
+        # the tmux session is still up (detach-and-abandon case).  "0" while
+        # running.  Missing for remote sessions that pre-date the #491 field.
+        pane_dead = s.get("pane_dead", "0")
         enriched.append(
             {
                 "session_name": session_name,
@@ -8984,6 +9147,7 @@ def sessions_cmd(output_json: bool, remote: bool, config_path: Path) -> None:
                 "repo_name": repo_name,
                 "issue_title": issue_title,
                 "machine": machine,
+                "pane_dead": pane_dead,
             }
         )
 
@@ -8991,21 +9155,59 @@ def sessions_cmd(output_json: bool, remote: bool, config_path: Path) -> None:
         click.echo(_json.dumps({"sessions": enriched}))
         return
 
+    # ── --prune: kill dead-pane sessions and finalize their assignments ──────
+    # Run before the human-readable list so output flows: list → prune results.
+
+    if prune:
+        _prune_dead_sessions(enriched, config_path)
+        return
+
+    # ── Human-readable output ─────────────────────────────────────────────────
+
     if not enriched:
         click.echo("No running interactive sessions.")
         return
 
-    for s in enriched:
+    # Separate alive sessions from dead-pane ones so the operator can see at
+    # a glance which need attention.
+    _alive = [s for s in enriched if s.get("pane_dead") != "1"]
+    _dead  = [s for s in enriched if s.get("pane_dead") == "1"]
+
+    def _print_session(s: dict, *, dead: bool = False) -> None:
         issue_part = f"#{s['issue_number']}" if s["issue_number"] else "(unknown issue)"
         repo_part = s["repo_name"] or "(unknown repo)"
         title_part = f" — {s['issue_title']}" if s["issue_title"] else ""
         machine_part = f" @{s['machine']}" if s.get("machine") else ""
+        dead_tag = "  [DEAD PANE — claude exited]" if dead else ""
         click.echo(
-            f"  {s['session_name']}  {repo_part} {issue_part}{machine_part}{title_part}"
+            f"  {s['session_name']}  {repo_part} {issue_part}"
+            f"{machine_part}{title_part}{dead_tag}"
+        )
+        # Two labeled options instead of a pipe that reads as a shell pipe.
+        click.echo(
+            f"    Option 1 (recommended):  coord reattach {s['assignment_id']}"
         )
         click.echo(
-            f"    reattach: coord reattach {s['assignment_id']}"
-            f"  |  tmux attach-session -t {s['session_name']}"
+            f"      (runs the finalize backstop on exit; preserves board state)"
+        )
+        click.echo(
+            f"    Option 2 (raw):          tmux attach-session -t {s['session_name']}"
+        )
+
+    for s in _alive:
+        _print_session(s, dead=False)
+
+    if _dead:
+        click.echo("")
+        click.echo(
+            f"  {len(_dead)} dead-pane session(s) — claude has exited, "
+            "tmux session still up:"
+        )
+        for s in _dead:
+            _print_session(s, dead=True)
+        click.echo("")
+        click.echo(
+            "  Run: coord sessions --prune   to finalize and kill dead sessions."
         )
 
 

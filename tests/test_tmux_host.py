@@ -395,19 +395,20 @@ class TestListCoordTmuxSessionsWithHost:
     def test_local_host_sends_tmux_cmd(self) -> None:
         m = MagicMock()
         m.returncode = 0
-        m.stdout = "coord-abc\n"
+        # #491: new format is "session_name\tpane_dead"
+        m.stdout = "coord-abc\t0\n"
 
         with patch("subprocess.run", return_value=m) as mock_run:
             list_coord_tmux_sessions(host=TmuxHost(None))
 
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "tmux"
-        assert "ls" in cmd
+        assert "list-panes" in cmd
 
     def test_remote_host_sends_ssh_cmd(self) -> None:
         m = MagicMock()
         m.returncode = 0
-        m.stdout = "coord-abc\n"
+        m.stdout = "coord-abc\t0\n"
 
         with patch("subprocess.run", return_value=m) as mock_run:
             sessions = list_coord_tmux_sessions(host=TmuxHost("remotehost"))
@@ -415,8 +416,9 @@ class TestListCoordTmuxSessionsWithHost:
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "ssh"
         assert "remotehost" in cmd
-        assert "ls" in cmd
+        assert "list-panes" in cmd
         assert sessions[0]["session_name"] == "coord-abc"
+        assert sessions[0]["pane_dead"] == "0"
 
 
 # ── remote FIX push-back (#486d) ──────────────────────────────────────────────
