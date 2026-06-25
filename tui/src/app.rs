@@ -7272,12 +7272,29 @@ impl CoordApp {
                 let prev_pl_sel = self.capture_pipeline_selection_id();
                 self.pipeline_issues = self.pipeline_issues_from_cache();
                 // Prune terminal sessions / spawn errors for issues no longer
-                // in the pipeline (mirrors the old loader's cleanup).
-                let live_keys: std::collections::HashSet<(String, u64)> = self
+                // in the pipeline or on the board (mirrors the old loader's cleanup).
+                let mut live_keys: std::collections::HashSet<(String, u64)> = self
                     .pipeline_issues
                     .iter()
                     .map(|i| (i.repo_slug.clone(), i.number))
                     .collect();
+                // #675: Board Terminal sessions use the same (repo_slug, number) key
+                // as Pipeline sessions, but Board-only issues (no status:* label) are
+                // absent from pipeline_issues — so their sessions were pruned on every
+                // data tick, causing the Board Terminal to flicker back to a plain
+                // shell immediately after "Chat about issue" spawned it.  Include all
+                // open_issues (the Board's data source) so Board terminal sessions
+                // survive the retain.
+                for oi in &self.data.open_issues {
+                    let slug = self
+                        .data
+                        .pipeline_repos
+                        .iter()
+                        .find(|(name, _)| name == &oi.repo_name)
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_else(|| oi.repo_name.clone());
+                    live_keys.insert((slug, oi.number));
+                }
                 // #620: never prune EVERY terminal at once.  The top-level
                 // degraded-tick guard above catches a fully-empty payload, but a
                 // *partial* degradation (machines/issues present yet
@@ -46283,10 +46300,22 @@ mod tests {
             all_labels: vec![],
             is_closed: false,
         }];
-        // Apply the same logic that poll_pipeline_loader uses.
+        // Apply the same logic that poll_pipeline_loader uses (open_issues is empty
+        // in this app so live_keys is pipeline-only — the Board extension adds nothing,
+        // correctly leaving stale-pipeline sessions to be pruned).
         app.pipeline_issues = new_issues;
-        let live_keys: std::collections::HashSet<(String, u64)> =
+        let mut live_keys: std::collections::HashSet<(String, u64)> =
             app.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
+        for oi in &app.data.open_issues {
+            let slug = app
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(name, _)| name == &oi.repo_name)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| oi.repo_name.clone());
+            live_keys.insert((slug, oi.number));
+        }
         app.detail_terminal_sessions.retain(|k, _| live_keys.contains(k));
         app.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
 
@@ -46298,6 +46327,70 @@ mod tests {
         assert!(
             app.detail_terminal_spawn_errors.contains_key(&("o/r".to_string(), 2)),
             "kept session for #2 should remain"
+        );
+    }
+
+    /// #675: Board-only terminal sessions must NOT be pruned by the pipeline
+    /// data tick.  An issue on the Board but NOT in the Pipeline (no status:*
+    /// label) is absent from pipeline_issues; before the fix the retain would
+    /// drop its session on every data tick, causing the Board Terminal tab to
+    /// flicker back to a plain shell immediately after "Chat about issue".
+    #[test]
+    fn board_terminal_session_not_pruned_by_data_tick() {
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("myrepo".to_string(), "owner/myrepo".to_string())],
+            ..BoardData::default()
+        });
+
+        // A Board-only issue (no status:* label, so absent from pipeline_issues).
+        // The detail-terminal key uses the slug: ("owner/myrepo", 42).
+        let board_key = ("owner/myrepo".to_string(), 42u64);
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "myrepo".to_string(),
+            number: 42,
+            title: "board-only issue".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: vec![], // no status:* → NOT in pipeline
+            milestone_number: None,
+            milestone_title: None,
+        });
+
+        // A completely-gone issue (#99) — no longer in pipeline OR open_issues.
+        let stale_key = ("owner/myrepo".to_string(), 99u64);
+
+        // Seed spawn-error map to stand in for real TerminalSessions.
+        app.detail_terminal_spawn_errors.insert(board_key.clone(), "board-chat".to_string());
+        app.detail_terminal_spawn_errors.insert(stale_key.clone(), "stale".to_string());
+
+        // pipeline_issues is empty — the Board issue was never dispatched.
+        app.pipeline_issues = vec![];
+
+        // Replicate the retain logic from poll_pipeline_loader (after the #675 fix).
+        let mut live_keys: std::collections::HashSet<(String, u64)> =
+            app.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
+        for oi in &app.data.open_issues {
+            let slug = app
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(name, _)| name == &oi.repo_name)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| oi.repo_name.clone());
+            live_keys.insert((slug, oi.number));
+        }
+        let prune = !live_keys.is_empty() || app.detail_terminal_spawn_errors.is_empty();
+        if prune {
+            app.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
+        }
+
+        assert!(
+            app.detail_terminal_spawn_errors.contains_key(&board_key),
+            "Board-only session must survive the prune (was absent from pipeline_issues)"
+        );
+        assert!(
+            !app.detail_terminal_spawn_errors.contains_key(&stale_key),
+            "Stale session (gone from both pipeline and board) must be pruned"
         );
     }
 
