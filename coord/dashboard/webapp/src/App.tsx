@@ -1,13 +1,20 @@
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import Home from '@/components/Home'
+import Detail from '@/components/Detail'
 
 /**
- * App root.  Client-side routing will be added in the Home / Detail screen issues.
- * For now the single route is the Home placeholder.
+ * App root.  BrowserRouter is used here; the dashboard server serves index.html
+ * as a SPA fallback for all non-API paths so deep links work on hard reload.
  */
 export default function App() {
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <Home />
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/detail/:id" element={<Detail />} />
+        </Routes>
+      </BrowserRouter>
     </div>
   )
 }
