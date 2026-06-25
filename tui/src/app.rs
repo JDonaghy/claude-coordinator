@@ -23791,7 +23791,23 @@ impl CoordApp {
     /// could resolve the wrong repo and dispatch the wrong issue (#480).
     /// Returns `(coord_repo_name, (repo_slug, number))`.
     fn selected_issue_repo_and_key(&self) -> Option<(String, (String, u64))> {
-        // Pipeline selection is the primary source.
+        // #675 BUG 5: When on the Board panel, use the Board selection so that
+        // 'Chat about issue' always refers to the board-selected issue — not
+        // whatever pipeline_sel still points to from a previous Pipeline click.
+        // Mirror the guard order in `selected_issue_key()`.
+        if self.active_view == SidebarView::Board {
+            let (coord_repo, num) = self.board_selected_issue()?;
+            let slug = self
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(name, _)| *name == coord_repo)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| coord_repo.clone());
+            return Some((coord_repo, (slug, num)));
+        }
+        // For all other views (Pipeline, Terminal, etc.) use the pipeline
+        // selection as the primary source.
         if let Some(issue) = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i)) {
             let repo = match issue.coord_repo.as_deref() {
                 Some(cr) if !cr.is_empty() => cr.to_string(),
@@ -23803,18 +23819,6 @@ impl CoordApp {
                     .to_string(),
             };
             return Some((repo, (issue.repo_slug.clone(), issue.number)));
-        }
-        // #675: fall back to the Board selection when on the Board panel.
-        if self.active_view == SidebarView::Board {
-            let (coord_repo, num) = self.board_selected_issue()?;
-            let slug = self
-                .data
-                .pipeline_repos
-                .iter()
-                .find(|(name, _)| *name == coord_repo)
-                .map(|(_, s)| s.clone())
-                .unwrap_or_else(|| coord_repo.clone());
-            return Some((coord_repo, (slug, num)));
         }
         None
     }
@@ -41125,6 +41129,7 @@ mod tests {
         // a running review/test/merge.  #569's type-gate must still hold for the
         // generic launchers (`reattachable_session_aid(.., Work)` returns None).
         let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline; // Pipeline selection must win
         app.pipeline_issues.push(PipelineIssue {
             number: 10,
             title: "x".to_string(),
@@ -41257,6 +41262,7 @@ mod tests {
         // PRECISELY by repo + issue number — a same-number session in a DIFFERENT
         // repo (vimcode #514 vs claude-coordinator #514) must NOT match (#480).
         let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline; // Pipeline selection must win
         app.pipeline_issues.push(PipelineIssue {
             number: 514,
             title: "x".to_string(),
@@ -41313,6 +41319,7 @@ mod tests {
         // what left the menu offering "Reattach" while the launch fell through to
         // the "Select machine" picker.
         let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline; // Pipeline selection must win
         app.pipeline_issues.push(PipelineIssue {
             number: 494,
             title: "x".to_string(),
@@ -47895,6 +47902,7 @@ mod tests {
     #[test]
     fn selected_issue_repo_and_key_uses_coord_repo_field() {
         let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline; // function is Pipeline-view-specific
         app.pipeline_issues = vec![PipelineIssue {
             number: 467,
             title: "t".to_string(),
@@ -47918,6 +47926,7 @@ mod tests {
     #[test]
     fn selected_issue_repo_and_key_falls_back_to_repo_slug_last_segment() {
         let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline; // function is Pipeline-view-specific
         app.pipeline_issues = vec![PipelineIssue {
             number: 1,
             title: "t".to_string(),
@@ -47948,6 +47957,7 @@ mod tests {
         // determine the repo, not a by-number lookup that would always match
         // the first row regardless of which is selected.
         let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline; // function is Pipeline-view-specific
         app.pipeline_issues = vec![
             PipelineIssue {
                 number: 207,
@@ -49158,6 +49168,81 @@ mod tests {
 
     // ── #675 BUG 3: Board Terminal is per-issue, not a shared singleton ─────────
     //
+    // ── #675 BUG 5: selected_issue_repo_and_key Board-view guard ────────────
+    //
+    // When `active_view == Board`, `selected_issue_repo_and_key()` must return
+    // the board-selected issue even when `pipeline_sel` is set.  This is the
+    // key used by `launch_interactive_session_on_machine` to store the spawned
+    // chat session; a mismatch caused the session to be stored under the
+    // pipeline key while `selected_issue_key()` (used by the renderer) looked
+    // up the board key → the terminal tab always showed a plain shell.
+
+    #[test]
+    fn selected_issue_repo_and_key_on_board_view_uses_board_selection_not_pipeline_sel() {
+        // Set up a board with one running issue (repo-a #10).
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+
+        // Select the board issue.
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+
+        // Set a pipeline selection that differs from the board issue.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 999,
+            title: "pipeline distractor".to_string(),
+            body: String::new(),
+            repo_slug: "owner/other".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+
+        // On Board view: board selection must win over pipeline_sel.
+        app.active_view = SidebarView::Board;
+        let result = app.selected_issue_repo_and_key();
+        assert!(result.is_some(), "expected board issue, got None");
+        let (coord_repo, (slug, num)) = result.unwrap();
+        assert_eq!(
+            num, 10,
+            "#675 BUG 5: issue number must be board issue 10, not pipeline issue 999"
+        );
+        assert_eq!(
+            coord_repo, "repo-a",
+            "#675 BUG 5: coord_repo must come from the board selection"
+        );
+        assert_eq!(
+            slug, "repo-a",
+            "#675 BUG 5: slug must come from the board selection"
+        );
+    }
+
+    #[test]
+    fn selected_issue_repo_and_key_on_board_view_returns_none_when_no_board_selection() {
+        // Board view with no board selection, but pipeline_sel set.
+        // selected_issue_repo_and_key() must return None — not the pipeline issue.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "pipeline issue".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+
+        assert!(
+            app.selected_issue_repo_and_key().is_none(),
+            "#675 BUG 5: Board view with no board selection must return None even when pipeline_sel is set"
+        );
+    }
+
     // When `active_view == Board`, `selected_issue_key()` must return the
     // currently-selected BOARD issue — not `pipeline_sel` — so that switching
     // between Board rows shows each issue's own terminal session.
