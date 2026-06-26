@@ -1162,3 +1162,140 @@ class TestPendingSummary:
         assert set(s.keys()) == {"api", "ui"}
         assert [x.assignment_id for x in s["api"]] == ["a"]
         assert [x.assignment_id for x in s["ui"]] == ["c"]
+
+
+# ── #732 drop_entry / prune_stale_queue_entries ───────────────────────────────
+
+class TestDropEntry:
+    """#732: drop_entry() removes exactly one row by assignment_id."""
+
+    def test_drops_existing_entry(self, coord_db) -> None:
+        save_queue([_q("aid1"), _q("aid2")])
+        removed = mq.drop_entry("aid1")
+        assert removed is True
+        remaining = load_queue()
+        assert [x.assignment_id for x in remaining] == ["aid2"]
+
+    def test_returns_false_when_not_found(self, coord_db) -> None:
+        save_queue([_q("aid1")])
+        removed = mq.drop_entry("ghost")
+        assert removed is False
+        # original entry untouched
+        assert len(load_queue()) == 1
+
+    def test_returns_false_on_empty_queue(self, coord_db) -> None:
+        assert mq.drop_entry("anything") is False
+
+    def test_only_removes_exact_match(self, coord_db) -> None:
+        """Prefix / substring of an ID must not match."""
+        save_queue([_q("aid-long"), _q("aid")])
+        mq.drop_entry("aid")
+        remaining = [x.assignment_id for x in load_queue()]
+        assert "aid-long" in remaining
+        assert "aid" not in remaining
+
+
+class TestPruneStaleQueueEntries:
+    """#732: prune_stale_queue_entries() removes closed-issue / merged-PR entries."""
+
+    def _seed(self, coord_db, entries: list[QueuedMerge]) -> None:
+        save_queue(entries)
+
+    def test_prunes_closed_issue(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: n == 217)
+        monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, branch: False)
+
+        self._seed(coord_db, [
+            _q("stale", state=CONFLICT),
+            _q("live"),
+        ])
+        pruned = mq.prune_stale_queue_entries()
+        assert len(pruned) == 0  # issue_number on _q() is 1, not 217
+        # Seed with the right issue number
+        save_queue([
+            QueuedMerge(
+                assignment_id="stale217",
+                repo_name="api", repo_github="acme/api",
+                branch="issue-217-foo", target_branch="main",
+                issue_number=217, issue_title="closed issue",
+                state=CONFLICT,
+            ),
+            _q("live"),
+        ])
+        pruned = mq.prune_stale_queue_entries()
+        assert len(pruned) == 1
+        assert pruned[0].assignment_id == "stale217"
+        remaining = load_queue()
+        assert len(remaining) == 1
+        assert remaining[0].assignment_id == "live"
+
+    def test_prunes_merged_pr(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: False)
+        monkeypatch.setattr(
+            github_ops, "pr_is_merged",
+            lambda repo, branch: branch == "issue-1-merged-branch",
+        )
+
+        save_queue([
+            QueuedMerge(
+                assignment_id="merged-aid",
+                repo_name="api", repo_github="acme/api",
+                branch="issue-1-merged-branch", target_branch="main",
+                issue_number=1, issue_title="t",
+                state=PENDING,
+            ),
+            _q("live", branch="issue-2-live"),
+        ])
+        pruned = mq.prune_stale_queue_entries()
+        assert [x.assignment_id for x in pruned] == ["merged-aid"]
+        assert [x.assignment_id for x in load_queue()] == ["live"]
+
+    def test_leaves_merged_state_entry_untouched(self, coord_db, monkeypatch) -> None:
+        """MERGED-state entries are correct history — must not be re-checked."""
+        from coord import github_ops
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            github_ops, "issue_is_closed",
+            lambda repo, n: calls.append("closed") or False,
+        )
+        monkeypatch.setattr(
+            github_ops, "pr_is_merged",
+            lambda repo, b: calls.append("pr") or False,
+        )
+
+        save_queue([_q("done", state=MERGED)])
+        pruned = mq.prune_stale_queue_entries()
+        assert pruned == []
+        assert calls == []  # no gh calls at all
+        assert len(load_queue()) == 1
+
+    def test_dry_run_does_not_write(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: True)
+        monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: False)
+
+        save_queue([_q("stale")])
+        pruned = mq.prune_stale_queue_entries(dry_run=True)
+        assert len(pruned) == 1
+        assert len(load_queue()) == 1  # still there — dry run
+
+    def test_fail_open_on_gh_error(self, coord_db, monkeypatch) -> None:
+        """A gh error in issue_is_closed keeps the entry (fail-open)."""
+        from coord import github_ops
+
+        monkeypatch.setattr(
+            github_ops, "issue_is_closed",
+            lambda repo, n: False,  # gh error simulated as False (fail-open)
+        )
+        monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: False)
+
+        save_queue([_q("live")])
+        pruned = mq.prune_stale_queue_entries()
+        assert pruned == []
+        assert len(load_queue()) == 1

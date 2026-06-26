@@ -740,6 +740,69 @@ def process(
     return events
 
 
+# ── Drop / prune (#732) ──────────────────────────────────────────────────
+
+def drop_entry(assignment_id: str) -> bool:
+    """Remove exactly the merge_queue row keyed to *assignment_id*.
+
+    Returns ``True`` when a row was deleted, ``False`` when no matching row
+    was found.  This is the surgical mutation that ``coord merge --drop`` and
+    the TUI "drop" action use; it never touches other rows.
+
+    Because the queue lives on the daemon host, callers on thin clients must
+    route through the daemon (``/merge`` endpoint with ``"drop": aid`` in the
+    body) rather than calling this directly — the daemon guard pattern is the
+    same as ``coord merge`` (#584).
+    """
+    conn = get_connection()
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM merge_queue WHERE assignment_id = ?", (assignment_id,)
+        )
+    return cursor.rowcount > 0
+
+
+def prune_stale_queue_entries(dry_run: bool = False) -> list["QueuedMerge"]:
+    """Remove merge_queue entries whose issue is closed or PR is already merged.
+
+    Returns the list of pruned entries so callers can surface them in output.
+
+    Only non-``MERGED`` entries are inspected — entries already recorded as
+    ``MERGED`` are correct history and are left untouched.
+
+    Uses :func:`coord.github_ops.issue_is_closed` and
+    :func:`coord.github_ops.pr_is_merged`, both of which **fail-open**
+    (return ``False`` on any ``gh`` error) so a transient GitHub/CLI failure
+    never silently prunes a live entry.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    entries = load_queue()
+    stale: list[QueuedMerge] = []
+    surviving: list[QueuedMerge] = []
+
+    for entry in entries:
+        if entry.state == MERGED:
+            surviving.append(entry)
+            continue
+
+        is_stale = False
+        if github_ops.issue_is_closed(entry.repo_github, entry.issue_number):
+            is_stale = True
+        elif entry.branch and github_ops.pr_is_merged(entry.repo_github, entry.branch):
+            is_stale = True
+
+        if is_stale:
+            stale.append(entry)
+        else:
+            surviving.append(entry)
+
+    if not dry_run and stale:
+        save_queue(surviving)
+
+    return stale
+
+
 # ── Convenience ──────────────────────────────────────────────────────────
 
 def pending_summary(items: list[QueuedMerge]) -> dict[str, list[QueuedMerge]]:
