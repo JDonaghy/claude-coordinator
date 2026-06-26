@@ -1,0 +1,56 @@
+# coord web — phone/web control-center dashboard (#700/#703).
+#
+# A systemd *user* unit (mirrors coord-serve). Serves the board dashboard +
+# the React/Vite phone PWA on port 7434. It is the THIRD always-on user
+# service, after coord-agent (every worker box) and coord-serve (the DB host).
+#
+# Install on the SAME always-on box that owns ~/.coord/coord.db (dellserver):
+# `coord web` reads the LOCAL board (state.load_board/build_board) — it does
+# NOT yet go through the coord serve daemon — so it MUST run where the DB
+# lives. Do not run it on a thin-client machine (it would render an empty
+# board). Routing it through the daemon so it can run anywhere — like the
+# CLI/TUI thin clients — is tracked in #749 (the BoardService facade).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-web.service ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-web
+#
+# Prereqs on the dashboard host (== the DB host):
+#   - ~/.coord-venv has a coord build whose package includes the BUILT webapp
+#     at coord/dashboard/webapp/dist/. dist/ is gitignored and NOT yet shipped
+#     in the PyPI wheel (#703), so until that lands either:
+#       (a) serve from an editable checkout where you've built the webapp:
+#           cd coord/dashboard/webapp && npm install && npm run build
+#           (and point ExecStart at that checkout's `coord` if it isn't
+#            ~/.coord-venv), or
+#       (b) accept the fallback: with no dist/, the server serves the LEGACY
+#           HTML dashboard, not the React PWA.
+#   - ~/.coord/coordinator.yml exists (canonical location; same resolution as
+#     the daemon: $COORD_CONFIG → ~/.coord/coordinator.yml → ./coordinator.yml).
+#   - ~/.coord/coord.db exists (this box owns it).
+#
+# Reach it from a phone on the tailnet: http://<dellserver-host>:7434
+# (same-origin API, so the phone needs no config; Add to Home Screen installs
+# the PWA).
+#
+# Restart over SSH needs the runtime-dir prefix (same #404 caveat as the agent):
+#   XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-web
+#
+# See docs/AGENT_OPERATIONS.md → "Web dashboard (coord web)".
+
+[Unit]
+Description=coord web — phone/web control-center dashboard (#700)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.coord-venv/bin/coord web --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7434
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

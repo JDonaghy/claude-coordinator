@@ -41,9 +41,17 @@ than assuming the publish failed.
 
 **Anything that changes `coord/agent.py` (e.g. the worker system
 prompts) only takes effect on agents after a release + rollout.**
-Coordinator-only code (CLI, `notify.py`, parsers, TUI) is live from the
-editable install the moment it's on disk — but agents run from PyPI, so
-agent-side changes need this release flow plus the rollout below.
+Coordinator-only Python (CLI, `notify.py`, `merge_queue.py`, parsers) is
+live from the editable install the moment it's on disk — but agents run
+from PyPI, so agent-side changes need this release flow plus the rollout
+below. Two surfaces sit outside this PyPI flow entirely:
+
+- **`coord-tui`** is a Rust binary — rebuild + reinstall locally
+  (`cd tui && cargo build && cp target/debug/coord-tui ~/.local/bin/`),
+  never PyPI. Don't bump the version for tui-only changes.
+- **The phone webapp** (`coord/dashboard/webapp/`) needs `npm run build`
+  and is not yet bundled in the wheel — see "Web dashboard (`coord web`)"
+  below and #703.
 
 ## Install a new agent (first time)
 
@@ -205,6 +213,43 @@ deleted) until the daemon has run clean for a day.
 ```bash
 systemctl --user restart coord-serve
 journalctl --user -u coord-serve -f
+```
+
+## Web dashboard (`coord web`, #700/#703)
+
+`coord web` serves the board dashboard + the React/Vite **phone PWA** on port
+7434. It is the **third always-on user service**, after `coord agent` (every
+worker box) and `coord serve` (the DB host). Like the daemon it belongs on
+**dellserver only**: `coord web` reads the **local** `~/.coord/coord.db`
+directly (`state.load_board`/`build_board`) — it does **not** route through the
+`coord serve` daemon — so it must run on the box that owns the DB. On a thin
+client it renders an empty board. (Routing it through the daemon so it can run
+anywhere, like the CLI/TUI clients, is tracked in **#749**.)
+
+The deployment picture, end to end:
+
+| Service | Port | Host | Unit |
+|---|---|---|---|
+| `coord agent` | 7433 | every worker machine | `coord-agent.service` (via `install-agent.sh`) |
+| `coord serve` | 7435 | dellserver only (owns the DB) | `deploy/coord-serve.service` |
+| `coord web` | 7434 | dellserver only (reads the local DB) | `deploy/coord-web.service` |
+
+The phone is just a browser: open `http://<dellserver-host>:7434` on the tailnet
+and Add to Home Screen (the API is same-origin, so no client config).
+
+**Build, run, and phone access:** see [`docs/PHONE_WEBAPP.md`](PHONE_WEBAPP.md) —
+the PWA bundle is gitignored and not yet bundled in the wheel (#703), so build it
+with `npm run build` from a checkout on the dashboard host, then `coord web`
+serves it automatically.
+
+**Service unit:** [`deploy/coord-web.service`](../deploy/coord-web.service) (full
+unit + prereqs in its header). Install + restart:
+
+```bash
+cp deploy/coord-web.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now coord-web
+# restart over SSH needs the runtime-dir prefix (same #404 caveat as the agent):
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-web
 ```
 
 ## Graphify graph: reseed a machine's local clone

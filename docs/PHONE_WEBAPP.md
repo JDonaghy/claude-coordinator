@@ -77,26 +77,14 @@ coord web --port 7434            # explicit port (default)
 coord web --host 127.0.0.1       # localhost-only (if you want a reverse proxy)
 ```
 
-**Run it as a service** (systemd, launchd, or tmux) so it stays up between sessions:
-
-```ini
-# ~/.config/systemd/user/coord-web.service
-[Unit]
-Description=coord web dashboard
-After=network.target
-
-[Service]
-ExecStart=%h/.coord-venv/bin/coord web
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-```
+**Run it as a service** so it stays up between sessions. A ready-made systemd
+*user* unit ships at [`deploy/coord-web.service`](../deploy/coord-web.service)
+(with prereqs + the `npm run build` / #703 caveat in its header):
 
 ```bash
-systemctl --user enable coord-web
-systemctl --user start coord-web
+cp deploy/coord-web.service ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload && systemctl --user enable --now coord-web
 ```
 
 ---
