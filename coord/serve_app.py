@@ -91,6 +91,37 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _passive_tick(config: Config) -> tuple[list[dict], list[str]]:
+    """One passive daemon tick: reconcile completed assignments + enqueue approved work.
+
+    Extracted as a module-level function so tests can call it directly without
+    wiring up the async ``_tick_loop`` infrastructure.
+
+    Steps:
+    1. ``reconcile_completed_assignments`` — flip any agent-finished running
+       rows to their terminal status (the #625 passive reconcile).  Loads the
+       board internally so it can be fully monkeypatched in tests.
+    2. ``enqueue_approved_work`` — add / re-key merge-queue entries for all
+       approved + tested done work (#736 / #217 invisible limbo fix).  Also
+       loads the board internally (a fresh snapshot after reconcile wrote DB
+       state) so the two steps are independently testable.
+
+    Returns ``(reconciled, enqueued)`` where *reconciled* is the list of dicts
+    from :func:`~coord.reconcile.reconcile_completed_assignments` and *enqueued*
+    is the list of assignment IDs newly added/re-keyed in the merge queue.
+
+    Note: the daemon ``_tick_loop`` calls these two steps with **separate**
+    ``try/except`` blocks so a failure in one does not silence the other.  This
+    function combines them for convenience in tests that want both results.
+    """
+    from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    reconciled = reconcile_completed_assignments(config)
+    enqueued = mq.enqueue_approved_work(config)  # loads its own board snapshot
+    return reconciled, enqueued
+
+
 def build_app(store: CoordStore, config: Config, *, token: str | None = None) -> Starlette:
     """Build the read-only control-center Starlette app bound to *store* + *config*.
 
@@ -589,9 +620,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
         async def _tick_loop() -> None:
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
+            from coord import merge_queue as _mq  # noqa: PLC0415
 
             while True:
                 await asyncio.sleep(interval)
+                # Step 1: reconcile (independent try/except so a failure here
+                # does not prevent the enqueue step below).
                 try:
                     reconciled = await run_in_threadpool(
                         reconcile_completed_assignments, config
@@ -607,6 +641,23 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         )
                 except Exception:  # noqa: BLE001 — a tick must never crash the daemon
                     log.warning("passive reconcile tick failed", exc_info=True)
+                # Step 2: enqueue approved work (#736 / #217 invisible limbo fix).
+                # Runs AFTER reconcile so freshly-completed work is on the board
+                # when we scan for approved assignments.  Independent try/except
+                # so a DB error here does not silence the reconcile step on the
+                # next tick.
+                try:
+                    enqueued = await run_in_threadpool(
+                        _mq.enqueue_approved_work, config
+                    )
+                    if enqueued:
+                        log.info(
+                            "passive enqueue: %d assignment(s) → merge queue (%s)",
+                            len(enqueued),
+                            ", ".join(enqueued),
+                        )
+                except Exception:  # noqa: BLE001
+                    log.warning("passive enqueue tick failed", exc_info=True)
 
         @contextlib.asynccontextmanager
         async def _ctx(_a):  # noqa: ANN202

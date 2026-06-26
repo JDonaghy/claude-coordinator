@@ -8146,12 +8146,16 @@ def merge(
                 cache=terminal_cache,
             ):
                 continue
-            entry = mq.enqueue(
+            # #736 / #292: use refresh_entry_assignment (not bare enqueue) so
+            # an existing PENDING entry is re-keyed to the latest fix assignment
+            # when the original assignment_id no longer matches.  Dedup by
+            # (repo_github, branch) is preserved — refresh_entry_assignment is a
+            # no-op when the entry is already correctly keyed.
+            if mq.refresh_entry_assignment(
                 a,
                 repo_github=repo_cfg.github,
                 target_branch=repo_cfg.default_branch,
-            )
-            if entry is not None:
+            ):
                 auto_enqueued.append(
                     f"  auto-enqueued: {a.repo_name} #{a.issue_number} "
                     f"({a.branch} → {repo_cfg.default_branch})"

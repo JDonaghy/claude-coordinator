@@ -867,6 +867,290 @@ class TestRefreshEntryAssignment:
         assert load_queue() == []
 
 
+class TestEnqueueApprovedWork:
+    """#736: enqueue_approved_work() is the daemon-tick path for reliable
+    enqueue-on-approval — called from _passive_tick every 30 seconds so
+    approved+tested work enters the merge queue without a manual coord merge.
+    """
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _config(*, review_enabled: bool = True, gates: list[str] | None = None):
+        """Minimal config-like object with .reviews, .pipeline, and .repo()."""
+        from dataclasses import dataclass, field as dc_field
+
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Repo:
+            name: str = "api"
+            github: str = "acme/api"
+            default_branch: str = "main"
+
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+            _repos: list = dc_field(default_factory=lambda: [_Repo()])
+
+            def repo(self, name: str):
+                return next((r for r in self._repos if r.name == name), None)
+
+        cfg = _Cfg()
+        cfg.reviews.enabled = review_enabled
+        cfg.pipeline.default_gates = gates if gates is not None else ["review", "test", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(completed=None, active=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str, *, test_state: str | None = "passed", branch: str | None = None) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done",
+            branch=branch or f"issue-1-{aid}",
+            test_state=test_state,
+        )
+
+    @staticmethod
+    def _review(of_aid: str, *, verdict: str = "approve") -> Assignment:
+        return Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=f"rev-{of_aid}", type="review", status="done",
+            review_of_assignment_id=of_aid, review_verdict=verdict,
+        )
+
+    # ── basic happy path ──────────────────────────────────────────────────
+
+    def test_enqueues_when_approved_and_test_passed(self, coord_db) -> None:
+        """Approved review + passed test → entry created in merge queue."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["w1"]
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "w1"
+        assert items[0].branch == "issue-1-w1"
+
+    def test_enqueues_when_test_state_is_skipped(self, coord_db) -> None:
+        """test_state='skipped' also satisfies the smoke gate."""
+        cfg = self._config()
+        work = self._work("w2", test_state="skipped")
+        rev = self._review("w2", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert "w2" in changed
+        assert any(i.assignment_id == "w2" for i in load_queue())
+
+    # ── idempotency ───────────────────────────────────────────────────────
+
+    def test_is_idempotent(self, coord_db) -> None:
+        """Second call with the same board is a no-op."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        first = mq.enqueue_approved_work(cfg, board)
+        second = mq.enqueue_approved_work(cfg, board)
+
+        assert first == ["w1"]
+        assert second == []  # already enqueued, no change
+        assert len(load_queue()) == 1
+
+    # ── gate conditions ───────────────────────────────────────────────────
+
+    def test_skips_when_review_required_but_not_approved(self, coord_db) -> None:
+        """No approved review → item is NOT enqueued when review is required."""
+        cfg = self._config(review_enabled=True, gates=["review", "test", "merge"])
+        work = self._work("w1", test_state="passed")
+        # No review assignment on the board.
+        board = self._board(completed=[work])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == []
+        assert load_queue() == []
+
+    def test_skips_when_test_required_but_no_verdict(self, coord_db) -> None:
+        """No test verdict → item is NOT enqueued when smoke is required."""
+        cfg = self._config(gates=["review", "test", "merge"])
+        work = self._work("w1", test_state=None)
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == []
+        assert load_queue() == []
+
+    def test_enqueues_when_reviews_disabled(self, coord_db) -> None:
+        """When reviews.enabled=False, the review gate is skipped entirely
+        and items with a passing smoke verdict are enqueued."""
+        cfg = self._config(review_enabled=False, gates=["test", "merge"])
+        work = self._work("w1", test_state="passed")
+        # No review on board — but reviews are disabled so it doesn't matter.
+        board = self._board(completed=[work])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert "w1" in changed
+        assert len(load_queue()) == 1
+
+    def test_enqueues_when_smoke_gate_not_configured(self, coord_db) -> None:
+        """When 'test' is absent from default_gates, smoke is not required."""
+        cfg = self._config(gates=["review", "merge"])  # no 'test' gate
+        work = self._work("w1", test_state=None)  # no test verdict — but gate off
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert "w1" in changed
+
+    def test_skips_work_with_no_branch(self, coord_db) -> None:
+        """Assignments without a branch are silently ignored."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        work.branch = None  # type: ignore[assignment]
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == []
+
+    def test_skips_already_merged_issue(self, coord_db) -> None:
+        """When a MERGED entry already exists for the issue, skip re-enqueueing."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+        # Seed a MERGED queue entry for the same issue.
+        mq.save_queue([_q("w1", state=mq.MERGED, repo="api")])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == []
+        # The existing MERGED entry is untouched.
+        assert load_queue()[0].state == mq.MERGED
+
+    def test_skips_unknown_repo(self, coord_db) -> None:
+        """Assignments for a repo not in config are silently skipped."""
+        cfg = self._config()  # only has 'api'
+        work = Assignment(
+            machine_name="m1", repo_name="unknown-repo", issue_number=1,
+            issue_title="t", assignment_id="w1", type="work",
+            status="done", branch="issue-1-w1", test_state="passed",
+        )
+        rev = Assignment(
+            machine_name="m2", repo_name="unknown-repo", issue_number=1,
+            issue_title="t", assignment_id="rev-w1", type="review",
+            status="done", review_of_assignment_id="w1", review_verdict="approve",
+        )
+        board = self._board(completed=[work, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == []
+
+    # ── re-keying after bounce (#292) ─────────────────────────────────────
+
+    def test_rekeyes_after_bounce(self, coord_db) -> None:
+        """After a review bounce the fix work's approval re-keys the queue
+        entry so has_approved_review can find it (#292 Defect 2)."""
+        cfg = self._config()
+
+        # Original work is done; its entry was created by a prior coord merge run.
+        orig_work = self._work("orig", branch="issue-1-orig")
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="orig",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-1-orig",
+                target_branch="main",
+                issue_number=1,
+                issue_title="t",
+            )
+        ])
+
+        # Fix work is now done on the same branch; it was approved.
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="[fix-1] t",
+            assignment_id="fix1", type="work", status="done",
+            branch="issue-1-orig",  # same branch as orig_work
+            test_state="passed",
+        )
+        fix_rev = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-fix1", type="review", status="done",
+            review_of_assignment_id="fix1", review_verdict="approve",
+        )
+        board = self._board(completed=[orig_work, fix_work, fix_rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        # The entry was re-keyed to fix1 (the approved fix assignment).
+        assert changed == ["fix1"]
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "fix1"
+        assert items[0].branch == "issue-1-orig"
+
+    def test_rekeying_is_idempotent(self, coord_db) -> None:
+        """Re-keying is a no-op when the entry is already keyed to fix1."""
+        cfg = self._config()
+
+        # Entry already keyed to fix1.
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="fix1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-1-orig",
+                target_branch="main",
+                issue_number=1,
+                issue_title="t",
+            )
+        ])
+
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="[fix-1] t",
+            assignment_id="fix1", type="work", status="done",
+            branch="issue-1-orig",
+            test_state="passed",
+        )
+        fix_rev = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-fix1", type="review", status="done",
+            review_of_assignment_id="fix1", review_verdict="approve",
+        )
+        board = self._board(completed=[fix_work, fix_rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == []  # already correct — no change
+        assert load_queue()[0].assignment_id == "fix1"
+
+
 class TestPendingSummary:
     def test_groups_by_repo_excludes_terminal(self) -> None:
         items = [

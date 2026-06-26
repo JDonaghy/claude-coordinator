@@ -1396,3 +1396,94 @@ def test_post_result_unset_writes_local(coord_db, monkeypatch):
         "SELECT status FROM assignments WHERE assignment_id='work13'"
     ).fetchone()
     assert row["status"] == "done"
+
+
+# ── Passive tick (#736 / #217): daemon enqueues approved work on every interval ──
+
+
+def _seed_approved_done_work(conn, *, aid: str = "work99", branch: str = "issue-7-impl") -> None:
+    """Seed an approved + test-passed done work assignment into the shared DB.
+
+    Inserts:
+    - A done work assignment on *branch* with ``test_state='passed'``.
+    - A done review assignment pointing at it with ``review_verdict='approve'``.
+
+    After these rows are present, ``build_board()`` will include them in
+    ``board.completed`` and ``enqueue_approved_work`` should enqueue the work.
+    The DB must already have ``board_initialized`` set (coord_db autouse fixture
+    sets this via ``_ensure_schema``; for ``rw_db`` we set it explicitly).
+    """
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, branch, test_state) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (aid, "laptop", "api", "acme/api", 7, "The issue", "done", "work", branch, "passed"),
+    )
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, review_of_assignment_id, review_verdict) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            f"rev-{aid}", "server", "api", "acme/api", 7, "Review of issue",
+            "done", "review", aid, "approve",
+        ),
+    )
+    conn.commit()
+
+
+def test_passive_tick_enqueues_approved_work(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#736: _passive_tick() enqueues an approved+tested work assignment into the
+    merge queue without a manual ``coord merge`` call.
+
+    This is the key regression guard for the #217 invisible limbo: the daemon
+    tick now reliably enqueues approved work on every interval, independent of
+    ``pipeline.auto_loop`` or ``coord notify``.
+    """
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.serve_app import _passive_tick
+
+    # reconcile_completed_assignments polls the agent HTTP API; stub it to avoid
+    # network calls and focus the test on the enqueue path.
+    monkeypatch.setattr(
+        "coord.reconcile._query_agent",
+        lambda host: None,  # agent unreachable → reconcile is a no-op
+    )
+
+    _seed_approved_done_work(rw_db)
+    cfg = load_config(valid_config_path)
+
+    reconciled, enqueued = _passive_tick(cfg)
+
+    # Reconcile found nothing (we stubbed the agent).
+    assert reconciled == []
+    # The approved+tested assignment was enqueued by the tick.
+    assert enqueued == ["work99"]
+    items = mq.load_queue()
+    assert len(items) == 1
+    assert items[0].assignment_id == "work99"
+    assert items[0].branch == "issue-7-impl"
+    assert items[0].repo_github == "acme/api"
+
+
+def test_passive_tick_is_idempotent(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """A second tick with the same approved work produces no further queue changes."""
+    from coord.config import load as load_config
+    from coord.serve_app import _passive_tick
+
+    monkeypatch.setattr("coord.reconcile._query_agent", lambda host: None)
+    _seed_approved_done_work(rw_db)
+    cfg = load_config(valid_config_path)
+
+    _passive_tick(cfg)  # first tick — creates the entry
+    _, enqueued2 = _passive_tick(cfg)  # second tick — already keyed correctly
+
+    assert enqueued2 == []
