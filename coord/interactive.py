@@ -1849,6 +1849,66 @@ def _remote_worktree_remove(
     return "__WT_DONE" in (result.stdout or "")
 
 
+def _remote_orphan_is_safe_to_prune(
+    ssh_target: str,
+    remote_repo_sh: str,
+    holder_abs_path: str,
+    branch: str,
+    *,
+    timeout: float = 15.0,
+) -> bool:
+    """Return ``True`` only when a dead holder worktree is safe to auto-prune.
+
+    Safety gate for the auto-prune-and-retry path (#759).  Both conditions
+    must hold before the coordinator removes a worktree without operator
+    intervention:
+
+    1. **Clean** — ``git status --porcelain`` inside *holder_abs_path* is
+       empty (no staged or unstaged changes).
+    2. **Fully pushed** — the holder's HEAD SHA matches the tip of
+       ``origin/refs/heads/<branch>`` (no local commits that haven't been
+       pushed to the remote).
+
+    *holder_abs_path* must be the **absolute** path as returned by
+    :func:`find_remote_branch_holder` (e.g.
+    ``/home/john/.coord/worktrees/<id>``).
+
+    *remote_repo_sh* is the ``$HOME``-form path to the repo checkout on
+    the remote machine (e.g. ``$HOME/src/myrepo``); the remote shell
+    expands ``$HOME`` correctly.
+
+    Returns ``False`` on any SSH / git failure — conservative default,
+    never auto-removes when the check cannot be completed.
+    """
+    holder_q = shlex.quote(holder_abs_path)
+    # branch is always issue-<N>-<slug> (alphanumeric + hyphens) — safe to
+    # interpolate directly, but quote defensively.
+    branch_q = shlex.quote(branch)
+    # The script runs on the remote shell.  $HOME in remote_repo_sh is
+    # expanded by the remote shell (passed unquoted); holder_q is a
+    # single-quoted absolute path (no $HOME expansion needed).
+    remote_cmd = (
+        f"cd {holder_q} 2>/dev/null || {{ echo __NOT_SAFE; exit 0; }}; "
+        f"STATUS=$(git status --porcelain 2>/dev/null); "
+        f"HEAD_SHA=$(git rev-parse HEAD 2>/dev/null); "
+        f"ORIGIN_SHA=$(git -C {remote_repo_sh} ls-remote origin"
+        f" refs/heads/{branch_q} 2>/dev/null | awk '{{print $1}}'); "
+        f"if [ -z \"$STATUS\" ] && [ -n \"$HEAD_SHA\" ] && [ -n \"$ORIGIN_SHA\" ]"
+        f" && [ \"$HEAD_SHA\" = \"$ORIGIN_SHA\" ]; then"
+        f" echo __SAFE; else echo __NOT_SAFE; fi"
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False  # SSH/timeout failure → conservative: do not auto-prune
+    return "__SAFE" in (result.stdout or "")
+
+
 def remote_worktree_exists(
     ssh_target: str,
     remote_worktree_sh: str,
