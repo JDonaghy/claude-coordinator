@@ -1952,7 +1952,7 @@ struct ContextMenuState {
 }
 
 #[derive(Clone, serde::Deserialize)]
-#[allow(dead_code)] // assignment_id and pr_url stored for future display
+#[allow(dead_code)] // pr_url stored for future display
 struct MergeQueueEntry {
     assignment_id: String,
     #[serde(default)]
@@ -1973,6 +1973,11 @@ struct MergeQueueEntry {
     /// is the single most useful clue when a merge is stalled.
     #[serde(default)]
     error: Option<String>,
+    /// Milestone title — client-side join from `open_issues` keyed on
+    /// `(repo_name, issue_number)`.  `None` when the issue carries no
+    /// milestone or the issue row is absent from `open_issues`.
+    #[serde(default)]
+    milestone_title: Option<String>,
 }
 
 /// CI check status for one PR, fetched in the background via `gh pr checks`.
@@ -3590,6 +3595,9 @@ fn load_data() -> BoardData {
                         repo_github: row.get::<_, String>(5)?,
                         target_branch: row.get::<_, Option<String>>(6)?,
                         error: row.get::<_, Option<String>>(7)?,
+                        // milestone_title is filled in by the client-side join
+                        // in assemble_board_data after open_issues are loaded.
+                        milestone_title: None,
                     })
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -3800,6 +3808,32 @@ fn assemble_board_data(
         .find(|(_, host, _)| host.eq_ignore_ascii_case(&local_hostname))
         .map(|(name, _, _)| name.clone())
         .unwrap_or_default();
+
+    // ── Client-side milestone join for merge_queue ────────────────────────
+    // For each merge-queue entry, look up the milestone from open_issues on
+    // (coord_repo_name, issue_number).  pipeline_repos maps coord repo name →
+    // github slug; we reverse it to map entry.repo_github → coord repo name,
+    // then scan open_issues for a matching row.
+    let merge_queue: Vec<MergeQueueEntry> = merge_queue
+        .into_iter()
+        .map(|mut entry| {
+            if let Some(issue_num) = entry.issue_number {
+                let coord_repo = pipeline_repos
+                    .iter()
+                    .find(|(_, gh)| *gh == entry.repo_github)
+                    .map(|(name, _)| name.as_str());
+                if let Some(cr) = coord_repo {
+                    if let Some(oi) = open_issues
+                        .iter()
+                        .find(|oi| oi.number == issue_num && oi.repo_name == cr)
+                    {
+                        entry.milestone_title = oi.milestone_title.clone();
+                    }
+                }
+            }
+            entry
+        })
+        .collect();
 
     BoardData {
         local_machine,
@@ -5748,6 +5782,12 @@ pub struct CoordApp {
     /// to `data.merge_queue.len().saturating_sub(1)` on navigation so it never
     /// goes out of bounds even after a data refresh.
     merge_queue_sel: usize,
+    /// Scroll offset (first visible row index) for the Merge Queue panel list.
+    /// Updated by `fix_merge_queue_scroll` after every j/k/Home/End navigation
+    /// and passed as `scroll_offset` to `draw_list` so the selected item stays
+    /// in the visible window.  See quadraui `primitives/list.rs`: "The app
+    /// updates `selected_idx` and `scroll_offset` for the next frame."
+    merge_queue_scroll: usize,
 
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
@@ -6059,8 +6099,9 @@ impl CoordApp {
                 col_scroll_offset: 0,
             },
             kanban_layout: std::cell::RefCell::new(None),
-            // #737: Merge Queue panel — selection starts at the first entry.
+            // #737: Merge Queue panel — selection and scroll start at the top.
             merge_queue_sel: 0,
+            merge_queue_scroll: 0,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
@@ -8384,6 +8425,52 @@ impl CoordApp {
         }
     }
 
+    /// Keep the selected merge-queue entry inside the visible window.
+    ///
+    /// Must be called after every j/k/Home/End navigation in the Merge Queue
+    /// panel.  `visible` is the number of rows the list widget can display
+    /// (pass `content_visible_rows(rect, lh)` from the render path, or a
+    /// reasonable constant like 10 in tests).  The quadraui list widget's
+    /// `layout()` skips rows above `scroll_offset`, so `merge_queue_scroll`
+    /// must track the display-index of the selected entry (accounting for
+    /// milestone-group header rows that precede it in the items array).
+    /// Same structural pattern as `fix_machine_scroll`.
+    fn fix_merge_queue_scroll(&mut self, visible: usize) {
+        if visible == 0 {
+            return;
+        }
+        let sel = self.merge_queue_display_idx_for_sel();
+        if sel < self.merge_queue_scroll {
+            self.merge_queue_scroll = sel;
+        } else if sel >= self.merge_queue_scroll + visible {
+            self.merge_queue_scroll = sel + 1 - visible;
+        }
+    }
+
+    /// Return the display-list index for the currently selected merge-queue
+    /// entry, accounting for milestone-group header rows inserted before each
+    /// group in `render_merge_queue_panel`.
+    ///
+    /// Counts the number of distinct `milestone_title` values seen in
+    /// `data.merge_queue[0..=sel]` (first-appearance order) — each unique
+    /// value corresponds to one header row.  Adding that count to `sel` gives
+    /// the row index the selected entry occupies in the rendered items array.
+    fn merge_queue_display_idx_for_sel(&self) -> usize {
+        let entries = &self.data.merge_queue;
+        if entries.is_empty() {
+            return 0;
+        }
+        let sel = self.merge_queue_sel.min(entries.len() - 1);
+        // Count distinct milestone groups whose header appears at or before `sel`.
+        let mut seen: Vec<Option<String>> = Vec::new();
+        for entry in entries.iter().take(sel + 1) {
+            if !seen.contains(&entry.milestone_title) {
+                seen.push(entry.milestone_title.clone());
+            }
+        }
+        sel + seen.len()
+    }
+
     // ── Widget builders ──────────────────────────────────────────────────
 
     fn machines_list(&self, has_focus: bool) -> ListView {
@@ -9786,10 +9873,13 @@ impl CoordApp {
     }
 
     /// Render the Merge Queue main panel — a scrollable list of all merge-queue
-    /// entries with their state, PR number, issue title, and error reason.
+    /// entries grouped by milestone, with their state, PR number, issue title,
+    /// and error reason.
     ///
-    /// The selected entry is highlighted.  The list uses `bordered: true` so
-    /// it has a visible box boundary matching the Pipeline detail style.
+    /// Entries are rendered under `Decoration::Header` milestone group labels.
+    /// When no entry carries a milestone the single group is labelled
+    /// "(No milestone)".  The selected entry is highlighted; `scroll_offset`
+    /// is driven by `merge_queue_scroll` so the selected row stays in view.
     fn render_merge_queue_panel(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
         let n = self.data.merge_queue.len();
         if n == 0 {
@@ -9802,32 +9892,63 @@ impl CoordApp {
         }
 
         // Clamp the selection in case the queue shrank after a drop.
-        let sel = self.merge_queue_sel.min(n - 1);
+        let sel_entry = self.merge_queue_sel.min(n - 1);
 
-        let items: Vec<ListItem> = self.data.merge_queue.iter().map(|entry| {
+        // ── Build items grouped by milestone ─────────────────────────────
+        // A `Decoration::Header` separator is inserted before the first entry
+        // of each distinct milestone group (first-appearance order).  The
+        // display index of `sel_entry` (used as `selected_idx`) must account
+        // for the header rows that precede it.
+        let mut items: Vec<ListItem> = Vec::with_capacity(n + 8);
+        let mut selected_idx = 0usize;
+        let mut last_ms: Option<Option<String>> = None; // sentinel: never matches first entry
+
+        for (i, entry) in self.data.merge_queue.iter().enumerate() {
+            let ms = entry.milestone_title.clone();
+            // Insert a header whenever the milestone changes (consecutive-run grouping).
+            if last_ms.as_ref() != Some(&ms) {
+                let header_label = ms.as_deref().unwrap_or("(No milestone)");
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            format!(" {} ", header_label),
+                            Color::rgb(150, 190, 230),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+                last_ms = Some(ms);
+            }
+            // Record the display index of the selected entry.
+            if i == sel_entry {
+                selected_idx = items.len();
+            }
             let label = self.merge_queue_entry_label(entry);
             let color = self.merge_queue_entry_color(entry);
-            ListItem {
+            items.push(ListItem {
                 text: StyledText {
                     spans: vec![StyledSpan::with_fg(&label, color)],
                 },
                 icon: None,
                 detail: None,
                 decoration: Decoration::Normal,
-            }
-        }).collect();
+            });
+        }
 
+        let total = items.len();
         backend.draw_list(rect, &ListView {
             id: WidgetId::new("mergequeue-list"),
             title: Some(StyledText::plain(" MERGE QUEUE ")),
             items,
-            selected_idx: sel,
-            scroll_offset: 0,
+            selected_idx,
+            scroll_offset: self.merge_queue_scroll,
             has_focus: true,
             bordered: true,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: n > 10,
+            show_v_scrollbar: total > 10,
         });
     }
 
@@ -16990,7 +17111,7 @@ impl CoordApp {
             // know about the activity-bar key shortcuts.
             StatusBarSegment {
                 text: format!(
-                    " {}  [1=Board 2=Machines 3=Pipeline 4=Settings 5=Terminal 7=MQ] ",
+                    " {}  [1=Board 2=Machines 3=Pipeline 4=Settings 5=Terminal 6=Kanban 7=MQ] ",
                     view_label
                 ),
                 fg: Color::rgb(200, 220, 255),
@@ -28893,12 +29014,14 @@ impl ShellApp for CoordApp {
                             self.merge_queue_sel =
                                 (self.merge_queue_sel + 1).min(n.saturating_sub(1));
                         }
+                        self.fix_merge_queue_scroll(content_visible_rows(list_b, lh));
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
                         if self.active_view == SidebarView::MergeQueue =>
                     {
                         self.merge_queue_sel = self.merge_queue_sel.saturating_sub(1);
+                        self.fix_merge_queue_scroll(content_visible_rows(list_b, lh));
                         needs_redraw = true;
                     }
                     // m → coord merge --order <assignment_id>  (merge-now)
@@ -29569,6 +29692,7 @@ impl ShellApp for CoordApp {
                             // #737: MergeQueue — Home jumps to first entry.
                             SidebarView::MergeQueue => {
                                 self.merge_queue_sel = 0;
+                                self.fix_merge_queue_scroll(content_visible_rows(list_b, lh));
                             }
                         }
                         needs_redraw = true;
@@ -29622,6 +29746,7 @@ impl ShellApp for CoordApp {
                                 if n > 0 {
                                     self.merge_queue_sel = n - 1;
                                 }
+                                self.fix_merge_queue_scroll(content_visible_rows(list_b, lh));
                             }
                         }
                         needs_redraw = true;
@@ -32111,6 +32236,7 @@ mod tests {
             kanban_layout: std::cell::RefCell::new(None),
             // #737
             merge_queue_sel: 0,
+            merge_queue_scroll: 0,
             // #217: use the default dark palette for test helpers.
             active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         }
@@ -34064,6 +34190,7 @@ mod tests {
             repo_github: "acme/repo-a".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         seed_open_issue_records(&mut app, "repo-a", &[7]);
         let cache = app.board_issues_cache.clone();
@@ -34819,6 +34946,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "done");
@@ -34915,6 +35043,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
 
         // Real state takes over — the merge_queue entry exists, so the
@@ -34969,6 +35098,7 @@ mod tests {
                 repo_github: "acme/api".to_string(),
                 target_branch: None,
                 error: None,
+                milestone_title: None,
             }],
             ..BoardData::default()
         };
@@ -36787,6 +36917,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         assert!(app.merge_blocked_on_review_for_selected_issue());
     }
@@ -36805,6 +36936,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         // An approved review on the board unblocks the merge.
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -36828,6 +36960,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -36852,6 +36985,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         assert!(!app.merge_blocked_on_review_for_selected_issue());
     }
@@ -36887,6 +37021,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -36915,6 +37050,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -36954,6 +37090,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         // Work assignment carries review_verdict='approve' directly — no
         // separate review assignment is present (the self-approval case).
@@ -36987,6 +37124,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         assert_eq!(
             app.pipeline_merge_state(),
@@ -37011,6 +37149,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -37079,6 +37218,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -37127,6 +37267,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
 
         // Original work (done, request-changes review).
@@ -37221,6 +37362,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
 
         let mut orig_work = _stage_assignment("orig-work", "work", 100.0, "done");
@@ -37266,6 +37408,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
 
         // Bounce scenario: original request-changes, fix approved.
@@ -37322,6 +37465,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -38039,6 +38183,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let issue = &app.pipeline_issues[0];
         // Lifecycle section must say "done" (open-but-merged path).
@@ -38063,6 +38208,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.pipeline_lifecycle_section(issue), "done");
@@ -38581,6 +38727,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Done);
@@ -38599,6 +38746,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Active);
@@ -38620,6 +38768,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
 
         // Failing CI → Failed.
@@ -38719,6 +38868,7 @@ mod tests {
             repo_github: repo.to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         }
     }
 
@@ -39102,6 +39252,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -39200,6 +39351,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[2].status, StageStatus::Failed);
@@ -40650,6 +40802,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         // Seed the cache directly — bypasses the gh subprocess.
         app.fetched_prs_cache.borrow_mut().insert(
@@ -40721,6 +40874,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         // Seed the cache with a fully populated PR including review.
         app.fetched_prs_cache.borrow_mut().insert(
@@ -40795,6 +40949,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         app.fetched_prs_cache.borrow_mut().insert(
             ("acme/api".to_string(), 244),
@@ -40854,6 +41009,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         // Pre-populate `pending_pr_fetches` so `pr_info_for_issue`
         // doesn't actually shell out to gh during the test.  An empty
@@ -41473,6 +41629,7 @@ mod tests {
                 repo_github: "JDonaghy/quadraui".to_string(),
                 target_branch: None,
                 error: None,
+                milestone_title: None,
             }],
             ..BoardData::default()
         });
@@ -43006,6 +43163,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.issue_number = 42;
@@ -43155,6 +43313,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: Some("main".to_string()),
             error: Some("CI check failed: build".to_string()),
+            milestone_title: None,
         });
         let briefing = app.troubleshoot_briefing("api", 42);
         assert!(
@@ -43388,6 +43547,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         // Query the helper directly rather than via rebuild so we don't trip
         // the "same issue — skip auto-focus" guard.
@@ -43485,6 +43645,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         });
         // Explicitly focus the last stage (merge = index 2).
         let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
@@ -48619,6 +48780,7 @@ mod tests {
             repo_github: repo_github.to_string(),
             target_branch: None,
             error: None,
+            milestone_title: None,
         }
     }
 
@@ -49978,6 +50140,7 @@ mod tests {
             repo_github: "owner/repo".to_string(),
             target_branch: Some("main".to_string()),
             error: None,
+            milestone_title: None,
         }
     }
 
@@ -49991,6 +50154,7 @@ mod tests {
             repo_github: "owner/repo".to_string(),
             target_branch: Some("main".to_string()),
             error: Some(error.to_string()),
+            milestone_title: None,
         }
     }
 
@@ -50135,17 +50299,19 @@ mod tests {
     fn tuidriver_merge_queue_view_activated_by_key_7() {
         use quadraui::tui::testing::driver_with_shell;
 
-        let mut app = make_test_app(BoardData {
+        // Start on the default Board view — do NOT pre-set active_view.
+        // The test verifies that the '7' key binding actually routes to MergeQueue.
+        let app = make_test_app(BoardData {
             merge_queue: vec![mq_entry_for_state("aid-1", 10, "pending", Some(5))],
             ..BoardData::default()
         });
-        // Start on Board view (default) and press '7'.
-        app.active_view = SidebarView::MergeQueue;
+        // app.active_view is Board (the default) — press '7' to switch.
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.press(Key::Char('7'));
 
-        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
         assert!(
             driver.screen_contains("MERGE QUEUE") || driver.screen_contains("Merge Queue"),
-            "MergeQueue panel must render its header when active:\n{}",
+            "pressing '7' must activate MergeQueue and render its panel:\n{}",
             driver.screen()
         );
     }
