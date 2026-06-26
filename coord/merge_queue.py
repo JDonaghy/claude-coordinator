@@ -219,6 +219,7 @@ class QueuedMerge:
     size: int | None = None
     last_attempt: float | None = None
     error: str | None = None
+    enqueued_at: float | None = None
 
 
 class GhOps(Protocol):
@@ -256,6 +257,7 @@ def load_queue() -> list[QueuedMerge]:
             size=row["size"],
             last_attempt=row["last_attempt"],
             error=row["error"],
+            enqueued_at=row["enqueued_at"],
         )
         for row in rows
     ]
@@ -271,13 +273,13 @@ def save_queue(items: list[QueuedMerge]) -> None:
                 """INSERT INTO merge_queue (
                     assignment_id, repo_name, repo_github, branch,
                     target_branch, issue_number, issue_title, state,
-                    pr_number, pr_url, size, last_attempt, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    pr_number, pr_url, size, last_attempt, error, enqueued_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item.assignment_id, item.repo_name, item.repo_github,
                     item.branch, item.target_branch, item.issue_number,
                     item.issue_title, item.state, item.pr_number, item.pr_url,
-                    item.size, item.last_attempt, item.error,
+                    item.size, item.last_attempt, item.error, item.enqueued_at,
                 ),
             )
 
@@ -308,6 +310,17 @@ def enqueue(
         for x in items
     ):
         return None
+    # #776: populate size eagerly at enqueue time via the compare API so the
+    # displayed order matches the merge order without waiting for a PR to be
+    # opened.  Fail-open: size=None keeps the entry at the back of the queue.
+    from coord import github_ops as _gho  # noqa: PLC0415
+    try:
+        diff_size: int | None = _gho.get_branch_diff_size(
+            repo_github, target_branch, assignment.branch
+        ) or None
+    except Exception:  # noqa: BLE001
+        diff_size = None
+
     entry = QueuedMerge(
         assignment_id=assignment.assignment_id or "",
         repo_name=assignment.repo_name,
@@ -316,6 +329,8 @@ def enqueue(
         target_branch=target_branch,
         issue_number=assignment.issue_number,
         issue_title=assignment.issue_title,
+        size=diff_size,
+        enqueued_at=time.time(),
     )
     items.append(entry)
     save_queue(items)
@@ -473,6 +488,15 @@ def refresh_entry_assignment(
         None,
     )
     if existing is None:
+        # #776: populate size eagerly (same as enqueue()) and record enqueued_at.
+        from coord import github_ops as _gho  # noqa: PLC0415
+        try:
+            diff_size: int | None = _gho.get_branch_diff_size(
+                repo_github, target_branch, assignment.branch
+            ) or None
+        except Exception:  # noqa: BLE001
+            diff_size = None
+
         entry = QueuedMerge(
             assignment_id=assignment.assignment_id,
             repo_name=assignment.repo_name,
@@ -481,6 +505,8 @@ def refresh_entry_assignment(
             target_branch=target_branch,
             issue_number=assignment.issue_number,
             issue_title=assignment.issue_title,
+            size=diff_size,
+            enqueued_at=time.time(),
         )
         items.append(entry)
         save_queue(items)
@@ -495,6 +521,206 @@ def refresh_entry_assignment(
         existing.error = None
     save_queue(items)
     return True
+
+
+# ── Plan-status constants (#776) ─────────────────────────────────────────────
+
+# Computed status values for PlannedMerge.status — not stored in the DB.
+PLAN_READY = "READY"
+PLAN_BLOCKED = "BLOCKED"
+PLAN_MERGING = "MERGING"
+PLAN_MERGED = "MERGED"
+PLAN_NEEDS_ATTENTION = "NEEDS_ATTENTION"
+
+
+# ── Gate evaluation (#776) ──────────────────────────────────────────────────
+
+def _entry_gate_status(
+    entry: "QueuedMerge",
+    board,
+    config,
+    ci_store: "CiStore | None" = None,
+) -> tuple[str, str | None]:
+    """Return *(status, reason)* for a single PENDING merge-queue entry.
+
+    Evaluates gates in the same order as :func:`process` — review → smoke →
+    CI — so the plan shown to the operator is byte-for-byte what merge would
+    do.  Both :func:`plan` and :func:`process` delegate to this helper so they
+    can never diverge.
+
+    Returns ``(PLAN_READY, None)`` when all gates pass.
+    Returns ``(PLAN_BLOCKED, reason)`` when any gate blocks.
+
+    The *ci_store* gate is only evaluated when both *ci_store* is provided
+    **and** the entry has a ``pr_number`` (CI is checked per-PR, not per-branch).
+    This mirrors the live-merge behaviour: a ``PENDING`` entry with no PR yet
+    opened is not blocked on CI — the PR hasn't been created yet.
+    """
+    if config is not None and board is not None:
+        if requires_review(entry, config) and not has_approved_review(entry, board):
+            return PLAN_BLOCKED, "review not approved"
+        if requires_smoke(entry, config) and not has_smoke_verdict(entry, board):
+            return PLAN_BLOCKED, "test verdict missing"
+    if ci_store is not None and ci_store.is_available and entry.pr_number:
+        checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
+        failed = failed_checks(checks)
+        if failed:
+            summary = ", ".join(f"{c.name} ({c.conclusion})" for c in failed)
+            return PLAN_BLOCKED, f"CI failed: {summary}"
+        pending = in_flight_checks(checks)
+        if pending:
+            summary = ", ".join(c.name for c in pending)
+            return PLAN_BLOCKED, f"CI running: {summary}"
+    return PLAN_READY, None
+
+
+# ── Merge plan (#776) ────────────────────────────────────────────────────────
+
+@dataclass
+class PlannedMerge:
+    """One entry in the server-side merge plan.
+
+    The plan is the single source of truth for ordering and gate-status — it
+    is what the TUI panel, the CLI ``--plan`` flag, and auto-drain all consume.
+    Unlike ``QueuedMerge``, which is the raw DB row, ``PlannedMerge`` carries
+    computed fields (``rank``, ``status``, ``reason``, ``milestone``) that are
+    always fresh and never stale.
+    """
+
+    assignment_id: str
+    repo_name: str
+    repo_github: str
+    branch: str
+    target_branch: str
+    issue_number: int
+    issue_title: str
+    rank: int                    # 1-based, ordered by true merge sequence
+    size: int | None             # diff lines (populated at enqueue; None = unknown)
+    status: str                  # READY | BLOCKED | MERGING | MERGED | NEEDS_ATTENTION
+    reason: str | None           # why it is blocked (None when READY / terminal)
+    enqueued_at: float | None    # unix timestamp when the entry was created
+    last_attempt: float | None   # unix timestamp of the last merge attempt
+    milestone: str | None        # issue milestone title, or None
+
+
+def _load_milestones_for_queue(
+    items: "list[QueuedMerge]",
+) -> "dict[tuple[str, int], str | None]":
+    """Load milestone titles for each (repo_name, issue_number) in *items*.
+
+    Queries the ``issues`` table in bulk and returns a dict keyed by
+    ``(repo_name, issue_number)``.  Missing rows (issue not yet synced) map
+    to ``None``.  Any DB error returns an empty dict so the plan degrades
+    gracefully.
+    """
+    if not items:
+        return {}
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT repo_name, number, milestone_title FROM issues"
+        ).fetchall()
+        return {
+            (r["repo_name"], r["number"]): r["milestone_title"]
+            for r in rows
+        }
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _state_to_plan_status(state: str) -> str:
+    """Map a ``QueuedMerge.state`` to a ``PlannedMerge.status`` constant."""
+    if state == PENDING:
+        return PLAN_READY      # will be overridden by gate check if blocked
+    if state == MERGING:
+        return PLAN_MERGING
+    if state == MERGED:
+        return PLAN_MERGED
+    # CONFLICT, HUMAN_REQUIRED, SKIPPED → surface for operator attention.
+    return PLAN_NEEDS_ATTENTION
+
+
+def plan(
+    board,
+    config,
+    ci_store: "CiStore | None" = None,
+) -> "list[PlannedMerge]":
+    """Return the **ordered merge plan** — one :class:`PlannedMerge` per queue entry.
+
+    This is the single source of truth for ordering and gate-status consumed by
+    the TUI panel (#B), the CLI ``--plan`` flag (#D), and auto-drain (#E).
+
+    Algorithm
+    ---------
+    1. Load the queue from the DB.
+    2. Group entries by ``(repo_github, target_branch)``.
+    3. Within each group, order PENDING entries by ``sequence()`` (size-ascending
+       with unknown-size last), then append non-PENDING entries in original DB
+       order.
+    4. Assign a 1-based ``rank`` globally across all groups (i.e. the first
+       PENDING entry across all repos is rank=1 regardless of repo).
+    5. For each entry:
+       - Derive ``status`` from the raw ``state`` value.
+       - For PENDING entries, override with :func:`_entry_gate_status` which
+         evaluates review / smoke / CI gates live against *board* + *config*.
+       - Look up the issue's milestone from the ``issues`` table.
+
+    The function is intentionally **read-only** — no side effects, no DB writes.
+    Pass ``board=None`` and/or ``config=None`` to skip gate evaluation (useful
+    in test scenarios that only care about ordering).
+    """
+    items = load_queue()
+    milestones = _load_milestones_for_queue(items)
+
+    # ── Group by (repo_github, target_branch) ──────────────────────────────
+    group_order: list[tuple[str, str]] = []
+    groups: dict[tuple[str, str], list[QueuedMerge]] = {}
+    for entry in items:
+        key = (entry.repo_github, entry.target_branch)
+        if key not in groups:
+            group_order.append(key)
+            groups[key] = []
+        groups[key].append(entry)
+
+    # ── Build the ranked plan ───────────────────────────────────────────────
+    result: list[PlannedMerge] = []
+    rank = 0
+
+    for key in group_order:
+        group = groups[key]
+        # PENDING entries sorted by sequence(); all others in DB insertion order.
+        pending = [e for e in group if e.state == PENDING]
+        non_pending = [e for e in group if e.state != PENDING]
+        ordered = sequence(pending) + non_pending
+
+        for entry in ordered:
+            rank += 1
+            base_status = _state_to_plan_status(entry.state)
+            reason: str | None = None
+
+            if entry.state == PENDING:
+                base_status, reason = _entry_gate_status(
+                    entry, board, config, ci_store
+                )
+
+            result.append(PlannedMerge(
+                assignment_id=entry.assignment_id,
+                repo_name=entry.repo_name,
+                repo_github=entry.repo_github,
+                branch=entry.branch,
+                target_branch=entry.target_branch,
+                issue_number=entry.issue_number,
+                issue_title=entry.issue_title,
+                rank=rank,
+                size=entry.size,
+                status=base_status,
+                reason=reason,
+                enqueued_at=entry.enqueued_at,
+                last_attempt=entry.last_attempt,
+                milestone=milestones.get((entry.repo_name, entry.issue_number)),
+            ))
+
+    return result
 
 
 # ── Sequencing ───────────────────────────────────────────────────────────

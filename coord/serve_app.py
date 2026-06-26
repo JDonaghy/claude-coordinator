@@ -195,11 +195,25 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
     async def board(request: Request) -> Response:  # noqa: ARG001
         try:
-            return JSONResponse(store.board_projection())
+            projection = store.board_projection()
         except Exception as e:  # noqa: BLE001 — surface a clean 503 rather than a stack trace
             return JSONResponse(
                 {"error": "board read failed", "detail": str(e)}, status_code=503
             )
+        # #776: inject server-side merge plan (ordered, gate-annotated) so thin
+        # clients get status + reason without re-implementing gate logic.
+        # Computed after the projection so a plan failure never 503 the board.
+        try:
+            from coord import merge_queue as _mq  # noqa: PLC0415
+            from coord.state import build_board as _build_board  # noqa: PLC0415
+            from dataclasses import asdict as _asdict  # noqa: PLC0415
+            _board = _build_board()
+            projection["merge_plan"] = [
+                _asdict(pm) for pm in _mq.plan(_board, config)
+            ]
+        except Exception:  # noqa: BLE001 — plan failure must not blank the board
+            projection["merge_plan"] = []
+        return JSONResponse(projection)
 
     async def serve_config(request: Request) -> Response:  # noqa: ARG001
         # Serve the raw coordinator.yml text the daemon owns; the client caches

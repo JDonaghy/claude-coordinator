@@ -153,7 +153,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             pr_url TEXT,
             size INTEGER,
             last_attempt REAL,
-            error TEXT
+            error TEXT,
+            enqueued_at REAL
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -298,6 +299,10 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # start so the TUI can explain the red box without any log file.
         # NULL for assignments that launched successfully.
         "ALTER TABLE assignments ADD COLUMN failure_reason TEXT",
+        # #776 (Merge Queue v2-A): track when an entry was added to the queue
+        # so the merge plan can display age and sort stably.  NULL for entries
+        # created before this migration ran.
+        "ALTER TABLE merge_queue ADD COLUMN enqueued_at REAL",
     ]
     for sql in migrations:
         try:
