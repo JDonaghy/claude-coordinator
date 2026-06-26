@@ -205,11 +205,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # Computed after the projection so a plan failure never 503 the board.
         try:
             from coord import merge_queue as _mq  # noqa: PLC0415
+            from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
             from coord.state import build_board as _build_board  # noqa: PLC0415
             from dataclasses import asdict as _asdict  # noqa: PLC0415
             _board = _build_board()
+            # Build ci_store so "CI running" / "CI failed" reasons appear in the
+            # plan.  Fail-open: a construction error returns None which disables
+            # the CI gate without blanking the whole plan.
+            try:
+                _ci = _build_ci_store(config.ci_store.type)
+            except Exception:  # noqa: BLE001
+                _ci = None
             projection["merge_plan"] = [
-                _asdict(pm) for pm in _mq.plan(_board, config)
+                _asdict(pm) for pm in _mq.plan(_board, config, ci_store=_ci)
             ]
         except Exception:  # noqa: BLE001 — plan failure must not blank the board
             projection["merge_plan"] = []

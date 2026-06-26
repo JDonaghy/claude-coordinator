@@ -1607,6 +1607,14 @@ def test_sync_issues_tick_marks_issues_closed(
     # The sync reported 0 open issues (all repos returned empty lists).
     assert total == 0
 
+    # The issue row must now be marked 'closed' in the DB.
+    row = rw_db.execute(
+        "SELECT state FROM issues WHERE repo_name = 'api' AND number = 42"
+    ).fetchone()
+    assert row is not None and row["state"] == "closed", (
+        f"Issue should be 'closed' after sync; got: {row['state'] if row else None}"
+    )
+
 
 # ── #776: merge_plan in /board payload ───────────────────────────────────────
 
