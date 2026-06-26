@@ -50,6 +50,17 @@ There is **no autonomous orchestration daemon** — nothing drives work on its o
 - **`coord notify` still has to be fired periodically.** The daemon serves state; it does not drive the loop. `notify` polls each agent for completion, posts the GH comments, and triggers the auto-loop (review-on-completion, fix-on-request-changes, re-review-on-fix-completion). Without it, the pipeline visibly freezes — agents finish work but no one notices. Run it on a cron, a `watch`, a TUI timer, or by hand.
 - **`coord` and `coord-tui` are peers, not nested layers.** The TUI does not shell out to `coord`. Both are independent clients of the same state — directly against SQLite, or (with `coord serve`) against the daemon's HTTP API. (See the [Divergence risk](#divergence-risk) section.)
 
+## The web dashboard (`coord web`, port 7434) and Phone Control Center
+
+`coord web` is an optional **web dashboard** that serves two things from the same port:
+
+1. **The React PWA** (Phone Control Center) — a mobile-optimised single-page app for reviewing pipeline status and triggering gate actions from a phone over Tailscale. Built separately from source (`npm run build` in `coord/dashboard/webapp/`) and served from `dist/`.
+2. **The JSON REST API** — `GET /api/pipeline`, `POST /api/pipeline/action`, `GET /api/board`, etc. — called by the React app, and also directly curl-able.
+
+Like `coord-tui`, `coord web` is a **peer client** of the same shared state (`~/.coord/coord.db`). Run it on the always-on host so phones can reach it via Tailscale at `http://<hostname>:7434`.
+
+**Full runbook** (build → serve → phone access → API reference → ToS posture): **[docs/PHONE_WEBAPP.md](PHONE_WEBAPP.md)**.
+
 ## The agent HTTP API
 
 The `coord agent` server exposes a small, JSON-only HTTP API on port 7433. Any client — `coord`, the TUI, `curl`, Postman — can call it. There's no authentication; Tailscale is the auth boundary.
