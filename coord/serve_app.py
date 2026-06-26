@@ -114,6 +114,10 @@ def _passive_tick(config: Config) -> tuple[list[dict], list[str]]:
     Note: the daemon ``_tick_loop`` calls these two steps with **separate**
     ``try/except`` blocks so a failure in one does not silence the other.  This
     function combines them for convenience in tests that want both results.
+
+    The slower-cadence merge-reconcile and issues-sync steps (``_reconcile_merges_tick``
+    / ``_sync_issues_tick``, #775) run in ``_tick_loop`` on a separate timer and
+    are tested via those helpers directly.
     """
     from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
     from coord import merge_queue as mq  # noqa: PLC0415
@@ -121,6 +125,56 @@ def _passive_tick(config: Config) -> tuple[list[dict], list[str]]:
     reconciled = reconcile_completed_assignments(config)
     enqueued = mq.enqueue_approved_work(config)  # loads its own board snapshot
     return reconciled, enqueued
+
+
+def _reconcile_merges_tick(config: Config) -> list[str]:
+    """Load the board, run ``reconcile_board_merges``, save the result.
+
+    Called on a slow throttled cadence by ``_tick_loop`` (#775).  Flips
+    ``done`` work assignments whose PR merged on GitHub to ``status='merged'``
+    and prunes the corresponding merge-queue rows, so the Pipeline:Live card
+    leaves the Merge gate without a manual ``coord reconcile-merges``.
+
+    Extracted as a module-level function so tests can call it directly without
+    wiring up the async ``_tick_loop`` infrastructure.
+    """
+    from coord.reconcile import reconcile_board_merges  # noqa: PLC0415
+    from coord.state import build_board, save_board  # noqa: PLC0415
+
+    board = build_board()
+    actions = reconcile_board_merges(board, config)
+    save_board(board)
+    return actions
+
+
+def _sync_issues_tick(config: Config) -> int:
+    """Fetch open issues from GitHub and update the local issues cache.
+
+    Called on the same slow cadence as ``_reconcile_merges_tick`` by
+    ``_tick_loop`` (#775).  Keeps the board's ``is_closed`` flag current so
+    issues closed by a merge appear in the Done section without a manual
+    ``coord sync``.
+
+    Returns the total number of open issues synced across all repos.
+    Extracted as a module-level function so tests can call it directly.
+    """
+    import logging  # noqa: PLC0415
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord.state import _upsert_open_issues_local  # noqa: PLC0415
+
+    log = logging.getLogger("coord.serve")
+    total = 0
+    for repo in config.repos:
+        try:
+            issues = github_ops.get_open_issues(repo.github)
+            _upsert_open_issues_local(repo.name, issues)
+            total += len(issues)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "issues-sync tick: repo %s failed", repo.name, exc_info=True
+            )
+    return total
 
 
 def build_app(store: CoordStore, config: Config, *, token: str | None = None) -> Starlette:
@@ -675,8 +729,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             housekeeping_interval = 3600.0
         last_housekeeping = _time.monotonic()
 
+        # #775: merge-reconcile + issue-closure sync on a slow cadence
+        # (default 5 min; 0 disables).  Both share one timer since they're
+        # both "reconcile with GitHub" operations at the same frequency.
+        try:
+            merges_interval = float(
+                os.environ.get("COORD_RECONCILE_MERGES_INTERVAL", "300")
+            )
+        except ValueError:
+            merges_interval = 300.0
+        last_merge_reconcile = _time.monotonic()
+
         async def _tick_loop() -> None:
-            nonlocal last_housekeeping
+            nonlocal last_housekeeping, last_merge_reconcile
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -739,6 +804,38 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             )
                     except Exception:  # noqa: BLE001
                         log.warning("housekeeping tick failed", exc_info=True)
+                # Steps 4 + 5: #775 record out-of-band merges and sync the
+                # open-issue closure cache on a slow cadence (default 5 min).
+                # Both run under the same timer since they're both "reconcile
+                # with GitHub" operations.  Independent try/except so a
+                # failure in one does not silence the other.
+                if merges_interval > 0 and (
+                    _time.monotonic() - last_merge_reconcile >= merges_interval
+                ):
+                    last_merge_reconcile = _time.monotonic()
+                    try:
+                        actions = await run_in_threadpool(
+                            _reconcile_merges_tick, config
+                        )
+                        if actions:
+                            log.info(
+                                "merge reconcile: %d action(s): %s",
+                                len(actions),
+                                "; ".join(actions),
+                            )
+                    except Exception:  # noqa: BLE001
+                        log.warning("merge reconcile tick failed", exc_info=True)
+                    try:
+                        synced = await run_in_threadpool(
+                            _sync_issues_tick, config
+                        )
+                        if synced:
+                            log.info(
+                                "issues sync: %d open issue(s) across all repos",
+                                synced,
+                            )
+                    except Exception:  # noqa: BLE001
+                        log.warning("issues sync tick failed", exc_info=True)
 
         @contextlib.asynccontextmanager
         async def _ctx(_a):  # noqa: ANN202
