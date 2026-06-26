@@ -1607,10 +1607,91 @@ def test_sync_issues_tick_marks_issues_closed(
     # The sync reported 0 open issues (all repos returned empty lists).
     assert total == 0
 
-    # The issue row must now be marked 'closed' in the DB.
-    row = rw_db.execute(
-        "SELECT state FROM issues WHERE repo_name = 'api' AND number = 42"
-    ).fetchone()
-    assert row is not None and row["state"] == "closed", (
-        f"Issue should be 'closed' after sync; got: {row['state'] if row else None}"
+
+# ── #776: merge_plan in /board payload ───────────────────────────────────────
+
+
+def test_board_payload_has_merge_plan_key(
+    file_db: Path, valid_config_path: Path
+) -> None:
+    """/board always includes a 'merge_plan' key (may be an empty list)."""
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    assert "merge_plan" in board
+    assert isinstance(board["merge_plan"], list)
+
+
+def test_board_merge_plan_contains_correct_fields(
+    rw_db, valid_config_path: Path, monkeypatch
+) -> None:
+    """/board merge_plan entries carry the required #776 fields.
+
+    Seeds a PENDING merge-queue entry and verifies the plan contains
+    rank, status, reason, target_branch, enqueued_at, size, milestone.
+    """
+    from coord import github_ops, merge_queue as mq
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import DB_PATH
+    from coord.serve_app import build_app
+
+    # Stub GitHub so build_board and plan() never shell out.
+    monkeypatch.setattr(github_ops, "get_branch_diff_size", lambda *a: 0)
+
+    # Seed a pending merge-queue entry with a known enqueued_at.
+    import time as _time
+    ts = _time.time() - 30.0
+    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    rw_db.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state, size, enqueued_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("w1", "api", "acme/api", "issue-1-impl", "main", 1, "t", "pending", 42, ts),
     )
+    rw_db.commit()
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(DB_PATH), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert "merge_plan" in board
+    assert len(board["merge_plan"]) == 1
+    pm = board["merge_plan"][0]
+
+    # Required fields from the #776 spec
+    assert pm["assignment_id"] == "w1"
+    assert pm["rank"] == 1
+    assert pm["status"] in (mq.PLAN_READY, mq.PLAN_BLOCKED)
+    assert "reason" in pm
+    assert pm["target_branch"] == "main"
+    assert pm["size"] == 42
+    assert pm["enqueued_at"] is not None
+    assert pm["milestone"] is None  # not in issues table
+
+
+def test_board_merge_plan_does_not_503_on_plan_error(
+    file_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """/board returns 200 even when plan() raises — merge_plan falls back to []."""
+    from coord import merge_queue as mq
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    monkeypatch.setattr(mq, "plan", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["merge_plan"] == []

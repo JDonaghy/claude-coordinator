@@ -370,6 +370,28 @@ def get_pr_size(repo: str, number: int) -> int:
     return int(data.get("additions", 0)) + int(data.get("deletions", 0))
 
 
+def get_branch_diff_size(repo: str, base: str, branch: str) -> int:
+    """Return total diff size (additions+deletions) for *branch* relative to *base*.
+
+    Uses the GitHub three-dot compare API — no PR required.  Sums
+    ``additions + deletions`` across all changed files.  Returns ``0`` on any
+    failure so callers can treat size as unknown-but-not-blocking.
+
+    Prefer this over :func:`get_pr_size` at enqueue time so size is populated
+    before a PR is opened and the ordering shown to the user matches the
+    ordering used at merge time (#776 size unification).
+    """
+    try:
+        raw = _gh("api", f"repos/{repo}/compare/{base}...{branch}")
+        data = json.loads(raw)
+        return sum(
+            int(f.get("additions", 0)) + int(f.get("deletions", 0))
+            for f in data.get("files", [])
+        )
+    except Exception:  # noqa: BLE001 — fail-open: unknown size is not blocking
+        return 0
+
+
 def merge_pr(repo: str, number: int, method: str = "rebase") -> tuple[bool, str]:
     """Merge a PR. Returns (success, message).
 

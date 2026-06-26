@@ -1299,3 +1299,385 @@ class TestPruneStaleQueueEntries:
         pruned = mq.prune_stale_queue_entries()
         assert pruned == []
         assert len(load_queue()) == 1
+
+
+# ── #776: enqueued_at + size-at-enqueue-time ──────────────────────────────────
+
+class TestEnqueuedAt:
+    """#776: enqueue() sets enqueued_at and populates size via the compare API."""
+
+    def _assignment(self, aid: str = "abc", branch: str = "issue-1-foo") -> Assignment:
+        return Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, branch=branch, status="done",
+        )
+
+    def test_enqueue_sets_enqueued_at(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+        monkeypatch.setattr(github_ops, "get_branch_diff_size", lambda *a: 0)
+        before = mq.__import_time = __import__("time").time()
+        enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].enqueued_at is not None
+        assert items[0].enqueued_at >= before
+
+    def test_enqueue_populates_size_from_compare_api(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+        monkeypatch.setattr(github_ops, "get_branch_diff_size", lambda repo, base, branch: 123)
+        enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
+        items = load_queue()
+        assert items[0].size == 123
+
+    def test_enqueue_size_none_on_compare_failure(self, coord_db, monkeypatch) -> None:
+        """When get_branch_diff_size returns 0, size is stored as None (unknown)."""
+        from coord import github_ops
+        monkeypatch.setattr(github_ops, "get_branch_diff_size", lambda *a: 0)
+        enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
+        items = load_queue()
+        # 0 is treated as unknown → None so unknown-size entries sort last.
+        assert items[0].size is None
+
+    def test_enqueue_size_survives_exception(self, coord_db, monkeypatch) -> None:
+        """If the compare API raises, enqueue still succeeds with size=None."""
+        from coord import github_ops
+        def _raise(*a):
+            raise RuntimeError("gh error")
+        monkeypatch.setattr(github_ops, "get_branch_diff_size", _raise)
+        entry = enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
+        assert entry is not None
+        assert entry.size is None
+
+    def test_enqueued_at_roundtrips_through_db(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+        monkeypatch.setattr(github_ops, "get_branch_diff_size", lambda *a: 50)
+        entry = enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
+        assert entry is not None
+        loaded = load_queue()[0]
+        assert loaded.enqueued_at == pytest.approx(entry.enqueued_at, abs=1.0)
+        assert loaded.size == 50
+
+
+# ── #776: plan() ─────────────────────────────────────────────────────────────
+
+class TestPlan:
+    """#776: plan() returns an ordered, gate-annotated PlannedMerge list.
+
+    The plan is the single source of truth for ordering and gate-status —
+    it must match sequence() exactly and apply the same gate logic as process().
+    """
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _config(*, review_enabled: bool = True, gates: list[str] | None = None):
+        from dataclasses import dataclass, field as dc_field
+
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+
+        cfg = _Cfg()
+        cfg.reviews.enabled = review_enabled
+        cfg.pipeline.default_gates = gates if gates is not None else ["review", "test", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(completed=None, active=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, test_state: str | None = "passed") -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done",
+            branch=f"issue-1-{aid}", test_state=test_state,
+        )
+
+    @staticmethod
+    def _review(of_aid: str, *, verdict: str = "approve") -> Assignment:
+        return Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=f"rev-{of_aid}", type="review", status="done",
+            review_of_assignment_id=of_aid, review_verdict=verdict,
+        )
+
+    @staticmethod
+    def _seed_queue(
+        items: list,
+        *,
+        monkeypatch,
+        github_ops_mod=None,
+    ) -> None:
+        """Seed pre-built QueuedMerge items directly (bypass enqueue size-lookup)."""
+        save_queue(items)
+
+    # ── ordering tests ────────────────────────────────────────────────────
+
+    def test_ordering_matches_sequence(self, coord_db) -> None:
+        """Plan order within a group must match sequence() (size-ascending)."""
+        items = [_q("big", size=500), _q("small", size=50), _q("mid", size=100)]
+        save_queue(items)
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        aids = [p.assignment_id for p in plan]
+        # sequence() returns [small, mid, big]
+        assert aids == ["small", "mid", "big"]
+
+    def test_rank_is_one_based_ascending(self, coord_db) -> None:
+        """Rank starts at 1 and increments by 1 per entry."""
+        items = [_q("a", size=10), _q("b", size=20), _q("c", size=30)]
+        save_queue(items)
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        assert [p.rank for p in plan] == [1, 2, 3]
+
+    def test_unknown_size_goes_last(self, coord_db) -> None:
+        """Entries with unknown size are placed last (same as sequence())."""
+        items = [_q("big", size=None), _q("small", size=50)]
+        save_queue(items)
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        assert [p.assignment_id for p in plan] == ["small", "big"]
+
+    def test_groups_by_repo_and_target_branch(self, coord_db) -> None:
+        """Each (repo_github, target_branch) group is ordered independently."""
+        items = [
+            _q("api-big",   repo="api", repo_github="acme/api", target="main",    size=500),
+            _q("api-small", repo="api", repo_github="acme/api", target="main",    size=50),
+            _q("ui-big",    repo="ui",  repo_github="acme/ui",  target="develop", size=300),
+        ]
+        save_queue(items)
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        # Both groups present in plan; each group ordered by size
+        aids = [p.assignment_id for p in plan]
+        # api group: small first; ui group has one entry
+        assert "api-small" in aids
+        api_idx_small = aids.index("api-small")
+        api_idx_big   = aids.index("api-big")
+        assert api_idx_small < api_idx_big
+
+    # ── gate-status tests ─────────────────────────────────────────────────
+
+    def test_ready_when_all_gates_pass(self, coord_db) -> None:
+        """An entry with approved review + passed test appears as READY."""
+        items = [_q("w1", size=100)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg)
+        assert len(plan) == 1
+        assert plan[0].status == mq.PLAN_READY
+        assert plan[0].reason is None
+        assert plan[0].rank == 1
+        assert plan[0].size == 100
+
+    def test_blocked_review_not_approved(self, coord_db) -> None:
+        """Entry missing an approved review appears as BLOCKED with reason."""
+        items = [_q("w1", size=50)]
+        save_queue(items)
+        # No review on the board
+        board = self._board(completed=[self._work("w1", test_state="passed")])
+        cfg = self._config()
+        plan = mq.plan(board, cfg)
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert "review" in (plan[0].reason or "").lower()
+
+    def test_blocked_test_verdict_missing(self, coord_db) -> None:
+        """Entry with no test verdict appears as BLOCKED with reason."""
+        items = [_q("w1", size=50)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state=None),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg)
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert "test" in (plan[0].reason or "").lower()
+
+    def test_blocked_ci_failed(self, coord_db) -> None:
+        """Entry with a failed CI check appears as BLOCKED with CI reason."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(name="build", status="completed", conclusion="failure")]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert "CI failed" in (plan[0].reason or "")
+
+    def test_blocked_ci_running(self, coord_db) -> None:
+        """Entry with a still-running CI check appears as BLOCKED."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(name="build", status="in_progress", conclusion=None)]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert "CI running" in (plan[0].reason or "")
+
+    def test_ci_not_checked_without_pr_number(self, coord_db) -> None:
+        """An entry with no PR yet opened is not blocked on CI."""
+        from types import SimpleNamespace
+
+        class AlwaysFailCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(name="build", status="completed", conclusion="failure")]
+
+        # pr=None → no pr_number
+        items = [_q("w1", size=50)]  # pr_number=None by default
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        # Even with a failing CI, no pr_number → CI gate skipped → READY
+        plan = mq.plan(board, cfg, ci_store=AlwaysFailCi())
+        assert plan[0].status == mq.PLAN_READY
+
+    # ── non-PENDING state mapping ─────────────────────────────────────────
+
+    def test_merging_entry_status(self, coord_db) -> None:
+        items = [_q("w1", state=mq.MERGING)]
+        save_queue(items)
+        board = self._board()
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        plan = mq.plan(board, cfg)
+        assert plan[0].status == mq.PLAN_MERGING
+
+    def test_merged_entry_status(self, coord_db) -> None:
+        items = [_q("w1", state=mq.MERGED)]
+        save_queue(items)
+        board = self._board()
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        plan = mq.plan(board, cfg)
+        assert plan[0].status == mq.PLAN_MERGED
+
+    def test_conflict_entry_status(self, coord_db) -> None:
+        items = [_q("w1", state=mq.CONFLICT)]
+        save_queue(items)
+        board = self._board()
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        plan = mq.plan(board, cfg)
+        assert plan[0].status == mq.PLAN_NEEDS_ATTENTION
+
+    # ── metadata fields ───────────────────────────────────────────────────
+
+    def test_target_branch_is_populated(self, coord_db) -> None:
+        items = [_q("w1", target="develop")]
+        save_queue(items)
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        assert plan[0].target_branch == "develop"
+
+    def test_enqueued_at_propagated(self, coord_db) -> None:
+        import time as _time
+        ts = _time.time() - 60.0
+        q = QueuedMerge(
+            assignment_id="w1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-w1", target_branch="main",
+            issue_number=1, issue_title="t",
+            enqueued_at=ts,
+        )
+        save_queue([q])
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        assert plan[0].enqueued_at == pytest.approx(ts, abs=1.0)
+
+    def test_milestone_from_issues_table(self, coord_db) -> None:
+        """Milestone title is pulled from the issues table when present."""
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "INSERT OR REPLACE INTO issues "
+            "(repo_name, number, title, body, state, labels, milestone_title) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("api", 1, "t", "", "open", "[]", "v1.0"),
+        )
+        conn.commit()
+
+        items = [_q("w1")]
+        save_queue(items)
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        assert plan[0].milestone == "v1.0"
+
+    def test_milestone_none_when_not_in_issues_table(self, coord_db) -> None:
+        items = [_q("w1")]
+        save_queue(items)
+        cfg = self._config(review_enabled=False, gates=["merge"])
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        assert plan[0].milestone is None
+
+    # ── empty queue ───────────────────────────────────────────────────────
+
+    def test_empty_queue_returns_empty_list(self, coord_db) -> None:
+        cfg = self._config()
+        board = self._board()
+        plan = mq.plan(board, cfg)
+        assert plan == []
+
+    # ── gate_status helper (unit test for _entry_gate_status) ─────────────
+
+    def test_entry_gate_status_ready(self, coord_db) -> None:
+        """All gates pass → READY."""
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        entry = _q("w1")
+        cfg = self._config()
+        status, reason = mq._entry_gate_status(entry, board, cfg)
+        assert status == mq.PLAN_READY
+        assert reason is None
+
+    def test_entry_gate_status_no_config_returns_ready(self) -> None:
+        """Without config/board, gate evaluation is skipped → READY."""
+        entry = _q("w1")
+        status, reason = mq._entry_gate_status(entry, None, None)
+        assert status == mq.PLAN_READY
+        assert reason is None
