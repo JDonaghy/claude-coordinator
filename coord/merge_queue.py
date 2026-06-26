@@ -322,6 +322,117 @@ def enqueue(
     return entry
 
 
+def enqueue_approved_work(config, board=None) -> list[str]:
+    """Enqueue / re-key merge-queue entries for all approved + tested done work.
+
+    Scans ``board.completed`` for done ``type=work`` assignments and, for each
+    that satisfies ALL three conditions:
+
+    1. Review gate OK — ``requires_review(a, config)`` is False, **or** an
+       approved review exists on the board (``has_approved_review``).
+    2. Smoke gate OK — ``requires_smoke(a, config)`` is False, **or** the
+       work assignment carries a ``test_state in ('passed', 'skipped')``
+       verdict (``has_smoke_verdict``).
+    3. Not terminal on GitHub — ``work_is_terminal`` returns False (issue still
+       open and PR not yet merged).
+
+    …calls :func:`refresh_entry_assignment` so the entry is **created** (when
+    the work was never enqueued) or **re-keyed** to the latest fix assignment
+    (the #292 bounce fix).  :func:`enqueue` is *not* used because it cannot
+    update an existing entry's ``assignment_id``; ``refresh_entry_assignment``
+    handles both cases.
+
+    Idempotent: a second call with the same board produces no further changes
+    (``refresh_entry_assignment`` is a no-op when the entry already exists and
+    is keyed correctly).
+
+    Returns a list of assignment IDs for which an entry was created or updated.
+    Call sites use this list for diagnostic logging; callers that don't need it
+    can discard the return value.
+
+    Called from the daemon passive tick (:func:`coord.serve_app._passive_tick`)
+    on every interval so approved work enters the queue without requiring a
+    manual ``coord merge`` run (#736 / #217 invisible limbo).
+    """
+    from coord import github_ops as _gho  # noqa: PLC0415
+
+    if board is None:
+        from coord.state import build_board as _build_board  # noqa: PLC0415
+        board = _build_board()
+
+    changed: list[str] = []
+    terminal_cache: dict = {}
+
+    completed = list(getattr(board, "completed", []) or [])
+
+    # Build the "already merged" set so we skip issues whose prior work attempt
+    # was already merged (avoids spawning a second PR on a retry/fix chain).
+    existing_queue = load_queue()
+    already_merged: set[tuple[str, int]] = {
+        (x.repo_name, x.issue_number)
+        for x in existing_queue
+        if x.state == MERGED
+    }
+
+    for a in completed:
+        if getattr(a, "type", None) != "work":
+            continue
+        if getattr(a, "status", None) != "done":
+            continue
+        branch = getattr(a, "branch", None)
+        aid = getattr(a, "assignment_id", None)
+        if not branch or not aid:
+            continue
+
+        repo_name = getattr(a, "repo_name", None)
+        repo_cfg = config.repo(repo_name)
+        if repo_cfg is None:
+            continue
+
+        # Skip issues already represented by a MERGED queue entry.
+        if (repo_name, getattr(a, "issue_number", 0)) in already_merged:
+            continue
+
+        # Skip if the assignment is already in the queue under its own ID.
+        # refresh_entry_assignment would create a second entry when no entry
+        # exists with a matching branch, even if one exists with the same
+        # assignment_id (e.g. seeded with a different branch in the queue).
+        # This guard prevents double-entries; re-keying is still handled
+        # because for fix-work the new aid is NOT yet in the queue.
+        if any(x.assignment_id == aid for x in existing_queue):
+            continue
+
+        # Gate 1: review.  Only block when the gate is configured AND no
+        # approved review is on the board.  Pass when reviews are disabled —
+        # using bare `has_approved_review` would always return False (no review
+        # assignments) and silently block every enqueue in a no-review config.
+        if requires_review(a, config) and not has_approved_review(a, board):
+            continue
+
+        # Gate 2: smoke.  Same semantics — only block when the gate is enabled.
+        if requires_smoke(a, config) and not has_smoke_verdict(a, board):
+            continue
+
+        # Gate 3: not already terminal on GitHub (merged / closed).  Fail OPEN
+        # on transient gh errors so a network blip never blocks a real enqueue.
+        if _gho.work_is_terminal(
+            repo_cfg.github,
+            getattr(a, "issue_number", 0),
+            branch,
+            cache=terminal_cache,
+        ):
+            continue
+
+        if refresh_entry_assignment(
+            a,
+            repo_github=repo_cfg.github,
+            target_branch=repo_cfg.default_branch,
+        ):
+            changed.append(aid)
+
+    return changed
+
+
 def refresh_entry_assignment(
     assignment: Assignment,
     repo_github: str,
@@ -349,8 +460,16 @@ def refresh_entry_assignment(
     if not assignment.branch or not assignment.assignment_id:
         return False
     items = load_queue()
+    # Match by (repo_github, branch) first; also accept a match by
+    # assignment_id alone so that a queue entry with a different branch but
+    # the same assignment_id (e.g. a test-seeded entry or a manually-created
+    # entry) is treated as "already present" rather than spawning a second row.
     existing = next(
-        (x for x in items if x.repo_github == repo_github and x.branch == assignment.branch),
+        (
+            x for x in items
+            if (x.repo_github == repo_github and x.branch == assignment.branch)
+            or x.assignment_id == assignment.assignment_id
+        ),
         None,
     )
     if existing is None:
