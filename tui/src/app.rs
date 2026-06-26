@@ -7278,22 +7278,28 @@ impl CoordApp {
                     .iter()
                     .map(|i| (i.repo_slug.clone(), i.number))
                     .collect();
-                // #675: Board Terminal sessions use the same (repo_slug, number) key
-                // as Pipeline sessions, but Board-only issues (no status:* label) are
-                // absent from pipeline_issues — so their sessions were pruned on every
-                // data tick, causing the Board Terminal to flicker back to a plain
-                // shell immediately after "Chat about issue" spawned it.  Include all
-                // open_issues (the Board's data source) so Board terminal sessions
-                // survive the retain.
-                for oi in &self.data.open_issues {
+                // #675 / follow-up: Board Terminal sessions must survive even when
+                // their issue is visible on the Board ONLY via assignment history
+                // (no open_issues record — coord sync hasn't run yet for this
+                // repo, or the assignment was created directly via `coord assign`
+                // before the first sync).  The d3dcd39 fix only iterated
+                // data.open_issues, which misses assignment-only Board entries.
+                // Use board_issues_cache instead — it was just rebuilt above by
+                // rebuild_board_sidebar() and includes BOTH open_issues-based
+                // entries AND assignment-only entries, exactly matching the full
+                // set of issues visible on the Board.  A session is pruned only
+                // when its issue is gone from BOTH the pipeline AND the board.
+                for (repo, groups) in &self.board_issues_cache {
                     let slug = self
                         .data
                         .pipeline_repos
                         .iter()
-                        .find(|(name, _)| name == &oi.repo_name)
+                        .find(|(name, _)| name.as_str() == repo.as_str())
                         .map(|(_, s)| s.clone())
-                        .unwrap_or_else(|| oi.repo_name.clone());
-                    live_keys.insert((slug, oi.number));
+                        .unwrap_or_else(|| repo.clone());
+                    for group in groups {
+                        live_keys.insert((slug.clone(), group.issue_number));
+                    }
                 }
                 // #620: never prune EVERY terminal at once.  The top-level
                 // degraded-tick guard above catches a fully-empty payload, but a
@@ -46330,11 +46336,37 @@ mod tests {
         );
     }
 
-    /// #675: Board-only terminal sessions must NOT be pruned by the pipeline
-    /// data tick.  An issue on the Board but NOT in the Pipeline (no status:*
-    /// label) is absent from pipeline_issues; before the fix the retain would
-    /// drop its session on every data tick, causing the Board Terminal tab to
-    /// flicker back to a plain shell immediately after "Chat about issue".
+    /// Helper: build live_keys using the same logic as apply_pending_data (after
+    /// the board_issues_cache fix) and run the retain on `detail_terminal_spawn_errors`.
+    fn run_board_retain_logic(app: &mut CoordApp) {
+        // Rebuild board_issues_cache from current data (mirrors apply_pending_data).
+        app.rebuild_board_sidebar();
+
+        let mut live_keys: std::collections::HashSet<(String, u64)> =
+            app.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
+
+        // New logic: iterate board_issues_cache (covers open_issues AND
+        // assignment-only Board entries — the fix for the d3dcd39 follow-up).
+        for (repo, groups) in &app.board_issues_cache {
+            let slug = app
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(name, _)| name.as_str() == repo.as_str())
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| repo.clone());
+            for group in groups {
+                live_keys.insert((slug.clone(), group.issue_number));
+            }
+        }
+        let prune = !live_keys.is_empty() || app.detail_terminal_spawn_errors.is_empty();
+        if prune {
+            app.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
+        }
+    }
+
+    /// #675: Board-only terminal sessions (issue in open_issues, no status:*
+    /// label) must NOT be pruned by the pipeline data tick.
     #[test]
     fn board_terminal_session_not_pruned_by_data_tick() {
         let mut app = make_test_app(BoardData {
@@ -46363,34 +46395,76 @@ mod tests {
         app.detail_terminal_spawn_errors.insert(board_key.clone(), "board-chat".to_string());
         app.detail_terminal_spawn_errors.insert(stale_key.clone(), "stale".to_string());
 
-        // pipeline_issues is empty — the Board issue was never dispatched.
+        // pipeline_issues is empty — the Board issue was never dispatched to Pipeline.
         app.pipeline_issues = vec![];
 
-        // Replicate the retain logic from poll_pipeline_loader (after the #675 fix).
-        let mut live_keys: std::collections::HashSet<(String, u64)> =
-            app.pipeline_issues.iter().map(|i| (i.repo_slug.clone(), i.number)).collect();
-        for oi in &app.data.open_issues {
-            let slug = app
-                .data
-                .pipeline_repos
-                .iter()
-                .find(|(name, _)| name == &oi.repo_name)
-                .map(|(_, s)| s.clone())
-                .unwrap_or_else(|| oi.repo_name.clone());
-            live_keys.insert((slug, oi.number));
-        }
-        let prune = !live_keys.is_empty() || app.detail_terminal_spawn_errors.is_empty();
-        if prune {
-            app.detail_terminal_spawn_errors.retain(|k, _| live_keys.contains(k));
-        }
+        run_board_retain_logic(&mut app);
 
         assert!(
             app.detail_terminal_spawn_errors.contains_key(&board_key),
-            "Board-only session must survive the prune (was absent from pipeline_issues)"
+            "Board-only session (in open_issues) must survive the prune"
         );
         assert!(
             !app.detail_terminal_spawn_errors.contains_key(&stale_key),
             "Stale session (gone from both pipeline and board) must be pruned"
+        );
+    }
+
+    /// #675 follow-up: Board issues visible ONLY from assignment records (no
+    /// open_issues entry — coord sync hasn't run yet, or `coord assign` was
+    /// used directly before the first sync) must also keep their terminal
+    /// sessions across data ticks.  The d3dcd39 fix iterated open_issues only
+    /// and missed this case; the board_issues_cache fix covers it.
+    #[test]
+    fn board_terminal_session_from_assignment_not_pruned() {
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("myrepo".to_string(), "owner/myrepo".to_string())],
+            ..BoardData::default()
+        });
+
+        // Issue #55 is visible on the Board ONLY because of an assignment —
+        // coord sync hasn't been run so the issues table (open_issues) is EMPTY.
+        let board_key = ("owner/myrepo".to_string(), 55u64);
+        app.data.assignments.push(make_assignment_typed(
+            "running",
+            55,
+            "myrepo",
+            Some("chat"),
+        ));
+        // Confirm open_issues has no entry for this issue.
+        assert!(
+            app.data.open_issues.is_empty(),
+            "test requires open_issues to be empty (assignment-only scenario)"
+        );
+
+        // Another pipeline issue with "coord" label — ensures live_keys is
+        // non-empty so the prune guard fires and the retain runs.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 100,
+            title: "pipeline issue".to_string(),
+            body: String::new(),
+            repo_slug: "owner/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+
+        // A stale session for an issue no longer on board or pipeline.
+        let stale_key = ("owner/myrepo".to_string(), 999u64);
+
+        app.detail_terminal_spawn_errors.insert(board_key.clone(), "board-chat".to_string());
+        app.detail_terminal_spawn_errors.insert(stale_key.clone(), "stale".to_string());
+
+        run_board_retain_logic(&mut app);
+
+        assert!(
+            app.detail_terminal_spawn_errors.contains_key(&board_key),
+            "Assignment-only Board session must survive (was absent from open_issues)"
+        );
+        assert!(
+            !app.detail_terminal_spawn_errors.contains_key(&stale_key),
+            "Stale session (no pipeline entry, no board entry) must be pruned"
         );
     }
 
