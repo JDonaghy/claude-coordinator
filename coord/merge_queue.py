@@ -472,6 +472,8 @@ def refresh_entry_assignment(
 
     Returns ``True`` when a change was made (entry created or updated).
     """
+    from coord import github_ops as _gho  # noqa: PLC0415
+
     if not assignment.branch or not assignment.assignment_id:
         return False
     items = load_queue()
@@ -489,7 +491,6 @@ def refresh_entry_assignment(
     )
     if existing is None:
         # #776: populate size eagerly (same as enqueue()) and record enqueued_at.
-        from coord import github_ops as _gho  # noqa: PLC0415
         try:
             diff_size: int | None = _gho.get_branch_diff_size(
                 repo_github, target_branch, assignment.branch
