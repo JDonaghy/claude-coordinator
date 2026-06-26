@@ -202,27 +202,45 @@ class TestProcess:
         # All entries left in MERGED state
         assert {x.state for x in items} == {MERGED}
 
-    def test_conflict_halts_that_repo_group_only(self) -> None:
+    def test_conflict_does_not_halt_other_repo_groups(self) -> None:
+        """A conflict in one (repo, target) group must not touch other groups."""
         items = [
             _q("a", size=10),
-            _q("b", size=20),
             _q("other", repo="ui", repo_github="acme/ui", size=5),
         ]
-        # Pre-assign PR numbers so we know which to fail.
         gh = FakeGh(
-            sizes={100: 10, 101: 20, 102: 5},
+            sizes={100: 10, 101: 5},
             merge_results={100: (False, "Merge conflict")},
         )
         events = process(items, gh)
-        # `a` conflicts, `b` is in same group → not merged
         states = {x.assignment_id: x.state for x in items}
         assert states["a"] == CONFLICT
-        assert states["b"] == PENDING
         # Different repo group still processes
         assert states["other"] == MERGED
-        # And we surfaced a conflict event
         kinds = [e.kind for e in events]
         assert "conflict" in kinds
+
+    def test_conflict_parks_entry_and_sibling_still_merges(self) -> None:
+        """#735: a conflicting entry is parked (CONFLICT) and siblings in the
+        same (repo, target) group continue to merge — no group-wide halt."""
+        items = [
+            _q("a", size=10),
+            _q("b", size=20),
+        ]
+        # PR 100 → `a` (first opened), PR 101 → `b`
+        gh = FakeGh(
+            sizes={100: 10, 101: 20},
+            merge_results={100: (False, "Merge conflict")},
+        )
+        events = process(items, gh, presorted=True)
+        states = {x.assignment_id: x.state for x in items}
+        # Conflicting entry is parked
+        assert states["a"] == CONFLICT
+        # Sibling in the same group still merges (#735)
+        assert states["b"] == MERGED
+        kinds = [e.kind for e in events]
+        assert "conflict" in kinds
+        assert "merged" in kinds
 
     def test_dry_run_no_gh_calls(self) -> None:
         items = [_q("a"), _q("b")]
