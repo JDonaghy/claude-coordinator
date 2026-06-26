@@ -1163,12 +1163,14 @@ class TestRemoteFixWorktreeCollision:
     def test_setup_failure_with_stale_holder(
         self, remote_config_file: Path, coord_dir: Path,
     ) -> None:
-        """When a stale worktree (no live session) holds the branch, the launcher
-        must print the worktree path and a prune command — NOT 'commits preserved'."""
+        """When a stale worktree (no live session) holds the branch and is NOT
+        safe to auto-prune (dirty/unpushed), the launcher must print the worktree
+        path and a manual prune command — NOT 'commits preserved'."""
         _seed_fix_board("work-c2", "rev-c2", "issue-1-fix-bug")
         holder_path = "/home/john/.coord/worktrees/deadbeefcafe"
 
         # Both _tmux_alive calls return False: main session dead, holder also dead.
+        # _remote_orphan_is_safe_to_prune returns False → unsafe, print manual cmd.
         with patch("coord.github_ops.get_issue",
                    return_value={"title": "Fix bug", "body": "b"}), \
              patch("coord.interactive._launch_via_tmux", return_value=1), \
@@ -1176,6 +1178,8 @@ class TestRemoteFixWorktreeCollision:
              patch("coord.interactive.remote_worktree_exists", return_value=False), \
              patch("coord.interactive.find_remote_branch_holder",
                    return_value=holder_path), \
+             patch("coord.interactive._remote_orphan_is_safe_to_prune",
+                   return_value=False), \
              patch("coord.interactive.finalize_remote_interactive_exit",
                    return_value=_make_finalize_result(
                        push_ok=False,
@@ -1191,7 +1195,7 @@ class TestRemoteFixWorktreeCollision:
         out = result.output
         assert "already checked out" in out, out
         assert holder_path in out, out
-        # Stale → must mention pruning, not reattach.
+        # Not safe → must mention pruning, not reattach.
         assert "prune" in out or "worktree remove" in out, out
         assert "commits preserved" not in out, out
         assert "claude exited" not in out, out

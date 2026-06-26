@@ -2426,6 +2426,8 @@ def assign(
         from coord.interactive import (  # noqa: PLC0415
             TmuxHost,
             _launch_via_tmux as _tmux_launch,
+            _remote_orphan_is_safe_to_prune as _remote_orphan_safe,
+            _remote_worktree_remove as _remote_wt_remove,
             find_remote_branch_holder as _find_branch_holder,
             finalize_interactive_exit,
             finalize_remote_interactive_exit,
@@ -3847,24 +3849,69 @@ def assign(
                         _holder_aid = Path(_holder).name
                         _holder_sname = f"coord-{_holder_aid}"
                         _holder_live = _tmux_alive(_holder_sname, host=_tmux_host)
-                        _err_lines = [
+                        _err_header = (
                             f"  error: setup failed — branch {work.branch!r} is "
-                            f"already checked out at {_holder} on {machine_obj.host}.",
-                        ]
+                            f"already checked out at {_holder} on {machine_obj.host}."
+                        )
                         if _holder_live:
-                            _err_lines += [
+                            click.echo("\n".join([
+                                _err_header,
                                 f"  active tmux session: {_holder_sname}",
                                 f"  reattach:  coord reattach {_holder_aid}",
                                 "  exit the session first, then retry this fix.",
-                            ]
+                            ]), err=True)
                         else:
-                            _err_lines += [
-                                "  stale worktree — prune it first:",
-                                f"    ssh {machine_obj.host} 'cd {_rp_sh}"
-                                f" && git worktree remove --force"
-                                f" {_shlex_fx.quote(_holder)}'",
-                            ]
-                        click.echo("\n".join(_err_lines), err=True)
+                            # Dead orphan — safety-gated auto-prune-and-retry (#759).
+                            _auto_pruned = False
+                            if _remote_orphan_safe(
+                                machine_obj.host, _rp_sh, _holder, work.branch,
+                            ):
+                                click.echo(
+                                    f"  auto-pruning stale orphan {_holder}"
+                                    f" on {machine_obj.host} …"
+                                )
+                                _auto_pruned = _remote_wt_remove(
+                                    machine_obj.host, _rp_sh, _holder,
+                                )
+                            if _auto_pruned:
+                                click.echo("  stale orphan auto-pruned — retrying launch …")
+                                _rc2 = _tmux_launch(
+                                    argv, effective_briefing, _sname,
+                                    cwd=None, host=_tmux_host,
+                                    raw_shell_cmd=_remote_cmd,
+                                )
+                                if _rc2 is None:
+                                    click.echo(
+                                        f"  error: could not create remote tmux session"
+                                        f" on {machine_obj.host} (retry after prune)",
+                                        err=True,
+                                    )
+                                else:
+                                    exit_code = _rc2
+                                    if _tmux_alive(_sname, host=_tmux_host):
+                                        click.echo(
+                                            f"  session still running in remote tmux:"
+                                            f" {_sname}\n"
+                                            f"  reattach with:  ssh -t {machine_obj.host}"
+                                            f" tmux attach-session -t {_sname}\n"
+                                            "  (the fix is not pushed until the session"
+                                            " ends and the coordinator finalizes)"
+                                        )
+                                        sys.exit(0)
+                                    if (
+                                        exit_code == 0
+                                        or _remote_wt_exists(machine_obj.host, _remote_wt)
+                                    ):
+                                        _wt_setup_ok = True  # retry succeeded
+                            else:
+                                # Not safe or prune failed → manual command.
+                                click.echo("\n".join([
+                                    _err_header,
+                                    "  stale worktree — prune it first:",
+                                    f"    ssh {machine_obj.host} 'cd {_rp_sh}"
+                                    f" && git worktree remove --force"
+                                    f" {_shlex_fx.quote(_holder)}'",
+                                ]), err=True)
                     else:
                         click.echo(
                             f"  error: setup failed — the remote worktree was "
@@ -4241,24 +4288,69 @@ def assign(
                         _holder_aid = Path(_holder).name
                         _holder_sname = f"coord-{_holder_aid}"
                         _holder_live = _tmux_alive(_holder_sname, host=_tmux_host)
-                        _err_lines = [
+                        _err_header = (
                             f"  error: setup failed — branch {rw_branch!r} is "
-                            f"already checked out at {_holder} on {machine_obj.host}.",
-                        ]
+                            f"already checked out at {_holder} on {machine_obj.host}."
+                        )
                         if _holder_live:
-                            _err_lines += [
+                            click.echo("\n".join([
+                                _err_header,
                                 f"  active tmux session: {_holder_sname}",
                                 f"  reattach:  coord reattach {_holder_aid}",
                                 "  exit the session first, then retry this rework.",
-                            ]
+                            ]), err=True)
                         else:
-                            _err_lines += [
-                                "  stale worktree — prune it first:",
-                                f"    ssh {machine_obj.host} 'cd {_rp_sh}"
-                                f" && git worktree remove --force"
-                                f" {_shlex_rw.quote(_holder)}'",
-                            ]
-                        click.echo("\n".join(_err_lines), err=True)
+                            # Dead orphan — safety-gated auto-prune-and-retry (#759).
+                            _auto_pruned = False
+                            if _remote_orphan_safe(
+                                machine_obj.host, _rp_sh, _holder, rw_branch,
+                            ):
+                                click.echo(
+                                    f"  auto-pruning stale orphan {_holder}"
+                                    f" on {machine_obj.host} …"
+                                )
+                                _auto_pruned = _remote_wt_remove(
+                                    machine_obj.host, _rp_sh, _holder,
+                                )
+                            if _auto_pruned:
+                                click.echo("  stale orphan auto-pruned — retrying launch …")
+                                _rc2 = _tmux_launch(
+                                    argv, effective_briefing, _sname,
+                                    cwd=None, host=_tmux_host,
+                                    raw_shell_cmd=_remote_cmd,
+                                )
+                                if _rc2 is None:
+                                    click.echo(
+                                        f"  error: could not create remote tmux session"
+                                        f" on {machine_obj.host} (retry after prune)",
+                                        err=True,
+                                    )
+                                else:
+                                    exit_code = _rc2
+                                    if _tmux_alive(_sname, host=_tmux_host):
+                                        click.echo(
+                                            f"  session still running in remote tmux:"
+                                            f" {_sname}\n"
+                                            f"  reattach with:  ssh -t {machine_obj.host}"
+                                            f" tmux attach-session -t {_sname}\n"
+                                            "  (the rework is not pushed until the session"
+                                            " ends and the coordinator finalizes)"
+                                        )
+                                        sys.exit(0)
+                                    if (
+                                        exit_code == 0
+                                        or _remote_wt_exists(machine_obj.host, _remote_wt)
+                                    ):
+                                        _wt_setup_ok_rw = True  # retry succeeded
+                            else:
+                                # Not safe or prune failed → manual command.
+                                click.echo("\n".join([
+                                    _err_header,
+                                    "  stale worktree — prune it first:",
+                                    f"    ssh {machine_obj.host} 'cd {_rp_sh}"
+                                    f" && git worktree remove --force"
+                                    f" {_shlex_rw.quote(_holder)}'",
+                                ]), err=True)
                     else:
                         click.echo(
                             f"  error: setup failed — the remote worktree was "
@@ -5002,24 +5094,69 @@ def assign(
                         _holder_aid = Path(_holder).name
                         _holder_sname = f"coord-{_holder_aid}"
                         _holder_live = _tmux_alive(_holder_sname, host=_tmux_host)
-                        _err_lines = [
+                        _err_header = (
                             f"  error: setup failed — branch {_remote_branch!r} is "
-                            f"already checked out at {_holder} on {machine_obj.host}.",
-                        ]
+                            f"already checked out at {_holder} on {machine_obj.host}."
+                        )
                         if _holder_live:
-                            _err_lines += [
+                            click.echo("\n".join([
+                                _err_header,
                                 f"  active tmux session: {_holder_sname}",
                                 f"  reattach:  coord reattach {_holder_aid}",
                                 "  exit the session first, then retry this work.",
-                            ]
+                            ]), err=True)
                         else:
-                            _err_lines += [
-                                "  stale worktree — prune it first:",
-                                f"    ssh {machine_obj.host} 'cd {_rp_sh}"
-                                f" && git worktree remove --force"
-                                f" {_shlex.quote(_holder)}'",
-                            ]
-                        click.echo("\n".join(_err_lines), err=True)
+                            # Dead orphan — safety-gated auto-prune-and-retry (#759).
+                            _auto_pruned = False
+                            if _remote_orphan_safe(
+                                machine_obj.host, _rp_sh, _holder, _remote_branch,
+                            ):
+                                click.echo(
+                                    f"  auto-pruning stale orphan {_holder}"
+                                    f" on {machine_obj.host} …"
+                                )
+                                _auto_pruned = _remote_wt_remove(
+                                    machine_obj.host, _rp_sh, _holder,
+                                )
+                            if _auto_pruned:
+                                click.echo("  stale orphan auto-pruned — retrying launch …")
+                                _rc2 = _tmux_launch(
+                                    argv, effective_briefing, _sname,
+                                    cwd=None, host=_tmux_host,
+                                    raw_shell_cmd=_remote_cmd,
+                                )
+                                if _rc2 is None:
+                                    click.echo(
+                                        f"  error: could not create remote tmux session"
+                                        f" on {machine_obj.host} (retry after prune)",
+                                        err=True,
+                                    )
+                                else:
+                                    exit_code = _rc2
+                                    if _tmux_alive(_sname, host=_tmux_host):
+                                        click.echo(
+                                            f"  session still running in remote tmux:"
+                                            f" {_sname}\n"
+                                            f"  reattach with:  coord reattach"
+                                            f" {assignment_id}\n"
+                                            "  (work commits are pushed when the session"
+                                            " ends and the coordinator finalizes)"
+                                        )
+                                        sys.exit(0)
+                                    if (
+                                        exit_code == 0
+                                        or _remote_wt_exists(machine_obj.host, _remote_wt)
+                                    ):
+                                        _wt_setup_ok_work = True  # retry succeeded
+                            else:
+                                # Not safe or prune failed → manual command.
+                                click.echo("\n".join([
+                                    _err_header,
+                                    "  stale worktree — prune it first:",
+                                    f"    ssh {machine_obj.host} 'cd {_rp_sh}"
+                                    f" && git worktree remove --force"
+                                    f" {_shlex.quote(_holder)}'",
+                                ]), err=True)
                     else:
                         click.echo(
                             f"  error: setup failed — the remote worktree was "
