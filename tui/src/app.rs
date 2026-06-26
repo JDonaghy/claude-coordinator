@@ -5807,6 +5807,59 @@ pub struct CoordApp {
     /// change.  Passed into theme-sensitive rendering helpers such as
     /// `Assignment::status_color_themed` and `stage_badge`.
     active_theme: quadraui::Theme,
+
+    // ── #728: Done-section time window ───────────────────────────────────────
+    /// Controls how far back the windowed Done list reaches.  Cycled by the
+    /// `→` key while the Done section is focused.  Resets to `H2` on restart.
+    done_window: DoneWindow,
+}
+
+/// #728: Time-window for the Done section in the Pipeline sidebar.
+///
+/// Cycled forward (H2 → H24 → D7 → All) by the `→` key while the Done
+/// section is focused.  Resets to `H2` on TUI restart (in-memory only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoneWindow {
+    /// Last 2 hours (default).
+    H2,
+    /// Last 24 hours.
+    H24,
+    /// Last 7 days.
+    D7,
+    /// All done issues regardless of age.
+    All,
+}
+
+impl DoneWindow {
+    /// The maximum age in seconds for this window, or `None` for "All".
+    fn secs(self) -> Option<f64> {
+        match self {
+            DoneWindow::H2 => Some(2.0 * 3600.0),
+            DoneWindow::H24 => Some(24.0 * 3600.0),
+            DoneWindow::D7 => Some(7.0 * 86_400.0),
+            DoneWindow::All => None,
+        }
+    }
+
+    /// Cycle to the next wider window.
+    fn next(self) -> Self {
+        match self {
+            DoneWindow::H2 => DoneWindow::H24,
+            DoneWindow::H24 => DoneWindow::D7,
+            DoneWindow::D7 => DoneWindow::All,
+            DoneWindow::All => DoneWindow::H2,
+        }
+    }
+
+    /// Short label for use in the section header.
+    fn label(self) -> &'static str {
+        match self {
+            DoneWindow::H2 => "last 2h",
+            DoneWindow::H24 => "last 24h",
+            DoneWindow::D7 => "last 7d",
+            DoneWindow::All => "all",
+        }
+    }
 }
 
 impl Default for CoordApp {
@@ -6110,6 +6163,8 @@ impl CoordApp {
                 crate::settings::TuiSettings::load_custom_theme_file()
                     .unwrap_or_else(|| s.theme.to_quadraui_theme())
             },
+            // #728: Done section shows last 2h by default; cycled with `→`.
+            done_window: DoneWindow::H2,
         };
         // #584: a thin client pulls config from the daemon (no local
         // coordinator.yml) so the status bar doesn't warn and subcommands have
@@ -9625,6 +9680,102 @@ impl CoordApp {
         }
     }
 
+    // ── #728: Done-section windowing helpers ─────────────────────────────────
+
+    /// Compute the "done-at" timestamp for an issue: the **max** `finished_at`
+    /// across all assignments for that issue (by issue number + coord-repo).
+    ///
+    /// Returns `None` when no assignment has a `finished_at` (e.g. the issue
+    /// was closed on GitHub with no coord pipeline rows, or rows predate the
+    /// column).  Such issues are excluded from the windowed view and only
+    /// appear when `done_window == All`.
+    fn issue_done_at(&self, issue: &PipelineIssue) -> Option<f64> {
+        let local_repo = issue.coord_repo.as_deref();
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == *r,
+                None => true,
+            })
+            .filter_map(|a| a.finished_at)
+            .reduce(f64::max)
+    }
+
+    /// Return a flat, deduplicated, time-windowed, newest-first list of
+    /// `pipeline_issues` indices for the **Done** lifecycle section.
+    ///
+    /// - Applies dedup (last-write-wins), search filter, and dismissal filter.
+    /// - Issues inside `self.done_window` are included; older ones are excluded
+    ///   unless `done_window == All`.
+    /// - Issues with `None` done-at are treated as "old" and only appear in `All`.
+    /// - Sorted newest-first; `None` timestamps go last.
+    fn pipeline_done_windowed(&self) -> Vec<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // Dedup: last write wins (same semantics as pipeline_repos_for_state).
+        let mut dedup: std::collections::HashMap<(String, u64), usize> =
+            std::collections::HashMap::new();
+        for (i, issue) in self.pipeline_issues.iter().enumerate() {
+            if !self
+                .pipeline_dismissed
+                .contains(&(issue.repo_slug.clone(), issue.number))
+                && self.pipeline_search.matches(issue.number, &issue.title)
+            {
+                dedup.insert((issue.repo_slug.clone(), issue.number), i);
+            }
+        }
+
+        let window_secs = self.done_window.secs();
+
+        // Collect done issues with their timestamps, filtered by window.
+        let mut entries: Vec<(usize, Option<f64>)> = dedup
+            .values()
+            .copied()
+            .filter(|&i| {
+                self.pipeline_lifecycle_section(&self.pipeline_issues[i]) == "done"
+            })
+            .map(|i| {
+                let done_at = self.issue_done_at(&self.pipeline_issues[i]);
+                (i, done_at)
+            })
+            .filter(|(_, done_at)| match (done_at, window_secs) {
+                (_, None) => true,               // All: include everything
+                (Some(t), Some(w)) => now - t <= w, // within window
+                (None, Some(_)) => false,         // unknown time: hide in windowed view
+            })
+            .collect();
+
+        // Sort: known timestamps newest-first, unknowns at the bottom.
+        entries.sort_by(|(_, a), (_, b)| match (a, b) {
+            (Some(at), Some(bt)) => bt.partial_cmp(at).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+
+        entries.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// True when the Pipeline Done section is the active sidebar section.
+    /// Used to gate the `→` extend-range key.
+    fn is_done_section_active(&self) -> bool {
+        let search_offset = 1usize;
+        if let Some(section) = self.pipeline_sidebar.active_section() {
+            if section >= search_offset {
+                let state_idx = section - search_offset;
+                if let Some(&key) = self.pipeline_state_section_names.get(state_idx) {
+                    return key == "done";
+                }
+            }
+        }
+        false
+    }
+
     /// Return issues for a lifecycle state, grouped by repo, in stable repo
     /// order (same order as `pipeline_repo_names`).  Only intended for
     /// `"new"`, `"refining"`, `"pending"`, and `"done"` — Active issues are
@@ -10185,7 +10336,12 @@ impl CoordApp {
         let refining_by_repo: Vec<(String, Vec<usize>)> =
             self.pipeline_repos_for_state("refining");
         let pending_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("pending");
-        let done_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("done");
+        // #728: Done is now a flat, time-windowed, newest-first list rather
+        // than the old repo-grouped archive.
+        let done_windowed: Vec<usize> = self.pipeline_done_windowed();
+        // Label includes the active window ("Done · last 2h", etc.)
+        let done_section_label: String =
+            format!("Done · {}", self.done_window.label());
 
         // Build the list of non-empty state sections in display order.
         // Each entry: (classifier_key, display_label).  Order matches the
@@ -10203,16 +10359,29 @@ impl CoordApp {
         if !active_flat.is_empty() {
             state_sections.push(("in-progress", "In-progress"));
         }
-        if !done_by_repo.is_empty() {
+        if !done_windowed.is_empty() {
             state_sections.push(("done", "Done"));
         }
 
         // ── Build sidebar section definitions ────────────────────────────
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
         defs.push(SidebarSectionDef::form("pipeline-search", "FILTER"));
-        for &(lc_key, lc_label) in &state_sections {
+        for &(lc_key, _lc_label) in &state_sections {
+            // #728: the Done section gets a window-aware label; all others
+            // keep their static labels.
+            let label = if lc_key == "done" {
+                done_section_label.clone()
+            } else {
+                match lc_key {
+                    "new" => "New".to_string(),
+                    "refining" => "Refining".to_string(),
+                    "pending" => "Pending".to_string(),
+                    "in-progress" => "In-progress".to_string(),
+                    other => other.to_string(),
+                }
+            };
             let mut def =
-                SidebarSectionDef::new(format!("section:state:{}", lc_key), lc_label.to_string());
+                SidebarSectionDef::new(format!("section:state:{}", lc_key), label);
             def.show_chevron = true;
             def.size = SectionSize::Content;
             defs.push(def);
@@ -10326,20 +10495,91 @@ impl CoordApp {
                         }
                     }
                 }
+                "done" => {
+                    // #728: Done is now a flat, time-windowed, newest-first list.
+                    // No repo sub-headers; issue rows directly at [0, ii].
+                    // Each row shows: #N  title  status  age  [● live]
+                    sidebar.set_section_badge(
+                        section_idx,
+                        Some(StyledText::plain(format!("({})", done_windowed.len()))),
+                    );
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64();
+                    for (ii, &issue_idx) in done_windowed.iter().enumerate() {
+                        let issue = &self.pipeline_issues[issue_idx];
+                        let title_color = if issue.coord_repo.is_some() {
+                            Color::rgb(160, 160, 160)
+                        } else {
+                            Color::rgb(110, 110, 110)
+                        };
+                        // Terse status: ✓ merged / ✓ closed
+                        let status_str = if self.merge_stage_status_for(issue) == StageStatus::Done {
+                            "✓ merged"
+                        } else {
+                            "✓ closed"
+                        };
+                        // Relative age.
+                        let age_str = match self.issue_done_at(issue) {
+                            Some(t) => {
+                                let secs = (now_secs - t).max(0.0) as u64;
+                                if secs < 3600 {
+                                    format!("  {}m ago", secs / 60)
+                                } else if secs < 86_400 {
+                                    format!("  {}h ago", secs / 3600)
+                                } else {
+                                    format!("  {}d ago", secs / 86_400)
+                                }
+                            }
+                            None => String::new(),
+                        };
+                        let mut spans = vec![
+                            StyledSpan::with_fg(
+                                format!("#{:<5}", issue.number),
+                                Color::rgb(150, 150, 240),
+                            ),
+                            StyledSpan::with_fg(trunc(&issue.title, 18), title_color),
+                            StyledSpan::with_fg(
+                                format!("  {}", status_str),
+                                Color::rgb(100, 180, 100),
+                            ),
+                            StyledSpan::with_fg(age_str, Color::rgb(120, 120, 140)),
+                        ];
+                        // ● session live badge (#728).
+                        if self.issue_session_is_live(issue) {
+                            spans.push(StyledSpan::with_fg(
+                                "  ● live".to_string(),
+                                Color::rgb(80, 160, 240),
+                            ));
+                        }
+                        // Repo tag badge (same as in-progress, for orientation).
+                        let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
+                        rows.push(TreeRow {
+                            path: vec![0u16, ii as u16],
+                            indent: 2,
+                            icon: None,
+                            text: StyledText { spans },
+                            badge: Some(Badge::colored(tag, Color::rgb(180, 140, 240))),
+                            is_expanded: None,
+                            decoration: Decoration::Normal,
+                            edit: None,
+                        });
+                    }
+                }
                 _ => {
-                    // New / Refining / Pending / Done: grouped by repo with
+                    // New / Refining / Pending: grouped by repo with
                     // expandable repo sub-headers.  #194 expanded this from
                     // the original three sections to all four non-Active
                     // lifecycle states.
                     //
-                    // #668: New and Done additionally group by milestone beneath
+                    // #668: New additionally groups by milestone beneath
                     // the repo level (repo → milestone → issue, 3-level path
                     // [ri, mi, ii]).  Refining and Pending remain 2-level.
                     let repo_groups: &Vec<(String, Vec<usize>)> = match lc_key {
                         "new" => &new_by_repo,
                         "refining" => &refining_by_repo,
                         "pending" => &pending_by_repo,
-                        "done" => &done_by_repo,
                         // `state_sections` is built in this function and only
                         // ever contains the five known keys above — this arm
                         // is unreachable.
@@ -10350,7 +10590,7 @@ impl CoordApp {
                         section_idx,
                         Some(StyledText::plain(format!("({})", total))),
                     );
-                    let milestone_grouped = lc_key == "new" || lc_key == "done";
+                    let milestone_grouped = lc_key == "new";
                     for (ri, (repo_key, issue_idxs)) in repo_groups.iter().enumerate() {
                         // Repo sub-header: expand/collapse keyed by
                         // (lifecycle_key, repo_key) — lifecycle first, repo
@@ -10411,7 +10651,7 @@ impl CoordApp {
                         }
 
                         if milestone_grouped {
-                            // #668: New/Done — 3-level tree: repo → milestone → issue.
+                            // #668: New — 3-level tree: repo → milestone → issue.
                             // Compute milestones for this repo's issue list.
                             let milestones =
                                 self.pipeline_milestones_for_issues(issue_idxs);
@@ -10544,11 +10784,11 @@ impl CoordApp {
         if sidebar.active_section().is_none() && !state_sections.is_empty() {
             let section_idx = search_offset; // first state section
             sidebar.set_active_section(Some(section_idx));
-            // Active sections use path [group_idx, issue_idx] (2-level).
-            // New/Done now use path [repo_idx, milestone_idx, issue_idx] (3-level).
-            // Refining/Pending use path [repo_idx, issue_idx] (2-level).
+            // Active / Done / Refining / Pending use path [group_idx, issue_idx] (2-level).
+            // New uses path [repo_idx, milestone_idx, issue_idx] (3-level, #668).
+            // #728: Done is now flat [0, issue_idx] (2-level), not 3-level.
             let first_state_key = state_sections.get(0).map(|&(k, _)| k).unwrap_or("");
-            let default_path = if first_state_key == "new" || first_state_key == "done" {
+            let default_path = if first_state_key == "new" {
                 vec![0u16, 0u16, 0u16]
             } else {
                 vec![0u16, 0u16]
@@ -10591,18 +10831,32 @@ impl CoordApp {
                             }
                         }
                     }
+                } else if state_key == "done" {
+                    // #728: Done is now flat [0, issue_idx] — search
+                    // pipeline_done_windowed() directly (no repo/milestone levels).
+                    for (ii, &idx) in done_windowed.iter().enumerate() {
+                        let issue = &self.pipeline_issues[idx];
+                        if issue.repo_slug == repo && issue.number == num {
+                            self.pipeline_sel = Some(idx);
+                            self.pipeline_sidebar.set_active_section(Some(section_idx));
+                            self.pipeline_sidebar.set_selected_path(
+                                section_idx,
+                                Some(vec![0u16, ii as u16]),
+                            );
+                            break 'outer;
+                        }
+                    }
                 } else {
                     let repo_groups: &Vec<(String, Vec<usize>)> = match state_key {
                         "new" => &new_by_repo,
                         "refining" => &refining_by_repo,
                         "pending" => &pending_by_repo,
-                        "done" => &done_by_repo,
                         // Unknown state key — skip selection restore.
                         _ => continue,
                     };
-                    // #668: New and Done use 3-level paths [ri, mi, ii];
+                    // #668: New uses 3-level paths [ri, mi, ii];
                     // Refining and Pending remain 2-level [ri, ii].
-                    if state_key == "new" || state_key == "done" {
+                    if state_key == "new" {
                         for (ri, (_, issue_idxs)) in repo_groups.iter().enumerate() {
                             // Compute milestones; owned Vec, so no self borrow persists.
                             let milestones = self.pipeline_milestones_for_issues(issue_idxs);
@@ -10681,7 +10935,8 @@ impl CoordApp {
     ///
     /// Path depth varies by state:
     /// - `in-progress`: `[group_idx, issue_idx]` (2-level)
-    /// - `new` / `done`: `[repo_idx, milestone_idx, issue_idx]` (3-level, #668)
+    /// - `new`: `[repo_idx, milestone_idx, issue_idx]` (3-level, #668)
+    /// - `done`: `[0, issue_idx]` (2-level flat, #728 — no repo/milestone groups)
     /// - `refining` / `pending`: `[repo_idx, issue_idx]` (2-level)
     ///
     /// A path shorter than the minimum for the state (header row selected)
@@ -10697,7 +10952,7 @@ impl CoordApp {
         let &state_key = self.pipeline_state_section_names.get(state_idx)?;
         let path = self.pipeline_sidebar.selected_path(section)?;
 
-        if state_key == "new" || state_key == "done" {
+        if state_key == "new" {
             // #668: 3-level path [repo_idx, milestone_idx, issue_idx].
             if path.len() < 3 {
                 return None; // repo or milestone header selected
@@ -10710,6 +10965,15 @@ impl CoordApp {
             let milestones = self.pipeline_milestones_for_issues(repo_issue_idxs);
             let (_, _, mil_issue_idxs) = milestones.get(mi)?;
             mil_issue_idxs.get(ii).copied()
+        } else if state_key == "done" {
+            // #728: flat 2-level path [0, issue_idx] — path[0] is the
+            // synthetic group (always 0); path[1] is the windowed list index.
+            if path.len() < 2 {
+                return None;
+            }
+            let ii = path[1] as usize;
+            let done_windowed = self.pipeline_done_windowed();
+            done_windowed.get(ii).copied()
         } else if state_key == "in-progress" {
             if path.len() < 2 {
                 return None; // liveness group header selected
@@ -16081,17 +16345,19 @@ impl CoordApp {
                     }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 2 => {
                         // #668: A two-level path = a milestone sub-header was
-                        // toggled within a New/Done section.  Persist the state in
+                        // toggled within a New section.  Persist the state in
                         // pipeline_milestone_expanded keyed by (lc_key, repo_key,
                         // milestone_key).  Refining/Pending have no milestone tier,
                         // so a path.len()==2 there is an issue row (not a header) —
                         // those sections handle selection via RowSelected, not here.
+                        // #728: Done no longer has milestone sub-headers (flat list),
+                        // so path.len()==2 in Done is an issue row — skip it here.
                         let search_offset = 1usize;
                         if section >= search_offset {
                             let state_idx = section - search_offset;
                             if let Some(&lc_key) = self.pipeline_state_section_names.get(state_idx)
                             {
-                                if lc_key == "new" || lc_key == "done" {
+                                if lc_key == "new" {
                                     let repo_groups = self.pipeline_repos_for_state(lc_key);
                                     let ri = path[0] as usize;
                                     let mi = path[1] as usize;
@@ -28922,6 +29188,19 @@ impl ShellApp for CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── #728: Done section extend-range (→) ─────────────
+                    // `→` while the Pipeline Done section is focused cycles
+                    // the time window: H2 → H24 → D7 → All → H2.
+                    Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.is_done_section_active()
+                            && !self.pipeline_search.focused =>
+                    {
+                        self.done_window = self.done_window.next();
+                        self.rebuild_pipeline_sidebar(None);
+                        needs_redraw = true;
+                    }
+
                     // ── Kanban keyboard nav (#638) ───────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Kanban =>
@@ -32107,6 +32386,8 @@ mod tests {
             merge_queue_scroll: 0,
             // #217: use the default dark palette for test helpers.
             active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
+            // #728: default 2h window for tests (can be overridden per test).
+            done_window: DoneWindow::H2,
         }
     }
 
@@ -34548,7 +34829,8 @@ mod tests {
             all_labels: vec!["coord".to_string()],
             is_closed: true,
         });
-
+        // #728: issue #104 has no finished_at; use All window so it appears.
+        app.done_window = DoneWindow::All;
         app.rebuild_pipeline_sidebar(None);
 
         // #628: three lifecycle sections in display order. status:ready and
@@ -35368,8 +35650,9 @@ mod tests {
             all_labels: vec!["coord".to_string()],
             is_closed: true,
         });
-        // Need an assignment so the closed issue is visible in Done
+        // #728: #55 has no finished_at; use All window so it appears in Done.
         // (pipeline_lifecycle_section returns "done" for is_closed=true).
+        app.done_window = DoneWindow::All;
         app.rebuild_pipeline_sidebar(None);
         // #628: the fixture's status:ready issues are now "new" (status:ready
         // gates nothing). With the closed #55 → "done", sections are New + Done.
@@ -35413,6 +35696,8 @@ mod tests {
             all_labels: vec!["coord".to_string()],
             is_closed: true,
         });
+        // #728: issue #90 has no finished_at; use All window so it appears.
+        app.done_window = DoneWindow::All;
         app.rebuild_pipeline_sidebar(None);
         assert_eq!(app.pipeline_state_section_names, vec!["done"]);
         app.pipeline_sidebar.set_collapsed(1, true); // collapse Done (section 1)
@@ -35776,7 +36061,9 @@ mod tests {
 
     #[test]
     fn pipeline_new_done_sections_grouped_by_repo() {
-        // New and Done sections must sub-group by repo, not be flat.
+        // New section must sub-group by repo.
+        // Done section (#728) is now flat/windowed — verify it shows the closed
+        // issue when done_window == All (no finished_at on the test issue).
         let mut app = make_pipeline_app();
         // Add a closed issue in the second repo.
         app.pipeline_issues.push(PipelineIssue {
@@ -35789,6 +36076,9 @@ mod tests {
             all_labels: vec!["coord".to_string()],
             is_closed: true,
         });
+        // #728: issues without finished_at are hidden in the default H2 window;
+        // set All so the test can observe the Done section.
+        app.done_window = DoneWindow::All;
         app.rebuild_pipeline_sidebar(None);
 
         // State sections: New + Done (#628: status:ready issues are "new").
@@ -35805,9 +36095,9 @@ mod tests {
         let new_groups = app.pipeline_repos_for_state("new");
         assert_eq!(new_groups.len(), 2, "New section has two repos");
 
-        // Done section has 1 repo.
-        let done_groups = app.pipeline_repos_for_state("done");
-        assert_eq!(done_groups.len(), 1, "Done section has one repo");
+        // Done section (#728): flat windowed list — 1 item (issue #100).
+        let done_windowed = app.pipeline_done_windowed();
+        assert_eq!(done_windowed.len(), 1, "Done windowed list has one item");
     }
 
     // ── #193: stale downstream stages ─────────────────────────────────────────
@@ -46083,31 +46373,11 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_done_section_has_milestone_sub_headers() {
-        // Done section (closed issues) must also group by milestone.
+    fn pipeline_done_section_is_flat_windowed_no_milestone_headers() {
+        // #728: Done section is now flat and time-windowed — no milestone
+        // sub-headers.  Issues without finished_at are hidden in H2 (default)
+        // but visible in All.
         let mut app = make_pipeline_app();
-        app.data.open_issues = vec![
-            OpenIssue {
-                repo_name: "api".to_string(),
-                number: 50,
-                title: "Done v1".to_string(),
-                body: String::new(),
-                labels: vec!["coord".to_string()],
-                state: "closed".to_string(),
-                milestone_number: Some(1),
-                milestone_title: Some("v1.0".to_string()),
-            },
-            OpenIssue {
-                repo_name: "api".to_string(),
-                number: 60,
-                title: "Done no-milestone".to_string(),
-                body: String::new(),
-                labels: vec!["coord".to_string()],
-                state: "closed".to_string(),
-                milestone_number: None,
-                milestone_title: None,
-            },
-        ];
         app.pipeline_issues = vec![
             PipelineIssue {
                 number: 50,
@@ -46130,18 +46400,29 @@ mod tests {
                 is_closed: true,
             },
         ];
-        app.rebuild_pipeline_sidebar(None);
 
+        // Default H2 window: no assignments → no finished_at → done_windowed empty.
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+        assert!(
+            !app.pipeline_state_section_names.contains(&"done"),
+            "Done section hidden in H2 when no finished_at timestamps",
+        );
+
+        // All window: both issues appear, flat (no milestone sub-headers).
+        app.done_window = DoneWindow::All;
+        app.rebuild_pipeline_sidebar(None);
         assert!(
             app.pipeline_state_section_names.contains(&"done"),
-            "Done section must be present",
+            "Done section visible in All window",
         );
-        let done_groups = app.pipeline_repos_for_state("done");
-        assert_eq!(done_groups.len(), 1);
-        let milestones = app.pipeline_milestones_for_issues(&done_groups[0].1);
-        assert_eq!(milestones.len(), 2, "two milestone buckets in Done");
-        assert_eq!(milestones[0].0, "1");
-        assert_eq!(milestones[1].0, "no-milestone");
+        let done_windowed = app.pipeline_done_windowed();
+        assert_eq!(done_windowed.len(), 2, "two done issues in All window");
+        // Verify these are real pipeline_issues indices.
+        for &idx in &done_windowed {
+            assert!(idx < app.pipeline_issues.len(), "index in bounds");
+            assert!(app.pipeline_issues[idx].is_closed, "issue is closed");
+        }
     }
 
     #[test]
@@ -50324,5 +50605,262 @@ mod tests {
             "#738: Merge must NOT appear in per-issue pipeline (lives in Merge Queue panel):\n{}",
             screen
         );
+    }
+
+    // ── #728: Windowed flat Done section ─────────────────────────────────────
+
+    /// Build a closed PipelineIssue for testing Done-section windowing.
+    fn closed_issue(number: u64, repo: &str, coord_repo: &str) -> PipelineIssue {
+        PipelineIssue {
+            number,
+            title: format!("Issue #{}", number),
+            body: String::new(),
+            repo_slug: repo.to_string(),
+            coord_repo: Some(coord_repo.to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: true,
+        }
+    }
+
+    /// Build a finished assignment for `issue_number`/`repo` with `finished_at`
+    /// seconds in the past.
+    fn finished_assignment_ago(id: &str, issue: u64, repo: &str, seconds_ago: f64) -> Assignment {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut a = make_assignment_typed("done", issue, repo, Some("work"));
+        a.id = id.to_string();
+        a.finished_at = Some(now - seconds_ago);
+        a
+    }
+
+    #[test]
+    fn done_windowed_h2_shows_only_recent_items() {
+        // Issues with finished_at inside 2h appear; older ones do not.
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![
+                finished_assignment_ago("a-recent", 10, "api", 30.0 * 60.0), // 30 min ago
+                finished_assignment_ago("a-old",    20, "api", 3.0 * 3600.0), // 3 h ago
+            ],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![
+            closed_issue(10, "acme/api", "api"), // recent
+            closed_issue(20, "acme/api", "api"), // old
+        ];
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+
+        let windowed = app.pipeline_done_windowed();
+        assert_eq!(windowed.len(), 1, "only 1 issue inside 2h");
+        assert_eq!(app.pipeline_issues[windowed[0]].number, 10, "must be #10");
+
+        assert!(
+            app.pipeline_state_section_names.contains(&"done"),
+            "Done section visible when at least one recent item exists",
+        );
+    }
+
+    #[test]
+    fn done_windowed_all_shows_issues_without_finished_at() {
+        // Issues with no finished_at are excluded in H2 but visible in All.
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![
+            closed_issue(10, "acme/api", "api"), // no assignment → no finished_at
+        ];
+
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+        assert!(
+            !app.pipeline_state_section_names.contains(&"done"),
+            "Done hidden in H2 when no finished_at",
+        );
+
+        app.done_window = DoneWindow::All;
+        app.rebuild_pipeline_sidebar(None);
+        let windowed = app.pipeline_done_windowed();
+        assert_eq!(windowed.len(), 1, "All window reveals timestamp-less issue");
+        assert_eq!(app.pipeline_issues[windowed[0]].number, 10);
+    }
+
+    #[test]
+    fn done_windowed_newest_first_ordering() {
+        // Done section is sorted newest-first (largest finished_at first).
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![
+                finished_assignment_ago("a-old",    10, "api", 60.0 * 60.0), // 1h ago
+                finished_assignment_ago("a-recent", 20, "api", 10.0 * 60.0), // 10m ago
+                finished_assignment_ago("a-mid",    30, "api", 30.0 * 60.0), // 30m ago
+            ],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![
+            closed_issue(10, "acme/api", "api"),
+            closed_issue(20, "acme/api", "api"),
+            closed_issue(30, "acme/api", "api"),
+        ];
+        app.done_window = DoneWindow::H2;
+
+        let windowed = app.pipeline_done_windowed();
+        assert_eq!(windowed.len(), 3, "all three fit in 2h");
+        // Newest first: 20 (10m), 30 (30m), 10 (60m).
+        assert_eq!(app.pipeline_issues[windowed[0]].number, 20, "newest first");
+        assert_eq!(app.pipeline_issues[windowed[1]].number, 30, "middle");
+        assert_eq!(app.pipeline_issues[windowed[2]].number, 10, "oldest last");
+    }
+
+    #[test]
+    fn done_windowed_flat_no_repo_or_milestone_subheaders() {
+        // Done section renders flat: path[0] == 0 (synthetic group),
+        // path[1] == issue index. No path.len()==1 (repo header) or
+        // path.len()==3 (milestone header) rows.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![{
+                let mut a = make_assignment_typed("done", 42, "api", Some("work"));
+                a.finished_at = Some(now - 60.0); // 1 minute ago
+                a
+            }],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![closed_issue(42, "acme/api", "api")];
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        // Switch to Pipeline view.
+        driver.press(quadraui::Key::Char('3'));
+        let screen = driver.screen();
+
+        // Done section header must show the window label.
+        assert!(
+            screen.contains("Done") && screen.contains("last 2h"),
+            "Done header shows window: last 2h\n{}",
+            screen,
+        );
+        // The issue number must appear.
+        assert!(screen.contains("#42"), "issue #42 must render\n{}", screen);
+        // "✓ merged" or "✓ closed" status must appear (terse status).
+        assert!(
+            screen.contains("✓ merged") || screen.contains("✓ closed"),
+            "terse status renders\n{}",
+            screen,
+        );
+        // No repo sub-headers (would be the repo_key "api" as a header row).
+        // They would show as "api (N)" in Done; now Done is flat.
+        // We can't easily assert absence of "api (N)" without parsing, but
+        // we can assert the issue title appears directly (not behind a header).
+        assert!(
+            screen.contains("Issue #42"),
+            "issue title appears directly\n{}",
+            screen,
+        );
+    }
+
+    #[test]
+    fn done_windowed_live_session_badge_appears() {
+        // A done issue with a matching live tmux session must be detected as
+        // live — which is the predicate that adds the "● live" span to the
+        // Done row during rebuild_pipeline_sidebar.
+        //
+        // We test the predicate (`issue_session_is_live`) directly here because
+        // the TuiDriver clips the sidebar column and the span is pushed past the
+        // visible boundary. The correct rendering contract is:
+        //   issue_session_is_live → true → span "  ● live" appended (see app.rs).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![{
+                let mut a = make_assignment_typed("done", 77, "api", Some("work"));
+                a.finished_at = Some(now - 120.0); // 2 minutes ago
+                a
+            }],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![closed_issue(77, "acme/api", "api")];
+        // Add a matching live tmux session.
+        app.live_tmux_sessions = vec![make_live_tmux_session("some-aid", 77, "api")];
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+
+        // Verify the issue is windowed (would appear in Done section).
+        let windowed = app.pipeline_done_windowed();
+        assert_eq!(windowed.len(), 1, "issue #77 must be in Done section");
+        assert_eq!(app.pipeline_issues[windowed[0]].number, 77);
+
+        // Verify the live-session predicate fires — this is what gates the
+        // "● live" span in rebuild_pipeline_sidebar's "done" arm.
+        let issue = &app.pipeline_issues[windowed[0]];
+        assert!(
+            app.issue_session_is_live(issue),
+            "issue_session_is_live must return true for #77 with matching tmux session",
+        );
+    }
+
+    #[test]
+    fn done_window_cycles_on_right_key() {
+        // The `→` key while Done section is focused cycles: H2 → H24 → D7 → All.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![{
+                let mut a = make_assignment_typed("done", 55, "api", Some("work"));
+                a.finished_at = Some(now - 300.0); // 5 minutes ago
+                a
+            }],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![closed_issue(55, "acme/api", "api")];
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        // Switch to Pipeline (key 3), Done section should be active already.
+        driver.press(quadraui::Key::Char('3'));
+
+        // Header starts with "last 2h".
+        let s0 = driver.screen();
+        assert!(s0.contains("last 2h"), "starts as last 2h\n{}", s0);
+
+        // Press → to cycle to 24h.
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
+        let s1 = driver.screen();
+        assert!(s1.contains("last 24h"), "H24 after first →\n{}", s1);
+
+        // Press → again: 7d.
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
+        let s2 = driver.screen();
+        assert!(s2.contains("last 7d"), "D7 after second →\n{}", s2);
+
+        // Press → again: all.
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
+        let s3 = driver.screen();
+        assert!(s3.contains("all") || s3.contains("All"), "All after third →\n{}", s3);
+
+        // Press → again: wraps back to 2h.
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
+        let s4 = driver.screen();
+        assert!(s4.contains("last 2h"), "wraps back to last 2h\n{}", s4);
     }
 }
