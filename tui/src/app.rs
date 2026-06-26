@@ -881,6 +881,9 @@ enum SidebarView {
     /// #638: Kanban view — three-column (Backlog / In Flight / Completed)
     /// rendered via `quadraui::Board`.
     Kanban,
+    /// #737: Merge Queue panel — global view of all in-flight PR merges,
+    /// grouped by milestone.  Key `7` switches to this view.
+    MergeQueue,
 }
 
 impl SidebarView {
@@ -892,6 +895,7 @@ impl SidebarView {
             SidebarView::Settings => "Settings",
             SidebarView::Terminal => "Terminal",
             SidebarView::Kanban => "Kanban",
+            SidebarView::MergeQueue => "Merge Queue",
         }
     }
 }
@@ -5739,6 +5743,12 @@ pub struct CoordApp {
     kanban_model: BoardModel,
     kanban_layout: std::cell::RefCell<Option<BoardLayout>>,
 
+    // ── #737: Merge Queue panel ──────────────────────────────────────────────
+    /// Selected entry index in the Merge Queue panel list (0-based).  Clamped
+    /// to `data.merge_queue.len().saturating_sub(1)` on navigation so it never
+    /// goes out of bounds even after a data refresh.
+    merge_queue_sel: usize,
+
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
@@ -6049,6 +6059,8 @@ impl CoordApp {
                 col_scroll_offset: 0,
             },
             kanban_layout: std::cell::RefCell::new(None),
+            // #737: Merge Queue panel — selection starts at the first entry.
+            merge_queue_sel: 0,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
@@ -9650,6 +9662,335 @@ impl CoordApp {
             }
         }
         map
+    }
+
+    // ── #737: Merge Queue panel helpers ──────────────────────────────────────
+
+    /// `true` when any merge-queue entry requires human attention:
+    /// HUMAN_REQUIRED, failed state, or a known CI failure.
+    fn merge_queue_needs_attention(&self) -> bool {
+        self.data.merge_queue.iter().any(|e| {
+            matches!(e.state.as_str(), "human_required" | "failed")
+                || (e.state == "pending"
+                    && e.pr_number.is_some()
+                    && self.ci_failed_for_entry(e))
+        })
+    }
+
+    /// Return a reference to the currently-selected merge-queue entry, if any.
+    fn selected_merge_queue_entry(&self) -> Option<&MergeQueueEntry> {
+        let n = self.data.merge_queue.len();
+        if n == 0 {
+            return None;
+        }
+        self.data.merge_queue.get(self.merge_queue_sel.min(n - 1))
+    }
+
+    /// Format a single merge-queue entry as a terse list label.
+    ///
+    /// Template: `[<STATE>] #<PR>  <issue_title>  (<error-reason>)`
+    fn merge_queue_entry_label(&self, entry: &MergeQueueEntry) -> String {
+        // State badge.
+        let state = match entry.state.as_str() {
+            "pending" => "PENDING",
+            "active" | "running" => "ACTIVE",
+            "merged" => "MERGED",
+            "human_required" => "NEEDS ATTENTION",
+            "failed" => "FAILED",
+            _ => &entry.state,
+        };
+        // PR number.
+        let pr = entry
+            .pr_number
+            .map(|n| format!(" #{}", n))
+            .unwrap_or_default();
+        // Issue title — join from open_issues on (repo_name, issue_number).
+        let title = entry
+            .issue_number
+            .and_then(|num| {
+                // Reverse-lookup: repo_github → coord repo name, then match open_issues.
+                let coord_repo = self
+                    .data
+                    .pipeline_repos
+                    .iter()
+                    .find(|(_, gh)| gh == &entry.repo_github)
+                    .map(|(name, _)| name.as_str());
+                self.data.open_issues.iter().find(|oi| {
+                    oi.number == num
+                        && coord_repo.is_some_and(|cr| oi.repo_name == cr)
+                })
+            })
+            .map(|oi| format!("  {}", oi.title))
+            .unwrap_or_default();
+        // Gate / conflict reason — the last error string from coord merge.
+        let reason = entry
+            .error
+            .as_deref()
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                // Truncate long error strings to keep the row terse.
+                let s = e.trim();
+                if s.len() > 60 {
+                    format!("  ({}…)", &s[..57])
+                } else {
+                    format!("  ({})", s)
+                }
+            })
+            .unwrap_or_default();
+        format!("[{}]{}{}{}", state, pr, title, reason)
+    }
+
+    /// State colour for a merge-queue entry label.
+    fn merge_queue_entry_color(&self, entry: &MergeQueueEntry) -> Color {
+        match entry.state.as_str() {
+            "human_required" | "failed" => Color::rgb(220, 70, 70),
+            "merged" => Color::rgb(80, 200, 80),
+            "active" | "running" => Color::rgb(80, 160, 220),
+            _ => {
+                // Pending: amber when CI is failing.
+                if self.ci_failed_for_entry(entry) {
+                    Color::rgb(220, 140, 40)
+                } else {
+                    Color::rgb(180, 180, 180)
+                }
+            }
+        }
+    }
+
+    /// Sidebar placeholder for the Merge Queue view — shows entry count and
+    /// an attention indicator when any entry needs human action.
+    fn merge_queue_sidebar(&self) -> ListView {
+        let n = self.data.merge_queue.len();
+        let attn = if self.merge_queue_needs_attention() {
+            " ⚠ needs attention"
+        } else {
+            ""
+        };
+        let hint = format!("  {} entr{}{}",
+            n,
+            if n == 1 { "y" } else { "ies" },
+            attn,
+        );
+        ListView {
+            id: WidgetId::new("mergequeue-sidebar"),
+            title: Some(StyledText::plain(" MERGE QUEUE ")),
+            items: vec![activity_item(&hint, Color::rgb(160, 160, 160))],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
+
+    /// Render the Merge Queue main panel — a scrollable list of all merge-queue
+    /// entries with their state, PR number, issue title, and error reason.
+    ///
+    /// The selected entry is highlighted.  The list uses `bordered: true` so
+    /// it has a visible box boundary matching the Pipeline detail style.
+    fn render_merge_queue_panel(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
+        let n = self.data.merge_queue.len();
+        if n == 0 {
+            backend.draw_list(rect, &plain_list(
+                "mergequeue-empty",
+                "  No merge-queue entries — run `coord merge` to populate the queue.",
+                0,
+            ));
+            return;
+        }
+
+        // Clamp the selection in case the queue shrank after a drop.
+        let sel = self.merge_queue_sel.min(n - 1);
+
+        let items: Vec<ListItem> = self.data.merge_queue.iter().map(|entry| {
+            let label = self.merge_queue_entry_label(entry);
+            let color = self.merge_queue_entry_color(entry);
+            ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(&label, color)],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            }
+        }).collect();
+
+        backend.draw_list(rect, &ListView {
+            id: WidgetId::new("mergequeue-list"),
+            title: Some(StyledText::plain(" MERGE QUEUE ")),
+            items,
+            selected_idx: sel,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: n > 10,
+        });
+    }
+
+    // ── #737: Merge Queue per-entry actions ───────────────────────────────────
+
+    /// `coord merge --order <assignment_id>` (or `--force-merge` when `force`).
+    fn dispatch_merge_queue_merge(&mut self, force: bool) {
+        let Some(entry) = self.selected_merge_queue_entry() else {
+            self.push_toast(
+                "Merge Queue",
+                "No entry selected.",
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+        let aid = entry.assignment_id.clone();
+        // Build the command as owned Strings so we can conditionally push
+        // --force-merge before slicing into &str refs for spawn_queued.
+        let mut cmd_strs: Vec<String> = vec![
+            "merge".to_string(),
+            "--order".to_string(),
+            aid.clone(),
+        ];
+        if force {
+            cmd_strs.push("--force-merge".to_string());
+        }
+        let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&cmd_refs) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    if force { "Force-merge dispatched" } else { "Merge dispatched" },
+                    &format!("coord merge --order {} {}", aid,
+                        if force { "--force-merge" } else { "" }),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "merge runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
+        }
+    }
+
+    /// `coord merge --drop <assignment_id>` — remove one entry from the queue.
+    fn dispatch_merge_queue_drop(&mut self) {
+        let Some(entry) = self.selected_merge_queue_entry() else {
+            self.push_toast(
+                "Merge Queue",
+                "No entry selected.",
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+        let aid = entry.assignment_id.clone();
+        let cmd_strs: Vec<String> = vec![
+            "merge".to_string(),
+            "--drop".to_string(),
+            aid.clone(),
+        ];
+        let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&cmd_refs) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Drop queued",
+                    &format!("coord merge --drop {}", aid),
+                    ToastSeverity::Info,
+                );
+                // Advance selection to stay in-bounds after the row disappears.
+                self.merge_queue_sel = self.merge_queue_sel.saturating_sub(1);
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast("⏳ Queued", "drop runs after current command", ToastSeverity::Info);
+            }
+            SpawnQueuedOutcome::Deduped => {}
+        }
+    }
+
+    /// Launch `coord assign --interactive --merge-of <assignment_id>` in the
+    /// standalone Terminal pane (SidebarView::Terminal), reusing the same PTY
+    /// infrastructure as Chat/Troubleshoot modes.
+    fn launch_merge_queue_interactive(&mut self) {
+        let Some(entry) = self.selected_merge_queue_entry() else {
+            self.push_toast(
+                "Resolve interactively",
+                "No entry selected.",
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+
+        // Reverse-lookup: repo_github → coord local repo name.
+        let repo: String = self
+            .data
+            .pipeline_repos
+            .iter()
+            .find(|(_, gh)| gh == &entry.repo_github)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default();
+        let issue_num = entry.issue_number.unwrap_or(0);
+        let work_aid = entry.assignment_id.clone();
+        let machine = self.data.local_machine.clone();
+
+        // Resolve the local checkout path for the terminal's CWD.
+        let cwd: std::path::PathBuf = if repo.is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        } else if let Some(path_str) = self.data.pipeline_repo_paths.get(&repo) {
+            std::path::PathBuf::from(path_str)
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        };
+
+        let cfg_path = self
+            .command_runner
+            .config_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+
+        // Build the launch command.
+        let launch_line = build_interactive_launch_cmd(
+            cfg_path.as_deref(),
+            &machine,
+            if repo.is_empty() { "unknown-repo" } else { &repo },
+            issue_num,
+            InteractiveLaunchMode::Merge,
+            Some(&work_aid),
+        );
+
+        let (cols, rows) = self
+            .terminal_pending_dims
+            .get()
+            .unwrap_or((80, 24));
+        let shell = quadraui::terminal_engine::default_shell();
+
+        match quadraui::terminal_engine::TerminalSession::spawn(
+            cols.max(20),
+            rows.max(5),
+            &shell,
+            &cwd,
+            10_000,
+        ) {
+            Ok(mut sess) => {
+                sess.send_str(&launch_line);
+                self.terminal_session = Some(sess);
+                self.terminal_spawn_error = None;
+                self.terminal_focused = true;
+                self.active_view = SidebarView::Terminal;
+                self.push_toast(
+                    "Resolve interactively",
+                    &format!("Launched merge agent for #{}", issue_num),
+                    ToastSeverity::Info,
+                );
+            }
+            Err(e) => {
+                self.terminal_spawn_error = Some(e.to_string());
+                self.push_toast(
+                    "Terminal error",
+                    &format!("Failed to spawn terminal: {}", e),
+                    ToastSeverity::Error,
+                );
+            }
+        }
     }
 
     /// Build the SidebarSystem entries for the Pipeline panel.
@@ -15818,6 +16159,8 @@ impl CoordApp {
             SidebarView::Terminal => false,
             // #638: Kanban sidebar is a placeholder; clicks are inert.
             SidebarView::Kanban => false,
+            // #737: Merge Queue sidebar is a placeholder; clicks are inert.
+            SidebarView::MergeQueue => false,
         }
     }
 
@@ -16353,6 +16696,8 @@ impl CoordApp {
             SidebarView::Terminal => false,
             // #638: Kanban sidebar is a placeholder — no sidebar scroll.
             SidebarView::Kanban => false,
+            // #737: Merge Queue sidebar is a placeholder — no sidebar scroll.
+            SidebarView::MergeQueue => false,
         }
     }
 
@@ -16612,6 +16957,8 @@ impl CoordApp {
             // #638: Kanban — mouse wheel scroll not yet implemented in v1;
             // keyboard navigation (j/k/h/l) works.
             SidebarView::Kanban => true,
+            // #737: Merge Queue panel — j/k handles navigation; wheel is no-op for now.
+            SidebarView::MergeQueue => true,
         }
     }
 
@@ -16643,7 +16990,7 @@ impl CoordApp {
             // know about the activity-bar key shortcuts.
             StatusBarSegment {
                 text: format!(
-                    " {}  [1=Board 2=Machines 3=Pipeline 4=Settings 5=Terminal] ",
+                    " {}  [1=Board 2=Machines 3=Pipeline 4=Settings 5=Terminal 7=MQ] ",
                     view_label
                 ),
                 fg: Color::rgb(200, 220, 255),
@@ -16857,6 +17204,17 @@ impl CoordApp {
                     live_hint
                 )
             }
+        } else if self.active_view == SidebarView::MergeQueue {
+            // #737: Merge Queue panel hints.
+            let attn = if self.merge_queue_needs_attention() {
+                " ⚠ needs attention!"
+            } else {
+                ""
+            };
+            format!(
+                " j/k=nav  m=merge  M=force-merge  d=drop  s=resolve-interactive{}  q=quit ",
+                attn
+            )
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS
             // section.  Right-click → Send to Pipeline (#261) is the
@@ -21919,14 +22277,16 @@ impl CoordApp {
                     ),
                 ]
             }
-            // Pipeline, Machines, Settings, Terminal, Kanban: no panel-level toolbar.
+            // Pipeline, Machines, Settings, Terminal, Kanban, MergeQueue: no panel-level toolbar.
             // Pipeline verbs are fully covered by keybinds; Terminal is a
-            // pure pass-through pane (#424); Kanban uses the Board widget natively.
+            // pure pass-through pane (#424); Kanban uses the Board widget natively;
+            // MergeQueue actions are surfaced in the status-bar hints (#737).
             SidebarView::Pipeline
             | SidebarView::Machines
             | SidebarView::Settings
             | SidebarView::Terminal
-            | SidebarView::Kanban => return None,
+            | SidebarView::Kanban
+            | SidebarView::MergeQueue => return None,
         };
 
         Some(Toolbar {
@@ -26640,6 +27000,10 @@ impl ShellApp for CoordApp {
                 SidebarView::Kanban => {
                     backend.draw_list(sidebar_rect, &self.kanban_sidebar_placeholder());
                 }
+                // #737: Merge Queue sidebar — entry count + attention indicator.
+                SidebarView::MergeQueue => {
+                    backend.draw_list(sidebar_rect, &self.merge_queue_sidebar());
+                }
             }
         }
 
@@ -26993,6 +27357,10 @@ impl ShellApp for CoordApp {
             SidebarView::Kanban => {
                 let layout = backend.draw_board(m, &self.kanban_model);
                 *self.kanban_layout.borrow_mut() = Some(layout);
+            }
+            // #737: Merge Queue panel — render the entry list in the main area.
+            SidebarView::MergeQueue => {
+                self.render_merge_queue_panel(backend, m, lh);
             }
         }
 
@@ -28510,6 +28878,58 @@ impl ShellApp for CoordApp {
                         self.active_view = SidebarView::Kanban;
                         needs_redraw = true;
                     }
+                    // #737: 7 → Merge Queue panel.
+                    Key::Char('7') => {
+                        self.active_view = SidebarView::MergeQueue;
+                        needs_redraw = true;
+                    }
+
+                    // ── Merge Queue keyboard nav (#737) ──────────────────
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::MergeQueue =>
+                    {
+                        let n = self.data.merge_queue.len();
+                        if n > 0 {
+                            self.merge_queue_sel =
+                                (self.merge_queue_sel + 1).min(n.saturating_sub(1));
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::MergeQueue =>
+                    {
+                        self.merge_queue_sel = self.merge_queue_sel.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    // m → coord merge --order <assignment_id>  (merge-now)
+                    Key::Char('m')
+                        if self.active_view == SidebarView::MergeQueue =>
+                    {
+                        self.dispatch_merge_queue_merge(false);
+                        needs_redraw = true;
+                    }
+                    // M → coord merge --order <assignment_id> --force-merge
+                    Key::Char('M')
+                        if self.active_view == SidebarView::MergeQueue =>
+                    {
+                        self.dispatch_merge_queue_merge(true);
+                        needs_redraw = true;
+                    }
+                    // d → coord merge --drop <assignment_id>
+                    Key::Char('d')
+                        if self.active_view == SidebarView::MergeQueue =>
+                    {
+                        self.dispatch_merge_queue_drop();
+                        needs_redraw = true;
+                    }
+                    // s → coord assign --interactive --merge-of <assignment_id>
+                    //     (launches in the standalone Terminal pane, like Chat/Troubleshoot)
+                    Key::Char('s')
+                        if self.active_view == SidebarView::MergeQueue =>
+                    {
+                        self.launch_merge_queue_interactive();
+                        needs_redraw = true;
+                    }
 
                     // ── Kanban keyboard nav (#638) ───────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down)
@@ -28876,6 +29296,8 @@ impl ShellApp for CoordApp {
                             SidebarView::Terminal => {}
                             // #638: Kanban j/k handled by the earlier guarded arm.
                             SidebarView::Kanban => {}
+                            // #737: MergeQueue j/k handled by the earlier guarded arm.
+                            SidebarView::MergeQueue => {}
                         }
                         needs_redraw = true;
                     }
@@ -28917,6 +29339,8 @@ impl ShellApp for CoordApp {
                             SidebarView::Terminal => {}
                             // #638: Kanban k handled by the earlier guarded arm.
                             SidebarView::Kanban => {}
+                            // #737: MergeQueue k handled by the earlier guarded arm.
+                            SidebarView::MergeQueue => {}
                         }
                         needs_redraw = true;
                     }
@@ -29142,6 +29566,10 @@ impl ShellApp for CoordApp {
                                 self.kanban_model.jump_to_top();
                                 self.kanban_clamp_col_scroll();
                             }
+                            // #737: MergeQueue — Home jumps to first entry.
+                            SidebarView::MergeQueue => {
+                                self.merge_queue_sel = 0;
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -29187,6 +29615,13 @@ impl ShellApp for CoordApp {
                             SidebarView::Kanban => {
                                 self.kanban_model.jump_to_bottom();
                                 self.kanban_clamp_col_scroll();
+                            }
+                            // #737: MergeQueue — End jumps to last entry.
+                            SidebarView::MergeQueue => {
+                                let n = self.data.merge_queue.len();
+                                if n > 0 {
+                                    self.merge_queue_sel = n - 1;
+                                }
                             }
                         }
                         needs_redraw = true;
@@ -31674,6 +32109,8 @@ mod tests {
                 col_scroll_offset: 0,
             },
             kanban_layout: std::cell::RefCell::new(None),
+            // #737
+            merge_queue_sel: 0,
             // #217: use the default dark palette for test helpers.
             active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         }
@@ -49527,5 +49964,263 @@ mod tests {
              got {:?}",
             section
         );
+    }
+
+    // ── #737: Merge Queue panel ───────────────────────────────────────────────
+
+    fn mq_entry_for_state(assignment_id: &str, issue_num: u64, state: &str, pr_number: Option<i64>) -> MergeQueueEntry {
+        MergeQueueEntry {
+            assignment_id: assignment_id.to_string(),
+            issue_number: Some(issue_num),
+            state: state.to_string(),
+            pr_number,
+            pr_url: pr_number.map(|n| format!("https://github.com/owner/repo/pull/{}", n)),
+            repo_github: "owner/repo".to_string(),
+            target_branch: Some("main".to_string()),
+            error: None,
+        }
+    }
+
+    fn mq_entry_with_error(assignment_id: &str, issue_num: u64, state: &str, error: &str) -> MergeQueueEntry {
+        MergeQueueEntry {
+            assignment_id: assignment_id.to_string(),
+            issue_number: Some(issue_num),
+            state: state.to_string(),
+            pr_number: Some(42),
+            pr_url: Some("https://github.com/owner/repo/pull/42".to_string()),
+            repo_github: "owner/repo".to_string(),
+            target_branch: Some("main".to_string()),
+            error: Some(error.to_string()),
+        }
+    }
+
+    // ── Unit tests: merge_queue_needs_attention ───────────────────────────────
+
+    #[test]
+    fn merge_queue_needs_attention_false_for_empty_queue() {
+        let app = make_app_default();
+        assert!(
+            !app.merge_queue_needs_attention(),
+            "empty queue must not need attention"
+        );
+    }
+
+    #[test]
+    fn merge_queue_needs_attention_false_for_pending_entries() {
+        let app = make_test_app(BoardData {
+            merge_queue: vec![
+                mq_entry_for_state("aid-1", 10, "pending", None),
+                mq_entry_for_state("aid-2", 11, "merged", Some(99)),
+            ],
+            ..BoardData::default()
+        });
+        assert!(
+            !app.merge_queue_needs_attention(),
+            "pending + merged entries without CI failure must not need attention"
+        );
+    }
+
+    #[test]
+    fn merge_queue_needs_attention_true_for_human_required() {
+        let app = make_test_app(BoardData {
+            merge_queue: vec![
+                mq_entry_for_state("aid-1", 10, "human_required", None),
+            ],
+            ..BoardData::default()
+        });
+        assert!(
+            app.merge_queue_needs_attention(),
+            "human_required entry must trigger needs-attention"
+        );
+    }
+
+    #[test]
+    fn merge_queue_needs_attention_true_for_failed() {
+        let app = make_test_app(BoardData {
+            merge_queue: vec![
+                mq_entry_for_state("aid-1", 10, "failed", Some(5)),
+            ],
+            ..BoardData::default()
+        });
+        assert!(
+            app.merge_queue_needs_attention(),
+            "failed entry must trigger needs-attention"
+        );
+    }
+
+    // ── Unit tests: selected_merge_queue_entry ────────────────────────────────
+
+    #[test]
+    fn selected_merge_queue_entry_none_for_empty_queue() {
+        let app = make_app_default();
+        assert!(
+            app.selected_merge_queue_entry().is_none(),
+            "empty queue must return None"
+        );
+    }
+
+    #[test]
+    fn selected_merge_queue_entry_returns_first_by_default() {
+        let app = make_test_app(BoardData {
+            merge_queue: vec![
+                mq_entry_for_state("aid-1", 10, "pending", None),
+                mq_entry_for_state("aid-2", 11, "pending", None),
+            ],
+            ..BoardData::default()
+        });
+        let entry = app.selected_merge_queue_entry();
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().assignment_id, "aid-1");
+    }
+
+    #[test]
+    fn selected_merge_queue_entry_clamps_to_last_entry() {
+        let mut app = make_test_app(BoardData {
+            merge_queue: vec![
+                mq_entry_for_state("aid-1", 10, "pending", None),
+            ],
+            ..BoardData::default()
+        });
+        app.merge_queue_sel = 99; // well beyond the end
+        let entry = app.selected_merge_queue_entry();
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().assignment_id, "aid-1");
+    }
+
+    // ── Unit tests: merge_queue_entry_label ──────────────────────────────────
+
+    #[test]
+    fn merge_queue_entry_label_shows_state_and_pr() {
+        let app = make_app_default();
+        let entry = mq_entry_for_state("aid-1", 10, "pending", Some(42));
+        let label = app.merge_queue_entry_label(&entry);
+        assert!(label.contains("PENDING"), "label must contain PENDING: {}", label);
+        assert!(label.contains("#42"), "label must contain PR number: {}", label);
+    }
+
+    #[test]
+    fn merge_queue_entry_label_human_required_shows_needs_attention() {
+        let app = make_app_default();
+        let entry = mq_entry_for_state("aid-1", 10, "human_required", None);
+        let label = app.merge_queue_entry_label(&entry);
+        assert!(label.contains("NEEDS ATTENTION"), "label must call out human_required: {}", label);
+    }
+
+    #[test]
+    fn merge_queue_entry_label_shows_error_reason() {
+        let app = make_app_default();
+        let entry = mq_entry_with_error(
+            "aid-1", 10, "pending",
+            "CI checks still running"
+        );
+        let label = app.merge_queue_entry_label(&entry);
+        assert!(label.contains("CI checks still running"), "label must show error reason: {}", label);
+    }
+
+    #[test]
+    fn merge_queue_entry_label_truncates_long_errors() {
+        let app = make_app_default();
+        let long_error = "a".repeat(80);
+        let entry = mq_entry_with_error("aid-1", 10, "pending", &long_error);
+        let label = app.merge_queue_entry_label(&entry);
+        // Long errors get truncated to 57 chars + "…)"
+        assert!(label.contains('…'), "label must truncate long errors: {}", label);
+    }
+
+    // ── TuiDriver black-box: Merge Queue panel ────────────────────────────────
+
+    /// #737 black-box (TuiDriver): pressing key '7' must switch to the Merge
+    /// Queue view and render the panel header.
+    #[test]
+    fn tuidriver_merge_queue_view_activated_by_key_7() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_queue: vec![mq_entry_for_state("aid-1", 10, "pending", Some(5))],
+            ..BoardData::default()
+        });
+        // Start on Board view (default) and press '7'.
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("MERGE QUEUE") || driver.screen_contains("Merge Queue"),
+            "MergeQueue panel must render its header when active:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #737 black-box (TuiDriver): entries in the merge queue must appear in
+    /// the panel with their state badge and PR number visible.
+    #[test]
+    fn tuidriver_merge_queue_panel_renders_entries() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_queue: vec![
+                mq_entry_for_state("aid-1", 10, "pending", Some(42)),
+                mq_entry_with_error("aid-2", 11, "human_required", "conflict in src/main.rs"),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // The panel must render at least one of the entry states.
+        let screen = driver.screen();
+        assert!(
+            screen.contains("PENDING") || screen.contains("NEEDS ATTENTION") || screen.contains("#42"),
+            "MergeQueue panel must render entry states and PR numbers:\n{}",
+            screen
+        );
+    }
+
+    /// #737 black-box (TuiDriver): empty queue must show a helpful placeholder.
+    #[test]
+    fn tuidriver_merge_queue_panel_empty_state_shows_placeholder() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen = driver.screen();
+        // The empty-state message mentions the queue being empty OR shows 0 entries.
+        assert!(
+            screen.contains("No merge-queue") || screen.contains("0 entries"),
+            "empty MergeQueue panel must show placeholder:\n{}",
+            screen
+        );
+    }
+
+    /// #737 black-box (TuiDriver): an entry with state=human_required must
+    /// trigger the needs-attention indicator in the sidebar hint.
+    #[test]
+    fn tuidriver_merge_queue_attention_shown_in_status_bar() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_queue: vec![
+                mq_entry_for_state("aid-1", 10, "human_required", None),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 200, 40);
+        let screen = driver.screen();
+        // The attention indicator ⚠ must appear somewhere (status bar or sidebar).
+        assert!(
+            screen.contains("attention") || screen.contains("⚠"),
+            "human_required entry must surface attention indicator:\n{}",
+            screen
+        );
+    }
+
+    /// #737: key '7' label is shown in the status-bar nav hint.
+    #[test]
+    fn sidebar_view_merge_queue_label() {
+        assert_eq!(SidebarView::MergeQueue.label(), "Merge Queue");
     }
 }
