@@ -112,7 +112,7 @@ coord merge                               # open PRs and merge in sequence
 
 Open Claude Code in the repo, type `/coordinator`. It handles first-time setup, issue triage, dispatch, monitoring, smoke tests, and PR creation. The slash command is at `.claude/commands/coordinator.md`.
 
-The CLI and the TUI are peer clients of the same state (SQLite + `coordinator.yml` + GitHub) — use whichever you prefer for any given operation; they don't conflict. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full picture.
+The CLI and the TUI are peer clients of the same state (SQLite + `coordinator.yml` + GitHub) — use whichever you prefer for any given operation; they don't conflict. To drive one shared board from any Tailscale host, an optional control-center daemon (`coord serve`, port 7435) fronts the canonical DB so every client renders the same state. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full picture.
 
 ## Worker Node Setup
 
@@ -316,7 +316,7 @@ hooks:
     - summary_report
 
 reviews:
-  enabled: false                 # opt-in: adversarial review on completion
+  enabled: true                  # adversarial review on completion (default; set false to opt out)
   auto_dispatch: true
   require_approval: false
   checklist:
@@ -336,6 +336,8 @@ smoke_tests:
 ```
 
 `coordinator.yml` is gitignored. Use `coordinator.example.yml` as the checked-in reference.
+
+The config file resolves in this order: `$COORD_CONFIG` → `~/.coord/coordinator.yml` (the canonical home, so the tool runs on a machine with no repo checkout) → `./coordinator.yml` (a development fallback). `coord config` prints the resolved path so it's never ambiguous which file is loaded.
 
 ## Pipeline Lifecycle (`status:*` labels)
 
@@ -394,7 +396,7 @@ The background GitHub poll runs every **60 seconds**; press `R` to refresh on de
 - **Progress streaming** — workers emit `STATUS:`/`STUCK:` lines; `coord status` shows real-time progress
 - **Failure reassignment** — `coord retry` re-dispatches to a different machine; `auto_reassign` does it automatically
 - **Crash recovery** — `coord resume` reconciles board with live agent state after restart
-- **Web dashboard** — lightweight board view at port 7434
+- **Web dashboard + phone PWA** — a lightweight board view at port 7434, plus a React/Vite phone control-center PWA served from the same port
 
 ## Why This Works (Even With One Machine)
 
@@ -456,7 +458,7 @@ When `coord approve` warns about stale dependencies, an upstream repo on the tar
 ### Board state issues
 
 - **Stuck assignments after crash:** Run `coord resume` to reconcile board with live agent state.
-- **Stale completed entries:** `coord resume` runs garbage collection, keeping the 50 most recent completed assignments.
+- **Stale completed entries:** `coord resume` runs garbage collection, trimming old completed assignments down to a recent window.
 
 ## Requirements
 

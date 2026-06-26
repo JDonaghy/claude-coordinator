@@ -61,11 +61,13 @@ File paths + line numbers for the relevant existing code. Saves the worker grepp
 
 ### Tier
 
-- `tier:small` — single-file mechanical change. 1-3 line predicate/classifier edits. Routes to haiku.
-- `tier:large` — multi-module refactor, algorithm-heavy work. Routes to opus.
-- No label — falls through to the default (sonnet).
+Model-by-label routing is driven by `models.labels` in `coordinator.yml` (empty by default — these labels only change the model where you configure the mapping; otherwise everything uses `models.default`). A common convention:
 
-The dispatcher (human or AI coordinator) sets this when filing; you can override at refinement time.
+- `tier:small` — single-file mechanical change. 1-3 line predicate/classifier edits. Map to haiku.
+- `tier:large` — multi-module refactor, algorithm-heavy work. Map to opus.
+- No matching label — falls through to `models.default` (sonnet).
+
+Configure it under `models.labels` (e.g. `tier:small: haiku`, `tier:large: opus`). The dispatcher (human or AI coordinator) sets the label when filing; you can override at refinement time.
 
 ## Anti-patterns to avoid
 

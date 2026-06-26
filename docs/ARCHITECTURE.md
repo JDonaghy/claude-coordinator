@@ -42,13 +42,13 @@ The split-brain design has three goals:
 - **The coordinator stays cheap.** The coordinator runs Opus by default (for triage and review); workers run Sonnet or Haiku. The coordinator's job is to *write good briefings and dispatch them*, not to do the work itself.
 - **GitHub is the message bus.** Briefings, completions, failures, and reviews are posted as issue comments with `<!-- coord:event=... -->` markers. Persistent, linkable, parseable by any tool. Surviving a coordinator crash is a matter of reading the latest comments.
 
-## The "no central daemon" choice
+## The control-center daemon (`coord serve`, #584) and the "no orchestration daemon" choice
 
-There is **no long-running coordinator daemon**. The CLI and TUI are short-lived processes that read state, do something, and exit. Three consequences:
+There is **no autonomous orchestration daemon** — nothing drives work on its own; a human (or a periodic `coord notify`) always advances the loop. What *has* been added (#584, the "portable control center") is an optional **board-serving daemon**, `coord serve` (port 7435): it fronts the one canonical SQLite DB + `coordinator.yml` on an always-on host (e.g. dellserver) and serves the board (`GET /board`) + config (`GET /config`) and records results (`POST /result`, `/completion`) over Tailscale, so `coord` and `coord-tui` on *any* machine render and drive the **same** board as bearer-token thin clients instead of each owning a local DB. Consequences:
 
-- **State lives in SQLite + GitHub.** `~/.coord/coord.db` is the local cache; GitHub issue comments are the durable source of truth. Either is enough to reconstruct the other.
-- **`coord notify` has to be fired periodically.** It polls each agent for completion, posts the GH comments, and triggers the auto-loop (review-on-completion, fix-on-request-changes, re-review-on-fix-completion). Without it, the pipeline visibly freezes — agents finish work but no one notices. Run it on a cron, a `watch`, a TUI timer, or by hand.
-- **`coord` and `coord-tui` are peers, not nested layers.** The TUI does not shell out to `coord`. Both are independent clients of the same state and HTTP API. (See the [Divergence risk](#divergence-risk) section.)
+- **State lives in SQLite + GitHub.** `~/.coord/coord.db` (owned by the daemon host when `coord serve` runs, else local) is the cache; GitHub issue comments are the durable source of truth. Either reconstructs the other.
+- **`coord notify` still has to be fired periodically.** The daemon serves state; it does not drive the loop. `notify` polls each agent for completion, posts the GH comments, and triggers the auto-loop (review-on-completion, fix-on-request-changes, re-review-on-fix-completion). Without it, the pipeline visibly freezes — agents finish work but no one notices. Run it on a cron, a `watch`, a TUI timer, or by hand.
+- **`coord` and `coord-tui` are peers, not nested layers.** The TUI does not shell out to `coord`. Both are independent clients of the same state — directly against SQLite, or (with `coord serve`) against the daemon's HTTP API. (See the [Divergence risk](#divergence-risk) section.)
 
 ## The agent HTTP API
 
@@ -170,7 +170,7 @@ The CLI and the TUI are peer clients of the same state. They re-implement the sa
 
 **Symptom of divergence:** the TUI paints a stage as `BlockedOnReview` when in fact the Python side would proceed, or vice versa. Today (May 2026) the TUI mostly delegates to queue rows, so most gate logic is in Python — but the TUI is growing, and the more it implements directly, the more divergence opportunity.
 
-**The natural next step**, if/when this becomes painful, is to make `coord` a long-running HTTP/JSON daemon (think `kubectl` + k8s apiserver) and have both the CLI and the TUI become thin clients. That would put all gate logic in one place. For now: status quo, with awareness.
+**That next step has since shipped in part:** `coord serve` (#584) makes the daemon the canonical board holder with the CLI and TUI as thin clients — but the *gate logic* still lives in both languages (the daemon serves rows, it doesn't yet centralise the state-machine rules). Closing the remaining drift is now tracked as explicit tech debt: a `BoardService` facade (#749) and generating the wire types from one schema so the Rust/TS mirrors can't diverge — #748 hardens the `/board` parse (the blank-board class), #750 removes the hand-mirror. See the Tech Debt milestone (epic #751).
 
 ## File map
 
@@ -186,7 +186,7 @@ The CLI and the TUI are peer clients of the same state. They re-implement the sa
 | `coord/review.py` | Adversarial review dispatch + verdict parsing. `dispatch_pending_reviews()` is the **bulk** path used by `reconcile()` and `coord notify`: it bounds dispatch with a per-pass cap (`reviews.max_auto_dispatch_per_pass`, default 5) and a **surge gate** (`reviews.flood_threshold`, default 12 — above it, refuse all and require `reviews.allow_review_flood: true` / `COORD_ALLOW_REVIEW_FLOOD=1`). This is the flood guard: a backlog "unmasking" (e.g. dropping a gate that had suppressed reviews) can't fire hundreds of metered reviews at once. See the 2026-06-08 incident. |
 | `coord/state.py`, `coord/db.py` | SQLite schema and access helpers. |
 | `coord/dashboard/` | The web dashboard (`coord web`). Optional. |
-| `tui/src/app.rs` | The Rust TUI. Big monolithic file by design; uses quadraui primitives. |
+| `tui/src/app.rs` | The Rust TUI (uses quadraui primitives). Historically one ~48k-line file; being decomposed into an `app/` module — see the Tech Debt milestone (epic #751 / #742–#745). |
 | `coordinator.yml` | Single source of truth for repos, machines, dependencies, policies (incl. `pipeline.default_gates`). Canonical location `~/.coord/coordinator.yml`; resolved `$COORD_CONFIG` → `~/.coord/coordinator.yml` → `./coordinator.yml`, so a machine needs no repo checkout. `coord config` / `coord serve` print the resolved path. |
 | `~/.coord/coord.db` | Local state cache. Survives across sessions; rebuilt from GitHub on `coord resume`. |
 | `~/.coord/logs/<id>.log` | Per-assignment worker log (on the agent machine that ran it). |

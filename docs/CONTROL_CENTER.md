@@ -333,7 +333,8 @@ border). Bare keystrokes go to the focused pane: a focused tree navigates with
   card grid, terminal app).
 - **Inter-pane:** **`Ctrl-W`** is the pane leader (vim window-nav). `Ctrl-W
   h/j/k/l` (or arrows) moves focus across panes / tiles / sidebar; `Ctrl-W` +
-  ops for split / close / zoom. **This replaces F12.**
+  ops for split / close / zoom. **Shipped (#605); it runs alongside the existing
+  F12 terminal-focus toggle rather than replacing it.**
 
 **The greedy-terminal problem & the leader.** A full-screen app inside a
 terminal wants *every* key — `h/j/k/l`, arrows, `Esc`, even `Ctrl-W` (vim's own

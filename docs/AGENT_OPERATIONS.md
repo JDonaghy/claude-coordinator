@@ -326,8 +326,10 @@ When `last_update.mode` is `editable (git pull)`, the agent's venv has a `pip in
 ssh <host>
 ~/.coord-venv/bin/pip uninstall -y claude-coordinator
 ~/.coord-venv/bin/pip install --upgrade claude-coordinator
-systemctl --user restart coord-agent
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent
 ```
+
+> **The `XDG_RUNTIME_DIR=/run/user/$(id -u)` prefix is load-bearing.** A bare `systemctl --user restart` silently no-ops in a non-interactive / scripted SSH session — and the agent's own `/update` `os.execv` self-restart doesn't take under systemd either (#404: same PID, stale version). Always prefix the restart when driving it over SSH. This is the single most-recurring fleet failure; an `✗ did not come back` is usually this false negative.
 
 After this, the `~/src/claude-coordinator` clone on that machine is no longer used by the agent and can be deleted. The next `coord agent update` will use the `pip install --upgrade` path, which doesn't depend on local git state.
 
@@ -362,7 +364,7 @@ If you have several editable installs to convert, you can script it (assumes SSH
 
 ```bash
 for host in precision elitebook dellserver; do
-  ssh $host '~/.coord-venv/bin/pip uninstall -y claude-coordinator && ~/.coord-venv/bin/pip install --upgrade claude-coordinator && systemctl --user restart coord-agent'
+  ssh $host '~/.coord-venv/bin/pip uninstall -y claude-coordinator && ~/.coord-venv/bin/pip install --upgrade claude-coordinator && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent'
 done
 ```
 

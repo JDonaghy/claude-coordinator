@@ -3,7 +3,7 @@
 > **The living, cross-repo / cross-machine objective for the coordinator and every agent it dispatches.**
 > This is *meta-level*: above any single issue, repo, or session (and broader than Claude's own per-session goal feature). Both humans and agents may edit it as priorities evolve — keep it short, current, and re-date the Status line. `coordinator.yml` is the source of truth for *topology*; **this file is the source of truth for *intent*.**
 >
-> _Last updated: 2026-06-20_
+> _Last updated: 2026-06-25_
 
 ## 🎯 North star
 
@@ -63,6 +63,10 @@ the critical path** (demoted to Horizon).
     - All on `main`; coord suite 2062 + tui 599 pass; coord-tui rebuilt + installed.
 - 📋 **Next, in order:** local interactive lifecycle (Work→Review→Test→Merge) is now complete end-to-end; **leg 4 cont. is remote Test/Merge over SSH (Track B)**. The merge agent supersedes #306's reactive-only conflict-fix with a proactive interactive rebase; #277/#567 (conflict-fix orphan branch, NULL-branch verdict gate) remain open backend hygiene. A1 follow-ups to fold in: the briefing emits both the `REVIEW_VERDICT` block and the report-result reminder; `coord report-result` needs a `--body-file` for full review bodies (see `project_a1_interactive_review`).
 - 🧭 **Open design Q — where do automated tests gate?** CI is pytest-only, so Rust repos (tui/quadraui/vimcode) still have no automated gate; they need an explicit `cargo build && cargo test` gate (extend CI, or a pre-merge verify step).
+
+## Near-term priority — Tech Debt sweep (2026-06-25)
+
+Before new feature work resumes (once the current pipeline clears), the committed near-term objective is the **Tech Debt milestone** (#19, epic #751): decompose the two god-files — `tui/src/app.rs` (~48.7k lines, 97% of the Rust crate) and `coord/cli.py` (~10.6k) — and harden the hand-mirrored cross-language `/board` seams (the #632 blank-board class). Every decomposition issue is a **behavior-preserving** refactor gated on a green black-box regression net (#741); drive the set (#741–#750) to completion as one unit. This is a structural-health investment, not a drift from the north star — it pays down the cost of the very surfaces (the TUI, the CLI, the wire contracts) the interactive control-center is built on.
 
 ## Horizon (beyond the deadline)
 
