@@ -438,8 +438,11 @@ def process(
     """Open PRs, size them, then merge each pending item.
 
     Items are grouped by (repo_github, target_branch); a **merge conflict**
-    in one group halts only that group (the target-branch state is now dirty
-    for later entries).  Within a group, items are merged in input order —
+    parks the conflicting entry (``CONFLICT`` state; the caller in
+    ``cli.py`` promotes it to ``HUMAN_REQUIRED``) and **continues** with
+    the remaining siblings in that group — each entry's ``gh pr merge`` is
+    independent, so a failed merge does not dirty the target branch for
+    siblings (#735).  Within a group, items are merged in input order —
     call `sequence(group)` first if you want size-based ordering.
     Set `presorted=True` to make that explicit at call sites.
 
@@ -613,7 +616,7 @@ def process(
             entry.state = CONFLICT
             entry.error = msg
             events.append(MergeEvent(entry, "conflict", msg))
-            break  # halt this (repo, target) group on conflict
+            continue  # #735: park this entry; siblings in same group still merge
 
     return events
 

@@ -128,7 +128,7 @@ class TestMergeCommand:
             next_pr[0] += 1
             return {"number": n, "url": f"u/{n}", "existed": False}
 
-        # First PR conflicts; second never gets attempted.
+        # First PR conflicts; second is attempted and succeeds (#735 park-and-continue).
         def fake_merge(repo, number, method="rebase"):
             if number == 200:
                 return False, "Merge conflict"
@@ -144,7 +144,7 @@ class TestMergeCommand:
 
         states = {x.assignment_id: x.state for x in mq.load_queue()}
         assert states["a"] == mq.CONFLICT
-        assert states["b"] == mq.PENDING  # halted
+        assert states["b"] == mq.MERGED  # #735: sibling merges despite conflict
 
     def test_human_classified_conflict_persists_as_human_required(
         self, config_file: Path, coord_dir: Path
