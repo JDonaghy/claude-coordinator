@@ -32238,6 +32238,7 @@ mod tests {
             repo_name: Some(repo.to_string()),
             issue_title: None,
             machine: Some("precision".to_string()),
+            pane_dead: false,
         }
     }
 
@@ -41412,6 +41413,7 @@ mod tests {
             is_closed: false,
         });
         app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
         // Work DONE (finalized) + a live-session entry pointing at it (zombie).
         app.data
             .assignments
@@ -41487,6 +41489,7 @@ mod tests {
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
 
         let items =
@@ -41529,6 +41532,7 @@ mod tests {
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
 
         assert!(
@@ -41564,6 +41568,7 @@ mod tests {
             is_closed: false,
         });
         app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
 
         // Only a zombie (done) session.  make_assignment_typed → id="id-200-done".
         app.data
@@ -41575,6 +41580,7 @@ mod tests {
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
         assert_eq!(
             app.selected_issue_any_session_id().as_deref(),
@@ -41593,6 +41599,7 @@ mod tests {
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         });
         assert_eq!(
             app.selected_issue_any_session_id().as_deref(),
@@ -41618,6 +41625,7 @@ mod tests {
             is_closed: false,
         });
         app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
         app.data
             .assignments
             .push(make_assignment_typed("done", 300, "repo-a", Some("work")));
@@ -41627,6 +41635,7 @@ mod tests {
             repo_name: Some("repo-a".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
 
         let target = pipeline_target(Some(300));
@@ -42197,6 +42206,7 @@ mod tests {
 
         let mut app = make_pipeline_app();
         app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
 
         // New (moved to pipeline, not started) → present + enabled.
         assert_eq!(
@@ -49010,6 +49020,7 @@ mod tests {
             repo_name: Some("api".to_string()),
             issue_title: None,
             machine: None,
+            pane_dead: false,
         }];
 
         // Open the context menu for the pipeline row (same state as right-click).
