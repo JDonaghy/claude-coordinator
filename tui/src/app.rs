@@ -10903,6 +10903,23 @@ impl CoordApp {
                 // GitHub email to learn a check broke.
                 if entry.is_some_and(|e| self.ci_failed_for_entry(e)) {
                     StageStatus::Failed
+                } else if self.data.assignments.iter().any(|a| {
+                    // #775: the daemon's merge-reconcile tick prunes the queue
+                    // row after flipping the work assignment to status='merged'.
+                    // Once the row is gone the match above falls here, so we
+                    // also check the assignment itself — a merged work assignment
+                    // is sufficient evidence that the Merge stage is Done, even
+                    // with no surviving queue entry.
+                    a.issue_number == issue.number
+                        && issue
+                            .coord_repo
+                            .as_deref()
+                            .map(|r| r == a.repo)
+                            .unwrap_or(true)
+                        && a.assignment_type.as_deref() == Some("work")
+                        && a.status == "merged"
+                }) {
+                    StageStatus::Done
                 } else if issue.is_closed {
                     StageStatus::Skipped
                 } else {
@@ -34975,6 +34992,69 @@ mod tests {
             app.merge_stage_status_for(&issue),
             StageStatus::Done,
             "after clearing, real 'merged' state must be returned",
+        );
+    }
+
+    #[test]
+    fn merge_stage_done_when_work_assignment_merged_and_no_queue_entry() {
+        // #775: reconcile_board_merges flips the work assignment to
+        // status='merged' and prunes the merge_queue row.  Once the row is
+        // gone the match in merge_stage_status_for hits the `_` arm — which
+        // must now also return Done when it finds a merged work assignment,
+        // rather than Pending.
+        let mut app = make_pipeline_app();
+        let issue = app.pipeline_issues[0].clone(); // acme/api #42
+
+        // Pre-condition: no queue entry → Pending.
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Pending,
+            "pre-condition: no queue entry means Pending",
+        );
+
+        // Simulate the daemon having flipped the assignment to 'merged'.
+        app.data.assignments.push(Assignment {
+            id: "w42".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "testmachine".to_string(),
+            status: "merged".to_string(),
+            branch: Some("issue-42-work".to_string()),
+            model: None,
+            dispatched_at: Some(1_000_042.0),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+        });
+
+        // With no queue entry but a merged work assignment, Merge stage → Done.
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Done,
+            "merged work assignment must make Merge stage Done even without a queue row",
+        );
+
+        // Sanity: pipeline_lifecycle_section should also see Done and classify
+        // the issue as 'done' (not 'in-progress').
+        assert_eq!(
+            app.pipeline_lifecycle_section(&issue),
+            "done",
+            "lifecycle section must be 'done' when merge stage is Done",
         );
     }
 

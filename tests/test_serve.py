@@ -1487,3 +1487,130 @@ def test_passive_tick_is_idempotent(
     _, enqueued2 = _passive_tick(cfg)  # second tick — already keyed correctly
 
     assert enqueued2 == []
+
+
+# ── #775: _reconcile_merges_tick + _sync_issues_tick ─────────────────────────
+
+
+def _seed_done_work_with_branch(
+    conn,
+    *,
+    aid: str = "work-m1",
+    branch: str = "issue-42-impl",
+    issue_number: int = 42,
+) -> None:
+    """Seed a done work assignment that has a branch (eligible for merge reconcile)."""
+    conn.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')"
+    )
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, branch) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            aid, "laptop", "api", "acme/api", issue_number,
+            "The issue", "done", "work", branch,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (
+            aid, "api", "acme/api", branch, "main",
+            issue_number, "The issue", "pending",
+        ),
+    )
+    conn.commit()
+
+
+def test_reconcile_merges_tick_flips_merged_and_prunes_queue(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#775: _reconcile_merges_tick flips a done assignment to 'merged' and
+    prunes its stale merge_queue row when the branch is terminal on GitHub.
+
+    This is the black-box acceptance test for the tick path described in the
+    issue acceptance criteria.
+    """
+    from coord import github_ops, merge_queue as mq
+    from coord.config import load as load_config
+    from coord.serve_app import _reconcile_merges_tick
+
+    # Stub all GitHub probes so we never shell out.
+    monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: True)
+    monkeypatch.setattr(
+        github_ops, "list_remote_branch_names", lambda repo: set()
+    )
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+    # prune_stale_queue_entries calls issue_is_closed / pr_is_merged.
+    monkeypatch.setattr(github_ops, "issue_is_closed", lambda *a: True)
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda *a: False)
+
+    _seed_done_work_with_branch(rw_db)
+    cfg = load_config(valid_config_path)
+
+    actions = _reconcile_merges_tick(cfg)
+
+    # The reconcile must have reported the flip.
+    assert any("mark merged" in a for a in actions), (
+        f"Expected 'mark merged' action; got: {actions}"
+    )
+    # DB must reflect the flip.
+    row = rw_db.execute(
+        "SELECT status FROM assignments WHERE assignment_id = 'work-m1'"
+    ).fetchone()
+    assert row is not None and row["status"] == "merged", (
+        f"Assignment status should be 'merged', got: {row['status'] if row else None}"
+    )
+    # The merge_queue row must have been pruned.
+    queue = mq.load_queue()
+    assert not any(e.assignment_id == "work-m1" for e in queue), (
+        f"merge_queue row should have been pruned; queue: {[e.assignment_id for e in queue]}"
+    )
+
+
+def test_sync_issues_tick_marks_issues_closed(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#775: _sync_issues_tick propagates issue closures into the DB so the
+    board's is_closed flag becomes accurate without a manual 'coord sync'.
+    """
+    from coord import github_ops
+    from coord.config import load as load_config
+    from coord.serve_app import _sync_issues_tick
+
+    # Seed an open issue in the DB.
+    rw_db.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')"
+    )
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, state, body, labels) "
+        "VALUES (?,?,?,?,?,?)",
+        ("api", 42, "An issue", "open", "", "[]"),
+    )
+    rw_db.commit()
+
+    # GitHub now returns an empty open-issue list (issue 42 was closed).
+    monkeypatch.setattr(
+        github_ops, "get_open_issues", lambda repo: []
+    )
+
+    cfg = load_config(valid_config_path)
+    total = _sync_issues_tick(cfg)
+
+    # The sync reported 0 open issues (all repos returned empty lists).
+    assert total == 0
+
+    # The issue row must now be marked 'closed' in the DB.
+    row = rw_db.execute(
+        "SELECT state FROM issues WHERE repo_name = 'api' AND number = 42"
+    ).fetchone()
+    assert row is not None and row["state"] == "closed", (
+        f"Issue should be 'closed' after sync; got: {row['state'] if row else None}"
+    )
