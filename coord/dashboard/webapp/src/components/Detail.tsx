@@ -407,7 +407,7 @@ export default function Detail() {
       </header>
 
       {/* ── Test gate ─────────────────────────────────────────────────────── */}
-      {(hasGate('test-verdict') || view.test_verdict !== null) && (
+      {(hasGate('test-verdict') || view.test_verdict != null) && (
         <section className="mb-4 rounded-lg border border-border bg-card p-4" aria-label="Test gate">
           <h3 className="mb-3 text-sm font-semibold text-card-foreground">Test</h3>
 

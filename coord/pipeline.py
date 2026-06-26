@@ -74,6 +74,11 @@ class PipelineView:
     # can render them without a slow GitHub re-fetch.  None when no findings
     # have been cached yet.
     review_findings_body: str | None = None
+    # Human-driven Test-gate verdict for the work assignment.
+    # Mirrors Assignment.test_state: None | "passed" | "failed" | "skipped".
+    # Populated by compute_pipeline so the phone detail screen can display the
+    # current verdict and the Record Test Verdict gate can offer Pass/Fail.
+    test_verdict: str | None = None
 
 
 # ── Stage progression constants ──────────────────────────────────────────────
@@ -250,6 +255,9 @@ def compute_pipeline(
     available_gates: list[PipelineGate] = []
 
     if current_stage == "done":
+        # Offer the human Test-gate so the phone can record a verdict before
+        # review auto-dispatch fires (Test precedes Review in the pipeline).
+        available_gates.append(PipelineGate("test-verdict", "Record Test Verdict", _EP))
         # Only offer review/smoke gates if those stages are actually required.
         if "review" in required_gates:
             available_gates.append(PipelineGate("dispatch_review", "Dispatch Review", _EP))
@@ -262,6 +270,12 @@ def compute_pipeline(
         available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
         if review_assignment is not None and review_assignment.review_posted_at is None:
             available_gates.append(PipelineGate("post_findings", "Post Findings", _EP))
+        # Offer the phone a way to record a review verdict manually when the
+        # automated reviewer produced no structured REVIEW_VERDICT block.
+        if review_assignment is not None and review_assignment.review_verdict is None:
+            available_gates.append(
+                PipelineGate("record-review-verdict", "Record Review Verdict", _EP)
+            )
         # Offer a headless fix when the review returned request-changes (#699):
         # the phone can dispatch a fix worker without attending a terminal.
         if (
@@ -291,6 +305,11 @@ def compute_pipeline(
     # (no I/O — review_assignment is already fetched from the board above).
     review_verdict = review_assignment.review_verdict if review_assignment else None
 
+    # Expose the human Test-gate verdict so the phone detail screen can display
+    # it and the record-test-verdict gate can be conditionally shown.
+    # Reads from Assignment.test_state (None | "passed" | "failed" | "skipped").
+    test_verdict = assignment.test_state
+
     return PipelineView(
         assignment_id=aid,
         issue_number=assignment.issue_number,
@@ -304,4 +323,5 @@ def compute_pipeline(
         review_findings_pending=review_findings_pending,
         review_verdict=review_verdict,
         review_findings_body=review_findings_body,
+        test_verdict=test_verdict,
     )
