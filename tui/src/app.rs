@@ -1993,9 +1993,10 @@ struct CiCheckSummary {
     running: usize,
     /// Names of failed checks (for the status-bar hint and detail row).
     failed_names: Vec<String>,
-    /// URL of the first failed check — surfaced as a clickable link target
-    /// in the detail row. We only show one in the terse summary; the user
-    /// can press Enter to open the PR for the full list.
+    /// URL of the first failed check — populated for future surfacing in the
+    /// Merge Queue panel CI detail view (#738: previously shown in the retired
+    /// per-issue Merge stage rows, now awaiting a Phase-3 panel detail row).
+    #[allow(dead_code)]
     first_failed_url: Option<String>,
     /// When this summary was fetched. Used to TTL the cache.
     fetched_at: Instant,
@@ -3314,7 +3315,7 @@ fn load_activity_log(id: &str) -> Vec<ListItem> {
 /// Pipeline panel.  Stages outside this list still render — they just
 /// don't show a button (they're driven implicitly by the coordinator).
 fn is_dispatchable_stage(name: &str) -> bool {
-    matches!(name, "plan" | "work" | "review" | "merge")
+    matches!(name, "plan" | "work" | "review")
 }
 
 /// Build a `ListItem` for one pipeline stage (plan/work/review/smoke).
@@ -9252,7 +9253,9 @@ impl CoordApp {
         }
         stages.push("work".to_string());
         for g in &self.data.pipeline_default_gates {
-            if g != "work" && g != "plan" {
+            // #738: "merge" is retired from per-issue pipeline; it lives
+            // solely in the Merge Queue panel (Phase 3, SidebarView::MergeQueue).
+            if g != "work" && g != "plan" && g != "merge" {
                 stages.push(g.clone());
             }
         }
@@ -12329,9 +12332,6 @@ impl CoordApp {
                     self.dispatch_pipeline_review()
                 }
             }
-            // Merge has no assignment row to retry against — re-running
-            // `coord merge` is the right call for both fresh and retry.
-            "merge" => self.dispatch_pipeline_merge(),
             other => {
                 self.pipeline_status = Some((
                     format!("stage '{}' not dispatchable from TUI", other),
@@ -12698,57 +12698,6 @@ impl CoordApp {
                 self.push_toast(
                     "⏳ Queued",
                     "notify runs after current command",
-                    ToastSeverity::Info,
-                );
-            }
-            SpawnQueuedOutcome::Deduped => {}
-        }
-        matches!(
-            outcome,
-            SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
-        )
-    }
-
-    /// Dispatch the Merge stage: `coord merge --repo <coord_repo>`.
-    fn dispatch_pipeline_merge(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else {
-            return false;
-        };
-        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
-            return false;
-        };
-        let Some(coord_repo) = issue.coord_repo.clone() else {
-            self.pipeline_status = Some((
-                format!(
-                    "no local repo mapping for {} — add it to coordinator.yml",
-                    issue.repo_slug
-                ),
-                Instant::now(),
-            ));
-            return false;
-        };
-        use crate::commands::SpawnQueuedOutcome;
-        let outcome = self
-            .command_runner
-            .spawn_queued(&["merge", "--repo", &coord_repo]);
-        match outcome {
-            SpawnQueuedOutcome::Started => {
-                // #290: mark the issue as in-flight so merge_stage_status_for returns
-                // Active immediately — the Merge box turns blue and the Go button drops
-                // at once, without waiting for the DB to reflect the new merge_queue entry.
-                // Only set inflight when the command actually started — not when queued,
-                // because the merge hasn't run yet and the UI state would be wrong.
-                self.pipeline_inflight_merges
-                    .insert((issue.repo_slug.clone(), issue.number));
-                self.pipeline_status = Some((
-                    format!("merge dispatched for {} (#{})", coord_repo, issue.number),
-                    Instant::now(),
-                ));
-            }
-            SpawnQueuedOutcome::Queued => {
-                self.push_toast(
-                    "⏳ Queued",
-                    "merge runs after current command",
                     ToastSeverity::Info,
                 );
             }
@@ -15214,11 +15163,7 @@ impl CoordApp {
                 decoration: Decoration::Normal,
             });
 
-            if name == "merge" {
-                self.append_merge_stage_rows(&mut items, &issue);
-            } else {
-                self.append_assignment_stage_rows(&mut items, &issue, name);
-            }
+            self.append_assignment_stage_rows(&mut items, &issue, name);
             items.push(kv_item("", "", None));
         }
 
@@ -15473,100 +15418,6 @@ impl CoordApp {
                 }
             }
             items.push(kv_item("", "", None));
-        }
-    }
-
-    /// Push detail rows for the merge stage from `merge_queue`.
-    fn append_merge_stage_rows(&self, items: &mut Vec<ListItem>, issue: &PipelineIssue) {
-        let entries: Vec<&MergeQueueEntry> = self
-            .data
-            .merge_queue
-            .iter()
-            .filter(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug)
-            .collect();
-        if entries.is_empty() {
-            items.push(kv_item(
-                "",
-                "    (not queued)",
-                Some(Color::rgb(140, 140, 140)),
-            ));
-            return;
-        }
-        for e in entries {
-            let id_short: String = e.assignment_id.chars().take(8).collect();
-            items.push(kv_item(
-                "Assignment",
-                &id_short,
-                Some(Color::rgb(160, 200, 220)),
-            ));
-            let state_color = match e.state.as_str() {
-                "merged" => Color::rgb(120, 200, 120),
-                "failed" | "human_required" => Color::rgb(220, 70, 70),
-                "open" | "queued" => Color::rgb(220, 180, 100),
-                _ => Color::rgb(180, 180, 180),
-            };
-            items.push(kv_item("State", &e.state, Some(state_color)));
-            // #241: if a conflict-fix is in flight or the entry is now
-            // human_required, surface a one-line substate row so the user
-            // doesn't have to guess what's happening.
-            if let Some(cf) = self.data.assignments.iter().find(|a| {
-                a.issue_number == issue.number
-                    && a.assignment_type.as_deref() == Some("conflict-fix")
-                    && (a.status == "running" || a.status == "pending")
-            }) {
-                items.push(kv_item(
-                    "Conflict-fix",
-                    &format!("Fixing on {} (assignment {})", cf.machine, cf.id),
-                    Some(Color::rgb(220, 180, 100)),
-                ));
-            } else if e.state == "human_required" {
-                items.push(kv_item(
-                    "Conflict-fix",
-                    "auto-fix did not resolve — manual rebase required",
-                    Some(Color::rgb(220, 100, 100)),
-                ));
-            }
-            if let Some(pr) = e.pr_number {
-                items.push(kv_item(
-                    "PR",
-                    &format!("#{}", pr),
-                    Some(Color::rgb(160, 200, 220)),
-                ));
-            }
-            if let Some(url) = &e.pr_url {
-                items.push(kv_item("URL", url, Some(Color::rgb(140, 170, 210))));
-            }
-            // #240: surface CI check status under the Merge stage when a PR
-            // exists.  Loading state is implicit — the row only renders once
-            // the background fetch returns.
-            if let Some(pr) = e.pr_number {
-                if let Some(summary) = self.pipeline_ci_checks.get(&(e.repo_github.clone(), pr)) {
-                    let terse = summary.terse();
-                    let line = if summary.failed > 0 {
-                        let names = summary.failed_names.join(", ");
-                        let url = summary.first_failed_url.as_deref().unwrap_or("");
-                        if url.is_empty() {
-                            format!("{} — {} failed", terse, names)
-                        } else {
-                            format!("{} — {} failed ({})", terse, names, url)
-                        }
-                    } else if summary.running > 0 {
-                        format!("{} — checks still running", terse)
-                    } else if !terse.is_empty() {
-                        terse
-                    } else {
-                        "no checks".to_string()
-                    };
-                    let color = if summary.failed > 0 {
-                        Color::rgb(220, 100, 100)
-                    } else if summary.running > 0 {
-                        Color::rgb(220, 180, 100)
-                    } else {
-                        Color::rgb(120, 200, 120)
-                    };
-                    items.push(kv_item("Checks", &line, Some(color)));
-                }
-            }
         }
     }
 
@@ -34446,13 +34297,13 @@ mod tests {
 
     #[test]
     fn pipeline_stage_names_prepends_work() {
+        // #738: "merge" is filtered out — per-issue pipeline ends at Review.
         let app = make_pipeline_app();
         assert_eq!(
             app.pipeline_stage_names(),
             vec![
                 "work".to_string(),
                 "review".to_string(),
-                "merge".to_string()
             ]
         );
     }
@@ -36018,21 +35869,21 @@ mod tests {
 
     #[test]
     fn upstream_max_dispatched_at_aggregates_across_all_prior_stages() {
-        // Pipeline is work → review → merge. Querying upstream of merge should
-        // see the latest dispatch across BOTH work AND review.
+        // #738: Pipeline is work → review (merge removed from per-issue stages).
+        // Querying upstream of "review" should see the latest dispatch across
+        // ALL prior work assignments.
         let mut app = make_pipeline_app();
         app.data
             .assignments
             .push(_stage_assignment("w1", "work", 100.0, "done"));
         app.data
             .assignments
-            .push(_stage_assignment("r1", "review", 250.0, "done"));
-        app.data
-            .assignments
-            .push(_stage_assignment("w2", "work", 150.0, "done"));
+            .push(_stage_assignment("w2", "work", 250.0, "done"));
         let issue = &app.pipeline_issues[0];
-        // Max across {work,review} prior to merge = 250 (the review).
-        assert_eq!(app.upstream_max_dispatched_at(issue, "merge"), Some(250.0));
+        // Max across {work} prior to review = 250 (the second work dispatch).
+        assert_eq!(app.upstream_max_dispatched_at(issue, "review"), Some(250.0));
+        // "merge" is no longer a per-issue stage → upstream lookup returns None.
+        assert_eq!(app.upstream_max_dispatched_at(issue, "merge"), None, "#738: merge not in stage list");
     }
 
     #[test]
@@ -38287,9 +38138,10 @@ mod tests {
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
         assert_eq!(view.stages[0].status, StageStatus::Done);
-        // Review/merge not run but issue is closed → Skipped (not Pending).
+        // Review not run but issue is closed → Skipped (not Pending).
+        // #738: merge is no longer a per-issue stage; only work+review remain.
         assert_eq!(view.stages[1].status, StageStatus::Skipped);
-        assert_eq!(view.stages[2].status, StageStatus::Skipped);
+        assert_eq!(view.stages.len(), 2, "#738: only work+review per-issue");
         // No Go/Retry actions on any stage (issue is closed).
         for s in &view.stages {
             assert!(
@@ -38573,14 +38425,14 @@ mod tests {
 
     #[test]
     fn build_pipeline_widget_attaches_go_to_first_pending_work() {
+        // #738: per-issue pipeline is Work→Test→Review (no Merge stage).
         let app = make_pipeline_app();
         let view = app.build_pipeline_widget().unwrap();
-        assert_eq!(view.stages.len(), 3);
+        assert_eq!(view.stages.len(), 2, "#738: only work+review per-issue");
         assert_eq!(view.stages[0].label, "Work");
         // Only the work stage gets a Go button (and only when Pending).
         assert_eq!(view.stages[0].action.as_deref(), Some("Go"));
         assert!(view.stages[1].action.is_none());
-        assert!(view.stages[2].action.is_none());
     }
 
     #[test]
@@ -38635,20 +38487,19 @@ mod tests {
         assert_eq!(view.stages[0].label, "Work");
         assert_eq!(view.stages[0].status, StageStatus::Done);
         assert!(view.stages[0].action.is_none(), "Work is done — no Go");
+        // #738: Review is the last per-issue stage; it gets the Go button.
         assert_eq!(
             view.stages[1].action.as_deref(),
             Some("Go"),
             "Review should now own the Go button"
         );
-        assert!(
-            view.stages[2].action.is_none(),
-            "Merge still gated on review"
-        );
+        assert_eq!(view.stages.len(), 2, "#738: no Merge stage in per-issue pipeline");
     }
 
-    /// Work + review both done, merge_queue empty → [Go] on Merge stage.
+    /// #738: Work + review both done → pipeline complete, no Merge stage, no actions.
+    /// Merge lives solely in the Merge Queue panel (SidebarView::MergeQueue).
     #[test]
-    fn build_pipeline_widget_go_on_merge_when_review_done() {
+    fn build_pipeline_widget_no_action_when_work_and_review_done() {
         let mut app = make_pipeline_app();
         app.data.assignments.push(Assignment {
             id: "w1".to_string(),
@@ -38692,7 +38543,7 @@ mod tests {
             exit_code: Some(0),
             assignment_type: Some("review".to_string()),
             test_state: None,
-            review_verdict: Some("approve".to_string()),  // #473: approved → green
+            review_verdict: Some("approve".to_string()),
             review_of_assignment_id: None,
             cost_usd: None,
             smoke_tests: None,
@@ -38707,11 +38558,12 @@ mod tests {
             failure_reason: None,
         });
         let view = app.build_pipeline_widget().unwrap();
+        // Both stages done, no Merge stage remaining.
+        assert_eq!(view.stages.len(), 2, "#738: Work→Review only");
         assert_eq!(view.stages[0].status, StageStatus::Done);
         assert_eq!(view.stages[1].status, StageStatus::Done);
         assert!(view.stages[0].action.is_none());
-        assert!(view.stages[1].action.is_none());
-        assert_eq!(view.stages[2].action.as_deref(), Some("Go"));
+        assert!(view.stages[1].action.is_none(), "#738: review done — no Go (merge is in queue panel)");
     }
 
     /// A `merged` row in merge_queue makes the Merge stage Done.
@@ -39298,64 +39150,9 @@ mod tests {
         assert_eq!(view.stages[0].action.as_deref(), Some("Retry"));
         // Review still Pending but its predecessor (Work) is Failed, not
         // Done — no Go on Review.
+        // #738: only 2 stages (work+review), no merge stage.
+        assert_eq!(view.stages.len(), 2);
         assert!(view.stages[1].action.is_none());
-        assert!(view.stages[2].action.is_none());
-    }
-
-    /// Failed merge_queue entry → [Retry] on Merge.
-    #[test]
-    fn build_pipeline_widget_retry_on_failed_merge() {
-        let mut app = make_pipeline_app();
-        // Work + Review done so the merge stage is reachable on the timeline.
-        for stage_name in ["work", "review"] {
-            app.data.assignments.push(Assignment {
-                id: stage_name.to_string(),
-                repo: "api".to_string(),
-                issue_number: 42,
-                issue_title: "Add cool thing".to_string(),
-                machine: "m1".to_string(),
-                status: "done".to_string(),
-                branch: None,
-                model: None,
-                dispatched_at: Some(1.0),
-                finished_at: Some(2.0),
-                exit_code: Some(0),
-                assignment_type: Some(stage_name.to_string()),
-                test_state: None,
-                // #473: the review stage is green only when approved.
-                review_verdict: if stage_name == "review" {
-                    Some("approve".to_string())
-                } else {
-                    None
-                },
-                review_of_assignment_id: None,
-                cost_usd: None,
-                smoke_tests: None,
-                review_findings: None,
-                test_plan: None,
-                test_plan_branch_head: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_creation_tokens: 0,
-                cache_read_tokens: 0,
-                is_interactive: false,
-                failure_reason: None,
-            });
-        }
-        app.data.merge_queue.push(MergeQueueEntry {
-            assignment_id: "w".to_string(),
-            issue_number: Some(42),
-            state: "failed".to_string(),
-            pr_number: None,
-            pr_url: None,
-            repo_github: "acme/api".to_string(),
-            target_branch: None,
-            error: None,
-            milestone_title: None,
-        });
-        let view = app.build_pipeline_widget().unwrap();
-        assert_eq!(view.stages[2].status, StageStatus::Failed);
-        assert_eq!(view.stages[2].action.as_deref(), Some("Retry"));
     }
 
     /// Failed stage without a coord_repo mapping must not show Retry —
@@ -39399,6 +39196,7 @@ mod tests {
     }
 
     /// Plan stage is prepended when pipeline_require_plan is true.
+    /// #738: "merge" is no longer a per-issue stage.
     #[test]
     fn pipeline_stage_names_prepends_plan_when_required() {
         let mut app = make_pipeline_app();
@@ -39409,12 +39207,12 @@ mod tests {
                 "plan".to_string(),
                 "work".to_string(),
                 "review".to_string(),
-                "merge".to_string(),
             ]
         );
     }
 
     /// Plan stage is omitted when pipeline_require_plan is false (default).
+    /// #738: "merge" is no longer a per-issue stage.
     #[test]
     fn pipeline_stage_names_omits_plan_when_not_required() {
         let app = make_pipeline_app();
@@ -39426,7 +39224,6 @@ mod tests {
             vec![
                 "work".to_string(),
                 "review".to_string(),
-                "merge".to_string()
             ]
         );
     }
@@ -39604,16 +39401,17 @@ mod tests {
             .collect::<Vec<&str>>()
             .join("|");
         // Headers for every stage are present.
+        // #738: Merge is no longer a per-issue stage — only Work and Review.
         assert!(text_blob.contains("Work"), "Work header missing");
         assert!(text_blob.contains("Review"), "Review header missing");
-        assert!(text_blob.contains("Merge"), "Merge header missing");
+        assert!(!text_blob.contains("Merge"), "#738: Merge must NOT appear in per-issue pipeline");
         // Assignment short id appears.
         assert!(text_blob.contains("abcdef12"), "short id missing");
         // Branch + model render.
         assert!(text_blob.contains("issue-42-cool"), "branch missing");
         assert!(text_blob.contains("sonnet"), "model missing");
         // Empty-detail rows for stages with no assignments.
-        assert!(text_blob.contains("(not started)") || text_blob.contains("(not queued)"));
+        assert!(text_blob.contains("(not started)"));
     }
 
     /// capitalize() upper-cases the first ASCII character only.
@@ -39625,13 +39423,14 @@ mod tests {
         assert_eq!(capitalize("Plan"), "Plan");
     }
 
-    /// is_dispatchable_stage covers the four stages the panel can fire.
+    /// is_dispatchable_stage covers the stages the panel can fire.
+    /// #738: "merge" is retired from per-issue pipeline so it is no longer dispatchable.
     #[test]
     fn is_dispatchable_stage_recognises_known_stages() {
         assert!(is_dispatchable_stage("plan"));
         assert!(is_dispatchable_stage("work"));
         assert!(is_dispatchable_stage("review"));
-        assert!(is_dispatchable_stage("merge"));
+        assert!(!is_dispatchable_stage("merge"), "#738: merge is not a per-issue stage");
         assert!(!is_dispatchable_stage("smoke"));
         assert!(!is_dispatchable_stage(""));
     }
@@ -43625,6 +43424,7 @@ mod tests {
     /// For a Done issue (all stages settled), the Pipeline tab body list
     /// shows the last stage's content.  With merge focused, it should
     /// surface merge queue details.
+    /// #738: per-issue pipeline ends at Review; stage content focuses the last stage.
     #[test]
     fn pipeline_tab_body_includes_stage_content_for_done_issue() {
         let mut app = make_pipeline_app();
@@ -43636,6 +43436,7 @@ mod tests {
         app.data
             .assignments
             .push(_stage_assignment("r1", "review", 200.0, "done"));
+        // A merged queue entry keeps the issue classified as Done.
         app.data.merge_queue.push(MergeQueueEntry {
             assignment_id: "w1".to_string(),
             issue_number: Some(42),
@@ -43647,10 +43448,10 @@ mod tests {
             error: None,
             milestone_title: None,
         });
-        // Explicitly focus the last stage (merge = index 2).
+        // #738: last per-issue stage is now "review" (merge removed).
         let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
         let last_idx = stages.len() - 1;
-        assert_eq!(stages[last_idx], "merge");
+        assert_eq!(stages[last_idx], "review", "#738: last stage must be review");
         app.pipeline_sel = Some(0);
         app.pipeline_focused_stage = Some(last_idx);
 
@@ -43661,10 +43462,10 @@ mod tests {
             .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
             .collect::<Vec<_>>()
             .join(" ");
-        // The stage-content header and merge state should appear.
+        // The stage-content header for review should appear.
         assert!(
-            text.contains("Stage content") || text.contains("Merge") || text.contains("merge"),
-            "expected merge stage content in Pipeline tab body for Done issue; got: {text:?}",
+            text.contains("Stage content") || text.contains("Review") || text.contains("review"),
+            "expected review stage content in Pipeline tab body for Done issue; got: {text:?}",
         );
     }
 
@@ -50388,5 +50189,60 @@ mod tests {
     #[test]
     fn sidebar_view_merge_queue_label() {
         assert_eq!(SidebarView::MergeQueue.label(), "Merge Queue");
+    }
+
+    /// #738: per-issue pipeline detail must NOT render a "Merge" stage box.
+    /// Merge lives solely in SidebarView::MergeQueue (the Phase-3 panel).
+    #[test]
+    fn tuidriver_pipeline_detail_has_no_merge_stage() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        // Put work in-progress so the detail panel renders stage content.
+        app.data.assignments.push(Assignment {
+            id: "w1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "m1".to_string(),
+            status: "running".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+        });
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+
+        // The stage strip must contain Work and Review but NOT Merge.
+        assert!(
+            screen.contains("Work") || screen.contains("WORK"),
+            "#738: Work stage must still render in per-issue pipeline:\n{}",
+            screen
+        );
+        assert!(
+            !screen.contains("Merge") && !screen.contains("MERGE"),
+            "#738: Merge must NOT appear in per-issue pipeline (lives in Merge Queue panel):\n{}",
+            screen
+        );
     }
 }
