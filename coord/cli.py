@@ -8030,6 +8030,16 @@ def _merge_via_daemon(svc, params: dict) -> None:
     is_flag=True,
     help="Skip the interactive smoke-test gate — merge even when no smoke verdict is recorded (#465).",
 )
+@click.option(
+    "--drop",
+    "drop_assignment",
+    default=None,
+    metavar="ASSIGNMENT_ID",
+    help=(
+        "#732: Drop exactly one merge_queue entry by assignment_id. "
+        "Routes through the daemon so thin clients don't need local DB access."
+    ),
+)
 def merge(
     config_path: Path,
     dry_run: bool,
@@ -8039,6 +8049,7 @@ def merge(
     force_merge: bool,
     skip_review: bool,
     skip_smoke: bool,
+    drop_assignment: str | None,
 ) -> None:
     # #584: the merge queue + board live in the canonical (host-local) DB, so on
     # a thin client `coord merge` (and the TUI 'Go' button, which shells out to
@@ -8054,7 +8065,23 @@ def merge(
             "dry_run": dry_run, "order": order, "repo_filter": repo_filter,
             "method": method, "force_merge": force_merge,
             "skip_review": skip_review, "skip_smoke": skip_smoke,
+            "drop": drop_assignment,
         })
+        return
+
+    # #732: --drop is a surgical single-entry removal; handle before the full
+    # merge pipeline so it works even when the queue is otherwise busy/blocked.
+    if drop_assignment:
+        from coord import merge_queue as _mq  # noqa: PLC0415
+
+        removed = _mq.drop_entry(drop_assignment)
+        if removed:
+            click.echo(f"merge-queue: dropped entry {drop_assignment}")
+        else:
+            click.echo(
+                f"merge-queue: no entry found for {drop_assignment!r}", err=True
+            )
+            sys.exit(1)
         return
 
     from coord import github_ops as gh_ops

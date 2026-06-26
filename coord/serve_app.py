@@ -459,6 +459,25 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         if body is None:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
+        # #732: --drop is a surgical single-row delete; handle it before
+        # running the full merge pipeline so it doesn't need to import or
+        # invoke the CLI at all.
+        drop_aid = body.get("drop")
+        if drop_aid:
+            from coord import merge_queue as _mq  # noqa: PLC0415
+
+            removed = _mq.drop_entry(str(drop_aid))
+            if removed:
+                return JSONResponse(
+                    {"output": f"merge-queue: dropped entry {drop_aid}\n", "exit_code": 0}
+                )
+            return JSONResponse(
+                {
+                    "output": f"merge-queue: no entry found for {drop_aid!r}\n",
+                    "exit_code": 1,
+                }
+            )
+
         def _run() -> dict:
             import contextlib  # noqa: PLC0415
             import io  # noqa: PLC0415
@@ -482,6 +501,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         force_merge=bool(body.get("force_merge")),
                         skip_review=bool(body.get("skip_review")),
                         skip_smoke=bool(body.get("skip_smoke")),
+                        drop_assignment=None,  # already handled above
                     )
             except SystemExit as e:  # click commands sys.exit() on some paths
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)

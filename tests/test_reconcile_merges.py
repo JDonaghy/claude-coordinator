@@ -1,4 +1,4 @@
-"""Tests for reconcile_board_merges: branch backfill (#611) + record merged (#609) + close stale PRs (#721)."""
+"""Tests for reconcile_board_merges: branch backfill (#611) + record merged (#609) + close stale PRs (#721) + prune stale queue (#732)."""
 
 from __future__ import annotations
 
@@ -327,3 +327,123 @@ def test_stale_pr_sweep_integrated_into_reconcile_board_merges(
     actions = reconcile_board_merges(board, config)
 
     assert any("close PR #44" in s for s in actions)
+
+
+# ── #732 prune stale merge_queue entries ─────────────────────────────────────
+
+
+def test_reconcile_prunes_conflict_entry_for_closed_issue(
+    monkeypatch, config, coord_db
+) -> None:
+    """Acceptance test: a CONFLICT entry whose issue is closed is pruned by
+    reconcile_board_merges and no longer appears in pending_summary (#732)."""
+    from coord import github_ops
+    from coord import merge_queue as mq
+    from coord.merge_queue import CONFLICT, QueuedMerge, save_queue
+
+    # Seed a stale conflict entry (mirrors the #217 incident: assignment
+    # id=60275968b733, issue=#217, state=conflict, issue now closed).
+    save_queue([
+        QueuedMerge(
+            assignment_id="60275968b733",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="issue-217-old-work",
+            target_branch="main",
+            issue_number=217,
+            issue_title="Old closed issue",
+            state=CONFLICT,
+        )
+    ])
+
+    # Stub network calls: issue 217 is closed; no open PRs.
+    monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: n == 217)
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: False)
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", lambda repo: set())
+    monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **kw: False)
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+
+    board = Board(completed=[], active=[])
+    actions = reconcile_board_merges(board, config)
+
+    # The prune action must be reported.
+    assert any("prune queue entry 60275968b733" in s for s in actions)
+
+    # The queue must now be empty.
+    remaining = mq.load_queue()
+    assert remaining == [], f"Expected empty queue, got {remaining}"
+
+    # pending_summary must no longer report a conflict.
+    summary = mq.pending_summary(mq.load_queue())
+    assert summary == {}, f"Expected no pending entries, got {summary}"
+
+
+def test_reconcile_prunes_conflict_entry_for_merged_pr(
+    monkeypatch, config, coord_db
+) -> None:
+    """A CONFLICT entry whose PR is already merged is pruned."""
+    from coord import github_ops
+    from coord import merge_queue as mq
+    from coord.merge_queue import CONFLICT, QueuedMerge, save_queue
+
+    save_queue([
+        QueuedMerge(
+            assignment_id="aid-merged-pr",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="issue-50-feature",
+            target_branch="main",
+            issue_number=50,
+            issue_title="Already merged",
+            state=CONFLICT,
+        )
+    ])
+
+    monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: False)
+    monkeypatch.setattr(
+        github_ops, "pr_is_merged",
+        lambda repo, b: b == "issue-50-feature",
+    )
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", lambda repo: set())
+    monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **kw: False)
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+
+    board = Board(completed=[], active=[])
+    actions = reconcile_board_merges(board, config)
+
+    assert any("prune queue entry aid-merged-pr" in s for s in actions)
+    assert mq.load_queue() == []
+
+
+def test_reconcile_prune_dry_run_does_not_remove_entry(
+    monkeypatch, config, coord_db
+) -> None:
+    """dry_run=True reports what would be pruned without modifying the queue."""
+    from coord import github_ops
+    from coord import merge_queue as mq
+    from coord.merge_queue import CONFLICT, QueuedMerge, save_queue
+
+    save_queue([
+        QueuedMerge(
+            assignment_id="dry-stale",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="issue-99-stale",
+            target_branch="main",
+            issue_number=99,
+            issue_title="Stale",
+            state=CONFLICT,
+        )
+    ])
+
+    monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: True)
+    monkeypatch.setattr(github_ops, "pr_is_merged", lambda repo, b: False)
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", lambda repo: set())
+    monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **kw: False)
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+
+    board = Board(completed=[], active=[])
+    actions = reconcile_board_merges(board, config, dry_run=True)
+
+    assert any("dry-stale" in s and "dry-run" in s for s in actions)
+    assert len(mq.load_queue()) == 1  # still there

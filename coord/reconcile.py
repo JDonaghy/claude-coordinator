@@ -852,4 +852,19 @@ def reconcile_board_merges(
     # (c) #721 — close open PRs whose work has already landed.
     actions.extend(close_stale_prs(config, repo=repo, issue=issue, dry_run=dry_run))
 
+    # (d) #732 — prune stale merge_queue entries for closed issues / merged PRs.
+    # Runs after the board sweeps so a just-marked-merged assignment doesn't
+    # also appear as a pruned queue entry in the same reconcile run.
+    # repo/issue filters don't apply here — we always scan the full queue, since
+    # a stale entry affects every `coord merge` run regardless of --repo.
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    pruned = mq.prune_stale_queue_entries(dry_run=dry_run)
+    for entry in pruned:
+        actions.append(
+            f"prune queue entry {entry.assignment_id} "
+            f"({entry.repo_name} #{entry.issue_number}, state={entry.state})"
+            + (" [dry-run]" if dry_run else "")
+        )
+
     return actions
