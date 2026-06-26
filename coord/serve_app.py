@@ -163,6 +163,11 @@ def _sync_issues_tick(config: Config) -> int:
     from coord import github_ops  # noqa: PLC0415
     from coord.state import _upsert_open_issues_local  # noqa: PLC0415
 
+    # Use the private _upsert_open_issues_local (underscore-prefixed) rather
+    # than the public upsert_open_issues, because the public variant routes
+    # through the daemon HTTP seam (/issues-sync) when a board-service URL is
+    # configured.  Since this function IS the daemon, we must write directly
+    # to the local DB to avoid a self-referential HTTP call.
     log = logging.getLogger("coord.serve")
     total = 0
     for repo in config.repos:
@@ -174,6 +179,7 @@ def _sync_issues_tick(config: Config) -> int:
             log.warning(
                 "issues-sync tick: repo %s failed", repo.name, exc_info=True
             )
+    log.debug("issues-sync tick: %d open issues across %d repos", total, len(config.repos))
     return total
 
 
@@ -738,7 +744,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         except ValueError:
             merges_interval = 300.0
-        last_merge_reconcile = _time.monotonic()
+        # Start at 0 so the first auto-reconcile fires on the very first tick
+        # (not after a full merges_interval delay).  On a daemon restart,
+        # merged-but-grey work should resolve immediately, not after 5 minutes.
+        last_merge_reconcile = 0.0
 
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile
