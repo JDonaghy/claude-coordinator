@@ -37,6 +37,7 @@ from pathlib import Path
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
@@ -612,6 +613,29 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         result = await run_in_threadpool(_run)
         return JSONResponse(result)
 
+    async def post_housekeeping(request: Request) -> Response:
+        # #762: archive stale terminal board rows on the canonical DB.  The CLI
+        # (`coord housekeeping`) routes here because the DB lives on the daemon;
+        # COORD_HOUSEKEEPING_ON_DAEMON guards the daemon against re-routing to
+        # itself (mirrors the reconcile/diagnose pattern).
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from coord import housekeeping  # noqa: PLC0415
+
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        dry_run = bool(body.get("dry_run", False))
+        os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] = "1"
+        try:
+            result = await run_in_threadpool(housekeeping.sweep, dry_run=dry_run)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "housekeeping failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse(result)
+
     def _lifespan(_app: Starlette):  # noqa: ANN202
         """#625: a dispatch-free passive reconcile tick.
 
@@ -638,7 +662,21 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         except ValueError:
             interval = 30.0
 
+        # #762: archive stale terminal board rows on a much slower cadence than
+        # the reconcile tick (default hourly; 0 disables).  Tracked separately so
+        # the heavy sweep doesn't run every reconcile interval.
+        import time as _time  # noqa: PLC0415
+
+        try:
+            housekeeping_interval = float(
+                os.environ.get("COORD_HOUSEKEEPING_INTERVAL", "3600")
+            )
+        except ValueError:
+            housekeeping_interval = 3600.0
+        last_housekeeping = _time.monotonic()
+
         async def _tick_loop() -> None:
+            nonlocal last_housekeeping
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -678,6 +716,29 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         )
                 except Exception:  # noqa: BLE001
                     log.warning("passive enqueue tick failed", exc_info=True)
+                # Step 3: #762 archival sweep on a slow cadence (default hourly).
+                # Independent try/except — a sweep failure must never crash the
+                # daemon or silence the reconcile/enqueue steps above.
+                if housekeeping_interval > 0 and (
+                    _time.monotonic() - last_housekeeping >= housekeeping_interval
+                ):
+                    last_housekeeping = _time.monotonic()
+                    try:
+                        from coord import housekeeping as _hk  # noqa: PLC0415
+
+                        os.environ["COORD_HOUSEKEEPING_ON_DAEMON"] = "1"
+                        swept = await run_in_threadpool(_hk.sweep)
+                        if swept.get("archived_assignments") or swept.get(
+                            "archived_notifications"
+                        ):
+                            log.info(
+                                "housekeeping: archived %d assignment(s), "
+                                "%d notification(s)",
+                                swept["archived_assignments"],
+                                swept["archived_notifications"],
+                            )
+                    except Exception:  # noqa: BLE001
+                        log.warning("housekeeping tick failed", exc_info=True)
 
         @contextlib.asynccontextmanager
         async def _ctx(_a):  # noqa: ANN202
@@ -712,6 +773,13 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/merge", post_merge, methods=["POST"]),
         Route("/reconcile-merges", post_reconcile_merges, methods=["POST"]),
         Route("/diagnose", post_diagnose, methods=["POST"]),
+        Route("/housekeeping", post_housekeeping, methods=["POST"]),
     ]
-    middleware = [Middleware(_BearerAuthMiddleware, token=token)] if token else []
+    # #762: gzip the /board projection (markdown-heavy JSON compresses ~9×), so a
+    # large payload can't overrun the TUI's fetch timeout on a slow link.  Gzip is
+    # outermost so it compresses every response (incl. auth rejections); ureq on
+    # the client decodes Content-Encoding: gzip transparently.
+    middleware = [Middleware(GZipMiddleware, minimum_size=1024)]
+    if token:
+        middleware.append(Middleware(_BearerAuthMiddleware, token=token))
     return Starlette(routes=routes, middleware=middleware, lifespan=_lifespan)
