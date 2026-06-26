@@ -304,6 +304,39 @@ describe('Detail — test gate', () => {
       expect(screen.getByText('Dispatch Fix')).toBeInTheDocument()
     })
   })
+
+  it('does not render the test section when test_verdict is absent (undefined) and no gate', async () => {
+    // Simulates the real backend before test_verdict was added to PipelineView —
+    // dataclasses.asdict() omits undeclared fields so the frontend receives
+    // undefined rather than null.  The !=/!== difference matters: `undefined !== null`
+    // is true but `undefined != null` is false, so only the loose check is safe.
+    const view = makeView()
+    const viewWithoutTestVerdict = { ...view } as Partial<PipelineView> & Record<string, unknown>
+    delete viewWithoutTestVerdict['test_verdict']
+    vi.mocked(fetchPipeline).mockResolvedValue([viewWithoutTestVerdict as PipelineView])
+    vi.mocked(fetchDiff).mockResolvedValue(makeDiff())
+    vi.mocked(pipelineAction).mockResolvedValue({ ok: true })
+
+    const queryClient = createTestQueryClient()
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/detail/work-1']}>
+          <Routes>
+            <Route path="/detail/:id" element={<Detail />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    await waitFor(() => screen.getByText('Fix the thing'))
+
+    // Test gate section should NOT render because:
+    // - no test-verdict gate in available_gates
+    // - test_verdict is undefined (missing from backend), which != null is false
+    expect(screen.queryByRole('region', { name: /test gate/i })).not.toBeInTheDocument()
+    expect(screen.queryByText('Pass')).not.toBeInTheDocument()
+    expect(screen.queryByText('Fail')).not.toBeInTheDocument()
+  })
 })
 
 // ── Review ────────────────────────────────────────────────────────────────────
