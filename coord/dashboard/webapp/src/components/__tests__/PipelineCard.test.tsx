@@ -31,6 +31,7 @@ function makeView(overrides: Partial<PipelineView> = {}): PipelineView {
     review_findings_pending: false,
     review_verdict: null,
     review_findings_body: null,
+    test_verdict: null,
     ...overrides,
   }
 }

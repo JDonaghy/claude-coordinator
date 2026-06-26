@@ -111,6 +111,11 @@ export interface PipelineView {
   review_verdict: 'approve' | 'request-changes' | null
   /** Cached review findings body from the DB; null when not yet available. */
   review_findings_body: string | null
+  /**
+   * Test verdict recorded via `coord test --passed/--failed/--skipped`.
+   * Added by #698 (test-verdict / record-review-verdict / findings pipeline fields).
+   */
+  test_verdict: TestVerdict | null
 }
 
 // ── GET /api/diff/{id} ────────────────────────────────────────────────────────
