@@ -21,7 +21,9 @@ non-SQLite backend inherits any SQLite-only idiom.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -31,6 +33,33 @@ from coord.db import DB_PATH
 # Bump when the /board payload shape changes incompatibly.  Clients may branch
 # on this; today everything is additive.
 SCHEMA_VERSION = 1
+
+# #762: terminal assignment statuses.  Anything NOT in this set (running /
+# pending) is "in-flight" and always kept on the board projection.
+TERMINAL_STATUSES = frozenset({"done", "merged", "failed", "cancelled", "advisory"})
+
+# #762: how many days of *terminal* assignment history the /board projection
+# carries.  The board grew unbounded (1209 assignments / 4.37 MB) and overran
+# the TUI's fetch timeout, blanking the whole board.  Cap the wire to active +
+# pipeline-referenced + this many days of terminal rows.  0 disables the cap
+# (serve everything — the pre-#762 behaviour).
+_DEFAULT_BOARD_RETENTION_DAYS = 14
+
+
+def _board_retention_days() -> int:
+    try:
+        return int(os.environ.get("COORD_BOARD_RETENTION_DAYS", _DEFAULT_BOARD_RETENTION_DAYS))
+    except (TypeError, ValueError):
+        return _DEFAULT_BOARD_RETENTION_DAYS
+
+
+def _board_retention_cutoff(now: float | None = None) -> float | None:
+    """Unix-timestamp floor for terminal rows on the board, or None when the
+    cap is disabled (``COORD_BOARD_RETENTION_DAYS=0``)."""
+    days = _board_retention_days()
+    if days <= 0:
+        return None
+    return (time.time() if now is None else now) - days * 86400.0
 
 # JSON-encoded columns per table — decoded to native objects on read so no
 # SQLite idiom (JSON-in-TEXT) leaks past the DAO.  Columns added by later ALTER
@@ -88,6 +117,92 @@ class CoordStore(Protocol):
     def record_result(self, record: Any) -> Any: ...
     def record_completion(self, record: Any) -> Any: ...
     def record_dispatched(self, assignment: Any) -> None: ...
+
+
+def compute_board_keep_ids(
+    assignment_index: list[dict],
+    merge_queue_ids: set[str],
+    open_issue_keys: set[tuple[str, int]],
+    cutoff: float | None,
+) -> set[str]:
+    """Return the set of ``assignment_id``s the /board projection must carry.
+
+    Pure function (no DB) so the read path (:meth:`SqliteStore.board_projection`)
+    and the #762 archival sweep apply *identical* rules.
+
+    ``assignment_index`` rows need only: ``assignment_id``, ``repo_name``,
+    ``issue_number``, ``status``, ``dispatched_at``, ``finished_at``,
+    ``review_of_assignment_id``.
+
+    A row is kept when it is **active** (status not terminal), **recent** (its
+    finish — or dispatch when never finished — is within the retention window),
+    **queued for merge**, or the **latest assignment of a still-open issue**.
+    The kept set is then closed over ``review_of_assignment_id`` in both
+    directions, so an in-flight item never loses its work↔review pairing.
+
+    ``cutoff=None`` (cap disabled) keeps everything.
+    """
+    by_id: dict[str, dict] = {
+        r["assignment_id"]: r for r in assignment_index if r.get("assignment_id")
+    }
+    if cutoff is None:
+        return set(by_id)
+
+    keep: set[str] = set()
+    latest_open: dict[tuple, tuple[float, str]] = {}
+    for r in assignment_index:
+        aid = r.get("assignment_id")
+        if not aid:
+            continue
+        status = (r.get("status") or "").lower()
+        if status not in TERMINAL_STATUSES:
+            keep.add(aid)
+        else:
+            ts = r.get("finished_at")
+            if ts is None:
+                ts = r.get("dispatched_at")
+            # Conservative: only drop a terminal row we can POSITIVELY date as
+            # old.  An undatable terminal row (no finish/dispatch timestamp) is
+            # kept rather than risk dropping something we can't age.
+            if ts is None or ts >= cutoff:
+                keep.add(aid)
+            elif aid in merge_queue_ids:
+                keep.add(aid)
+        # Track the most-recently-dispatched assignment per open issue so an
+        # open pipeline card never loses its latest state to the age cap.
+        key = (r.get("repo_name"), r.get("issue_number"))
+        if key in open_issue_keys:
+            disp = r.get("dispatched_at") or 0.0
+            cur = latest_open.get(key)
+            if cur is None or disp >= cur[0]:
+                latest_open[key] = (disp, aid)
+    for _, aid in latest_open.values():
+        keep.add(aid)
+
+    # Closure over review links (work → its reviews, review → its work).
+    reviews_of: dict[str, list[str]] = {}
+    for aid, r in by_id.items():
+        tgt = r.get("review_of_assignment_id")
+        if tgt:
+            reviews_of.setdefault(tgt, []).append(aid)
+    frontier = list(keep)
+    while frontier:
+        aid = frontier.pop()
+        tgt = by_id.get(aid, {}).get("review_of_assignment_id")
+        if tgt and tgt in by_id and tgt not in keep:
+            keep.add(tgt)
+            frontier.append(tgt)
+        for rev in reviews_of.get(aid, ()):
+            if rev not in keep:
+                keep.add(rev)
+                frontier.append(rev)
+    return keep
+
+
+_KEEP_INDEX_COLUMNS = (
+    "assignment_id, repo_name, issue_number, status, dispatched_at, "
+    "finished_at, review_of_assignment_id"
+)
 
 
 def _decode_row(table: str, row: sqlite3.Row) -> dict:
@@ -190,24 +305,78 @@ class SqliteStore:
         with closing(self._connect()) as conn:
             return self._round_number(conn)
 
+    def _board_keep_ids(self, conn: sqlite3.Connection, cutoff: float | None) -> set[str]:
+        """#762: assignment_ids the projection must carry (see
+        :func:`compute_board_keep_ids`)."""
+        index = [
+            dict(r)
+            for r in conn.execute(f"SELECT {_KEEP_INDEX_COLUMNS} FROM assignments").fetchall()
+        ]
+        mq_ids = {
+            r["assignment_id"]
+            for r in conn.execute("SELECT assignment_id FROM merge_queue").fetchall()
+            if r["assignment_id"]
+        }
+        open_keys = {
+            (r["repo_name"], r["number"])
+            for r in conn.execute(
+                "SELECT repo_name, number FROM issues WHERE LOWER(state) != 'closed'"
+            ).fetchall()
+        }
+        return compute_board_keep_ids(index, mq_ids, open_keys, cutoff)
+
+    def _capped_assignments(self, conn: sqlite3.Connection, keep: set[str] | None) -> list[dict]:
+        rows = conn.execute(
+            "SELECT * FROM assignments ORDER BY dispatched_at DESC"
+        ).fetchall()
+        if keep is None:
+            return [_decode_row("assignments", r) for r in rows]
+        return [
+            _decode_row("assignments", r)
+            for r in rows
+            if r["assignment_id"] in keep
+        ]
+
+    def _capped_notifications(
+        self, conn: sqlite3.Connection, keep: set[str] | None, cutoff: float | None
+    ) -> list[dict]:
+        rows = conn.execute("SELECT * FROM notifications").fetchall()
+        if cutoff is None:
+            return [_decode_row("notifications", r) for r in rows]
+        out: list[dict] = []
+        for r in rows:
+            posted = r["posted_at"]
+            if (posted is not None and posted >= cutoff) or (
+                keep is not None and r["assignment_id"] in keep
+            ):
+                out.append(_decode_row("notifications", r))
+        return out
+
     def board_projection(self) -> dict:
         """The full ``GET /board`` payload — one consistent snapshot.
 
         A superset of what the Rust TUI's ``load_data()`` reads from SQLite
         today, minus the live machine-reachability probes (the client keeps
         doing those itself over the tailnet).
+
+        #762: assignments + notifications are capped to active + pipeline-
+        referenced + the last ``COORD_BOARD_RETENTION_DAYS`` (default 14) of
+        terminal rows, so the wire can't grow unbounded and overrun the TUI's
+        fetch timeout (which blanks the whole board on any error).
         """
         with closing(self._connect()) as conn:
+            cutoff = _board_retention_cutoff()
+            keep = self._board_keep_ids(conn, cutoff) if cutoff is not None else None
             return {
                 "schema_version": SCHEMA_VERSION,
                 "round_number": self._round_number(conn),
-                "assignments": self._table(conn, "assignments", order="dispatched_at DESC"),
+                "assignments": self._capped_assignments(conn, keep),
                 "machines": self._table(conn, "machines", order="name"),
                 "merge_queue": self._table(conn, "merge_queue", order="id"),
                 "proposals": self._table(conn, "proposals", order="id"),
                 "issues": self._table(conn, "issues", order="repo_name, number"),
                 "plans": self._plans(conn),
-                "notifications": self._table(conn, "notifications"),
+                "notifications": self._capped_notifications(conn, keep, cutoff),
                 "board_meta": self._board_meta(conn),
             }
 

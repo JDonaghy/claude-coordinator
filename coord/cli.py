@@ -7137,6 +7137,63 @@ def reconcile_merges(repo_name: str | None, dry_run: bool, config_path: Path) ->
         click.echo(action)
 
 
+def _print_housekeeping_result(resp: dict) -> None:
+    dry = resp.get("dry_run")
+    archived_a = resp.get("archived_assignments", 0)
+    archived_n = resp.get("archived_notifications", 0)
+    days = resp.get("retention_days")
+    if not archived_a and not archived_n:
+        click.echo(
+            f"housekeeping: nothing to archive (no terminal rows older than {days}d)."
+        )
+        return
+    verb = "would archive" if dry else "archived"
+    suffix = "  (dry-run — nothing moved)" if dry else ""
+    click.echo(
+        f"housekeeping: {verb} {archived_a} assignment(s) + "
+        f"{archived_n} notification(s) (terminal, older than {days}d).{suffix}"
+    )
+
+
+@main.command(
+    "housekeeping",
+    help=(
+        "#762: archive stale terminal board rows so the /board payload + DB stay "
+        "bounded (an unbounded board overran the TUI fetch timeout and blanked "
+        "the board).\n\n"
+        "Moves terminal assignments older than COORD_ARCHIVE_RETENTION_DAYS "
+        "(default 30) + their notifications into assignments_archive / "
+        "notifications_archive — it NEVER deletes, and never touches active, "
+        "recent, merge-queued, open-issue-latest, or review-linked rows. Routes "
+        "through the daemon (the canonical DB lives there)."
+    ),
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Report what would be archived without moving anything.",
+)
+def housekeeping(dry_run: bool) -> None:
+    """#762: archive stale terminal board rows (active/recent/referenced kept)."""
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    _svc = resolve_board_service()
+    if _svc is not None and not os.environ.get("COORD_HOUSEKEEPING_ON_DAEMON"):
+        from coord.client import post_record  # noqa: PLC0415
+
+        try:
+            resp = post_record(_svc, "/housekeeping", {"dry_run": dry_run}, timeout=180.0)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"error: housekeeping via daemon failed: {exc}", err=True)
+            sys.exit(1)
+        _print_housekeeping_result(resp)
+        return
+
+    from coord import housekeeping as _hk  # noqa: PLC0415
+
+    _print_housekeeping_result(_hk.sweep(dry_run=dry_run))
+
+
 def _diagnose_via_daemon(svc, params: dict) -> None:
     """#diagnose: run ``coord diagnose`` on the daemon host (canonical board +
     gh + ssh access to the fleet) and relay its output, so the per-stage doctor
