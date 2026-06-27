@@ -1116,6 +1116,11 @@ struct BoardPayload {
     machines: Vec<RawMachine>,
     #[serde(default)]
     merge_queue: Vec<MergeQueueEntry>,
+    /// Server-side merge plan (#776) — ranked, annotated list of planned merges.
+    /// Computed by `coord.merge_queue.plan()` and injected by `serve_app.py`.
+    /// Empty when the daemon is older than v0.4.53 (pre-#776).
+    #[serde(default)]
+    merge_plan: Vec<PlannedMergeEntry>,
     #[serde(default)]
     proposals: Vec<Proposal>,
     #[serde(default)]
@@ -1980,6 +1985,51 @@ struct MergeQueueEntry {
     milestone_title: Option<String>,
 }
 
+/// One entry in the server-side merge plan from #776.
+///
+/// Deserialized from the `merge_plan` key of the `/board` payload, which is
+/// computed by `coord.merge_queue.plan()` and injected by `serve_app.py`.
+/// Unlike the raw `MergeQueueEntry` (DB row), this carries computed fields
+/// that are always fresh: `rank` (true merge order), `status` (READY /
+/// BLOCKED / MERGING / MERGED / NEEDS_ATTENTION), `reason` (live gate
+/// explanation), `size` (diff lines), `enqueued_at`, and `last_attempt`.
+///
+/// The panel reads this structure; it does **not** re-derive ordering or gate
+/// status in Rust.
+#[derive(Clone, serde::Deserialize, Default)]
+struct PlannedMergeEntry {
+    assignment_id: String,
+    repo_name: String,
+    repo_github: String,
+    #[allow(dead_code)]
+    branch: String,
+    target_branch: String,
+    issue_number: u64,
+    issue_title: String,
+    /// 1-based position in the true merge sequence across all repos.
+    rank: u32,
+    /// Diff size in lines (populated at enqueue; `None` = unknown).
+    #[serde(default)]
+    size: Option<i64>,
+    /// Computed status: "READY" | "BLOCKED" | "MERGING" | "MERGED" | "NEEDS_ATTENTION".
+    status: String,
+    /// Human-readable explanation of why the entry is BLOCKED (None when not blocked).
+    #[serde(default)]
+    reason: Option<String>,
+    /// Unix timestamp when the entry was enqueued.
+    #[serde(default)]
+    enqueued_at: Option<f64>,
+    /// Unix timestamp of the last merge attempt.
+    #[serde(default)]
+    last_attempt: Option<f64>,
+    /// Issue milestone title (None when no milestone).  Stored for future
+    /// display (e.g. milestone grouping in a later phase); not shown in the
+    /// #777 panel which groups by repo→target_branch instead.
+    #[allow(dead_code)]
+    #[serde(default)]
+    milestone: Option<String>,
+}
+
 /// CI check status for one PR, fetched in the background via `gh pr checks`.
 ///
 /// Populated from `fetch_ci_checks_summary` and stored on `CoordApp` keyed by
@@ -2464,6 +2514,10 @@ struct BoardData {
     open_issues: Vec<OpenIssue>,
     machines: Vec<Machine>,
     merge_queue: Vec<MergeQueueEntry>,
+    /// Server-side merge plan (#776) — ranked list from `/board`.  Non-empty
+    /// when the daemon is v0.4.53+ and has planned merges.  The MergeQueue
+    /// panel renders this in preference to `merge_queue` when non-empty.
+    merge_plan: Vec<PlannedMergeEntry>,
     proposals: Vec<Proposal>,
     /// Pipeline gate names from `pipeline.default_gates` in coordinator.yml.
     /// Defaults to `["review", "merge"]` when the board_meta key is absent.
@@ -2598,6 +2652,28 @@ fn trunc(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => &s[..byte_idx],
         None => s,
+    }
+}
+
+/// Format a Unix timestamp as a human-readable "X ago" string relative to `now`.
+///
+/// Used in the Merge Queue panel (#777) to show `enqueued_at` and `last_attempt`.
+/// Returns `""` for `None` timestamps.  Precision caps at minutes for < 1h,
+/// hours for < 24h, days otherwise — keeps panel rows terse.
+fn format_age(ts: Option<f64>, now: f64) -> String {
+    let ts = match ts {
+        Some(t) if t > 0.0 => t,
+        _ => return String::new(),
+    };
+    let secs = (now - ts).max(0.0) as u64;
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
     }
 }
 
@@ -3708,6 +3784,9 @@ fn load_data() -> BoardData {
         machine_rows,
         open_issues,
         merge_queue,
+        // Local SQLite path has no merge_plan; it is only available from the
+        // remote /board endpoint (coord serve, #776).  Pass empty here.
+        Vec::new(),
         proposals,
         plans,
         pipeline_default_gates,
@@ -3735,6 +3814,7 @@ fn assemble_board_data(
     machine_rows: Vec<(String, String, Vec<String>)>,
     open_issues: Vec<OpenIssue>,
     merge_queue: Vec<MergeQueueEntry>,
+    merge_plan: Vec<PlannedMergeEntry>,
     proposals: Vec<Proposal>,
     plans: std::collections::HashMap<String, PlanData>,
     pipeline_default_gates: Vec<String>,
@@ -3842,6 +3922,7 @@ fn assemble_board_data(
         open_issues,
         machines,
         merge_queue,
+        merge_plan,
         proposals,
         pipeline_default_gates,
         pipeline_tracked_labels,
@@ -4071,6 +4152,7 @@ fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         machine_rows,
         payload.issues,
         payload.merge_queue,
+        payload.merge_plan,
         payload.proposals,
         plans,
         pipeline_default_gates,
@@ -8541,27 +8623,45 @@ impl CoordApp {
     }
 
     /// Return the display-list index for the currently selected merge-queue
-    /// entry, accounting for milestone-group header rows inserted before each
-    /// group in `render_merge_queue_panel`.
+    /// entry, accounting for group header rows inserted before each group in
+    /// `render_merge_queue_panel`.
     ///
-    /// Counts the number of distinct `milestone_title` values seen in
-    /// `data.merge_queue[0..=sel]` (first-appearance order) — each unique
-    /// value corresponds to one header row.  Adding that count to `sel` gives
-    /// the row index the selected entry occupies in the rendered items array.
+    /// When `data.merge_plan` is non-empty (#776 path), groups are by
+    /// `(repo_github, target_branch)`.  When only `data.merge_queue` is
+    /// available (legacy path), groups are by `milestone_title`.
+    /// Adding the header count to `sel` gives the row index the selected
+    /// entry occupies in the rendered items array.
     fn merge_queue_display_idx_for_sel(&self) -> usize {
-        let entries = &self.data.merge_queue;
-        if entries.is_empty() {
-            return 0;
-        }
-        let sel = self.merge_queue_sel.min(entries.len() - 1);
-        // Count distinct milestone groups whose header appears at or before `sel`.
-        let mut seen: Vec<Option<String>> = Vec::new();
-        for entry in entries.iter().take(sel + 1) {
-            if !seen.contains(&entry.milestone_title) {
-                seen.push(entry.milestone_title.clone());
+        if !self.data.merge_plan.is_empty() {
+            // #776 plan path: groups are (repo_github, target_branch).
+            let entries = &self.data.merge_plan;
+            if entries.is_empty() {
+                return 0;
             }
+            let sel = self.merge_queue_sel.min(entries.len() - 1);
+            let mut seen: Vec<(&str, &str)> = Vec::new();
+            for entry in entries.iter().take(sel + 1) {
+                let key = (entry.repo_github.as_str(), entry.target_branch.as_str());
+                if !seen.contains(&key) {
+                    seen.push(key);
+                }
+            }
+            sel + seen.len()
+        } else {
+            // Legacy path: groups are milestone_title.
+            let entries = &self.data.merge_queue;
+            if entries.is_empty() {
+                return 0;
+            }
+            let sel = self.merge_queue_sel.min(entries.len() - 1);
+            let mut seen: Vec<Option<String>> = Vec::new();
+            for entry in entries.iter().take(sel + 1) {
+                if !seen.contains(&entry.milestone_title) {
+                    seen.push(entry.milestone_title.clone());
+                }
+            }
+            sel + seen.len()
         }
-        sel + seen.len()
     }
 
     // ── Widget builders ──────────────────────────────────────────────────
@@ -9945,8 +10045,19 @@ impl CoordApp {
     // ── #737: Merge Queue panel helpers ──────────────────────────────────────
 
     /// `true` when any merge-queue entry requires human attention:
-    /// HUMAN_REQUIRED, failed state, or a known CI failure.
+    /// NEEDS_ATTENTION plan-status (from `merge_plan`), or — when only the
+    /// legacy `merge_queue` is available — HUMAN_REQUIRED/failed state or
+    /// a known CI failure.
     fn merge_queue_needs_attention(&self) -> bool {
+        if !self.data.merge_plan.is_empty() {
+            // #776 plan path: surface "NEEDS_ATTENTION" status from the server.
+            return self
+                .data
+                .merge_plan
+                .iter()
+                .any(|p| p.status == "NEEDS_ATTENTION");
+        }
+        // Legacy fallback: derive attention from raw merge_queue state.
         self.data.merge_queue.iter().any(|e| {
             matches!(e.state.as_str(), "human_required" | "failed")
                 || (e.state == "pending"
@@ -9962,6 +10073,18 @@ impl CoordApp {
             return None;
         }
         self.data.merge_queue.get(self.merge_queue_sel.min(n - 1))
+    }
+
+    /// Return a reference to the currently-selected planned merge entry, if any.
+    ///
+    /// Used when `data.merge_plan` is non-empty (v0.4.53+ daemon path).
+    /// `merge_queue_sel` indexes into the rendered plan list order.
+    fn selected_merge_plan_entry(&self) -> Option<&PlannedMergeEntry> {
+        let n = self.data.merge_plan.len();
+        if n == 0 {
+            return None;
+        }
+        self.data.merge_plan.get(self.merge_queue_sel.min(n - 1))
     }
 
     /// Format a single merge-queue entry as a terse list label.
@@ -10038,7 +10161,12 @@ impl CoordApp {
     /// Sidebar placeholder for the Merge Queue view — shows entry count and
     /// an attention indicator when any entry needs human action.
     fn merge_queue_sidebar(&self) -> ListView {
-        let n = self.data.merge_queue.len();
+        // Use merge_plan count when available (#776); fall back to merge_queue.
+        let n = if !self.data.merge_plan.is_empty() {
+            self.data.merge_plan.len()
+        } else {
+            self.data.merge_queue.len()
+        };
         let attn = if self.merge_queue_needs_attention() {
             " ⚠ needs attention"
         } else {
@@ -10063,15 +10191,25 @@ impl CoordApp {
         }
     }
 
-    /// Render the Merge Queue main panel — a scrollable list of all merge-queue
-    /// entries grouped by milestone, with their state, PR number, issue title,
-    /// and error reason.
+    /// Render the Merge Queue main panel.
     ///
-    /// Entries are rendered under `Decoration::Header` milestone group labels.
-    /// When no entry carries a milestone the single group is labelled
-    /// "(No milestone)".  The selected entry is highlighted; `scroll_offset`
-    /// is driven by `merge_queue_scroll` so the selected row stays in view.
+    /// **#777 — plan path (v0.4.53+ daemon):** when `data.merge_plan` is
+    /// non-empty, renders the server-computed ranked plan grouped by
+    /// `repo → target_branch`.  Each entry shows its rank number, plan
+    /// status badge, PR number, diff size, issue title, live gate reason
+    /// (for BLOCKED), and age.  The order matches what `coord merge` would do.
+    ///
+    /// **Legacy fallback:** when `merge_plan` is empty (older daemon or local
+    /// SQLite path), falls back to displaying `data.merge_queue` entries
+    /// grouped by milestone as in #737.
     fn render_merge_queue_panel(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
+        // ── #777: plan path ───────────────────────────────────────────────────
+        if !self.data.merge_plan.is_empty() {
+            self.render_merge_plan_panel(backend, rect);
+            return;
+        }
+
+        // ── Legacy path (no merge_plan from daemon) ───────────────────────────
         let n = self.data.merge_queue.len();
         if n == 0 {
             backend.draw_list(rect, &plain_list(
@@ -10143,19 +10281,214 @@ impl CoordApp {
         });
     }
 
+    // ── #777: Ranked plan panel ───────────────────────────────────────────────
+
+    /// Render the Merge Queue panel from `data.merge_plan` (#776 plan path).
+    ///
+    /// Layout (per the #777 spec):
+    /// ```text
+    /// MERGE QUEUE — order = next coord merge run
+    ///
+    /// repo-name → target-branch
+    ///   1. [READY]   #812  +14   Fix toast clipping        queued 4m ago
+    ///   2. [BLOCKED] #770  +120  CI running (2 checks)      last try 2m ago
+    /// other-repo → develop
+    ///   3. [READY]   #383  +41   ButtonBar primitive        queued 1h ago
+    /// ```
+    ///
+    /// Entries are grouped by `(repo_github, target_branch)` via
+    /// `Decoration::Header` separators.  Group headers show
+    /// `<repo_name> → <target_branch>` using the coord-local repo name from
+    /// `pipeline_repos` (falling back to the GitHub slug when not mapped).
+    /// Each entry row includes rank, status badge, PR number (from
+    /// `merge_queue` by `assignment_id`), size, truncated title, and age.
+    fn render_merge_plan_panel(&self, backend: &mut dyn Backend, rect: Rect) {
+        let plan = &self.data.merge_plan;
+        let n = plan.len();
+        if n == 0 {
+            backend.draw_list(rect, &plain_list(
+                "mergequeue-empty",
+                "  No merge-queue entries — run `coord merge` to populate the queue.",
+                0,
+            ));
+            return;
+        }
+
+        // Build a lookup: assignment_id → pr_number (from the raw merge_queue).
+        let pr_lookup: std::collections::HashMap<&str, i64> = self
+            .data
+            .merge_queue
+            .iter()
+            .filter_map(|mq| mq.pr_number.map(|pr| (mq.assignment_id.as_str(), pr)))
+            .collect();
+
+        // Current time for age formatting.  Using a 0 fallback (shows "" for
+        // missing timestamps) is safe here — the field is cosmetic only.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        let sel_entry = self.merge_queue_sel.min(n - 1);
+        let mut items: Vec<ListItem> = Vec::with_capacity(n + 8);
+        let mut selected_idx = 0usize;
+        // Consecutive-run grouping by (repo_github, target_branch).
+        let mut last_group: Option<(&str, &str)> = None;
+
+        for (i, entry) in plan.iter().enumerate() {
+            // ── Group header ─────────────────────────────────────────────
+            let group_key = (entry.repo_github.as_str(), entry.target_branch.as_str());
+            if last_group != Some(group_key) {
+                // `repo_name` from the plan is the coord-local name; prefer it
+                // over the GitHub slug for a friendlier group header.
+                let display_repo = if !entry.repo_name.is_empty() {
+                    &entry.repo_name
+                } else {
+                    &entry.repo_github
+                };
+                let header_label = format!(" {} → {} ", display_repo, entry.target_branch);
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(header_label, Color::rgb(150, 190, 230))],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+                last_group = Some(group_key);
+            }
+
+            // ── Record selection display index ────────────────────────────
+            if i == sel_entry {
+                selected_idx = items.len();
+            }
+
+            // ── Format the entry label ────────────────────────────────────
+            // Status badge: map plan status to display string.
+            let status_badge = match entry.status.as_str() {
+                "READY"           => "READY",
+                "BLOCKED"         => "BLOCKED",
+                "MERGING"         => "MERGING",
+                "MERGED"          => "MERGED",
+                "NEEDS_ATTENTION" => "NEEDS ATTENTION",
+                other             => other,
+            };
+
+            // PR number (cross-ref with raw merge_queue by assignment_id).
+            let pr_str = pr_lookup
+                .get(entry.assignment_id.as_str())
+                .map(|&pr| format!(" #{}", pr))
+                .unwrap_or_default();
+
+            // Diff size.
+            let size_str = entry.size
+                .map(|s| format!(" +{}", s))
+                .unwrap_or_default();
+
+            // Title — truncate to keep the row terse.
+            let title_short = trunc(&entry.issue_title, 40);
+
+            // Age: show `enqueued_at` for READY/BLOCKED, `last_attempt` for
+            // MERGING/terminal states that have a recent attempt.
+            let age_str = if matches!(entry.status.as_str(), "MERGED" | "NEEDS_ATTENTION") {
+                // Terminal / attention: show last_attempt if any.
+                let age = format_age(entry.last_attempt, now);
+                if age.is_empty() { String::new() } else { format!("  last try {}", age) }
+            } else {
+                // Active/blocked: prefer last_attempt for MERGING, enqueued_at otherwise.
+                let ts = if entry.status == "MERGING" {
+                    entry.last_attempt.or(entry.enqueued_at)
+                } else {
+                    entry.enqueued_at
+                };
+                let label = if entry.status == "MERGING" || entry.last_attempt.is_some() {
+                    "last try"
+                } else {
+                    "queued"
+                };
+                let age = format_age(ts, now);
+                if age.is_empty() { String::new() } else { format!("  {} {}", label, age) }
+            };
+
+            // Reason for BLOCKED entries — the live gate explanation from the plan.
+            let reason_str = if entry.status == "BLOCKED" {
+                entry.reason
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .map(|r| {
+                        let s = r.trim();
+                        if s.len() > 50 {
+                            format!("  ({}…)", &s[..47])
+                        } else {
+                            format!("  ({})", s)
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let label = format!(
+                "  {}. [{}]{}{} {}{}{}",
+                entry.rank, status_badge, pr_str, size_str, title_short, reason_str, age_str,
+            );
+
+            // Status colour.
+            let color = match entry.status.as_str() {
+                "NEEDS_ATTENTION" => Color::rgb(220, 70, 70),
+                "MERGED"          => Color::rgb(80, 200, 80),
+                "MERGING"         => Color::rgb(80, 160, 220),
+                "BLOCKED"         => Color::rgb(220, 140, 40),
+                _                 => Color::rgb(180, 180, 180), // READY
+            };
+
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(label, color)],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+        }
+
+        let total = items.len();
+        backend.draw_list(rect, &ListView {
+            id: WidgetId::new("mergequeue-list"),
+            title: Some(StyledText::plain(" MERGE QUEUE — order = next coord merge run ")),
+            items,
+            selected_idx,
+            scroll_offset: self.merge_queue_scroll,
+            has_focus: true,
+            bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: total > 10,
+        });
+    }
+
     // ── #737: Merge Queue per-entry actions ───────────────────────────────────
 
     /// `coord merge --order <assignment_id>` (or `--force-merge` when `force`).
     fn dispatch_merge_queue_merge(&mut self, force: bool) {
-        let Some(entry) = self.selected_merge_queue_entry() else {
-            self.push_toast(
-                "Merge Queue",
-                "No entry selected.",
-                ToastSeverity::Warning,
-            );
-            return;
+        // Prefer merge_plan (v0.4.53+ daemon); fall back to raw merge_queue.
+        let aid = if !self.data.merge_plan.is_empty() {
+            match self.selected_merge_plan_entry() {
+                Some(e) => e.assignment_id.clone(),
+                None => {
+                    self.push_toast("Merge Queue", "No entry selected.", ToastSeverity::Warning);
+                    return;
+                }
+            }
+        } else {
+            match self.selected_merge_queue_entry() {
+                Some(e) => e.assignment_id.clone(),
+                None => {
+                    self.push_toast("Merge Queue", "No entry selected.", ToastSeverity::Warning);
+                    return;
+                }
+            }
         };
-        let aid = entry.assignment_id.clone();
         // Build the command as owned Strings so we can conditionally push
         // --force-merge before slicing into &str refs for spawn_queued.
         let mut cmd_strs: Vec<String> = vec![
@@ -10186,15 +10519,24 @@ impl CoordApp {
 
     /// `coord merge --drop <assignment_id>` — remove one entry from the queue.
     fn dispatch_merge_queue_drop(&mut self) {
-        let Some(entry) = self.selected_merge_queue_entry() else {
-            self.push_toast(
-                "Merge Queue",
-                "No entry selected.",
-                ToastSeverity::Warning,
-            );
-            return;
+        // Prefer merge_plan (v0.4.53+ daemon); fall back to raw merge_queue.
+        let aid = if !self.data.merge_plan.is_empty() {
+            match self.selected_merge_plan_entry() {
+                Some(e) => e.assignment_id.clone(),
+                None => {
+                    self.push_toast("Merge Queue", "No entry selected.", ToastSeverity::Warning);
+                    return;
+                }
+            }
+        } else {
+            match self.selected_merge_queue_entry() {
+                Some(e) => e.assignment_id.clone(),
+                None => {
+                    self.push_toast("Merge Queue", "No entry selected.", ToastSeverity::Warning);
+                    return;
+                }
+            }
         };
-        let aid = entry.assignment_id.clone();
         let cmd_strs: Vec<String> = vec![
             "merge".to_string(),
             "--drop".to_string(),
@@ -10223,25 +10565,46 @@ impl CoordApp {
     /// standalone Terminal pane (SidebarView::Terminal), reusing the same PTY
     /// infrastructure as Chat/Troubleshoot modes.
     fn launch_merge_queue_interactive(&mut self) {
-        let Some(entry) = self.selected_merge_queue_entry() else {
-            self.push_toast(
-                "Resolve interactively",
-                "No entry selected.",
-                ToastSeverity::Warning,
-            );
-            return;
-        };
+        // Prefer merge_plan (v0.4.53+ daemon); fall back to raw merge_queue.
+        let (work_aid, repo_github, issue_num): (String, String, u64) =
+            if !self.data.merge_plan.is_empty() {
+                match self.selected_merge_plan_entry() {
+                    Some(e) => (e.assignment_id.clone(), e.repo_github.clone(), e.issue_number),
+                    None => {
+                        self.push_toast(
+                            "Resolve interactively",
+                            "No entry selected.",
+                            ToastSeverity::Warning,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                match self.selected_merge_queue_entry() {
+                    Some(e) => (
+                        e.assignment_id.clone(),
+                        e.repo_github.clone(),
+                        e.issue_number.unwrap_or(0),
+                    ),
+                    None => {
+                        self.push_toast(
+                            "Resolve interactively",
+                            "No entry selected.",
+                            ToastSeverity::Warning,
+                        );
+                        return;
+                    }
+                }
+            };
 
         // Reverse-lookup: repo_github → coord local repo name.
         let repo: String = self
             .data
             .pipeline_repos
             .iter()
-            .find(|(_, gh)| gh == &entry.repo_github)
+            .find(|(_, gh)| **gh == repo_github)
             .map(|(name, _)| name.clone())
             .unwrap_or_default();
-        let issue_num = entry.issue_number.unwrap_or(0);
-        let work_aid = entry.assignment_id.clone();
         let machine = self.data.local_machine.clone();
 
         // Resolve the local checkout path for the terminal's CWD.
@@ -50984,6 +51347,180 @@ mod tests {
     #[test]
     fn sidebar_view_merge_queue_label() {
         assert_eq!(SidebarView::MergeQueue.label(), "Merge Queue");
+    }
+
+    // ── Unit tests: PlannedMergeEntry helpers (#777) ──────────────────────────
+
+    /// Build a `PlannedMergeEntry` for use in tests.
+    fn planned_entry(
+        assignment_id: &str,
+        repo_name: &str,
+        repo_github: &str,
+        target_branch: &str,
+        issue_number: u64,
+        issue_title: &str,
+        rank: u32,
+        size: Option<i64>,
+        status: &str,
+        reason: Option<&str>,
+    ) -> PlannedMergeEntry {
+        PlannedMergeEntry {
+            assignment_id: assignment_id.to_string(),
+            repo_name: repo_name.to_string(),
+            repo_github: repo_github.to_string(),
+            branch: format!("issue-{}-branch", issue_number),
+            target_branch: target_branch.to_string(),
+            issue_number,
+            issue_title: issue_title.to_string(),
+            rank,
+            size,
+            status: status.to_string(),
+            reason: reason.map(|s| s.to_string()),
+            enqueued_at: Some(1_700_000_000.0), // fixed timestamp; age shown as N ago
+            last_attempt: None,
+            milestone: None,
+        }
+    }
+
+    /// #777: merge_queue_needs_attention returns true when a plan entry has
+    /// status NEEDS_ATTENTION, even with an empty legacy merge_queue.
+    #[test]
+    fn merge_queue_needs_attention_true_for_plan_needs_attention() {
+        let app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("aid-1", "myrepo", "owner/myrepo", "main", 42, "Fix bug", 1, Some(10), "NEEDS_ATTENTION", None),
+            ],
+            ..BoardData::default()
+        });
+        assert!(
+            app.merge_queue_needs_attention(),
+            "NEEDS_ATTENTION plan entry must trigger needs-attention"
+        );
+    }
+
+    /// #777: merge_queue_needs_attention returns false when all plan entries
+    /// are READY, even if there are HUMAN_REQUIRED entries in merge_queue.
+    #[test]
+    fn merge_queue_needs_attention_false_when_plan_all_ready() {
+        let app = make_test_app(BoardData {
+            // Plan is present and has no NEEDS_ATTENTION — plan path wins.
+            merge_plan: vec![
+                planned_entry("aid-1", "repo", "owner/repo", "main", 10, "Thing", 1, None, "READY", None),
+            ],
+            // Legacy merge_queue has human_required — but plan path takes precedence.
+            merge_queue: vec![
+                mq_entry_for_state("aid-old", 99, "human_required", None),
+            ],
+            ..BoardData::default()
+        });
+        assert!(
+            !app.merge_queue_needs_attention(),
+            "READY-only plan must not trigger attention even with legacy human_required entry"
+        );
+    }
+
+    // ── TuiDriver black-box: Merge Queue v2 panel (#777) ─────────────────────
+
+    /// #777 black-box (TuiDriver): when merge_plan is populated, the panel
+    /// must render entries in rank order with rank numbers and status badges.
+    #[test]
+    fn tuidriver_merge_plan_renders_ranked_entries() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("aid-1", "myrepo", "owner/myrepo", "main", 42, "Fix toast clipping", 1, Some(14), "READY", None),
+                planned_entry("aid-2", "myrepo", "owner/myrepo", "main", 99, "Merge-queue size column", 2, Some(63), "BLOCKED", Some("CI running (2 checks)")),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        let screen = driver.screen();
+
+        // Must show rank numbers.
+        assert!(
+            screen.contains("1.") && screen.contains("2."),
+            "panel must show rank numbers:\n{}", screen
+        );
+        // Must show READY badge.
+        assert!(
+            screen.contains("READY"),
+            "panel must show READY status badge:\n{}", screen
+        );
+        // Must show BLOCKED badge.
+        assert!(
+            screen.contains("BLOCKED"),
+            "panel must show BLOCKED status badge:\n{}", screen
+        );
+        // Must show the blocking reason for BLOCKED entries.
+        assert!(
+            screen.contains("CI running"),
+            "panel must show live blocking reason:\n{}", screen
+        );
+        // Must show size (+14 or +63).
+        assert!(
+            screen.contains("+14") || screen.contains("+63"),
+            "panel must show diff size:\n{}", screen
+        );
+    }
+
+    /// #777 black-box (TuiDriver): entries from different repos must be
+    /// grouped under separate repo → target-branch headers.
+    #[test]
+    fn tuidriver_merge_plan_grouped_by_repo_and_target() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("aid-1", "claude-coordinator", "owner/claude-coordinator", "main",   812, "Fix toast clipping",     1, Some(14), "READY", None),
+                planned_entry("aid-2", "quadraui",           "owner/quadraui",           "develop", 383, "ButtonBar primitive",   2, Some(41), "READY", None),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        let screen = driver.screen();
+
+        // Each repo must have its own group header containing → and the target branch.
+        assert!(
+            screen.contains("claude-coordinator") || screen.contains("main"),
+            "panel must render repo group header:\n{}", screen
+        );
+        assert!(
+            screen.contains("quadraui") || screen.contains("develop"),
+            "panel must render second repo group header:\n{}", screen
+        );
+        // Both rank numbers must appear.
+        assert!(
+            screen.contains("1.") && screen.contains("2."),
+            "both rank numbers must appear:\n{}", screen
+        );
+    }
+
+    /// #777 black-box (TuiDriver): the plan panel title should contain
+    /// "MERGE QUEUE" and the order hint.
+    #[test]
+    fn tuidriver_merge_plan_panel_title_shows_order_hint() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("aid-1", "repo", "owner/repo", "main", 10, "A fix", 1, None, "READY", None),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("MERGE QUEUE"),
+            "panel title must show MERGE QUEUE:\n{}", screen
+        );
     }
 
     /// #738: per-issue pipeline detail must NOT render a "Merge" stage box.
