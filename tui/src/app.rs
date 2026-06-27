@@ -19673,6 +19673,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -52246,6 +52247,57 @@ mod tests {
         assert!(
             screen.contains("Merge") || screen.contains("merge"),
             "#780: confirm dialog must contain 'Merge'; screen =\n{}",
+            screen
+        );
+    }
+
+    /// #780: TuiDriver test — pressing `m` in the MergeQueue panel on a READY
+    /// entry dispatches "Merge only this" (`coord merge --only <aid>`) and
+    /// shows a confirming toast on screen.
+    ///
+    /// This exercises the full key-binding path:
+    ///   Key::Char('m') → dispatch_merge_queue_merge_only(false) → spawn_queued
+    ///   → toast "Merge only this dispatched"
+    ///
+    /// A READY entry at sel=0 is used so the BLOCKED guard is not triggered
+    /// and the dispatch path (and its toast) is exercised.
+    #[test]
+    fn tuidriver_merge_only_this_dispatches() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry(
+                    "aid-ready-1", "repo", "owner/repo", "main",
+                    42, "Fix the thing", 1, Some(5), "READY", None,
+                ),
+                planned_entry(
+                    "aid-blocked-1", "repo", "owner/repo", "main",
+                    43, "Blocked entry", 2, None, "BLOCKED", Some("CI failing"),
+                ),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+        // sel=0 → selects the first (READY) entry via selected_merge_plan_entry.
+        app.merge_queue_sel = 0;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.press(Key::Char('m'));
+
+        let screen = driver.screen();
+        // The dispatch path must NOT show "No entry selected" (which fires only
+        // when selected_merge_plan_entry returns None).
+        assert!(
+            !screen.contains("No entry selected"),
+            "#780: pressing 'm' on a READY entry must not show 'No entry selected'; screen =\n{}",
+            screen
+        );
+        // A dispatched or queued toast must appear — the key binding must have
+        // routed to dispatch_merge_queue_merge_only and started the command.
+        assert!(
+            screen.contains("Merge only") || screen.contains("--only") || screen.contains("Queued"),
+            "#780: pressing 'm' on a READY entry must show a merge-only dispatch toast; screen =\n{}",
             screen
         );
     }
