@@ -8447,9 +8447,10 @@ def merge(
             for ev in conflict_events:
                 kind = classify_conflict(ev.entry.error)
                 if kind == "rebaseable":
-                    # Retry cap (#241): if a conflict-fix already ran for this
-                    # entry in this session, don't loop — mark HUMAN_REQUIRED
-                    # so the user takes over.
+                    # Retry cap (#241/#784): if a conflict-fix already ran and
+                    # failed for this entry in this session, don't loop — mark
+                    # HUMAN_REQUIRED so the user takes over.  A successful
+                    # prior fix does not trigger this guard (#784).
                     if has_prior_conflict_fix(fix_board, ev.entry.assignment_id):
                         ev.entry.state = HUMAN_REQUIRED
                         click.echo(

@@ -144,6 +144,8 @@ def has_prior_conflict_fix(board: Board, merge_entry_id: str | None) -> bool:
         if a.status in ("failed", "advisory"):
             return True
         # "done" = successful rebase → cap not consumed; a re-conflict is new.
+        # "cancelled" falls through here too — a cancelled attempt did no work,
+        # so it is treated the same as "done": re-dispatch is allowed.
     return False
 
 
@@ -201,11 +203,14 @@ def dispatch_conflict_fix(
     (no capable machine, no ``repo_path`` configured, agent unreachable, …).
     The caller is responsible for persisting the board.
 
-    Retry cap: if a conflict-fix has *ever* been dispatched for this entry's
-    ``assignment_id`` in the current session — active OR completed — the call
-    is a no-op (returns None).  Per the spec, we cap at one conflict-fix
-    attempt per merge entry; the caller is responsible for marking the entry
-    HUMAN_REQUIRED when this guard fires, so the user takes over.
+    Retry cap: blocks on two conditions — (1) an **active** conflict-fix
+    (``running``/``pending``) for this entry is already in flight, preventing
+    duplicate dispatch; or (2) a **failed** conflict-fix (``failed``/
+    ``advisory``) already completed, consuming the one-per-entry retry cap so
+    the caller marks the entry ``HUMAN_REQUIRED``.  A ``done`` (successful)
+    conflict-fix does *not* block a new dispatch — a successful rebase can be
+    followed by a fresh conflict if other PRs merged in the meantime, and that
+    warrants a new attempt rather than an immediate human escalation (#784).
     """
     if has_prior_conflict_fix(board, entry.assignment_id):
         return None
