@@ -183,6 +183,101 @@ def _sync_issues_tick(config: Config) -> int:
     return total
 
 
+def _auto_drain_tick(config: Config) -> "list":
+    """Drain READY merge-queue entries — the opt-in daemon auto-merge (#781).
+
+    Called by ``_tick_loop`` when ``merge.auto_drain: true`` is set in
+    ``coordinator.yml``.  Evaluates the live merge plan (review + smoke + CI
+    gates) and calls :func:`coord.merge_queue.process` on exactly the entries
+    the plan marks ``READY``.  ``BLOCKED``, ``MERGING``, ``MERGED``, and
+    ``NEEDS_ATTENTION`` entries are never touched.
+
+    ``merge.max_per_tick > 0`` caps how many READY entries are attempted in a
+    single tick (0 = unlimited).
+
+    Gate policy is inherited from :func:`coord.merge_queue.process`:
+    no ``force_merge``, no ``skip_review``, no ``skip_smoke``.  A drain error
+    must not silence the enqueue/reconcile steps — the caller wraps this in its
+    own ``try/except``.
+
+    Mutates merge-queue rows in place and persists the changes.  Returns the
+    list of :class:`~coord.merge_queue.MergeEvent` objects so the caller can
+    log each event.  Returns an empty list when there are no READY entries.
+
+    Extracted as a module-level function so tests can call it directly without
+    wiring up the async ``_tick_loop`` infrastructure.
+    """
+    import logging  # noqa: PLC0415
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord import merge_queue as mq  # noqa: PLC0415
+    from coord.ci_store import build_ci_store  # noqa: PLC0415
+    from coord.merge_queue import PENDING, PLAN_READY  # noqa: PLC0415
+    from coord.state import build_board  # noqa: PLC0415
+
+    log = logging.getLogger("coord.serve")
+
+    board = build_board()
+
+    # Build the CI store; fail-open so a transient gh error doesn't disable drain.
+    try:
+        ci_store = build_ci_store(config.ci_store.type)
+    except Exception:  # noqa: BLE001
+        ci_store = None
+
+    # Compute the gate-annotated plan — the single source of truth for READY.
+    merge_plan = mq.plan(board, config, ci_store=ci_store)
+    ready_aids = {pm.assignment_id for pm in merge_plan if pm.status == PLAN_READY}
+
+    if not ready_aids:
+        log.debug("auto-drain: no READY entries")
+        return []
+
+    # Load the raw queue and restrict to PENDING + READY.
+    all_items = mq.load_queue()
+    ready_items = [
+        item for item in all_items
+        if item.assignment_id in ready_aids and item.state == PENDING
+    ]
+
+    if not ready_items:
+        log.debug("auto-drain: plan shows READY but no PENDING queue rows match")
+        return []
+
+    # Apply per-tick cap when configured.
+    cap = config.merge.max_per_tick
+    if cap > 0 and len(ready_items) > cap:
+        log.debug(
+            "auto-drain: capping %d READY entries to %d (max_per_tick)",
+            len(ready_items), cap,
+        )
+        ready_items = ready_items[:cap]
+
+    # process() mutates ready_items in place (state, pr_number, etc.).
+    events = mq.process(
+        ready_items,
+        github_ops,
+        method="rebase",
+        dry_run=False,
+        presorted=False,
+        ci_store=ci_store,
+        force_merge=False,
+        config=config,
+        board=board,
+        skip_review=False,
+        skip_smoke=False,
+    )
+
+    # Persist: merge the mutated rows back over the on-disk queue (same
+    # pattern as ``coord merge`` in cli.py to avoid clobbering unrelated rows).
+    fresh = mq.load_queue()
+    by_id = {item.assignment_id: item for item in ready_items}
+    merged = [by_id.get(item.assignment_id, item) for item in fresh]
+    mq.save_queue(merged)
+
+    return events
+
+
 def build_app(store: CoordStore, config: Config, *, token: str | None = None) -> Starlette:
     """Build the read-only control-center Starlette app bound to *store* + *config*.
 
@@ -812,7 +907,28 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         )
                 except Exception:  # noqa: BLE001
                     log.warning("passive enqueue tick failed", exc_info=True)
-                # Step 3: #762 archival sweep on a slow cadence (default hourly).
+                # Step 3: #781 auto-drain READY merge-queue entries.
+                # Runs AFTER enqueue so freshly-approved work can be picked up
+                # in the same tick.  Default-off (merge.auto_drain: false) —
+                # no behaviour change for users who haven't opted in.
+                # Independent try/except so a drain error never silences the
+                # reconcile/enqueue steps on the next tick.
+                if config.merge.auto_drain:
+                    try:
+                        drain_events = await run_in_threadpool(
+                            _auto_drain_tick, config
+                        )
+                        for ev in drain_events:
+                            log.info(
+                                "auto-drain: %s %s #%d — %s",
+                                ev.kind,
+                                ev.entry.repo_name,
+                                ev.entry.issue_number,
+                                ev.message,
+                            )
+                    except Exception:  # noqa: BLE001
+                        log.warning("auto-drain tick failed", exc_info=True)
+                # Step 4: #762 archival sweep on a slow cadence (default hourly).
                 # Independent try/except — a sweep failure must never crash the
                 # daemon or silence the reconcile/enqueue steps above.
                 if housekeeping_interval > 0 and (
@@ -835,7 +951,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             )
                     except Exception:  # noqa: BLE001
                         log.warning("housekeeping tick failed", exc_info=True)
-                # Steps 4 + 5: #775 record out-of-band merges and sync the
+                # Steps 5 + 6: #775 record out-of-band merges and sync the
                 # open-issue closure cache on a slow cadence (default 5 min).
                 # Both run under the same timer since they're both "reconcile
                 # with GitHub" operations.  Independent try/except so a

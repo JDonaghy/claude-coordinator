@@ -306,6 +306,30 @@ class PipelineConfig:
 
 
 @dataclass
+class MergeConfig:
+    """Merge behaviour configuration.
+
+    ``auto_drain`` enables automatic draining of READY merge-queue entries on
+    each daemon passive tick.  **Default-off** — with no ``merge:`` block in
+    ``coordinator.yml`` the daemon never merges automatically and existing
+    behaviour is unchanged.
+
+    When enabled, after the enqueue step in ``_tick_loop`` the daemon calls
+    :func:`coord.serve_app._auto_drain_tick`, which evaluates the plan
+    (review + smoke + CI gates) and merges exactly the entries marked
+    ``READY``, in true ``sequence()`` order.  ``BLOCKED`` and terminal
+    entries are never touched.  Every auto-merge is logged so the operator
+    can audit what drained (#781).
+
+    Set ``max_per_tick`` to cap how many merges the daemon may perform in a
+    single tick (default ``0`` = unlimited).
+    """
+
+    auto_drain: bool = False
+    max_per_tick: int = 0
+
+
+@dataclass
 class CiStoreConfig:
     """Backend selection for CI check visibility (#240).
 
@@ -392,6 +416,7 @@ class Config:
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
+    merge: MergeConfig = field(default_factory=MergeConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     path: Path | None = None
 
@@ -436,6 +461,7 @@ def load(path: str | Path | None = None) -> Config:
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
     ci_store = _parse_ci_store(raw.get("ci_store"))
+    merge = _parse_merge(raw.get("merge"))
     providers = _parse_providers(raw.get("providers"))
 
     return Config(
@@ -449,6 +475,7 @@ def load(path: str | Path | None = None) -> Config:
         pipeline=pipeline,
         dispatch=dispatch,
         ci_store=ci_store,
+        merge=merge,
         providers=providers,
         path=p,
     )
@@ -950,6 +977,31 @@ def _parse_ci_store(raw: Any) -> CiStoreConfig:
         if not isinstance(value, str) or value not in ("github", "none"):
             raise ConfigError("ci_store.type must be one of: github, none")
         cfg.type = value
+    return cfg
+
+
+def _parse_merge(raw: Any) -> MergeConfig:
+    """Parse the optional ``merge:`` block from coordinator.yml.
+
+    An absent block returns ``MergeConfig()`` — ``auto_drain=False`` —
+    preserving existing behaviour: the daemon never merges automatically.
+    """
+    if raw is None:
+        return MergeConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'merge' must be a mapping")
+
+    cfg = MergeConfig()
+    if "auto_drain" in raw:
+        value = raw["auto_drain"]
+        if not isinstance(value, bool):
+            raise ConfigError("merge.auto_drain must be a boolean")
+        cfg.auto_drain = value
+    if "max_per_tick" in raw:
+        value = raw["max_per_tick"]
+        if not isinstance(value, int) or value < 0:
+            raise ConfigError("merge.max_per_tick must be a non-negative integer")
+        cfg.max_per_tick = value
     return cfg
 
 

@@ -1703,3 +1703,232 @@ def test_board_merge_plan_does_not_503_on_plan_error(
     assert resp.status_code == 200
     body = resp.json()
     assert body["merge_plan"] == []
+
+
+# ── #781: _auto_drain_tick ────────────────────────────────────────────────────
+
+
+def _seed_queued_ready_entry(
+    conn,
+    *,
+    aid: str = "work-drain1",
+    branch: str = "issue-55-impl",
+    issue_number: int = 55,
+) -> None:
+    """Seed a fully-gated (approved + tested) done work assignment AND a
+    corresponding pending merge_queue row.
+
+    After this seed:
+    - ``plan()`` sees the work has an approved review + passed test verdict →
+      marks the entry ``PLAN_READY`` (all gates pass).
+    - ``_auto_drain_tick`` should pick it up and call ``process()``.
+    """
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, branch, test_state) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (aid, "laptop", "api", "acme/api", issue_number, "The issue", "done", "work", branch, "passed"),
+    )
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, review_of_assignment_id, review_verdict) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            f"rev-{aid}", "server", "api", "acme/api", issue_number, "Review of issue",
+            "done", "review", aid, "approve",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (aid, "api", "acme/api", branch, "main", issue_number, "The issue", "pending"),
+    )
+    conn.commit()
+
+
+def _seed_queued_blocked_entry(
+    conn,
+    *,
+    aid: str = "work-blocked1",
+    branch: str = "issue-56-impl",
+    issue_number: int = 56,
+) -> None:
+    """Seed a done work assignment with NO approved review + a pending queue row.
+
+    ``plan()`` marks this entry ``PLAN_BLOCKED`` (review not approved), so
+    ``_auto_drain_tick`` must skip it.
+    """
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    conn.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, branch, test_state) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (aid, "laptop", "api", "acme/api", issue_number, "The issue", "done", "work", branch, "passed"),
+    )
+    # No review row — plan() will evaluate review gate → BLOCKED.
+    conn.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (aid, "api", "acme/api", branch, "main", issue_number, "The issue", "pending"),
+    )
+    conn.commit()
+
+
+def _make_drain_config(tmp_path: "Path", *, auto_drain: bool = True) -> "Path":
+    """Write a coordinator.yml with merge.auto_drain set and return its path."""
+    content = (
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tailnet\n"
+        "    capabilities: [python]\n"
+        "    repos: [api]\n"
+        "\n"
+        f"merge:\n"
+        f"  auto_drain: {'true' if auto_drain else 'false'}\n"
+    )
+    p = tmp_path / "coord-drain.yml"
+    p.write_text(content)
+    return p
+
+
+def test_auto_drain_config_default_off(valid_config_path: "Path") -> None:
+    """#781: merge.auto_drain defaults to False when the merge: block is absent."""
+    from coord.config import load as load_config
+
+    cfg = load_config(valid_config_path)
+    assert cfg.merge.auto_drain is False
+    assert cfg.merge.max_per_tick == 0
+
+
+def test_auto_drain_ready_entry_merges(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#781: _auto_drain_tick() merges a READY entry when auto_drain is enabled.
+
+    Gate conditions met (approved review + passed test), so plan() marks the
+    entry READY and _auto_drain_tick calls process() which merges the PR.
+    """
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.merge_queue import MERGED
+    from coord.serve_app import _auto_drain_tick
+
+    # Stub out github_ops so process() never shells out.
+    monkeypatch.setattr(
+        "coord.github_ops.create_pr",
+        lambda repo, *, base, head, title, body: {
+            "number": 201, "url": "https://gh/201", "existed": False
+        },
+    )
+    monkeypatch.setattr("coord.github_ops.get_pr_size", lambda repo, number: 42)
+    monkeypatch.setattr("coord.github_ops.merge_pr", lambda repo, number, method="rebase": (True, "merged"))
+    # NoOpCi so CI gate is always a pass (is_available=False).  Patch at the
+    # source module — _auto_drain_tick imports build_ci_store as a local import.
+    from coord.ci_store import NoOpCi as _NoOpCi
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+
+    _seed_queued_ready_entry(rw_db)
+    cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
+    assert cfg.merge.auto_drain is True
+
+    events = _auto_drain_tick(cfg)
+
+    # At least one "merged" event emitted.
+    merge_events = [ev for ev in events if ev.kind == "merged"]
+    assert merge_events, f"expected a merged event, got: {[ev.kind for ev in events]}"
+    assert merge_events[0].entry.assignment_id == "work-drain1"
+
+    # Queue entry transitioned to MERGED.
+    items = mq.load_queue()
+    assert any(item.state == MERGED for item in items), (
+        f"expected MERGED in queue, got: {[item.state for item in items]}"
+    )
+
+
+def test_auto_drain_blocked_entry_not_touched(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#781: _auto_drain_tick() skips a BLOCKED entry — no merge call, state unchanged.
+
+    The blocked entry has no approved review, so plan() marks it PLAN_BLOCKED.
+    _auto_drain_tick should return an empty events list and leave the queue row
+    in its original 'pending' state.
+    """
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.serve_app import _auto_drain_tick
+
+    # Track any merge calls — there should be none.
+    merge_calls: list = []
+    monkeypatch.setattr(
+        "coord.github_ops.merge_pr",
+        lambda repo, number, method="rebase": merge_calls.append((repo, number)) or (True, "merged"),
+    )
+    from coord.ci_store import NoOpCi as _NoOpCi
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+
+    _seed_queued_blocked_entry(rw_db)
+    cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
+
+    events = _auto_drain_tick(cfg)
+
+    # No events — BLOCKED entry was skipped entirely.
+    assert events == [], f"expected no events for blocked entry, got: {[ev.kind for ev in events]}"
+    assert merge_calls == [], "merge_pr must not be called for a BLOCKED entry"
+
+    # Queue row is still pending.
+    items = mq.load_queue()
+    assert len(items) == 1
+    assert items[0].state == "pending"
+
+
+def test_auto_drain_error_isolation(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#781: an error inside _auto_drain_tick propagates cleanly so the tick
+    loop's try/except can absorb it without crashing the daemon.
+
+    Verifies two isolation properties:
+    1. The error raised by plan() bubbles out of _auto_drain_tick (the caller
+       is responsible for catching it — matching the pattern of every other tick
+       step in _tick_loop).
+    2. The queue is left untouched (no partial writes on error).
+    """
+    import pytest
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.serve_app import _auto_drain_tick
+
+    _seed_queued_ready_entry(rw_db)
+    cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
+
+    original_items = mq.load_queue()
+    assert len(original_items) == 1
+
+    # Simulate a transient CI-lookup failure inside plan().
+    monkeypatch.setattr(
+        mq, "plan",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("ci lookup exploded")),
+    )
+
+    with pytest.raises(RuntimeError, match="ci lookup exploded"):
+        _auto_drain_tick(cfg)
+
+    # Queue is unchanged — no partial writes occurred.
+    after = mq.load_queue()
+    assert len(after) == 1
+    assert after[0].state == "pending"
