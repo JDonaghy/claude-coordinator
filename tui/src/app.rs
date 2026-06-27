@@ -2006,6 +2006,12 @@ struct MergeQueueEntry {
     /// is the single most useful clue when a merge is stalled.
     #[serde(default)]
     error: Option<String>,
+    /// Worker branch name — joined from `assignments.branch`.  Used by
+    /// `compute_staging_local` for branch-level dedup (#778): a fix worker
+    /// that shares a branch with an already-queued original work assignment
+    /// must be excluded from staging even though it has a different assignment_id.
+    #[serde(default)]
+    branch: Option<String>,
     /// Milestone title — client-side join from `open_issues` keyed on
     /// `(repo_name, issue_number)`.  `None` when the issue carries no
     /// milestone or the issue row is absent from `open_issues`.
@@ -3502,6 +3508,14 @@ fn compute_staging_local(
     // Fast-lookup sets.
     let queued_aids: std::collections::HashSet<&str> =
         merge_queue.iter().map(|e| e.assignment_id.as_str()).collect();
+    // Branch-level dedup (#778): a fix worker dispatched after the original
+    // work was enqueued shares the same branch but has a different
+    // assignment_id.  Exclude any assignment whose branch is already in the
+    // queue so staging doesn't oscillate for the fix.
+    let queued_branches: std::collections::HashSet<&str> = merge_queue
+        .iter()
+        .filter_map(|e| e.branch.as_deref())
+        .collect();
     // Issue numbers for which a MERGED queue entry already exists.  We key
     // on issue_number only (no repo cross-check) because in the local path
     // MergeQueueEntry carries repo_github (the GitHub slug) while Assignment
@@ -3546,8 +3560,15 @@ fn compute_staging_local(
             _ => continue,
         };
 
-        // Skip items already in the queue.
-        if queued_aids.contains(a.id.as_str()) {
+        // Skip items already in the queue (by assignment_id or branch).
+        // Branch-level dedup catches fix workers that share a branch with an
+        // already-queued original work assignment (#778).
+        if queued_aids.contains(a.id.as_str())
+            || a.branch
+                .as_deref()
+                .map(|b| queued_branches.contains(b))
+                .unwrap_or(false)
+        {
             continue;
         }
 
@@ -3728,7 +3749,7 @@ fn load_data() -> BoardData {
     let merge_queue: Vec<MergeQueueEntry> = {
         let stmt = conn.prepare(
             "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url, \
-             mq.repo_github, mq.target_branch, mq.error \
+             mq.repo_github, mq.target_branch, mq.error, a.branch \
              FROM merge_queue mq \
              LEFT JOIN assignments a ON mq.assignment_id = a.assignment_id",
         );
@@ -3744,6 +3765,9 @@ fn load_data() -> BoardData {
                         repo_github: row.get::<_, String>(5)?,
                         target_branch: row.get::<_, Option<String>>(6)?,
                         error: row.get::<_, Option<String>>(7)?,
+                        // branch from assignments — used for branch-level dedup
+                        // in compute_staging_local (#778).
+                        branch: row.get::<_, Option<String>>(8)?,
                         // milestone_title is filled in by the client-side join
                         // in assemble_board_data after open_issues are loaded.
                         milestone_title: None,
@@ -34600,6 +34624,7 @@ mod tests {
             repo_github: "acme/repo-a".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         seed_open_issue_records(&mut app, "repo-a", &[7]);
@@ -35357,6 +35382,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -35454,6 +35480,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
 
@@ -35509,6 +35536,7 @@ mod tests {
                 repo_github: "acme/api".to_string(),
                 target_branch: None,
                 error: None,
+                branch: None,
                 milestone_title: None,
             }],
             ..BoardData::default()
@@ -37399,6 +37427,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         assert!(app.merge_blocked_on_review_for_selected_issue());
@@ -37418,6 +37447,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         // An approved review on the board unblocks the merge.
@@ -37442,6 +37472,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -37467,6 +37498,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         assert!(!app.merge_blocked_on_review_for_selected_issue());
@@ -37503,6 +37535,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -37532,6 +37565,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -37572,6 +37606,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         // Work assignment carries review_verdict='approve' directly — no
@@ -37606,6 +37641,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         assert_eq!(
@@ -37631,6 +37667,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -37700,6 +37737,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -37749,6 +37787,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
 
@@ -37844,6 +37883,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
 
@@ -37890,6 +37930,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
 
@@ -37947,6 +37988,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -38665,6 +38707,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let issue = &app.pipeline_issues[0];
@@ -38690,6 +38733,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let issue = &app.pipeline_issues[0];
@@ -39210,6 +39254,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let issue = &app.pipeline_issues[0];
@@ -39229,6 +39274,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let issue = &app.pipeline_issues[0];
@@ -39251,6 +39297,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
 
@@ -39351,6 +39398,7 @@ mod tests {
             repo_github: repo.to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         }
     }
@@ -39735,6 +39783,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let view = app.build_pipeline_widget().unwrap();
@@ -41232,6 +41281,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         // Seed the cache directly — bypasses the gh subprocess.
@@ -41304,6 +41354,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         // Seed the cache with a fully populated PR including review.
@@ -41379,6 +41430,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         app.fetched_prs_cache.borrow_mut().insert(
@@ -41439,6 +41491,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         // Pre-populate `pending_pr_fetches` so `pr_info_for_issue`
@@ -42059,6 +42112,7 @@ mod tests {
                 repo_github: "JDonaghy/quadraui".to_string(),
                 target_branch: None,
                 error: None,
+                branch: None,
                 milestone_title: None,
             }],
             ..BoardData::default()
@@ -43593,6 +43647,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -43743,6 +43798,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: Some("main".to_string()),
             error: Some("CI check failed: build".to_string()),
+            branch: None,
             milestone_title: None,
         });
         let briefing = app.troubleshoot_briefing("api", 42);
@@ -43977,6 +44033,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         // Query the helper directly rather than via rebuild so we don't trip
@@ -44077,6 +44134,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
         // #738: last per-issue stage is now "review" (merge removed).
@@ -49203,6 +49261,7 @@ mod tests {
             repo_github: repo_github.to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         }
     }
@@ -50563,6 +50622,7 @@ mod tests {
             repo_github: "owner/repo".to_string(),
             target_branch: Some("main".to_string()),
             error: None,
+            branch: None,
             milestone_title: None,
         }
     }
@@ -50577,6 +50637,7 @@ mod tests {
             repo_github: "owner/repo".to_string(),
             target_branch: Some("main".to_string()),
             error: Some(error.to_string()),
+            branch: None,
             milestone_title: None,
         }
     }
@@ -50923,6 +50984,103 @@ mod tests {
             screen.contains("PENDING") || screen.contains("pending") || screen.contains("#5"),
             "queue entry must still render when staging is empty:\n{}",
             screen
+        );
+    }
+
+    /// #778 unit: compute_staging_local must exclude a fix assignment whose
+    /// branch is already in the merge queue under a *different* assignment_id.
+    /// This is the root cause of the smoke-test failure: the fix (aid=w-fix)
+    /// shared a branch with the already-queued original work (aid=w-orig) but
+    /// was not excluded because the dedup was assignment_id-only.
+    #[test]
+    fn compute_staging_local_excludes_fix_when_branch_already_queued() {
+        let branch = "issue-42-original".to_string();
+
+        // Work assignment: the fix — done, approved, but smoke verdict missing.
+        let fix_work = Assignment {
+            id: "w-fix".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Some feature".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: Some(branch.clone()),
+            assignment_type: Some("work".to_string()),
+            test_state: None, // smoke verdict missing → would be BLOCKED without branch dedup
+            review_verdict: None,
+            review_of_assignment_id: None,
+            model: None,
+            dispatched_at: None,
+            finished_at: None,
+            exit_code: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+        };
+
+        // Review for the fix — approved.
+        let fix_review = Assignment {
+            id: "rev-fix".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Some feature".to_string(),
+            machine: "m2".to_string(),
+            status: "done".to_string(),
+            branch: None,
+            assignment_type: Some("review".to_string()),
+            test_state: None,
+            review_verdict: Some("approve".to_string()),
+            review_of_assignment_id: Some("w-fix".to_string()),
+            model: None,
+            dispatched_at: None,
+            finished_at: None,
+            exit_code: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+        };
+
+        // The merge queue has the ORIGINAL work (different aid, same branch).
+        let queue_entry = MergeQueueEntry {
+            assignment_id: "w-orig".to_string(),
+            issue_number: Some(42),
+            state: "pending".to_string(),
+            pr_number: None,
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: Some("main".to_string()),
+            error: None,
+            branch: Some(branch.clone()), // same branch as the fix
+            milestone_title: None,
+        };
+
+        let gates = vec!["review".to_string(), "test".to_string(), "merge".to_string()];
+        let assignments = vec![fix_work, fix_review];
+        let merge_queue = vec![queue_entry];
+
+        let staging = compute_staging_local(&assignments, &merge_queue, &gates);
+        assert!(
+            staging.is_empty(),
+            "fix assignment must be excluded from staging when its branch is \
+             already in the merge queue under a different assignment_id; \
+             got: {:?}",
+            staging
         );
     }
 

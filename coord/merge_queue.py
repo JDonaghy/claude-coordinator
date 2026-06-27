@@ -836,6 +836,11 @@ def staging_items(board, config) -> list[StagingItem]:
     # Fast-lookup: assignment IDs already in the queue (any state).
     queued_aids: set[str] = {x.assignment_id for x in existing_queue}
 
+    # Fast-lookup: branches already in the queue (any state).  A fix worker
+    # dispatched after the original work was enqueued will have a different
+    # assignment_id but share the same branch — so dedup by branch too.
+    queued_branches: set[str] = {x.branch for x in existing_queue if x.branch}
+
     # Fast-lookup: (repo_name, issue_number) pairs already MERGED so we skip
     # issues whose prior attempt was already shipped.
     already_merged: set[tuple[str, int]] = {
@@ -862,8 +867,10 @@ def staging_items(board, config) -> list[StagingItem]:
         issue_number = int(getattr(a, "issue_number", 0) or 0)
         issue_title = getattr(a, "issue_title", None) or ""
 
-        # Skip items already tracked in the queue.
-        if aid in queued_aids:
+        # Skip items already tracked in the queue (by assignment_id or branch).
+        # Branch-level dedup catches fix workers that share a branch with an
+        # already-queued original work assignment (#778).
+        if aid in queued_aids or branch in queued_branches:
             continue
 
         # Skip if the issue has already been merged via a prior work attempt.
