@@ -8234,6 +8234,17 @@ def _merge_via_daemon(svc, params: dict) -> None:
         "Routes through the daemon so thin clients don't need local DB access."
     ),
 )
+@click.option(
+    "--only",
+    "only_assignment",
+    default=None,
+    metavar="ASSIGNMENT_ID",
+    help=(
+        "#780: Merge exactly one entry by assignment_id, leaving the rest of the queue "
+        "untouched.  Mutually exclusive with --order.  BLOCKED entries are reported "
+        "and skipped (use --force-merge to override gates)."
+    ),
+)
 def merge(
     config_path: Path,
     dry_run: bool,
@@ -8244,6 +8255,7 @@ def merge(
     skip_review: bool,
     skip_smoke: bool,
     drop_assignment: str | None,
+    only_assignment: str | None,
 ) -> None:
     # #584: the merge queue + board live in the canonical (host-local) DB, so on
     # a thin client `coord merge` (and the TUI 'Go' button, which shells out to
@@ -8260,6 +8272,7 @@ def merge(
             "method": method, "force_merge": force_merge,
             "skip_review": skip_review, "skip_smoke": skip_smoke,
             "drop": drop_assignment,
+            "only": only_assignment,
         })
         return
 
@@ -8283,6 +8296,64 @@ def merge(
     from coord.ci_store import build_ci_store
     from coord.merge_queue import CONFLICT, MERGED, PENDING
     from coord.state import load_board
+
+    # #780: --only is a surgical single-entry merge that leaves all other queue
+    # entries in PENDING state.  Handled early — before the full auto-enqueue
+    # scan — so a --only run doesn't touch unrelated entries.
+    if only_assignment:
+        if order:
+            click.echo(
+                "error: --only and --order are mutually exclusive", err=True
+            )
+            sys.exit(1)
+        cfg_only = _load_config(config_path)
+        only_queue = mq.load_queue()
+        only_entry = next(
+            (e for e in only_queue if e.assignment_id == only_assignment), None
+        )
+        if only_entry is None:
+            click.echo(
+                f"merge-queue: no entry found for {only_assignment!r}", err=True
+            )
+            sys.exit(1)
+        if only_entry.state != PENDING:
+            click.echo(
+                f"merge-queue: entry {only_assignment!r} is in state "
+                f"{only_entry.state!r} (not PENDING) — cannot merge"
+            )
+            sys.exit(1)
+        board_only = load_board()
+        ci_store_only = build_ci_store(cfg_only.ci_store.type)
+        if skip_review:
+            click.echo("  --skip-review: review-approval gate bypassed (#253)")
+        if skip_smoke:
+            click.echo("  --skip-smoke: interactive smoke-test gate bypassed (#465)")
+        only_items = [only_entry]
+        events_only = mq.process(
+            only_items, gh_ops,
+            method=method, dry_run=dry_run, presorted=True,
+            ci_store=ci_store_only, force_merge=force_merge,
+            config=cfg_only, board=board_only,
+            skip_review=skip_review, skip_smoke=skip_smoke,
+        )
+        for ev in events_only:
+            e = ev.entry
+            prefix = f"  {e.repo_name} #{e.issue_number} ({e.branch})"
+            click.echo(f"{prefix}: {ev.kind} — {ev.message}")
+        if not dry_run:
+            # Save only the modified entry back; all other entries are untouched.
+            all_items_only = mq.load_queue()
+            by_id_only = {only_entry.assignment_id: only_entry}
+            merged_only = [by_id_only.get(x.assignment_id, x) for x in all_items_only]
+            mq.save_queue(merged_only)
+        click.echo("")
+        click.echo(
+            "Summary (--only): "
+            + ", ".join(f"{k}={v}" for k, v in sorted(
+                {x.state: 1 for x in only_items}.items()
+            ))
+        )
+        return
 
     cfg = _load_config(config_path)
 

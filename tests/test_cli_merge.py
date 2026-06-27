@@ -381,6 +381,100 @@ class TestMergeCommand:
         assert merge_order[0] == 300
 
 
+class TestMergeOnly:
+    """#780: coord merge --only <aid> — single-entry isolation."""
+
+    def test_only_merges_selected_entry_and_leaves_others_pending(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """The target entry is merged; the other two entries remain PENDING."""
+        _seed_queue([_entry("x1"), _entry("x2"), _entry("x3")])
+
+        next_pr = [400]
+        merged_prs: list[int] = []
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            n = next_pr[0]
+            next_pr[0] += 1
+            return {"number": n, "url": f"u/{n}", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            merged_prs.append(number)
+            return True, "ok"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "x2"]
+            )
+
+        assert result.exit_code == 0, result.output
+        # Exactly one merge was performed.
+        assert len(merged_prs) == 1, f"expected exactly 1 merge, got {merged_prs}"
+
+        # Only x2 is MERGED; x1 and x3 stay PENDING.
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["x2"] == mq.MERGED, f"x2 should be MERGED, got {states['x2']!r}"
+        assert states["x1"] == mq.PENDING, f"x1 should still be PENDING, got {states['x1']!r}"
+        assert states["x3"] == mq.PENDING, f"x3 should still be PENDING, got {states['x3']!r}"
+
+    def test_only_errors_when_entry_not_found(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Specifying an unknown assignment_id with --only exits non-zero."""
+        _seed_queue([_entry("y1")])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--only", "nonexistent"]
+        )
+        assert result.exit_code != 0
+        assert "no entry found" in result.output.lower() or "no entry found" in (result.stderr or "").lower()
+
+    def test_only_and_order_are_mutually_exclusive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--only and --order cannot be combined."""
+        _seed_queue([_entry("z1")])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--only", "z1", "--order", "z1"]
+        )
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output.lower() or \
+               "mutually exclusive" in (result.stderr or "").lower()
+
+    def test_only_dry_run_does_not_merge(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--only --dry-run shows the plan but does NOT call gh pr merge."""
+        _seed_queue([_entry("d1"), _entry("d2")])
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=5):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "d1", "--dry-run"]
+            )
+
+        assert result.exit_code == 0, result.output
+        merge_fn.assert_not_called()
+        # Summary line must reference --only.
+        assert "only" in result.output.lower()
+
+    def test_only_errors_when_entry_not_pending(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--only on an already-merged entry exits non-zero with a clear message."""
+        _seed_queue([_entry("m1", state=mq.MERGED)])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--only", "m1"]
+        )
+        assert result.exit_code != 0
+        assert "pending" in result.output.lower() or "pending" in (result.stderr or "").lower()
+
+
 class TestMergeAutoEnqueue:
     """#242: `coord merge` must scan board.completed and enqueue eligible
     work assignments, so done-work that reached terminal state via paths
