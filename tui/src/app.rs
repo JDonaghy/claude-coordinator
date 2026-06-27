@@ -8624,31 +8624,36 @@ impl CoordApp {
 
     /// Return the display-list index for the currently selected merge-queue
     /// entry, accounting for group header rows inserted before each group in
-    /// `render_merge_queue_panel`.
+    /// the render functions.
     ///
     /// When `data.merge_plan` is non-empty (#776 path), groups are by
-    /// `(repo_github, target_branch)`.  When only `data.merge_queue` is
-    /// available (legacy path), groups are by `milestone_title`.
+    /// `(repo_github, target_branch)` using **consecutive-run** counting —
+    /// matching `render_merge_plan_panel` which emits a new header each time
+    /// the current entry's group differs from the previous one (not just on
+    /// the first occurrence of each group).  When only `data.merge_queue` is
+    /// available (legacy path), groups are by `milestone_title` (first-seen).
     /// Adding the header count to `sel` gives the row index the selected
     /// entry occupies in the rendered items array.
     fn merge_queue_display_idx_for_sel(&self) -> usize {
         if !self.data.merge_plan.is_empty() {
             // #776 plan path: groups are (repo_github, target_branch).
+            // Use consecutive-run counting to match render_merge_plan_panel,
+            // which emits a header on every group transition — including when
+            // the same repo/branch pair reappears after an intervening entry.
             let entries = &self.data.merge_plan;
-            if entries.is_empty() {
-                return 0;
-            }
             let sel = self.merge_queue_sel.min(entries.len() - 1);
-            let mut seen: Vec<(&str, &str)> = Vec::new();
+            let mut headers = 0usize;
+            let mut last_key: Option<(&str, &str)> = None;
             for entry in entries.iter().take(sel + 1) {
                 let key = (entry.repo_github.as_str(), entry.target_branch.as_str());
-                if !seen.contains(&key) {
-                    seen.push(key);
+                if last_key != Some(key) {
+                    headers += 1;
+                    last_key = Some(key);
                 }
             }
-            sel + seen.len()
+            sel + headers
         } else {
-            // Legacy path: groups are milestone_title.
+            // Legacy path: groups are milestone_title (first-seen).
             let entries = &self.data.merge_queue;
             if entries.is_empty() {
                 return 0;
@@ -10303,16 +10308,9 @@ impl CoordApp {
     /// Each entry row includes rank, status badge, PR number (from
     /// `merge_queue` by `assignment_id`), size, truncated title, and age.
     fn render_merge_plan_panel(&self, backend: &mut dyn Backend, rect: Rect) {
+        // Called only when merge_plan is non-empty (see render_merge_queue_panel).
         let plan = &self.data.merge_plan;
         let n = plan.len();
-        if n == 0 {
-            backend.draw_list(rect, &plain_list(
-                "mergequeue-empty",
-                "  No merge-queue entries — run `coord merge` to populate the queue.",
-                0,
-            ));
-            return;
-        }
 
         // Build a lookup: assignment_id → pr_number (from the raw merge_queue).
         let pr_lookup: std::collections::HashMap<&str, i64> = self
@@ -10401,11 +10399,10 @@ impl CoordApp {
                 } else {
                     entry.enqueued_at
                 };
-                let label = if entry.status == "MERGING" || entry.last_attempt.is_some() {
-                    "last try"
-                } else {
-                    "queued"
-                };
+                // Only use "last try" when the entry is actively MERGING;
+                // for READY/BLOCKED entries the timestamp is always enqueued_at
+                // regardless of whether last_attempt is set, so "queued" is correct.
+                let label = if entry.status == "MERGING" { "last try" } else { "queued" };
                 let age = format_age(ts, now);
                 if age.is_empty() { String::new() } else { format!("  {} {}", label, age) }
             };
@@ -51484,14 +51481,16 @@ mod tests {
         let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
         let screen = driver.screen();
 
-        // Each repo must have its own group header containing → and the target branch.
+        // Each repo must have its own group header with the separator arrow.
+        // Use && (not ||) so the assertion actually tests that both the repo
+        // name and branch appear together in the header, not just either one.
         assert!(
-            screen.contains("claude-coordinator") || screen.contains("main"),
-            "panel must render repo group header:\n{}", screen
+            screen.contains("claude-coordinator") && screen.contains("main"),
+            "panel must render claude-coordinator → main group header:\n{}", screen
         );
         assert!(
-            screen.contains("quadraui") || screen.contains("develop"),
-            "panel must render second repo group header:\n{}", screen
+            screen.contains("quadraui") && screen.contains("develop"),
+            "panel must render quadraui → develop group header:\n{}", screen
         );
         // Both rank numbers must appear.
         assert!(
@@ -51520,6 +51519,103 @@ mod tests {
         assert!(
             screen.contains("MERGE QUEUE"),
             "panel title must show MERGE QUEUE:\n{}", screen
+        );
+    }
+
+
+    /// #777 unit test: merge_queue_display_idx_for_sel plan path uses
+    /// consecutive-run counting, not first-seen dedup.
+    ///
+    /// Scenario: plan entries [A, B, A] (same repo/branch appears non-contiguously
+    /// after an intervening entry from a different repo).  render_merge_plan_panel
+    /// emits 3 group headers (A, B, A again), so display_idx_for_sel must also
+    /// count 3 transitions — not 2 unique keys.
+    #[test]
+    fn merge_queue_display_idx_consecutive_run_non_contiguous() {
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                // Group A: owner/coord → main
+                planned_entry("aid-1", "coord", "owner/coord", "main", 1, "Fix A", 1, None, "READY", None),
+                // Group B: owner/other → main  (different repo → new header)
+                planned_entry("aid-2", "other", "owner/other", "main", 2, "Fix B", 2, None, "READY", None),
+                // Group A again: same as first (non-contiguous) → third header
+                planned_entry("aid-3", "coord", "owner/coord", "main", 3, "Fix C", 3, None, "READY", None),
+            ],
+            ..BoardData::default()
+        });
+
+        // sel=0 → 1 header before/at it (A header), display_idx = 0 + 1 = 1.
+        app.merge_queue_sel = 0;
+        assert_eq!(
+            app.merge_queue_display_idx_for_sel(), 1,
+            "sel=0: 1 header (A), display_idx should be 1"
+        );
+
+        // sel=1 → 2 headers before/at it (A header, B header), display_idx = 1 + 2 = 3.
+        app.merge_queue_sel = 1;
+        assert_eq!(
+            app.merge_queue_display_idx_for_sel(), 3,
+            "sel=1: 2 headers (A, B), display_idx should be 3"
+        );
+
+        // sel=2 → 3 headers before/at it (A, B, A again), display_idx = 2 + 3 = 5.
+        // With first-seen dedup this would return 4 (2 unique keys) — the bug.
+        app.merge_queue_sel = 2;
+        assert_eq!(
+            app.merge_queue_display_idx_for_sel(), 5,
+            "sel=2: 3 consecutive-run headers (A, B, A), display_idx should be 5"
+        );
+    }
+
+    /// #777 unit test: dispatch_merge_queue_merge picks the plan entry (not
+    /// the legacy merge_queue) when merge_plan is populated.
+    ///
+    /// Since CommandRunner spawns a real process we can't intercept the argv,
+    /// but we can verify the plan path is exercised by checking that no
+    /// "No entry selected" warning toast is pushed (which would fire only if
+    /// selected_merge_plan_entry() returned None — impossible when the plan
+    /// has at least one entry and sel is in bounds).
+    #[test]
+    fn dispatch_merge_queue_merge_uses_plan_path_when_plan_nonempty() {
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("plan-aid-1", "myrepo", "owner/myrepo", "main", 42, "Fix bug", 1, Some(10), "READY", None),
+            ],
+            merge_queue: vec![], // legacy path absent — ensures plan path must be taken
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+        app.merge_queue_sel = 0;
+
+        app.dispatch_merge_queue_merge(false);
+
+        // The "No entry selected." warning only fires on the None branch —
+        // if the plan path correctly found the entry, no such toast appears.
+        assert!(
+            app.toasts.iter().all(|(t, _, _)| t.body != "No entry selected."),
+            "plan path must find the entry; no 'No entry selected' toast expected"
+        );
+    }
+
+    /// #777 unit test: dispatch_merge_queue_drop picks the plan entry (not
+    /// the legacy merge_queue) when merge_plan is populated.
+    #[test]
+    fn dispatch_merge_queue_drop_uses_plan_path_when_plan_nonempty() {
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("plan-aid-2", "myrepo", "owner/myrepo", "main", 99, "Drop me", 1, None, "BLOCKED", Some("CI failing")),
+            ],
+            merge_queue: vec![],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+        app.merge_queue_sel = 0;
+
+        app.dispatch_merge_queue_drop();
+
+        assert!(
+            app.toasts.iter().all(|(t, _, _)| t.body != "No entry selected."),
+            "plan path must find the entry; no 'No entry selected' toast expected"
         );
     }
 
