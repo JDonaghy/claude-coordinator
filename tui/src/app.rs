@@ -11821,6 +11821,7 @@ impl CoordApp {
                 ),
             }],
             bg: None,
+            focused_index: None,
         })
     }
 
@@ -18693,6 +18694,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
+                table: None,
                 input: None,
             });
         }
@@ -18739,6 +18741,7 @@ impl CoordApp {
                 buttons,
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
+                table: None,
                 input: None,
             });
         }
@@ -18773,6 +18776,7 @@ impl CoordApp {
                 buttons,
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
+                table: None,
                 input: None,
             });
         }
@@ -18811,6 +18815,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
+                table: None,
                 input: None,
             });
         }
@@ -18841,6 +18846,7 @@ impl CoordApp {
                 ],
                 severity: None,
                 vertical_buttons: false,
+                table: None,
                 input: Some(DialogInput::TextInput(DialogTextInput {
                     value: buf.clone(),
                     placeholder: "description…".into(),
@@ -18873,6 +18879,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
+                table: None,
                 input: Some(DialogInput::TextInput(DialogTextInput {
                     value: buf.clone(),
                     placeholder: "reason…".into(),
@@ -18919,6 +18926,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -18979,6 +18987,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -19028,6 +19037,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
+                table: None,
                 input: Some(DialogInput::TextInput(DialogTextInput {
                     value: p.findings.clone(),
                     placeholder: "What did the reviewer flag? (required)".into(),
@@ -19076,6 +19086,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -19118,6 +19129,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -19154,6 +19166,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -19194,6 +19207,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -19229,6 +19243,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -19291,6 +19306,7 @@ impl CoordApp {
                 ],
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
+                table: None,
                 input: None,
             });
         }
@@ -19337,6 +19353,7 @@ impl CoordApp {
                 buttons,
                 severity,
                 vertical_buttons: false,
+                table: None,
                 input: None,
             });
         }
@@ -19404,6 +19421,7 @@ impl CoordApp {
             width: dialog_w,
             title_height: title_h,
             body_height: body_h,
+            table_height: 0.0,
             input_height: input_h,
             button_row_height: btn_row_h,
             button_width: btn_w,
@@ -21751,6 +21769,7 @@ impl CoordApp {
                     },
                 ],
                 bg: None,
+                focused_index: None,
             };
             backend.draw_toolbar(bar_rect, &toolbar, None, None);
 
@@ -22690,6 +22709,7 @@ impl CoordApp {
                 id: WidgetId::new("sidebar-action-bar"),
                 buttons,
                 bg: None,
+                focused_index: None,
             }),
             toolbar_height: Some(self.sidebar_action_bar_height(lh)),
         }
@@ -22876,6 +22896,7 @@ impl CoordApp {
             id: WidgetId::new("panel-toolbar"),
             buttons,
             bg: None,
+            focused_index: None,
         })
     }
 
@@ -25827,6 +25848,7 @@ impl CoordApp {
             }],
             severity: Some(DialogSeverity::Warning),
             vertical_buttons: false,
+            table: None,
             input: None,
         })
     }
