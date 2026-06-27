@@ -8198,6 +8198,15 @@ def _merge_via_daemon(svc, params: dict) -> None:
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Show the plan without opening or merging PRs.")
 @click.option(
+    "--plan",
+    "show_plan",
+    is_flag=True,
+    help=(
+        "#779: Print the ranked merge order and per-entry gate status. "
+        "No PRs opened, no merges — purely read-only."
+    ),
+)
+@click.option(
     "--order",
     default=None,
     help="Comma-separated assignment IDs to merge first (overrides size-based sequencing).",
@@ -8237,6 +8246,7 @@ def _merge_via_daemon(svc, params: dict) -> None:
 def merge(
     config_path: Path,
     dry_run: bool,
+    show_plan: bool,
     order: str | None,
     repo_filter: str | None,
     method: str,
@@ -8256,10 +8266,10 @@ def merge(
     _merge_svc = resolve_board_service()
     if _merge_svc is not None and not os.environ.get("COORD_MERGE_ON_DAEMON"):
         _merge_via_daemon(_merge_svc, {
-            "dry_run": dry_run, "order": order, "repo_filter": repo_filter,
-            "method": method, "force_merge": force_merge,
-            "skip_review": skip_review, "skip_smoke": skip_smoke,
-            "drop": drop_assignment,
+            "dry_run": dry_run, "plan": show_plan, "order": order,
+            "repo_filter": repo_filter, "method": method,
+            "force_merge": force_merge, "skip_review": skip_review,
+            "skip_smoke": skip_smoke, "drop": drop_assignment,
         })
         return
 
@@ -8276,6 +8286,59 @@ def merge(
                 f"merge-queue: no entry found for {drop_assignment!r}", err=True
             )
             sys.exit(1)
+        return
+
+    # #779: --plan is a pure read-only path; handle it before the auto-enqueue
+    # scan so it never causes side effects.  It shares daemon routing with the
+    # rest of coord merge, so the plan always reflects the canonical board/queue
+    # (not a thin-client's local copy).
+    if show_plan:
+        from coord import merge_queue as _plan_mq  # noqa: PLC0415
+        from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
+        from coord.state import load_board as _load_board  # noqa: PLC0415
+
+        _cfg = _load_config(config_path)
+        _board = _load_board()
+        _ci = _build_ci_store(_cfg.ci_store.type)
+
+        planned = _plan_mq.plan(_board, _cfg, _ci)
+
+        # --repo scoping
+        if repo_filter:
+            planned = [p for p in planned if p.repo_name == repo_filter]
+
+        # --order: put the named IDs first, then renumber ranks so the display
+        # matches what a subsequent `coord merge --order <ids>` would actually do.
+        if order:
+            _override_ids = [s.strip() for s in order.split(",") if s.strip()]
+            _by_id = {p.assignment_id: p for p in planned}
+            _head = [_by_id[aid] for aid in _override_ids if aid in _by_id]
+            _tail = [p for p in planned if p.assignment_id not in set(_override_ids)]
+            planned = _head + _tail
+            for _i, _p in enumerate(planned, 1):
+                _p.rank = _i
+
+        if not planned:
+            click.echo("Merge queue is empty (nothing to plan).")
+            return
+
+        # Print grouped by (repo_name → target_branch), preserving plan order.
+        _last_group: tuple[str, str] | None = None
+        for _p in planned:
+            _gkey = (_p.repo_name, _p.target_branch)
+            if _gkey != _last_group:
+                if _last_group is not None:
+                    click.echo("")
+                click.echo(f"{_p.repo_name} → {_p.target_branch}")
+                _last_group = _gkey
+            _size_str = f"+{_p.size}" if _p.size is not None else "?"
+            _status_str = _p.status
+            if _p.reason:
+                _status_str = f"{_p.status}   {_p.reason}"
+            click.echo(
+                f"  {_p.rank}. #{_p.issue_number}  {_size_str}   "
+                f"{_status_str}     {_p.issue_title}"
+            )
         return
 
     from coord import github_ops as gh_ops

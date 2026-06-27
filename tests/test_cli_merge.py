@@ -619,3 +619,164 @@ class TestStatusMergeQueue:
         assert "Merge queue" in result.output
         assert "#1 (worker/a1 → main)" in result.output
         assert "[conflict]" in result.output
+
+
+# ── #779: coord merge --plan ──────────────────────────────────────────────────
+
+class TestMergePlanFlag:
+    """#779: `coord merge --plan` prints ranked order + gate status, no side effects."""
+
+    def test_plan_prints_output_format(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--plan emits a repo→branch header and one ranked line per entry."""
+        _seed_queue([_entry("x1", size=14), _entry("x2", size=63)])
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--plan"]
+        )
+        assert result.exit_code == 0, result.output
+        # Header: "repo_name → target_branch"
+        assert "api → main" in result.output
+        # Issue numbers present
+        assert "#1" in result.output
+        # Rank numbers present
+        assert "1." in result.output
+        assert "2." in result.output
+        # Sizes present
+        assert "+14" in result.output
+        assert "+63" in result.output
+        # Gate status present
+        assert "READY" in result.output
+
+    def test_plan_no_side_effects(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--plan must never open PRs or call merge_pr."""
+        _seed_queue([_entry("y1", size=10), _entry("y2", size=20)])
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size") as size_fn:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--plan"]
+            )
+        assert result.exit_code == 0, result.output
+        create.assert_not_called()
+        merge_fn.assert_not_called()
+        size_fn.assert_not_called()
+        # Queue must be unchanged (still PENDING)
+        items = mq.load_queue()
+        assert all(i.state == mq.PENDING for i in items)
+
+    def test_plan_repo_filter(
+        self, tmp_path: Path, coord_dir: Path
+    ) -> None:
+        """--plan --repo <name> only shows that repo's entries."""
+        # Config with two repos.
+        cfg_text = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+  - name: lib
+    github: acme/lib
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api, lib]
+    repo_paths:
+      api: /tmp/api
+      lib: /tmp/lib
+reviews:
+  enabled: false
+"""
+        config_file2 = tmp_path / "coordinator.yml"
+        config_file2.write_text(cfg_text)
+
+        api_entry = mq.QueuedMerge(
+            assignment_id="api1", repo_name="api", repo_github="acme/api",
+            branch="worker/api1", target_branch="main",
+            issue_number=10, issue_title="API fix", size=5,
+        )
+        lib_entry = mq.QueuedMerge(
+            assignment_id="lib1", repo_name="lib", repo_github="acme/lib",
+            branch="worker/lib1", target_branch="main",
+            issue_number=20, issue_title="Lib fix", size=8,
+        )
+        mq.save_queue([api_entry, lib_entry])
+
+        result = CliRunner().invoke(
+            main,
+            ["merge", "--config", str(config_file2), "--plan", "--repo", "api"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "api → main" in result.output
+        assert "#10" in result.output
+        # The lib entry must not appear.
+        assert "#20" not in result.output
+        assert "lib" not in result.output
+
+    def test_plan_order_override(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--plan --order <ids> puts those entries first and renumbers ranks.
+
+        Without --order, natural size-ascending sequence is:
+          rank 1 → gamma (size=10), rank 2 → beta (size=50), rank 3 → alpha (size=100).
+        With --order alpha,..., alpha's size (+100) must appear on the rank-1 line.
+        """
+        _seed_queue([
+            _entry("alpha", size=100),
+            _entry("beta",  size=50),
+            _entry("gamma", size=10),
+        ])
+        result = CliRunner().invoke(
+            main,
+            ["merge", "--config", str(config_file), "--plan", "--order", "alpha,beta,gamma"],
+        )
+        assert result.exit_code == 0, result.output
+        lines = [l for l in result.output.splitlines() if l.strip()]
+        # First ranked entry line (starts with "  1.") should have size +100 (alpha).
+        rank1_line = next((l for l in lines if l.lstrip().startswith("1.")), None)
+        assert rank1_line is not None, f"No rank-1 line in output:\n{result.output}"
+        assert "+100" in rank1_line, (
+            f"alpha (size=100) should be rank 1 with --order alpha,..., "
+            f"got rank-1 line: {rank1_line!r}"
+        )
+
+    def test_plan_shows_blocked_status(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """--plan shows BLOCKED with a reason when a gate is not satisfied."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        # Enable the review gate.
+        config_file.write_text(CONFIG_YAML.replace(
+            "reviews:\n  enabled: false\n", ""
+        ))
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=301,
+            issue_title="#301 needs review", assignment_id="w301",
+            type="work", status="done", branch="issue-301-fix",
+        )
+        save_board(Board(active=[], completed=[work]))
+        _seed_queue([_entry("w301")])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--plan"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "BLOCKED" in result.output
+        assert "review" in result.output.lower()
+
+    def test_plan_empty_queue(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--plan on an empty queue prints a clear message and exits cleanly."""
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--plan"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "empty" in result.output.lower()
