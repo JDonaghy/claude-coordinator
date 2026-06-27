@@ -1004,6 +1004,11 @@ struct Assignment {
     /// assignment detail panel so the TUI explains the red box without a log file.
     #[serde(default)]
     failure_reason: Option<String>,
+    /// #803: fix-round counter — 0 on the original work assignment, N on the
+    /// N-th fix.  Used to compute the next iteration's escalated model via
+    /// [`fix_model_for_iteration`]: `next_iteration = review_iteration + 1`.
+    #[serde(default)]
+    review_iteration: i64,
 }
 
 /// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)
@@ -2545,6 +2550,68 @@ struct OpenIssue {
     milestone_title: Option<String>,
 }
 
+/// #803: models config snapshot read from `board_meta['pipeline_models']`.
+/// Mirrors `coord.config.ModelsConfig` and `pipeline.escalate_fix_model`.
+/// Used to compute the escalated model tier for the interactive `--fix-of`
+/// path without requiring the TUI to parse `coordinator.yml` itself.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PipelineModels {
+    /// Alias used when no model is specified (e.g. `"sonnet"`).
+    #[serde(default = "pipeline_models_default_tier")]
+    default: String,
+    /// Ordered list of model aliases (low → high).  Mirrors
+    /// `models.escalation` in coordinator.yml.
+    #[serde(default = "pipeline_models_default_escalation")]
+    escalation: Vec<String>,
+    /// When `false`, no escalation happens and every fix iteration uses the
+    /// default model.  Mirrors `pipeline.escalate_fix_model`.
+    #[serde(default = "pipeline_models_default_escalate")]
+    escalate_fix_model: bool,
+}
+
+fn pipeline_models_default_tier() -> String { "sonnet".to_string() }
+fn pipeline_models_default_escalation() -> Vec<String> {
+    vec!["haiku".to_string(), "sonnet".to_string(), "opus".to_string()]
+}
+fn pipeline_models_default_escalate() -> bool { true }
+
+impl Default for PipelineModels {
+    fn default() -> Self {
+        Self {
+            default: pipeline_models_default_tier(),
+            escalation: pipeline_models_default_escalation(),
+            escalate_fix_model: pipeline_models_default_escalate(),
+        }
+    }
+}
+
+/// #803: pure function — mirrors Python's `_fix_model_for_iteration`.
+///
+/// Returns the model alias to use for a fix on the given iteration number
+/// (1-based: iteration 1 = first fix, iteration 2 = second fix, …).
+///
+/// - Iteration 1 → `models.default` (first fix stays cheap/fast).
+/// - Iteration 2+ → climb one rung up `models.escalation` per extra
+///   iteration, capped at the ladder top.
+/// - When `escalate_fix_model` is false → always `models.default`.
+fn fix_model_for_iteration(models: &PipelineModels, iteration: i64) -> String {
+    if !models.escalate_fix_model {
+        return models.default.clone();
+    }
+    let mut model = models.default.clone();
+    let extra = (iteration.max(1) - 1) as usize;
+    for _ in 0..extra {
+        let pos = models.escalation.iter().position(|m| m == &model);
+        match pos {
+            Some(idx) if idx + 1 < models.escalation.len() => {
+                model = models.escalation[idx + 1].clone();
+            }
+            _ => break, // already at the top or not on the ladder → cap
+        }
+    }
+    model
+}
+
 #[derive(Default)]
 struct BoardData {
     local_machine: String,
@@ -2590,6 +2657,12 @@ struct BoardData {
     /// #778: approved/done work not yet in the merge queue.  Computed
     /// locally in `load_data` or received from the `/board` JSON payload.
     merge_staging: Vec<StagingEntry>,
+    /// #803: model config snapshot for the interactive `--fix-of` escalation.
+    /// `None` when `board_meta['pipeline_models']` has not been written yet
+    /// (pre-#803 coordinator versions).  Falls back to the struct's `Default`
+    /// implementation (sonnet default, [haiku,sonnet,opus] ladder, escalation
+    /// enabled) which matches the coordinator.yml defaults.
+    pipeline_models: Option<PipelineModels>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.
@@ -3712,7 +3785,8 @@ fn load_data() -> BoardData {
              smoke_tests, review_findings, test_plan, test_plan_branch_head, \
              COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), \
              COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0), \
-             COALESCE(is_interactive, 0), failure_reason \
+             COALESCE(is_interactive, 0), failure_reason, \
+             COALESCE(review_iteration, 0) \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -3766,6 +3840,9 @@ fn load_data() -> BoardData {
                 // unexpected NULL type); a missing column causes conn.prepare() to
                 // fail before any row is fetched, not here.
                 failure_reason: row.get::<_, Option<String>>(25).unwrap_or(None),
+                // #803: fix-round counter for model escalation on the interactive
+                // --fix-of path.  COALESCE handles the pre-migration NULL case.
+                review_iteration: row.get::<_, i64>(26)?,
             })
         }) {
             Ok(r) => r,
@@ -3925,6 +4002,7 @@ fn load_data() -> BoardData {
         pipeline_require_plan,
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
+        pipeline_models,
     ) = load_pipeline_meta(&conn);
 
     // ── Query cached structured plans ──────────────────────────────────────
@@ -3977,6 +4055,7 @@ fn load_data() -> BoardData {
         pipeline_repo_paths,
         pipeline_require_plan,
         merge_staging,
+        pipeline_models,
     )
 }
 
@@ -4006,6 +4085,7 @@ fn assemble_board_data(
     pipeline_repo_paths: std::collections::HashMap<String, String>,
     pipeline_require_plan: bool,
     merge_staging: Vec<StagingEntry>,
+    pipeline_models: Option<PipelineModels>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -4115,6 +4195,7 @@ fn assemble_board_data(
         pipeline_repo_paths,
         plans,
         merge_staging,
+        pipeline_models,
     }
 }
 
@@ -4204,6 +4285,7 @@ fn parse_pipeline_meta_from_map(
     bool,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
+    Option<PipelineModels>,
 ) {
     fn read_map(
         meta: &std::collections::HashMap<String, String>,
@@ -4253,6 +4335,11 @@ fn parse_pipeline_meta_from_map(
     let repo_run_cmds = read_map(meta, "pipeline_repo_run_cmds");
     let repo_paths = read_map(meta, "pipeline_repo_paths");
 
+    // #803: model config snapshot — None when the daemon is pre-#803.
+    let pipeline_models: Option<PipelineModels> = meta
+        .get("pipeline_models")
+        .and_then(|v| serde_json::from_str::<PipelineModels>(v).ok());
+
     (
         default_gates,
         tracked_labels,
@@ -4260,6 +4347,7 @@ fn parse_pipeline_meta_from_map(
         require_plan,
         repo_run_cmds,
         repo_paths,
+        pipeline_models,
     )
 }
 
@@ -4329,6 +4417,7 @@ fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         pipeline_require_plan,
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
+        pipeline_models,
     ) = parse_pipeline_meta_from_map(&payload.board_meta);
 
     // #778: prefer the server-computed staging list from the /board payload;
@@ -4359,6 +4448,7 @@ fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         pipeline_repo_paths,
         pipeline_require_plan,
         merge_staging,
+        pipeline_models,
     )
 }
 
@@ -5322,6 +5412,7 @@ fn load_pipeline_meta(
     bool,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
+    Option<PipelineModels>,
 ) {
     fn read_key(conn: &Connection, key: &str) -> Option<String> {
         conn.query_row(
@@ -5376,6 +5467,10 @@ fn load_pipeline_meta(
     // #349: repo_name → local checkout path on this machine.
     let repo_paths = read_map(conn, "pipeline_repo_paths");
 
+    // #803: model config snapshot for interactive --fix-of escalation.
+    let pipeline_models: Option<PipelineModels> = read_key(conn, "pipeline_models")
+        .and_then(|v| serde_json::from_str::<PipelineModels>(&v).ok());
+
     (
         default_gates,
         tracked_labels,
@@ -5383,6 +5478,7 @@ fn load_pipeline_meta(
         require_plan,
         repo_run_cmds,
         repo_paths,
+        pipeline_models,
     )
 }
 
@@ -19585,27 +19681,39 @@ impl CoordApp {
         // fix, so the fix worker is briefed with concrete feedback instead
         // of the "(No structured findings were captured)" fallback.
         if let Some(ref p) = self.pending_rework {
+            // #803: compute the escalated model before borrowing `p` for the
+            // dialog body.  `fix_model_for_issue` resolves `pipeline_models`
+            // from board_meta and the latest work assignment's review_iteration.
+            let fix_model_hint = self.fix_model_for_issue(&p.coord_repo, p.issue_num);
             // #587 owns this dialog (operator types the reviewer's findings into
             // the input below); the per-issue context block (#603 Phase 2) still
             // reaches the fix worker via the briefing injection, so the #603
             // dialog preview is reserved for the test-fix dialog where the
             // findings are already captured (test_reason).
+            let mut rework_body = vec![
+                StyledText::plain(format!(
+                    "The review of {} #{} requested changes.",
+                    p.coord_repo, p.issue_num,
+                )),
+                StyledText::plain(
+                    "Type the reviewer's findings in the text box below \
+                     (required), then press Enter to save them and start \
+                     an interactive fix on the same branch."
+                        .to_string(),
+                ),
+            ];
+            // #803: surface which model will be used for the fix so an opus
+            // escalation is visible before the operator presses Enter.
+            if let Some(ref model) = fix_model_hint {
+                rework_body.push(StyledText::plain(format!(
+                    "Model: {model} (auto-escalated per fix iteration)",
+                )));
+            }
             return Some(Dialog {
                 table: None,
                 id: WidgetId::new("dialog:rework"),
                 title: StyledText::plain("Review requested changes — enter findings & start fix"),
-                body: vec![
-                    StyledText::plain(format!(
-                        "The review of {} #{} requested changes.",
-                        p.coord_repo, p.issue_num,
-                    )),
-                    StyledText::plain(
-                        "Type the reviewer's findings in the text box below \
-                         (required), then press Enter to save them and start \
-                         an interactive fix on the same branch."
-                            .to_string(),
-                    ),
-                ],
+                body: rework_body,
                 buttons: vec![
                     DialogButton {
                         id: WidgetId::new("fix"),
@@ -19639,6 +19747,8 @@ impl CoordApp {
             if let Some(d) = self.live_session_blocking_dialog(p.issue_num, &p.coord_repo) {
                 return Some(d);
             }
+            // #803: compute escalated model before further borrows of `self`.
+            let fix_model_hint = self.fix_model_for_issue(&p.coord_repo, p.issue_num);
             let mut body = vec![
                 StyledText::plain(format!(
                     "The manual smoke test for {} #{} failed.",
@@ -19650,6 +19760,12 @@ impl CoordApp {
                         .to_string(),
                 ),
             ];
+            // #803: surface the escalated model tier before the operator confirms.
+            if let Some(ref model) = fix_model_hint {
+                body.push(StyledText::plain(format!(
+                    "Model: {model} (auto-escalated per fix iteration)",
+                )));
+            }
             body.extend(self.fix_briefing_preview_lines());  // #603 preview
             return Some(Dialog {
                 table: None,
@@ -25807,6 +25923,35 @@ impl CoordApp {
             Some(aid) => !self.review_assignment_has_findings(&aid),
             None => false,
         }
+    }
+
+    /// #803: compute the model tier that will be used for the next interactive
+    /// `--fix-of` session for the given issue.
+    ///
+    /// Mirrors Python's `_fix_model_for_iteration(cfg, next_iteration)`.
+    /// Returns `None` when the models config snapshot is absent from
+    /// `board_meta` (pre-#803 coordinator; the fix will use whatever default
+    /// `coord assign` resolves, same as before this feature).
+    fn fix_model_for_issue(&self, coord_repo: &str, issue_num: u64) -> Option<String> {
+        let models = self.data.pipeline_models.as_ref()?;
+        // The latest work assignment for this issue carries the current
+        // review_iteration.  next_iteration = review_iteration + 1.
+        let latest_work = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| {
+                a.repo == coord_repo
+                    && a.issue_number == issue_num
+                    && a.assignment_type.as_deref() == Some("work")
+            })
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        let next_iteration = latest_work.review_iteration + 1;
+        Some(fix_model_for_iteration(models, next_iteration))
     }
 
     /// True when the embedded Terminal pane for issue `key` is showing a still-
@@ -33870,6 +34015,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         }
     }
 
@@ -34716,6 +34862,134 @@ mod tests {
         assert!(app.pending_rework.is_some(), "dialog should remain open when findings are empty");
     }
 
+    // ── #803: model hint in fix dialogs ──────────────────────────────────────
+
+    /// Build a `BoardData` with `pipeline_models` set to a known escalation
+    /// ladder and a single `work` assignment for issue 42 on "api" with the
+    /// given `review_iteration`.  Used by the #803 dialog-body tests.
+    fn board_with_fix_iteration(review_iteration: i64) -> BoardData {
+        let models = PipelineModels {
+            default: "sonnet".to_string(),
+            escalation: vec![
+                "haiku".to_string(),
+                "sonnet".to_string(),
+                "opus".to_string(),
+            ],
+            escalate_fix_model: true,
+        };
+        let work = Assignment {
+            id: "w1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add feature".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: Some("issue-42-feature".to_string()),
+            model: None,
+            dispatched_at: Some(1.0),
+            finished_at: Some(2.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+            review_iteration,
+        };
+        BoardData {
+            assignments: vec![work],
+            pipeline_models: Some(models),
+            ..BoardData::default()
+        }
+    }
+
+    /// Extract the body text lines from a `Dialog`.
+    fn dialog_body_text(dlg: &Dialog) -> Vec<String> {
+        dlg.body
+            .iter()
+            .flat_map(|b| b.spans.iter())
+            .map(|s| s.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn rework_dialog_shows_model_hint_on_first_fix() {
+        // #803: iteration 0 work → iteration 1 fix → stays on default (sonnet).
+        let mut app = make_test_app(board_with_fix_iteration(0));
+        app.pending_rework = Some(PendingRework {
+            coord_repo: "api".to_string(),
+            repo_slug: "api".to_string(),
+            issue_num: 42,
+            findings: String::new(),
+        });
+        let dlg = app.build_prompt_dialog().expect("rework dialog built");
+        let body = dialog_body_text(&dlg).join("\n");
+        assert!(
+            body.contains("Model: sonnet"),
+            "first fix must show default model (sonnet), got:\n{body}",
+        );
+    }
+
+    #[test]
+    fn rework_dialog_shows_escalated_model_on_second_fix() {
+        // #803: iteration 1 work → iteration 2 fix → escalates (sonnet → opus).
+        let mut app = make_test_app(board_with_fix_iteration(1));
+        app.pending_rework = Some(PendingRework {
+            coord_repo: "api".to_string(),
+            repo_slug: "api".to_string(),
+            issue_num: 42,
+            findings: String::new(),
+        });
+        let dlg = app.build_prompt_dialog().expect("rework dialog built");
+        let body = dialog_body_text(&dlg).join("\n");
+        assert!(
+            body.contains("Model: opus"),
+            "second fix must show escalated model (opus), got:\n{body}",
+        );
+    }
+
+    #[test]
+    fn test_fix_dialog_shows_model_hint() {
+        // #803: test-fail fix dialog also shows the escalated model tier.
+        // review_iteration=1 → next_iteration=2 → opus.
+        let mut app = make_test_app(board_with_fix_iteration(1));
+        app.pending_test_fix = Some(PendingTestFix {
+            coord_repo: "api".to_string(),
+            repo_slug: "api".to_string(),
+            issue_num: 42,
+        });
+        let dlg = app.build_prompt_dialog().expect("test-fix dialog built");
+        let body = dialog_body_text(&dlg).join("\n");
+        assert!(
+            body.contains("Model: opus"),
+            "test-fix dialog must show escalated model (opus), got:\n{body}",
+        );
+    }
+
+    #[test]
+    fn fix_model_for_issue_returns_none_without_pipeline_models() {
+        // #803: when board_meta carries no `pipeline_models` (pre-#803 coordinator),
+        // `fix_model_for_issue` returns None — no model hint in dialog.
+        let work = make_assignment_typed("done", 42, "api", Some("work"));
+        let app = make_app_with_assignments(vec![work]);
+        // pipeline_models is None (default) → method returns None.
+        assert_eq!(
+            app.fix_model_for_issue("api", 42),
+            None,
+            "should return None when pipeline_models not in board_meta",
+        );
+    }
+
     #[test]
     fn build_interactive_launch_cmd_fix_mode_emits_fix_of() {
         let cmd = build_interactive_launch_cmd(
@@ -34944,6 +35218,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         }
     }
 
@@ -36236,6 +36511,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -36418,6 +36694,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -36491,6 +36768,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -36682,6 +36960,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -37505,6 +37784,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         }
     }
 
@@ -39361,6 +39641,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -39407,6 +39688,7 @@ mod tests {
                 cache_read_tokens: 0,
                 is_interactive: false,
                 failure_reason: None,
+                review_iteration: 0,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -39447,6 +39729,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -39476,6 +39759,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -39516,6 +39800,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -39545,6 +39830,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: true,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -39590,6 +39876,7 @@ mod tests {
                 cache_read_tokens: 0,
                 is_interactive: false,
                 failure_reason: None,
+                review_iteration: 0,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -39629,6 +39916,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -39658,6 +39946,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -39706,6 +39995,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -39754,6 +40044,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -39886,6 +40177,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -39979,6 +40271,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -40027,6 +40320,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -40062,6 +40356,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -40102,6 +40397,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -40131,6 +40427,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -40168,6 +40465,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -40234,6 +40532,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -40280,6 +40579,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -40308,6 +40608,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Both stages done, no Merge stage remaining.
@@ -40509,10 +40810,11 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         }
     }
 
-    /// Concurrency cap: when CI_MAX_IN_FLIGHT loaders are already in-flight,
+    ///Concurrency cap: when CI_MAX_IN_FLIGHT loaders are already in-flight,
     /// `maybe_kick_ci_check_loaders` must not start any additional ones.
     #[test]
     fn maybe_kick_ci_check_loaders_respects_concurrency_cap() {
@@ -40849,6 +41151,7 @@ mod tests {
                 cache_read_tokens: 0,
                 is_interactive: false,
                 failure_reason: None,
+                review_iteration: 0,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -40901,6 +41204,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -40945,6 +41249,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -41032,6 +41337,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -41075,6 +41381,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -41112,6 +41419,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -41149,6 +41457,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -41274,7 +41583,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);")
             .unwrap();
-        let (gates, labels, repos, require_plan, run_cmds, repo_paths) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds, repo_paths, _models) = load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["review".to_string(), "merge".to_string()]);
         assert_eq!(labels, vec!["coord".to_string()]);
         assert!(repos.is_empty());
@@ -41300,7 +41609,7 @@ mod tests {
               ('pipeline_require_plan', '1');",
         )
         .unwrap();
-        let (gates, labels, repos, require_plan, run_cmds, repo_paths) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds, repo_paths, _models) = load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["plan", "work", "smoke"]);
         assert_eq!(labels, vec!["hotfix", "feature"]);
         assert_eq!(repos, vec![("api".to_string(), "acme/api".to_string())]);
@@ -45798,6 +46107,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -45918,6 +46228,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -46279,6 +46590,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -53052,6 +53364,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         });
 
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);

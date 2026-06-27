@@ -104,6 +104,18 @@ def _save_config_snapshot(config: Config) -> None:
             "('pipeline_require_plan', ?)",
             ("1" if config.dispatch.require_plan else "0",),
         )
+        # #803: models config snapshot — TUI reads this to show which model
+        # tier will be used for an interactive --fix-of without needing to
+        # parse coordinator.yml itself.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_models', ?)",
+            (json.dumps({
+                "default": config.models.default,
+                "escalation": config.models.escalation,
+                "escalate_fix_model": config.pipeline.escalate_fix_model,
+            }),),
+        )
         # #349: repo_name → local-checkout path for the machine running this
         # coordinator.  Used by the TUI to read git branch HEADs when
         # detecting test-plan staleness.  Only includes repos that have a
@@ -3451,6 +3463,7 @@ def assign(
         if fix_of is not None:
             from coord.auto_loop import (  # noqa: PLC0415
                 _build_fix_briefing,
+                _fix_model_for_iteration,
                 _load_review_findings,
             )
             from coord.agent import (  # noqa: PLC0415
@@ -3581,7 +3594,15 @@ def assign(
                 work, _SNS(body=_findings_body), next_iteration, max_iter,
             )
 
-            resolved_model = model if model else cfg.models.default
+            # #803: escalate the model per fix iteration, mirroring the headless
+            # auto-loop path.  Explicit --model always wins; when omitted,
+            # _fix_model_for_iteration returns the appropriate tier (or None when
+            # pipeline.escalate_fix_model=False), falling back to cfg.models.default.
+            resolved_model = (
+                model
+                or _fix_model_for_iteration(cfg, next_iteration)
+                or cfg.models.default
+            )
             assignment_id = _uuid.uuid4().hex[:12]
             if _is_local:
                 fix_repo_path = str(
@@ -3644,6 +3665,9 @@ def assign(
                 "  mode: HUMAN-ATTENDED interactive fix "
                 "(migration leg 3 / Track B #486)"
             )
+            # #803: show the escalated model so an opus escalation is visible.
+            _explicit = "(explicit --model override)" if model else "(auto-selected)"
+            click.echo(f"  model: {resolved_model} {_explicit}")
             click.echo(
                 f"  assignment id: {assignment_id}  (fix_of={fix_of}, "
                 f"work={work.assignment_id})"

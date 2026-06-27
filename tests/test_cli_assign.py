@@ -1464,3 +1464,133 @@ class TestAssignInteractiveMerge:
             )
         assert result.exit_code == 2
         assert "mutually exclusive" in result.output
+
+
+# ── Config YAML with explicit model tiers for escalation tests ────────────────
+
+_ESCALATION_CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+models:
+  default: sonnet
+  escalation: [haiku, sonnet, opus]
+pipeline:
+  escalate_fix_model: true
+"""
+
+_NO_ESCALATION_CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+models:
+  default: sonnet
+  escalation: [haiku, sonnet, opus]
+pipeline:
+  escalate_fix_model: false
+"""
+
+
+class TestAssignInteractiveFixModelEscalation:
+    """#803: interactive --fix-of path auto-escalates the model per bounce
+    iteration, mirroring the headless auto-loop.  Uses --dry-run so no
+    subprocess is launched; asserts the 'model:' line emitted by cli.py."""
+
+    @pytest.fixture
+    def esc_config(self, tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(_ESCALATION_CONFIG_YAML)
+        return p
+
+    @pytest.fixture
+    def no_esc_config(self, tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(_NO_ESCALATION_CONFIG_YAML)
+        return p
+
+    def test_iteration_1_uses_default_model(
+        self, esc_config: Path, coord_dir: Path
+    ) -> None:
+        """First fix (review_iteration=0 work → iteration=1) stays on the
+        default model (sonnet) — the escalation only kicks in from iter 2+."""
+        _seed_review_and_work("work-e1", "rev-e1", "issue-1-fix-e1",
+                              review_iteration=0)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(esc_config),
+                 "--interactive", "--fix-of", "rev-e1", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "model: sonnet (auto-selected)" in result.output
+
+    def test_iteration_2_escalates_to_next_model(
+        self, esc_config: Path, coord_dir: Path
+    ) -> None:
+        """Second fix (review_iteration=1 work → iteration=2) climbs one
+        rung: sonnet → opus (haiku < sonnet < opus, current default=sonnet)."""
+        _seed_review_and_work("work-e2", "rev-e2", "issue-1-fix-e2",
+                              review_iteration=1)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(esc_config),
+                 "--interactive", "--fix-of", "rev-e2", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "model: opus (auto-selected)" in result.output
+
+    def test_explicit_model_overrides_escalation(
+        self, esc_config: Path, coord_dir: Path
+    ) -> None:
+        """An explicit --model flag wins over the auto-escalated tier."""
+        _seed_review_and_work("work-e3", "rev-e3", "issue-1-fix-e3",
+                              review_iteration=1)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(esc_config),
+                 "--interactive", "--fix-of", "rev-e3",
+                 "--model", "haiku", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "model: haiku (explicit --model override)" in result.output
+
+    def test_escalate_disabled_stays_on_default(
+        self, no_esc_config: Path, coord_dir: Path
+    ) -> None:
+        """When pipeline.escalate_fix_model=false, every fix iteration uses
+        the config's default model regardless of bounce count."""
+        _seed_review_and_work("work-e4", "rev-e4", "issue-1-fix-e4",
+                              review_iteration=1)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(no_esc_config),
+                 "--interactive", "--fix-of", "rev-e4", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        # escalation disabled → stays on sonnet (the default)
+        assert "model: sonnet (auto-selected)" in result.output
