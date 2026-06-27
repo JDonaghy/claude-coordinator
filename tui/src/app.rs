@@ -29198,6 +29198,24 @@ impl ShellApp for CoordApp {
                     {
                         self.done_window = self.done_window.next();
                         self.rebuild_pipeline_sidebar(None);
+                        // After rebuild the SidebarSystem starts with
+                        // active_section() == None, so the default_select block
+                        // in rebuild_pipeline_sidebar selects the FIRST section
+                        // (usually in-progress) and the restore loop only re-
+                        // focuses Done if pipeline_sel pointed at a Done row.
+                        // When the user is on the Done section HEADER (no issue
+                        // row selected) pipeline_sel is None, so the restore is
+                        // skipped and Done loses focus.  Re-assert Done focus
+                        // unconditionally here so subsequent → presses still
+                        // fire the extend-range handler.
+                        if let Some(done_idx) = self
+                            .pipeline_state_section_names
+                            .iter()
+                            .position(|&k| k == "done")
+                            .map(|i| i + 1)
+                        {
+                            self.pipeline_sidebar.set_active_section(Some(done_idx));
+                        }
                         needs_redraw = true;
                     }
 
@@ -50862,5 +50880,119 @@ mod tests {
         driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
         let s4 = driver.screen();
         assert!(s4.contains("last 2h"), "wraps back to last 2h\n{}", s4);
+    }
+
+    /// Regression test for the focus-loss bug fixed in #728.
+    ///
+    /// When the board has BOTH an in-progress section AND a done section,
+    /// focusing the Done section HEADER (no issue row selected — `pipeline_sel`
+    /// is None) and pressing → should keep the Done section focused across
+    /// rebuilds.  Previously the rebuild's `default_select` block would pick
+    /// in-progress (the first section) and the restore loop would skip Done
+    /// because `prev_sel` was None.
+    #[test]
+    fn done_window_cycles_on_right_key_with_in_progress_section() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // Board has one in-progress issue AND one done issue — Done is NOT the
+        // first section, so `default_select` would pick in-progress if the
+        // restore loop is skipped.
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![
+                // In-progress assignment (running, not done).
+                make_assignment_typed("running", 42, "api", Some("work")),
+                // Done assignment finished 5 minutes ago.
+                {
+                    let mut a = make_assignment_typed("done", 55, "api", Some("work"));
+                    a.finished_at = Some(now - 300.0); // 5 minutes ago
+                    a
+                },
+            ],
+            ..BoardData::default()
+        });
+        // Open issue #42 → in-progress; closed issue #55 → done.
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 42,
+                title: "In-progress issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            closed_issue(55, "acme/api", "api"),
+        ];
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+
+        // After rebuild the in-progress section is the first state section and
+        // default_select focuses it.  Check that both sections exist.
+        assert!(
+            app.pipeline_state_section_names.contains(&"in-progress"),
+            "board must have an in-progress section for this regression test"
+        );
+        assert!(
+            app.pipeline_state_section_names.contains(&"done"),
+            "board must have a done section for this regression test"
+        );
+
+        // Simulate the user having navigated to the Done section HEADER
+        // (no issue row selected within Done — pipeline_sel is None).
+        // This is the state that triggered the focus-loss bug.
+        let done_section_idx = app
+            .pipeline_state_section_names
+            .iter()
+            .position(|&k| k == "done")
+            .expect("done section must exist")
+            + 1; // +1 because section 0 is the FILTER form
+        app.pipeline_sidebar
+            .set_active_section(Some(done_section_idx));
+        app.pipeline_sel = None; // no row selected — user is on the section header
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        // Switch to Pipeline view.
+        driver.press(quadraui::Key::Char('3'));
+
+        // The Done section header should show "last 2h" initially.
+        let s0 = driver.screen();
+        assert!(s0.contains("last 2h"), "initial Done header shows last 2h\n{}", s0);
+
+        // First →: cycles to 24h.  Also verifies Done section is still focused
+        // (if it weren't, the key would be unhandled and the label unchanged).
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
+        let s1 = driver.screen();
+        assert!(s1.contains("last 24h"), "H24 after first → (multi-section board)\n{}", s1);
+
+        // Second →: cycles to 7d.  This is the regression case — before the
+        // fix, Done would lose focus after the first press and this would fail.
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
+        let s2 = driver.screen();
+        assert!(s2.contains("last 7d"), "D7 after second → (multi-section board)\n{}", s2);
+
+        // Third →: all.
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
+        let s3 = driver.screen();
+        assert!(
+            s3.contains("all") || s3.contains("All"),
+            "All after third → (multi-section board)\n{}",
+            s3
+        );
+
+        // Fourth →: wraps back to 2h.
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
+        let s4 = driver.screen();
+        assert!(
+            s4.contains("last 2h"),
+            "wraps back to last 2h after fourth → (multi-section board)\n{}",
+            s4
+        );
     }
 }
