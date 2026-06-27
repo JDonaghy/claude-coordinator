@@ -342,9 +342,8 @@ def test_conflict_fix_zero_commits_is_done_not_advisory(
 
     # Simulate the rebase scenario: create a feature branch that is
     # force-pushed so local == remote (0 commits ahead of origin/branch).
-    import subprocess as _sp
     def _git_run(*args: str, cwd: Path) -> None:
-        _sp.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+        subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
 
     _git_run("checkout", "-b", "issue-784-fix", cwd=clone)
     (clone / "fix.txt").write_text("fix\n")
