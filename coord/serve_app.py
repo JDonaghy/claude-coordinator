@@ -588,7 +588,6 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     merge_cmd.callback(
                         config_path=config.path,
                         dry_run=bool(body.get("dry_run")),
-                        show_plan=bool(body.get("plan")),
                         order=body.get("order"),
                         repo_filter=body.get("repo_filter"),
                         method=body.get("method") or "rebase",
