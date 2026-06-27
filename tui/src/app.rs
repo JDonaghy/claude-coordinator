@@ -49155,6 +49155,172 @@ mod tests {
         );
     }
 
+    /// A plain left-press (no Shift) in a **Pipeline Terminal** tab with mouse
+    /// reporting active fires the same one-shot discovery toast.
+    ///
+    /// Regression guard for the Board/Pipeline-Terminal routing path added in
+    /// #790 fix: the standalone-Terminal toast test covers `SidebarView::Terminal`
+    /// but the operator typically opens the terminal from the Pipeline or Board
+    /// detail panel.  This test drives the full `TuiDriver` render + mouse-down
+    /// dispatch through the Pipeline Terminal code path so
+    /// `handle_mouse → terminal_mouse_event → forward_mouse` reaches the session
+    /// in `detail_terminal_sessions` and the toast appears on screen.
+    #[test]
+    #[cfg(unix)]
+    fn pipeline_terminal_plain_press_fires_shift_drag_discovery_toast() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        fn poll_until_ms(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = std::time::Instant::now();
+            let limit = std::time::Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        }
+
+        let cwd = std::env::temp_dir();
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Enable SGR mouse-reporting so plain drags are forwarded to the PTY.
+        sess.send_str("printf '\\033[?1000h'\n");
+        assert!(
+            poll_until_ms(&mut sess, 3000, |s| s.mouse_reporting_enabled()),
+            "mouse reporting did not turn on within 3 s"
+        );
+
+        let issue_key = ("owner/repo".to_string(), 42u64);
+        let mut app = make_test_app(BoardData::default());
+        // Set up a pipeline issue so selected_issue_key() resolves.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "test issue for pipeline terminal toast".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        app.detail_terminal_sessions.insert(issue_key, sess);
+
+        assert!(
+            !app.terminal_shift_drag_hint_shown,
+            "terminal_shift_drag_hint_shown must start false"
+        );
+
+        // 120×40 screen; sidebar width=35, tab bar height=1 row (TUI lh=1).
+        // x=70 is in the main area; y=10 is below the tab bar (row 1) and
+        // above the hint strip (last row), so the click lands in PTY content.
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.click(70.0, 10.0);
+
+        assert!(
+            driver.screen_contains("Terminal selection"),
+            "discovery toast title must appear after a plain Pipeline Terminal press:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("Hold Shift"),
+            "discovery toast body must mention 'Hold Shift':\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// A plain left-press (no Shift) in a **Board Terminal** tab with mouse
+    /// reporting active fires the one-shot discovery toast.
+    ///
+    /// Regression guard for the Board Terminal routing path added in #790
+    /// fix (92f5293 — Board Terminal was missing from all mouse-routing
+    /// helpers).  Mirrors the Pipeline Terminal toast test but exercises
+    /// `SidebarView::Board + BoardDetailTab::Terminal` code path through
+    /// `handle_mouse → reporting_on → terminal_mouse_event → forward_mouse`.
+    #[test]
+    #[cfg(unix)]
+    fn board_terminal_plain_press_fires_shift_drag_discovery_toast() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        fn poll_until_ms(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = std::time::Instant::now();
+            let limit = std::time::Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        }
+
+        let cwd = std::env::temp_dir();
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Enable SGR mouse-reporting so plain drags are forwarded to the PTY.
+        sess.send_str("printf '\\033[?1000h'\n");
+        assert!(
+            poll_until_ms(&mut sess, 3000, |s| s.mouse_reporting_enabled()),
+            "mouse reporting did not turn on within 3 s"
+        );
+
+        // Set up a board with one running issue (repo-a #10) so that
+        // `selected_issue_key()` can resolve the key via the board selection.
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+
+        // Point the board sidebar at the issue: section 1 = repo-a
+        // (section 0 is the search form), path [0, 0] = milestone 0, issue 0.
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+        app.active_view = SidebarView::Board;
+        app.board_detail_tab = BoardDetailTab::Terminal;
+
+        // Issue key for board: pipeline_repos is empty so coord_repo is used
+        // directly — key = ("repo-a", 10).
+        let issue_key = ("repo-a".to_string(), 10u64);
+        app.detail_terminal_sessions.insert(issue_key, sess);
+
+        assert!(
+            !app.terminal_shift_drag_hint_shown,
+            "terminal_shift_drag_hint_shown must start false"
+        );
+
+        // 120×40 screen; sidebar width=35, tab bar height=1 row (TUI lh=1).
+        // y=10 is below the tab bar and above the hint strip (last row).
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.click(70.0, 10.0);
+
+        assert!(
+            driver.screen_contains("Terminal selection"),
+            "discovery toast title must appear after a plain Board Terminal press:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("Hold Shift"),
+            "discovery toast body must mention 'Hold Shift':\n{}",
+            driver.screen(),
+        );
+    }
+
     // ── #467: local `coord assign --interactive` launcher ────────────────────
     //
     // Replaces the #446 ssh+tmux launcher tests (deleted with the launcher
