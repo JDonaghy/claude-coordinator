@@ -5677,6 +5677,12 @@ pub struct CoordApp {
     /// other than `y`/`Y` cancels; the early-intercept block consumes the
     /// keypress so the normal `y`-as-prefix paths can't fire.
     pending_force_merge: Option<String>,
+    /// #780: pending "Merge all ready" confirmation from the Merge Queue panel.
+    /// `Some(aids)` means the user pressed `a` and we are waiting for one-key
+    /// confirmation before running `coord merge` to drain every READY entry.
+    /// `aids` is the list of READY assignment_ids shown in the confirm prompt.
+    /// Any key other than `y`/`Y` cancels.
+    pending_merge_all_ready: Option<Vec<String>>,
     /// #259: open right-click context menu, or `None` if no menu is showing.
     /// Opened by right-click on a Board / Pipeline sidebar row; dismissed by
     /// click-outside, Escape, or item activation.
@@ -6361,6 +6367,7 @@ impl CoordApp {
             chat_spinner_throttle: 0,
             paused_machines: read_paused_machines(),
             pending_force_merge: None,
+            pending_merge_all_ready: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(Vec::new()),
             dialog_layout: std::cell::RefCell::new(None),
@@ -10731,14 +10738,26 @@ impl CoordApp {
         });
     }
 
-    // ── #737: Merge Queue per-entry actions ───────────────────────────────────
+    // ── #737 / #780: Merge Queue per-entry actions ───────────────────────────
 
-    /// `coord merge --order <assignment_id>` (or `--force-merge` when `force`).
-    fn dispatch_merge_queue_merge(&mut self, force: bool) {
+    /// `coord merge --only <assignment_id>` (single-entry merge, #780).
+    ///
+    /// Merges exactly the selected entry and leaves all other queue entries
+    /// untouched.  When `force` is true, appends `--force-merge` to bypass CI
+    /// and gate checks.
+    ///
+    /// For BLOCKED entries: shows a warning toast with the block reason and
+    /// returns without dispatching (the operator can use `M` / force to
+    /// override via `--force-merge`).
+    fn dispatch_merge_queue_merge_only(&mut self, force: bool) {
         // Prefer merge_plan (v0.4.53+ daemon); fall back to raw merge_queue.
-        let aid = if !self.data.merge_plan.is_empty() {
+        let (aid, status, reason) = if !self.data.merge_plan.is_empty() {
             match self.selected_merge_plan_entry() {
-                Some(e) => e.assignment_id.clone(),
+                Some(e) => (
+                    e.assignment_id.clone(),
+                    e.status.clone(),
+                    e.reason.clone(),
+                ),
                 None => {
                     self.push_toast("Merge Queue", "No entry selected.", ToastSeverity::Warning);
                     return;
@@ -10746,18 +10765,34 @@ impl CoordApp {
             }
         } else {
             match self.selected_merge_queue_entry() {
-                Some(e) => e.assignment_id.clone(),
+                Some(e) => (e.assignment_id.clone(), String::new(), None),
                 None => {
                     self.push_toast("Merge Queue", "No entry selected.", ToastSeverity::Warning);
                     return;
                 }
             }
         };
+
+        // For BLOCKED entries (without force) surface the reason rather than
+        // silently dispatching a merge that will fail the gate.
+        if !force && status == "BLOCKED" {
+            let body = reason
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or("gate check failed");
+            self.push_toast(
+                "Blocked — cannot merge",
+                &format!("{}  (use M to force)", body),
+                ToastSeverity::Warning,
+            );
+            return;
+        }
+
         // Build the command as owned Strings so we can conditionally push
         // --force-merge before slicing into &str refs for spawn_queued.
         let mut cmd_strs: Vec<String> = vec![
             "merge".to_string(),
-            "--order".to_string(),
+            "--only".to_string(),
             aid.clone(),
         ];
         if force {
@@ -10768,9 +10803,9 @@ impl CoordApp {
         match self.command_runner.spawn_queued(&cmd_refs) {
             SpawnQueuedOutcome::Started => {
                 self.push_toast(
-                    if force { "Force-merge dispatched" } else { "Merge dispatched" },
-                    &format!("coord merge --order {} {}", aid,
-                        if force { "--force-merge" } else { "" }),
+                    if force { "Force-merge (only) dispatched" } else { "Merge only this dispatched" },
+                    &format!("coord merge --only {}{}", aid,
+                        if force { " --force-merge" } else { "" }),
                     ToastSeverity::Info,
                 );
             }
@@ -10779,6 +10814,36 @@ impl CoordApp {
             }
             SpawnQueuedOutcome::Deduped => {}
         }
+    }
+
+    /// `coord merge` — drain every READY entry in the queue after one-key
+    /// confirmation.  Sets `pending_merge_all_ready` with the list of READY
+    /// aids so the confirm dialog can display the count and a preview.
+    fn dispatch_merge_queue_merge_all(&mut self) {
+        // Collect all READY aids from merge_plan (preferred) or legacy queue.
+        let ready_aids: Vec<String> = if !self.data.merge_plan.is_empty() {
+            self.data.merge_plan.iter()
+                .filter(|e| e.status == "READY")
+                .map(|e| e.assignment_id.clone())
+                .collect()
+        } else {
+            // Legacy merge_queue has no status field; treat all PENDING as ready.
+            self.data.merge_queue.iter()
+                .map(|e| e.assignment_id.clone())
+                .collect()
+        };
+
+        if ready_aids.is_empty() {
+            self.push_toast(
+                "No READY entries",
+                "Nothing to merge — all entries are BLOCKED or the queue is empty.",
+                ToastSeverity::Info,
+            );
+            return;
+        }
+
+        // Show confirm dialog; key handler fires `coord merge` on 'y'.
+        self.pending_merge_all_ready = Some(ready_aids);
     }
 
     /// `coord merge --drop <assignment_id>` — remove one entry from the queue.
@@ -18170,14 +18235,14 @@ impl CoordApp {
                 )
             }
         } else if self.active_view == SidebarView::MergeQueue {
-            // #737: Merge Queue panel hints.
+            // #737 / #780: Merge Queue panel hints.
             let attn = if self.merge_queue_needs_attention() {
                 " ⚠ needs attention!"
             } else {
                 ""
             };
             format!(
-                " j/k=nav  m=merge  M=force-merge  d=drop  s=resolve-interactive{}  q=quit ",
+                " j/k=nav  a=merge-all-ready  m=merge-only-this  M=force-merge  d=drop  s=interactive{}  q=quit ",
                 attn
             )
         } else {
@@ -19547,6 +19612,66 @@ impl CoordApp {
                     },
                 ],
                 severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
+        // ── #780: Merge-all-ready confirm ───────────────────────────────
+        if let Some(ref aids) = self.pending_merge_all_ready {
+            let n = aids.len();
+            let preview = if aids.len() <= 4 {
+                aids.iter()
+                    .map(|a| {
+                        // Show PR-friendly short label: look up issue number from
+                        // merge_plan; fall back to the raw assignment_id.
+                        self.data.merge_plan.iter()
+                            .find(|e| &e.assignment_id == a)
+                            .map(|e| format!("#{}", e.issue_number))
+                            .unwrap_or_else(|| a.clone())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                let shown = aids.iter().take(3)
+                    .map(|a| {
+                        self.data.merge_plan.iter()
+                            .find(|e| &e.assignment_id == a)
+                            .map(|e| format!("#{}", e.issue_number))
+                            .unwrap_or_else(|| a.clone())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}, +{} more", shown, aids.len() - 3)
+            };
+            return Some(Dialog {
+                id: WidgetId::new("dialog:merge-all-ready"),
+                title: StyledText::plain("Merge All Ready"),
+                body: vec![
+                    StyledText::plain(format!(
+                        "Merge {} READY entr{}?",
+                        n,
+                        if n == 1 { "y" } else { "ies" }
+                    )),
+                    StyledText::plain(preview),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: format!("y  Merge {} entr{}", n, if n == 1 { "y" } else { "ies" }),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: Some(Color::rgb(60, 160, 80)),
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
             });
@@ -23194,6 +23319,7 @@ impl CoordApp {
         self.watch_focused.is_some()
             || self.pending_purge.is_some()
             || self.pending_force_merge.is_some()
+            || self.pending_merge_all_ready.is_some()
             || self.pending_test_fail.is_some()
             || self.pending_report_fix.is_some()
             || self.pending_refinement_close_prompt.is_some()
@@ -23221,6 +23347,7 @@ impl CoordApp {
         if self.watch_focused.is_some()
             || self.pending_purge.is_some()
             || self.pending_force_merge.is_some()
+            || self.pending_merge_all_ready.is_some()
             || self.pending_test_fail.is_some()
             || self.pending_report_fix.is_some()
             || self.pending_refinement_close_prompt.is_some()
@@ -29613,6 +29740,50 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── #780: Merge-all-ready confirm: intercept key presses ──────────
+        if let Some(aids) = self.pending_merge_all_ready.clone() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        // Drain the entire queue — `coord merge` already merges in
+                        // READY order; no extra args needed.
+                        let args: Vec<&str> = vec!["merge"];
+                        use crate::commands::SpawnQueuedOutcome;
+                        match self.command_runner.spawn_queued(&args) {
+                            SpawnQueuedOutcome::Started => {
+                                self.push_toast(
+                                    "Merge all ready dispatched",
+                                    &format!("coord merge — {} entr{} queued",
+                                        aids.len(),
+                                        if aids.len() == 1 { "y" } else { "ies" }),
+                                    ToastSeverity::Info,
+                                );
+                            }
+                            SpawnQueuedOutcome::Queued => {
+                                self.push_toast(
+                                    "⏳ Queued",
+                                    "merge runs after current command",
+                                    ToastSeverity::Info,
+                                );
+                            }
+                            SpawnQueuedOutcome::Deduped => {}
+                        }
+                        self.pending_merge_all_ready = None;
+                    }
+                    _ => {
+                        // Any other key cancels.
+                        self.pending_merge_all_ready = None;
+                        self.push_toast(
+                            "Merge all cancelled",
+                            "Queue unchanged",
+                            ToastSeverity::Info,
+                        );
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #532: Artifact-pull dialog: intercept key presses ──────────────
         // While the info dialog is open:
         //   'c'/'C' — copy path to clipboard (when available), then dismiss.
@@ -29947,18 +30118,25 @@ impl ShellApp for CoordApp {
                         self.fix_merge_queue_scroll(content_visible_rows(list_b, lh));
                         needs_redraw = true;
                     }
-                    // m → coord merge --order <assignment_id>  (merge-now)
+                    // #780: a → "Merge all ready" — confirm prompt then drain queue.
+                    Key::Char('a')
+                        if self.active_view == SidebarView::MergeQueue =>
+                    {
+                        self.dispatch_merge_queue_merge_all();
+                        needs_redraw = true;
+                    }
+                    // #780: m → "Merge only this" — coord merge --only <aid>
                     Key::Char('m')
                         if self.active_view == SidebarView::MergeQueue =>
                     {
-                        self.dispatch_merge_queue_merge(false);
+                        self.dispatch_merge_queue_merge_only(false);
                         needs_redraw = true;
                     }
-                    // M → coord merge --order <assignment_id> --force-merge
+                    // #780: M → "Force merge only this" — coord merge --only <aid> --force-merge
                     Key::Char('M')
                         if self.active_view == SidebarView::MergeQueue =>
                     {
-                        self.dispatch_merge_queue_merge(true);
+                        self.dispatch_merge_queue_merge_only(true);
                         needs_redraw = true;
                     }
                     // d → coord merge --drop <assignment_id>
@@ -33166,6 +33344,7 @@ mod tests {
             chat_spinner_throttle: 0,
             paused_machines: read_paused_machines(),
             pending_force_merge: None,
+            pending_merge_all_ready: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(Vec::new()),
             dialog_layout: std::cell::RefCell::new(None),
@@ -51893,7 +52072,7 @@ mod tests {
         );
     }
 
-    /// #777 unit test: dispatch_merge_queue_merge picks the plan entry (not
+    /// #777 / #780: dispatch_merge_queue_merge_only picks the plan entry (not
     /// the legacy merge_queue) when merge_plan is populated.
     ///
     /// Since CommandRunner spawns a real process we can't intercept the argv,
@@ -51902,7 +52081,7 @@ mod tests {
     /// selected_merge_plan_entry() returned None — impossible when the plan
     /// has at least one entry and sel is in bounds).
     #[test]
-    fn dispatch_merge_queue_merge_uses_plan_path_when_plan_nonempty() {
+    fn dispatch_merge_queue_merge_only_uses_plan_path_when_plan_nonempty() {
         let mut app = make_test_app(BoardData {
             merge_plan: vec![
                 planned_entry("plan-aid-1", "myrepo", "owner/myrepo", "main", 42, "Fix bug", 1, Some(10), "READY", None),
@@ -51913,13 +52092,161 @@ mod tests {
         app.active_view = SidebarView::MergeQueue;
         app.merge_queue_sel = 0;
 
-        app.dispatch_merge_queue_merge(false);
+        app.dispatch_merge_queue_merge_only(false);
 
         // The "No entry selected." warning only fires on the None branch —
         // if the plan path correctly found the entry, no such toast appears.
         assert!(
             app.toasts.iter().all(|(t, _, _)| t.body != "No entry selected."),
             "plan path must find the entry; no 'No entry selected' toast expected"
+        );
+    }
+
+    /// #780: dispatch_merge_queue_merge_only for a BLOCKED entry (non-force)
+    /// must push a warning toast with the block reason and NOT dispatch a
+    /// merge command.
+    #[test]
+    fn dispatch_merge_queue_merge_only_blocked_shows_reason_toast() {
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry(
+                    "blocked-aid", "myrepo", "owner/myrepo", "main", 77,
+                    "Blocked PR", 1, None, "BLOCKED", Some("review not approved"),
+                ),
+            ],
+            merge_queue: vec![],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+        app.merge_queue_sel = 0;
+
+        app.dispatch_merge_queue_merge_only(false);
+
+        // Must have at least one warning toast about being blocked.
+        let has_blocked_toast = app.toasts.iter().any(|(t, _, _)| {
+            t.title.contains("Blocked") || t.title.contains("blocked")
+        });
+        assert!(
+            has_blocked_toast,
+            "BLOCKED entry must produce a warning toast; toasts = {:?}",
+            app.toasts.iter().map(|(t, _, _)| &t.title).collect::<Vec<_>>()
+        );
+    }
+
+    /// #780: dispatch_merge_queue_merge_only with force=true on a BLOCKED entry
+    /// must NOT show a blocked toast and must proceed (no "No entry selected" toast).
+    #[test]
+    fn dispatch_merge_queue_merge_only_force_bypasses_blocked_check() {
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry(
+                    "blocked-aid2", "myrepo", "owner/myrepo", "main", 78,
+                    "Blocked PR force", 1, None, "BLOCKED", Some("CI failing"),
+                ),
+            ],
+            merge_queue: vec![],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+        app.merge_queue_sel = 0;
+
+        app.dispatch_merge_queue_merge_only(true); // force=true
+
+        // No "Blocked" toast — force bypasses the gate.
+        assert!(
+            app.toasts.iter().all(|(t, _, _)| !t.title.contains("Blocked") && !t.title.contains("blocked")),
+            "force mode must not produce a 'Blocked' toast"
+        );
+        // No "No entry selected" either.
+        assert!(
+            app.toasts.iter().all(|(t, _, _)| t.body != "No entry selected."),
+            "force mode on BLOCKED entry must find the entry without 'No entry selected' toast"
+        );
+    }
+
+    /// #780: dispatch_merge_queue_merge_all with READY entries sets
+    /// `pending_merge_all_ready` to the list of READY aids.
+    #[test]
+    fn dispatch_merge_queue_merge_all_sets_pending_when_ready_entries_exist() {
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("aid-r1", "repo", "owner/repo", "main", 10, "R1", 1, Some(5), "READY", None),
+                planned_entry("aid-b1", "repo", "owner/repo", "main", 11, "B1", 2, None, "BLOCKED", Some("CI")),
+                planned_entry("aid-r2", "repo", "owner/repo", "main", 12, "R2", 3, Some(10), "READY", None),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        app.dispatch_merge_queue_merge_all();
+
+        let pending = app.pending_merge_all_ready.as_ref()
+            .expect("pending_merge_all_ready must be Some after calling merge_all with READY entries");
+        // Only the two READY aids — BLOCKED is excluded.
+        assert_eq!(pending.len(), 2, "only READY entries should be in pending list");
+        assert!(pending.contains(&"aid-r1".to_string()), "aid-r1 must be in pending");
+        assert!(pending.contains(&"aid-r2".to_string()), "aid-r2 must be in pending");
+        assert!(!pending.contains(&"aid-b1".to_string()), "BLOCKED aid-b1 must not be in pending");
+    }
+
+    /// #780: dispatch_merge_queue_merge_all with no READY entries pushes an
+    /// informational toast instead of opening a confirm dialog.
+    #[test]
+    fn dispatch_merge_queue_merge_all_no_ready_shows_toast() {
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("aid-b2", "repo", "owner/repo", "main", 20, "B2", 1, None, "BLOCKED", Some("no review")),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        app.dispatch_merge_queue_merge_all();
+
+        // pending_merge_all_ready stays None — no READY entries.
+        assert!(
+            app.pending_merge_all_ready.is_none(),
+            "pending_merge_all_ready must remain None when no READY entries"
+        );
+        // Should have pushed an info toast.
+        assert!(
+            !app.toasts.is_empty(),
+            "a toast must be pushed when there are no READY entries"
+        );
+    }
+
+    /// #780: TuiDriver test — pressing `a` in the MergeQueue panel with READY
+    /// entries must show a confirm dialog that includes the entry count.
+    #[test]
+    fn tuidriver_merge_all_ready_confirm_dialog_shows_count() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry("r1", "repo", "owner/repo", "main", 10, "Ready 1", 1, Some(5), "READY", None),
+                planned_entry("r2", "repo", "owner/repo", "main", 11, "Ready 2", 2, Some(8), "READY", None),
+                planned_entry("b1", "repo", "owner/repo", "main", 12, "Blocked", 3, None, "BLOCKED", Some("CI")),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+        app.merge_queue_sel = 0;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.press(Key::Char('a'));
+
+        let screen = driver.screen();
+        // The confirm dialog must mention "2" (count of READY entries).
+        assert!(
+            screen.contains("2"),
+            "#780: confirm dialog must show READY count (2); screen =\n{}",
+            screen
+        );
+        // Must include "Merge" in some form.
+        assert!(
+            screen.contains("Merge") || screen.contains("merge"),
+            "#780: confirm dialog must contain 'Merge'; screen =\n{}",
+            screen
         );
     }
 
