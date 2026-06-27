@@ -17189,8 +17189,19 @@ impl CoordApp {
     }
 
     /// Begin a host-side selection drag in the active terminal at `(col, row)`.
-    /// Clears any previous selection and sets the anchor to `(col, row)`.
-    /// No-op (dragging flag not set) when there is no active terminal session.
+    /// Sets the selection anchor when a session is available, and always sets
+    /// `terminal_host_sel_dragging = true` so that Move events are routed to
+    /// the host selection path rather than forwarded to the PTY.
+    ///
+    /// The dragging flag is set **unconditionally** even when
+    /// `active_terminal_session_mut()` returns `None` (e.g. a Pipeline or Board
+    /// terminal session that is still being spawned, or a transient issue-key
+    /// mismatch between the render and the event handler).  If the session is not
+    /// found on Down, Move re-tries the same lookup — when the session IS
+    /// accessible at that point the selection anchor is updated normally; when it
+    /// is still absent the Move is a no-op.  On release the copy guard finds no
+    /// text and exits cleanly without writing a spurious empty string to the
+    /// clipboard.
     fn terminal_host_sel_begin(&mut self, col: u16, row: u16) {
         use quadraui::terminal_engine::TerminalSelection;
         if let Some(sess) = self.active_terminal_session_mut() {
@@ -17200,9 +17211,12 @@ impl CoordApp {
                 end_row: row,
                 end_col: col,
             });
-        } else {
-            return;
         }
+        // Set unconditionally: the drag must be owned by the host regardless
+        // of whether the session lookup succeeded above.  The old code had
+        // `else { return; }` here, which left the flag unset and handed the
+        // entire drag sequence (Move + Up) back to the PTY — causing Shift+drag
+        // in Pipeline / Board terminal tabs to produce no selection and no copy.
         self.terminal_host_sel_dragging = true;
     }
 
@@ -49443,6 +49457,128 @@ mod tests {
             "hint strip must still be visible after Shift+drag:\n{}",
             driver.screen(),
         );
+    }
+
+    // ── #790 iteration 4: terminal_host_sel_dragging set unconditionally ─────
+
+    /// `terminal_host_sel_begin` must set `terminal_host_sel_dragging = true`
+    /// even when `active_terminal_session_mut()` returns `None`.
+    ///
+    /// Regression guard: the old code had `else { return; }` which left the
+    /// flag unset whenever the session lookup failed, silently handing the
+    /// entire Shift+drag sequence (Move + Up) back to the PTY.  This caused
+    /// the auto-copy path in MouseUp to be unreachable for Pipeline and Board
+    /// terminal tabs where the session key resolves only after the first full
+    /// tick.
+    #[test]
+    fn host_sel_begin_sets_dragging_without_active_session() {
+        // Default state: active_view = Board, board_detail_tab = Board (not
+        // Terminal) → active_terminal_session_mut() returns None.
+        let mut app = make_test_app(BoardData::default());
+        assert!(
+            app.active_terminal_session_mut().is_none(),
+            "precondition: no active terminal session in default app state"
+        );
+        app.terminal_host_sel_begin(5, 3);
+        assert!(
+            app.terminal_host_sel_dragging,
+            "terminal_host_sel_dragging must be set even when session lookup returns None"
+        );
+    }
+
+    /// Shift+drag in a **Pipeline Terminal** tab sets `terminal_host_sel_dragging`
+    /// and initialises the selection anchor on the session.
+    ///
+    /// Regression guard for #790 iteration 4: verifies that with a session
+    /// present in `detail_terminal_sessions` (and matching `pipeline_sel`),
+    /// `terminal_host_sel_begin` both sets the flag and writes the anchor.
+    #[test]
+    #[cfg(unix)]
+    fn pipeline_terminal_shift_drag_begins_host_selection() {
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        let issue_key = ("owner/repo".to_string(), 42u64);
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "test issue for pipeline shift-drag".to_string(),
+            body: String::new(),
+            repo_slug: "owner/repo".to_string(),
+            coord_repo: None,
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        app.detail_terminal_sessions.insert(issue_key.clone(), sess);
+
+        app.terminal_host_sel_begin(5, 3);
+
+        assert!(
+            app.terminal_host_sel_dragging,
+            "dragging flag must be set for Pipeline terminal Shift+drag"
+        );
+        let sel = app
+            .detail_terminal_sessions
+            .get(&issue_key)
+            .expect("session must still exist")
+            .selection
+            .as_ref()
+            .expect("selection anchor must be initialised in Pipeline terminal session");
+        assert_eq!((sel.start_col, sel.start_row), (5, 3), "anchor at (col=5, row=3)");
+        assert_eq!((sel.end_col, sel.end_row), (5, 3), "collapsed on begin");
+    }
+
+    /// Shift+drag in a **Board Terminal** tab sets `terminal_host_sel_dragging`
+    /// and initialises the selection anchor on the session.
+    ///
+    /// Regression guard for #790 iteration 4: exercises
+    /// `SidebarView::Board + BoardDetailTab::Terminal` through
+    /// `terminal_host_sel_begin` → `active_terminal_session_mut`.
+    #[test]
+    #[cfg(unix)]
+    fn board_terminal_shift_drag_begins_host_selection() {
+        let cwd = std::env::temp_dir();
+        let sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Set up a board with one running issue (repo-a #10) so that
+        // board_selected_issue() resolves and selected_issue_key() returns
+        // Some(("repo-a", 10)).
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let mut app = make_app_with_assignments(assignments);
+
+        // Point the board sidebar at the issue: section 1 = repo-a,
+        // path [0, 0] = milestone 0, issue 0.
+        app.board_sidebar.set_active_section(Some(1));
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+        app.active_view = SidebarView::Board;
+        app.board_detail_tab = BoardDetailTab::Terminal;
+
+        let issue_key = ("repo-a".to_string(), 10u64);
+        app.detail_terminal_sessions.insert(issue_key.clone(), sess);
+
+        app.terminal_host_sel_begin(3, 2);
+
+        assert!(
+            app.terminal_host_sel_dragging,
+            "dragging flag must be set for Board terminal Shift+drag"
+        );
+        let sel = app
+            .detail_terminal_sessions
+            .get(&issue_key)
+            .expect("session must still exist")
+            .selection
+            .as_ref()
+            .expect("selection anchor must be initialised in Board terminal session");
+        assert_eq!((sel.start_col, sel.start_row), (3, 2), "anchor at (col=3, row=2)");
+        assert_eq!((sel.end_col, sel.end_row), (3, 2), "collapsed on begin");
     }
 
     // ── #467: local `coord assign --interactive` launcher ────────────────────
