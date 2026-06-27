@@ -5108,18 +5108,47 @@ fn load_pipeline_meta(
 
 // ─── Log items cache ──────────────────────────────────────────────────────────
 
+/// Resumable parser state for [`parse_sse_log_more`].
+///
+/// Stored in [`LogItemsCache`] so incremental re-parses resume from where the
+/// last parse left off — only newly appended SSE lines need to be processed.
+/// Defaults to the "before any lines" state via `Default`.
+#[derive(Default, Clone)]
+struct LogParseState {
+    turn_n: usize,
+    assistant_idx: usize,
+    last_assistant_time: Option<std::time::Instant>,
+    /// Last `user.timestamp` epoch (seconds) seen during the pre-pass.  Carried
+    /// across calls so that `user_epochs` can be extended with only new lines.
+    last_user_epoch: Option<f64>,
+    /// `user_epoch_per_turn` result, extended incrementally.  One entry per
+    /// `"type":"assistant"` event in order.
+    user_epochs: Vec<Option<f64>>,
+}
+
 /// Cached result of parsing a log's SSE (or file) content into [`ListItem`]s.
 ///
-/// Invalidated when the assignment ID, line count, or wrap width changes.
-/// Prevents the full O(n) re-parse of every log line on every render tick
-/// (~60 fps); rebuilds only when the log actually grows or the panel is resized.
+/// Invalidated fully when the assignment ID or wrap width changes, or when
+/// `line_count` *shrinks* (shouldn't happen, but defensive).  When `line_count`
+/// grows and the assignment/width are unchanged, the cache is extended
+/// incrementally by [`parse_sse_log_more`] — only the new lines are parsed.
 struct LogItemsCache {
     assignment_id: String,
     /// Number of SSE lines (or file bytes for local logs) at the time of caching.
     line_count: usize,
     wrap_width: usize,
     items: Vec<ListItem>,
+    /// Resumed parser state — allows O(new_lines) incremental append when the
+    /// SSE stream grows.  Not meaningful for the file-based path (which does its
+    /// own exact-match caching via byte length).
+    parse_state: LogParseState,
 }
+
+/// Minimum wall-clock gap between successive tick-driven `Reaction::Redraw`s.
+///
+/// Caps streaming redraws at ≈15 fps.  User-input events (`dispatch_event`)
+/// still bypass this and redraw immediately — the throttle lives only in `tick`.
+const CONTENT_REDRAW_MIN: Duration = Duration::from_millis(66);
 
 // ─── CoordApp ─────────────────────────────────────────────────────────────────
 
@@ -5594,7 +5623,13 @@ pub struct CoordApp {
     /// Avoids the full O(n) re-parse of every log line on every render tick
     /// (~60 fps).  Rebuilt only when the assignment, line count, or wrap
     /// width changes.  `RefCell` so `pipeline_log_list` can update from `&self`.
+    /// Extended incrementally (#787) when the SSE stream grows.
     log_items_cache: std::cell::RefCell<Option<LogItemsCache>>,
+    /// #787: true while a tick source requested a redraw but the 15-fps
+    /// throttle gate has not yet elapsed.  Cleared when the redraw fires.
+    redraw_pending: bool,
+    /// #787: when the most recent tick-driven `Reaction::Redraw` was emitted.
+    last_redraw_at: Instant,
 
     // ── #349: Test-plan state ─────────────────────────────────────────────────
     /// Work-assignment IDs for which we have already queued a
@@ -6092,6 +6127,8 @@ impl CoordApp {
             last_artifact_pulls: std::collections::HashMap::new(),
             artifact_pull_dialog: None,
             log_items_cache: std::cell::RefCell::new(None),
+            redraw_pending: false,
+            last_redraw_at: Instant::now(),
             test_plan_pending: std::collections::HashSet::new(),
             test_plan_staleness_checked_for: None,
             test_step_jobs: std::collections::HashMap::new(),
@@ -15252,29 +15289,71 @@ impl CoordApp {
                             Some(Color::rgb(140, 140, 140)),
                         ));
                     } else {
-                        // #399 scroll-perf: check cache before re-parsing all lines.
+                        // #399/#787 scroll-perf: 3-way cache decision.
+                        //   exact hit  → extend items from cache (zero parse).
+                        //   can extend → parse only new lines, append (O(new)).
+                        //   full build → parse all lines from scratch (O(total)).
                         let line_count = sse.lines.len();
-                        let cache_valid = {
+                        // Determine the cache status in a scoped borrow so we
+                        // can take `borrow_mut` below without a conflict.
+                        enum CacheStatus { ExactHit, CanExtend(usize), FullBuild }
+                        let status = {
                             let cache = self.log_items_cache.borrow();
-                            cache.as_ref().map_or(false, |c| {
-                                c.assignment_id == a.id
-                                    && c.line_count == line_count
-                                    && c.wrap_width == wrap_width
-                            })
+                            match cache.as_ref() {
+                                Some(c)
+                                    if c.assignment_id == a.id && c.wrap_width == wrap_width =>
+                                {
+                                    if c.line_count == line_count {
+                                        CacheStatus::ExactHit
+                                    } else if c.line_count < line_count {
+                                        CacheStatus::CanExtend(c.line_count)
+                                    } else {
+                                        // line_count shrank — defensive full rebuild.
+                                        CacheStatus::FullBuild
+                                    }
+                                }
+                                _ => CacheStatus::FullBuild,
+                            }
                         };
-                        if cache_valid {
-                            let cache = self.log_items_cache.borrow();
-                            items.extend(cache.as_ref().unwrap().items.iter().cloned());
-                        } else {
-                            let content_items =
-                                parse_sse_log_readable(&sse.lines, &sse.line_times, wrap_width);
-                            *self.log_items_cache.borrow_mut() = Some(LogItemsCache {
-                                assignment_id: a.id.clone(),
-                                line_count,
-                                wrap_width,
-                                items: content_items.clone(),
-                            });
-                            items.extend(content_items);
+                        match status {
+                            CacheStatus::ExactHit => {
+                                let cache = self.log_items_cache.borrow();
+                                items.extend(cache.as_ref().unwrap().items.iter().cloned());
+                            }
+                            CacheStatus::CanExtend(old_count) => {
+                                // Parse only the new suffix, append to cached items.
+                                let cached = {
+                                    let mut cache = self.log_items_cache.borrow_mut();
+                                    let c = cache.as_mut().unwrap();
+                                    let new_items = parse_sse_log_more(
+                                        &sse.lines[old_count..],
+                                        &sse.line_times[old_count..],
+                                        wrap_width,
+                                        &mut c.parse_state,
+                                    );
+                                    c.items.extend(new_items);
+                                    c.line_count = line_count;
+                                    c.items.clone()
+                                };
+                                items.extend(cached);
+                            }
+                            CacheStatus::FullBuild => {
+                                let mut state = LogParseState::default();
+                                let content_items = parse_sse_log_more(
+                                    &sse.lines,
+                                    &sse.line_times,
+                                    wrap_width,
+                                    &mut state,
+                                );
+                                *self.log_items_cache.borrow_mut() = Some(LogItemsCache {
+                                    assignment_id: a.id.clone(),
+                                    line_count,
+                                    wrap_width,
+                                    items: content_items.clone(),
+                                    parse_state: state,
+                                });
+                                items.extend(content_items);
+                            }
                         }
                     }
                     if sse.done {
@@ -15309,6 +15388,9 @@ impl CoordApp {
                                 line_count,
                                 wrap_width,
                                 items: content_items.clone(),
+                                // File-based path uses exact-match caching; parse_state is
+                                // unused here (file content is not parsed incrementally).
+                                parse_state: LogParseState::default(),
                             });
                             items.extend(content_items);
                         }
@@ -30774,7 +30856,22 @@ impl ShellApp for CoordApp {
             self.chat_last_activity = None;
             self.chat_spinner_throttle = 0;
         }
+        // #787: accumulate any tick-source redraw request and gate the
+        // actual Reaction::Redraw to at most CONTENT_REDRAW_MIN apart
+        // (≈15 fps).  `redraw_pending` stays true until a frame fires, so
+        // the trailing update always paints within one interval.
         if needs_redraw {
+            self.redraw_pending = true;
+        }
+        let (fire_now, new_last) = coalesce_redraw(
+            self.redraw_pending,
+            self.last_redraw_at,
+            Instant::now(),
+            CONTENT_REDRAW_MIN,
+        );
+        if fire_now {
+            self.redraw_pending = false;
+            self.last_redraw_at = new_last;
             Reaction::Redraw
         } else {
             Reaction::Continue
@@ -31261,6 +31358,102 @@ fn user_epoch_elapsed(user_epochs: &[Option<f64>], idx: usize) -> Option<std::ti
     None
 }
 
+/// #787: decide whether to emit a tick-driven redraw this frame.
+///
+/// Returns `(fire_now, new_last_redraw_at)`:
+/// - `(true, now)` when `pending` is set and at least `min` has elapsed since `last`.
+/// - `(false, last)` otherwise (caller should leave `last_redraw_at` unchanged).
+///
+/// Kept pure (no `Instant::now()` call inside) so unit tests can inject
+/// controlled `Instant` values without real-time delays.
+fn coalesce_redraw(
+    pending: bool,
+    last: Instant,
+    now: Instant,
+    min: Duration,
+) -> (bool, Instant) {
+    if pending && now.duration_since(last) >= min {
+        (true, now)
+    } else {
+        (false, last)
+    }
+}
+
+/// Incremental core of [`parse_sse_log_readable`].
+///
+/// Processes `new_lines`/`new_times` starting from `state`, mutating `state`
+/// to reflect the newly consumed lines so subsequent calls continue from where
+/// this one stopped.  The caller is responsible for slicing off only the lines
+/// that have not yet been processed.
+///
+/// This is the function [`LogItemsCache`] calls when new SSE lines arrive:
+/// instead of re-parsing thousands of accumulated lines from scratch, it parses
+/// only the lines appended since the last cache fill — O(new_lines) rather than
+/// O(total_lines).
+///
+/// # Correctness of incremental pre-pass
+///
+/// `user_epoch_per_turn` is a forward-only scan: it tracks `last_user_epoch`
+/// and appends an entry per `"type":"assistant"` event.  Because lines are
+/// append-only (SSE streams never prepend or reorder), extending the pre-pass
+/// with only the new suffix is equivalent to running it over all lines — earlier
+/// entries in `state.user_epochs` never change.
+fn parse_sse_log_more(
+    new_lines: &[String],
+    new_times: &[std::time::Instant],
+    wrap_width: usize,
+    state: &mut LogParseState,
+) -> Vec<ListItem> {
+    // Incremental pre-pass: extend user_epochs using only the new lines,
+    // starting from the last user epoch seen in prior calls.
+    for line in new_lines {
+        match json_str(line, "type").as_deref() {
+            Some("user") => {
+                if let Some(ts) = json_str(line, "timestamp") {
+                    state.last_user_epoch = parse_iso8601_to_epoch(&ts);
+                }
+            }
+            Some("assistant") => {
+                state.user_epochs.push(state.last_user_epoch);
+            }
+            _ => {}
+        }
+    }
+
+    let mut items = Vec::new();
+    for (i, line) in new_lines.iter().enumerate() {
+        let t = new_times.get(i).copied();
+        let elapsed = if json_str(line, "type").as_deref() == Some("assistant") {
+            // Prefer content-embedded user timestamps (survive replay bursts).
+            // Fall back to arrival-Instant for turns with no preceding user
+            // event (typically the very first inter-turn gap on a live stream).
+            let e = user_epoch_elapsed(&state.user_epochs, state.assistant_idx).or_else(|| {
+                t.and_then(|now| {
+                    state
+                        .last_assistant_time
+                        .map(|prev| now.duration_since(prev))
+                })
+            });
+            state.last_assistant_time = t;
+            state.assistant_idx += 1;
+            e
+        } else {
+            None
+        };
+        items.extend(parse_json_events_readable(
+            line,
+            &mut state.turn_n,
+            elapsed,
+            wrap_width,
+        ));
+        // Surface structured review verdict after result events.
+        if line.contains("\"type\":\"result\"") {
+            items.extend(extract_review_items(line));
+        }
+    }
+    items
+}
+
 /// Render SSE log lines using the readable (#385) format: wrapped prose,
 /// arrow-prefixed tool calls, one line per tool call, thinking on separate
 /// wrapped lines.  Used by both the Log tab and the live watch overlay.
@@ -31272,47 +31465,16 @@ fn user_epoch_elapsed(user_epochs: &[Option<f64>], idx: usize) -> Option<std::ti
 /// Arrival-`Instant` deltas are used as fallback for turns that have no
 /// preceding user event (e.g. the first inter-turn gap on live streams before
 /// the second user event arrives).
+///
+/// Delegates to [`parse_sse_log_more`] from a fresh [`LogParseState`] so that
+/// all callers (watch overlay, tests) are unaffected by the refactor.
 fn parse_sse_log_readable(
     lines: &[String],
     times: &[std::time::Instant],
     wrap_width: usize,
 ) -> Vec<ListItem> {
-    // Pre-pass: extract the last user.timestamp before each assistant turn so
-    // that per-turn deltas are computed from content timestamps, not from the
-    // moment of SSE reception (which collapses to a single Instant on replay).
-    let user_epochs = user_epoch_per_turn(lines.iter().map(|s| s.as_str()));
-
-    let mut items = Vec::new();
-    let mut turn_n: usize = 0;
-    let mut assistant_idx: usize = 0;
-    let mut last_assistant_time: Option<std::time::Instant> = None;
-    for (i, line) in lines.iter().enumerate() {
-        let t = times.get(i).copied();
-        let elapsed = if json_str(line, "type").as_deref() == Some("assistant") {
-            // Prefer content-embedded user timestamps (survive replay bursts).
-            // Fall back to arrival-Instant for turns with no preceding user
-            // event (typically the very first inter-turn gap on a live stream).
-            let e = user_epoch_elapsed(&user_epochs, assistant_idx).or_else(|| {
-                t.and_then(|now| last_assistant_time.map(|prev| now.duration_since(prev)))
-            });
-            last_assistant_time = t;
-            assistant_idx += 1;
-            e
-        } else {
-            None
-        };
-        items.extend(parse_json_events_readable(
-            line,
-            &mut turn_n,
-            elapsed,
-            wrap_width,
-        ));
-        // Surface structured review verdict after result events.
-        if line.contains("\"type\":\"result\"") {
-            items.extend(extract_review_items(line));
-        }
-    }
-    items
+    let mut state = LogParseState::default();
+    parse_sse_log_more(lines, times, wrap_width, &mut state)
 }
 
 /// Like `parse_log_content` but renders using the readable (#385) format.
@@ -32401,6 +32563,8 @@ mod tests {
             last_artifact_pulls: std::collections::HashMap::new(),
             artifact_pull_dialog: None,
             log_items_cache: std::cell::RefCell::new(None),
+            redraw_pending: false,
+            last_redraw_at: Instant::now(),
             test_plan_pending: std::collections::HashSet::new(),
             test_plan_staleness_checked_for: None,
             test_step_jobs: std::collections::HashMap::new(),
@@ -46086,6 +46250,200 @@ mod tests {
         assert!(
             !all_text.contains("+0s"),
             "should not show +0s deltas from collapsed Instants:\n{all_text}"
+        );
+    }
+
+    // ── #787: coalesce_redraw unit tests ─────────────────────────────────────
+
+    #[test]
+    fn coalesce_redraw_caps_rate() {
+        // Emits at most one redraw per CONTENT_REDRAW_MIN.  Simulate a
+        // sequence of ticks spaced 10 ms apart and confirm at most one
+        // redraw fires within any 66 ms window.
+        let t0 = Instant::now();
+        let min = CONTENT_REDRAW_MIN;
+
+        // First tick with pending=true: gap since t0 is 0 ms → should NOT fire.
+        let (fire, last) = coalesce_redraw(true, t0, t0, min);
+        assert!(!fire, "should not redraw when no time has elapsed");
+        assert_eq!(last, t0, "last_redraw_at must stay unchanged when not firing");
+
+        // Simulate 70 ms elapsed (past the 66 ms threshold).
+        let t70 = t0 + Duration::from_millis(70);
+        let (fire, last) = coalesce_redraw(true, t0, t70, min);
+        assert!(fire, "should redraw after >= CONTENT_REDRAW_MIN elapsed");
+        assert_eq!(last, t70, "last_redraw_at must update to `now` on fire");
+
+        // A second tick 5 ms after the last fire should NOT redraw again.
+        let t75 = t70 + Duration::from_millis(5);
+        let (fire2, last2) = coalesce_redraw(true, t70, t75, min);
+        assert!(!fire2, "must not redraw again within CONTENT_REDRAW_MIN");
+        assert_eq!(last2, t70, "last_redraw_at must be unchanged when not firing");
+    }
+
+    #[test]
+    fn coalesce_redraw_trailing_frame() {
+        // pending=true that persists until the interval elapses must always
+        // fire a "trailing frame" — the last update is never silently dropped.
+        let t0 = Instant::now();
+        let min = CONTENT_REDRAW_MIN;
+
+        // Not pending → never fires regardless of elapsed time.
+        let t_far = t0 + Duration::from_secs(10);
+        let (fire, _) = coalesce_redraw(false, t0, t_far, min);
+        assert!(!fire, "pending=false must never fire");
+
+        // pending=true, interval elapsed → must fire (the trailing frame).
+        let (fire, new_last) = coalesce_redraw(true, t0, t_far, min);
+        assert!(fire, "trailing frame must fire when pending && elapsed >= min");
+        assert_eq!(new_last, t_far);
+    }
+
+    // ── #787: incremental log parse correctness ───────────────────────────────
+
+    /// Property test: for many line sequences and split points, the incremental
+    /// `parse_sse_log_more` result must be **byte-identical** to a single
+    /// full `parse_sse_log_readable` over the same line slice.
+    ///
+    /// Exercises the stateful pre-pass (user_epochs) and the main render loop
+    /// with a realistic mix of system / assistant / user / result events.
+    #[test]
+    fn incremental_log_parse_matches_full() {
+        let lines: Vec<String> = vec![
+            r#"{"type":"system","subtype":"init","model":"claude-test"}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2024-01-01T00:00:30Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"pwd"}}]}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2024-01-01T00:01:00Z","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"/home"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All done!"}]}}"#.to_string(),
+            r#"{"type":"result","num_turns":3,"total_cost_usd":0.01,"duration_ms":90000,"stop_reason":"end_turn"}"#.to_string(),
+        ];
+        let now = std::time::Instant::now();
+        let times: Vec<std::time::Instant> = vec![now; lines.len()];
+        let wrap_width = 80;
+
+        // Full parse — reference result.
+        let full = parse_sse_log_readable(&lines, &times, wrap_width);
+
+        // Try every split point: parse [0..split] then [split..n] incrementally
+        // and verify the combined items match the full parse.
+        for split in 0..=lines.len() {
+            let mut state = LogParseState::default();
+            let part1 = parse_sse_log_more(&lines[..split], &times[..split], wrap_width, &mut state);
+            let part2 = parse_sse_log_more(&lines[split..], &times[split..], wrap_width, &mut state);
+            let mut combined = part1;
+            combined.extend(part2);
+
+            // Compare by rendering each item's spans to a string.
+            let render = |items: &[ListItem]| -> Vec<String> {
+                items
+                    .iter()
+                    .map(|item| {
+                        item.text
+                            .spans
+                            .iter()
+                            .map(|s| s.text.as_ref())
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .collect()
+            };
+
+            let full_rendered = render(&full);
+            let combined_rendered = render(&combined);
+            assert_eq!(
+                full_rendered, combined_rendered,
+                "incremental result must match full parse at split={split}/{n}\n\
+                 full:     {full_rendered:?}\n\
+                 combined: {combined_rendered:?}",
+                n = lines.len(),
+            );
+        }
+    }
+
+    // ── #787: TuiDriver black-box — streaming log renders content ─────────────
+
+    /// Verify that a synthetic SSE log attached to a Pipeline assignment
+    /// renders its content correctly through the full
+    /// `pipeline_log_list → render_content → TuiDriver` path.
+    ///
+    /// Ensures neither the redraw cap (Part 1) nor the incremental cache
+    /// (Part 2) drops or corrupts visible log output.
+    #[test]
+    fn tuidriver_streaming_log_renders_content() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        const LOG_TEXT: &str = "All systems operational — deployment verified";
+
+        // Build an assignment.
+        let asgn = make_assignment_typed("running", 55, "my-repo", Some("work"));
+        let aid = asgn.id.clone();
+
+        // Create the app with that assignment.
+        let mut app = make_test_app(BoardData {
+            assignments: vec![asgn],
+            ..BoardData::default()
+        });
+
+        // Populate pipeline_issues with a matching entry.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 55,
+            title: "Streaming log test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/my-repo".to_string(),
+            coord_repo: Some("my-repo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+        app.active_view = SidebarView::Pipeline;
+
+        // Inject synthetic SSE lines into the watch pool so pipeline_log_list
+        // picks them up (it prefers watch_pool over the HTTP-polling path).
+        let log_line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{LOG_TEXT}"}}]}}}}"#
+        );
+        let now = Instant::now();
+        let (_, rx) = std::sync::mpsc::channel::<SseWatchMsg>();
+        app.watch_pool.insert(
+            aid,
+            WatchContext {
+                state: WatchState {
+                    assignment_id: "id-55-running".to_string(),
+                    machine: "testmachine".to_string(),
+                    repo: "my-repo".to_string(),
+                    issue_number: 55,
+                    assignment_type: "work".to_string(),
+                    scroll: usize::MAX,
+                },
+                sse: WatchSseState {
+                    rx,
+                    lines: vec![log_line],
+                    line_times: vec![now],
+                    current_turn: 1,
+                    last_event_id: 0,
+                    fail_count: 0,
+                    first_fail_at: None,
+                    done: false,
+                    host: "testmachine".to_string(),
+                    pending_tail: String::new(),
+                },
+                inject_transcript: Vec::new(),
+                inject_sse_offsets: Vec::new(),
+                history_turns: Vec::new(),
+                last_focused_at: now,
+            },
+        );
+
+        // Render through the full CoordApp → ShellAdapter → TestBackend path.
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        assert!(
+            driver.screen_contains(LOG_TEXT),
+            "Streaming log content must appear on the Pipeline Log tab:\n{}",
+            driver.screen()
         );
     }
 
