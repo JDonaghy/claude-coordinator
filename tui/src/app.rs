@@ -10558,6 +10558,97 @@ impl CoordApp {
         }
     }
 
+    // ── #684: Start (automated) > Merge — headless queue drain ───────────────
+
+    /// True when the selected pipeline issue has an active `type="merge"`
+    /// assignment (i.e. an interactive `coord assign --merge-of` session is
+    /// currently running).  Used to guard the automated merge action so the
+    /// headless queue and the interactive agent never race on the same branch.
+    fn has_active_interactive_merge_for_issue(&self, issue_num: u64) -> bool {
+        self.data.assignments.iter().any(|a| {
+            a.issue_number == issue_num
+                && a.assignment_type.as_deref() == Some("merge")
+                && a.status == "running"
+        })
+    }
+
+    /// True when the merge queue already has a `state="merging"` entry for
+    /// `issue_num` — the headless queue is actively processing that branch.
+    /// Used to guard `start-merge-interactive` so an operator doesn't launch
+    /// an interactive `--merge-of` agent over a concurrent headless merge.
+    fn has_active_headless_merge_for_issue(&self, issue_num: u64) -> bool {
+        // Prefer merge_plan (v0.4.53+ daemon); fall back to raw merge_queue.
+        if !self.data.merge_plan.is_empty() {
+            self.data.merge_plan.iter().any(|e| {
+                e.issue_number == issue_num && e.status == "MERGING"
+            })
+        } else {
+            self.data.merge_queue.iter().any(|e| {
+                e.issue_number == Some(issue_num) && e.state == "merging"
+            })
+        }
+    }
+
+    /// `coord merge --order <assignment_id>` sourced from the Pipeline panel's
+    /// selected issue (the "Start (automated) > Merge" action, #684).
+    ///
+    /// Unlike `dispatch_merge_queue_merge` (which fires from the MergeQueue
+    /// panel and acts on the *currently selected queue entry*), this function
+    /// resolves the completed work assignment from the Pipeline selection and
+    /// feeds it to the same `coord merge --order` path.  `coord merge` handles
+    /// the idempotent enqueue step server-side before merging.
+    fn dispatch_merge_automated_for_selected_pipeline_issue(&mut self) -> bool {
+        let Some(aid) = self.selected_completed_work_aid() else {
+            self.push_toast(
+                "Start merge (automated)",
+                "No completed work assignment with a branch — cannot enqueue.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        // Guard: refuse if an interactive --merge-of session is already running
+        // for this issue — running both would race on the same branch.
+        let issue_num = self
+            .selected_issue_repo_and_key()
+            .map(|(_, k)| k.1)
+            .unwrap_or(0);
+        if self.has_active_interactive_merge_for_issue(issue_num) {
+            self.push_toast(
+                "Start merge (automated)",
+                "An interactive merge session is already running for this issue — \
+                 stop it first to avoid a branch race.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        }
+        let cmd_strs: Vec<String> = vec![
+            "merge".to_string(),
+            "--order".to_string(),
+            aid.clone(),
+        ];
+        let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&cmd_refs) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Merge queued (automated)",
+                    &format!("coord merge --order {}", &aid[..aid.len().min(8)]),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "⏳ Queued",
+                    "merge runs after current command",
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Deduped => false,
+        }
+    }
+
     /// Launch `coord assign --interactive --merge-of <assignment_id>` in the
     /// standalone Terminal pane (SidebarView::Terminal), reusing the same PTY
     /// infrastructure as Chat/Troubleshoot modes.
@@ -11975,6 +12066,7 @@ impl CoordApp {
                 ),
             }],
             bg: None,
+            focused_index: None,
         })
     }
 
@@ -18347,10 +18439,21 @@ impl CoordApp {
                 // dispatch_pipeline_work/plan refuses a duplicate on an already-
                 // active issue gracefully.
                 // `start-skip-plan` = work directly; `start-with-plan` = plan-then-work.
-                let automated_children = vec![
+                // #684: `start-merge-automated` = headless merge via the existing
+                // merge queue (`coord merge --order <aid>`).  Gated on a completed
+                // work assignment; disabled when an interactive --merge-of session
+                // is already running for this issue (branch-race guard).
+                let mut automated_children = vec![
                     ContextMenuItem::action("start-skip-plan", "Work"),
                     ContextMenuItem::action("start-with-plan", "Plan"),
                 ];
+                let mut auto_merge_item =
+                    ContextMenuItem::action("start-merge-automated", "Merge");
+                auto_merge_item.disabled = self.selected_completed_work_aid().is_none()
+                    || issue_number
+                        .map(|n| self.has_active_interactive_merge_for_issue(n))
+                        .unwrap_or(false);
+                automated_children.push(auto_merge_item);
                 items.push(ContextMenuItem::parent("Start (automated)", automated_children));
 
                 // #685: "Set test mode" — pick smoke vs auto policy for headless Work.
@@ -18808,6 +18911,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
+                table: None,
             });
         }
 
@@ -18854,6 +18958,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
+                table: None,
             });
         }
 
@@ -18888,6 +18993,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
+                table: None,
             });
         }
 
@@ -18926,6 +19032,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
+                table: None,
             });
         }
 
@@ -18960,6 +19067,7 @@ impl CoordApp {
                     placeholder: "description…".into(),
                     cursor: Some(buf.len()),
                 })),
+                table: None,
             });
         }
 
@@ -18992,6 +19100,7 @@ impl CoordApp {
                     placeholder: "reason…".into(),
                     cursor: Some(buf.len()),
                 })),
+                table: None,
             });
         }
 
@@ -19034,6 +19143,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
+                table: None,
             });
         }
 
@@ -19094,6 +19204,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
+                table: None,
             });
         }
 
@@ -19147,6 +19258,7 @@ impl CoordApp {
                     placeholder: "What did the reviewer flag? (required)".into(),
                     cursor: Some(p.findings.len()),
                 })),
+                table: None,
             });
         }
 
@@ -19191,6 +19303,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
+                table: None,
             });
         }
 
@@ -19233,6 +19346,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
+                table: None,
             });
         }
 
@@ -19269,6 +19383,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
                 input: None,
+                table: None,
             });
         }
 
@@ -19309,6 +19424,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
                 input: None,
+                table: None,
             });
         }
 
@@ -19344,6 +19460,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
                 input: None,
+                table: None,
             });
         }
 
@@ -19406,6 +19523,7 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
+                table: None,
             });
         }
 
@@ -19452,6 +19570,7 @@ impl CoordApp {
                 severity,
                 vertical_buttons: false,
                 input: None,
+                table: None,
             });
         }
 
@@ -19523,6 +19642,7 @@ impl CoordApp {
             button_width: btn_w,
             button_gap: lh,
             padding,
+            table_height: 0.0,
         };
         let layout = dialog.layout(viewport, measure, |_| {
             quadraui::ToolbarItemMeasure::new(0.0)
@@ -21865,6 +21985,7 @@ impl CoordApp {
                     },
                 ],
                 bg: None,
+                focused_index: None,
             };
             backend.draw_toolbar(bar_rect, &toolbar, None, None);
 
@@ -22431,9 +22552,32 @@ impl CoordApp {
                 true
             }
             // Leg 3c (#517, #306): human-attended merge agent launcher.
+            // #684: guard against launching an interactive session when the
+            // headless queue is already actively merging this branch.
             "start-merge-interactive" => {
-                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
-                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Merge);
+                let issue_num = self
+                    .selected_issue_repo_and_key()
+                    .map(|(_, k)| k.1)
+                    .unwrap_or(0);
+                if self.has_active_headless_merge_for_issue(issue_num) {
+                    self.push_toast(
+                        "Start merge (interactive)",
+                        "The headless merge queue is already merging this branch — \
+                         wait for it to finish (or drop it from the Merge Queue panel \
+                         first).",
+                        ToastSeverity::Warning,
+                    );
+                } else {
+                    self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                    self.launch_interactive_session_for_selected_issue(
+                        InteractiveLaunchMode::Merge,
+                    );
+                }
+                true
+            }
+            // #684: headless merge via the existing queue — `coord merge --order`.
+            "start-merge-automated" => {
+                self.dispatch_merge_automated_for_selected_pipeline_issue();
                 true
             }
             "start-with-plan" => {
@@ -22804,6 +22948,7 @@ impl CoordApp {
                 id: WidgetId::new("sidebar-action-bar"),
                 buttons,
                 bg: None,
+                focused_index: None,
             }),
             toolbar_height: Some(self.sidebar_action_bar_height(lh)),
         }
@@ -22990,6 +23135,7 @@ impl CoordApp {
             id: WidgetId::new("panel-toolbar"),
             buttons,
             bg: None,
+            focused_index: None,
         })
     }
 
@@ -25979,6 +26125,7 @@ impl CoordApp {
             severity: Some(DialogSeverity::Warning),
             vertical_buttons: false,
             input: None,
+            table: None,
         })
     }
 
@@ -43656,8 +43803,8 @@ mod tests {
 
     #[test]
     fn pipeline_row_start_automated_is_a_submenu_parent() {
-        // "Start (automated)" must contain Work and Plan as children with the
-        // correct action_ids.
+        // "Start (automated)" must contain Work, Plan, AND Merge as children
+        // with the correct action_ids.
         let app = make_app_default();
         let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
         let parent = items.iter().find(|i| i.label == "Start (automated)");
@@ -43668,6 +43815,187 @@ mod tests {
         let child_ids: Vec<&str> = children.iter().filter_map(|i| i.action_id.as_deref()).collect();
         assert!(child_ids.contains(&"start-skip-plan"), "Work (start-skip-plan) must be in automated submenu");
         assert!(child_ids.contains(&"start-with-plan"), "Plan (start-with-plan) must be in automated submenu");
+        assert!(child_ids.contains(&"start-merge-automated"), "#684: Merge must be in automated submenu");
+    }
+
+    // ── #684: Start (automated) > Merge ──────────────────────────────────────
+
+    #[test]
+    fn start_merge_automated_disabled_without_completed_work() {
+        // `start-merge-automated` must be disabled when no done work assignment
+        // with a branch exists for the selected issue.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let children = items
+            .iter()
+            .find(|i| i.label == "Start (automated)")
+            .and_then(|p| p.submenu.as_ref())
+            .expect("Start (automated) submenu");
+        let merge_item = children
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("start-merge-automated"))
+            .expect("start-merge-automated must exist");
+        assert!(
+            merge_item.disabled,
+            "#684: start-merge-automated must be disabled with no completed work"
+        );
+    }
+
+    #[test]
+    fn start_merge_automated_enabled_with_completed_work() {
+        // Once a done work assignment WITH a branch exists, `start-merge-automated`
+        // must be enabled (no interactive merge is running to block it).
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        let mut work = make_assignment_typed("done", 42, "api", Some("work"));
+        work.branch = Some("issue-42-feature".to_string()); // branch required by completed_work_aid_for
+        app.data.assignments.push(work);
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let children = items
+            .iter()
+            .find(|i| i.label == "Start (automated)")
+            .and_then(|p| p.submenu.as_ref())
+            .expect("Start (automated) submenu");
+        let merge_item = children
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("start-merge-automated"))
+            .expect("start-merge-automated must exist");
+        assert!(
+            !merge_item.disabled,
+            "#684: start-merge-automated must be enabled when completed work exists"
+        );
+    }
+
+    #[test]
+    fn start_merge_automated_disabled_when_interactive_merge_running() {
+        // `start-merge-automated` must be disabled when a `type="merge"` +
+        // `status="running"` assignment already exists — interactive vs headless
+        // race guard (#684).
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        // Completed work with a branch (normally enables the item).
+        let mut work = make_assignment_typed("done", 42, "api", Some("work"));
+        work.branch = Some("issue-42-feature".to_string());
+        app.data.assignments.push(work);
+        // Interactive merge session running — should disable the automated item.
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 42, "api", Some("merge")));
+        let items =
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let children = items
+            .iter()
+            .find(|i| i.label == "Start (automated)")
+            .and_then(|p| p.submenu.as_ref())
+            .expect("Start (automated) submenu");
+        let merge_item = children
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("start-merge-automated"))
+            .expect("start-merge-automated must exist");
+        assert!(
+            merge_item.disabled,
+            "#684: start-merge-automated must be disabled when interactive merge is running"
+        );
+    }
+
+    #[test]
+    fn dispatch_merge_automated_spawns_coord_merge_order() {
+        // Dispatching `start-merge-automated` must run `coord merge --order <aid>`.
+        // Verify via `running_info()` — the label is "coord merge --order <aid>".
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        // Completed work assignment on issue 42 / repo "api".
+        let mut work = make_assignment_typed("done", 42, "api", Some("work"));
+        work.branch = Some("issue-42-feature".to_string());
+        let work_id = work.id.clone();
+        app.data.assignments.push(work);
+
+        let dispatched = app.dispatch_merge_automated_for_selected_pipeline_issue();
+        assert!(dispatched, "dispatch must return true when work aid is found");
+        // The label produced by CommandRunner is "coord <argv...>" joined.
+        let label = app
+            .command_runner
+            .running_info()
+            .map(|(l, _)| l.to_string())
+            .unwrap_or_default();
+        assert!(
+            label.contains("merge"),
+            "spawned command must contain 'merge', got: {label:?}"
+        );
+        assert!(
+            label.contains("--order"),
+            "spawned command must contain '--order', got: {label:?}"
+        );
+        assert!(
+            label.contains(&work_id),
+            "spawned command must contain the work assignment id {work_id:?}, got: {label:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_merge_automated_toasts_when_interactive_merge_running() {
+        // When an interactive merge session is running, the dispatch must toast
+        // a warning and NOT spawn `coord merge` (#684 race guard).
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        let mut work = make_assignment_typed("done", 42, "api", Some("work"));
+        work.branch = Some("issue-42-feature".to_string());
+        app.data.assignments.push(work);
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 42, "api", Some("merge")));
+
+        let toasts_before = app.toasts.len();
+        let dispatched = app.dispatch_merge_automated_for_selected_pipeline_issue();
+        assert!(!dispatched, "dispatch must return false when interactive merge is running");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "must push a warning toast when interactive merge blocks"
+        );
+        assert!(
+            !app.command_runner.is_running(),
+            "must NOT spawn coord merge when interactive merge is running"
+        );
+    }
+
+    #[test]
+    fn start_merge_interactive_toasts_when_headless_merging() {
+        // `start-merge-interactive` must push a warning toast (and NOT launch
+        // an interactive session) when the headless queue is in MERGING state
+        // for the selected issue (#684 clash guard).
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        // Headless queue is actively merging issue 42.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w42".to_string(),
+            issue_number: Some(42),
+            state: "merging".to_string(),
+            pr_number: Some(999),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            milestone_title: None,
+        });
+
+        let toasts_before = app.toasts.len();
+        let target = pipeline_target(Some(42));
+        let fired = app.dispatch_context_menu_action("start-merge-interactive", &target);
+        assert!(fired, "action must be 'handled' (return true)");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "must push a warning toast when headless queue is MERGING"
+        );
+        assert!(
+            !app.command_runner.is_running(),
+            "must NOT launch an interactive session when headless merge is active"
+        );
     }
 
     #[test]
