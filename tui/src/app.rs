@@ -16053,6 +16053,20 @@ impl CoordApp {
                                     })
                                     .unwrap_or(false)
                             }
+                            // #675/#790: Board Terminal tab shares detail_terminal_sessions
+                            // with Pipeline Terminal — must peek the same way so host-select
+                            // vs PTY-forward arbitration is consistent with Pipeline.
+                            SidebarView::Board
+                                if self.board_detail_tab == BoardDetailTab::Terminal =>
+                            {
+                                self.selected_issue_key()
+                                    .and_then(|k| {
+                                        self.detail_terminal_sessions
+                                            .get(&k)
+                                            .map(|s| s.mouse_reporting_enabled())
+                                    })
+                                    .unwrap_or(false)
+                            }
                             _ => false,
                         }
                     };
@@ -16089,8 +16103,7 @@ impl CoordApp {
                             self.terminal_shift_drag_hint_shown = true;
                             self.push_toast(
                                 "Terminal selection",
-                                "Hold Shift to select & copy text \
-                                 (Shift+drag, then Ctrl+C).",
+                                "Hold Shift while dragging to select text.",
                                 ToastSeverity::Info,
                             );
                         }
@@ -16994,6 +17007,21 @@ impl CoordApp {
                 }
                 false
             }
+            // #675/#790: Board Terminal tab mirrors Pipeline Terminal routing —
+            // shares detail_terminal_sessions and the same tab-bar geometry.
+            SidebarView::Board if self.board_detail_tab == BoardDetailTab::Terminal => {
+                let content_y = main_b.y + detail_tab_bar_height(lh);
+                if let Some((col, row)) =
+                    terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+                {
+                    if let Some(issue_key) = self.selected_issue_key() {
+                        if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) {
+                            return sess.forward_mouse(kind, button, col, row, modifiers);
+                        }
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -17052,6 +17080,24 @@ impl CoordApp {
                 }
                 false
             }
+            // #675/#790: Board Terminal tab mirrors Pipeline Terminal routing.
+            SidebarView::Board if self.board_detail_tab == BoardDetailTab::Terminal => {
+                let content_y = main_b.y + detail_tab_bar_height(lh);
+                let (col, row) =
+                    terminal_pixel_to_cell_clamped(pos, main_b, content_y, char_w, lh);
+                if let Some(issue_key) = self.selected_issue_key() {
+                    if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) {
+                        return sess.forward_mouse(
+                            TerminalMouseKind::Release,
+                            button,
+                            col,
+                            row,
+                            Modifiers::default(),
+                        );
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -17080,6 +17126,12 @@ impl CoordApp {
                 let content_y = main_b.y + detail_tab_bar_height(lh);
                 terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
             }
+            // #675/#790: Board Terminal tab shares the same tab-bar geometry as
+            // Pipeline Terminal (same detail_tab_bar_height offset).
+            SidebarView::Board if self.board_detail_tab == BoardDetailTab::Terminal => {
+                let content_y = main_b.y + detail_tab_bar_height(lh);
+                terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
+            }
             _ => None,
         }
     }
@@ -17097,6 +17149,11 @@ impl CoordApp {
                 let key = self.selected_issue_key()?;
                 self.detail_terminal_sessions.get_mut(&key)
             }
+            // #675/#790: Board Terminal tab uses the same detail_terminal_sessions.
+            SidebarView::Board if self.board_detail_tab == BoardDetailTab::Terminal => {
+                let key = self.selected_issue_key()?;
+                self.detail_terminal_sessions.get_mut(&key)
+            }
             _ => None,
         }
     }
@@ -17108,6 +17165,11 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
+                let key = self.selected_issue_key()?;
+                self.detail_terminal_sessions.get(&key)?.selected_text()
+            }
+            // #675/#790: Board Terminal tab uses the same detail_terminal_sessions.
+            SidebarView::Board if self.board_detail_tab == BoardDetailTab::Terminal => {
                 let key = self.selected_issue_key()?;
                 self.detail_terminal_sessions.get(&key)?.selected_text()
             }
@@ -23869,13 +23931,13 @@ impl CoordApp {
     /// the layout doesn't shift when switching to/from this view.
     /// #790: one-line hint shown at the bottom of a terminal pane whose PTY
     /// session has mouse-reporting enabled.  Tells the user that Shift+drag
-    /// overrides the PTY's grab so they can select & copy text.
+    /// overrides the PTY's grab so they can select text.
     fn terminal_mouse_hint_list(id_suffix: &str) -> ListView {
         ListView {
             id: WidgetId::new(format!("terminal-mouse-hint:{}", id_suffix)),
             title: None,
             items: vec![activity_item(
-                "  Shift+drag = select · Ctrl+C = copy",
+                "  Hold Shift + drag to select text",
                 Color::rgb(120, 140, 120),
             )],
             selected_idx: 0,
@@ -48970,16 +49032,24 @@ mod tests {
         app.active_view = SidebarView::Terminal;
         app.terminal_session = Some(sess);
 
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
 
         assert!(
-            driver.screen_contains("Shift+drag"),
+            driver.screen_contains("Hold Shift"),
             "hint strip must render when mouse reporting is ON:\n{}",
             driver.screen(),
         );
         assert!(
-            driver.screen_contains("Ctrl+C"),
-            "hint strip must include Ctrl+C copy affordance:\n{}",
+            driver.screen_contains("select text"),
+            "hint strip must mention 'select text':\n{}",
+            driver.screen(),
+        );
+        // Ctrl+C is intentionally absent from the hint (it only works with a
+        // prior Shift+drag selection and its behaviour depends on the platform
+        // clipboard — advertising it unconditionally is misleading).
+        assert!(
+            !driver.screen_contains("Ctrl+C"),
+            "hint strip must NOT advertise Ctrl+C (removed in #790 fix):\n{}",
             driver.screen(),
         );
     }
@@ -49006,11 +49076,81 @@ mod tests {
         app.active_view = SidebarView::Terminal;
         app.terminal_session = Some(sess);
 
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
 
         assert!(
-            !driver.screen_contains("Shift+drag"),
+            !driver.screen_contains("Hold Shift"),
             "hint strip must NOT render when mouse reporting is OFF:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// A plain left-press (no Shift) in a PTY pane with mouse reporting active
+    /// fires the one-shot discovery toast and sets `terminal_shift_drag_hint_shown`.
+    ///
+    /// Regression guard for the finding that the toast code path was untested:
+    /// this drives the full `TuiDriver` render + mouse-down dispatch so the
+    /// event goes through `handle_mouse → terminal_mouse_event → forward_mouse`
+    /// and the toast appears on the rendered screen.
+    #[test]
+    #[cfg(unix)]
+    fn terminal_plain_press_fires_shift_drag_discovery_toast() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        fn poll_until_ms(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = std::time::Instant::now();
+            let limit = std::time::Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        }
+
+        let cwd = std::env::temp_dir();
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Enable SGR mouse-reporting so plain drags are forwarded to the PTY
+        // rather than handled as host-side text selection.
+        sess.send_str("printf '\\033[?1000h'\n");
+        assert!(
+            poll_until_ms(&mut sess, 3000, |s| s.mouse_reporting_enabled()),
+            "mouse reporting did not turn on within 3 s"
+        );
+
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        app.terminal_session = Some(sess);
+        // Confirm the toast has NOT fired yet (initial state).
+        assert!(
+            !app.terminal_shift_drag_hint_shown,
+            "terminal_shift_drag_hint_shown must start false"
+        );
+
+        // 120×40 screen; default sidebar width = 35 → main/terminal area
+        // starts at x=35.  Click at (70, 20) — well inside the terminal
+        // content, no Shift modifier.
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.click(70.0, 20.0);
+
+        // The one-shot discovery toast must be visible on the next rendered frame.
+        assert!(
+            driver.screen_contains("Terminal selection"),
+            "discovery toast title must appear after a plain PTY press:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("Hold Shift"),
+            "discovery toast body must mention 'Hold Shift':\n{}",
             driver.screen(),
         );
     }
