@@ -6824,24 +6824,19 @@ def _apply_label_change(
     success_message: str,
     no_op_message: str | None = None,
 ) -> None:
-    """Shared backbone for the four label-change commands (#260/#261/#266).
+    """Shared backbone for the lifecycle label-change commands (#260/#261/#266/#802).
 
-    Resolves *repo* via ``coordinator.yml``, fetches the issue's current
-    labels via ``gh issue view``, computes the post-edit label set, runs
-    ``gh issue edit`` with only the labels that are actually present
-    (``--remove-label`` errors on unknown repo labels), then writes the
-    new label set to the local ``issues`` cache so the TUI's next data
-    refresh tick reflects the change without waiting for the 5-minute
-    ``coord sync`` throttle.
+    Resolves *repo* via ``coordinator.yml``, then delegates to
+    ``state.apply_issue_labels`` which routes through the daemon seam
+    (GitHub via ``gh`` today; GitLab / bare-DB later) — the same seam
+    ``coord issue label`` uses.  The local ``issues`` cache is updated
+    inside the seam so the TUI reflects the change on its next tick.
 
-    ``no_op_message`` (optional) is echoed when there are no add/remove
-    ops to perform — used by ``coord backlog`` to say "already in
-    Backlog" instead of running a no-op ``gh issue edit``.
+    ``no_op_message`` (optional) is echoed when no labels were actually
+    added or removed — used by ``coord backlog`` to say "already in
+    Backlog" instead of making a no-op ``gh`` call.
     """
-    import subprocess as _sp  # noqa: PLC0415
-    import json as _json  # noqa: PLC0415
-
-    from coord.state import update_issue_labels  # noqa: PLC0415
+    from coord.state import apply_issue_labels  # noqa: PLC0415
 
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
@@ -6851,48 +6846,19 @@ def _apply_label_change(
     slug = repo_entry.github
 
     try:
-        view = _sp.run(
-            ["gh", "issue", "view", str(issue), "--repo", slug, "--json", "labels"],
-            capture_output=True, text=True, timeout=15,
+        _new_labels, changed = apply_issue_labels(
+            repo, issue,
+            add=add,
+            remove=remove_if_present,
+            repo_github=slug,
         )
-    except (_sp.TimeoutExpired, OSError) as e:
-        click.echo(f"error: failed to run gh view: {e}", err=True)
-        sys.exit(1)
-    if view.returncode != 0:
-        click.echo(f"gh failed: {view.stderr.strip()}", err=True)
-        sys.exit(1)
-    try:
-        current = {lbl.get("name", "") for lbl in _json.loads(view.stdout).get("labels", [])}
-    except _json.JSONDecodeError as e:
-        click.echo(f"could not parse gh view output: {e}", err=True)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: label change failed: {e}", err=True)
         sys.exit(1)
 
-    to_add = add - current
-    to_remove = remove_if_present & current
-    if not to_add and not to_remove:
-        if no_op_message is not None:
-            click.echo(no_op_message)
-        else:
-            click.echo(success_message)
+    if not changed and no_op_message is not None:
+        click.echo(no_op_message)
         return
-
-    args = ["gh", "issue", "edit", str(issue), "--repo", slug]
-    for lbl in sorted(to_add):
-        args.extend(["--add-label", lbl])
-    for lbl in sorted(to_remove):
-        args.extend(["--remove-label", lbl])
-
-    try:
-        result = _sp.run(args, capture_output=True, text=True, timeout=15)
-    except (_sp.TimeoutExpired, OSError) as e:
-        click.echo(f"error: failed to run gh edit: {e}", err=True)
-        sys.exit(1)
-    if result.returncode != 0:
-        click.echo(f"gh failed: {result.stderr.strip()}", err=True)
-        sys.exit(1)
-
-    new_labels = sorted((current - to_remove) | to_add)
-    update_issue_labels(repo, issue, new_labels)
 
     click.echo(success_message)
 
@@ -7611,6 +7577,125 @@ def issue_edit_cmd(
         click.echo(f"error: issue edit failed: {e}", err=True)
         sys.exit(1)
     click.echo(f"#{issue} ({slug}) updated" if updated else f"#{issue} ({slug}): no change")
+
+
+@issue_group.command(
+    "create",
+    help=(
+        "Create a new GitHub issue through the backend-agnostic seam. REPO "
+        "is the local repo name from coordinator.yml. Prints the new issue "
+        "number on success.\n\n"
+        "Use --body-file for long markdown bodies (avoids shell-quoting "
+        "issues). '-' reads from stdin. Routes through the daemon seam so "
+        "agents never need to call `gh issue create` directly."
+    ),
+)
+@click.argument("repo")
+@click.option("--title", required=True, help="Issue title.")
+@click.option("--body", default=None, help="Issue body (markdown).")
+@click.option(
+    "--body-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Read the body from a file. '-' = stdin.",
+)
+@click.option(
+    "--label",
+    "labels",
+    multiple=True,
+    help="Label to add (repeatable). The label must already exist in the repo.",
+)
+@_CONFIG_OPTION
+def issue_create_cmd(
+    repo: str,
+    title: str,
+    body: str | None,
+    body_file: Path | None,
+    labels: tuple[str, ...],
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    if body_file is not None:
+        body = sys.stdin.read() if str(body_file) == "-" else Path(body_file).read_text()
+    from coord.state import create_issue as _create_issue  # noqa: PLC0415
+
+    try:
+        result = _create_issue(
+            repo, title, body or "",
+            labels=list(labels),
+            repo_github=slug,
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: issue create failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"#{result['number']} ({slug}) created")
+
+
+@issue_group.command(
+    "label",
+    help=(
+        "Add and/or remove arbitrary labels on an existing issue through the "
+        "backend-agnostic seam. REPO is the local repo name from "
+        "coordinator.yml; ISSUE is the GH issue number.\n\n"
+        "Provide --add and/or --remove (both repeatable). Already-present "
+        "labels in --add and already-absent labels in --remove are "
+        "silently ignored (idempotent). Updates the local issues cache so "
+        "the TUI reflects the change without waiting for `coord sync`.\n\n"
+        "Routes through the daemon seam so agents never need to call "
+        "`gh issue edit` directly."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--add",
+    "add_labels",
+    multiple=True,
+    help="Label to add (repeatable).",
+)
+@click.option(
+    "--remove",
+    "remove_labels",
+    multiple=True,
+    help="Label to remove (repeatable).",
+)
+@_CONFIG_OPTION
+def issue_label_cmd(
+    repo: str,
+    issue: int,
+    add_labels: tuple[str, ...],
+    remove_labels: tuple[str, ...],
+    config_path: Path,
+) -> None:
+    if not add_labels and not remove_labels:
+        click.echo("error: provide --add and/or --remove", err=True)
+        sys.exit(2)
+    from coord.state import apply_issue_labels  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    try:
+        _new_labels, changed = apply_issue_labels(
+            repo, issue,
+            add=set(add_labels),
+            remove=set(remove_labels),
+            repo_github=slug,
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: issue label failed: {e}", err=True)
+        sys.exit(1)
+    if changed:
+        parts: list[str] = []
+        if add_labels:
+            parts.append(f"+{{{', '.join(sorted(add_labels))}}}")
+        if remove_labels:
+            parts.append(f"-{{{', '.join(sorted(remove_labels))}}}")
+        click.echo(f"#{issue} ({slug}) labels updated: {' '.join(parts)}")
+    else:
+        click.echo(f"#{issue} ({slug}) labels unchanged (no delta)")
 
 
 @main.group("context")

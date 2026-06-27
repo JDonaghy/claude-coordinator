@@ -463,6 +463,60 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"updated": bool(updated)})
 
+    async def post_issue_label(request: Request) -> Response:
+        # #802: generic add/remove of arbitrary labels through the seam.
+        # The actual gh call runs HERE on the daemon so the tracker stays
+        # behind one seam; the client just sends (repo_name, issue_number,
+        # add[], remove[]) and gets back (labels[], changed).
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            new_labels, changed = state._apply_issue_labels_local(
+                body["repo_name"],
+                body["issue_number"],
+                add=set(body.get("add") or []),
+                remove=set(body.get("remove") or []),
+                repo_github=body.get("repo_github"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-label write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"labels": new_labels, "changed": changed})
+
+    async def post_issue_create(request: Request) -> Response:
+        # #802: create a new GitHub issue through the seam.
+        # The actual gh call runs HERE on the daemon; the client sends
+        # (repo_name, title, body, labels[], repo_github) and gets back
+        # {"number": N, "url": "..."}.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            result = state._create_issue_local(
+                body["repo_name"],
+                body["title"],
+                body.get("body") or "",
+                labels=body.get("labels") or [],
+                repo_github=body.get("repo_github"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-create failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(result)
+
     async def get_issue_context(request: Request) -> Response:
         # #603: read an issue's raw context entries (oldest-first) for the
         # briefing read-path / `coord context show` on a thin client.
@@ -895,6 +949,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/assignment-usage", post_assignment_usage, methods=["POST"]),
         Route("/issue-labels", post_issue_labels, methods=["POST"]),
+        Route("/issue-label", post_issue_label, methods=["POST"]),
+        Route("/issue-create", post_issue_create, methods=["POST"]),
         Route("/issues-sync", post_issues_sync, methods=["POST"]),
         Route("/issue-edit", post_issue_edit, methods=["POST"]),
         Route("/issue-context", get_issue_context, methods=["GET"]),
