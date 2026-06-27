@@ -1829,6 +1829,29 @@ class TestStagingItems:
         items = mq.staging_items(board, cfg)
         assert items == []
 
+    def test_excluded_when_branch_already_queued_by_different_assignment(
+        self, coord_db
+    ) -> None:
+        """A fix dispatched after the original work was enqueued must not
+        appear in staging, even though its assignment_id differs from the
+        queued entry.  Branch-level dedup catches this (#778 smoke-test
+        failure: fix-1 cycled in/out of staging every ~30 s)."""
+        branch = "issue-42-original"
+        # The original work (different aid) is already in the queue.
+        original_work = self._work("w-orig", branch=branch, issue_number=42)
+        # A fix worker shares the same branch but has a fresh assignment_id.
+        fix_work = self._work("w-fix", branch=branch, issue_number=42, test_state=None)
+        rev = self._review("w-fix")
+        board = self._board(completed=[original_work, fix_work, rev])
+        # Queue contains the original assignment_id — NOT the fix's.
+        save_queue([_q("w-orig", branch=branch)])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        # The fix must be excluded: its branch is already in the queue.
+        assert items == [], (
+            f"Expected no staging items but got: {items}"
+        )
+
     def test_excluded_when_issue_already_merged(self, coord_db) -> None:
         """Items from an issue with a MERGED queue entry are excluded."""
         work = self._work("w1", issue_number=42)
