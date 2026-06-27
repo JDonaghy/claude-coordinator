@@ -744,6 +744,164 @@ def reorder(items: list[QueuedMerge], order: list[str]) -> list[QueuedMerge]:
     return head + tail
 
 
+# ── Staging section (#778) ────────────────────────────────────────────────────
+
+# Status values for StagingItem.status — never stored in the DB.
+STAGING_READY = "ready"      # all gates pass; will be enqueued on the next tick
+STAGING_BLOCKED = "blocked"  # at least one non-review gate is failing
+
+
+@dataclass
+class StagingItem:
+    """One entry in the 'approved but not yet queued' staging section.
+
+    Populated by :func:`staging_items` which scans the board for completed
+    work assignments that have an approved review (or don't need one) but
+    have not yet been admitted to the merge queue.  Exposed on ``/board`` so
+    thin clients (TUI, phone webapp) can answer "did my PR make it in?" without
+    a manual ``coord merge --dry-run``.
+    """
+
+    assignment_id: str
+    repo_name: str
+    issue_number: int
+    issue_title: str
+    branch: str
+    status: str          # STAGING_READY | STAGING_BLOCKED
+    reason: str | None   # None when ready; human-readable gate failure when blocked
+
+
+def _work_has_approved_review_a(a, board) -> bool:
+    """True when *a* (a work Assignment) has an approved review on *board*.
+
+    Mirrors :func:`has_approved_review` but accepts a raw Assignment rather
+    than a QueuedMerge entry, since staging items are not yet in the queue.
+    Handles bounce/fix chains: any work assignment on the same branch counts.
+    """
+    pool = (
+        list(getattr(board, "completed", []) or [])
+        + list(getattr(board, "active", []) or [])
+    )
+    aid = getattr(a, "assignment_id", None)
+    branch = getattr(a, "branch", None)
+
+    # Seed with the entry's own id, then expand to any work assignment sharing
+    # the branch (e.g. a fix worker dispatched after a review bounce).
+    branch_work_ids: set[str] = set()
+    if aid:
+        branch_work_ids.add(aid)
+    for x in pool:
+        if getattr(x, "type", None) != "work":
+            continue
+        x_aid = getattr(x, "assignment_id", None)
+        if x_aid and branch and getattr(x, "branch", None) == branch:
+            branch_work_ids.add(x_aid)
+
+    if not branch_work_ids:
+        return False
+
+    for x in pool:
+        if getattr(x, "type", None) != "review":
+            continue
+        if getattr(x, "review_of_assignment_id", None) not in branch_work_ids:
+            continue
+        if getattr(x, "review_verdict", None) == "approve":
+            return True
+    return False
+
+
+def staging_items(board, config) -> list[StagingItem]:
+    """Return work assignments that are done+approved but not yet in the queue.
+
+    Scans ``board.completed`` for ``type=work, status=done`` assignments and
+    returns one :class:`StagingItem` per candidate that has an approved review
+    (or doesn't need one) but hasn't yet been admitted to the merge queue.
+    Each item is classified:
+
+    * ``STAGING_READY``   — all gates pass; will be enqueued on the next daemon
+      tick (typically within 30 s of approval).
+    * ``STAGING_BLOCKED`` — the smoke / test gate is failing; the item cannot
+      enter the queue until the operator records a verdict (``coord test
+      --passed`` / ``--skipped``).
+
+    Items that have NOT received an approved review are silently excluded so
+    that the staging section only shows work the pipeline has already green-lit.
+
+    The function is intentionally **read-only**: no DB writes, no GitHub API
+    calls.  Pass ``board=None`` or ``config=None`` to skip gate evaluation
+    (useful in tests that only care about filtering logic).
+    """
+    existing_queue = load_queue()
+
+    # Fast-lookup: assignment IDs already in the queue (any state).
+    queued_aids: set[str] = {x.assignment_id for x in existing_queue}
+
+    # Fast-lookup: (repo_name, issue_number) pairs already MERGED so we skip
+    # issues whose prior attempt was already shipped.
+    already_merged: set[tuple[str, int]] = {
+        (x.repo_name, x.issue_number)
+        for x in existing_queue
+        if x.state == MERGED
+    }
+
+    result: list[StagingItem] = []
+    completed = list(getattr(board, "completed", []) or [])
+
+    for a in completed:
+        if getattr(a, "type", None) != "work":
+            continue
+        if getattr(a, "status", None) != "done":
+            continue
+
+        aid = getattr(a, "assignment_id", None)
+        branch = getattr(a, "branch", None)
+        if not aid or not branch:
+            continue
+
+        repo_name = getattr(a, "repo_name", None) or ""
+        issue_number = int(getattr(a, "issue_number", 0) or 0)
+        issue_title = getattr(a, "issue_title", None) or ""
+
+        # Skip items already tracked in the queue.
+        if aid in queued_aids:
+            continue
+
+        # Skip if the issue has already been merged via a prior work attempt.
+        if (repo_name, issue_number) in already_merged:
+            continue
+
+        # Gate: review.  Skip entirely when review is required but NOT yet
+        # approved — the item isn't "approved" yet and should not appear in the
+        # staging section (it belongs to the pipeline, not the merge staging).
+        if config is not None and board is not None:
+            if requires_review(a, config) and not _work_has_approved_review_a(a, board):
+                continue
+
+        # Gate: smoke.  When the test gate is enabled and no verdict exists,
+        # the item appears as BLOCKED rather than being silently excluded.
+        status = STAGING_READY
+        reason: str | None = None
+        if config is not None and board is not None:
+            if requires_smoke(a, config) and getattr(a, "test_state", None) not in (
+                "passed",
+                "skipped",
+            ):
+                status = STAGING_BLOCKED
+                reason = "test verdict missing"
+
+        result.append(StagingItem(
+            assignment_id=aid,
+            repo_name=repo_name,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            branch=branch,
+            status=status,
+            reason=reason,
+        ))
+
+    return result
+
+
 # ── Processing ───────────────────────────────────────────────────────────
 
 @dataclass

@@ -1096,6 +1096,34 @@ struct RawMachine {
     repos: Vec<String>,
 }
 
+/// #778: one entry in the "approved but not yet queued" staging section.
+///
+/// Mirrors `coord.merge_queue.StagingItem` on the Python side.  Populated
+/// by `staging_items()` server-side; the TUI receives it via the `/board`
+/// JSON payload and also computes it locally in `load_data`.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct StagingEntry {
+    /// Wire field — present for future right-click / force-enqueue actions.
+    #[allow(dead_code)]
+    assignment_id: String,
+    /// Wire field — present for future per-repo grouping.
+    #[allow(dead_code)]
+    repo_name: String,
+    issue_number: i64,
+    issue_title: String,
+    /// Wire field — present for future branch-detail display.
+    #[allow(dead_code)]
+    branch: String,
+    /// `"ready"` — all gates pass, will enqueue on next daemon tick.
+    /// `"blocked"` — at least one non-review gate is failing.
+    #[serde(default)]
+    status: String,
+    /// Human-readable gate failure when `status == "blocked"`, e.g.
+    /// `"test verdict missing"`.  `None` when ready.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 /// #584: the top-level `coord serve` /board payload.
 ///
 /// serde ignores unknown JSON keys by default, so the many extra columns the
@@ -1131,6 +1159,11 @@ struct BoardPayload {
     /// board_meta key → STRING value (JSON-encoded for the pipeline_* keys).
     #[serde(default)]
     board_meta: std::collections::HashMap<String, String>,
+    /// #778: approved/done work not yet in the merge queue.  Computed
+    /// server-side by `staging_items()`; empty when the board daemon is not
+    /// running (the local SQLite path computes its own in `load_data`).
+    #[serde(default)]
+    merge_staging: Vec<StagingEntry>,
 }
 
 /// Parsed fields from a successful `/health` HTTP response.
@@ -2548,6 +2581,9 @@ struct BoardData {
     /// TUI just loads the JSON blob and renders it in the Plan stage
     /// content panel.
     plans: std::collections::HashMap<String, PlanData>,
+    /// #778: approved/done work not yet in the merge queue.  Computed
+    /// locally in `load_data` or received from the `/board` JSON payload.
+    merge_staging: Vec<StagingEntry>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.
@@ -3512,6 +3548,118 @@ fn tcp_probe(host: &str, port: u16) -> bool {
     rx.recv_timeout(Duration::from_millis(200)).unwrap_or(false)
 }
 
+/// #778: compute staging entries from data already in memory.
+///
+/// Mirrors `coord.merge_queue.staging_items()` but runs in Rust using the
+/// assignments and merge-queue entries already loaded from SQLite (or received
+/// in the remote payload).  This keeps the local-DB path working without
+/// requiring a `coord serve` daemon.
+///
+/// Gate checks performed:
+/// 1. **Review gate** (when `"review"` is in `pipeline_default_gates`): the
+///    work assignment must have a sibling review assignment with
+///    `review_verdict = "approve"`.  Items without an approved review are
+///    silently excluded (they're still "in pipeline", not "staging").
+/// 2. **Smoke gate** (when `"test"` is in `pipeline_default_gates`): the
+///    work assignment must carry `test_state = "passed"` or `"skipped"`.
+///    Items that fail this gate appear as BLOCKED with reason
+///    `"test verdict missing"`.
+///
+/// Items already in the merge queue (any state) and items from issues that
+/// already have a MERGED queue entry are excluded.
+fn compute_staging_local(
+    assignments: &[Assignment],
+    merge_queue: &[MergeQueueEntry],
+    pipeline_default_gates: &[String],
+) -> Vec<StagingEntry> {
+    let review_gate = pipeline_default_gates.iter().any(|g| g == "review");
+    let smoke_gate = pipeline_default_gates.iter().any(|g| g == "test");
+
+    // Fast-lookup sets.
+    let queued_aids: std::collections::HashSet<&str> =
+        merge_queue.iter().map(|e| e.assignment_id.as_str()).collect();
+    // Issue numbers for which a MERGED queue entry already exists.  We key
+    // on issue_number only (no repo cross-check) because in the local path
+    // MergeQueueEntry carries repo_github (the GitHub slug) while Assignment
+    // carries repo (the coord-local name) — there is no reliable mapping
+    // between the two without loading config.  False positives (two repos
+    // with the same issue number) are extremely rare and the penalty is only
+    // a temporarily missing staging row, so this approximation is acceptable.
+    let merged_issue_numbers: std::collections::HashSet<u64> = merge_queue
+        .iter()
+        .filter(|e| e.state == "merged")
+        .filter_map(|e| e.issue_number)
+        .collect();
+
+    // Build a quick look-up: assignment_id → list of (review_verdict) for
+    // reviews that point to it.  We need this to check the review gate.
+    // Key: work assignment_id; Value: true when at least one "approve" exists.
+    let mut approved_aids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for a in assignments {
+        if a.assignment_type.as_deref() != Some("review") {
+            continue;
+        }
+        if a.review_verdict.as_deref() != Some("approve") {
+            continue;
+        }
+        if let Some(ref of_aid) = a.review_of_assignment_id {
+            approved_aids.insert(of_aid.clone());
+        }
+    }
+
+    let mut result: Vec<StagingEntry> = Vec::new();
+
+    for a in assignments {
+        if a.assignment_type.as_deref() != Some("work") {
+            continue;
+        }
+        if a.status != "done" {
+            continue;
+        }
+        let branch = match a.branch.as_deref() {
+            Some(b) if !b.is_empty() => b.to_string(),
+            _ => continue,
+        };
+
+        // Skip items already in the queue.
+        if queued_aids.contains(a.id.as_str()) {
+            continue;
+        }
+
+        // Skip items from issues already MERGED.
+        if merged_issue_numbers.contains(&a.issue_number) {
+            continue;
+        }
+
+        // Review gate.
+        if review_gate && !approved_aids.contains(&a.id) {
+            continue; // not approved → not a staging item
+        }
+
+        // Smoke gate.
+        let (status, reason) = if smoke_gate
+            && !matches!(a.test_state.as_deref(), Some("passed") | Some("skipped"))
+        {
+            ("blocked".to_string(), Some("test verdict missing".to_string()))
+        } else {
+            ("ready".to_string(), None)
+        };
+
+        result.push(StagingEntry {
+            assignment_id: a.id.clone(),
+            repo_name: a.repo.clone(),
+            issue_number: a.issue_number as i64,
+            issue_title: a.issue_title.clone(),
+            branch,
+            status,
+            reason,
+        });
+    }
+
+    result
+}
+
 fn load_data() -> BoardData {
     // #584: when a board service is configured (env or ~/.coord/client.toml),
     // fetch the read-only board projection over HTTP from the `coord serve`
@@ -3779,6 +3927,15 @@ fn load_data() -> BoardData {
         out
     };
 
+    // #778: compute staging entries (approved/done work not yet in queue)
+    // locally from already-loaded assignments + merge_queue so the staging
+    // section works even without a coord serve daemon running.
+    let merge_staging = compute_staging_local(
+        &assignments,
+        &merge_queue,
+        &pipeline_default_gates,
+    );
+
     assemble_board_data(
         assignments,
         machine_rows,
@@ -3795,6 +3952,7 @@ fn load_data() -> BoardData {
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
         pipeline_require_plan,
+        merge_staging,
     )
 }
 
@@ -3823,6 +3981,7 @@ fn assemble_board_data(
     pipeline_repo_run_cmds: std::collections::HashMap<String, String>,
     pipeline_repo_paths: std::collections::HashMap<String, String>,
     pipeline_require_plan: bool,
+    merge_staging: Vec<StagingEntry>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -3931,6 +4090,7 @@ fn assemble_board_data(
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
         plans,
+        merge_staging,
     }
 }
 
@@ -4147,6 +4307,19 @@ fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         pipeline_repo_paths,
     ) = parse_pipeline_meta_from_map(&payload.board_meta);
 
+    // #778: prefer the server-computed staging list from the /board payload;
+    // fall back to local computation so the panel still works if the daemon
+    // is running an older version that doesn't emit merge_staging yet.
+    let merge_staging = if payload.merge_staging.is_empty() {
+        compute_staging_local(
+            &assignments,
+            &payload.merge_queue,
+            &pipeline_default_gates,
+        )
+    } else {
+        payload.merge_staging
+    };
+
     assemble_board_data(
         assignments,
         machine_rows,
@@ -4161,6 +4334,7 @@ fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
         pipeline_require_plan,
+        merge_staging,
     )
 }
 
@@ -10216,7 +10390,10 @@ impl CoordApp {
 
         // ── Legacy path (no merge_plan from daemon) ───────────────────────────
         let n = self.data.merge_queue.len();
-        if n == 0 {
+        let staging = &self.data.merge_staging;
+
+        // Empty-state: no staging AND no queue entries.
+        if n == 0 && staging.is_empty() {
             backend.draw_list(rect, &plain_list(
                 "mergequeue-empty",
                 "  No merge-queue entries — run `coord merge` to populate the queue.",
@@ -10226,26 +10403,73 @@ impl CoordApp {
         }
 
         // Clamp the selection in case the queue shrank after a drop.
-        let sel_entry = self.merge_queue_sel.min(n - 1);
+        let sel_entry = if n > 0 { self.merge_queue_sel.min(n - 1) } else { 0 };
 
-        // ── Build items grouped by milestone ─────────────────────────────
-        // A `Decoration::Header` separator is inserted before the first entry
-        // of each distinct milestone group (first-appearance order).  The
-        // display index of `sel_entry` (used as `selected_idx`) must account
-        // for the header rows that precede it.
-        let mut items: Vec<ListItem> = Vec::with_capacity(n + 8);
+        // ── Build item list ───────────────────────────────────────────────
+        //
+        // Layout (top → bottom):
+        //   [staging header]            — only when staging is non-empty
+        //   [staging rows]
+        //   [queue header]              — only when BOTH sections are non-empty
+        //   [milestone sub-headers]
+        //   [queue rows]
+        //
+        // The staging section answers "did my approved PR make it into the
+        // queue?" and is always shown above the active queue so it's the
+        // first thing seen when opening the panel.
+        //
+        // `selected_idx` tracks where the selected queue entry lands in the
+        // combined list, accounting for all inserted header rows above it.
+
+        let mut items: Vec<ListItem> = Vec::with_capacity(staging.len() + n + 10);
         let mut selected_idx = 0usize;
-        let mut last_ms: Option<Option<String>> = None; // sentinel: never matches first entry
 
-        for (i, entry) in self.data.merge_queue.iter().enumerate() {
-            let ms = entry.milestone_title.clone();
-            // Insert a header whenever the milestone changes (consecutive-run grouping).
-            if last_ms.as_ref() != Some(&ms) {
-                let header_label = ms.as_deref().unwrap_or("(No milestone)");
+        // ── #778: Staging section ──────────────────────────────────────────
+        if !staging.is_empty() {
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        " About to enter queue ".to_string(),
+                        Color::rgb(180, 210, 150),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Header,
+            });
+
+            for entry in staging {
+                let issue_part = format!("#{:<5} {}", entry.issue_number, trunc(&entry.issue_title, 22));
+                let (arrow_text, arrow_color) = if entry.status == "blocked" {
+                    let reason = entry.reason.as_deref().unwrap_or("gate failing");
+                    (format!("→  BLOCKED: {}", reason), Color::rgb(220, 90, 80))
+                } else {
+                    ("→  enqueuing on next tick".to_string(), Color::rgb(130, 200, 120))
+                };
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![
+                            StyledSpan::with_fg(issue_part, Color::rgb(150, 150, 240)),
+                            StyledSpan::with_fg("  ".to_string(), Color::rgb(120, 120, 120)),
+                            StyledSpan::with_fg(arrow_text, arrow_color),
+                        ],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Normal,
+                });
+            }
+        }
+
+        // ── Merge queue section ────────────────────────────────────────────
+        if n > 0 {
+            // When both sections are visible, add a separator so the reader
+            // can immediately distinguish staged-but-pending from in-queue.
+            if !staging.is_empty() {
                 items.push(ListItem {
                     text: StyledText {
                         spans: vec![StyledSpan::with_fg(
-                            format!(" {} ", header_label),
+                            " In merge queue ".to_string(),
                             Color::rgb(150, 190, 230),
                         )],
                     },
@@ -10253,22 +10477,41 @@ impl CoordApp {
                     detail: None,
                     decoration: Decoration::Header,
                 });
-                last_ms = Some(ms);
             }
-            // Record the display index of the selected entry.
-            if i == sel_entry {
-                selected_idx = items.len();
+
+            // Milestone-grouped queue entries (existing behaviour).
+            let mut last_ms: Option<Option<String>> = None; // sentinel: never matches first
+            for (i, entry) in self.data.merge_queue.iter().enumerate() {
+                let ms = entry.milestone_title.clone();
+                if last_ms.as_ref() != Some(&ms) {
+                    let header_label = ms.as_deref().unwrap_or("(No milestone)");
+                    items.push(ListItem {
+                        text: StyledText {
+                            spans: vec![StyledSpan::with_fg(
+                                format!(" {} ", header_label),
+                                Color::rgb(150, 190, 230),
+                            )],
+                        },
+                        icon: None,
+                        detail: None,
+                        decoration: Decoration::Header,
+                    });
+                    last_ms = Some(ms);
+                }
+                if i == sel_entry {
+                    selected_idx = items.len();
+                }
+                let label = self.merge_queue_entry_label(entry);
+                let color = self.merge_queue_entry_color(entry);
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(&label, color)],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Normal,
+                });
             }
-            let label = self.merge_queue_entry_label(entry);
-            let color = self.merge_queue_entry_color(entry);
-            items.push(ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(&label, color)],
-                },
-                icon: None,
-                detail: None,
-                decoration: Decoration::Normal,
-            });
         }
 
         let total = items.len();
@@ -51638,6 +51881,119 @@ mod tests {
         assert!(
             app.toasts.iter().all(|(t, _, _)| t.body != "No entry selected."),
             "plan path must find the entry; no 'No entry selected' toast expected"
+        );
+    }
+
+    // ── #778: staging section TuiDriver tests ─────────────────────────────
+
+    /// Helper: build a ready StagingEntry (all gates green).
+    #[cfg(test)]
+    fn staging_entry_ready(aid: &str, issue_num: i64) -> StagingEntry {
+        StagingEntry {
+            assignment_id: aid.to_string(),
+            repo_name: "api".to_string(),
+            issue_number: issue_num,
+            issue_title: format!("Feature #{}", issue_num),
+            branch: format!("issue-{}-{}", issue_num, aid),
+            status: "ready".to_string(),
+            reason: None,
+        }
+    }
+
+    /// Helper: build a blocked StagingEntry (smoke gate failing).
+    #[cfg(test)]
+    fn staging_entry_blocked(aid: &str, issue_num: i64) -> StagingEntry {
+        StagingEntry {
+            assignment_id: aid.to_string(),
+            repo_name: "api".to_string(),
+            issue_number: issue_num,
+            issue_title: format!("Feature #{}", issue_num),
+            branch: format!("issue-{}-{}", issue_num, aid),
+            status: "blocked".to_string(),
+            reason: Some("test verdict missing".to_string()),
+        }
+    }
+
+    /// #778 black-box (TuiDriver): a ready staging item shows the staging
+    /// header and "enqueuing" label in the Merge Queue panel.
+    #[test]
+    fn tuidriver_staging_section_renders_when_not_empty() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_staging: vec![staging_entry_ready("w1", 820)],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("About to enter queue") || screen.contains("enqueuing"),
+            "staging header or enqueuing label must appear in the panel:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("#820") || screen.contains("820"),
+            "staging issue number must appear in the panel:\n{}",
+            screen
+        );
+    }
+
+    /// #778 black-box (TuiDriver): a blocked staging item shows "BLOCKED" and
+    /// the gate failure reason in the Merge Queue panel.
+    #[test]
+    fn tuidriver_staging_shows_blocked_reason() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_staging: vec![staging_entry_blocked("w2", 815)],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("BLOCKED"),
+            "BLOCKED must appear in the panel for a blocked staging item:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("test verdict missing") || screen.contains("verdict"),
+            "gate failure reason must appear in the panel:\n{}",
+            screen
+        );
+    }
+
+    /// #778 black-box (TuiDriver): when merge_staging is empty the staging
+    /// header must NOT appear, and the existing queue entry must still render.
+    #[test]
+    fn tuidriver_staging_section_absent_when_empty() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            merge_queue: vec![mq_entry_for_state("aid-1", 10, "pending", Some(5))],
+            merge_staging: vec![],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+
+        assert!(
+            !screen.contains("About to enter queue"),
+            "staging header must NOT appear when merge_staging is empty:\n{}",
+            screen
+        );
+        // Queue entry must still render normally.
+        assert!(
+            screen.contains("PENDING") || screen.contains("pending") || screen.contains("#5"),
+            "queue entry must still render when staging is empty:\n{}",
+            screen
         );
     }
 

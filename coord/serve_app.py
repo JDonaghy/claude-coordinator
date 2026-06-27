@@ -314,8 +314,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             projection["merge_plan"] = [
                 _asdict(pm) for pm in _mq.plan(_board, config, ci_store=_ci)
             ]
+            # #778: staging section — approved/done work not yet in the queue.
+            # Reuses the same _board snapshot built above.  Fail-open: any
+            # error returns an empty list rather than 503ing the board.
+            try:
+                projection["merge_staging"] = [
+                    _asdict(si) for si in _mq.staging_items(_board, config)
+                ]
+            except Exception:  # noqa: BLE001
+                projection["merge_staging"] = []
         except Exception:  # noqa: BLE001 — plan failure must not blank the board
             projection["merge_plan"] = []
+            projection["merge_staging"] = []
         return JSONResponse(projection)
 
     async def serve_config(request: Request) -> Response:  # noqa: ARG001

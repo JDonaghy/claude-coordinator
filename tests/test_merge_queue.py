@@ -1681,3 +1681,214 @@ class TestPlan:
         status, reason = mq._entry_gate_status(entry, None, None)
         assert status == mq.PLAN_READY
         assert reason is None
+
+
+# ── #778: staging_items() ─────────────────────────────────────────────────────
+
+class TestStagingItems:
+    """#778: staging_items() surfaces approved/done work not yet in the queue.
+
+    The helper must:
+    - Return READY items when all gates pass.
+    - Return BLOCKED items when the smoke gate fails.
+    - Exclude items whose review is not yet approved.
+    - Exclude items already tracked in the merge queue.
+    - Exclude items from issues already MERGED.
+    - Behave sensibly when review or smoke gates are disabled.
+    """
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _config(*, review_enabled: bool = True, gates: list[str] | None = None):
+        from dataclasses import dataclass, field as dc_field
+
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+
+        cfg = _Cfg()
+        cfg.reviews.enabled = review_enabled
+        cfg.pipeline.default_gates = gates if gates is not None else ["review", "test", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(completed=None, active=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(
+        aid: str = "w1",
+        *,
+        test_state: str | None = "passed",
+        branch: str | None = None,
+        issue_number: int = 42,
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=issue_number,
+            issue_title="Some feature", assignment_id=aid, type="work",
+            status="done", branch=branch or f"issue-{issue_number}-{aid}",
+            test_state=test_state,
+        )
+
+    @staticmethod
+    def _review(of_aid: str, *, verdict: str = "approve") -> Assignment:
+        return Assignment(
+            machine_name="m2", repo_name="api", issue_number=42,
+            issue_title="Some feature", assignment_id=f"rev-{of_aid}",
+            type="review", status="done",
+            review_of_assignment_id=of_aid, review_verdict=verdict,
+        )
+
+    # ── ready path ────────────────────────────────────────────────────────
+
+    def test_ready_when_approved_and_smoke_passed(self, coord_db) -> None:
+        """Approved review + passed test → READY staging item."""
+        work = self._work("w1", test_state="passed")
+        rev = self._review("w1")
+        board = self._board(completed=[work, rev])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].assignment_id == "w1"
+        assert items[0].status == mq.STAGING_READY
+        assert items[0].reason is None
+
+    def test_ready_when_approved_and_smoke_skipped(self, coord_db) -> None:
+        """Approved review + skipped test → READY (skipped counts as verdict)."""
+        work = self._work("w1", test_state="skipped")
+        rev = self._review("w1")
+        board = self._board(completed=[work, rev])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].status == mq.STAGING_READY
+
+    # ── blocked path ──────────────────────────────────────────────────────
+
+    def test_blocked_when_smoke_verdict_missing(self, coord_db) -> None:
+        """Approved review but no smoke verdict → BLOCKED with reason."""
+        work = self._work("w1", test_state=None)
+        rev = self._review("w1")
+        board = self._board(completed=[work, rev])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].status == mq.STAGING_BLOCKED
+        assert items[0].reason == "test verdict missing"
+
+    def test_blocked_when_smoke_verdict_failed(self, coord_db) -> None:
+        """test_state='failed' counts as missing for staging purposes."""
+        work = self._work("w1", test_state="failed")
+        rev = self._review("w1")
+        board = self._board(completed=[work, rev])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].status == mq.STAGING_BLOCKED
+
+    # ── exclusion: review not yet approved ────────────────────────────────
+
+    def test_excluded_when_review_not_approved(self, coord_db) -> None:
+        """Work with request-changes review is NOT a staging item."""
+        work = self._work("w1")
+        rev = self._review("w1", verdict="request-changes")
+        board = self._board(completed=[work, rev])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert items == []
+
+    def test_excluded_when_no_review_at_all(self, coord_db) -> None:
+        """Work with no review at all is excluded when review gate is enabled."""
+        work = self._work("w1")
+        board = self._board(completed=[work])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert items == []
+
+    # ── exclusion: already in queue ───────────────────────────────────────
+
+    def test_excluded_when_already_queued(self, coord_db) -> None:
+        """Items already in the merge queue are not shown in staging."""
+        work = self._work("w1")
+        rev = self._review("w1")
+        board = self._board(completed=[work, rev])
+        # Seed the queue with the same assignment_id.
+        save_queue([_q("w1")])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert items == []
+
+    def test_excluded_when_issue_already_merged(self, coord_db) -> None:
+        """Items from an issue with a MERGED queue entry are excluded."""
+        work = self._work("w1", issue_number=42)
+        rev = self._review("w1")
+        board = self._board(completed=[work, rev])
+        # Seed a MERGED entry for the same (repo, issue) pair.
+        merged_entry = QueuedMerge(
+            assignment_id="old-w", repo_name="api", repo_github="acme/api",
+            branch="issue-42-old", target_branch="main",
+            issue_number=42, issue_title="Some feature",
+            state=MERGED,
+        )
+        save_queue([merged_entry])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert items == []
+
+    # ── gate-disabled paths ───────────────────────────────────────────────
+
+    def test_included_when_review_gate_disabled(self, coord_db) -> None:
+        """When reviews are disabled, work is included without needing a review."""
+        work = self._work("w1")
+        board = self._board(completed=[work])
+        cfg = self._config(review_enabled=False, gates=["test", "merge"])
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].status == mq.STAGING_READY
+
+    def test_included_when_smoke_gate_disabled(self, coord_db) -> None:
+        """When 'test' is not in default_gates, missing verdict → READY."""
+        work = self._work("w1", test_state=None)
+        rev = self._review("w1")
+        board = self._board(completed=[work, rev])
+        cfg = self._config(gates=["review", "merge"])  # no "test" gate
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].status == mq.STAGING_READY
+
+    # ── metadata ─────────────────────────────────────────────────────────
+
+    def test_item_carries_metadata(self, coord_db) -> None:
+        """StagingItem carries the correct repo/issue/branch metadata."""
+        work = self._work("w1", issue_number=99, branch="issue-99-w1")
+        rev = self._review("w1")
+        board = self._board(completed=[work, rev])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        item = items[0]
+        assert item.assignment_id == "w1"
+        assert item.repo_name == "api"
+        assert item.issue_number == 99
+        assert item.branch == "issue-99-w1"
+        assert item.issue_title == "Some feature"
+
+    # ── no-config / no-board ──────────────────────────────────────────────
+
+    def test_returns_empty_without_board(self, coord_db) -> None:
+        """Without a board there are no completed assignments to scan."""
+        from coord.models import Board
+        cfg = self._config()
+        items = mq.staging_items(Board(active=[], completed=[]), cfg)
+        assert items == []
