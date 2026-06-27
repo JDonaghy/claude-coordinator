@@ -73,9 +73,14 @@ ADVISORY = "advisory"
 
 # #448: spec types that are expected to push commits, so a clean exit with
 # zero commits is interesting (advisory).  Review/smoke workers commit
-# nothing by design and must NOT be flagged advisory.  conflict-fix is
-# expected to rebase + force-push, so it stays in scope.
-_ADVISORY_TYPES = ("work", "conflict-fix")
+# nothing by design and must NOT be flagged advisory.
+# #784: conflict-fix is EXCLUDED from the advisory check.  A successful
+# rebase + force-push leaves the worktree 0 commits ahead of
+# origin/<branch> by design (local and remote are in sync after the push).
+# The briefing instructs the worker to exit non-zero on any failure, so
+# exit_code==0 unambiguously means the fix landed — marking it advisory
+# would block the auto re-enqueue and inflate the retry cap.
+_ADVISORY_TYPES = ("work",)
 
 # Maximum number of terminal (done/failed/cancelled) assignments retained in
 # memory and persisted to agent_state.json (#452).  Oldest entries (by

@@ -318,20 +318,19 @@ class TestDispatch:
         _, payload = client.calls[0]
         assert payload.get("target_branch") == _entry().branch
 
-    def test_retry_cap_blocks_second_dispatch_when_prior_completed(
+    def test_retry_cap_blocks_second_dispatch_when_prior_failed(
         self, two_machine_config: Config, coord_db,
     ) -> None:
-        """A conflict-fix in ``board.completed`` must block a second dispatch.
+        """A conflict-fix in ``board.completed`` with status "failed" blocks a
+        second dispatch — the retry cap is consumed by a genuine failure.
 
-        Without this guard the dispatcher would re-fire after every
-        ``coord merge`` retry, because :func:`coord.claim.has_active_followup`
-        only scans ``board.active`` — the original bug from the review of
-        #243.
+        (The original test used status="done", which #784 changed: a successful
+        rebase should NOT consume the cap so a re-conflict gets another attempt.)
         """
         board = Board()
         board.completed.append(Assignment(
             machine_name="server", repo_name="api", issue_number=1, issue_title="x",
-            assignment_id="prev-fix", status="done",
+            assignment_id="prev-fix", status="failed",
             type="conflict-fix", review_of_assignment_id="abc123",
         ))
         client = _FakeHTTPClient({"id": "would-not-fire"})
@@ -340,6 +339,32 @@ class TestDispatch:
         )
         assert result is None
         assert client.calls == [], "HTTP should not be called when retry cap hit"
+
+    def test_retry_cap_not_consumed_by_successful_fix(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """A conflict-fix that completed successfully (status="done") must NOT
+        block a second dispatch.
+
+        #784: a successful rebase can be followed by a new conflict if other PRs
+        merged in the meantime; that re-conflict deserves a fresh fix attempt.
+        Only genuine failures (failed / advisory) consume the one-per-entry cap.
+        """
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="server", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="prev-fix", status="done",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        ))
+        client = _FakeHTTPClient({"id": "fresh-fix"})
+        result = dispatch_conflict_fix(
+            _entry(), board, two_machine_config, http_client=client,
+            prefer_machine="laptop",
+        )
+        assert result is not None, (
+            "a successful prior fix must NOT block a new dispatch on re-conflict"
+        )
+        assert len(client.calls) == 1, "HTTP should have been called"
 
 
 class TestHasPriorConflictFix:
@@ -362,14 +387,26 @@ class TestHasPriorConflictFix:
         ))
         assert has_prior_conflict_fix(board, "abc123") is True
 
-    def test_true_when_completed_has_matching_conflict_fix(self) -> None:
+    def test_true_when_completed_has_failed_conflict_fix(self) -> None:
         from coord.conflict_fix import has_prior_conflict_fix
         board = Board()
         board.completed.append(Assignment(
             machine_name="m", repo_name="api", issue_number=1, issue_title="x",
             type="conflict-fix", review_of_assignment_id="abc123",
+            status="failed",
         ))
         assert has_prior_conflict_fix(board, "abc123") is True
+
+    def test_false_when_completed_has_successful_conflict_fix(self) -> None:
+        """#784: a done (successful) fix does not block a second attempt."""
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status="done",
+        ))
+        assert has_prior_conflict_fix(board, "abc123") is False
 
     def test_ignores_non_conflict_fix_types(self) -> None:
         from coord.conflict_fix import has_prior_conflict_fix

@@ -118,23 +118,32 @@ def build_conflict_fix_briefing(
 
 
 def has_prior_conflict_fix(board: Board, merge_entry_id: str | None) -> bool:
-    """True if a conflict-fix worker has already been dispatched for *merge_entry_id*
-    in this session — looking at both active and completed assignments.
+    """True when a second conflict-fix dispatch for *merge_entry_id* is blocked.
 
-    The original :func:`coord.claim.has_active_followup` only scans
-    ``board.active``, which lets a second conflict-fix dispatch fire once the
-    first moves to ``board.completed`` (e.g. after a successful rebase that
-    nevertheless leaves a fresh conflict on the next ``coord merge``).  The
-    spec caps retries at one per session, so the dispatcher and the
-    ``coord merge`` caller both consult this combined predicate.
+    Blocks when a conflict-fix is **active** (running/pending — don't spawn a
+    duplicate) or has **genuinely failed** (failed/advisory — retry cap
+    consumed, escalate to human).
+
+    #784: a conflict-fix that completed **successfully** (``status="done"``)
+    does *not* block a subsequent dispatch.  A successful rebase can be
+    followed by a new conflict if other PRs merged in the meantime; that is a
+    fresh situation and warrants a fresh fix attempt.  Only actual failures
+    consume the one-per-entry cap.
     """
     if merge_entry_id is None:
         return False
     for a in list(board.active) + list(board.completed):
         if a.type != "conflict-fix":
             continue
-        if a.review_of_assignment_id == merge_entry_id:
+        if a.review_of_assignment_id != merge_entry_id:
+            continue
+        # Active attempt in flight — prevent duplicate dispatch.
+        if a.status in ("running", "pending"):
             return True
+        # Genuine failure — retry cap consumed, surface to human.
+        if a.status in ("failed", "advisory"):
+            return True
+        # "done" = successful rebase → cap not consumed; a re-conflict is new.
     return False
 
 

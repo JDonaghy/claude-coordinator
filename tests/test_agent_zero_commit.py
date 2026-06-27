@@ -324,6 +324,69 @@ def test_nonzero_exit_is_failed_regardless_of_commits(
     server.shutdown()
 
 
+# ── conflict-fix type is exempt from advisory check (#784) ───────────────────
+
+
+def test_conflict_fix_zero_commits_is_done_not_advisory(
+    tmp_path: Path, repo_with_remote: tuple[Path, Path],
+) -> None:
+    """A conflict-fix worker that exits cleanly with 0 commits ahead of
+    origin/<branch> must be marked DONE, NOT ADVISORY.
+
+    A rebase + force-push leaves the worktree 0 commits ahead of the remote
+    branch by design (local and remote are in sync after the push).  Without
+    this exemption the reap would mismark a successful fix as advisory, block
+    the auto re-enqueue, and inflate the retry cap (#784).
+    """
+    clone, origin = repo_with_remote
+
+    # Simulate the rebase scenario: create a feature branch that is
+    # force-pushed so local == remote (0 commits ahead of origin/branch).
+    import subprocess as _sp
+    def _git_run(*args: str, cwd: Path) -> None:
+        _sp.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+
+    _git_run("checkout", "-b", "issue-784-fix", cwd=clone)
+    (clone / "fix.txt").write_text("fix\n")
+    _git_run("add", "fix.txt", cwd=clone)
+    _git_run("config", "user.email", "w@w.com", cwd=clone)
+    _git_run("config", "user.name", "Worker", cwd=clone)
+    _git_run("commit", "-m", "fix(#784): rebase", cwd=clone)
+    _git_run("push", "-u", "origin", "issue-784-fix", cwd=clone)
+    # Now local == remote → 0 commits ahead of origin/issue-784-fix.
+
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        # Worker exits cleanly without adding new commits (simulates a
+        # conflict-fix that already ran git push --force-with-lease itself).
+        worker_command=lambda spec: ["/bin/true"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(clone),
+        issue_number=784,
+        issue_title="[conflict-fix] rebase test",
+        briefing="b",
+        branch="issue-784-fix",
+        type="conflict-fix",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == DONE, (
+        f"conflict-fix with exit_code=0 must be DONE not {final.status!r} — "
+        "a rebase+force-push is 0 commits ahead of origin/branch by design (#784)"
+    )
+    assert final.exit_code == 0
+    assert final.zero_commit_reason is None, (
+        "conflict-fix exempt from advisory: zero_commit_reason must be None"
+    )
+    server.shutdown()
+
+
 # ── ADVISORY is terminal — counted as completed, not active ──────────────────
 
 
