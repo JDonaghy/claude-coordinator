@@ -23249,11 +23249,26 @@ impl CoordApp {
         }
 
         // Drain all SSE watch channels in the pool (including background
-        // sessions not currently focused).  Any new lines arriving from any
-        // background thread trigger a redraw so turn-count badges and the Log
-        // tab stay fresh even while the watch overlay is closed.
+        // sessions not currently focused).  Draining always runs so data
+        // accumulates into `sse.lines` (turn-count increments, Log tab
+        // content).  A redraw is only requested when the drained content is
+        // actually visible: Pipeline / Board / Kanban / MergeQueue views
+        // show turn-count badges and/or the Log tab; Settings / Terminal /
+        // Machines show none of that data.  When the watch overlay is open
+        // (`watch_focused.is_some()`) a repaint is always needed regardless
+        // of the underlying view.  On a view switch the normal event handler
+        // sets `needs_redraw = true`, so accumulated-but-unseen SSE data
+        // paints immediately when the user navigates back.
         if !self.watch_pool.is_empty() {
-            needs_redraw |= self.drain_watch_pool();
+            let got_new = self.drain_watch_pool();
+            if got_new {
+                let watch_data_visible = self.watch_focused.is_some()
+                    || !matches!(
+                        self.active_view,
+                        SidebarView::Settings | SidebarView::Terminal | SidebarView::Machines
+                    );
+                needs_redraw |= watch_data_visible;
+            }
         }
 
         // Advance inject chat spinner when the overlay is open.
@@ -24035,7 +24050,14 @@ impl CoordApp {
             None => {}
         }
 
-        changed
+        // Only signal a repaint when the Terminal view is currently visible.
+        // When the user is on any other view the PTY output has already been
+        // consumed into the VT100 scrollback buffer (no output is lost), but
+        // there is nothing on screen to update — suppressing the redraw here
+        // eliminates the ≈286 µs full-screen refresh per background PTY tick.
+        // The next view switch sets `needs_redraw = true` via the normal
+        // event handler, so all accumulated output paints immediately.
+        changed && self.active_view == SidebarView::Terminal
     }
 
     /// Forward a key press to the embedded terminal PTY (#424).
@@ -24303,11 +24325,13 @@ impl CoordApp {
         }
 
         // 2. Resize all sessions when dims change.
+        // Track separately so the redraw decision below can gate on visibility.
+        let mut resize_changed = false;
         if let Some((cols, rows)) = self.detail_terminal_pending_dims.get() {
             for sess in self.detail_terminal_sessions.values_mut() {
                 if cols != sess.cols() || rows != sess.rows() {
                     sess.resize(cols, rows);
-                    changed = true;
+                    resize_changed = true;
                 }
             }
         }
@@ -24331,13 +24355,23 @@ impl CoordApp {
         //    pane crash never aborts the TUI — the panicked session is removed
         //    and its error recorded; the post-exit board actions
         //    (detect_completed_interactive_work etc.) continue firing normally.
+        //
+        //    Track which session keys produced new output so we can suppress
+        //    redraws for sessions that are not currently displayed (#789).
+        let mut keys_changed: Vec<(String, u64)> = Vec::new();
         let mut panicked: Vec<((String, u64), String)> = Vec::new();
         for (key, sess) in self.detail_terminal_sessions.iter_mut() {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sess.poll())) {
-                Ok(c) => changed |= c,
+                Ok(c) => {
+                    if c {
+                        keys_changed.push(key.clone());
+                    }
+                }
                 Err(e) => {
                     panicked.push((key.clone(), vt100_panic_to_string(&e)));
-                    changed = true;
+                    // Record the panicked key so the eviction below triggers a
+                    // redraw when the affected session is the visible one.
+                    keys_changed.push(key.clone());
                 }
             }
         }
@@ -24357,7 +24391,31 @@ impl CoordApp {
                 .insert(key, format!("Session ended (renderer fault: {msg})"));
         }
 
-        changed
+        // Only signal a repaint when the Terminal tab is currently displayed.
+        // Off-screen sessions have already had their output consumed into the
+        // VT100 scrollback buffer (no output is lost); suppressing the redraw
+        // eliminates spurious full-screen repaints from background PTY ticks.
+        // The view/tab-switch event handler sets `needs_redraw = true`, so
+        // accumulated content paints immediately when the user navigates here.
+        //
+        // `changed` here captures only section-1 spawn events, which are
+        // themselves gated on the Terminal tab being visible — so when the
+        // tab is off-screen, `changed` is always false and we return it as-is.
+        let terminal_tab_visible = (self.active_view == SidebarView::Pipeline
+            && self.pipeline_detail_tab == PipelineDetailTab::Terminal)
+            || (self.active_view == SidebarView::Board
+                && self.board_detail_tab == BoardDetailTab::Terminal);
+
+        if !terminal_tab_visible {
+            return changed; // spawn can't happen off-screen → always false here
+        }
+
+        // Terminal tab is visible: propagate resize events and check whether
+        // the currently-displayed session produced new output.
+        let visible_key_changed = self
+            .selected_issue_key()
+            .map_or(false, |k| keys_changed.contains(&k));
+        changed || resize_changed || visible_key_changed
     }
 
     /// Forward a keypress to the selected issue's detail terminal PTY (#440).
@@ -50993,6 +51051,194 @@ mod tests {
             s4.contains("last 2h"),
             "wraps back to last 2h after fourth → (multi-section board)\n{}",
             s4
+        );
+    }
+
+    // ── #789: off-screen repaint suppression ─────────────────────────────────
+    //
+    // These tests verify that PTY/SSE streams don't force a full-screen repaint
+    // when the relevant view/tab is off-screen, while still accumulating data so
+    // switching back shows everything immediately.
+
+    /// #789: when the active view is one that shows no SSE data (Settings,
+    /// Terminal, Machines), incoming watch-pool lines must drain into sse.lines
+    /// but must NOT trigger a redraw via `run_periodic_work`.
+    #[test]
+    fn offscreen_watch_pool_drains_but_suppresses_redraw() {
+        let mut app = make_app_default();
+        // Put the app on a view that shows no SSE badges or Log tab.
+        app.active_view = SidebarView::Settings;
+        // Ensure no auto-refresh fires during the test call (cadence is 5 s;
+        // refreshed_at was just set by make_test_app so elapsed ≈ 0 ms).
+
+        let (sse_state, tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, sse_state);
+        // Clear watch_focused so the overlay is not considered open.
+        app.watch_focused = None;
+
+        // Push a line into the channel so drain_watch_pool sees new data.
+        tx.send(SseWatchMsg::Lines {
+            last_id: 1,
+            text: "background output line\n".to_string(),
+        })
+        .unwrap();
+
+        // run_periodic_work must return false: data arrived but nothing to repaint.
+        let redraw = app.run_periodic_work();
+        assert!(
+            !redraw,
+            "#789: run_periodic_work must not request a repaint when \
+             watch-pool data arrives on Settings view"
+        );
+
+        // The line MUST have been drained into sse.lines (no data loss).
+        let sse = &app.watch_pool[TEST_AID].sse;
+        assert_eq!(
+            sse.lines,
+            vec!["background output line"],
+            "#789: SSE line must accumulate even when the repaint is suppressed"
+        );
+    }
+
+    /// #789: when the active view IS one that shows SSE data (Pipeline, Board,
+    /// Kanban, MergeQueue), incoming watch-pool lines must still trigger a redraw.
+    #[test]
+    fn onscreen_watch_pool_triggers_redraw() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.watch_focused = None; // overlay not open; view alone is enough
+
+        let (sse_state, tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, sse_state);
+
+        tx.send(SseWatchMsg::Lines {
+            last_id: 2,
+            text: "foreground output line\n".to_string(),
+        })
+        .unwrap();
+
+        let redraw = app.run_periodic_work();
+        assert!(
+            redraw,
+            "#789: run_periodic_work must request a repaint when watch-pool \
+             data arrives on the Pipeline view"
+        );
+    }
+
+    /// #789: the watch overlay being open (`watch_focused.is_some()`) must
+    /// always trigger a redraw regardless of which view is active.
+    #[test]
+    fn offscreen_watch_pool_with_overlay_open_still_triggers_redraw() {
+        let mut app = make_app_default();
+        // Put the app on Settings — normally no SSE repaint.
+        app.active_view = SidebarView::Settings;
+
+        let (sse_state, tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, sse_state); // also sets watch_focused = Some(TEST_AID)
+
+        tx.send(SseWatchMsg::Lines {
+            last_id: 3,
+            text: "overlay line\n".to_string(),
+        })
+        .unwrap();
+
+        // watch_focused is Some → overlay open → must repaint even on Settings.
+        let redraw = app.run_periodic_work();
+        assert!(
+            redraw,
+            "#789: run_periodic_work must request a repaint when the watch \
+             overlay is open, regardless of active view"
+        );
+    }
+
+    /// #789 TuiDriver (view-switch correctness): SSE lines accumulated while
+    /// the Pipeline view was not active must appear immediately after switching.
+    ///
+    /// Architecture note: for PTY sessions (`drive_terminal_pane`,
+    /// `drive_detail_terminals`) the same invariant holds — PTY output is
+    /// consumed into the VT100 scrollback buffer on every tick; render reads
+    /// the current buffer; the view/tab-switch event handler sets
+    /// `needs_redraw = true` — but verifying it requires a live PTY subprocess
+    /// which is out of scope for TestBackend tests (quadraui#302).  The SSE
+    /// path tested here exercises the identical "drain silently, paint on switch"
+    /// architecture.
+    #[test]
+    fn tuidriver_offscreen_sse_accumulates_and_shows_on_view_switch() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Build a pipeline app with one running assignment.
+        let assignments = vec![{
+            let mut a = make_assignment_typed("running", 42, "api", Some("work"));
+            a.id = TEST_AID.to_string();
+            a
+        }];
+        let mut app = make_app_with_assignments(assignments);
+        // Wire up a pipeline issue so the Log tab can find it.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+
+        // Pre-load SSE lines into the watch pool — simulates output that
+        // accumulated while the user was on a different view.
+        let (sse_state, _tx) = make_sse_state_pair();
+        let mut ctx = WatchContext {
+            state: WatchState {
+                assignment_id: TEST_AID.to_string(),
+                machine: "m1".to_string(),
+                repo: "api".to_string(),
+                issue_number: 42,
+                assignment_type: "work".to_string(),
+                scroll: usize::MAX,
+            },
+            sse: sse_state,
+            inject_transcript: Vec::new(),
+            inject_sse_offsets: Vec::new(),
+            history_turns: Vec::new(),
+            last_focused_at: Instant::now(),
+        };
+        ctx.sse.lines.push(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello from background"}]}}"#
+                .to_string(),
+        );
+        ctx.sse.line_times.push(Instant::now());
+        app.watch_pool.insert(TEST_AID.to_string(), ctx);
+        app.watch_focused = None; // overlay not open
+
+        // Start on Settings view (off-screen for SSE data).
+        app.active_view = SidebarView::Settings;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 180, 40);
+
+        // Confirm we're on Settings (no Pipeline content visible).
+        let settings_screen = driver.screen();
+        assert!(
+            !settings_screen.contains("hello from background"),
+            "SSE content must not appear on Settings view:\n{settings_screen}"
+        );
+
+        // Switch to Pipeline view.
+        driver.press(quadraui::Key::Char('3'));
+        // Navigate to the Log tab (h cycles left; l/Right cycles right).
+        // Tabs: Pipeline → Issue → Stages → Log → ...
+        // Three presses of 'l' (right) from Pipeline tab → Log tab.
+        driver.press(quadraui::Key::Char('l'));
+        driver.press(quadraui::Key::Char('l'));
+        driver.press(quadraui::Key::Char('l'));
+
+        let log_screen = driver.screen();
+        assert!(
+            log_screen.contains("hello from background"),
+            "#789: SSE content accumulated off-screen must appear immediately \
+             after switching to Pipeline > Log tab:\n{log_screen}"
         );
     }
 }
