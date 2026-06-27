@@ -16344,8 +16344,21 @@ impl CoordApp {
                     // terminal_host_sel_end() already cleared collapsed (point)
                     // selections, so active_terminal_selected_text() is Some only
                     // when a real (non-trivial) range was dragged.
+                    //
+                    // Guard: skip if text is blank (selection covered only
+                    // whitespace/empty cells).  Writing an empty string to the
+                    // clipboard would silently erase any previous content and
+                    // make "paste produces nothing" the outcome — worse than
+                    // leaving the clipboard unchanged.
                     if let Some(text) = self.active_terminal_selected_text() {
-                        backend.services().clipboard().write_text(&text);
+                        if !text.trim().is_empty() {
+                            backend.services().clipboard().write_text(&text);
+                            self.push_toast(
+                                "Copied",
+                                "Text copied to clipboard",
+                                ToastSeverity::Info,
+                            );
+                        }
                         self.clear_active_terminal_selection();
                     }
                     return true;
@@ -49291,6 +49304,121 @@ mod tests {
         assert!(
             !driver.screen_contains("Terminal selection"),
             "no discovery toast should appear after a plain Board Terminal press:\n{}",
+            driver.screen(),
+        );
+    }
+
+    // ── #790: auto-copy on Shift+drag (clipboard guard) ─────────────────────
+
+    /// A fresh terminal screen consists of blank cells.  `selected_text()` for
+    /// a selection over those cells returns a string of spaces that becomes
+    /// empty after trimming.  This proves that the `!text.trim().is_empty()`
+    /// guard in the MouseUp handler is necessary: without it, writing `"   "`
+    /// to the clipboard would silently erase the user's previous clipboard
+    /// contents and make "paste produces nothing" the outcome.
+    #[test]
+    #[cfg(unix)]
+    fn active_terminal_selected_text_whitespace_for_blank_cells() {
+        use quadraui::terminal_engine::TerminalSelection;
+        let mut app = make_terminal_app_with_session();
+        // Select a multi-cell horizontal range — cells are blank on a fresh session.
+        app.terminal_session.as_mut().unwrap().selection = Some(TerminalSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 5,
+        });
+        let text = app
+            .active_terminal_selected_text()
+            .expect("selection is Some → result must be Some");
+        // The content may be spaces or empty but must not carry printable text.
+        assert!(
+            text.trim().is_empty(),
+            "blank cells should yield only whitespace; got: {text:?}"
+        );
+    }
+
+    /// Shift+drag over blank terminal cells must NOT produce a "Copied" toast
+    /// (because there is nothing to copy).
+    ///
+    /// Drives the full `TuiDriver` dispatch path: Shift+MouseDown → MouseMoved
+    /// → MouseUp.  With mouse reporting active and Shift held, the down event
+    /// begins a host-side selection; the up event triggers the #790 auto-copy
+    /// path.  The `!text.trim().is_empty()` guard skips the clipboard write and
+    /// the toast when all selected cells are blank — this test pins that behaviour.
+    #[test]
+    #[cfg(unix)]
+    fn shift_drag_over_blank_cells_no_copied_toast() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        fn poll_until_ms(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = std::time::Instant::now();
+            let limit = std::time::Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        }
+
+        let cwd = std::env::temp_dir();
+        let mut sess =
+            quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+                .expect("spawn /bin/sh");
+
+        // Enable SGR mouse reporting so Shift is the only way to start a host
+        // selection (plain drag is forwarded to the PTY).
+        sess.send_str("printf '\\033[?1000h'\n");
+        assert!(
+            poll_until_ms(&mut sess, 3000, |s| s.mouse_reporting_enabled()),
+            "mouse reporting did not turn on within 3 s"
+        );
+
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        app.terminal_session = Some(sess);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // Shift+MouseDown at (70, 20) — inside the terminal pane.
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Left,
+            position: quadraui::Point::new(70.0, 20.0),
+            modifiers: Modifiers { shift: true, ..Modifiers::default() },
+        });
+        // Drag right by a few cells.
+        driver.dispatch(UiEvent::MouseMoved {
+            position: quadraui::Point::new(90.0, 20.0),
+            buttons: quadraui::ButtonMask {
+                left: true,
+                ..quadraui::ButtonMask::default()
+            },
+        });
+        // Release.
+        driver.dispatch(UiEvent::MouseUp {
+            widget: None,
+            button: MouseButton::Left,
+            position: quadraui::Point::new(90.0, 20.0),
+        });
+
+        // Blank cells → guard fires → no "Copied" toast should appear.
+        assert!(
+            !driver.screen_contains("Copied"),
+            "blank-cell Shift+drag must not produce a 'Copied' toast:\n{}",
+            driver.screen(),
+        );
+        // Hint strip must remain visible.
+        assert!(
+            driver.screen_contains("Hold Shift"),
+            "hint strip must still be visible after Shift+drag:\n{}",
             driver.screen(),
         );
     }
