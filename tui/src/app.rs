@@ -5862,10 +5862,6 @@ pub struct CoordApp {
     /// shell) or Shift is held (force-override). Cleared on the matching
     /// mouse-release. `pty_pressed_buttons` is NOT set for these drags.
     terminal_host_sel_dragging: bool,
-    /// #790: set to `true` the first time a plain left-press (no Shift) is
-    /// forwarded to the PTY while mouse-reporting is active. Used to gate a
-    /// one-shot discovery toast so it fires at most once per session.
-    terminal_shift_drag_hint_shown: bool,
 
     // ── #207: Machine metrics sparklines ─────────────────────────────────
     /// Rolling ring-buffer of CPU + memory samples per machine, keyed by
@@ -6292,8 +6288,6 @@ impl CoordApp {
             pty_pressed_buttons: 0,
             // #464: host-side terminal selection drag state.
             terminal_host_sel_dragging: false,
-            // #790: one-shot PTY-drag discovery toast not yet shown.
-            terminal_shift_drag_hint_shown: false,
             // #207: machine metrics sparklines.
             machine_metrics: std::collections::HashMap::new(),
             pending_metrics: Vec::new(),
@@ -16094,19 +16088,6 @@ impl CoordApp {
                         // fires even if the user drags out of the panel
                         // before releasing (#454 review fix).
                         self.pty_pressed_buttons |= pty_button_bit(MouseButton::Left);
-                        // #790: first-use discovery toast — fire once per session
-                        // the first time a plain left-press (no Shift) reaches the
-                        // PTY.  The persistent hint strip in the terminal pane
-                        // already shows the affordance, but the toast catches users
-                        // who haven't noticed it yet.
-                        if !modifiers.shift && !self.terminal_shift_drag_hint_shown {
-                            self.terminal_shift_drag_hint_shown = true;
-                            self.push_toast(
-                                "Terminal selection",
-                                "Hold Shift while dragging to select text.",
-                                ToastSeverity::Info,
-                            );
-                        }
                         return true;
                     }
                     self.mouse_main_click(pos, main_b, lh)
@@ -16358,6 +16339,15 @@ impl CoordApp {
                 // send a spurious Release to the PTY.
                 if self.terminal_host_sel_dragging && btn == MouseButton::Left {
                     self.terminal_host_sel_end();
+                    // #790: auto-copy the selection to clipboard on mouse-up so
+                    // the user doesn't need to press Ctrl-C after Shift+dragging.
+                    // terminal_host_sel_end() already cleared collapsed (point)
+                    // selections, so active_terminal_selected_text() is Some only
+                    // when a real (non-trivial) range was dragged.
+                    if let Some(text) = self.active_terminal_selected_text() {
+                        backend.services().clipboard().write_text(&text);
+                        self.clear_active_terminal_selection();
+                    }
                     return true;
                 }
                 // #454: forward button release to the embedded PTY when mouse
@@ -32776,8 +32766,6 @@ mod tests {
             pty_pressed_buttons: 0,
             // #464
             terminal_host_sel_dragging: false,
-            // #790
-            terminal_shift_drag_hint_shown: false,
             // #207
             machine_metrics: std::collections::HashMap::new(),
             pending_metrics: Vec::new(),
@@ -48831,14 +48819,16 @@ mod tests {
             !app.terminal_host_sel_dragging,
             "dragging flag cleared after end"
         );
-        // Non-collapsed selection must remain so Ctrl-C can copy it.
+        // Non-collapsed selection remains after terminal_host_sel_end() alone.
+        // The full MouseUp handler (handle_mouse) then auto-copies and clears it,
+        // but terminal_host_sel_end() itself only clears the dragging flag.
         assert!(
             app.terminal_session
                 .as_ref()
                 .unwrap()
                 .selection
                 .is_some(),
-            "selection should persist after end (non-collapsed)"
+            "selection should persist after terminal_host_sel_end() (non-collapsed)"
         );
     }
 
@@ -49086,15 +49076,15 @@ mod tests {
     }
 
     /// A plain left-press (no Shift) in a PTY pane with mouse reporting active
-    /// fires the one-shot discovery toast and sets `terminal_shift_drag_hint_shown`.
+    /// is forwarded to the PTY and does NOT show a discovery toast.
     ///
-    /// Regression guard for the finding that the toast code path was untested:
-    /// this drives the full `TuiDriver` render + mouse-down dispatch so the
-    /// event goes through `handle_mouse → terminal_mouse_event → forward_mouse`
-    /// and the toast appears on the rendered screen.
+    /// Regression guard: plain PTY click must not interfere with the hint strip
+    /// or trigger any spurious UI event.  Drives the full `TuiDriver` render +
+    /// mouse-down dispatch through `handle_mouse → terminal_mouse_event →
+    /// forward_mouse` and asserts the hint strip remains visible afterward.
     #[test]
     #[cfg(unix)]
-    fn terminal_plain_press_fires_shift_drag_discovery_toast() {
+    fn terminal_plain_press_hint_strip_remains_visible() {
         use quadraui::tui::testing::driver_with_shell;
 
         fn poll_until_ms(
@@ -49130,11 +49120,6 @@ mod tests {
         let mut app = make_test_app(BoardData::default());
         app.active_view = SidebarView::Terminal;
         app.terminal_session = Some(sess);
-        // Confirm the toast has NOT fired yet (initial state).
-        assert!(
-            !app.terminal_shift_drag_hint_shown,
-            "terminal_shift_drag_hint_shown must start false"
-        );
 
         // 120×40 screen; default sidebar width = 35 → main/terminal area
         // starts at x=35.  Click at (70, 20) — well inside the terminal
@@ -49142,32 +49127,31 @@ mod tests {
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
         driver.click(70.0, 20.0);
 
-        // The one-shot discovery toast must be visible on the next rendered frame.
+        // After a plain PTY press the hint strip must still be visible (it is
+        // a permanent row, not a one-shot).  The click is forwarded to the PTY
+        // and must not trigger any discovery toast.
         assert!(
-            driver.screen_contains("Terminal selection"),
-            "discovery toast title must appear after a plain PTY press:\n{}",
+            driver.screen_contains("Hold Shift"),
+            "hint strip must still be visible after a plain PTY press:\n{}",
             driver.screen(),
         );
         assert!(
-            driver.screen_contains("Hold Shift"),
-            "discovery toast body must mention 'Hold Shift':\n{}",
+            !driver.screen_contains("Terminal selection"),
+            "no discovery toast should appear after a plain PTY press:\n{}",
             driver.screen(),
         );
     }
 
     /// A plain left-press (no Shift) in a **Pipeline Terminal** tab with mouse
-    /// reporting active fires the same one-shot discovery toast.
+    /// reporting active is forwarded to the PTY and does not trigger a toast.
     ///
-    /// Regression guard for the Board/Pipeline-Terminal routing path added in
-    /// #790 fix: the standalone-Terminal toast test covers `SidebarView::Terminal`
-    /// but the operator typically opens the terminal from the Pipeline or Board
-    /// detail panel.  This test drives the full `TuiDriver` render + mouse-down
-    /// dispatch through the Pipeline Terminal code path so
-    /// `handle_mouse → terminal_mouse_event → forward_mouse` reaches the session
-    /// in `detail_terminal_sessions` and the toast appears on screen.
+    /// Regression guard for the Board/Pipeline-Terminal routing path (#790):
+    /// verifies that `handle_mouse → terminal_mouse_event → forward_mouse`
+    /// reaches the session in `detail_terminal_sessions` and that the hint
+    /// strip stays visible (a permanent row, not a one-shot).
     #[test]
     #[cfg(unix)]
-    fn pipeline_terminal_plain_press_fires_shift_drag_discovery_toast() {
+    fn pipeline_terminal_plain_press_hint_strip_remains_visible() {
         use quadraui::tui::testing::driver_with_shell;
 
         fn poll_until_ms(
@@ -49204,7 +49188,7 @@ mod tests {
         // Set up a pipeline issue so selected_issue_key() resolves.
         app.pipeline_issues = vec![PipelineIssue {
             number: 42,
-            title: "test issue for pipeline terminal toast".to_string(),
+            title: "test issue for pipeline terminal hint".to_string(),
             body: String::new(),
             repo_slug: "owner/repo".to_string(),
             coord_repo: None,
@@ -49217,11 +49201,6 @@ mod tests {
         app.pipeline_detail_tab = PipelineDetailTab::Terminal;
         app.detail_terminal_sessions.insert(issue_key, sess);
 
-        assert!(
-            !app.terminal_shift_drag_hint_shown,
-            "terminal_shift_drag_hint_shown must start false"
-        );
-
         // 120×40 screen; sidebar width=35, tab bar height=1 row (TUI lh=1).
         // x=70 is in the main area; y=10 is below the tab bar (row 1) and
         // above the hint strip (last row), so the click lands in PTY content.
@@ -49229,28 +49208,28 @@ mod tests {
         driver.click(70.0, 10.0);
 
         assert!(
-            driver.screen_contains("Terminal selection"),
-            "discovery toast title must appear after a plain Pipeline Terminal press:\n{}",
+            driver.screen_contains("Hold Shift"),
+            "hint strip must remain visible after a plain Pipeline Terminal press:\n{}",
             driver.screen(),
         );
         assert!(
-            driver.screen_contains("Hold Shift"),
-            "discovery toast body must mention 'Hold Shift':\n{}",
+            !driver.screen_contains("Terminal selection"),
+            "no discovery toast should appear after a plain Pipeline Terminal press:\n{}",
             driver.screen(),
         );
     }
 
     /// A plain left-press (no Shift) in a **Board Terminal** tab with mouse
-    /// reporting active fires the one-shot discovery toast.
+    /// reporting active is forwarded to the PTY and does not trigger a toast.
     ///
-    /// Regression guard for the Board Terminal routing path added in #790
-    /// fix (92f5293 — Board Terminal was missing from all mouse-routing
-    /// helpers).  Mirrors the Pipeline Terminal toast test but exercises
-    /// `SidebarView::Board + BoardDetailTab::Terminal` code path through
-    /// `handle_mouse → reporting_on → terminal_mouse_event → forward_mouse`.
+    /// Regression guard for the Board Terminal routing path (#790 / 92f5293 —
+    /// Board Terminal was missing from all mouse-routing helpers).  Mirrors the
+    /// Pipeline Terminal test but exercises `SidebarView::Board +
+    /// BoardDetailTab::Terminal` through `handle_mouse → reporting_on →
+    /// terminal_mouse_event → forward_mouse`.
     #[test]
     #[cfg(unix)]
-    fn board_terminal_plain_press_fires_shift_drag_discovery_toast() {
+    fn board_terminal_plain_press_hint_strip_remains_visible() {
         use quadraui::tui::testing::driver_with_shell;
 
         fn poll_until_ms(
@@ -49299,24 +49278,19 @@ mod tests {
         let issue_key = ("repo-a".to_string(), 10u64);
         app.detail_terminal_sessions.insert(issue_key, sess);
 
-        assert!(
-            !app.terminal_shift_drag_hint_shown,
-            "terminal_shift_drag_hint_shown must start false"
-        );
-
         // 120×40 screen; sidebar width=35, tab bar height=1 row (TUI lh=1).
         // y=10 is below the tab bar and above the hint strip (last row).
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
         driver.click(70.0, 10.0);
 
         assert!(
-            driver.screen_contains("Terminal selection"),
-            "discovery toast title must appear after a plain Board Terminal press:\n{}",
+            driver.screen_contains("Hold Shift"),
+            "hint strip must remain visible after a plain Board Terminal press:\n{}",
             driver.screen(),
         );
         assert!(
-            driver.screen_contains("Hold Shift"),
-            "discovery toast body must mention 'Hold Shift':\n{}",
+            !driver.screen_contains("Terminal selection"),
+            "no discovery toast should appear after a plain Board Terminal press:\n{}",
             driver.screen(),
         );
     }
