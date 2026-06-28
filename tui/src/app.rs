@@ -2590,13 +2590,14 @@ impl Default for PipelineModels {
 /// Returns the model alias to use for a fix on the given iteration number
 /// (1-based: iteration 1 = first fix, iteration 2 = second fix, …).
 ///
-/// - Iteration 1 → `models.default` (first fix stays cheap/fast).
+/// - `None` when `escalate_fix_model` is false — escalation is disabled, so
+///   no model hint is surfaced (the fix will use coord's normal default).
+/// - Iteration 1 → `Some(models.default)` (first fix stays cheap/fast).
 /// - Iteration 2+ → climb one rung up `models.escalation` per extra
 ///   iteration, capped at the ladder top.
-/// - When `escalate_fix_model` is false → always `models.default`.
-fn fix_model_for_iteration(models: &PipelineModels, iteration: i64) -> String {
+fn fix_model_for_iteration(models: &PipelineModels, iteration: i64) -> Option<String> {
     if !models.escalate_fix_model {
-        return models.default.clone();
+        return None;
     }
     let mut model = models.default.clone();
     let extra = (iteration.max(1) - 1) as usize;
@@ -2609,7 +2610,7 @@ fn fix_model_for_iteration(models: &PipelineModels, iteration: i64) -> String {
             _ => break, // already at the top or not on the ladder → cap
         }
     }
-    model
+    Some(model)
 }
 
 #[derive(Default)]
@@ -25951,7 +25952,7 @@ impl CoordApp {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })?;
         let next_iteration = latest_work.review_iteration + 1;
-        Some(fix_model_for_iteration(models, next_iteration))
+        fix_model_for_iteration(models, next_iteration)
     }
 
     /// True when the embedded Terminal pane for issue `key` is showing a still-
@@ -34991,6 +34992,84 @@ mod tests {
     }
 
     #[test]
+    fn fix_model_for_issue_returns_none_when_escalation_disabled() {
+        // #803: when escalate_fix_model=false, fix_model_for_issue must return
+        // None regardless of the iteration count, so no misleading
+        // "auto-escalated" label appears in the dialog.
+        let models = PipelineModels {
+            escalate_fix_model: false,
+            ..PipelineModels::default()
+        };
+        let mut work = make_assignment_typed("done", 42, "api", Some("work"));
+        work.review_iteration = 2; // would normally escalate if enabled
+        let board = BoardData {
+            assignments: vec![work],
+            pipeline_models: Some(models),
+            ..BoardData::default()
+        };
+        let app = make_test_app(board);
+        assert_eq!(
+            app.fix_model_for_issue("api", 42),
+            None,
+            "escalation disabled → no model hint (None)",
+        );
+    }
+
+    #[test]
+    fn rework_dialog_omits_model_hint_when_escalation_disabled() {
+        // #803: when escalate_fix_model=false, the rework dialog must NOT show
+        // "auto-escalated" — the label would be a false claim.
+        let models = PipelineModels {
+            escalate_fix_model: false,
+            ..PipelineModels::default()
+        };
+        let mut work = make_assignment_typed("done", 42, "api", Some("work"));
+        work.review_iteration = 2;
+        let board = BoardData {
+            assignments: vec![work],
+            pipeline_models: Some(models),
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(board);
+        app.pending_rework = Some(PendingRework {
+            coord_repo: "api".to_string(),
+            repo_slug: "api".to_string(),
+            issue_num: 42,
+            findings: String::new(),
+        });
+        let dlg = app.build_prompt_dialog().expect("rework dialog built");
+        let body = dialog_body_text(&dlg).join("\n");
+        assert!(
+            !body.contains("auto-escalated"),
+            "escalation disabled — 'auto-escalated' must not appear in dialog body:\n{body}",
+        );
+    }
+
+    /// #803 TuiDriver black-box: the escalated model tier must be visible on the
+    /// rendered screen when escalation is enabled.  Seeds `board_with_fix_iteration(1)`
+    /// (review_iteration=1 → next_iteration=2 → opus) with a `pending_rework`,
+    /// renders through the full `ShellAdapter → render_frame → TestBackend` path,
+    /// and asserts the screen grid contains "Model: opus".
+    #[test]
+    fn rework_dialog_model_hint_renders_on_screen() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(board_with_fix_iteration(1));
+        app.pending_rework = Some(PendingRework {
+            coord_repo: "api".to_string(),
+            repo_slug: "api".to_string(),
+            issue_num: 42,
+            findings: String::new(),
+        });
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("Model: opus"),
+            "rework dialog must show 'Model: opus' on screen for iteration 2:\n{}",
+            driver.screen(),
+        );
+    }
+
+    #[test]
     fn build_interactive_launch_cmd_fix_mode_emits_fix_of() {
         let cmd = build_interactive_launch_cmd(
             None,
@@ -40814,7 +40893,7 @@ mod tests {
         }
     }
 
-    ///Concurrency cap: when CI_MAX_IN_FLIGHT loaders are already in-flight,
+    /// Concurrency cap: when CI_MAX_IN_FLIGHT loaders are already in-flight,
     /// `maybe_kick_ci_check_loaders` must not start any additional ones.
     #[test]
     fn maybe_kick_ci_check_loaders_respects_concurrency_cap() {
