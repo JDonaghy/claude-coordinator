@@ -11961,6 +11961,7 @@ impl CoordApp {
     fn pipeline_action_bar_toolbar(&self) -> Option<Toolbar> {
         let (label, _stage_idx) = self.pipeline_action_button()?;
         Some(Toolbar {
+            focused_index: None,
             id: WidgetId::new("pipeline-action-bar"),
             buttons: vec![ToolbarButton::Action {
                 id: WidgetId::new("pipeline-action:dispatch"),
@@ -18783,6 +18784,7 @@ impl CoordApp {
         // ── Force-quit confirmation (interactive session live) ───────────
         if self.pending_quit_confirm {
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:quit-confirm"),
                 title: StyledText::plain("Quit — interactive session live?"),
                 body: vec![StyledText::plain(
@@ -18845,6 +18847,7 @@ impl CoordApp {
                 tint: None,
             });
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:machine-picker"),
                 title: StyledText::plain(format!("Select machine for interactive {verb}")),
                 body: vec![StyledText::plain(
@@ -18879,6 +18882,7 @@ impl CoordApp {
                 tint: None,
             });
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:repo-picker"),
                 title: StyledText::plain("Select Target Repo"),
                 body: vec![StyledText::plain(
@@ -18894,6 +18898,7 @@ impl CoordApp {
         // ── Refinement-chat close (#410: Cancel / Save / Send) ──────────
         if let Some(ref p) = self.pending_refinement_close_prompt {
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:refinement-close"),
                 title: StyledText::plain("Close Refinement Chat"),
                 body: vec![StyledText::plain(format!(
@@ -18932,6 +18937,7 @@ impl CoordApp {
         // ── Report-fix description input ─────────────────────────────────
         if let Some(ref buf) = self.pending_report_fix {
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:report-fix"),
                 title: StyledText::plain("Report & Dispatch Fix"),
                 body: vec![StyledText::plain(
@@ -18966,6 +18972,7 @@ impl CoordApp {
         // ── Test-failure reason input ────────────────────────────────────
         if let Some((_, ref buf)) = self.pending_test_fail {
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:test-fail"),
                 title: StyledText::plain("Record Test Failure"),
                 body: vec![StyledText::plain("Enter a reason (optional):")],
@@ -19004,6 +19011,7 @@ impl CoordApp {
                 return Some(d);
             }
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:auto-review"),
                 title: StyledText::plain("Test passed — start review?"),
                 body: vec![
@@ -19069,6 +19077,7 @@ impl CoordApp {
                 ),
             };
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:stage-launch"),
                 title: StyledText::plain(title.to_string()),
                 body: vec![
@@ -19110,6 +19119,7 @@ impl CoordApp {
             // dialog preview is reserved for the test-fix dialog where the
             // findings are already captured (test_reason).
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:rework"),
                 title: StyledText::plain("Review requested changes — enter findings & start fix"),
                 body: vec![
@@ -19169,6 +19179,7 @@ impl CoordApp {
             ];
             body.extend(self.fix_briefing_preview_lines());  // #603 preview
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:test-fix"),
                 title: StyledText::plain("Test failed — start fix?"),
                 body,
@@ -19201,6 +19212,7 @@ impl CoordApp {
                 return Some(d);
             }
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:merge-agent"),
                 title: StyledText::plain("Review approved — start merge agent?"),
                 body: vec![
@@ -19244,6 +19256,7 @@ impl CoordApp {
                 format!("Scope: --repo {}", repo)
             };
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:force-merge"),
                 title: StyledText::plain("Force Merge"),
                 body: vec![
@@ -19282,6 +19295,7 @@ impl CoordApp {
                 .map(|m| m.active_count)
                 .unwrap_or(0);
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:restart"),
                 title: StyledText::plain("Restart Machine"),
                 body: vec![StyledText::plain(format!(
@@ -19315,6 +19329,7 @@ impl CoordApp {
         // ── Purge confirm ────────────────────────────────────────────────
         if let Some((a, i)) = self.pending_purge {
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:purge"),
                 title: StyledText::plain("Purge Old Data"),
                 body: vec![StyledText::plain(format!(
@@ -19369,6 +19384,7 @@ impl CoordApp {
                 "2    Fully automated".to_string()
             };
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:test-mode-choice"),
                 title: StyledText::plain(format!(
                     "Test mode for {} #{} ({})",
@@ -19445,6 +19461,7 @@ impl CoordApp {
                 Some(DialogSeverity::Warning)
             };
             return Some(Dialog {
+                table: None,
                 id: WidgetId::new("dialog:artifact-pull"),
                 title: StyledText::plain("Artifacts"),
                 body: vec![StyledText::plain(dlg.body.clone())],
@@ -19515,6 +19532,7 @@ impl CoordApp {
             .unwrap_or(6);
         let btn_w = (max_label_len as f32 * 0.7 * lh + padding * 2.0).max(8.0 * lh);
         let measure = DialogMeasure {
+            table_height: 0.0,
             width: dialog_w,
             title_height: title_h,
             body_height: body_h,
@@ -21842,6 +21860,7 @@ impl CoordApp {
             // Action bar with Refine + New Issue buttons.
             let repo_known = repo.is_some();
             let toolbar = Toolbar {
+                focused_index: None,
                 id: WidgetId::new("board-chat-cta"),
                 buttons: vec![
                     ToolbarButton::Action {
@@ -22801,6 +22820,7 @@ impl CoordApp {
         SidebarPanel {
             id: WidgetId::new("sidebar-panel"),
             toolbar: Some(Toolbar {
+                focused_index: None,
                 id: WidgetId::new("sidebar-action-bar"),
                 buttons,
                 bg: None,
@@ -22987,6 +23007,7 @@ impl CoordApp {
         };
 
         Some(Toolbar {
+            focused_index: None,
             id: WidgetId::new("panel-toolbar"),
             buttons,
             bg: None,
@@ -25954,6 +25975,7 @@ impl CoordApp {
             return None;
         }
         Some(Dialog {
+            table: None,
             id: WidgetId::new("dialog:reattach-first"),
             title: StyledText::plain(format!(
                 "Live session still running — #{issue_num}",
