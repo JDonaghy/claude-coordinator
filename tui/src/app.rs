@@ -18440,6 +18440,7 @@ impl CoordApp {
         &self,
         issue_number: Option<u64>,
         lifecycle: &BoardRowLifecycle,
+        repo_name: Option<&str>,
     ) -> Vec<ContextMenuItem> {
         let mut items: Vec<ContextMenuItem> = Vec::new();
         // #628: the Board is Backlog → In-flight → Completed (the status:ready
@@ -18466,6 +18467,19 @@ impl CoordApp {
         // stays the default-selected item.
         if issue_number.is_some() {
             items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
+            // #815: "View in Pipeline" — navigate from the Board to the matching
+            // Pipeline entry.  Disabled when the issue isn't tracked in the
+            // Pipeline (no coord label / no matching entry).
+            let in_pipeline = issue_number.zip(repo_name).map_or(false, |(num, repo)| {
+                self.pipeline_issues.iter().any(|pi| {
+                    pi.number == num
+                        && pi.coord_repo.as_deref().unwrap_or(&pi.repo_slug) == repo
+                })
+            });
+            let mut jump_item =
+                ContextMenuItem::action("jump-to-pipeline", "View in Pipeline");
+            jump_item.disabled = !in_pipeline;
+            items.push(jump_item);
             items.push(ContextMenuItem::separator());
         }
         if let Some(num) = issue_number {
@@ -18965,9 +18979,13 @@ impl CoordApp {
         let items = match &target {
             ContextMenuTarget::BoardRow {
                 issue_number,
+                repo_name,
                 lifecycle,
-                ..
-            } => self.context_menu_items_for_board_row(*issue_number, lifecycle),
+            } => self.context_menu_items_for_board_row(
+                *issue_number,
+                lifecycle,
+                repo_name.as_deref(),
+            ),
             ContextMenuTarget::PipelineRow {
                 issue_number,
                 lifecycle,
@@ -21933,6 +21951,10 @@ impl CoordApp {
         let Some((repo_name, issue_number)) = self.board_selected_issue() else {
             return;
         };
+        // Kick the pipeline loader so data is current — in particular, if the
+        // user has never visited the Pipeline view this session, pipeline_issues
+        // is empty and the find() below would always return None (false negative).
+        self.maybe_kick_pipeline_loader();
         // Match by coord_repo (the local repo name from coordinator.yml) just
         // like `confirm_issue_finder` does — `board_active_repo` returns the
         // local name, not the GitHub owner/name slug.
@@ -21942,10 +21964,27 @@ impl CoordApp {
         });
         if let Some(pi) = pipeline_entry {
             let repo_slug = pi.repo_slug.clone();
+            // #815: capture is_closed before calling mutable methods that
+            // require &mut self and would end the borrow of pipeline_issues.
+            let is_closed = pi.is_closed;
             self.active_view = SidebarView::Pipeline;
             self.rebuild_pipeline_sidebar(Some((repo_slug, issue_number)));
             self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
             self.pipeline_stage_content_scroll = 0;
+            // #815: if the matched issue is in the Done section, expand Done so
+            // the selection is visible (rebuild_pipeline_sidebar defaults Done
+            // to collapsed, so without this the user would see no change).
+            if is_closed {
+                let search_offset = 1usize;
+                if let Some(done_idx) = self
+                    .pipeline_state_section_names
+                    .iter()
+                    .position(|&k| k == "done")
+                {
+                    self.pipeline_sidebar
+                        .set_collapsed(done_idx + search_offset, false);
+                }
+            }
         } else {
             self.push_toast(
                 "Not in Pipeline",
@@ -22872,6 +22911,12 @@ impl CoordApp {
                         );
                     }
                 }
+                true
+            }
+            // #815: View in Pipeline — jump from the Board to the matching
+            // Pipeline entry (same logic as pressing `p`).
+            "jump-to-pipeline" => {
+                self.jump_board_to_pipeline();
                 true
             }
             // #261: Send to Pipeline — add the `coord` label so the
@@ -43878,9 +43923,10 @@ mod tests {
             Point::new(0.0, 0.0),
             board_target(Some(1), BoardRowLifecycle::InFlight),
         );
-        // #661 InFlight layout — Chat about issue / sep / Copy / sep / Refresh
-        // (the Board "Send" is gone). First item (selected) is "chat-about-issue";
-        // moving forward skips the separator and lands on "copy-issue-number".
+        // #661/#815 InFlight layout — Chat about issue / View in Pipeline (disabled)
+        // / sep / Copy / sep / Refresh (the Board "Send" is gone).  First selectable
+        // item is "chat-about-issue"; moving forward skips the disabled "View in
+        // Pipeline" and the separator, landing on "copy-issue-number".
         let state_before = app.pending_context_menu.clone().unwrap();
         app.context_menu_move_selection(1);
         let state_after = app.pending_context_menu.clone().unwrap();
@@ -43917,7 +43963,7 @@ mod tests {
         // interactive-vs-automated choice lives in the Pipeline menu.
         let app = make_app_default();
         let backlog =
-            app.context_menu_items_for_board_row(Some(7), &BoardRowLifecycle::Backlog);
+            app.context_menu_items_for_board_row(Some(7), &BoardRowLifecycle::Backlog, None);
         assert!(
             backlog.iter().any(|i| i.label == "Send to Pipeline"),
             "Backlog row must offer Send to Pipeline",
@@ -43927,7 +43973,7 @@ mod tests {
             "Board must never offer the direct Send (#661)",
         );
         let refined =
-            app.context_menu_items_for_board_row(Some(7), &BoardRowLifecycle::Refined);
+            app.context_menu_items_for_board_row(Some(7), &BoardRowLifecycle::Refined, None);
         assert!(
             !refined
                 .iter()
@@ -43980,7 +44026,8 @@ mod tests {
         // (Backlog) row; refining is now an action (the chat can `coord ready`),
         // not a state.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Backlog);
+        let items =
+            app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Backlog, None);
         let ids: Vec<&str> = items.iter().filter_map(|it| it.action_id.as_deref()).collect();
         assert!(
             ids.contains(&"chat-about-issue"),
@@ -43997,7 +44044,8 @@ mod tests {
         // Adding `status:refining` to an in-flight row would be
         // confusing — refining is upstream of dispatch.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::InFlight);
+        let items =
+            app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::InFlight, None);
         assert!(
             !items
                 .iter()
@@ -44088,7 +44136,8 @@ mod tests {
         // that puts an issue into the Pipeline — the status:ready "Refined" state
         // it used to live on is gone (status:ready gates nothing).
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::Backlog);
+        let items =
+            app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::Backlog, None);
         assert!(
             items
                 .iter()
@@ -44103,7 +44152,8 @@ mod tests {
         // In-flight rows already carry the `coord` label — the action
         // would be a no-op (and confusing).
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::InFlight);
+        let items =
+            app.context_menu_items_for_board_row(Some(99), &BoardRowLifecycle::InFlight, None);
         assert!(
             !items
                 .iter()
@@ -44135,7 +44185,8 @@ mod tests {
         // none of the old refine state-transitions (mark-refined / drop-to-refining
         // / refine / refine-chat) — only the global actions.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Refining);
+        let items =
+            app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Refining, None);
         let ids: Vec<&str> = items.iter().filter_map(|it| it.action_id.as_deref()).collect();
         for gone in ["mark-refined", "drop-to-refining", "refine", "refine-chat"] {
             assert!(!ids.contains(&gone), "{gone} must be eliminated; got {ids:?}");
@@ -44150,7 +44201,7 @@ mod tests {
         // only on Backlog/Refined + InProgress).
         let app = make_app_default();
         let has_chat_board = |lc: &BoardRowLifecycle, issue: Option<u64>| -> bool {
-            app.context_menu_items_for_board_row(issue, lc)
+            app.context_menu_items_for_board_row(issue, lc, None)
                 .iter()
                 .any(|it| it.action_id.as_deref() == Some("chat-about-issue"))
         };
@@ -44187,7 +44238,8 @@ mod tests {
         // Mark Refined / Drop to Backlog are state-transition actions
         // only meaningful for Refining rows.
         let app = make_app_default();
-        let items = app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Backlog);
+        let items =
+            app.context_menu_items_for_board_row(Some(42), &BoardRowLifecycle::Backlog, None);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -53645,11 +53697,12 @@ mod tests {
         driver.press(quadraui::Key::Char('p'));
 
         let pipeline_screen = driver.screen();
-        // The Pipeline panel must be active (activity bar label or a known
-        // pipeline-only UI element must be visible).
+        // The Pipeline panel must be active.  "In-progress" is a
+        // Pipeline-only section header (the Board uses "Backlog" / "Completed"),
+        // so its presence is a strong indicator that the Pipeline view is shown.
         assert!(
-            pipeline_screen.contains("Pipeline") || pipeline_screen.contains("#42"),
-            "#815: pressing p in Board must switch to Pipeline view:\n{pipeline_screen}"
+            pipeline_screen.contains("In-progress") || pipeline_screen.contains("progress"),
+            "#815: Pipeline sidebar (In-progress section) must be visible after jump:\n{pipeline_screen}"
         );
         // Issue #42 must be selected / visible in the Pipeline panel.
         assert!(
@@ -53778,5 +53831,180 @@ mod tests {
                  \nIn-progress at char {ip}, New at char {nw}:\n{screen}"
             );
         }
+    }
+
+    // ── #815: Jump Board→Pipeline — Done-expand and toast paths ──────────────
+
+    /// #815: Jumping to a closed/Done issue must expand the Done section so
+    /// the selected row is immediately visible — `rebuild_pipeline_sidebar`
+    /// leaves Done collapsed by default, so without an explicit expand the
+    /// user would see no change.
+    #[test]
+    fn jump_to_pipeline_expands_done_for_closed_issue() {
+        let a = make_assignment_typed("done", 55, "myrepo", Some("work"));
+        let mut app = make_test_app(BoardData {
+            assignments: vec![a],
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 55,
+                title: "Closed issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "closed".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 55,
+            title: "Closed issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: true,
+        }];
+        app.done_window = DoneWindow::All;
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 55);
+
+        // Verify Done section exists and is collapsed before the jump.
+        let search_offset = 1usize;
+        let done_idx_before = app
+            .pipeline_state_section_names
+            .iter()
+            .position(|&k| k == "done")
+            .expect("done section must exist after rebuild");
+        assert!(
+            app.pipeline_sidebar.is_collapsed(done_idx_before + search_offset),
+            "#815: Done section must be collapsed by default before jump"
+        );
+
+        // Perform the jump.
+        app.jump_board_to_pipeline();
+
+        // Must have switched to Pipeline view.
+        assert_eq!(
+            app.active_view,
+            SidebarView::Pipeline,
+            "#815: jump_board_to_pipeline must switch to Pipeline view"
+        );
+
+        // Done section must now be expanded so the selection is visible.
+        let done_idx_after = app
+            .pipeline_state_section_names
+            .iter()
+            .position(|&k| k == "done")
+            .expect("done section must still exist after jump");
+        assert!(
+            !app.pipeline_sidebar.is_collapsed(done_idx_after + search_offset),
+            "#815: Done section must be expanded after jumping to a closed/Done issue"
+        );
+    }
+
+    /// #815: Pressing `p` (or calling `jump_board_to_pipeline`) when the
+    /// selected Board issue is not in `pipeline_issues` must push a toast
+    /// and leave the active view unchanged.
+    #[test]
+    fn jump_to_pipeline_toasts_when_issue_not_in_pipeline() {
+        let mut app = make_test_app(BoardData {
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 77,
+                title: "Untracked issue".to_string(),
+                body: String::new(),
+                labels: vec![],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            ..BoardData::default()
+        });
+        // pipeline_issues is intentionally empty — issue is NOT tracked.
+        app.pipeline_issues = vec![];
+        app.rebuild_board_sidebar();
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 77);
+
+        let before_toasts = app.toasts.len();
+        app.jump_board_to_pipeline();
+
+        // View must stay on Board.
+        assert_eq!(
+            app.active_view,
+            SidebarView::Board,
+            "#815: view must not change when issue is not in the pipeline"
+        );
+        // A toast must have been queued.
+        assert!(
+            app.toasts.len() > before_toasts,
+            "#815: a toast must be pushed when the issue is not in the pipeline"
+        );
+    }
+
+    // ── #815: Board context menu — "View in Pipeline" disabled state ──────────
+
+    /// #815: "View in Pipeline" must appear in the Board right-click menu for
+    /// any lifecycle that has an issue number, and must be **disabled** when the
+    /// issue is not present in `pipeline_issues`.
+    #[test]
+    fn board_menu_view_in_pipeline_disabled_when_not_in_pipeline() {
+        // make_app_default() has empty pipeline_issues.
+        let app = make_app_default();
+        let items = app.context_menu_items_for_board_row(
+            Some(42),
+            &BoardRowLifecycle::InFlight,
+            Some("repo-a"),
+        );
+        let item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("jump-to-pipeline"));
+        assert!(
+            item.is_some(),
+            "#815: 'View in Pipeline' must be present in the Board right-click menu"
+        );
+        assert!(
+            item.unwrap().disabled,
+            "#815: 'View in Pipeline' must be disabled when the issue is not in the pipeline"
+        );
+    }
+
+    /// #815: "View in Pipeline" must be **enabled** when the issue exists in
+    /// `pipeline_issues` with a matching repo.
+    #[test]
+    fn board_menu_view_in_pipeline_enabled_when_in_pipeline() {
+        let mut app = make_app_default();
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "In pipeline".to_string(),
+            body: String::new(),
+            repo_slug: "acme/repo-a".to_string(),
+            coord_repo: Some("repo-a".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        let items = app.context_menu_items_for_board_row(
+            Some(42),
+            &BoardRowLifecycle::InFlight,
+            Some("repo-a"),
+        );
+        let item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("jump-to-pipeline"));
+        assert!(
+            item.is_some(),
+            "#815: 'View in Pipeline' must be present in the Board right-click menu"
+        );
+        assert!(
+            !item.unwrap().disabled,
+            "#815: 'View in Pipeline' must be enabled when the issue is in the pipeline"
+        );
     }
 }
