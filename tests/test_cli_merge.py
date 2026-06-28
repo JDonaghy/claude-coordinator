@@ -780,3 +780,137 @@ reviews:
         )
         assert result.exit_code == 0, result.output
         assert "empty" in result.output.lower()
+
+
+# ── #779-fix: coord merge --plan daemon routing via /board ────────────────────
+
+class TestMergePlanDaemonRouting:
+    """#779-fix: --plan fetches merge_plan from /board, never touches /merge.
+
+    Older daemons receive plan=True via /merge but have no show_plan handler
+    and fall through to a live merge cycle.  The fix routes --plan through
+    /board (merge_plan field present since #776/v0.4.53) instead.
+    """
+
+    def _make_plan_payload(self) -> dict:
+        """A minimal /board payload that includes a merge_plan list."""
+        return {
+            "assignments": [],
+            "plans": {},
+            "round_number": 0,
+            "notifications": [],
+            "merge_plan": [
+                {
+                    "assignment_id": "daemon1",
+                    "repo_name": "api",
+                    "repo_github": "acme/api",
+                    "branch": "worker/daemon1",
+                    "target_branch": "main",
+                    "issue_number": 42,
+                    "issue_title": "Daemon fix",
+                    "rank": 1,
+                    "size": 77,
+                    "status": "READY",
+                    "reason": None,
+                    "enqueued_at": None,
+                    "last_attempt": None,
+                    "milestone": None,
+                },
+            ],
+        }
+
+    def test_plan_routes_to_board_not_merge(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """When a daemon is configured, --plan fetches /board, never calls /merge."""
+        from coord.client import ServiceConfig
+
+        svc = ServiceConfig(url="http://dellserver:7435")
+        payload = self._make_plan_payload()
+
+        with (
+            patch("coord.client.resolve_board_service", return_value=svc),
+            patch("coord.client.fetch_board_payload", return_value=payload) as fetch_mock,
+            patch("coord.client.post_record") as post_mock,
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--plan"]
+            )
+
+        assert result.exit_code == 0, result.output
+        # /board must have been fetched
+        fetch_mock.assert_called_once_with(svc)
+        # /merge must NOT have been called (old-daemon side-effect guard)
+        post_mock.assert_not_called()
+        # Plan output present
+        assert "#42" in result.output
+        assert "+77" in result.output
+        assert "READY" in result.output
+
+    def test_plan_daemon_missing_merge_plan_exits_cleanly(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """When /board lacks merge_plan (daemon predates #776) exit with a clear error."""
+        from coord.client import ServiceConfig
+
+        svc = ServiceConfig(url="http://dellserver:7435")
+        # Payload without merge_plan — simulates a very old daemon.
+        old_payload = {"assignments": [], "plans": {}, "round_number": 0,
+                       "notifications": []}
+
+        with (
+            patch("coord.client.resolve_board_service", return_value=svc),
+            patch("coord.client.fetch_board_payload", return_value=old_payload),
+            patch("coord.client.post_record") as post_mock,
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--plan"]
+            )
+
+        assert result.exit_code != 0
+        assert "merge_plan" in result.output or "merge_plan" in (result.stderr or "")
+        # /merge must still never be called
+        post_mock.assert_not_called()
+
+    def test_plan_daemon_repo_filter_applied_client_side(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--plan --repo filter is applied to the /board payload on the client."""
+        from coord.client import ServiceConfig
+
+        svc = ServiceConfig(url="http://dellserver:7435")
+        payload = {
+            "assignments": [], "plans": {}, "round_number": 0, "notifications": [],
+            "merge_plan": [
+                {
+                    "assignment_id": "api1", "repo_name": "api",
+                    "repo_github": "acme/api", "branch": "w/api1",
+                    "target_branch": "main", "issue_number": 10,
+                    "issue_title": "API fix", "rank": 1, "size": 5,
+                    "status": "READY", "reason": None, "enqueued_at": None,
+                    "last_attempt": None, "milestone": None,
+                },
+                {
+                    "assignment_id": "lib1", "repo_name": "lib",
+                    "repo_github": "acme/lib", "branch": "w/lib1",
+                    "target_branch": "main", "issue_number": 20,
+                    "issue_title": "Lib fix", "rank": 2, "size": 8,
+                    "status": "READY", "reason": None, "enqueued_at": None,
+                    "last_attempt": None, "milestone": None,
+                },
+            ],
+        }
+
+        with (
+            patch("coord.client.resolve_board_service", return_value=svc),
+            patch("coord.client.fetch_board_payload", return_value=payload),
+            patch("coord.client.post_record"),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["merge", "--config", str(config_file), "--plan", "--repo", "api"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "#10" in result.output
+        assert "#20" not in result.output
