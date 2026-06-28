@@ -11164,9 +11164,13 @@ impl CoordApp {
             format!("Done · {}", self.done_window.label());
 
         // Build the list of non-empty state sections in display order.
-        // Each entry: (classifier_key, display_label).  Order matches the
-        // #194 spec: New → Refining → Pending → In-progress → Done.
+        // #815: In-progress on top — active work is the most relevant item
+        // to see immediately; the pre-dispatch lifecycle states follow in
+        // order (New → Refining → Pending); Done stays last.
         let mut state_sections: Vec<(&'static str, &'static str)> = Vec::new();
+        if !active_flat.is_empty() {
+            state_sections.push(("in-progress", "In-progress"));
+        }
         if !new_by_repo.is_empty() {
             state_sections.push(("new", "New"));
         }
@@ -11175,9 +11179,6 @@ impl CoordApp {
         }
         if !pending_by_repo.is_empty() {
             state_sections.push(("pending", "Pending"));
-        }
-        if !active_flat.is_empty() {
-            state_sections.push(("in-progress", "In-progress"));
         }
         if !done_windowed.is_empty() {
             state_sections.push(("done", "Done"));
@@ -11719,11 +11720,16 @@ impl CoordApp {
         // Sync `pipeline_sel` to the sidebar's actual selection.
         self.pipeline_sel = self.selected_pipeline_index();
         // Restore per-section collapse state by state key.  New sections
-        // that weren't present before stay expanded by default.
+        // that weren't present before default to expanded, EXCEPT Done which
+        // defaults to collapsed (#815) — it's an archive, not active work.
         for (i, &state_key) in self.pipeline_state_section_names.iter().enumerate() {
             if let Some(&was_collapsed) = prev_state_collapsed.get(state_key) {
                 self.pipeline_sidebar
                     .set_collapsed(i + search_offset, was_collapsed);
+            } else if state_key == "done" {
+                // #815: Done section starts collapsed by default so the active
+                // sections are immediately visible without scrolling past history.
+                self.pipeline_sidebar.set_collapsed(i + search_offset, true);
             }
         }
         // Restore panel scroll so the visible area doesn't jump back to the
@@ -21918,6 +21924,40 @@ impl CoordApp {
         }
     }
 
+    /// #815: Jump from the Board to the Pipeline for the currently-selected
+    /// issue.  If the issue has a coord tracking label and appears in
+    /// `pipeline_issues`, the Pipeline view is activated and the issue is
+    /// highlighted.  If the issue is not in the Pipeline (no tracked label),
+    /// a toast explains why and the Board view stays active.
+    fn jump_board_to_pipeline(&mut self) {
+        let Some((repo_name, issue_number)) = self.board_selected_issue() else {
+            return;
+        };
+        // Match by coord_repo (the local repo name from coordinator.yml) just
+        // like `confirm_issue_finder` does — `board_active_repo` returns the
+        // local name, not the GitHub owner/name slug.
+        let pipeline_entry = self.pipeline_issues.iter().find(|pi| {
+            pi.number == issue_number
+                && pi.coord_repo.as_deref().unwrap_or(&pi.repo_slug) == repo_name
+        });
+        if let Some(pi) = pipeline_entry {
+            let repo_slug = pi.repo_slug.clone();
+            self.active_view = SidebarView::Pipeline;
+            self.rebuild_pipeline_sidebar(Some((repo_slug, issue_number)));
+            self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
+            self.pipeline_stage_content_scroll = 0;
+        } else {
+            self.push_toast(
+                "Not in Pipeline",
+                &format!(
+                    "#{} has no coord tracking label — add one to dispatch it.",
+                    issue_number
+                ),
+                ToastSeverity::Info,
+            );
+        }
+    }
+
     /// Render the Telescope-style issue finder overlay.
     ///
     /// Draws a centered box (~70 % wide, ~60 % tall) over `viewport` that shows:
@@ -31369,6 +31409,19 @@ impl ShellApp for CoordApp {
                         }
                     }
 
+                    // ── p — Board: jump to the same issue in Pipeline view ───
+                    // #815: When an issue row is selected in the Board, pressing
+                    // `p` switches to the Pipeline panel and highlights that issue.
+                    // No-op when the search filter has focus (to avoid stealing
+                    // typed 'p' characters from the search box).
+                    Key::Char('p')
+                        if self.active_view == SidebarView::Board
+                            && !self.board_search.focused =>
+                    {
+                        self.jump_board_to_pipeline();
+                        needs_redraw = true;
+                    }
+
                     // ── p — Machines: pause/unpause routing toggle ────────
                     Key::Char('p') if self.active_view == SidebarView::Machines => {
                         if let Some(m) = self.data.machines.get(self.machine_sel) {
@@ -36055,13 +36108,14 @@ mod tests {
         app.done_window = DoneWindow::All;
         app.rebuild_pipeline_sidebar(None);
 
-        // #628: three lifecycle sections in display order. status:ready and
-        // status:refining gate nothing, so the fixture's status:ready issues +
-        // #101 (no label) + #102 (status:refining) all sit in New.
+        // #815: In-progress moves to the top; the pre-dispatch states follow.
+        // status:ready and status:refining gate nothing, so the fixture's
+        // status:ready issues + #101 (no label) + #102 (status:refining) all
+        // sit in New.  Order is: In-progress → New → Done.
         assert_eq!(
             app.pipeline_state_section_names,
-            vec!["new", "in-progress", "done"],
-            "the three lifecycle sections must appear in canonical order",
+            vec!["in-progress", "new", "done"],
+            "In-progress must appear first (#815), followed by New then Done",
         );
     }
 
@@ -36919,11 +36973,17 @@ mod tests {
         // gates nothing). With the closed #55 → "done", sections are New + Done.
         // Section 0 = FILTER, 1 = "New", 2 = "Done".
         assert_eq!(app.pipeline_state_section_names, vec!["new", "done"]);
+        // #815: Done starts collapsed by default; New starts expanded.
+        assert!(!app.pipeline_sidebar.is_collapsed(1)); // New: expanded by default
+        assert!(app.pipeline_sidebar.is_collapsed(2));  // Done: collapsed by default (#815)
+
+        // Collapse New and explicitly expand Done (user action).
         app.pipeline_sidebar.set_collapsed(1, true);
+        app.pipeline_sidebar.set_collapsed(2, false);
         assert!(app.pipeline_sidebar.is_collapsed(1));
         assert!(!app.pipeline_sidebar.is_collapsed(2));
 
-        // Rebuild — without the fix this resets collapse state to expanded.
+        // Rebuild — collapse state must be preserved across rebuild.
         app.rebuild_pipeline_sidebar(None);
 
         assert!(
@@ -36932,7 +36992,7 @@ mod tests {
         );
         assert!(
             !app.pipeline_sidebar.is_collapsed(2),
-            "Done section stays expanded as it was",
+            "Done section stays expanded (user explicitly expanded it; persists across rebuild)",
         );
     }
 
@@ -53090,6 +53150,17 @@ mod tests {
         app.pipeline_issues = vec![closed_issue(42, "acme/api", "api")];
         app.done_window = DoneWindow::H2;
         app.rebuild_pipeline_sidebar(None);
+        // #815: Done starts collapsed by default; expand it so #42 is visible.
+        {
+            let search_offset = 1usize; // section 0 = FILTER widget
+            if let Some(done_idx) = app
+                .pipeline_state_section_names
+                .iter()
+                .position(|&k| k == "done")
+            {
+                app.pipeline_sidebar.set_collapsed(done_idx + search_offset, false);
+            }
+        }
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
         // Switch to Pipeline view.
@@ -53515,5 +53586,197 @@ mod tests {
             "#789: SSE content accumulated off-screen must appear immediately \
              after switching to Pipeline > Log tab:\n{log_screen}"
         );
+    }
+
+    // ── #815: Jump Board→Pipeline ─────────────────────────────────────────────
+
+    /// #815 TuiDriver: pressing `p` in the Board view when an issue that
+    /// also appears in the Pipeline is selected switches to the Pipeline view
+    /// and highlights that issue in the Pipeline sidebar.
+    #[test]
+    fn tuidriver_p_key_in_board_jumps_to_pipeline() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // One done work assignment for issue #42 in repo "myrepo".
+        let a = make_assignment_typed("done", 42, "myrepo", Some("work"));
+        let mut app = make_test_app(BoardData {
+            assignments: vec![a],
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 42,
+                title: "Jump test issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            ..BoardData::default()
+        });
+        // Populate pipeline_issues so jump_board_to_pipeline can find the entry.
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Jump test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        // Start in Board view.
+        app.active_view = SidebarView::Board;
+        // Select issue #42 in the Board sidebar.
+        app.select_issue("myrepo", 42);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Confirm we're on Board and the issue is visible.
+        let board_screen = driver.screen();
+        assert!(
+            board_screen.contains("Board") || board_screen.contains("#42"),
+            "initial screen must show Board view:\n{board_screen}"
+        );
+
+        // Press 'p' — should jump to Pipeline and select issue #42.
+        driver.press(quadraui::Key::Char('p'));
+
+        let pipeline_screen = driver.screen();
+        // The Pipeline panel must be active (activity bar label or a known
+        // pipeline-only UI element must be visible).
+        assert!(
+            pipeline_screen.contains("Pipeline") || pipeline_screen.contains("#42"),
+            "#815: pressing p in Board must switch to Pipeline view:\n{pipeline_screen}"
+        );
+        // Issue #42 must be selected / visible in the Pipeline panel.
+        assert!(
+            pipeline_screen.contains("42"),
+            "#815: issue #42 must be visible in Pipeline after jump:\n{pipeline_screen}"
+        );
+    }
+
+    // ── #815: Default-collapsed Done section ──────────────────────────────────
+
+    /// #815: when the Done section appears for the first time (no prior
+    /// collapse state), `rebuild_pipeline_sidebar` must default it to collapsed
+    /// so active work sections are immediately visible without scrolling.
+    #[test]
+    fn done_section_default_collapsed_on_first_render() {
+        // Build an app with one done issue so the Done section exists.
+        let a = make_assignment_typed("done", 10, "myrepo", Some("work"));
+        let mut app = make_test_app(BoardData {
+            assignments: vec![a],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 10,
+            title: "Done issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:done".to_string()],
+            is_closed: true, // closed = Done section
+        }];
+        // Use DoneWindow::All so the Done section appears even without finished_at.
+        app.done_window = DoneWindow::All;
+        // First rebuild — no prior collapse state; Done should default to collapsed.
+        app.rebuild_pipeline_sidebar(None);
+
+        // The "done" key must be present in the state section names.
+        let done_idx = app
+            .pipeline_state_section_names
+            .iter()
+            .position(|&k| k == "done");
+        assert!(
+            done_idx.is_some(),
+            "done section must exist when there are closed issues"
+        );
+        let search_offset = 1usize;
+        let section_idx = done_idx.unwrap() + search_offset;
+        assert!(
+            app.pipeline_sidebar.is_collapsed(section_idx),
+            "#815: Done section must be collapsed by default on first render"
+        );
+    }
+
+    // ── #815: In-progress on top ──────────────────────────────────────────────
+
+    /// #815 TuiDriver: when both In-progress and New items exist, the
+    /// In-progress section must appear above (rendered before) the New section
+    /// in the Pipeline sidebar.
+    #[test]
+    fn tuidriver_inprogress_section_renders_above_new() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // One running assignment → In-progress; one open issue with no assignment → New.
+        let running = make_assignment_typed("running", 5, "myrepo", Some("work"));
+        let mut app = make_test_app(BoardData {
+            assignments: vec![running],
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 99,
+                title: "Brand new issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 5,
+                title: "Running issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/myrepo".to_string(),
+                coord_repo: Some("myrepo".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 99,
+                title: "Brand new issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/myrepo".to_string(),
+                coord_repo: Some("myrepo".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+
+        // Both sections must be visible.
+        assert!(
+            screen.contains("In-progress") || screen.contains("progress"),
+            "#815: In-progress section must appear in Pipeline sidebar:\n{screen}"
+        );
+        assert!(
+            screen.contains("New"),
+            "#815: New section must appear in Pipeline sidebar:\n{screen}"
+        );
+
+        // In-progress must appear before (higher on screen than) New.
+        let pos_inprogress = screen.find("In-progress").or_else(|| screen.find("progress"));
+        let pos_new = screen.find("New");
+        if let (Some(ip), Some(nw)) = (pos_inprogress, pos_new) {
+            assert!(
+                ip < nw,
+                "#815: In-progress section must appear above New section in the sidebar.\
+                 \nIn-progress at char {ip}, New at char {nw}:\n{screen}"
+            );
+        }
     }
 }
