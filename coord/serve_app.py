@@ -683,6 +683,14 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     merge_cmd.callback(
                         config_path=config.path,
                         dry_run=bool(body.get("dry_run")),
+                        # #684 added --plan/show_plan to the merge command and
+                        # routes --plan via /board, so /merge never needs it —
+                        # but the callback still *requires* the param.  Pass
+                        # False explicitly or the call raises "merge() missing 1
+                        # required positional argument: 'show_plan'" and every
+                        # daemon-routed merge (thin client, TUI 'Go', headless
+                        # drain) crashes before doing anything.
+                        show_plan=False,
                         order=body.get("order"),
                         repo_filter=body.get("repo_filter"),
                         method=body.get("method") or "rebase",

@@ -118,6 +118,28 @@ def test_serve_bearer_auth(file_db: Path, valid_config_path: Path):
         assert ok.status_code == 200
 
 
+def test_serve_merge_passes_show_plan_to_callback(file_db: Path, valid_config_path: Path):
+    """#684 regression: ``post_merge`` must pass ``show_plan`` to the merge
+    callback.  #684 added ``--plan``/``show_plan`` to ``coord merge`` (routing
+    ``--plan`` via /board, never /merge) but left the daemon handler invoking
+    ``merge_cmd.callback(...)`` without it — so every daemon-routed merge (thin
+    client, TUI 'Go', headless drain) crashed with ``merge() missing 1 required
+    positional argument: 'show_plan'`` before doing anything.
+
+    A nonexistent ``repo_filter`` keeps the dry-run a hermetic no-op (empty
+    queue → no gh/network), so the test asserts only that the signature bug
+    does not recur.
+    """
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.post("/merge", json={"dry_run": True, "repo_filter": "no-such-repo"})
+        assert resp.status_code == 200
+        err = resp.json().get("error") or ""
+        assert "show_plan" not in err, f"merge handler regressed on show_plan: {err}"
+        assert "missing 1 required positional argument" not in err
+
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 def test_board_from_payload_matches_local_build(file_db: Path):
