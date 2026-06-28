@@ -12507,7 +12507,6 @@ impl CoordApp {
                 ),
             }],
             bg: None,
-            focused_index: None,
         })
     }
 
@@ -19371,7 +19370,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
-                table: None,
             });
         }
 
@@ -19419,7 +19417,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
-                table: None,
             });
         }
 
@@ -19455,7 +19452,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
-                table: None,
             });
         }
 
@@ -19495,7 +19491,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
-                table: None,
             });
         }
 
@@ -19531,7 +19526,6 @@ impl CoordApp {
                     placeholder: "description…".into(),
                     cursor: Some(buf.len()),
                 })),
-                table: None,
             });
         }
 
@@ -19565,7 +19559,6 @@ impl CoordApp {
                     placeholder: "reason…".into(),
                     cursor: Some(buf.len()),
                 })),
-                table: None,
             });
         }
 
@@ -19609,7 +19602,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
-                table: None,
             });
         }
 
@@ -19671,7 +19663,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
-                table: None,
             });
         }
 
@@ -19738,7 +19729,6 @@ impl CoordApp {
                     placeholder: "What did the reviewer flag? (required)".into(),
                     cursor: Some(p.findings.len()),
                 })),
-                table: None,
             });
         }
 
@@ -19792,7 +19782,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
-                table: None,
             });
         }
 
@@ -19836,7 +19825,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: false,
                 input: None,
-                table: None,
             });
         }
 
@@ -19874,7 +19862,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
                 input: None,
-                table: None,
             });
         }
 
@@ -19977,7 +19964,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
                 input: None,
-                table: None,
             });
         }
 
@@ -20014,7 +20000,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Warning),
                 vertical_buttons: false,
                 input: None,
-                table: None,
             });
         }
 
@@ -20078,7 +20063,6 @@ impl CoordApp {
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
                 input: None,
-                table: None,
             });
         }
 
@@ -20126,7 +20110,6 @@ impl CoordApp {
                 severity,
                 vertical_buttons: false,
                 input: None,
-                table: None,
             });
         }
 
@@ -20199,7 +20182,6 @@ impl CoordApp {
             button_width: btn_w,
             button_gap: lh,
             padding,
-            table_height: 0.0,
         };
         let layout = dialog.layout(viewport, measure, |_| {
             quadraui::ToolbarItemMeasure::new(0.0)
@@ -22598,7 +22580,6 @@ impl CoordApp {
                     },
                 ],
                 bg: None,
-                focused_index: None,
             };
             backend.draw_toolbar(bar_rect, &toolbar, None, None);
 
@@ -23568,7 +23549,6 @@ impl CoordApp {
                 id: WidgetId::new("sidebar-action-bar"),
                 buttons,
                 bg: None,
-                focused_index: None,
             }),
             toolbar_height: Some(self.sidebar_action_bar_height(lh)),
         }
@@ -23758,7 +23738,6 @@ impl CoordApp {
             id: WidgetId::new("panel-toolbar"),
             buttons,
             bg: None,
-            focused_index: None,
         })
     }
 
@@ -26778,7 +26757,6 @@ impl CoordApp {
             severity: Some(DialogSeverity::Warning),
             vertical_buttons: false,
             input: None,
-            table: None,
         })
     }
 
@@ -45021,6 +44999,7 @@ mod tests {
             repo_github: "acme/api".to_string(),
             target_branch: None,
             error: None,
+            branch: None,
             milestone_title: None,
         });
 
@@ -53346,6 +53325,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         };
 
         // Review for the fix — approved.
@@ -53376,6 +53356,7 @@ mod tests {
             cache_read_tokens: 0,
             is_interactive: false,
             failure_reason: None,
+            review_iteration: 0,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
