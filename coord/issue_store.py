@@ -367,6 +367,23 @@ def _post_completion_local(record: CompletionRecord) -> StoreOutcome:
             )
         return _post_advisory_path(record)
 
+    # #812: interactive review session that failed to start or exited without a
+    # verdict.  Reviews never commit code, so commits_ahead is always None here
+    # (no worktree).  The legitimate "done" path for a review is post_result,
+    # which is called by coord report-result or the transcript-floor — both run
+    # BEFORE post_completion in finalize_interactive_exit and return early.
+    # Reaching post_completion for a review means neither path captured a verdict,
+    # so the session was abandoned or never started.  Finalise as failed
+    # (→ red/recoverable in the TUI) rather than done (→ permanently stuck blue).
+    if atype == "review":
+        summary = record.summary or (
+            "Interactive review session exited without producing a verdict "
+            "(session may have failed to start). "
+            "Re-dispatch a fresh review via 'Start review'."
+        )
+        record = _dc.replace(record, summary=summary)
+        return _post_failure_path(record)
+
     if record.exit_code != 0:
         return _post_failure_path(record)
 

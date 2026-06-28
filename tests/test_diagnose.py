@@ -151,6 +151,61 @@ def test_review_with_findings_is_healthy(monkeypatch, config) -> None:
     assert res.needs_reset is False
 
 
+# ── #812: review done but no verdict (failed-to-start / abandoned) ───────────
+
+
+def test_done_review_without_verdict_offers_reset(monkeypatch, config) -> None:
+    """#812: a review row that is status=done but has no verdict is permanently
+    stuck (nothing is running, but TUI showed Active).  Diagnose must detect it
+    and set needs_reset so the operator can re-dispatch a fresh review."""
+    calls = _stub(monkeypatch, session="dead", recover_verdict=None)
+    monkeypatch.setattr(
+        "coord.state.load_assignment_review_findings", lambda aid: None
+    )
+    a = _assign(aid="r812", typ="review", status="done", verdict=None)
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review")
+    assert res.needs_reset is True
+    assert res.recovered is False
+    assert any("#812" in f or "no verdict" in f or "verdict" in f for f in res.findings), (
+        f"expected verdict-related finding, got: {res.findings}"
+    )
+    # Tried transcript recovery before giving up.
+    assert "r812" in calls["recover"]
+
+
+def test_done_review_without_verdict_recovered_from_transcript(monkeypatch, config) -> None:
+    """#812: if the transcript contains the verdict (race between finalize and
+    the transcript write), recover it and mark stage as recovered — no reset."""
+    calls = _stub(monkeypatch, session="dead", recover_verdict="approve")
+    monkeypatch.setattr(
+        "coord.state.load_assignment_review_findings", lambda aid: None
+    )
+    a = _assign(aid="r812b", typ="review", status="done", verdict=None)
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review")
+    assert res.recovered is True
+    assert res.needs_reset is False
+    assert "r812b" in calls["recover"]
+    assert any("recovered" in x for x in res.actions_taken)
+
+
+def test_done_review_without_verdict_dry_run_does_not_write(monkeypatch, config) -> None:
+    """#812: dry-run must not write anything — should report needs_reset only."""
+    calls = _stub(monkeypatch, session="dead", recover_verdict=None)
+    monkeypatch.setattr(
+        "coord.state.load_assignment_review_findings", lambda aid: None
+    )
+    a = _assign(aid="r812c", typ="review", status="done", verdict=None)
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(
+        board, config, "api", 42, "review", dry_run=True
+    )
+    # dry_run: no actual writes; transcript recovery is skipped
+    assert "r812c" not in calls["recover"]
+    assert res.needs_reset is True
+
+
 # ── stale-but-live → needs reset ─────────────────────────────────────────────
 
 

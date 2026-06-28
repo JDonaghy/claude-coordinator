@@ -11757,12 +11757,17 @@ impl CoordApp {
                 // inviting a premature merge.  Consult `review_verdict`:
                 //   approve         → Done   (green ✓)
                 //   request-changes → Failed (red ✗ — changes requested)
-                //   None/unknown    → Active (distinct; verdict not extracted —
-                //                     must NOT read as green)
+                //   None/unknown    → Failed (red ✗ — #812: a terminal done
+                //                     row with no verdict is a dead end, not
+                //                     in-progress.  Renders as recoverable
+                //                     Failed rather than permanent blue Active)
+                // Note: in-flight reviews (status="running") are handled by
+                // the `any(status=="running")` guard at the top of this
+                // function and never reach this match arm.
                 "done" if stage == "review" => match latest.review_verdict.as_deref() {
                     Some("approve") => Some(StageStatus::Done),
                     Some("request-changes") | Some("fail") => Some(StageStatus::Failed),
-                    _ => Some(StageStatus::Active),
+                    _ => Some(StageStatus::Failed),
                 },
                 "done" => Some(StageStatus::Done),
                 "failed" => Some(StageStatus::Failed),
@@ -36089,10 +36094,46 @@ mod tests {
             "request-changes must render Failed (red), never green"
         );
 
+        // #812: a terminal (status="done") review with no verdict must render
+        // as Failed (red, recoverable), not Active (blue, permanently stuck).
+        // In-flight reviews (status="running") are caught by the early
+        // `any(status=="running") → Active` guard and never reach this arm.
         app.data.assignments = vec![mk_review(None)];
         let s = app.stage_status_for(&issue, "review");
         assert_ne!(s, StageStatus::Done, "a verdict-less review must not render green");
-        assert_eq!(s, StageStatus::Active);
+        assert_eq!(
+            s,
+            StageStatus::Failed,
+            "#812: a done review with no verdict must render Failed (red/recoverable), not Active (blue/stuck)"
+        );
+    }
+
+    #[test]
+    fn review_stage_status_running_with_no_verdict_is_active_not_failed() {
+        // #812 regression guard: in-flight reviews (status="running") must
+        // still render Active (blue), NOT Failed — the absence of a verdict
+        // during the session is expected.  Only a *terminal* (done) row with
+        // no verdict is an error.
+        let issue = PipelineIssue {
+            number: 700,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        };
+        let mut a = make_assignment_typed("running", 700, "api", Some("review"));
+        a.review_verdict = None;
+        a.dispatched_at = Some(100.0);
+        let mut app = make_app_default();
+        app.data.assignments = vec![a];
+        assert_eq!(
+            app.stage_status_for(&issue, "review"),
+            StageStatus::Active,
+            "an in-flight review (running) with no verdict must still render Active"
+        );
     }
 
     #[test]
