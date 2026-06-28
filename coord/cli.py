@@ -8379,6 +8379,83 @@ def _reconcile_via_daemon(svc, params: dict) -> None:
         sys.exit(int(code))
 
 
+def _print_merge_plan_entries(planned: list) -> None:
+    """Print a list of PlannedMerge entries grouped by repo → target_branch."""
+    if not planned:
+        click.echo("Merge queue is empty (nothing to plan).")
+        return
+    _last_group: tuple[str, str] | None = None
+    for _p in planned:
+        _gkey = (_p.repo_name, _p.target_branch)
+        if _gkey != _last_group:
+            if _last_group is not None:
+                click.echo("")
+            click.echo(f"{_p.repo_name} → {_p.target_branch}")
+            _last_group = _gkey
+        _size_str = f"+{_p.size}" if _p.size is not None else "?"
+        _status_str = _p.status
+        if _p.reason:
+            _status_str = f"{_p.status}   {_p.reason}"
+        click.echo(
+            f"  {_p.rank}. #{_p.issue_number}  {_size_str}   "
+            f"{_status_str}     {_p.issue_title}"
+        )
+
+
+def _show_plan_from_daemon(
+    svc,
+    *,
+    repo_filter: str | None,
+    order: str | None,
+) -> None:
+    """#779-fix: display merge plan via /board — never touches /merge.
+
+    Older daemons (≤v0.4.53 pre-#779) receive ``plan=True`` via ``/merge``
+    but have no show_plan handler, so they fall through to a full live merge
+    cycle with side effects.  The ``merge_plan`` field has been injected into
+    ``/board`` since #776/v0.4.53, so we fetch that instead — guaranteed
+    read-only on every supported daemon version.
+
+    Exits with an error message if the daemon payload lacks ``merge_plan``
+    (daemon predates v0.4.53); the caller should not fall through to a local
+    path that would show an empty thin-client queue.
+    """
+    from coord.client import fetch_board_payload  # noqa: PLC0415
+    from coord.merge_queue import PlannedMerge  # noqa: PLC0415
+
+    try:
+        payload = fetch_board_payload(svc)
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"error: fetch board for --plan failed: {exc}", err=True)
+        sys.exit(1)
+
+    if "merge_plan" not in payload:
+        click.echo(
+            "error: daemon does not expose merge_plan in /board "
+            "(upgrade the daemon to v0.4.53+ to use coord merge --plan).",
+            err=True,
+        )
+        sys.exit(1)
+
+    raw: list[dict] = payload.get("merge_plan") or []
+    known = set(PlannedMerge.__dataclass_fields__)
+    planned = [PlannedMerge(**{k: v for k, v in d.items() if k in known}) for d in raw]
+
+    if repo_filter:
+        planned = [p for p in planned if p.repo_name == repo_filter]
+
+    if order:
+        _override_ids = [s.strip() for s in order.split(",") if s.strip()]
+        _by_id = {p.assignment_id: p for p in planned}
+        _head = [_by_id[aid] for aid in _override_ids if aid in _by_id]
+        _tail = [p for p in planned if p.assignment_id not in set(_override_ids)]
+        planned = _head + _tail
+        for _i, _p in enumerate(planned, 1):
+            _p.rank = _i
+
+    _print_merge_plan_entries(planned)
+
+
 def _merge_via_daemon(svc, params: dict) -> None:
     """#584: run ``coord merge`` on the daemon host (where the canonical DB +
     merge queue + gh live) and relay its output, so the TUI 'Go' button and
@@ -8484,8 +8561,15 @@ def merge(
 
     _merge_svc = resolve_board_service()
     if _merge_svc is not None and not os.environ.get("COORD_MERGE_ON_DAEMON"):
+        # #779-fix: --plan must never reach /merge on an older daemon — it has
+        # no show_plan handler and falls through to a live merge cycle (side
+        # effects).  Route through /board instead; merge_plan has been in the
+        # /board payload since #776/v0.4.53.
+        if show_plan:
+            _show_plan_from_daemon(_merge_svc, repo_filter=repo_filter, order=order)
+            return
         _merge_via_daemon(_merge_svc, {
-            "dry_run": dry_run, "plan": show_plan, "order": order,
+            "dry_run": dry_run, "order": order,
             "repo_filter": repo_filter, "method": method,
             "force_merge": force_merge, "skip_review": skip_review,
             "skip_smoke": skip_smoke, "drop": drop_assignment,
@@ -8509,9 +8593,10 @@ def merge(
         return
 
     # #779: --plan is a pure read-only path; handle it before the auto-enqueue
-    # scan so it never causes side effects.  It shares daemon routing with the
-    # rest of coord merge, so the plan always reflects the canonical board/queue
-    # (not a thin-client's local copy).
+    # scan so it never causes side effects.  When a daemon is present this path
+    # is short-circuited above by _show_plan_from_daemon (/board, not /merge).
+    # This local branch runs on the daemon itself (COORD_MERGE_ON_DAEMON set)
+    # or when no daemon is configured (standalone dev environment).
     if show_plan:
         from coord import merge_queue as _plan_mq  # noqa: PLC0415
         from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
@@ -8538,27 +8623,7 @@ def merge(
             for _i, _p in enumerate(planned, 1):
                 _p.rank = _i
 
-        if not planned:
-            click.echo("Merge queue is empty (nothing to plan).")
-            return
-
-        # Print grouped by (repo_name → target_branch), preserving plan order.
-        _last_group: tuple[str, str] | None = None
-        for _p in planned:
-            _gkey = (_p.repo_name, _p.target_branch)
-            if _gkey != _last_group:
-                if _last_group is not None:
-                    click.echo("")
-                click.echo(f"{_p.repo_name} → {_p.target_branch}")
-                _last_group = _gkey
-            _size_str = f"+{_p.size}" if _p.size is not None else "?"
-            _status_str = _p.status
-            if _p.reason:
-                _status_str = f"{_p.status}   {_p.reason}"
-            click.echo(
-                f"  {_p.rank}. #{_p.issue_number}  {_size_str}   "
-                f"{_status_str}     {_p.issue_title}"
-            )
+        _print_merge_plan_entries(planned)
         return
 
     from coord import github_ops as gh_ops
