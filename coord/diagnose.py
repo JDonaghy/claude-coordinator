@@ -421,6 +421,34 @@ def _recover_review(
         else:
             res.findings.append("findings NOT recoverable from transcript — re-review needed")
             res.needs_reset = True
+    elif latest.status == "done" and verdict is None:
+        # #812: review finalised as done but no verdict was ever captured.
+        # The session likely failed to start (no session_id, no exit_code) or
+        # exited before the reviewer ran coord report-result / the transcript-floor.
+        # This is a permanent stuck state: nothing is running, TUI rendered it
+        # blue/Active (now Fixed → red/Failed), Diagnose & Reset must handle it.
+        res.findings.append(
+            "review finalised as done but has no verdict — "
+            "session likely failed to start or exited before verdict capture (#812)"
+        )
+        if dry_run:
+            res.findings.append(
+                "(dry-run) would try transcript recovery; if verdict not found, reset"
+            )
+            res.needs_reset = True
+            return
+        recovered_verdict = _recover_review_findings(latest, config)
+        if recovered_verdict:
+            res.actions_taken.append(
+                "recovered review verdict/findings from session transcript"
+            )
+            res.recovered = True
+        else:
+            res.findings.append(
+                "no verdict recoverable from transcript — "
+                "reset to re-dispatch a fresh review"
+            )
+            res.needs_reset = True
     elif state == "dead" and latest.status == "running":
         res.findings.append("review session is dead but board still says running (phantom)")
         if not dry_run:

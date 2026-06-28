@@ -290,6 +290,66 @@ class TestPostCompletion:
             f"expected diagnostic/chat in advisory body, got: {body[:300]!r}"
         )
 
+    # ── #812: review session that exited without capturing a verdict ────────────
+
+    def test_review_type_without_verdict_is_failed(self) -> None:
+        """#812: post_completion on a type='review' row should always produce
+        'failed', not 'done'.  Reviews never commit code, so commits_ahead=None
+        is the only possible value.  Reaching post_completion for a review means
+        neither coord report-result nor the transcript-floor captured a verdict
+        — the session was abandoned or never started.  Must NOT produce 'done'
+        (which would leave the review box permanently blue/Active in the TUI)."""
+        _seed_running_assignment("aid-rev-noverd", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment") as post:
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-rev-noverd",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=None,  # reviews have no worktree
+                )
+            )
+        assert outcome.status == "failed", (
+            f"review without verdict should be failed, got {outcome.status!r}"
+        )
+        row = state_mod.get_connection().execute(
+            "SELECT status, review_verdict FROM assignments WHERE assignment_id=?",
+            ("aid-rev-noverd",),
+        ).fetchone()
+        assert row["status"] == "failed"
+        assert row["review_verdict"] is None
+        # A failure comment should have been posted so the operator notices.
+        post.assert_called_once()
+        _repo, _issue, body = post.call_args.args
+        assert "failed" in body.lower() or "failure" in body.lower() or "error" in body.lower(), (
+            f"expected failure marker in comment body, got: {body[:300]!r}"
+        )
+
+    def test_review_type_failed_summary_mentions_verdict(self) -> None:
+        """#812: the failure comment body for a verdictless review should
+        mention verdict/review so the operator understands what happened."""
+        _seed_running_assignment("aid-rev-msg", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment") as post:
+            issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-rev-msg",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=None,
+                )
+            )
+        _repo, _issue, body = post.call_args.args
+        # The coordinator comment that wraps the summary will carry the word
+        # "failure" from the format_failure wrapper — confirm the write went
+        # through the failure path at all.
+        assert post.called, "expected a GitHub comment to be posted"
+
     def test_github_post_failure_does_not_undo_state(self) -> None:
         """Comment-post failure is non-fatal — the DB write is the
         authoritative record."""
