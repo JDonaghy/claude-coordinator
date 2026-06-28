@@ -6253,6 +6253,14 @@ pub struct CoordApp {
     /// Controls how far back the windowed Done list reaches.  Cycled by the
     /// `→` key while the Done section is focused.  Resets to `H2` on restart.
     done_window: DoneWindow,
+
+    // ── #816: PTY-panic modal ─────────────────────────────────────────────────
+    /// When `Some`, a dismissible modal dialog is shown explaining that a vt100
+    /// parser panic evicted an active terminal session.  The string is the raw
+    /// panic message captured by `catch_unwind` and converted via
+    /// [`vt100_panic_to_string`].  Set by [`report_terminal_panic`]; cleared
+    /// when the operator dismisses the dialog (Esc / Enter / outside-click).
+    pty_panic_dialog: Option<String>,
 }
 
 /// #728: Time-window for the Done section in the Pipeline sidebar.
@@ -6609,6 +6617,8 @@ impl CoordApp {
             },
             // #728: Done section shows last 2h by default; cycled with `→`.
             done_window: DoneWindow::H2,
+            // #816: no pending PTY-panic dialog on startup.
+            pty_panic_dialog: None,
         };
         // #584: a thin client pulls config from the daemon (no local
         // coordinator.yml) so the status bar doesn't warn and subcommands have
@@ -20089,6 +20099,34 @@ impl CoordApp {
             });
         }
 
+        // ── #816: PTY-panic notification ────────────────────────────────────
+        // Shown when a vt100 parser panic evicted an active terminal session.
+        // Dismissed by Esc / Enter / outside-click.
+        if let Some(ref panic_msg) = self.pty_panic_dialog {
+            let body = format!(
+                "A renderer fault (vt100 parser panic) evicted the active terminal \
+                 session.  The session has ended; board-driven actions (Test, Review, \
+                 Merge) continue normally.\n\nFault: {}",
+                panic_msg
+            );
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:pty-panic"),
+                title: StyledText::plain("Renderer fault — session evicted"),
+                body: vec![StyledText::plain(body)],
+                buttons: vec![DialogButton {
+                    id: WidgetId::new("close"),
+                    label: "Esc  Dismiss".into(),
+                    is_default: true,
+                    is_cancel: true,
+                    tint: None,
+                }],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Artifact-pull result (#532) ─────────────────────────────────────
         // Info dialog shown after `coord pull-artifact` completes, and
         // re-openable at any time by pressing `a` on the same pipeline row.
@@ -20308,6 +20346,9 @@ impl CoordApp {
             self.pending_purge = None;
         } else if self.artifact_pull_dialog.is_some() {
             self.artifact_pull_dialog = None;
+        } else if self.pty_panic_dialog.is_some() {
+            // #816: dismiss the PTY-panic notification dialog.
+            self.pty_panic_dialog = None;
         }
         *self.dialog_layout.borrow_mut() = None;
     }
@@ -20737,6 +20778,12 @@ impl CoordApp {
             }
             // Both "copy" and "close" dismiss the dialog.
             self.artifact_pull_dialog = None;
+            *self.dialog_layout.borrow_mut() = None;
+        }
+
+        // ── #816: PTY-panic notification ────────────────────────────────────
+        if self.pty_panic_dialog.is_some() && id == "close" {
+            self.pty_panic_dialog = None;
             *self.dialog_layout.borrow_mut() = None;
         }
     }
@@ -23682,6 +23729,7 @@ impl CoordApp {
             || self.pending_auto_review.is_some()
             || self.pending_rework.is_some()
             || self.artifact_pull_dialog.is_some()
+            || self.pty_panic_dialog.is_some()
             || self.pending_machine_picker.is_some()
             || self.pending_repo_picker.is_some()
             || self.refinement_notes_modal.is_some()
@@ -23712,6 +23760,7 @@ impl CoordApp {
             || self.pending_test_fix.is_some()
             || self.pending_merge.is_some()
             || self.artifact_pull_dialog.is_some()
+            || self.pty_panic_dialog.is_some()
         {
             return None;
         }
@@ -25166,6 +25215,21 @@ fn vt100_panic_to_string(e: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 impl CoordApp {
+    /// Raise a dismissible modal dialog (#816) reporting that a vt100 parser
+    /// panic has evicted a terminal session.
+    ///
+    /// Called by the `catch_unwind` eviction paths in both
+    /// [`drive_terminal_pane`] (standalone Terminal view) and
+    /// [`drive_detail_terminals`] (Pipeline / Board detail Terminal tab).
+    ///
+    /// `msg` is the raw panic payload string produced by [`vt100_panic_to_string`].
+    /// The dialog persists until the operator explicitly dismisses it (Esc /
+    /// Enter / outside-click); it renders on top of all other UI and blocks
+    /// keyboard input via [`any_blocking_modal_active`].
+    fn report_terminal_panic(&mut self, msg: String) {
+        self.pty_panic_dialog = Some(msg);
+    }
+
     /// Per-tick maintenance for the embedded terminal pane (#424).
     ///
     /// Performs three things in order, each idempotent:
@@ -25253,11 +25317,15 @@ impl CoordApp {
                 // session_pane_live(), which returns false when the session
                 // is gone — regardless of whether it exited normally or was
                 // evicted here.
+                let panic_msg = vt100_panic_to_string(&e);
                 self.terminal_session = None;
                 self.terminal_spawn_error = Some(format!(
                     "Session ended (renderer fault: {})",
-                    vt100_panic_to_string(&e)
+                    panic_msg
                 ));
+                // #816: surface a dismissible modal so the operator sees an
+                // explicit notification rather than silently losing the pane.
+                self.report_terminal_panic(panic_msg);
                 changed = true;
             }
             None => {}
@@ -25602,6 +25670,8 @@ impl CoordApp {
             self.detail_terminal_sessions.remove(&key);
             self.detail_terminal_spawn_errors
                 .insert(key, format!("Session ended (renderer fault: {msg})"));
+            // #816: surface a dismissible modal for explicit operator notification.
+            self.report_terminal_panic(msg);
         }
 
         // Only signal a repaint when the Terminal tab is currently displayed.
@@ -30219,6 +30289,23 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── #816: PTY-panic dialog key intercept ────────────────────────────
+        // Esc and Enter dismiss; any other key is swallowed to keep the
+        // dialog visible and let the operator read the fault message.
+        if self.pty_panic_dialog.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                let dismiss = matches!(
+                    key,
+                    Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)
+                );
+                if dismiss {
+                    self.pty_panic_dialog = None;
+                    *self.dialog_layout.borrow_mut() = None;
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── User-mapped keybindings (checked before hardcoded bindings) ──────
         if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
             if let Some(action) = self.action_for_key(key, modifiers) {
@@ -33858,6 +33945,8 @@ mod tests {
             active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
             // #728: default 2h window for tests (can be overridden per test).
             done_window: DoneWindow::H2,
+            // #816: no pending PTY-panic dialog in test helpers.
+            pty_panic_dialog: None,
         }
     }
 
@@ -54448,6 +54537,73 @@ mod tests {
         assert!(
             !item.unwrap().disabled,
             "#815: 'View in Pipeline' must be enabled when the issue is in the pipeline"
+        );
+    }
+
+    // ── #816: PTY-panic dialog ───────────────────────────────────────────────
+
+    /// Setting `pty_panic_dialog` shows the renderer-fault dialog; pressing
+    /// Esc dismisses it and clears the field.
+    ///
+    /// Drives the full `ShellAdapter → handle → render` pipeline with
+    /// `TuiDriver` so the dialog rendering path and the Esc key-intercept are
+    /// both exercised against the real screen grid.
+    #[test]
+    fn tuidriver_pty_panic_dialog_shows_and_dismisses_on_esc() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.pty_panic_dialog = Some("attempt to subtract with overflow".to_string());
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // Dialog must be visible on the initial render.
+        assert!(
+            driver.screen_contains("Renderer fault"),
+            "initial render must show PTY-panic dialog title:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("renderer fault"),
+            "dialog body must mention the renderer fault:\n{}",
+            driver.screen()
+        );
+
+        // Press Esc — the dialog must close.
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        assert!(
+            !driver.screen_contains("Renderer fault"),
+            "dialog must be dismissed after Esc:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// `report_terminal_panic` sets `pty_panic_dialog` and the dialog is
+    /// rendered on the next frame.  Verifies the method-level API used by
+    /// the `drive_terminal_pane` / `drive_detail_terminals` eviction paths.
+    #[test]
+    fn tuidriver_pty_panic_dialog_via_report_method() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        // Simulate what drive_terminal_pane does on a catch_unwind Err.
+        app.report_terminal_panic("called Option::unwrap() on a None value".to_string());
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        assert!(
+            driver.screen_contains("Renderer fault"),
+            "report_terminal_panic must surface the dialog:\n{}",
+            driver.screen()
+        );
+
+        // Enter also dismisses.
+        driver.press_named(quadraui::NamedKey::Enter);
+        assert!(
+            !driver.screen_contains("Renderer fault"),
+            "dialog must be dismissed after Enter:\n{}",
+            driver.screen()
         );
     }
 }
