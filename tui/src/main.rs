@@ -32,13 +32,25 @@ fn main() {
         std::env::set_var("SSH_ASKPASS", "/bin/false");
     }
 
+    // Stash the panic message so `catch_unwind` below can retrieve it after
+    // the terminal has been restored.  `OnceLock` is panic-safe (no mutex
+    // that could deadlock inside the hook).
+    static PANIC_MSG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
     // Persist any panic to ~/.coord/coord-tui-panic.log before the shell
-    // restores the terminal and the message scrolls offscreen. The previous
-    // hook (Rust's default) writes to stderr inside the alternate screen,
-    // which is invisible after teardown. Keep the default hook running too so
-    // users with stderr captured still see the message.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    // restores the terminal and the message scrolls offscreen.
+    //
+    // IMPORTANT: we do NOT chain to the Rust default hook here.  The default
+    // hook writes directly to stderr, which is inside the alternate-screen
+    // buffer while the TUI is running.  That output is invisible after
+    // terminal teardown — and it corrupts the TUI display if the panic fires
+    // mid-render before teardown.  Instead we log to a file (always
+    // readable) and print a clean one-liner to stderr AFTER `catch_unwind`
+    // returns (by which point quadraui has already restored the terminal).
+    std::panic::set_hook(Box::new(|info| {
+        // Stash the one-line summary for the post-restore message.
+        let _ = PANIC_MSG.set(info.to_string());
+
         if let Some(home) = std::env::var_os("HOME") {
             let log_dir = std::path::Path::new(&home).join(".coord");
             let _ = std::fs::create_dir_all(&log_dir);
@@ -62,8 +74,34 @@ fn main() {
                 );
             }
         }
-        default_hook(info);
+        // No default_hook call — see comment above.
     }));
 
-    quadraui::tui::shell_runner::run_with_shell(CoordApp::new(), CoordApp::shell_config());
+    // Wrap the TUI run loop in `catch_unwind` so that a panic that escapes
+    // quadraui's internal recovery (e.g. during startup or shutdown) still
+    // lets quadraui's Drop handlers restore the terminal before we print the
+    // post-mortem.  Without this wrapper the process would abort (or the
+    // `panic = "abort"` profile would kill it) and leave the terminal in raw
+    // mode.
+    //
+    // `AssertUnwindSafe` is safe here: we immediately exit the process on the
+    // Err branch; we never resume normal execution with a potentially
+    // inconsistent CoordApp.
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        quadraui::tui::shell_runner::run_with_shell(CoordApp::new(), CoordApp::shell_config());
+    }));
+
+    if run_result.is_err() {
+        // At this point the terminal has been restored by quadraui's Drop
+        // handler, so a plain `eprintln!` is safe and visible.
+        let summary = PANIC_MSG
+            .get()
+            .map(String::as_str)
+            .unwrap_or("unknown panic");
+        eprintln!(
+            "\ncoord-tui panicked: {}\n\nFull details in ~/.coord/coord-tui-panic.log\n",
+            summary
+        );
+        std::process::exit(101);
+    }
 }
