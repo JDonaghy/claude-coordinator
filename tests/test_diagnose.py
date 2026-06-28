@@ -747,3 +747,137 @@ def test_diagnose_missing_repo_and_issue_errors(monkeypatch, tmp_path) -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["diagnose", "--config", str(cfg_file)])
     assert result.exit_code == 2
+
+
+# ── #814: remote failed without failure_reason + base-checkout lock ──────────
+
+
+def test_failed_without_failure_reason_not_healthy(monkeypatch, config) -> None:
+    """A remote interactive failure sets status=failed but no failure_reason.
+    _recover_work_like must NOT say 'stage looks healthy' (#814)."""
+    _stub(monkeypatch, session="dead")
+    # Stub _prune_orphan_for_failed to do nothing — we only care about the
+    # branch in _recover_work_like, not about what the prune helper does.
+    monkeypatch.setattr(diagnose, "_prune_orphan_for_failed", lambda *a, **k: None)
+
+    a = _assign(
+        aid="w-remote-fail",
+        status="failed",
+        branch="issue-42-foo",
+        failure_reason=None,  # remote path doesn't set this
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    # Must NOT say "stage looks healthy" — the stage has failed.
+    assert not any("looks healthy" in f for f in res.findings), (
+        f"should not say 'looks healthy' for a failed stage; findings={res.findings}"
+    )
+    # Must report the failed state.
+    assert any("failed" in f for f in res.findings), (
+        f"expected a 'failed' finding; findings={res.findings}"
+    )
+    # recoverd=True is fine — the stage row is terminal.
+    assert res.recovered is True
+
+
+def test_maybe_fix_base_checkout_lock_reports_finding(monkeypatch, config) -> None:
+    """When the base checkout on a remote machine holds the branch, diagnose
+    reports a finding and fixes it via SSH (#814)."""
+    _BASE = "/home/john/src/api"
+    free_calls: list = []
+
+    monkeypatch.setattr(
+        "coord.interactive.find_remote_branch_holder",
+        lambda *a, **kw: _BASE,
+    )
+    monkeypatch.setattr(
+        "coord.interactive._remote_base_checkout_free_branch",
+        lambda *a, **kw: free_calls.append(True) or True,
+    )
+
+    from coord.diagnose import DiagnoseResult, _maybe_fix_base_checkout_lock
+
+    # Give the machine a repo_path so the helper can build the SSH path.
+    config.machines[0].repo_paths["api"] = "~/src/api"
+
+    a = _assign(
+        aid="w-base-lock",
+        status="failed",
+        branch="issue-42-foo",
+        failure_reason=None,
+    )
+    res = DiagnoseResult(repo_name="api", issue_number=42, stage="work")
+    _maybe_fix_base_checkout_lock(a, config, "issue-42-foo", res, dry_run=False)
+
+    # Must have reported a finding about the base checkout.
+    assert any("base checkout" in f for f in res.findings), (
+        f"expected 'base checkout' finding; got {res.findings}"
+    )
+    # Must have called the free function.
+    assert len(free_calls) == 1, (
+        f"expected _remote_base_checkout_free_branch called once; got {free_calls!r}"
+    )
+    # Must have recorded an action.
+    assert any("freed" in act for act in res.actions_taken), (
+        f"expected 'freed' action; got {res.actions_taken}"
+    )
+
+
+def test_maybe_fix_base_checkout_lock_dry_run(monkeypatch, config) -> None:
+    """dry_run=True: reports finding but does not call the SSH free function."""
+    _BASE = "/home/john/src/api"
+    free_calls: list = []
+
+    monkeypatch.setattr(
+        "coord.interactive.find_remote_branch_holder",
+        lambda *a, **kw: _BASE,
+    )
+    monkeypatch.setattr(
+        "coord.interactive._remote_base_checkout_free_branch",
+        lambda *a, **kw: free_calls.append(True) or True,
+    )
+
+    from coord.diagnose import DiagnoseResult, _maybe_fix_base_checkout_lock
+
+    config.machines[0].repo_paths["api"] = "~/src/api"
+
+    a = _assign(
+        aid="w-base-dry",
+        status="failed",
+        branch="issue-42-foo",
+        failure_reason=None,
+    )
+    res = DiagnoseResult(repo_name="api", issue_number=42, stage="work")
+    _maybe_fix_base_checkout_lock(a, config, "issue-42-foo", res, dry_run=True)
+
+    assert free_calls == [], "dry_run=True must not call the SSH free function"
+    assert any("dry-run" in f for f in res.findings), (
+        f"expected dry-run finding; got {res.findings}"
+    )
+
+
+def test_maybe_fix_base_checkout_lock_no_base_holder(monkeypatch, config) -> None:
+    """When find_remote_branch_holder returns None, no finding is added."""
+    monkeypatch.setattr(
+        "coord.interactive.find_remote_branch_holder",
+        lambda *a, **kw: None,
+    )
+
+    from coord.diagnose import DiagnoseResult, _maybe_fix_base_checkout_lock
+
+    config.machines[0].repo_paths["api"] = "~/src/api"
+
+    a = _assign(
+        aid="w-no-holder",
+        status="failed",
+        branch="issue-42-foo",
+        failure_reason=None,
+    )
+    res = DiagnoseResult(repo_name="api", issue_number=42, stage="work")
+    _maybe_fix_base_checkout_lock(a, config, "issue-42-foo", res, dry_run=False)
+
+    assert not res.findings, (
+        f"no findings expected when holder is None; got {res.findings}"
+    )
+    assert not res.actions_taken, res.actions_taken

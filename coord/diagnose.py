@@ -473,6 +473,17 @@ def _recover_work_like(
         # (dirty worktrees that couldn't be pruned mean the block is still present).
         if not res.needs_reset:
             res.recovered = True  # stage row is already terminal — nothing more needed
+    elif latest.status == "failed":
+        # #814: remote interactive sessions finalize as "failed" without setting
+        # failure_reason (the local-launch code path sets it; the remote backstop
+        # in finalize_remote_interactive_exit does not).  The stage row is already
+        # terminal, but there may be a blocking branch lock on the remote machine
+        # that will cause the next retry to fail identically — detect and fix it.
+        res.findings.append("work stage failed (no captured failure reason)")
+        if latest.branch:
+            _prune_orphan_for_failed(board, config, latest, res, dry_run=dry_run)
+        if not res.needs_reset:
+            res.recovered = True
     elif state == "live" and _is_stale(latest):
         res.findings.append("session is LIVE but stale (idle days) — reset to clear it")
         res.needs_reset = True
@@ -487,8 +498,16 @@ def _recover_work_like(
 def _prune_orphan_for_failed(
     board, config, latest: "Assignment", res: DiagnoseResult, *, dry_run: bool
 ) -> None:
-    """#618: if *latest* is a failed launch, detect and prune the orphaned
-    worktree that caused the "branch already checked out" collision."""
+    """#618/#814: if *latest* is a failed launch, detect and prune the orphaned
+    worktree that caused the "branch already checked out" collision.
+
+    Also checks (#814) whether the blocking holder is the repo BASE checkout
+    (~/src/<repo>) on the assignment's machine.  Coord-managed worktrees are
+    under ``~/.coord/worktrees/`` and can be force-removed; the base checkout
+    must NEVER be removed — instead, ``git checkout <default_branch>`` frees the
+    branch.  This second check is performed remotely via SSH when the assignment
+    ran on a different machine.
+    """
     branch = latest.branch
     if not branch:
         return
@@ -507,11 +526,16 @@ def _prune_orphan_for_failed(
                 repo_path = candidate
                 break
     if repo_path is None:
+        # #814: even without a local path, attempt the remote base-checkout check.
+        _maybe_fix_base_checkout_lock(latest, config, branch, res, dry_run=dry_run)
         return
 
     active_ids = _active_assignment_ids_for_repo(board, repo_name)
     orphans = _find_orphaned_worktrees(repo_path, branch, active_assignment_ids=active_ids)
     if not orphans:
+        # #814: no local coord worktree holding the branch — check whether the
+        # BASE checkout on the assignment's machine is the blocker.
+        _maybe_fix_base_checkout_lock(latest, config, branch, res, dry_run=dry_run)
         return
 
     res.findings.append(
@@ -535,6 +559,91 @@ def _prune_orphan_for_failed(
         res.findings.append(
             f"{len(skipped)} worktree(s) skipped (uncommitted work — inspect manually): "
             + ", ".join(str(p) for p in skipped)
+        )
+        res.needs_reset = True
+
+
+def _maybe_fix_base_checkout_lock(
+    latest: "Assignment",
+    config: "Config",
+    branch: str,
+    res: DiagnoseResult,
+    *,
+    dry_run: bool,
+) -> None:
+    """#814: detect and optionally fix a base-checkout branch lock on the
+    assignment's machine (local or remote).
+
+    When ``~/src/<repo>`` on the target machine is checked out on *branch*,
+    ``git worktree add`` refuses to create a worktree for that branch, causing
+    launch failures that loop uselessly.  The fix is ``git checkout
+    <default_branch>`` in the base checkout — NEVER pruning or deleting it
+    (invariant #561).
+
+    Works for both local assignments (SSH to ``localhost``) and remote ones.
+    SSH failures are silently ignored — conservative: if we can't check we
+    don't report a false "healthy".
+    """
+    machine = next(
+        (m for m in config.machines if m.name == latest.machine_name), None
+    )
+    if machine is None:
+        return
+    repo_name = latest.repo_name
+    repo_cfg = next((r for r in config.repos if r.name == repo_name), None)
+    if repo_cfg is None:
+        return
+
+    rp_str = machine.repo_path(repo_name)
+    if not rp_str:
+        return
+    # Build the $HOME-form path for the remote shell.
+    if rp_str.startswith("~/"):
+        remote_repo_sh = "$HOME/" + rp_str[2:]
+    elif rp_str == "~":
+        remote_repo_sh = "$HOME"
+    else:
+        remote_repo_sh = rp_str
+
+    default_branch = repo_cfg.default_branch or "main"
+
+    try:
+        from coord.interactive import (  # noqa: PLC0415
+            _holder_is_base_checkout,
+            _remote_base_checkout_free_branch,
+            find_remote_branch_holder,
+        )
+    except ImportError:
+        return  # interactive module unavailable — skip gracefully
+
+    holder = find_remote_branch_holder(machine.host, remote_repo_sh, branch)
+    if holder is None or not _holder_is_base_checkout(holder):
+        return  # not the base-checkout case
+
+    res.findings.append(
+        f"base checkout {holder!r} on {machine.host} is on branch {branch!r}"
+        f" — this blocks worktree creation for {branch!r}"
+    )
+    if dry_run:
+        res.findings.append(
+            f"(dry-run) would checkout {default_branch!r} in {holder!r}"
+            f" on {machine.host} to free the branch"
+        )
+        return
+
+    freed = _remote_base_checkout_free_branch(
+        machine.host, remote_repo_sh, default_branch,
+    )
+    if freed:
+        res.actions_taken.append(
+            f"freed base checkout {holder!r} on {machine.host}:"
+            f" checked out {default_branch!r} (was on {branch!r})"
+        )
+    else:
+        res.findings.append(
+            f"could not auto-free base checkout on {machine.host} —"
+            f" run manually: ssh {machine.host}"
+            f" 'git -C {remote_repo_sh} checkout {default_branch}'"
         )
         res.needs_reset = True
 

@@ -495,3 +495,275 @@ class TestRemoteOrphanIsSafeToPrune:
                 "/home/john/.coord/worktrees/abc123",
                 "issue-42-fix-bug",
             ) is False
+
+
+# ── Unit tests for _holder_is_base_checkout ───────────────────────────────────
+
+
+class TestHolderIsBaseCheckout:
+    """Unit tests for the #814 base-checkout-detection helper."""
+
+    def test_worktree_path_returns_false(self) -> None:
+        """Coord-managed worktree path → False (it IS a worktree, not the base)."""
+        from coord.interactive import _holder_is_base_checkout
+
+        assert _holder_is_base_checkout(
+            "/home/john/.coord/worktrees/deadbeefcafe"
+        ) is False
+
+    def test_worktree_path_with_subdir_returns_false(self) -> None:
+        """Deep path under .coord/worktrees → still False."""
+        from coord.interactive import _holder_is_base_checkout
+
+        assert _holder_is_base_checkout(
+            "/home/john/.coord/worktrees/abc123/subdirectory"
+        ) is False
+
+    def test_base_checkout_src_path_returns_true(self) -> None:
+        """~/src/<repo> path → True (this IS the base checkout)."""
+        from coord.interactive import _holder_is_base_checkout
+
+        assert _holder_is_base_checkout(
+            "/home/john/src/claude-coordinator"
+        ) is True
+
+    def test_absolute_non_worktree_path_returns_true(self) -> None:
+        """Any absolute path not under .coord/worktrees → True."""
+        from coord.interactive import _holder_is_base_checkout
+
+        assert _holder_is_base_checkout("/opt/repos/myrepo") is True
+
+
+# ── Unit tests for _remote_base_checkout_free_branch ─────────────────────────
+
+
+class TestRemoteBaseCheckoutFreeBranch:
+    """Unit tests for the SSH helper that frees the base checkout (#814)."""
+
+    def _mk_run(self, stdout: str, returncode: int = 0) -> MagicMock:
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        m.stderr = ""
+        return m
+
+    def test_returns_true_when_checkout_succeeds(self) -> None:
+        from coord.interactive import _remote_base_checkout_free_branch
+
+        with patch("subprocess.run", return_value=self._mk_run("__FREE_DONE\n")):
+            assert _remote_base_checkout_free_branch(
+                "host", "$HOME/src/api", "main"
+            ) is True
+
+    def test_returns_false_when_checkout_fails(self) -> None:
+        from coord.interactive import _remote_base_checkout_free_branch
+
+        with patch("subprocess.run", return_value=self._mk_run("__FREE_FAIL\n")):
+            assert _remote_base_checkout_free_branch(
+                "host", "$HOME/src/api", "main"
+            ) is False
+
+    def test_returns_false_on_ssh_error(self) -> None:
+        from coord.interactive import _remote_base_checkout_free_branch
+
+        with patch("subprocess.run", side_effect=OSError("connection refused")):
+            assert _remote_base_checkout_free_branch(
+                "host", "$HOME/src/api", "main"
+            ) is False
+
+    def test_returns_false_on_timeout(self) -> None:
+        import subprocess as _subprocess
+        from coord.interactive import _remote_base_checkout_free_branch
+
+        with patch(
+            "subprocess.run",
+            side_effect=_subprocess.TimeoutExpired(cmd=["ssh"], timeout=15),
+        ):
+            assert _remote_base_checkout_free_branch(
+                "host", "$HOME/src/api", "main"
+            ) is False
+
+    def test_returns_false_when_output_empty(self) -> None:
+        from coord.interactive import _remote_base_checkout_free_branch
+
+        with patch("subprocess.run", return_value=self._mk_run("")):
+            assert _remote_base_checkout_free_branch(
+                "host", "$HOME/src/api", "main"
+            ) is False
+
+
+# ── Scenario (e): base checkout holds branch → free + retry (#814) ───────────
+
+
+_BASE_CHECKOUT_PATH = "/home/john/src/api"
+
+
+class TestBaseCheckoutHolder:
+    """When the base checkout ~/src/<repo> holds the branch, the launcher must
+    free it with ``git checkout <default>`` (NEVER remove it) and then retry.
+
+    This is the #814 fix.  The holder path does NOT contain '.coord/worktrees',
+    so _holder_is_base_checkout returns True.
+    """
+
+    def test_fix_of_base_checkout_holder_freed_and_retried(
+        self, remote_cfg: Path,
+    ) -> None:
+        """--fix-of: base checkout on issue branch → freed → session retried."""
+        _seed_fix_board("work-bc1", "rev-bc1", "issue-1-fix-bug")
+
+        # First launch fails; retry after free succeeds.
+        tmux_returns = iter([1, 0])
+
+        def _fake_tmux(argv: Any, briefing: Any, sname: Any, **kw: Any) -> int:
+            return next(tmux_returns)
+
+        free_calls: list[tuple[str, str, str]] = []
+
+        def _fake_free(ssh_target: str, remote_repo_sh: str, default_branch: str,
+                       **kw: Any) -> bool:
+            free_calls.append((ssh_target, remote_repo_sh, default_branch))
+            return True
+
+        remove_calls: list[Any] = []
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux", side_effect=_fake_tmux), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.remote_worktree_exists", return_value=False), \
+             patch("coord.interactive.find_remote_branch_holder",
+                   return_value=_BASE_CHECKOUT_PATH), \
+             patch("coord.interactive._remote_base_checkout_free_branch",
+                   side_effect=_fake_free), \
+             patch("coord.interactive._remote_worktree_remove",
+                   side_effect=lambda *a, **kw: remove_calls.append(a) or True), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=_make_finalize_result(push_ok=True)):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_cfg),
+                 "--interactive", "--fix-of", "rev-bc1"],
+            )
+
+        out = result.output
+
+        # _remote_base_checkout_free_branch must be called (free the base checkout).
+        assert len(free_calls) == 1, (
+            f"expected _remote_base_checkout_free_branch called once; got {free_calls!r}"
+        )
+        assert free_calls[0][2] == "main", (
+            f"expected checkout to 'main'; got {free_calls[0][2]!r}"
+        )
+
+        # _remote_worktree_remove must NOT be called (base is never pruned).
+        assert remove_calls == [], (
+            f"_remote_worktree_remove must not be called for base checkout; "
+            f"got {remove_calls!r}"
+        )
+
+        # Output must mention freeing the base checkout, not "auto-pruning orphan".
+        assert "base checkout freed" in out, (
+            f"expected 'base checkout freed' in output; got:\n{out}"
+        )
+        assert "auto-prun" not in out, (
+            f"'auto-prun' must not appear for base-checkout case; got:\n{out}"
+        )
+        # Must NOT say "prune it first".
+        assert "prune it first" not in out, out
+
+    def test_fix_of_base_checkout_free_fails_prints_manual_cmd(
+        self, remote_cfg: Path,
+    ) -> None:
+        """If freeing the base checkout fails, a manual command is printed."""
+        _seed_fix_board("work-bc2", "rev-bc2", "issue-1-fix-bug")
+
+        remove_calls: list[Any] = []
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux", return_value=1), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.remote_worktree_exists", return_value=False), \
+             patch("coord.interactive.find_remote_branch_holder",
+                   return_value=_BASE_CHECKOUT_PATH), \
+             patch("coord.interactive._remote_base_checkout_free_branch",
+                   return_value=False), \
+             patch("coord.interactive._remote_worktree_remove",
+                   side_effect=lambda *a, **kw: remove_calls.append(a) or True), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=_make_finalize_result(push_ok=False)):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_cfg),
+                 "--interactive", "--fix-of", "rev-bc2"],
+            )
+
+        out = result.output
+
+        # _remote_worktree_remove must NOT be called.
+        assert remove_calls == [], (
+            f"_remote_worktree_remove must not be called for base checkout; "
+            f"got {remove_calls!r}"
+        )
+        # Must show a manual fix command.
+        assert "git" in out and "checkout" in out, (
+            f"expected manual 'git checkout' command; got:\n{out}"
+        )
+        # Must NOT say "auto-prun".
+        assert "auto-prun" not in out, out
+
+    def test_work_path_base_checkout_holder_freed_and_retried(
+        self, remote_cfg: Path,
+    ) -> None:
+        """Plain work path: base checkout on branch → freed → session retried."""
+        tmux_returns = iter([1, 0])
+
+        def _fake_tmux(argv: Any, briefing: Any, sname: Any, **kw: Any) -> int:
+            return next(tmux_returns)
+
+        free_calls: list[tuple[str, str, str]] = []
+
+        def _fake_free(ssh_target: str, remote_repo_sh: str, default_branch: str,
+                       **kw: Any) -> bool:
+            free_calls.append((ssh_target, remote_repo_sh, default_branch))
+            return True
+
+        remove_calls: list[Any] = []
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "New feature", "body": "b"}), \
+             patch("coord.claim.find_work_claim", return_value=None), \
+             patch("coord.state.record_dispatched"), \
+             patch("coord.state.save_board"), \
+             patch("coord.state.build_board",
+                   return_value=MagicMock(active=[], completed=[])), \
+             patch("coord.interactive._launch_via_tmux", side_effect=_fake_tmux), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.remote_worktree_exists", return_value=False), \
+             patch("coord.interactive.find_remote_branch_holder",
+                   return_value=_BASE_CHECKOUT_PATH), \
+             patch("coord.interactive._remote_base_checkout_free_branch",
+                   side_effect=_fake_free), \
+             patch("coord.interactive._remote_worktree_remove",
+                   side_effect=lambda *a, **kw: remove_calls.append(a) or True), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=_make_finalize_result(push_ok=True)):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "42",
+                 "--config", str(remote_cfg),
+                 "--interactive"],
+            )
+
+        out = result.output
+        assert len(free_calls) == 1, (
+            f"_remote_base_checkout_free_branch must be called once; got {free_calls!r}"
+        )
+        assert remove_calls == [], (
+            f"_remote_worktree_remove must not be called; got {remove_calls!r}"
+        )
+        assert "base checkout freed" in out, out
+        assert "auto-prun" not in out, out

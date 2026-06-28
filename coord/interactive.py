@@ -2001,6 +2001,60 @@ def find_remote_branch_holder(
     return None
 
 
+def _holder_is_base_checkout(holder_abs_path: str) -> bool:
+    """Return ``True`` when *holder_abs_path* is the repo base checkout.
+
+    Coord always places worker worktrees under ``~/.coord/worktrees/<id>``.
+    Any holder path that does NOT contain ``.coord/worktrees`` is therefore the
+    base repo checkout (e.g. ``~/src/<repo>``) — the invariant path that must
+    NEVER be pruned or removed (#814 / #561).
+
+    Used by the remote interactive launch paths to distinguish a stale orphan
+    (safe to force-remove) from the base checkout (must be freed with
+    ``git checkout <default_branch>`` instead).
+    """
+    return ".coord/worktrees" not in holder_abs_path
+
+
+def _remote_base_checkout_free_branch(
+    ssh_target: str,
+    remote_repo_sh: str,
+    default_branch: str,
+    *,
+    timeout: float = 15.0,
+) -> bool:
+    """Check out *default_branch* in the remote base checkout to free a branch.
+
+    When ``~/src/<repo>`` is checked out on an issue branch, ``git worktree
+    add`` refuses to create a new worktree for the same branch.  The correct
+    remedy is to switch the base back to *default_branch* so the branch ref is
+    no longer occupied by the main checkout (#814 / #561).
+
+    *remote_repo_sh* is a ``$HOME``-form path (e.g. ``$HOME/src/myrepo``); the
+    remote shell expands ``$HOME`` correctly because the path is passed unquoted
+    inside the compound command.
+
+    Returns ``True`` when the remote ``git checkout`` succeeded.
+    Returns ``False`` on SSH / timeout / git failure — the caller then falls
+    back to printing a manual-fix command for the operator.
+    """
+    default_branch_q = shlex.quote(default_branch)
+    remote_cmd = (
+        f"git -C {remote_repo_sh} checkout {default_branch_q} 2>/dev/null"
+        f" && echo __FREE_DONE || echo __FREE_FAIL"
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "__FREE_DONE" in (result.stdout or "")
+
+
 def _remote_stash_artifacts(
     ssh_target: str,
     remote_worktree_sh: str,
