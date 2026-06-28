@@ -171,6 +171,8 @@ class FakeGh:
     merge_results: dict[int, tuple[bool, str]] = field(default_factory=dict)
     create_calls: list[tuple[str, dict]] = field(default_factory=list)
     merge_calls: list[tuple[str, int, str]] = field(default_factory=list)
+    close_calls: list[tuple[str, int]] = field(default_factory=list)
+    close_raises: bool = False
     next_pr: int = 100
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
@@ -185,6 +187,11 @@ class FakeGh:
     def merge_pr(self, repo: str, number: int, method: str = "rebase") -> tuple[bool, str]:
         self.merge_calls.append((repo, number, method))
         return self.merge_results.get(number, (True, "merged"))
+
+    def close_issue(self, repo: str, issue_number: int) -> None:
+        self.close_calls.append((repo, issue_number))
+        if self.close_raises:
+            raise RuntimeError("gh issue close failed")
 
 
 class TestProcess:
@@ -201,6 +208,29 @@ class TestProcess:
         assert merge_seq == [101, 102, 100]
         # All entries left in MERGED state
         assert {x.state for x in items} == {MERGED}
+
+    def test_closes_linked_issue_on_merge(self) -> None:
+        # #806: a successful merge must close the linked issue deterministically,
+        # not rely on the worker having put `Closes #N` in the PR body.
+        items = [_q("a")]
+        process(items, gh := FakeGh())
+        assert items[0].state == MERGED
+        assert gh.close_calls == [(items[0].repo_github, items[0].issue_number)]
+
+    def test_close_failure_does_not_revert_merge(self) -> None:
+        # #806: closing is best-effort — a `gh issue close` failure must leave
+        # the merge standing and surface a warning, never undo MERGED.
+        items = [_q("a")]
+        events = process(items, FakeGh(close_raises=True))
+        assert items[0].state == MERGED
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "could not close" in merged[0].message
+
+    def test_dry_run_does_not_close(self) -> None:
+        # #806: dry-run never reaches the real merge path, so no issue is closed.
+        items = [_q("a")]
+        process(items, gh := FakeGh(), dry_run=True)
+        assert gh.close_calls == []
 
     def test_conflict_does_not_halt_other_repo_groups(self) -> None:
         """A conflict in one (repo, target) group must not touch other groups."""

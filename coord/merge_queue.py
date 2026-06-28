@@ -233,6 +233,8 @@ class GhOps(Protocol):
 
     def merge_pr(self, repo: str, number: int, method: str = "rebase") -> tuple[bool, str]: ...
 
+    def close_issue(self, repo: str, issue_number: int) -> None: ...
+
 
 # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -1122,7 +1124,26 @@ def process(
             if ok:
                 entry.state = MERGED
                 entry.error = None
-                events.append(MergeEvent(entry, "merged", f"merged PR #{entry.pr_number}"))
+                # Deterministically close the linked issue.  GitHub's `Closes #N`
+                # auto-close only fires when the PR *body* carries the keyword
+                # AND it merges into the default branch; the worker-created-PR
+                # path only asks the LLM for it and `fix(#N):` subjects aren't
+                # closing keywords, so issues got stranded open (#806).
+                # Best-effort — a close failure must not undo a successful merge.
+                # Closing on GitHub keeps the daemon the sole DB writer: the next
+                # reconcile/sync flips the cached row to closed (state.py).
+                try:
+                    gh_ops.close_issue(entry.repo_github, entry.issue_number)
+                    events.append(MergeEvent(
+                        entry, "merged",
+                        f"merged PR #{entry.pr_number}; closed issue #{entry.issue_number}",
+                    ))
+                except Exception as e:  # noqa: BLE001 — never fail a merge on close
+                    events.append(MergeEvent(
+                        entry, "merged",
+                        f"merged PR #{entry.pr_number} (warning: could not "
+                        f"close issue #{entry.issue_number}: {e})",
+                    ))
                 continue
             entry.state = CONFLICT
             entry.error = msg

@@ -69,6 +69,32 @@ def edit_issue(
         )
 
 
+def close_issue(repo: str, issue_number: int, *, comment: str | None = None) -> None:
+    """Close a GitHub issue, optionally posting *comment* first.
+
+    The deterministic counterpart to a ``Closes #N`` keyword in a PR body:
+    ``coord merge`` calls this after a successful merge so an issue is never
+    stranded open when a worker-created PR forgot the keyword (and
+    conventional-commit ``fix(#N):`` subjects are *not* GitHub closing
+    keywords).  Idempotent — closing an already-closed issue is a no-op.
+    Raises RuntimeError on any other ``gh`` failure.  Part of the
+    issue-tracker seam (GitHub backend); GitLab / bare-DB adapters slot in
+    alongside this later (#806).
+    """
+    if comment:
+        post_issue_comment(repo, issue_number, comment)
+    result = subprocess.run(
+        ["gh", "issue", "close", str(issue_number), "--repo", repo],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0 and "already closed" not in result.stderr.lower():
+        raise RuntimeError(
+            f"gh issue close #{issue_number} failed: {result.stderr.strip()}"
+        )
+
+
 def issue_is_closed(repo: str, issue_number: int) -> bool:
     """True when issue ``issue_number`` is closed on GitHub.
 
