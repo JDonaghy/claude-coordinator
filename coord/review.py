@@ -731,6 +731,7 @@ def dispatch_review(
     now: float | None = None,
     terminal_cache: dict | None = None,
     remote_branch_checker=None,
+    branch_sha_fetcher=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -944,6 +945,19 @@ def dispatch_review(
     except (httpx.HTTPError, httpx.TimeoutException):
         return None
 
+    # #821: capture branch HEAD SHA for commit-bound approval check.
+    # If the branch moves after this review runs (new commits pushed),
+    # has_approved_review will detect the staleness via branch_head_sha ≠
+    # review_head_sha and block the merge until a fresh review is done.
+    # Best-effort: None means "SHA unavailable"; the staleness check is skipped
+    # (backward-compatible with pre-821 rows and air-gapped setups).
+    _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
+    review_head_sha: str | None = None
+    try:
+        review_head_sha = _get_sha(repo.github, completed.branch)
+    except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
+        pass
+
     review_assignment = Assignment(
         machine_name=choice.machine.name,
         repo_name=completed.repo_name,
@@ -961,6 +975,7 @@ def dispatch_review(
         review_target=str(pr["number"]) if pr else completed.branch,
         review_of_assignment_id=completed.assignment_id,
         model=review_model_alias,
+        review_head_sha=review_head_sha,
     )
     board.active.append(review_assignment)
 

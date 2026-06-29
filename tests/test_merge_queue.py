@@ -193,6 +193,11 @@ class FakeGh:
         if self.close_raises:
             raise RuntimeError("gh issue close failed")
 
+    def get_branch_sha(self, repo: str, branch: str) -> str | None:
+        # Tests don't exercise SHA tracking by default; return None so the
+        # backward-compatible "no SHA → skip staleness check" path runs.
+        return None
+
 
 class TestProcess:
     def test_opens_pr_sizes_and_merges_in_size_order(self) -> None:
@@ -493,6 +498,8 @@ class TestReviewGate:
         kinds = [e.kind for e in events]
         assert "smoke_required" in kinds, "smoke gate must fire when board is None"
         assert "merged" not in kinds
+        assert items[0].state == PENDING, "blocked entry must remain PENDING"
+        assert items[0].error is not None, "blocked entry must carry an error message"
 
     def test_process_fail_closed_board_none_skip_review_still_merges(self) -> None:
         """#821: explicit skip_review=True can still bypass the gate for local overrides."""
@@ -505,6 +512,57 @@ class TestReviewGate:
         kinds = [e.kind for e in events]
         assert "review_required" not in kinds
         assert "merged" in kinds
+
+    # ── #821: commit-bound approval — production population ──────────────
+
+    def test_process_populates_branch_head_sha_from_gh_ops(self) -> None:
+        """#821: process() must populate entry.branch_head_sha via gh_ops.get_branch_sha.
+
+        This verifies the *production population* path — that get_branch_sha is
+        actually called (not just that has_approved_review checks the value).
+        """
+        from dataclasses import dataclass as _dc, field as _dc_field
+
+        sha_calls: list[tuple[str, str]] = []
+
+        class _TrackingGh(FakeGh):
+            def get_branch_sha(self, repo: str, branch: str) -> str | None:
+                sha_calls.append((repo, branch))
+                return "cafebabe"
+
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "cafebabe"  # matches what _TrackingGh returns
+        board = self._board(completed=[work, review])
+
+        items = [_q("w1", size=10)]
+        process(items, _TrackingGh(), config=cfg, board=board)
+
+        # get_branch_sha must have been called for the entry.
+        assert len(sha_calls) >= 1, "process() must call gh_ops.get_branch_sha"
+        assert sha_calls[0][1] == items[0].branch, "must fetch SHA for the entry's branch"
+        # The field must be populated on the entry.
+        assert items[0].branch_head_sha == "cafebabe"
+
+    def test_process_stale_sha_blocks_merge_end_to_end(self) -> None:
+        """#821: end-to-end — review at old SHA + branch moved → process blocks merge."""
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "oldsha"  # review was at this commit
+
+        class _MovedBranchGh(FakeGh):
+            def get_branch_sha(self, repo: str, branch: str) -> str | None:
+                return "newsha"  # branch has new commits since review
+
+        board = self._board(completed=[work, review])
+        items = [_q("w1", size=10)]
+        events = process(items, _MovedBranchGh(), config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "merged" not in kinds, "stale approval must not allow merge"
+        assert "review_required" in kinds, "stale approval must re-block the review gate"
 
     # ── #821: commit-bound approval ───────────────────────────────────────
 
