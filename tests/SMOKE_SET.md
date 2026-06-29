@@ -113,10 +113,12 @@ Also relevant in the same file: the `TestIssueStoreFinalise` class
 **File:** `tui/src/app.rs` — `mod tests` block (added by #741)
 
 Six `TuiDriver`-based black-box tests guard the coord-tui rendering:
-`tuidriver_board_screen_renders`, `tuidriver_key_j_moves_selection_down`,
-`tuidriver_key_3_switches_to_pipeline`, `tuidriver_key_4_switches_to_merge_queue`,
+`tuidriver_kanban_view_activated_by_key_6`,
+`tuidriver_kanban_in_flight_column_shows_running_issue`,
 `tuidriver_key_1_returns_to_board_from_merge_queue`,
-`tuidriver_pipeline_tab_shows_pipeline_items`.
+`tuidriver_key_3_switches_to_pipeline`,
+`tuidriver_right_click_opens_board_context_menu`,
+`tuidriver_pipeline_summary_tab_renders`.
 
 Run: `cargo test` from `tui/`.
 
