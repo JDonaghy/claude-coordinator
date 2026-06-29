@@ -70,6 +70,18 @@ pub struct CommandRunner {
     /// `--config <path>` so it locates the right config file. When `None`,
     /// the status bar shows a warning and commands will fail.
     pub(crate) config_path: Option<PathBuf>,
+    /// When `true`, [`do_spawn`] records the call but does **not** start a
+    /// real subprocess.  A pre-resolved success result is placed on the
+    /// channel so [`poll`] sees an immediate completion on the next tick.
+    ///
+    /// Always `false` in production.  Set by [`CommandRunner::new_for_test`]
+    /// so TuiDriver tests can exercise dispatch paths (key-bindings, toasts,
+    /// state changes) without touching the live `coord` daemon.
+    no_spawn: bool,
+    /// Argv of every "spawned" call, in order.  Populated only when
+    /// `no_spawn = true` so tests can assert on what commands would have run.
+    #[cfg(test)]
+    pub(crate) spawned_calls: Vec<Vec<String>>,
 }
 
 /// Search for `coordinator.yml` in three places, in order:
@@ -133,6 +145,27 @@ impl CommandRunner {
             queue: VecDeque::new(),
             message: None,
             config_path: find_config(),
+            no_spawn: false,
+            #[cfg(test)]
+            spawned_calls: Vec::new(),
+        }
+    }
+
+    /// Construct a runner suitable for unit / TuiDriver tests.
+    ///
+    /// In this mode [`do_spawn`] records the call in [`Self::spawned_calls`]
+    /// and immediately synthesises a zero-exit success result — **no real
+    /// `coord` subprocess is ever started**.  This prevents merge-queue
+    /// key-binding tests from reaching the live daemon.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            state: CommandState::Idle,
+            queue: VecDeque::new(),
+            message: None,
+            config_path: None,
+            no_spawn: true,
+            spawned_calls: Vec::new(),
         }
     }
 
@@ -147,6 +180,30 @@ impl CommandRunner {
     /// `label` or the stored `argv` (kept clean for status display and dedup).
     fn do_spawn(&mut self, argv: Vec<String>) {
         let label = format!("coord {}", argv.join(" "));
+
+        // ── Test-isolation fast path ─────────────────────────────────────────
+        // When no_spawn is set (tests only), record the call and synthesise an
+        // immediately-resolved success result so poll() sees completion on the
+        // next tick.  No real subprocess is started.
+        if self.no_spawn {
+            #[cfg(test)]
+            self.spawned_calls.push(argv.clone());
+            let (tx, rx) = mpsc::channel();
+            let _ = tx.send(CommandResult {
+                label: label.clone(),
+                exit_code: 0,
+                duration: Duration::default(),
+                stderr: String::new(),
+                stdout: String::new(),
+            });
+            self.state = CommandState::Running {
+                label,
+                argv,
+                started_at: Instant::now(),
+                rx,
+            };
+            return;
+        }
         let (tx, rx) = mpsc::channel();
 
         // Build the full argument list, injecting --config after the subcommand

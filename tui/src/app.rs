@@ -4209,7 +4209,17 @@ fn assemble_board_data(
 ///
 /// Any trailing `/` is stripped from the URL so callers can append `/board`.
 fn resolve_board_service() -> Option<(String, Option<String>)> {
+    // In the test binary, treat the board service as absent.  This prevents
+    // `record_test_verdict_remote`, `load_board_data_from_service`, and
+    // `fetch_remote_config_to_cache` from firing real HTTP requests against
+    // the production daemon during `cargo test`.  The `OnceLock` cache in
+    // `is_remote_board_service()` would otherwise latch a developer-machine
+    // value of `true` for the entire test process.
+    #[cfg(test)]
+    return None;
+
     // Env first.
+    #[allow(unreachable_code)]
     if let Ok(url) = std::env::var("COORD_SERVICE_URL") {
         let url = url.trim();
         if !url.is_empty() {
@@ -4497,6 +4507,19 @@ fn parse_plan_data(v: &serde_json::Value) -> PlanData {
 /// blocking the UI thread.
 fn start_data_load() -> std::sync::mpsc::Receiver<BoardData> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // In the test binary, immediately resolve with an empty payload so that
+    // apply_pending_data()'s degraded-tick guard fires and preserves the
+    // BoardData seeded by make_test_app().  Without this guard, refreshes
+    // triggered by view-switches (maybe_kick_pipeline_loader → refresh) read
+    // the real local SQLite DB and overwrite pipeline_issues / data.assignments
+    // with whatever the developer's coord.db currently contains, making
+    // TuiDriver tests non-deterministic and machine-dependent.
+    #[cfg(test)]
+    {
+        let _ = tx.send(BoardData::default());
+        return rx;
+    }
+    #[allow(unreachable_code)]
     std::thread::spawn(move || {
         let _ = tx.send(load_data());
     });
@@ -33671,7 +33694,11 @@ mod tests {
             refreshed_at: Instant::now(),
             detail_scroll: 0,
             machine_detail_scroll: 0,
-            command_runner: crate::commands::CommandRunner::new(),
+            // Use new_for_test() so no real `coord` subprocess is ever spawned
+            // when tests exercise dispatch paths (merge-queue key-bindings,
+            // etc.).  Calls are recorded in spawned_calls; a zero-exit success
+            // is resolved on the channel immediately so poll() returns quickly.
+            command_runner: crate::commands::CommandRunner::new_for_test(),
             last_notify: Instant::now(),
             issue_sync_last: None,
             board_search: SidebarFilter::default(),
@@ -53151,6 +53178,49 @@ mod tests {
             "#780: pressing 'm' on a READY entry must show a merge-only dispatch toast; screen =\n{}",
             screen
         );
+    }
+
+    /// Isolation smoke test: merge-queue dispatch must not spawn a real
+    /// `coord merge` subprocess.  Verifies the `CommandRunner::new_for_test()`
+    /// seam installed in `make_test_app` records the call in `spawned_calls`
+    /// without actually executing anything.
+    ///
+    /// This is the explicit guard that prevents the merge-queue TuiDriver tests
+    /// from reaching the live daemon.  If `make_test_app` accidentally starts
+    /// using `CommandRunner::new()` again, this test would FAIL (no spawned_calls
+    /// entry) OR the test suite would require `COORD_SERVICE_URL` to be set.
+    #[test]
+    fn merge_queue_dispatch_records_call_without_spawning() {
+        let mut app = make_test_app(BoardData {
+            merge_plan: vec![
+                planned_entry(
+                    "no-spawn-aid", "repo", "owner/repo", "main",
+                    99, "Isolation check", 1, Some(7), "READY", None,
+                ),
+            ],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::MergeQueue;
+        app.merge_queue_sel = 0;
+
+        // Before dispatch: no calls recorded.
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "no spawned calls expected before dispatch"
+        );
+
+        app.dispatch_merge_queue_merge_only(false);
+
+        // After dispatch: exactly one call recorded, no real subprocess was started.
+        assert_eq!(
+            app.command_runner.spawned_calls.len(), 1,
+            "dispatch must record exactly one spawned call; got {:?}",
+            app.command_runner.spawned_calls
+        );
+        let call = &app.command_runner.spawned_calls[0];
+        assert_eq!(call[0], "merge", "first arg must be 'merge'");
+        assert_eq!(call[1], "--only", "second arg must be '--only'");
+        assert_eq!(call[2], "no-spawn-aid", "third arg must be the assignment id");
     }
 
     /// #777 unit test: dispatch_merge_queue_drop picks the plan entry (not
