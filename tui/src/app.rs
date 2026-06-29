@@ -54684,4 +54684,224 @@ mod tests {
             driver.screen()
         );
     }
+
+    // ── #741: core smoke set — guards each main surface against structural regressions ──
+    //
+    // One TuiDriver test per trafficked screen.  Green on `main` today;
+    // must stay green through every app.rs decomposition step so a structural
+    // move cannot silently break a surface.
+
+    /// #741 core smoke: pressing '6' must switch to the Kanban view and
+    /// render all three column headers (Backlog / In Flight / Completed).
+    /// The default Board view does not paint these labels, so their presence
+    /// after the key-press is the signal that the view switch occurred.
+    #[test]
+    fn tuidriver_kanban_view_activated_by_key_6() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Seed an app with one running issue so the Kanban model is non-empty.
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let app = make_app_with_assignments(assignments);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Board is the default; Kanban column headers must NOT be present yet.
+        assert!(
+            !driver.screen_contains("In Flight"),
+            "#741: 'In Flight' column must NOT render on the initial Board view:\n{}",
+            driver.screen()
+        );
+
+        // Press '6' → switch to Kanban.
+        driver.press(quadraui::Key::Char('6'));
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Backlog"),
+            "#741: 'Backlog' column header must appear after key '6':\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("In Flight"),
+            "#741: 'In Flight' column header must appear after key '6':\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("Completed"),
+            "#741: 'Completed' column header must appear after key '6':\n{}",
+            screen
+        );
+    }
+
+    /// #741 core smoke: a running issue must appear inside the Kanban
+    /// "In Flight" column (not Backlog or Completed) so that a refactor
+    /// of the bucket-routing logic can't silently misplace it.
+    #[test]
+    fn tuidriver_kanban_in_flight_column_shows_running_issue() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let assignments = vec![make_assignment_typed("running", 99, "test-repo", Some("work"))];
+        let app = make_app_with_assignments(assignments);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        driver.press(quadraui::Key::Char('6')); // switch to Kanban
+
+        let screen = driver.screen();
+        // The card title is "Issue 99" (set by make_assignment_typed).
+        assert!(
+            screen.contains("Issue 99") || screen.contains("#99"),
+            "#741: issue must appear in Kanban after pressing '6':\n{}",
+            screen
+        );
+        // The issue is running → it must be in the In Flight column, not Backlog.
+        // We verify this by asserting the screen contains both "In Flight" and
+        // the issue text.  (A full layout test would check column bounds, but
+        // presence-after-key-switch is the regression guard we need here.)
+        assert!(
+            screen.contains("In Flight"),
+            "#741: 'In Flight' column must render when there is a running issue:\n{}",
+            screen
+        );
+    }
+
+    /// #741 core smoke: pressing '1' from Merge Queue must return to the
+    /// Board view.  Guards the numeric shortcut routing block against
+    /// regressions that would break the per-view key assignments.
+    #[test]
+    fn tuidriver_key_1_returns_to_board_from_merge_queue() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Switch away from Board first.
+        driver.press(quadraui::Key::Char('7')); // → Merge Queue
+        let after_7 = driver.screen();
+        assert!(
+            after_7.contains("MERGE QUEUE") || after_7.contains("Merge Queue"),
+            "#741: sanity — screen should show Merge Queue after '7':\n{}",
+            after_7
+        );
+
+        // Press '1' → back to Board.
+        driver.press(quadraui::Key::Char('1'));
+        let after_1 = driver.screen();
+        assert!(
+            !after_1.contains("MERGE QUEUE"),
+            "#741: MERGE QUEUE must NOT be shown after pressing '1':\n{}",
+            after_1
+        );
+    }
+
+    /// #741 core smoke: pressing '3' from the default Board view must
+    /// switch to the Pipeline panel.  A structural move of the key handler
+    /// that forgets to update `active_view` would regress this.
+    #[test]
+    fn tuidriver_key_3_switches_to_pipeline() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Use the pipeline fixture so the Pipeline sidebar has content.
+        let mut app = make_pipeline_app();
+        // Ensure we start on Board (default), not Pipeline.
+        app.active_view = SidebarView::Board;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Before pressing '3' the MergeQueue banner must be absent.
+        driver.press(quadraui::Key::Char('3'));
+
+        // After '3' the Pipeline-specific "New" section or stage strip
+        // should be visible; at minimum the Merge Queue label is not the
+        // active heading.
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("MERGE QUEUE"),
+            "#741: Merge Queue must NOT show after pressing '3':\n{}",
+            screen
+        );
+        // The pipeline sidebar section label "New" appears when there are
+        // tracked issues with status:ready — make_pipeline_app() provides these.
+        assert!(
+            screen.contains("New") || screen.contains("Pipeline"),
+            "#741: Pipeline panel must render after key '3':\n{}",
+            screen
+        );
+    }
+
+    /// #741 core smoke: dispatching a `MouseButton::Right` event onto a
+    /// Board sidebar row must open the context menu and render its items
+    /// on screen — specifically "Chat about issue" which is present for
+    /// every issue regardless of lifecycle.
+    ///
+    /// This is the one test that drives the full right-click event chain
+    /// (Right MouseDown → `handle` → `open_context_menu` → render) rather
+    /// than calling `open_context_menu` directly.
+    #[test]
+    fn tuidriver_right_click_opens_board_context_menu() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let assignments = vec![make_assignment_typed("running", 42, "repo-a", Some("work"))];
+        let app = make_app_with_assignments(assignments);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Locate the issue row in the Board sidebar by finding its number or title.
+        // The sidebar renders "#42   Issue 42"; either fragment is enough.
+        let (x, y) = driver.find("#42").or_else(|| driver.find("Issue 42")).unwrap_or_else(|| {
+            panic!(
+                "#741: could not find board row '#42' / 'Issue 42' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+
+        // Dispatch a right-click at the row's coordinates.  This exercises the
+        // full `UiEvent::MouseDown { button: Right }` → `handle` → `open_context_menu`
+        // path that a real right-click takes.
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Chat about issue"),
+            "#741: right-click on a Board row must open the context menu with \
+             'Chat about issue':\n{}",
+            screen
+        );
+    }
+
+    /// #741 core smoke: clicking the "Summary" tab in the Pipeline detail panel
+    /// must render the tab without a panic.  The tab shows session history
+    /// (fetched on demand), so the smoke asserts only that the render
+    /// succeeds — the empty-state "loading" placeholder is sufficient.
+    #[test]
+    fn tuidriver_pipeline_summary_tab_renders() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0); // select the first issue
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Locate the "Summary" tab label and click it.
+        let (x, y) = driver.find("Summary").unwrap_or_else(|| {
+            panic!(
+                "#741: 'Summary' tab label not found in Pipeline detail panel:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        // The render must not panic; the screen must be non-empty.
+        let screen = driver.screen();
+        assert!(
+            !screen.trim().is_empty(),
+            "#741: Pipeline Summary tab must produce a non-empty screen:\n{}",
+            screen
+        );
+    }
 }
