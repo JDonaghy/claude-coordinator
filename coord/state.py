@@ -88,6 +88,8 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.test_state,
         a.test_reason,
         a.review_verdict,
+        # #821: commit-bound SHA for review assignments.
+        a.review_head_sha,
         a.cost_usd,
         # #252: encode list as JSON; None → NULL.
         (json.dumps(a.smoke_tests) if a.smoke_tests is not None else None),
@@ -103,8 +105,8 @@ _UPSERT_SQL = """
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
-        review_posted_at, test_state, test_reason, review_verdict, cost_usd,
-        smoke_tests, provider_name
+        review_posted_at, test_state, test_reason, review_verdict, review_head_sha,
+        cost_usd, smoke_tests, provider_name
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
@@ -112,7 +114,7 @@ _UPSERT_SQL = """
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?
+        ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         status             = excluded.status,
@@ -136,6 +138,10 @@ _UPSERT_SQL = """
         test_state         = excluded.test_state,
         test_reason        = excluded.test_reason,
         review_verdict     = COALESCE(excluded.review_verdict, review_verdict),
+        -- #821: once a review_head_sha is recorded, preserve it; a later
+        -- upsert without the SHA (e.g. from an older code path) must not
+        -- erase a captured value.
+        review_head_sha    = COALESCE(excluded.review_head_sha, review_head_sha),
         -- #208: cost_usd is set once at completion.  COALESCE so a re-load
         -- of the same row from an agent that doesn't know the cost
         -- doesn't blow away a previously-captured value.

@@ -97,6 +97,8 @@ def row_to_assignment(row: object) -> Assignment:
         test_state=d.get("test_state"),
         test_reason=d.get("test_reason"),
         review_verdict=d.get("review_verdict"),
+        # #821: commit-bound review gate; None for pre-821 rows.
+        review_head_sha=d.get("review_head_sha"),
         cost_usd=d.get("cost_usd"),
         # #252: stored as JSON; absent column → None (not parsed yet).
         smoke_tests=decode_smoke_tests(d.get("smoke_tests")),

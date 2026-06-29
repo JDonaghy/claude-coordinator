@@ -303,6 +303,12 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # so the merge plan can display age and sort stably.  NULL for entries
         # created before this migration ran.
         "ALTER TABLE merge_queue ADD COLUMN enqueued_at REAL",
+        # #821: commit-bound review gate — SHA of the branch HEAD at the time
+        # the review assignment ran.  When both this column and the merge-queue
+        # entry's branch_head_sha are populated and differ, `has_approved_review`
+        # treats the approval as stale (new commits since the review → re-review
+        # required).  NULL for rows predating this feature.
+        "ALTER TABLE assignments ADD COLUMN review_head_sha TEXT",
     ]
     for sql in migrations:
         try:

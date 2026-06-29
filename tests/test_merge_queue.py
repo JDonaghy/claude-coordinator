@@ -439,11 +439,112 @@ class TestReviewGate:
         assert "merged" in kinds
 
     def test_legacy_callers_without_config_unaffected(self) -> None:
-        """Callers that don't pass config/board still work (no surprise breakage)."""
+        """Callers that don't pass config/board still work (no surprise breakage).
+
+        When config is None, requires_review() returns False so no gate fires.
+        The fail-closed rule (#821) only applies when config is present and
+        confirms review is required but board is absent.
+        """
         items = [_q("w1", size=10)]
         gh = FakeGh()
         events = process(items, gh)
         assert any(e.kind == "merged" for e in events)
+
+    # ── #821: fail-closed gates ───────────────────────────────────────────
+
+    def test_process_fails_closed_when_board_none_and_review_required(self) -> None:
+        """#821: process() with board=None must block a review-required entry."""
+        cfg = self._config()  # reviews.enabled=True, gate includes "review"
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        # No board → cannot confirm review approval → fail closed.
+        events = process(items, gh, config=cfg, board=None)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" in kinds, "gate must fire when board is None"
+        assert "merged" not in kinds, "merge must not proceed without confirmed review"
+        assert items[0].state == PENDING
+        assert items[0].error is not None
+
+    def test_process_fails_closed_when_board_none_and_smoke_required(self) -> None:
+        """#821: process() with board=None must block a smoke-required entry."""
+        from dataclasses import dataclass as _dc, field as _dc_field
+
+        @_dc
+        class _Reviews:
+            enabled: bool = False  # review gate off
+
+        @_dc
+        class _Pipeline:
+            default_gates: list | None = None
+
+        @_dc
+        class _SmokeConfig:
+            reviews: _Reviews = _dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = _dc_field(default_factory=_Pipeline)
+
+        cfg = _SmokeConfig()
+        cfg.pipeline.default_gates = ["test", "merge"]  # smoke gate on, review off
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        # No board → cannot confirm smoke verdict → fail closed.
+        events = process(items, gh, config=cfg, board=None)
+
+        kinds = [e.kind for e in events]
+        assert "smoke_required" in kinds, "smoke gate must fire when board is None"
+        assert "merged" not in kinds
+
+    def test_process_fail_closed_board_none_skip_review_still_merges(self) -> None:
+        """#821: explicit skip_review=True can still bypass the gate for local overrides."""
+        cfg = self._config()
+        items = [_q("w1", size=10)]
+        gh = FakeGh()
+        # skip_review=True is the explicit local override; must still work.
+        events = process(items, gh, config=cfg, board=None, skip_review=True)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" not in kinds
+        assert "merged" in kinds
+
+    # ── #821: commit-bound approval ───────────────────────────────────────
+
+    def test_has_approved_review_stale_sha_blocks(self) -> None:
+        """#821: an approval covering a different commit SHA is rejected."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"  # SHA when review was done
+
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"  # branch moved since review
+
+        board = self._board(completed=[work, review])
+        # Review SHA != branch SHA → stale approval → must return False.
+        assert mq.has_approved_review(entry, board) is False
+
+    def test_has_approved_review_matching_sha_passes(self) -> None:
+        """#821: an approval at the same commit SHA is accepted."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "abc123"  # same SHA as review
+
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(entry, board) is True
+
+    def test_has_approved_review_no_sha_skips_commit_check(self) -> None:
+        """#821: when SHAs are absent, the commit check is skipped (backward compat)."""
+        work = self._work("w1")
+        # review_head_sha unset (pre-821 row)
+        review = self._review("w1", verdict="approve")
+
+        entry = _q("w1", branch="worker/w1")
+        # branch_head_sha also unset
+
+        board = self._board(completed=[work, review])
+        # No SHAs → skip the commit check → approval still valid.
+        assert mq.has_approved_review(entry, board) is True
 
     # ── #292 Defect 1: has_approved_review with bounce ────────────────────
 
@@ -759,7 +860,13 @@ class TestSmokeGate:
         assert "merged" in kinds
 
     def test_process_legacy_callers_without_config_unaffected(self) -> None:
-        """Legacy callers that don't pass config/board still work."""
+        """Legacy callers that don't pass config/board still work.
+
+        When config is None, requires_smoke() returns False (no "test" gate
+        configured) so no smoke gate fires.  The fail-closed rule (#821) only
+        applies when config is present and says smoke is required but board
+        is absent.
+        """
         items = [_q("w1", size=10)]
         gh = FakeGh()
         events = process(items, gh)
