@@ -327,6 +327,22 @@ def get_default_branch_head(repo: str, branch: str) -> str:
     return data["commit"]["sha"]
 
 
+def get_branch_sha(repo: str, branch: str) -> str | None:
+    """Return the current HEAD SHA for *branch* on *repo*, or ``None`` on failure.
+
+    Best-effort wrapper around the GitHub branches API.  Returns ``None`` when
+    GitHub is unavailable, ``gh`` is not authenticated, or the branch does not
+    exist — callers treat ``None`` as "SHA tracking unavailable" and skip the
+    commit-bound staleness check introduced in #821.
+    """
+    try:
+        raw = _gh("api", f"repos/{repo}/branches/{branch}")
+        data = json.loads(raw)
+        return data["commit"]["sha"]
+    except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
+        return None
+
+
 # ── PR operations (used by the merge queue) ──────────────────────────────
 
 def find_pr_for_branch(repo: str, branch: str) -> dict | None:

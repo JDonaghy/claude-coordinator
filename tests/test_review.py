@@ -575,6 +575,65 @@ def test_dispatch_review_sends_to_different_machine_and_appends_to_board(
     assert "# Project rules" in payload["briefing"]
 
 
+def test_dispatch_review_captures_branch_sha(
+    two_machine_config: Config,
+) -> None:
+    """#821: dispatch_review must set review_head_sha on the returned Assignment.
+
+    When the branch SHA can be fetched, the review Assignment carries it so
+    has_approved_review can later reject the approval if new commits are pushed
+    onto the branch after the review ran (stale-SHA check).
+    """
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "sha-review-1"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 7, "url": "https://github.com/acme/api/pull/7", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        branch_sha_fetcher=lambda repo, branch: "deadbeef1234",  # injected for test
+    )
+
+    assert result is not None
+    assert result.review_head_sha == "deadbeef1234", (
+        "review_head_sha must be captured from branch tip at dispatch time"
+    )
+
+
+def test_dispatch_review_tolerates_sha_fetch_failure(
+    two_machine_config: Config,
+) -> None:
+    """#821: dispatch_review must not fail when the SHA fetcher raises."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "sha-fail-1"})
+
+    def _failing_sha(repo, branch):
+        raise RuntimeError("GitHub unavailable")
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 8, "url": "https://github.com/acme/api/pull/8", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        branch_sha_fetcher=_failing_sha,
+    )
+
+    # Dispatch must succeed; review_head_sha is None (unavailable is not blocking).
+    assert result is not None
+    assert result.review_head_sha is None
+
+
 def test_dispatch_review_handles_http_failure_gracefully(
     two_machine_config: Config,
 ) -> None:

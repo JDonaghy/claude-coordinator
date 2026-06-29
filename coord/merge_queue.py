@@ -252,6 +252,16 @@ class GhOps(Protocol):
 
     def close_issue(self, repo: str, issue_number: int) -> None: ...
 
+    def get_branch_sha(self, repo: str, branch: str) -> str | None:
+        """Return the current HEAD SHA for *branch*, or None on failure.
+
+        Used to populate ``QueuedMerge.branch_head_sha`` at process() time so
+        ``has_approved_review`` can reject stale approvals (#821).  Returning
+        ``None`` (on any network/auth failure) is safe — the staleness check
+        is skipped for rows without a SHA, preserving backward compatibility.
+        """
+        ...
+
 
 # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -1016,6 +1026,13 @@ def process(
                 events.append(MergeEvent(entry, "opened", f"(dry run) would open PR for {entry.branch}"))
             ordered = group if presorted else sequence(group)
             for entry in ordered:
+                # #821: populate branch_head_sha for the commit-bound approval
+                # staleness check in has_approved_review.  Only when the board
+                # is live (board=None blocks unconditionally; no SHA needed).
+                if board is not None and entry.branch_head_sha is None:
+                    entry.branch_head_sha = gh_ops.get_branch_sha(
+                        entry.repo_github, entry.branch
+                    )
                 # #292 (Defect 4): apply the review gate in dry-run so output
                 # reflects real behaviour.  CI cannot be checked in dry-run
                 # (no PR exists yet), so review and smoke gates are evaluated.
@@ -1088,6 +1105,13 @@ def process(
         for entry in ordered:
             if entry.pr_number is None:
                 continue
+            # #821: populate branch_head_sha for the commit-bound approval
+            # staleness check in has_approved_review.  Only when the board
+            # is live (board=None blocks unconditionally; no SHA needed).
+            if board is not None and entry.branch_head_sha is None:
+                entry.branch_head_sha = gh_ops.get_branch_sha(
+                    entry.repo_github, entry.branch
+                )
             # Review gate (#253/#821): refuse to merge when a review is required
             # by the pipeline policy but no approved review is on the board.
             # --skip-review bypasses for trivial/docs-only merges where the
