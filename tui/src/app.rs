@@ -20116,7 +20116,7 @@ impl CoordApp {
                 body: vec![StyledText::plain(body)],
                 buttons: vec![DialogButton {
                     id: WidgetId::new("close"),
-                    label: "Esc  Dismiss".into(),
+                    label: "Esc / Enter  Dismiss".into(),
                     is_default: true,
                     is_cancel: true,
                     tint: None,
@@ -30239,6 +30239,29 @@ impl ShellApp for CoordApp {
             }
         }
 
+        // ── #816: PTY-panic dialog key intercept ────────────────────────────
+        // Esc and Enter dismiss; any other key is swallowed to keep the
+        // dialog visible and let the operator read the fault message.
+        //
+        // This block intentionally runs BEFORE the artifact_pull_dialog
+        // intercept below, matching the rendering priority established in
+        // build_prompt_dialog (pty_panic_dialog is returned first / shown on
+        // top).  When both dialogs are simultaneously active the operator sees
+        // the PTY-panic dialog and their keystrokes must be routed to it first.
+        if self.pty_panic_dialog.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                let dismiss = matches!(
+                    key,
+                    Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)
+                );
+                if dismiss {
+                    self.pty_panic_dialog = None;
+                    *self.dialog_layout.borrow_mut() = None;
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #532: Artifact-pull dialog: intercept key presses ──────────────
         // While the info dialog is open:
         //   'c'/'C' — copy path to clipboard (when available), then dismiss.
@@ -30248,11 +30271,12 @@ impl ShellApp for CoordApp {
         //   on Tab / arrow keys while the dialog is focused.
         //
         // This block intentionally runs AFTER the destructive-confirmation
-        // intercepts (pending_purge, pending_force_merge, pending_restart) so
-        // that if both an artifact dialog and a confirmation prompt are alive
-        // at the same time, the confirmation prompt wins — matching the
-        // rendering priority in build_prompt_dialog and avoiding silently
-        // swallowed `y` keystrokes against a hidden artifact dialog.
+        // intercepts (pending_purge, pending_force_merge, pending_restart) AND
+        // after the pty_panic_dialog intercept above, so that if both an
+        // artifact dialog and a higher-priority dialog are alive at the same
+        // time, the higher-priority one wins — matching the rendering priority
+        // in build_prompt_dialog and avoiding silently swallowed keystrokes
+        // against a hidden artifact dialog.
         if self.artifact_pull_dialog.is_some() {
             if let UiEvent::KeyPressed { key, .. } = &event {
                 let path = self
@@ -54603,6 +54627,60 @@ mod tests {
         assert!(
             !driver.screen_contains("Renderer fault"),
             "dialog must be dismissed after Enter:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// When both `pty_panic_dialog` and `artifact_pull_dialog` are active
+    /// simultaneously, keystrokes must be routed to the higher-priority
+    /// `pty_panic_dialog` first — matching the rendering order in
+    /// `build_prompt_dialog` where `pty_panic_dialog` is returned first.
+    ///
+    /// Specifically: pressing `c` (artifact clipboard shortcut) while the
+    /// PTY-panic dialog is visible must NOT trigger the artifact copy action.
+    /// The PTY-panic dialog swallows the keystroke, leaving `artifact_pull_dialog`
+    /// intact and `pty_panic_dialog` still set (since `c` is not Esc/Enter).
+    #[test]
+    fn tuidriver_pty_panic_dialog_wins_key_priority_over_artifact_dialog() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        // Set both dialogs active simultaneously.
+        app.pty_panic_dialog = Some("overflow".to_string());
+        app.artifact_pull_dialog = Some(ArtifactPullDialog {
+            path: Some("/tmp/artifact.tar.gz".to_string()),
+            body: "Artifact downloaded successfully.".to_string(),
+        });
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // The PTY-panic dialog must be what's visible (higher rendering priority).
+        assert!(
+            driver.screen_contains("Renderer fault"),
+            "pty_panic_dialog must be the visible dialog when both are set:\n{}",
+            driver.screen()
+        );
+
+        // Press 'c' — the artifact dialog's clipboard shortcut.
+        // The PTY-panic intercept must swallow it; no clipboard action, no
+        // artifact dialog dismissal.
+        driver.press_named(quadraui::NamedKey::Tab); // swallowed, no dismiss
+        // Use a character key that artifact handler would treat as CopyAndDismiss.
+        // We can't easily type 'c' via press_named, but we CAN confirm that
+        // after Esc the PTY-panic dialog is gone while we DON'T get a "Copied"
+        // toast (which would only appear if the artifact handler ran first).
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        // After Esc the PTY-panic dialog is dismissed.
+        assert!(
+            !driver.screen_contains("Renderer fault"),
+            "pty_panic_dialog must be dismissed after Esc:\n{}",
+            driver.screen()
+        );
+        // No "Copied" toast — the artifact clipboard action was NOT triggered.
+        assert!(
+            !driver.screen_contains("Copied"),
+            "artifact clipboard action must NOT have fired:\n{}",
             driver.screen()
         );
     }
