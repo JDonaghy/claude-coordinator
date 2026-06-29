@@ -1658,7 +1658,7 @@ def test_board_payload_has_merge_plan_key(
 
 
 def test_board_merge_plan_contains_correct_fields(
-    rw_db, valid_config_path: Path, monkeypatch
+    rw_db, valid_config_path: Path, monkeypatch, tmp_path: Path
 ) -> None:
     """/board merge_plan entries carry the required #776 fields.
 
@@ -1668,7 +1668,6 @@ def test_board_merge_plan_contains_correct_fields(
     from coord import github_ops, merge_queue as mq
     from coord.config import load as load_config
     from coord.dao import SqliteStore
-    from coord.db import DB_PATH
     from coord.serve_app import build_app
 
     # Stub GitHub so build_board and plan() never shell out.
@@ -1689,7 +1688,12 @@ def test_board_merge_plan_contains_correct_fields(
     rw_db.commit()
 
     cfg = load_config(valid_config_path)
-    app = build_app(SqliteStore(DB_PATH), cfg)
+    # #684/#776 regression: read from the SAME db rw_db seeded (its temp
+    # rw.db), not the canonical DB_PATH.  SqliteStore opens mode=ro, which
+    # errors ("unable to open database file") when the path is absent — so
+    # SqliteStore(DB_PATH) failed in CI (no ~/.coord/coord.db) and only
+    # "passed" locally where a real coord.db happened to exist.
+    app = build_app(SqliteStore(tmp_path / "rw.db"), cfg)
     with TestClient(app) as cli:
         board = cli.get("/board").json()
 
