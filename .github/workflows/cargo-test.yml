@@ -1,0 +1,50 @@
+name: Rust tests
+
+# Closes the gap documented in GOAL.md (2026-06-11):
+#   "CI is pytest-only, so Rust repos (tui/quadraui/vimcode) still have no
+#    automated gate; they need an explicit cargo build && cargo test gate."
+# Issue #741 called for either resolving or tracking the gap — this resolves it
+# for the coord-tui crate (the tui/ subdirectory of this repo).
+#
+# Path-dep note: tui/Cargo.toml has
+#   quadraui = { path = "../../quadraui/quadraui", ... }
+# which mirrors the local dev layout ~/src/claude-coordinator/ (sibling of
+# ~/src/quadraui/).  On CI we replicate that layout by checking out quadraui
+# at `path: ../quadraui` (one level above $GITHUB_WORKSPACE), so the relative
+# path from tui/ resolves to the same place.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tui/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tui/**'
+
+jobs:
+  cargo-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Check out quadraui as a sibling directory to match the local path dep.
+      # tui/Cargo.toml: quadraui = { path = "../../quadraui/quadraui" }
+      # From tui/ that resolves to ../quadraui/quadraui relative to the repo root,
+      # i.e. the sibling checkout at path: ../quadraui.
+      - name: Check out quadraui (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/quadraui
+          path: ../quadraui
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+
+      - name: cargo test (tui)
+        working-directory: tui
+        run: cargo test
