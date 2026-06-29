@@ -695,7 +695,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         repo_filter=body.get("repo_filter"),
                         method=body.get("method") or "rebase",
                         force_merge=bool(body.get("force_merge")),
-                        skip_review=bool(body.get("skip_review")),
+                        # #821: daemon always enforces review regardless of any
+                        # skip_review flag the client sends.  The gate is
+                        # safety-critical and must not be bypassable remotely.
+                        skip_review=False,
                         skip_smoke=bool(body.get("skip_smoke")),
                         drop_assignment=None,  # already handled above
                         only_assignment=body.get("only"),  # #780: single-entry merge

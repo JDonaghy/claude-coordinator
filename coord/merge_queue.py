@@ -130,13 +130,25 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     if not branch_work_ids:
         return False
 
+    # #821: commit-bound check.  If the entry has a branch_head_sha (set at
+    # process() time from the live branch tip) and the review has a
+    # review_head_sha (set when the review assignment ran), an approval only
+    # counts when the two SHAs match — i.e. no new commits were pushed after
+    # the review completed.  When either SHA is absent (pre-821 rows or SHA
+    # tracking unavailable) the check is skipped (backward-compatible).
+    current_sha = getattr(entry, "branch_head_sha", None)
+
     for a in pool:
         if getattr(a, "type", None) != "review":
             continue
         if getattr(a, "review_of_assignment_id", None) not in branch_work_ids:
             continue
-        if getattr(a, "review_verdict", None) == "approve":
-            return True
+        if getattr(a, "review_verdict", None) != "approve":
+            continue
+        review_sha = getattr(a, "review_head_sha", None)
+        if review_sha is not None and current_sha is not None and review_sha != current_sha:
+            continue  # stale: branch moved past the commit the review covered
+        return True
     return False
 
 
@@ -220,6 +232,11 @@ class QueuedMerge:
     last_attempt: float | None = None
     error: str | None = None
     enqueued_at: float | None = None
+    # #821: current branch HEAD SHA, populated at process() time from GitHub.
+    # When set, `has_approved_review` checks it against the review assignment's
+    # `review_head_sha` to detect stale approvals (commits pushed after review).
+    # None means SHA tracking is not available for this entry.
+    branch_head_sha: str | None = None
 
 
 class GhOps(Protocol):
@@ -965,19 +982,19 @@ def process(
     the entry is **skipped** (``continue``) rather than halting the group, so
     a ready sibling can still merge.  ``force_merge=True`` skips this gate.
 
-    #253: When both *config* and *board* are supplied and the entry requires
-    a review (``reviews.enabled`` and ``"review"`` in ``pipeline.default_gates``)
-    but no approved review exists on the board, a ``review_required`` event
-    is emitted and the entry is **skipped** (not the whole group — #292
-    Defect 3).  ``skip_review=True`` bypasses this gate.  When *config* or
-    *board* is None the gate is silently skipped (legacy callers and tests
-    that don't construct a board still work).
+    #253/#821: When *config* says review is required (``reviews.enabled`` and
+    ``"review"`` in ``pipeline.default_gates``) the gate **fails closed**: if
+    *board* is ``None`` the approval cannot be confirmed so the entry is
+    blocked (``review_required`` event, skip — never merge).  When *config*
+    is ``None`` the gate is not applicable (no review policy → no block).
+    ``skip_review=True`` bypasses the gate for explicit local-only overrides.
+    The daemon ``/merge`` endpoint always passes ``skip_review=False`` and
+    ignores any ``skip_review`` flag from the client (#821).
 
-    #465: When ``"test"`` is in ``pipeline.default_gates`` and the work
-    assignment on *entry*'s branch has no ``test_state in ('passed', 'skipped')``
-    verdict, a ``smoke_required`` event is emitted and the entry is skipped.
-    ``skip_smoke=True`` bypasses this gate.  Same legacy-caller semantics as
-    the review gate: if *config* or *board* is None the gate is skipped.
+    #465/#821: Same fail-closed semantics for the smoke gate: when *config*
+    says ``"test"`` is in ``pipeline.default_gates`` but *board* is ``None``,
+    the verdict cannot be confirmed → block (``smoke_required`` event).
+    ``skip_smoke=True`` bypasses the gate.
 
     Dry-run applies both the review and smoke gates so output reflects what
     a real run would do.  CI cannot be checked without a real PR number.
@@ -1002,29 +1019,39 @@ def process(
                 # #292 (Defect 4): apply the review gate in dry-run so output
                 # reflects real behaviour.  CI cannot be checked in dry-run
                 # (no PR exists yet), so review and smoke gates are evaluated.
+                # #821: fail closed — if review is required but board is None
+                # (approval cannot be confirmed) block the entry.
                 if (
                     not skip_review
                     and config is not None
-                    and board is not None
                     and requires_review(entry, config)
-                    and not has_approved_review(entry, board)
+                    and (board is None or not has_approved_review(entry, board))
                 ):
+                    _why = (
+                        "board unavailable to confirm review approval"
+                        if board is None
+                        else "review required but not approved"
+                    )
                     events.append(MergeEvent(
                         entry, "review_required",
-                        f"(dry run) would be blocked: review required but not approved for {entry.branch}",
+                        f"(dry run) would be blocked: {_why} for {entry.branch}",
                     ))
                     continue
-                # #465: smoke gate in dry-run.
+                # #465/#821: smoke gate in dry-run — same fail-closed logic.
                 if (
                     not skip_smoke
                     and config is not None
-                    and board is not None
                     and requires_smoke(entry, config)
-                    and not has_smoke_verdict(entry, board)
+                    and (board is None or not has_smoke_verdict(entry, board))
                 ):
+                    _why = (
+                        "board unavailable to confirm smoke verdict"
+                        if board is None
+                        else "smoke test required but no verdict"
+                    )
                     events.append(MergeEvent(
                         entry, "smoke_required",
-                        f"(dry run) would be blocked: smoke test required but no verdict for {entry.branch}",
+                        f"(dry run) would be blocked: {_why} for {entry.branch}",
                     ))
                     continue
                 events.append(MergeEvent(
@@ -1061,36 +1088,46 @@ def process(
         for entry in ordered:
             if entry.pr_number is None:
                 continue
-            # Review gate (#253): refuse to merge when a review is required by
-            # the pipeline policy but no approved review is on the board.
+            # Review gate (#253/#821): refuse to merge when a review is required
+            # by the pipeline policy but no approved review is on the board.
             # --skip-review bypasses for trivial/docs-only merges where the
             # user has consciously decided review isn't needed.
             # #292 (Defect 3): skip this entry and try the next one in the
             # group rather than halting the whole group.  An un-reviewed entry
             # should not prevent a fully-approved sibling from merging.
+            # #821: fail closed — when review is required but board is None
+            # the approval cannot be confirmed; block rather than silently merge.
             if (
                 not skip_review
                 and config is not None
-                and board is not None
                 and requires_review(entry, config)
-                and not has_approved_review(entry, board)
+                and (board is None or not has_approved_review(entry, board))
             ):
-                msg = "review required but not approved"
+                msg = (
+                    "review required but board unavailable to confirm approval"
+                    if board is None
+                    else "review required but not approved"
+                )
                 entry.error = msg
                 events.append(MergeEvent(entry, "review_required", msg))
                 continue  # #292: skip this entry; try the next in the group
-            # Smoke gate (#465): refuse to merge when the interactive smoke
-            # is required by the pipeline policy but no passing/skipped
-            # verdict is recorded on the work assignment.  Same skip-not-halt
-            # semantics as the review gate above.
+            # Smoke gate (#465/#821): refuse to merge when the interactive smoke
+            # is required by the pipeline policy but no passing/skipped verdict
+            # is recorded on the work assignment.  Same skip-not-halt semantics
+            # as the review gate above.
+            # #821: fail closed — when smoke is required but board is None
+            # the verdict cannot be confirmed; block rather than silently merge.
             if (
                 not skip_smoke
                 and config is not None
-                and board is not None
                 and requires_smoke(entry, config)
-                and not has_smoke_verdict(entry, board)
+                and (board is None or not has_smoke_verdict(entry, board))
             ):
-                msg = "smoke test required but no verdict recorded"
+                msg = (
+                    "smoke test required but board unavailable to confirm verdict"
+                    if board is None
+                    else "smoke test required but no verdict recorded"
+                )
                 entry.error = msg
                 events.append(MergeEvent(entry, "smoke_required", msg))
                 continue  # skip this entry; try the next in the group

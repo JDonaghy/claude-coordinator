@@ -8681,7 +8681,13 @@ def merge(
                 f"{only_entry.state!r} (not PENDING) — cannot merge"
             )
             sys.exit(1)
-        board_only = load_board()
+        # #821: never pass None to process() — use an empty board so
+        # has_smoke_verdict can apply its "no work found → fail open" rule.
+        # process() blocks on board=None when a gate IS required; an empty
+        # board lets the gate function decide.
+        from coord.models import Board as _Board  # noqa: PLC0415
+        _raw_board_only = load_board()
+        board_only = _raw_board_only if _raw_board_only is not None else _Board(active=[], completed=[])
         ci_store_only = build_ci_store(cfg_only.ci_store.type)
         if skip_review:
             click.echo("  --skip-review: review-approval gate bypassed (#253)")
@@ -8729,7 +8735,13 @@ def merge(
     # exist anymore.  When the issues table has no row for an issue (cache
     # miss), default to OPEN — that matches the prior coord status enqueue
     # path which had no such check.
-    board = load_board()
+    # #821: never pass None to process() — use an empty board so
+    # has_smoke_verdict can apply its "no work found → fail open" rule.
+    # process() blocks on board=None when a gate IS required; an empty
+    # board lets the gate function decide.
+    from coord.models import Board as _Board  # noqa: PLC0415
+    _raw_board = load_board()
+    board = _raw_board if _raw_board is not None else _Board(active=[], completed=[])
     open_by_repo, known_by_repo = _load_issue_states()
     # Set of (repo_name, issue_number) for which a `merged` entry already
     # exists.  Avoids spawning a fresh PR for an issue that was already

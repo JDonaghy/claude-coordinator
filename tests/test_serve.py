@@ -1175,6 +1175,33 @@ def test_serve_merge_relays_nonzero_exit(
     assert resp.json()["exit_code"] == 2
 
 
+def test_serve_merge_ignores_client_skip_review(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """#821: POST /merge with skip_review=True must NOT propagate to the merge callback.
+
+    The daemon always enforces the review gate regardless of any flag the thin
+    client sends.  Verify the callback is invoked with skip_review=False even
+    when the POST body contains skip_review=True.
+    """
+    from coord.cli import merge as merge_cmd
+
+    captured: dict = {}
+
+    def fake_callback(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(merge_cmd, "callback", fake_callback)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/merge", json={"skip_review": True, "dry_run": True})
+    assert resp.status_code == 200
+    # Daemon must have stripped the client's skip_review flag.
+    assert captured.get("skip_review") is False, (
+        f"daemon must pass skip_review=False to callback, got {captured.get('skip_review')!r}"
+    )
+
+
 def test_merge_command_routes_to_daemon_when_service_set(coord_db, monkeypatch):
     # #584: `coord merge` on a thin client POSTs to /merge and relays the output,
     # instead of no-opping against the empty local board.

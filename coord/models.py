@@ -209,6 +209,14 @@ class Assignment:
     # by the merge-queue gate (`has_approved_review`) to refuse merging work
     # whose review has not approved.
     review_verdict: str | None = None
+    # #821: SHA of the branch HEAD captured at the time the review assignment
+    # ran.  When set, `has_approved_review` compares this against the merge
+    # queue entry's `branch_head_sha` to reject stale approvals — if the
+    # branch gained commits after the review ran, the approval no longer
+    # covers the current HEAD and the entry is re-blocked until re-reviewed.
+    # None for review assignments predating this field or where SHA tracking
+    # is not available.
+    review_head_sha: str | None = None
     # #208: parsed worker cost from the final stream-json `result` event.
     # None means "not yet captured" (older rows, in-flight workers, or
     # workers whose log lacked usage data).  Set on completion by
