@@ -1,3 +1,7 @@
+//! Settings panel and periodic update helpers extracted from `app/mod.rs` (#744).
+//!
+//! **Import pattern:** `use super::*` is intentional — these methods live on `CoordApp`
+//! and need the full parent namespace. See `sessions.rs` for the full rationale.
 #[allow(unused_imports)]
 use super::*;
 

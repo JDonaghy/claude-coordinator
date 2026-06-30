@@ -1,3 +1,9 @@
+//! `ShellApp` trait implementation and rendering logic extracted from `app/mod.rs` (#744).
+//!
+//! **Import pattern:** `use super::*` is intentional — these methods live on `CoordApp`
+//! and need the full parent namespace (all quadraui types, app-field types, and bindings
+//! from other extracted modules). Pure-function submodules (`format.rs`, `data.rs`) use
+//! explicit imports because their dependency surface is small and stable.
 #[allow(unused_imports)]
 use super::*;
 
