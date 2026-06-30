@@ -175,7 +175,7 @@ class TestRestoreDefaultBranch:
         # #561: a pass verdict cleans up the throwaway test worktree.
         wt = tmp_path / "wt-abc123"
         wt.mkdir()
-        monkeypatch.setattr("coord.cli._test_worktree_path", lambda aid, repo: wt)
+        monkeypatch.setattr("coord.commands.test_gate._test_worktree_path", lambda aid, repo: wt)
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         result = CliRunner().invoke(main, [
             "test", "abc123", "--passed", "--config", str(config_file),
@@ -278,7 +278,7 @@ class TestBranchCheckout:
         # #561: build in a throwaway worktree fetched fresh — NEVER `git
         # checkout` in the base checkout (it's the live coordinator source).
         monkeypatch.setattr(
-            "coord.cli._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
+            "coord.commands.test_gate._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
         )
         mock_run.return_value = MagicMock(returncode=0)
 
@@ -323,7 +323,7 @@ class TestBranchCheckout:
         monkeypatch, tmp_path: Path,
     ) -> None:
         monkeypatch.setattr(
-            "coord.cli._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
+            "coord.commands.test_gate._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
         )
         mock_run.side_effect = subprocess.CalledProcessError(
             1, "git fetch", stderr="fatal: not a git repository"
@@ -378,7 +378,7 @@ class TestBranchReconciliation:
         _ = _gc
 
         monkeypatch.setattr(
-            "coord.cli._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
+            "coord.commands.test_gate._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
         )
 
         # Seed a merge_queue row pointing the assignment at PR #999.
@@ -444,7 +444,7 @@ class TestBranchReconciliation:
         """No PR registered → can't ask GitHub.  Reconciliation
         returns None and the worktree-add error is surfaced."""
         monkeypatch.setattr(
-            "coord.cli._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
+            "coord.commands.test_gate._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
         )
         mock_run.side_effect = [
             MagicMock(returncode=0, stdout="", stderr=""),  # git fetch --prune
@@ -472,7 +472,7 @@ class TestBranchReconciliation:
         worktree-add failure is unrelated (e.g. local clone missing the
         ref).  Don't pretend we fixed it; surface the original error."""
         monkeypatch.setattr(
-            "coord.cli._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
+            "coord.commands.test_gate._test_worktree_path", lambda aid, repo: tmp_path / f"wt-{aid}"
         )
         from coord.db import get_connection
         conn = get_connection()

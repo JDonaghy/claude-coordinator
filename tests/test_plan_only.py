@@ -405,15 +405,17 @@ class TestStatusBadgeMapPlan:
 
     def test_plan_type_in_badge_map(self) -> None:
         """The badge_map used in coord status must include a 'plan' entry."""
-        # Import the CLI module and locate badge_map source via inspection.
-        # We verify the behaviour directly: a plan assignment spec must produce
-        # a non-empty badge string containing "plan".
-        import coord.cli as cli_mod
+        # Import the module that implements `coord status` (#747: status now
+        # lives in coord/commands/status.py, not coord/cli.py) and locate
+        # badge_map source via inspection. We verify the behaviour directly:
+        # a plan assignment spec must produce a non-empty badge string
+        # containing "plan".
+        import coord.commands.status as status_mod
         import inspect
-        src = inspect.getsource(cli_mod)
+        src = inspect.getsource(status_mod)
         # badge_map definition must include the "plan" key
         assert '"plan"' in src or "'plan'" in src, (
-            "badge_map in cli.py must include a 'plan' key"
+            "badge_map in coord/commands/status.py must include a 'plan' key"
         )
 
     def test_status_displays_plan_badge(

@@ -887,7 +887,7 @@ class TestRemoteReviewVerdictRelay:
         monkeypatch.setattr("click.prompt", lambda *a, **k: next(answers))
         # The operator types the full findings in $EDITOR (stubbed here).
         monkeypatch.setattr(
-            "coord.cli._collect_review_body_via_editor",
+            "coord.commands.review._collect_review_body_via_editor",
             lambda **kw: "Blocking: app.rs:42 Right-on-leaf must be a no-op.",
         )
 
@@ -927,7 +927,7 @@ class TestRemoteReviewVerdictRelay:
         answers = iter(["r", ""])  # request-changes, empty summary
         monkeypatch.setattr("click.prompt", lambda *a, **k: next(answers))
         monkeypatch.setattr(
-            "coord.cli._collect_review_body_via_editor", lambda **kw: None
+            "coord.commands.review._collect_review_body_via_editor", lambda **kw: None
         )
         posted: dict = {}
         monkeypatch.setattr(

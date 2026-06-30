@@ -224,7 +224,7 @@ class TestWatchCommand:
         if extra_args:
             args += extra_args
 
-        from coord import cli as _cli_mod
+        from coord.commands import sessions as _cli_mod
 
         def _non_blocking_tail(path, interval=1.0):
             """Read lines synchronously without blocking after EOF."""
