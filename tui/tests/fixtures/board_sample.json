@@ -1,0 +1,233 @@
+{
+  "assignments": [
+    {
+      "assignment_id": "work-748b",
+      "branch": "issue-749-followup",
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "claude_session_id": null,
+      "cost_usd": null,
+      "dispatched_at": 1000001000.0,
+      "exit_code": null,
+      "failure_reason": null,
+      "files_allowed": [],
+      "files_forbidden": [],
+      "finished_at": null,
+      "input_tokens": 0,
+      "is_interactive": 1,
+      "issue_number": 749,
+      "issue_title": "interactive follow-up",
+      "machine_name": "dellserver",
+      "model": null,
+      "output_tokens": 0,
+      "plan": null,
+      "pr_url": null,
+      "provider_name": null,
+      "repo_github": "JDonaghy/claude-coordinator",
+      "repo_name": "claude-coordinator",
+      "required_gates": [],
+      "review_findings": null,
+      "review_head_sha": null,
+      "review_iteration": 0,
+      "review_of_assignment_id": null,
+      "review_posted_at": null,
+      "review_state": null,
+      "review_target": null,
+      "review_verdict": null,
+      "smoke_test": null,
+      "smoke_test_reason": null,
+      "smoke_tests": null,
+      "status": "running",
+      "test_plan": null,
+      "test_plan_branch_head": null,
+      "test_reason": null,
+      "test_state": null,
+      "type": "work",
+      "unreachable_count": 0
+    },
+    {
+      "assignment_id": "rev-748a",
+      "branch": null,
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 0,
+      "claude_session_id": null,
+      "cost_usd": null,
+      "dispatched_at": 1000000700.0,
+      "exit_code": null,
+      "failure_reason": null,
+      "files_allowed": [],
+      "files_forbidden": [],
+      "finished_at": 1000000900.0,
+      "input_tokens": 0,
+      "is_interactive": 0,
+      "issue_number": 748,
+      "issue_title": "seam: golden /board fixture",
+      "machine_name": "dellserver",
+      "model": null,
+      "output_tokens": 0,
+      "plan": null,
+      "pr_url": null,
+      "provider_name": null,
+      "repo_github": "JDonaghy/claude-coordinator",
+      "repo_name": "claude-coordinator",
+      "required_gates": [],
+      "review_findings": null,
+      "review_head_sha": null,
+      "review_iteration": 0,
+      "review_of_assignment_id": "work-748a",
+      "review_posted_at": null,
+      "review_state": null,
+      "review_target": null,
+      "review_verdict": "approve",
+      "smoke_test": null,
+      "smoke_test_reason": null,
+      "smoke_tests": null,
+      "status": "done",
+      "test_plan": null,
+      "test_plan_branch_head": null,
+      "test_reason": null,
+      "test_state": null,
+      "type": "review",
+      "unreachable_count": 0
+    },
+    {
+      "assignment_id": "work-748a",
+      "branch": "issue-748-fixture",
+      "cache_creation_tokens": 0,
+      "cache_read_tokens": 5000,
+      "claude_session_id": null,
+      "cost_usd": 0.42,
+      "dispatched_at": 1000000000.0,
+      "exit_code": 0,
+      "failure_reason": null,
+      "files_allowed": [],
+      "files_forbidden": [],
+      "finished_at": 1000000600.0,
+      "input_tokens": 1200,
+      "is_interactive": 0,
+      "issue_number": 748,
+      "issue_title": "seam: golden /board fixture",
+      "machine_name": "precision",
+      "model": "sonnet",
+      "output_tokens": 340,
+      "plan": null,
+      "pr_url": null,
+      "provider_name": null,
+      "repo_github": "JDonaghy/claude-coordinator",
+      "repo_name": "claude-coordinator",
+      "required_gates": [],
+      "review_findings": "{\"verdict\": \"approve\", \"body\": \"Looks good.\"}",
+      "review_head_sha": null,
+      "review_iteration": 0,
+      "review_of_assignment_id": null,
+      "review_posted_at": null,
+      "review_state": null,
+      "review_target": null,
+      "review_verdict": "approve",
+      "smoke_test": null,
+      "smoke_test_reason": null,
+      "smoke_tests": [
+        "fixture loads in the TUI",
+        "round_number is non-zero"
+      ],
+      "status": "done",
+      "test_plan": {
+        "steps": [
+          {
+            "cmd": "cargo test",
+            "kind": "run",
+            "label": "run tui tests"
+          }
+        ]
+      },
+      "test_plan_branch_head": null,
+      "test_reason": null,
+      "test_state": "passed",
+      "type": "work",
+      "unreachable_count": 0
+    }
+  ],
+  "board_meta": {
+    "board_initialized": "1",
+    "pipeline_default_gates": "[\"test\", \"review\", \"merge\"]",
+    "round_number": "3"
+  },
+  "issues": [
+    {
+      "body": "## Context\n\nThe /board payload is shipped as raw SQLite rows...",
+      "labels": [
+        "coord",
+        "status:ready"
+      ],
+      "milestone_number": 12,
+      "milestone_title": "Tech Debt: seam hardening",
+      "number": 748,
+      "repo_name": "claude-coordinator",
+      "state": "open",
+      "synced_at": 1000001100.0,
+      "title": "seam: golden /board fixture + CI round-trip parse test"
+    }
+  ],
+  "machines": [
+    {
+      "capabilities": [
+        "python",
+        "gtk"
+      ],
+      "host": "dellserver.tailnet",
+      "name": "dellserver",
+      "repos": [
+        "claude-coordinator"
+      ]
+    },
+    {
+      "capabilities": [
+        "python",
+        "rust"
+      ],
+      "host": "precision.tailnet",
+      "name": "precision",
+      "repos": [
+        "claude-coordinator"
+      ]
+    }
+  ],
+  "merge_queue": [
+    {
+      "assignment_id": "work-748a",
+      "branch": "issue-748-fixture",
+      "enqueued_at": 1000000950.0,
+      "error": null,
+      "id": 1,
+      "issue_number": 748,
+      "issue_title": "seam: golden /board fixture",
+      "last_attempt": null,
+      "pr_number": 9001,
+      "pr_url": "https://github.com/JDonaghy/claude-coordinator/pull/9001",
+      "repo_github": "JDonaghy/claude-coordinator",
+      "repo_name": "claude-coordinator",
+      "size": 240,
+      "state": "queued",
+      "target_branch": "main"
+    }
+  ],
+  "notifications": [],
+  "plans": {},
+  "proposals": [
+    {
+      "briefing": "",
+      "files_likely": [],
+      "id": 1,
+      "issue_number": 750,
+      "issue_title": "next seam-hardening pass",
+      "machine_name": "precision",
+      "model": null,
+      "rationale": "precision is idle and has touched dao.py recently",
+      "repo_name": "claude-coordinator",
+      "required_gates": [],
+      "type": "work"
+    }
+  ],
+  "round_number": 3,
+  "schema_version": 1
+}
