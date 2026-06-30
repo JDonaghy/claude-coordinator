@@ -1,0 +1,1271 @@
+#[allow(unused_imports)]
+use super::*;
+
+// ─── Shared periodic work (called from both handle() and tick()) ─────────────
+
+impl CoordApp {
+    /// Time-based housekeeping that must run regardless of whether a UI
+    /// event arrived: toast pruning, data auto-refresh, background command
+    /// runner draining, pipeline loader polling, and auto-notify when
+    /// running assignments exist. Returns true if anything changed and a
+    /// redraw is required.
+    pub(crate) fn run_periodic_work(&mut self) -> bool {
+        let mut needs_redraw = false;
+
+        // Toast pruning
+        let before = self.toasts.len();
+        self.prune_toasts();
+        if self.toasts.len() != before {
+            needs_redraw = true;
+        }
+
+        // Auto-refresh: kick off background data load when interval elapses.
+        // Uses the user-configured cadence from settings (default 5 s); when
+        // the cadence is "Off" no automatic reload happens (manual `r` still works).
+        //
+        // #315: while a chat resume is pending we override the cadence with a
+        // 300 ms floor.  Without this, the bind waits up to a full refresh
+        // interval (default 5 s) for the new assignment row to appear in
+        // `data.assignments` — which feels like "the chat is frozen" to the
+        // user even though the worker is already replying.
+        let cadence = self.settings.refresh_cadence.as_duration();
+        let should_refresh = if self.pending_chat_resume.is_some() {
+            self.refreshed_at.elapsed() >= Duration::from_millis(300)
+        } else {
+            match cadence {
+                Some(c) => self.refreshed_at.elapsed() >= c,
+                None => false,
+            }
+        };
+        if should_refresh && self.pending_data.is_none() {
+            self.pending_data = Some(start_data_load());
+            if self.active_view == SidebarView::Pipeline {
+                self.maybe_kick_pipeline_loader();
+            }
+            // #pause: rescan the paused-machines file at the same cadence
+            // as the rest of the data refresh.  Picks up out-of-band edits
+            // (`coord pause foo` from another terminal) without polling on
+            // every tick.
+            let fresh = read_paused_machines();
+            if fresh != self.paused_machines {
+                self.paused_machines = fresh;
+            }
+            needs_redraw = true;
+        }
+
+        // Poll background command runner
+        if let Some(result) = self.command_runner.poll() {
+            // Surface command failures via toast — previously they only set
+            // a green status-bar message that was easy to miss (and styled
+            // the same as success).  Without this, e.g. `coord refine`
+            // failing because a label doesn't exist on the repo would leave
+            // the user staring at an unchanged board with no feedback.
+            //
+            // #532: a pull-artifact failure that the dialog is about to surface
+            // shouldn't ALSO fire a generic toast — that's redundant feedback.
+            // But only suppress when the dialog will actually pick it up: the
+            // dialog handler matches on `pending_artifact_pull` carrying the
+            // SAME work_id as the completed label.  If a second pull was
+            // started in the meantime, `pending_artifact_pull` now points at
+            // the newer work_id and the stale result would otherwise be
+            // silently dropped (no toast, no dialog).  Check the match first,
+            // suppress only when handled.
+            if result.exit_code != 0
+                && !should_suppress_command_failed_toast(
+                    &result.label,
+                    self.pending_artifact_pull.as_ref(),
+                )
+            {
+                let reason = first_meaningful_stderr_line(&result.stderr)
+                    .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
+                self.push_toast(
+                    "Command failed",
+                    &format!("{}\n{}", result.label, reason),
+                    ToastSeverity::Error,
+                );
+            }
+            // Per-stage doctor: surface `coord diagnose`'s findings/actions and,
+            // when it couldn't recover, point at the non-destructive Reset.  The
+            // findings ride on stdout (captured since this feature); the trailing
+            // DIAGNOSE_RESULT line tells us whether a reset is still needed.
+            if result.label.contains("diagnose ") && result.exit_code == 0 {
+                let out = result.stdout.trim();
+                let needs_reset = out
+                    .lines()
+                    .rev()
+                    .find(|l| l.starts_with("DIAGNOSE_RESULT:"))
+                    .map(|l| l.contains("needs_reset=true"))
+                    .unwrap_or(false);
+                let is_reset = result.label.contains("--reset");
+                // Prefer the action (✓) lines; fall back to the findings (·).
+                let actions: Vec<&str> = out
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with('✓'))
+                    .collect();
+                let mut body = if !actions.is_empty() {
+                    actions.join("\n")
+                } else {
+                    out.lines()
+                        .filter(|l| l.trim_start().starts_with('·'))
+                        .take(6)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                if body.is_empty() {
+                    body = "no changes needed".to_string();
+                }
+                let (title, sev) = if is_reset {
+                    ("Stage reset (branch kept)", ToastSeverity::Info)
+                } else if needs_reset {
+                    body.push_str(
+                        "\n\n→ right-click → \"Reset stage (keeps branch + commits)\" to clear it.",
+                    );
+                    ("Diagnose — still wedged", ToastSeverity::Warning)
+                } else {
+                    ("Diagnose & fix stage", ToastSeverity::Info)
+                };
+                self.push_toast(title, &body, sev);
+                self.refresh();
+            }
+            // #264: chain the queued `coord ready` after `coord stop`
+            // finished cleanly at the end of a refinement chat.  We only
+            // fire it on successful stop — leaving the issue in
+            // status:refining when the worker couldn't be killed is the
+            // safer default (the user can drop to backlog manually).
+            if let Some(p) = self.pending_refine_ready.clone() {
+                if result.label.contains(&format!("stop {}", p.assignment_id))
+                    && result.exit_code == 0
+                {
+                    self.pending_refine_ready = None;
+                    let issue_str = p.issue_number.to_string();
+                    // Use spawn_queued so `ready` is enqueued if another command
+                    // was queued while this stop was running.  ready_started is
+                    // true for both Started and Queued — it will run eventually.
+                    use crate::commands::SpawnQueuedOutcome;
+                    let ready_outcome = self
+                        .command_runner
+                        .spawn_queued(&["ready", &p.repo, &issue_str]);
+                    let ready_started = matches!(
+                        ready_outcome,
+                        SpawnQueuedOutcome::Started | SpawnQueuedOutcome::Queued
+                    );
+                    if !ready_started {
+                        self.push_toast(
+                            "Refine with chat",
+                            "ready already queued or running — skipping duplicate.",
+                            ToastSeverity::Info,
+                        );
+                    }
+                    // #410: Send path — queue coord assign to run after coord ready.
+                    // Gate on `ready_started`: if coord ready never launched we must
+                    // not dispatch the issue (it would skip the status:ready flip).
+                    if p.then_dispatch && ready_started {
+                        if let Some(machine) = self.best_machine_for(&p.repo).cloned() {
+                            let machine_name = machine.name.clone();
+                            let model_str = self
+                                .settings
+                                .machine_model
+                                .get(&machine_name)
+                                .map(|mp| mp.as_str().to_string());
+                            let issue_str2 = p.issue_number.to_string();
+                            let mut cmd: Vec<String> = vec![
+                                "assign".into(),
+                                machine_name.clone(),
+                                p.repo.clone(),
+                                issue_str2,
+                            ];
+                            if let Some(ref m) = model_str {
+                                cmd.push("--model".into());
+                                cmd.push(m.clone());
+                            }
+                            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+                            use crate::commands::SpawnQueuedOutcome;
+                            match self.command_runner.spawn_queued(&cmd_refs) {
+                                SpawnQueuedOutcome::Started => {
+                                    self.push_toast(
+                                        "Send",
+                                        &format!(
+                                            "#{} dispatched → {}",
+                                            p.issue_number, machine_name
+                                        ),
+                                        ToastSeverity::Info,
+                                    );
+                                }
+                                SpawnQueuedOutcome::Queued => {
+                                    self.push_toast(
+                                        "Send",
+                                        &format!(
+                                            "#{}: dispatch queued → {}",
+                                            p.issue_number, machine_name
+                                        ),
+                                        ToastSeverity::Info,
+                                    );
+                                }
+                                SpawnQueuedOutcome::Deduped => {}
+                            }
+                            self.maybe_kick_pipeline_loader();
+                        } else {
+                            self.push_toast(
+                                "Send",
+                                &format!(
+                                    "#{}: ready — but no reachable machine for {}.",
+                                    p.issue_number, p.repo
+                                ),
+                                ToastSeverity::Warning,
+                            );
+                        }
+                    }
+                }
+            }
+            // #336 / #434 / #532: pull-artifact completion — open an info
+            // dialog showing the full destination path (success) or the
+            // error message (failure).  Replaces the 4-second toast with a
+            // re-openable, copyable dialog; the durable panel line remains.
+            if let Some((work_id, repo, sanitized)) = &self.pending_artifact_pull.clone() {
+                if result.label.contains(&format!("pull-artifact {}", work_id)) {
+                    self.pending_artifact_pull = None;
+                    let pull_message: String;
+                    if result.exit_code == 0 {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                        let path = format!("{home}/.coord/artifacts/{repo}/{sanitized}/");
+                        pull_message = path.clone();
+                        // #532: open dialog instead of ephemeral toast.
+                        self.artifact_pull_dialog = Some(ArtifactPullDialog {
+                            path: Some(path.clone()),
+                            body: format!("Saved to:\n{}", path),
+                        });
+                    } else {
+                        // Capture the error text for the dialog and the
+                        // durable panel line.
+                        pull_message =
+                            first_meaningful_stderr_line(&result.stderr).unwrap_or_else(|| {
+                                format!("exit {} — no stderr captured", result.exit_code)
+                            });
+                        // #532: open dialog showing the failure reason.
+                        self.artifact_pull_dialog = Some(ArtifactPullDialog {
+                            path: None,
+                            body: format!(
+                                "Pull failed (exit {}):\n{}",
+                                result.exit_code, pull_message
+                            ),
+                        });
+                    }
+                    // #434: persist the result so it remains visible after
+                    // the dialog dismisses (drives the "Last pull: …" panel
+                    // line and lets `a` re-open the dialog).
+                    self.last_artifact_pulls.insert(
+                        work_id.clone(),
+                        ArtifactPullResult {
+                            exit_code: result.exit_code,
+                            message: pull_message,
+                            finished_at: Instant::now(),
+                        },
+                    );
+                }
+            }
+            // #290 recovery: a coord command just finished.  If this was a
+            // merge dispatch and no merge_queue row appeared yet (CI gate
+            // blocked, queue empty, or transient read error), the optimistic
+            // inflight flag would otherwise stay set forever — permanently
+            // showing the Merge box as blue with no way to retry.  Clear any
+            // inflight entry that still has no matching row in the current
+            // data so the Go button returns and the user can retry.  Entries
+            // whose DB rows already arrived are handled (and cleared earlier)
+            // by apply_pending_data; this only fires for the stuck case.
+            self.pipeline_inflight_merges.retain(|(_, issue_number)| {
+                self.data
+                    .merge_queue
+                    .iter()
+                    .any(|m| m.issue_number == Some(*issue_number))
+            });
+            // A coord command just finished — most mutate labels (track,
+            // refine, ready, backlog, bounce) or assignment state, all written
+            // to the DB cache.  refresh() reloads `data` from the DB, which
+            // rebuilds the Pipeline from the cache in apply_pending_data, so the
+            // user sees the result on the next tick (no gh search).
+            self.refresh();
+            needs_redraw = true;
+        }
+
+        // #264: bind a pending refinement-chat dispatch to its new
+        // assignment row as soon as it appears in the DB.
+        if self.pending_refinement.is_some() && self.maybe_bind_pending_refinement() {
+            needs_redraw = true;
+        }
+
+        // #316: bind a pending board-chat dispatch (new-issue or refine-board)
+        // to its assignment row when it appears in the DB.
+        if self.pending_board_chat.is_some() && self.maybe_bind_pending_board_chat() {
+            needs_redraw = true;
+        }
+
+        // #314 Phase B: bind a pending test-chat dispatch to its new assignment row.
+        if self.pending_test_chat.is_some() && self.maybe_bind_pending_test_chat() {
+            needs_redraw = true;
+        }
+
+        // #315: rebind the open chat overlay to the new assignment when a
+        // `coord chat-continue` re-dispatch has landed in the DB.
+        if self.pending_chat_resume.is_some() && self.maybe_bind_pending_resume() {
+            needs_redraw = true;
+        }
+
+        // #319 Phase A: capture the chat's reply to the refinement-notes
+        // synth prompt and open the review modal when it's complete.
+        if self.pending_refinement_notes_synth.is_some() && self.poll_refinement_notes_synth() {
+            needs_redraw = true;
+        }
+        // #319 Phase A: drain the `gh issue comment` shell-out result.
+        if self.refinement_notes_post_rx.is_some() && self.poll_refinement_notes_post() {
+            needs_redraw = true;
+        }
+        // #316 Phase B: drain the `gh issue create` shell-out result.
+        if self.file_issue_post_rx.is_some() && self.poll_file_issue_post() {
+            needs_redraw = true;
+        }
+        // #486 Leg 4: drain the background local+remote session fetch.
+        if self.pending_remote_sessions.is_some() && self.poll_remote_sessions() {
+            needs_redraw = true;
+        }
+
+        // #603: the fix-briefing preview arrived → repaint the confirm dialog.
+        if self.fix_briefing_rx.is_some() && self.poll_fix_briefing_preview() {
+            needs_redraw = true;
+        }
+
+        // #315: drain InjectFallback signals from `spawn_inject_post`.
+        // These fire when /inject/{id} returned 409/410 — the worker
+        // exited mid-flight after submit_inject's gate.  Transparently
+        // trigger chat-continue so the typed message isn't lost.
+        loop {
+            let fb = match self.inject_fallback_rx.try_recv() {
+                Ok(fb) => fb,
+                Err(_) => break,
+            };
+            // Suppress if a resume is already in flight for this issue.
+            if self.pending_chat_resume.is_some() {
+                continue;
+            }
+            let arm_unix_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let config_path = self.command_runner.config_path.clone();
+            // Look up the old assignment's type so the resume bind matches
+            // the same chat type (fixes #361: test-chat / new-issue-chat
+            // continuations never rebound when filter was "refinement"-only).
+            let old_type = self
+                .data
+                .assignments
+                .iter()
+                .find(|a| a.id == fb.aid)
+                .and_then(|a| a.assignment_type.clone());
+            spawn_chat_continue(config_path, fb.aid.clone(), fb.text.clone());
+            self.pending_chat_resume = Some(PendingChatResume {
+                old_assignment_id: fb.aid.clone(),
+                issue_number: fb.issue_number,
+                dispatched_at: Instant::now(),
+                arm_unix_secs,
+                old_type,
+            });
+            self.pipeline_status = Some((
+                format!("⏳ Resuming chat #{}…", fb.issue_number),
+                Instant::now(),
+            ));
+            needs_redraw = true;
+        }
+
+        // #240: keep merge-queue CI check summaries fresh on the Pipeline view.
+        self.maybe_kick_ci_check_loaders();
+        if self.poll_ci_check_loaders() {
+            needs_redraw = true;
+        }
+
+        // Auto-notify: run `coord notify` when running assignments exist.
+        // #584: skip on a thin client — `coord notify` is a host-side control
+        // command; running it locally here only errors (no DB/config).
+        let has_running = self.data.assignments.iter().any(|a| a.status == "running");
+        if has_running
+            && !is_remote_board_service()
+            && self.last_notify.elapsed() >= NOTIFY_EVERY
+            && !self.command_runner.is_running()
+        {
+            self.command_runner.spawn(&["notify"]);
+            self.last_notify = Instant::now();
+        }
+
+        // Drain all SSE watch channels in the pool (including background
+        // sessions not currently focused).  Draining always runs so data
+        // accumulates into `sse.lines` (turn-count increments, Log tab
+        // content).  A redraw is only requested when the drained content is
+        // actually visible: Pipeline / Board / Kanban / MergeQueue views
+        // show turn-count badges and/or the Log tab; Settings / Terminal /
+        // Machines show none of that data.  When the watch overlay is open
+        // (`watch_focused.is_some()`) a repaint is always needed regardless
+        // of the underlying view.  On a view switch the normal event handler
+        // sets `needs_redraw = true`, so accumulated-but-unseen SSE data
+        // paints immediately when the user navigates back.
+        if !self.watch_pool.is_empty() {
+            let got_new = self.drain_watch_pool();
+            if got_new {
+                let watch_data_visible = self.watch_focused.is_some()
+                    || !matches!(
+                        self.active_view,
+                        SidebarView::Settings | SidebarView::Terminal | SidebarView::Machines
+                    );
+                needs_redraw |= watch_data_visible;
+            }
+        }
+
+        // Advance inject chat spinner when the overlay is open.
+        // NOTE: previously this set `needs_redraw = true` unconditionally,
+        // forcing a 60 fps repaint whenever the chat was open even though
+        // nothing in the chat ever set `chat.set_busy(true)` — so the
+        // spinner is invisible and the redraw was pure waste.  That waste
+        // was unnoticed when the chat was used only for short worker-
+        // guidance bursts; the #264 refinement chat keeps the overlay open
+        // for minutes and surfaced it as ~50 % CPU.  Until any caller
+        // actually animates a visible spinner here, just advance the frame
+        // counter without forcing a repaint — repaints are driven by real
+        // content changes (transcript / SSE drain) below.
+        if let Some(ref mut chat) = self.inject_chat {
+            self.inject_spinner_frame = self.inject_spinner_frame.wrapping_add(1);
+            chat.set_spinner_frame(self.inject_spinner_frame);
+        }
+
+        // #235: Drain Phase 1 build completions and toast the outcome.
+        // Cheap no-op when no jobs are in flight.
+        needs_redraw |= self.poll_test_build_jobs();
+
+        // #349: Drain completed test-plan step jobs.
+        if self.poll_test_step_jobs() {
+            needs_redraw = true;
+        }
+        // #349: Maybe spawn `coord test-plan` if the test stage is focused
+        // and no plan is cached yet (or the plan is stale).
+        self.maybe_spawn_test_plan();
+
+        // #271 part 2 follow-up: drain completed `gh pr view` fetches
+        // into the cache so the Test guidance block picks them up.
+        if self.poll_pending_pr_fetches() {
+            needs_redraw = true;
+        }
+
+        // #558: Drain completed `gh issue view --json comments` fetches for
+        // the Pipeline Summary tab.
+        if self.poll_pending_comments_fetches() {
+            needs_redraw = true;
+        }
+
+        // #336: Poll the in-flight artifact manifest fetch and populate cache.
+        if let Some((key, rx)) = &self.artifact_fetch_rx {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    let (manifest, absence_reason) = match outcome {
+                        ArtifactFetchOutcome::Found(m) => (Some(m), None),
+                        ArtifactFetchOutcome::NotStashed => {
+                            (None, Some(ArtifactAbsence::NotStashed))
+                        }
+                        ArtifactFetchOutcome::Empty => {
+                            (None, Some(ArtifactAbsence::ManifestEmpty))
+                        }
+                        ArtifactFetchOutcome::Unreachable(e) => {
+                            (None, Some(ArtifactAbsence::AgentUnreachable(e)))
+                        }
+                    };
+                    let entry = ArtifactCacheEntry {
+                        fetched_at: Instant::now(),
+                        manifest,
+                        absence_reason,
+                    };
+                    let key_clone = key.clone();
+                    self.artifact_cache.insert(key_clone, entry);
+                    self.artifact_fetch_rx = None;
+                    needs_redraw = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.artifact_fetch_rx = None;
+                }
+            }
+        }
+        // #336: Trigger a fresh manifest fetch when the pipeline Test-stage
+        // context is visible and the cache entry is absent or older than 30 s.
+        if self.artifact_fetch_rx.is_none() && self.active_view == SidebarView::Pipeline {
+            if let Some((host, repo, sanitized, _work_id)) = self.artifact_fetch_target() {
+                let key = (repo.clone(), sanitized.clone());
+                let needs_fetch = match self.artifact_cache.get(&key) {
+                    None => true,
+                    Some(e) => e.fetched_at.elapsed() > Duration::from_secs(30),
+                };
+                if needs_fetch {
+                    let rx = spawn_artifact_fetch(&host, &repo, &sanitized);
+                    self.artifact_fetch_rx = Some((key, rx));
+                }
+            }
+        }
+
+        // #207: Machine metrics polling — only when the Machines panel is
+        // visible so we don't burn background threads when the user is on
+        // another view.
+        if self.active_view == SidebarView::Machines {
+            // Drain any completed in-flight metrics fetches first.
+            let mut drained: Vec<PendingMetrics> = Vec::new();
+            for pm in self.pending_metrics.drain(..) {
+                match pm.rx.try_recv() {
+                    Ok(Ok(sample)) => {
+                        let buf = self.machine_metrics
+                            .entry(pm.machine)
+                            .or_default();
+                        buf.push_back(sample);
+                        if buf.len() > METRICS_HISTORY {
+                            buf.pop_front();
+                        }
+                        needs_redraw = true;
+                    }
+                    Ok(Err(_)) => {}  // fetch failed — silently skip
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Still in flight — put it back.
+                        drained.push(pm);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                }
+            }
+            self.pending_metrics = drained;
+
+            // Kick a new round when the cadence has elapsed and no fetches
+            // are outstanding (avoids piling up requests when the agent is slow).
+            if self.pending_metrics.is_empty()
+                && self.metrics_last_polled.elapsed() >= METRICS_CADENCE
+            {
+                self.metrics_last_polled = Instant::now();
+                for m in &self.data.machines {
+                    if m.reachable && !m.host.is_empty() {
+                        let pm = spawn_machine_metrics(&m.host, 7433, m.name.clone());
+                        self.pending_metrics.push(pm);
+                    }
+                }
+            }
+        }
+
+        needs_redraw
+    }
+
+    /// Drain pending messages from every SSE stream in `watch_pool`,
+    /// accumulate lines, and handle per-entry reconnect/error logic.
+    /// Returns `true` when new data arrived on any stream (redraw needed).
+    ///
+    /// Reconnect strategy (per entry): on transient errors, reopen the stream
+    /// using `Last-Event-Id` so replay starts from the last received byte
+    /// offset.  After **3 failures within 10 seconds** a toast is shown
+    /// (keyed to the affected issue) and reconnection stops — the user must
+    /// press `R` while watching that issue to retry.  Background streams
+    /// (not currently focused) show the toast with the issue number so the
+    /// user can switch to them to diagnose the failure.
+    ///
+    /// Maximum pool size is `WATCH_POOL_CAP` (currently 8 concurrent streams).
+    pub(crate) fn drain_watch_pool(&mut self) -> bool {
+        let ids: Vec<String> = self.watch_pool.keys().cloned().collect();
+        let mut got_new = false;
+        for id in ids {
+            got_new |= self.drain_pool_entry(&id);
+        }
+        got_new
+    }
+
+    /// Drain one pool entry.  Returns `true` when new data arrived.
+    pub(crate) fn drain_pool_entry(&mut self, id: &str) -> bool {
+        let mut got_new = false;
+        let mut needs_reconnect = false;
+        let mut fail_limit_hit = false;
+
+        // First pass: drain all pending messages while we hold a mutable ref.
+        if let Some(ctx) = self.watch_pool.get_mut(id) {
+            let sse = &mut ctx.sse;
+            if sse.done {
+                return false;
+            }
+            loop {
+                use std::sync::mpsc::TryRecvError;
+                let msg = match sse.rx.try_recv() {
+                    Ok(m) => m,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        // Background thread exited without sending; treat as error.
+                        sse.fail_count += 1;
+                        match sse.first_fail_at {
+                            None => sse.first_fail_at = Some(Instant::now()),
+                            Some(t) if t.elapsed() > Duration::from_secs(10) => {
+                                sse.first_fail_at = Some(Instant::now());
+                                sse.fail_count = 1;
+                            }
+                            _ => {}
+                        }
+                        if sse.fail_count >= 3 {
+                            sse.done = true;
+                            fail_limit_hit = true;
+                        } else {
+                            needs_reconnect = true;
+                        }
+                        got_new = true;
+                        break;
+                    }
+                };
+
+                match msg {
+                    SseWatchMsg::Lines { last_id, text } => {
+                        sse.last_event_id = last_id;
+                        // Reassemble lines split across SSE chunks. The agent
+                        // emits whatever it read from the log file (up to
+                        // LOG_CHUNK_SIZE=4096 bytes), so a JSON line longer
+                        // than that arrives in pieces. If the chunk doesn't
+                        // end with `\n`, hold the trailing partial line until
+                        // the next chunk completes it. Without this, broken
+                        // half-lines reach parse_json_event and we lose
+                        // fields like total_cost_usd / stop_reason that come
+                        // after the split point.
+                        let mut payload = std::mem::take(&mut sse.pending_tail);
+                        payload.push_str(&text);
+                        let (complete, tail) = if payload.ends_with('\n') {
+                            (payload.clone(), String::new())
+                        } else if let Some(last_nl) = payload.rfind('\n') {
+                            let (a, b) = payload.split_at(last_nl + 1);
+                            (a.to_string(), b.to_string())
+                        } else {
+                            (String::new(), payload.clone())
+                        };
+                        let now = Instant::now();
+                        for line in complete.lines() {
+                            if json_str(line, "type").as_deref() == Some("assistant") {
+                                sse.current_turn += 1;
+                            }
+                            sse.lines.push(line.to_string());
+                            sse.line_times.push(now);
+                        }
+                        sse.pending_tail = tail;
+                        got_new = true;
+                    }
+                    SseWatchMsg::Done { last_id } if !sse.pending_tail.is_empty() => {
+                        // Stream is ending — flush any trailing partial line
+                        // before transitioning to done. Without this, a final
+                        // result line whose terminating `\n` never reached us
+                        // (worker exited mid-write) would be invisible.
+                        let tail = std::mem::take(&mut sse.pending_tail);
+                        let now = Instant::now();
+                        for line in tail.lines() {
+                            if json_str(line, "type").as_deref() == Some("assistant") {
+                                sse.current_turn += 1;
+                            }
+                            sse.lines.push(line.to_string());
+                            sse.line_times.push(now);
+                        }
+                        sse.last_event_id = last_id;
+                        sse.done = true;
+                        got_new = true;
+                        break;
+                    }
+                    SseWatchMsg::Done { last_id } => {
+                        sse.last_event_id = last_id;
+                        sse.done = true;
+                        got_new = true;
+                        break;
+                    }
+                    SseWatchMsg::Error(err_msg) => {
+                        // Surface the actual error in the log so the user
+                        // can diagnose connection issues without grepping
+                        // agent journalctl. Capped to one line in the panel.
+                        sse.lines.push(format!("[sse error] {}", err_msg));
+                        // Connection failure. Update the failure window.
+                        sse.fail_count += 1;
+                        match sse.first_fail_at {
+                            None => sse.first_fail_at = Some(Instant::now()),
+                            Some(t) if t.elapsed() > Duration::from_secs(10) => {
+                                // Window expired: reset to a fresh 10-second window.
+                                sse.first_fail_at = Some(Instant::now());
+                                sse.fail_count = 1;
+                            }
+                            _ => {}
+                        }
+                        if sse.fail_count >= 3 {
+                            sse.done = true;
+                            fail_limit_hit = true;
+                        } else {
+                            needs_reconnect = true;
+                        }
+                        got_new = true;
+                        break;
+                    }
+                    SseWatchMsg::Heartbeat => {
+                        // No-op: the thread just confirmed the channel is alive.
+                    }
+                }
+            }
+        }
+
+        // Post-drain: reconnect or show error toast (no pool borrow held).
+        if fail_limit_hit {
+            // Include issue number so background-stream failures are identifiable.
+            let issue_num = self.watch_pool.get(id).map(|ctx| ctx.state.issue_number);
+            let is_focused = self.watch_focused.as_deref() == Some(id);
+            let msg = if is_focused {
+                "Lost connection 3× in 10 s — press R to reconnect".to_string()
+            } else if let Some(n) = issue_num {
+                format!(
+                    "Lost connection to #{} 3× in 10 s — switch to it and press R",
+                    n
+                )
+            } else {
+                "Lost SSE connection 3× in 10 s".to_string()
+            };
+            self.push_toast("SSE stream error", &msg, ToastSeverity::Error);
+        } else if needs_reconnect {
+            // Clone what we need before taking a new mutable borrow.
+            let (host, last_id) = match self.watch_pool.get(id) {
+                Some(ctx) => (ctx.sse.host.clone(), ctx.sse.last_event_id),
+                None => return got_new,
+            };
+            if !host.is_empty() {
+                let new_rx = spawn_sse_watch(&host, id, last_id);
+                if let Some(ctx) = self.watch_pool.get_mut(id) {
+                    ctx.sse.rx = new_rx;
+                }
+            }
+        }
+
+        got_new
+    }
+
+    /// Compatibility alias used by unit tests that still call `drain_sse_watch`.
+    /// Delegates to `drain_watch_pool` so all pool entries are processed.
+    #[cfg(test)]
+    pub(crate) fn drain_sse_watch(&mut self) -> bool {
+        self.drain_watch_pool()
+    }
+
+    // ─── Settings panel ───────────────────────────────────────────────────────
+
+    /// #237: empty sidebar list for the Settings view.  The form lives in
+    /// the main panel and spans the full width; the sidebar shows just a
+    /// header so the overall panel chrome stays consistent across views.
+    pub(crate) fn settings_sidebar_placeholder(&self) -> ListView {
+        ListView {
+            id: WidgetId::new("settings-sidebar-placeholder"),
+            title: Some(StyledText::plain(" SETTINGS ")),
+            items: Vec::new(),
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
+
+    /// #424: empty list shown in the sidebar slot while the Terminal
+    /// view is active — keeps the sidebar header at a stable height so
+    /// the layout doesn't shift when switching to/from this view.
+    pub(crate) fn terminal_sidebar_placeholder(&self) -> ListView {
+        let hint = if self.terminal_focused {
+            "  PTY focused — F12 to release"
+        } else {
+            "  PTY released — F12 to focus"
+        };
+        ListView {
+            id: WidgetId::new("terminal-sidebar-placeholder"),
+            title: Some(StyledText::plain(" TERMINAL ")),
+            items: vec![activity_item(hint, Color::rgb(160, 160, 160))],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
+
+    /// Build the unified settings `Form`.
+    ///
+    /// #237: All categories render as one full-width scrollable form with
+    /// `FieldKind::Label` headers between groups — mirroring vimcode's
+    /// settings layout.  The previous version split the panel into a
+    /// category nav (sidebar) plus a per-category form (main); that split
+    /// caused click hit-test misalignment because `FormController`'s cached
+    /// metrics were sized for a different rect than where it was actually
+    /// drawn.  One rect ⇒ no drift.
+    ///
+    /// Field IDs are stable across renders so the `FormController` can
+    /// match events correctly.
+    pub(crate) fn build_settings_form(&self) -> Form {
+        let mut fields: Vec<FormField> = Vec::new();
+
+        // ── Display ────────────────────────────────────────────────────
+        fields.push(settings_label("Display"));
+        fields.push(FormField {
+            id: WidgetId::new("settings:theme"),
+            label: StyledText::plain("Theme"),
+            kind: FieldKind::SegmentedControl {
+                options: Theme::LABELS.iter().map(|s| s.to_string()).collect(),
+                selected_idx: self.settings.theme.to_idx(),
+            },
+            hint: StyledText::plain("Visual style (Light/High Contrast coming soon)"),
+            disabled: false,
+            validation: None,
+        });
+
+        // ── Refresh ────────────────────────────────────────────────────
+        fields.push(settings_label("Auto-Refresh"));
+        fields.push(FormField {
+            id: WidgetId::new("settings:cadence"),
+            label: StyledText::plain("Cadence"),
+            kind: FieldKind::SegmentedControl {
+                options: RefreshCadence::LABELS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                selected_idx: self.settings.refresh_cadence.to_idx(),
+            },
+            hint: StyledText::plain("How often the board is reloaded from the database"),
+            disabled: false,
+            validation: None,
+        });
+
+        // ── Notifications ──────────────────────────────────────────────
+        fields.push(settings_label("Notifications"));
+        fields.push(FormField {
+            id: WidgetId::new("settings:audio"),
+            label: StyledText::plain("Audio on completion"),
+            kind: FieldKind::Toggle {
+                value: self.settings.audio_on_completion,
+            },
+            hint: StyledText::plain("Ring a bell when an assignment finishes"),
+            disabled: false,
+            validation: None,
+        });
+
+        // ── Watch Overlay ──────────────────────────────────────────────
+        fields.push(settings_label("Watch Overlay"));
+        fields.push(FormField {
+            id: WidgetId::new("settings:log-ttl"),
+            label: StyledText::plain("Log cache TTL"),
+            kind: FieldKind::SegmentedControl {
+                options: LogCacheTtl::LABELS.iter().map(|s| s.to_string()).collect(),
+                selected_idx: self.settings.log_cache_ttl.to_idx(),
+            },
+            hint: StyledText::plain("How long a fetched log is reused before re-requesting"),
+            disabled: false,
+            validation: None,
+        });
+
+        // ── Keybindings ────────────────────────────────────────────────
+        fields.push(settings_label("Keybindings"));
+        let refresh_key = self
+            .settings
+            .keybindings
+            .get(ACTION_PIPELINE_REFRESH)
+            .map(|s| s.as_str())
+            .unwrap_or("Ctrl+R");
+        fields.push(FormField {
+            id: WidgetId::new("settings:keybind:pipeline_refresh"),
+            label: StyledText::plain("Pipeline refresh"),
+            kind: FieldKind::TextInput {
+                value: refresh_key.to_string(),
+                placeholder: "e.g. Ctrl+R or <C-r> or F5".to_string(),
+                cursor: None,
+                selection_anchor: None,
+            },
+            hint: StyledText::plain("Key to force-refresh issues from GitHub. Empty = disabled."),
+            disabled: false,
+            validation: None,
+        });
+
+        // ── Machine Models ─────────────────────────────────────────────
+        fields.push(settings_label("Per-Machine Model Overrides"));
+        if self.data.machines.is_empty() {
+            fields.push(FormField {
+                id: WidgetId::new("settings:no-machines"),
+                label: StyledText::plain("No machines available"),
+                kind: FieldKind::ReadOnly {
+                    value: StyledText::plain("—"),
+                },
+                hint: StyledText::plain("Machines are discovered from coordinator.yml"),
+                disabled: true,
+                validation: None,
+            });
+        }
+        for machine in &self.data.machines {
+            let current_pref = self
+                .settings
+                .machine_model
+                .get(&machine.name)
+                .copied()
+                .unwrap_or_default();
+            fields.push(FormField {
+                id: WidgetId::new(format!("settings:model:{}", machine.name)),
+                label: StyledText::plain(machine.name.clone()),
+                kind: FieldKind::SegmentedControl {
+                    options: ModelPref::LABELS.iter().map(|s| s.to_string()).collect(),
+                    selected_idx: current_pref.to_idx(),
+                },
+                hint: StyledText::plain(
+                    "Session-level override; coordinator.yml is the project default",
+                ),
+                disabled: false,
+                validation: None,
+            });
+        }
+
+        // Compute focused_field from settings_field_sel, skipping label fields.
+        let interactive: Vec<WidgetId> = fields
+            .iter()
+            .filter(|f| !matches!(f.kind, FieldKind::Label | FieldKind::ReadOnly { .. }))
+            .map(|f| f.id.clone())
+            .collect();
+        let focused_field = interactive.get(self.settings_field_sel).cloned();
+
+        Form {
+            id: WidgetId::new("settings-form"),
+            fields,
+            focused_field,
+            scroll_offset: self.settings_form.borrow().scroll_offset(),
+            has_focus: true,
+        }
+    }
+
+    /// Return the IDs of the interactive (non-label, non-read-only) fields
+    /// for the current settings category, in form order.
+    ///
+    /// Used to map `settings_field_sel` to a concrete field when handling
+    /// keyboard events.
+    pub(crate) fn settings_interactive_field_ids(&self) -> Vec<WidgetId> {
+        let form = self.build_settings_form();
+        form.fields
+            .iter()
+            .filter(|f| !matches!(f.kind, FieldKind::Label | FieldKind::ReadOnly { .. }))
+            .map(|f| f.id.clone())
+            .collect()
+    }
+
+    /// Handle a directional key (h/l or Left/Right) against the focused
+    /// settings form field.  Returns `true` when a setting changed.
+    ///
+    /// Builds the form only once to avoid the double-rebuild that occurred
+    /// when `settings_interactive_field_ids` and the field-kind lookup both
+    /// called `build_settings_form` separately.
+    pub(crate) fn settings_change_focused(&mut self, direction: i32) -> bool {
+        // Build once; extract both the interactive-field list and the kind.
+        let form = self.build_settings_form();
+        let interactive: Vec<_> = form
+            .fields
+            .iter()
+            .filter(|f| !matches!(f.kind, FieldKind::Label | FieldKind::ReadOnly { .. }))
+            .collect();
+        let Some(field) = interactive.get(self.settings_field_sel) else {
+            return false;
+        };
+        let field_id = field.id.clone();
+
+        let event = match &field.kind {
+            FieldKind::SegmentedControl {
+                options,
+                selected_idx,
+            } => {
+                let n = options.len();
+                if n == 0 {
+                    return false;
+                }
+                let new_idx = if direction > 0 {
+                    (selected_idx + 1) % n
+                } else {
+                    selected_idx.checked_sub(1).unwrap_or(n - 1)
+                };
+                FormEvent::SegmentedControlChanged {
+                    id: field_id,
+                    selected_idx: new_idx,
+                }
+            }
+            FieldKind::Toggle { value } => FormEvent::ToggleChanged {
+                id: field_id,
+                value: !value,
+            },
+            _ => return false,
+        };
+        self.apply_settings_event(&event)
+    }
+
+    /// Recompute `active_theme` from the current `settings.theme` and the
+    /// optional `~/.coord/theme.toml` custom-palette file.
+    ///
+    /// Called after every settings change that might affect the palette.
+    pub(crate) fn rebuild_active_theme(&mut self) {
+        self.active_theme = crate::settings::TuiSettings::load_custom_theme_file()
+            .unwrap_or_else(|| self.settings.theme.to_quadraui_theme());
+    }
+
+    /// Apply a `FormEvent` from the settings form to the settings state,
+    /// save to disk, and return `true` if something changed.
+    ///
+    /// When the save fails (e.g. read-only home directory), a non-fatal
+    /// error toast is shown so the user is aware without interrupting their
+    /// workflow.
+    pub(crate) fn apply_settings_event(&mut self, event: &FormEvent) -> bool {
+        match event {
+            FormEvent::SegmentedControlChanged { id, selected_idx } => {
+                match id.as_str() {
+                    "settings:theme" => {
+                        self.settings.theme = Theme::from_idx(*selected_idx);
+                        self.rebuild_active_theme();
+                    }
+                    "settings:cadence" => {
+                        self.settings.refresh_cadence = RefreshCadence::from_idx(*selected_idx);
+                    }
+                    "settings:log-ttl" => {
+                        self.settings.log_cache_ttl = LogCacheTtl::from_idx(*selected_idx);
+                    }
+                    field_id if field_id.starts_with("settings:model:") => {
+                        let machine = field_id["settings:model:".len()..].to_string();
+                        self.settings
+                            .machine_model
+                            .insert(machine, ModelPref::from_idx(*selected_idx));
+                    }
+                    _ => return false,
+                }
+                if let Err(e) = self.settings.save() {
+                    self.push_toast(
+                        "Settings",
+                        &format!("could not persist settings: {e}"),
+                        ToastSeverity::Error,
+                    );
+                }
+                true
+            }
+            FormEvent::ToggleChanged { id, value } => {
+                if id.as_str() == "settings:audio" {
+                    self.settings.audio_on_completion = *value;
+                    if let Err(e) = self.settings.save() {
+                        self.push_toast(
+                            "Settings",
+                            &format!("could not persist settings: {e}"),
+                            ToastSeverity::Error,
+                        );
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            FormEvent::TextInputChanged { id, value }
+            | FormEvent::TextInputCommitted { id, value }
+                if id.as_str().starts_with("settings:keybind:") =>
+            {
+                let action = &id.as_str()["settings:keybind:".len()..];
+                self.settings
+                    .keybindings
+                    .insert(action.to_string(), value.clone());
+                self.parsed_keybindings = parse_keybindings(&self.settings);
+                if let Err(e) = self.settings.save() {
+                    self.push_toast(
+                        "Settings",
+                        &format!("could not persist settings: {e}"),
+                        ToastSeverity::Error,
+                    );
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+
+// ─── Settings helpers ─────────────────────────────────────────────────────────
+
+/// Build a non-interactive category label `FormField` for the settings form.
+pub(crate) fn settings_label(text: &str) -> FormField {
+    FormField {
+        id: WidgetId::new(format!(
+            "settings-label:{}",
+            text.to_lowercase().replace(' ', "-")
+        )),
+        label: StyledText::plain(text.to_string()),
+        kind: FieldKind::Label,
+        hint: StyledText::default(),
+        disabled: false,
+        validation: None,
+    }
+}
+
+// ─── Purge helper ─────────────────────────────────────────────────────────────
+
+/// Open a short-lived read-write connection to `coord.db` and delete:
+///
+/// * `assignments` rows where `status IN ('done', 'failed')` and
+///   `finished_at < now - older_than_secs`
+/// * `issues` rows where `state = 'closed'` and
+///   `synced_at < now - older_than_secs`
+///
+/// Returns the total number of rows deleted across both tables.
+///
+/// A separate read-write connection is used because the main data-load
+/// connection is opened with `SQLITE_OPEN_READ_ONLY`.  SQLite WAL mode
+/// serialises concurrent writers, so this is safe.
+/// Compute the cutoff timestamp for purge predicates.
+pub(crate) fn purge_cutoff(older_than_secs: f64) -> f64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    now - older_than_secs
+}
+
+/// Count rows that would be deleted by [`purge_done_assignments_conn`].
+/// Inner helper that takes an explicit connection so tests can run against
+/// an in-memory DB without touching the real coord.db.
+pub(crate) fn count_purgeable_conn(conn: &Connection, cutoff: f64) -> rusqlite::Result<(usize, usize)> {
+    let a: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM assignments \
+         WHERE status IN ('done', 'failed') \
+         AND finished_at IS NOT NULL \
+         AND finished_at < ?1",
+        rusqlite::params![cutoff],
+        |r| r.get(0),
+    )?;
+    let i: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM issues \
+         WHERE state = 'closed' \
+         AND synced_at IS NOT NULL \
+         AND synced_at < ?1",
+        rusqlite::params![cutoff],
+        |r| r.get(0),
+    )?;
+    Ok((a as usize, i as usize))
+}
+
+/// Delete old `done`/`failed` assignments and old closed issues.
+/// Inner helper — see [`count_purgeable_conn`].
+pub(crate) fn purge_done_assignments_conn(conn: &Connection, cutoff: f64) -> rusqlite::Result<(usize, usize)> {
+    let assignments_deleted = conn.execute(
+        "DELETE FROM assignments \
+         WHERE status IN ('done', 'failed') \
+         AND finished_at IS NOT NULL \
+         AND finished_at < ?1",
+        rusqlite::params![cutoff],
+    )?;
+    let issues_deleted = conn.execute(
+        "DELETE FROM issues \
+         WHERE state = 'closed' \
+         AND synced_at IS NOT NULL \
+         AND synced_at < ?1",
+        rusqlite::params![cutoff],
+    )?;
+    Ok((assignments_deleted, issues_deleted))
+}
+
+/// Count rows that would be deleted by [`purge_done_assignments_db`].
+///
+/// Returns `(assignments, closed_issues)` so the confirmation prompt and the
+/// completion toast show matching numbers — the user is never surprised by
+/// a "47 rows removed" toast after confirming "Purge 3 rows".
+pub(crate) fn count_purgeable_db(older_than_secs: f64) -> rusqlite::Result<(usize, usize)> {
+    let conn = open_purge_conn()?;
+    count_purgeable_conn(&conn, purge_cutoff(older_than_secs))
+}
+
+/// Delete old `done`/`failed` assignments and old closed issues.
+/// Returns `(assignments_deleted, issues_deleted)`; errors propagate to the
+/// caller for a visible error toast (silent `.unwrap_or(0)` previously hid
+/// SQLITE_BUSY).
+pub(crate) fn purge_done_assignments_db(older_than_secs: f64) -> rusqlite::Result<(usize, usize)> {
+    let conn = open_purge_conn()?;
+    purge_done_assignments_conn(&conn, purge_cutoff(older_than_secs))
+}
+
+/// #200: Record a Test gate verdict on the given work assignment id.
+/// `verdict` is "passed" | "failed" | "skipped". `reason` is only stored for
+/// failures (ignored otherwise).
+///
+/// Also mirrors `smoke_test` / `smoke_test_reason` so `coord fix` can see the
+/// verdict — `coord fix` guards on `smoke_test == "fail"` (cli.py:4285-4291).
+/// Without this mirror, a report+fix dispatched from the TUI would immediately
+/// exit-1 with "smoke_test is None, expected 'fail'".  Mirrors the same logic
+/// as `coord test --fail/--pass` (cli.py:3308-3312).
+///
+/// Inner function accepts an explicit connection so tests can run against an
+/// in-memory DB without touching the real coord.db.
+pub(crate) fn record_test_verdict_conn(
+    conn: &Connection,
+    assignment_id: &str,
+    verdict: &str,
+    reason: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE assignments SET test_state = ?1, test_reason = ?2 WHERE assignment_id = ?3",
+        rusqlite::params![verdict, reason, assignment_id],
+    )?;
+    // Mirror smoke_test for "passed" and "failed" verdicts only (same as CLI).
+    if matches!(verdict, "failed" | "passed") {
+        let smoke_val: &str = if verdict == "failed" { "fail" } else { "pass" };
+        let smoke_reason: Option<&str> = if verdict == "failed" { reason } else { None };
+        conn.execute(
+            "UPDATE assignments SET smoke_test = ?1, smoke_test_reason = ?2 \
+             WHERE assignment_id = ?3",
+            rusqlite::params![smoke_val, smoke_reason, assignment_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// #590 Phase 2: POST the verdict to the daemon when a board service is set
+/// (the thin client's local coord.db is the wrong DB). Mirrors the smoke_test
+/// derivation in [`record_test_verdict_conn`] so the daemon writes the same
+/// columns. ureq is built without the `json` feature, so serialize + send_string.
+pub(crate) fn record_test_verdict_remote(
+    assignment_id: &str,
+    verdict: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let (url, token) = resolve_board_service().ok_or("no board service configured")?;
+    let (smoke_test, smoke_reason): (Option<&str>, Option<&str>) = match verdict {
+        "failed" => (Some("fail"), reason),
+        "passed" => (Some("pass"), None),
+        _ => (None, None),
+    };
+    let body = serde_json::json!({
+        "assignment_id": assignment_id,
+        "test_state": verdict,
+        "test_reason": reason,
+        "smoke_test": smoke_test,
+        "smoke_test_reason": smoke_reason,
+    });
+    let body_str = serde_json::to_string(&body).map_err(|e| format!("{e}"))?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let mut req = agent
+        .post(&format!("{url}/test-verdict"))
+        .set("Content-Type", "application/json");
+    if let Some(t) = token.as_deref() {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    req.send_string(&body_str).map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+pub(crate) fn record_test_verdict_db(
+    assignment_id: &str,
+    verdict: &str,
+    reason: Option<&str>,
+) -> rusqlite::Result<()> {
+    if is_remote_board_service() {
+        return record_test_verdict_remote(assignment_id, verdict, reason).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e,
+            )))
+        });
+    }
+    let conn = open_purge_conn()?;
+    record_test_verdict_conn(&conn, assignment_id, verdict, reason)
+}
