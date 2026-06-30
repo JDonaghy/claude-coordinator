@@ -7,9 +7,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags};
 use super::types::*;
-#[allow(unused_imports)]
-use super::format::*;
-
 
 /// Messages sent from the background SSE watch thread to the main thread.
 pub(crate) enum SseWatchMsg {
