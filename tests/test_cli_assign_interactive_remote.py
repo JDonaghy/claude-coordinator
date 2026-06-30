@@ -626,6 +626,43 @@ class TestRemoteSessionAlive:
         assert "issue-1" in spy.call_args.kwargs["branch"]
         assert "remote backstop" in result.output
 
+    def test_session_ended_nonzero_exit_propagates(
+        self, remote_config_file: Path, coord_dir: Path
+    ) -> None:
+        """Regression (#746 review): the remote `claude` session's exit
+        status must propagate as `coord assign`'s own process exit code —
+        mirrors the local path's `sys.exit(exit_code)`.  A caller checking
+        `$?` after `coord assign <machine> <repo> <issue> --interactive`
+        on a remote machine must see the remote session's real exit code,
+        not a false success."""
+
+        def _fake_tmux_launch(argv: Any, briefing: Any, sname: Any, **kw: Any) -> int:
+            return 7
+
+        fake = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=1, push_ok=True, push_error=None,
+        )
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("coord.claim.find_work_claim", return_value=None), \
+             patch("coord.state.record_dispatched"), \
+             patch("coord.state.save_board"), \
+             patch("coord.state.build_board", return_value=MagicMock(active=[], completed=[])), \
+             patch("coord.interactive._launch_via_tmux",
+                   side_effect=_fake_tmux_launch), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=fake):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "precision", "api", "1",
+                    "--config", str(remote_config_file),
+                    "--interactive",
+                ],
+            )
+        assert result.exit_code == 7, result.output
+
 
 # ── Launch failure handling ───────────────────────────────────────────────────
 

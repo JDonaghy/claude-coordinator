@@ -2417,16 +2417,6 @@ def assign(
     # ClaudePtyProvider here AND asserting its capabilities are flagged
     # human_attended_only is the structural guarantee that this path is
     # the only one that can launch it; the unattended dispatch sites
-
-    # #437: HUMAN-ATTENDED branch.  When --interactive is set, we run
-    # interactive `claude` as a child of THIS shell with the briefing
-    # PRE-FILLED in the input box.  No HTTP agent, no Proposal, no
-    # GitHub posting, no board update — the operator drives the session
-    # and closes it manually.  This is the subscription-billed escape
-    # hatch from Anthropic ToS §3.7 metering.  Resolving
-    # ClaudePtyProvider here AND asserting its capabilities are flagged
-    # human_attended_only is the structural guarantee that this path is
-    # the only one that can launch it; the unattended dispatch sites
     # (dispatch/review/reconcile) refuse the same capability.
     #
     # assign() is a thin dispatcher (#746): the validation above is the
@@ -5897,6 +5887,8 @@ def _dispatch_interactive_work(
                 f"  warning: remote backstop failed to record work exit: {exc}",
                 err=True,
             )
+
+        sys.exit(exit_code)
 
 
 def _dispatch_headless(
