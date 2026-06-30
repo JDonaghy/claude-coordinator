@@ -1,0 +1,269 @@
+"""Shared infra for coord/commands/*.py: config loading, the shared
+``--config`` option, port constants, and the handful of helpers used by
+more than one command module. Extracted from coord/cli.py (#747)."""
+
+from __future__ import annotations
+
+import json
+import socket
+import sys
+from pathlib import Path
+
+import click
+
+from coord.config import Config, ConfigError, load, resolve_config_path
+from coord.brain import AGENT_PORT
+
+AGENT_PORT = 7433
+# Portable control-center daemon port (#584); canonical constant in
+# coord.serve_app.SERVE_PORT — duplicated here for the CLI decorator default,
+# mirroring the AGENT_PORT pattern above.
+SERVE_PORT = 7435
+
+
+_CONFIG_OPTION = click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    # Callable default: resolved per-invocation to a concrete Path so every
+    # command receives a real path (never None). Resolution order:
+    # $COORD_CONFIG → ~/.coord/coordinator.yml → ./coordinator.yml.
+    default=resolve_config_path,
+    help=(
+        "Path to coordinator.yml. Default resolution: $COORD_CONFIG, then "
+        "~/.coord/coordinator.yml, then ./coordinator.yml."
+    ),
+)
+
+
+def _save_config_snapshot(config: Config) -> None:
+    """Persist machine + pipeline metadata to the DB so dashboards can read it.
+
+    Writes:
+    - ``machines`` rows (used by the web dashboard + the TUI Machines view)
+    - ``board_meta['pipeline_default_gates']`` JSON list of default gates
+    - ``board_meta['pipeline_tracked_labels']`` JSON list of tracked GitHub
+      issue labels (defaults to ``['coord']`` when unconfigured)
+
+    The pipeline keys let the TUI Pipeline panel pick up coordinator.yml
+    settings without having to parse YAML itself.
+    """
+    # #584: a thin client (board_service configured) must not create/write a
+    # local DB — the daemon/host owns the config snapshot.  On the host
+    # board_service is unset, so the snapshot is written as before.
+    from coord.client import resolve_board_service
+    if resolve_board_service() is not None:
+        return
+    conn = None
+    try:
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute("DELETE FROM machines")
+        for m in config.machines:
+            conn.execute(
+                "INSERT INTO machines (name, host, capabilities, repos) VALUES (?, ?, ?, ?)",
+                (m.name, m.host, json.dumps(m.capabilities), json.dumps(m.repos)),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_default_gates', ?)",
+            (json.dumps(list(config.pipeline.default_gates)),),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_tracked_labels', ?)",
+            (json.dumps(config.pipeline.tracked_labels()),),
+        )
+        # Repo name → GitHub slug map: the TUI pipeline panel uses this to
+        # translate a `gh search issues` repository.nameWithOwner back into
+        # the coord-local repo name expected by `coord assign`.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_repos', ?)",
+            (json.dumps({r.name: r.github for r in config.repos}),),
+        )
+        # #296: run_cmd per repo — TUI surfaces this in the Test stage
+        # detail panel as the "Run" row so the tester knows what to launch.
+        # Only repos that have a run_cmd are included; absent → no entry.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_repo_run_cmds', ?)",
+            (json.dumps({r.name: r.run_cmd for r in config.repos if r.run_cmd is not None}),),
+        )
+        # Whether the pipeline includes a Plan gate before Work. Sourced
+        # from dispatch.require_plan — when true, the TUI prepends a Plan
+        # stage and Work [Go] becomes "approve plan" rather than fresh
+        # dispatch.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_require_plan', ?)",
+            ("1" if config.dispatch.require_plan else "0",),
+        )
+        # #803: models config snapshot — TUI reads this to show which model
+        # tier will be used for an interactive --fix-of without needing to
+        # parse coordinator.yml itself.
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_models', ?)",
+            (json.dumps({
+                "default": config.models.default,
+                "escalation": config.models.escalation,
+                "escalate_fix_model": config.pipeline.escalate_fix_model,
+            }),),
+        )
+        # #349: repo_name → local-checkout path for the machine running this
+        # coordinator.  Used by the TUI to read git branch HEADs when
+        # detecting test-plan staleness.  Only includes repos that have a
+        # repo_paths entry on the matching machine (hostname-matched first;
+        # any machine as fallback).
+        local_hostname = socket.gethostname().split(".")[0]
+        repo_paths_map: dict[str, str] = {}
+        # Try hostname-matched machine first, then fall back to all machines.
+        for pass_no in range(2):
+            for m in config.machines:
+                on_this_machine = (
+                    m.name == local_hostname
+                    or m.host.split(".")[0] == local_hostname
+                )
+                if pass_no == 0 and not on_this_machine:
+                    continue
+                for rn in m.repos:
+                    if rn not in repo_paths_map:
+                        p = m.repo_path(rn)
+                        if p:
+                            repo_paths_map[rn] = str(Path(p).expanduser())
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_repo_paths', ?)",
+            (json.dumps(repo_paths_map),),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 — non-critical, don't abort CLI
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _load_config(path: Path | None) -> Config:
+    # Resolve the default location ($COORD_CONFIG → ~/.coord/coordinator.yml →
+    # ./coordinator.yml) when no explicit --config was given, so `coord` works on
+    # a machine without a repo checkout and isn't sensitive to the CWD.
+    if path is None:
+        from coord.config import resolve_config_path  # noqa: PLC0415
+
+        path = resolve_config_path()
+    # #584/#591: a thin client (board_service set) has no local coordinator.yml.
+    # When the path is absent, fetch + cache the daemon's config and load that,
+    # so EVERY command — not just `coord status` — is config-portable. On the
+    # host (svc unset) or when a local config exists, this is a no-op.
+    try:
+        if not Path(path).exists():
+            from coord.client import resolve_board_service  # noqa: PLC0415
+
+            svc = resolve_board_service()
+            if svc is not None:
+                from coord.client import fetch_remote_config  # noqa: PLC0415
+
+                try:
+                    path = fetch_remote_config(svc)
+                except Exception as exc:  # noqa: BLE001 — fall through to the normal error
+                    click.echo(
+                        f"warning: could not fetch config from {svc.url}: {exc}",
+                        err=True,
+                    )
+        cfg = load(path)
+    except ConfigError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(2)
+    _save_config_snapshot(cfg)
+    return cfg
+
+
+def _not_implemented(name: str) -> None:
+    click.echo(f"coord {name}: not implemented yet (stub)", err=True)
+    sys.exit(1)
+
+
+def _apply_label_change(
+    repo: str,
+    issue: int,
+    config_path: Path,
+    *,
+    add: set[str],
+    remove_if_present: set[str],
+    success_message: str,
+    no_op_message: str | None = None,
+) -> None:
+    """Shared backbone for the four label-change commands (#260/#261/#266).
+
+    Resolves *repo* via ``coordinator.yml``, fetches the issue's current
+    labels via ``gh issue view``, computes the post-edit label set, runs
+    ``gh issue edit`` with only the labels that are actually present
+    (``--remove-label`` errors on unknown repo labels), then writes the
+    new label set to the local ``issues`` cache so the TUI's next data
+    refresh tick reflects the change without waiting for the 5-minute
+    ``coord sync`` throttle.
+
+    ``no_op_message`` (optional) is echoed when there are no add/remove
+    ops to perform — used by ``coord backlog`` to say "already in
+    Backlog" instead of running a no-op ``gh issue edit``.
+    """
+    import subprocess as _sp  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+
+    from coord.state import update_issue_labels  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r} (not in coordinator.yml)", err=True)
+        sys.exit(1)
+    slug = repo_entry.github
+
+    try:
+        view = _sp.run(
+            ["gh", "issue", "view", str(issue), "--repo", slug, "--json", "labels"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (_sp.TimeoutExpired, OSError) as e:
+        click.echo(f"error: failed to run gh view: {e}", err=True)
+        sys.exit(1)
+    if view.returncode != 0:
+        click.echo(f"gh failed: {view.stderr.strip()}", err=True)
+        sys.exit(1)
+    try:
+        current = {lbl.get("name", "") for lbl in _json.loads(view.stdout).get("labels", [])}
+    except _json.JSONDecodeError as e:
+        click.echo(f"could not parse gh view output: {e}", err=True)
+        sys.exit(1)
+
+    to_add = add - current
+    to_remove = remove_if_present & current
+    if not to_add and not to_remove:
+        if no_op_message is not None:
+            click.echo(no_op_message)
+        else:
+            click.echo(success_message)
+        return
+
+    args = ["gh", "issue", "edit", str(issue), "--repo", slug]
+    for lbl in sorted(to_add):
+        args.extend(["--add-label", lbl])
+    for lbl in sorted(to_remove):
+        args.extend(["--remove-label", lbl])
+
+    try:
+        result = _sp.run(args, capture_output=True, text=True, timeout=15)
+    except (_sp.TimeoutExpired, OSError) as e:
+        click.echo(f"error: failed to run gh edit: {e}", err=True)
+        sys.exit(1)
+    if result.returncode != 0:
+        click.echo(f"gh failed: {result.stderr.strip()}", err=True)
+        sys.exit(1)
+
+    new_labels = sorted((current - to_remove) | to_add)
+    update_issue_labels(repo, issue, new_labels)
+
+    click.echo(success_message)

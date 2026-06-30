@@ -715,7 +715,7 @@ class TestAssignInteractiveReview:
              patch("coord.interactive.tmux_available", return_value=False), \
              patch("coord.interactive.tmux_session_alive", return_value=False), \
              patch("coord.interactive.finalize_interactive_exit", finalize_spy), \
-             patch("coord.cli._prompt_and_relay_review_verdict", relay_spy):
+             patch("coord.commands.dispatch_workers._prompt_and_relay_review_verdict", relay_spy):
             result = CliRunner().invoke(
                 main,
                 ["assign", "laptop", "api", "1", "--config", str(config_file),

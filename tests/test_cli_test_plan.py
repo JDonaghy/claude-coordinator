@@ -514,7 +514,7 @@ class TestGetAssignmentBranchHead:
             "coord.test_orchestrator.generate_plan", return_value=SAMPLE_PLAN
         ):
             with patch(
-                "coord.cli._get_assignment_branch_head",
+                "coord.commands.test_gate._get_assignment_branch_head",
                 return_value="abc123456789",
             ):
                 result = runner.invoke(

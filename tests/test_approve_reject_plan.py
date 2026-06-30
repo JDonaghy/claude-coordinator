@@ -158,7 +158,7 @@ class TestApprovePlan:
         board = Board(active=[], completed=[a])
         state_mod.save_board(board)
 
-        with patch("coord.cli._load_plan_for_assignment", return_value=None):
+        with patch("coord.commands.plan_followup._load_plan_for_assignment", return_value=None):
             result = CliRunner().invoke(
                 main, ["approve-plan", "plan-003", "--config", str(config_file)]
             )
@@ -390,7 +390,7 @@ class TestRejectPlan:
         board = Board(active=[], completed=[a])
         state_mod.save_board(board)
 
-        with patch("coord.cli._load_plan_for_assignment", return_value=None):
+        with patch("coord.commands.plan_followup._load_plan_for_assignment", return_value=None):
             result = CliRunner().invoke(
                 main,
                 ["reject-plan", "plan-022", "--guidance", "Fix it", "--config", str(config_file)],
