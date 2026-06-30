@@ -8,7 +8,7 @@ version = "0.4.56"
 description = "Coordinate Claude Code workers across multiple machines and repos."
 readme = "README.md"
 requires-python = ">=3.12"
-license = "MIT"
+license = "LicenseRef-FSL-1.1-MIT"
 authors = [{ name = "John Donaghy", email = "johnfdonaghy@gmail.com" }]
 keywords = ["claude", "claude-code", "multi-agent", "coordinator", "automation"]
 classifiers = [
