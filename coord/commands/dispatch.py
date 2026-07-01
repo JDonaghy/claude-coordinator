@@ -377,7 +377,11 @@ def approve(
 @click.option(
     "--force",
     is_flag=True,
-    help="Bypass claim detection only (use when retrying after infra failures).",
+    help=(
+        "Bypass claim detection (retry after infra failures); also overrides "
+        "the pipeline.max_review_iterations cap on --fix-of so an intractable "
+        "story can keep iterating."
+    ),
 )
 
 
