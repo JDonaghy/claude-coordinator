@@ -1776,8 +1776,11 @@ pub struct CoordApp {
     // ── Board search / milestone state ──────────────────────────────────
     /// Filter state (query / cursor / focus) for the Board sidebar's FILTER box.
     board_search: SidebarFilter,
-    /// #406/#410: Expanded state for each (repo, milestone_key) pair.  Default:
-    /// expanded when the milestone has in-flight items, collapsed otherwise.
+    /// #406/#410/#857: Expanded state for each (repo, milestone_key) pair.
+    /// Default for an untouched key: expanded when the milestone has
+    /// in-flight items, collapsed otherwise (#857 — milestones-first view;
+    /// in-flight work stays visible without an extra click). Once a user
+    /// toggles a key, that choice persists across rebuilds.
     /// milestone_key is the milestone number as a string, or `"no-milestone"`.
     board_milestone_expanded: std::collections::HashMap<(String, String), bool>,
     // ── Pipeline panel state ────────────────────────────────────────────
@@ -1806,9 +1809,11 @@ pub struct CoordApp {
     /// lifecycle-first now that lifecycle is the top-level grouping and repo
     /// is the sub-group.
     pipeline_lifecycle_expanded: std::collections::HashMap<(String, String), bool>,
-    /// #668: Expanded state for milestone sub-headers in Pipeline New/Done
-    /// sections.  Key: `(lifecycle_key, repo_key, milestone_key)`.
-    /// Default: true (expanded).  Persists across rebuilds.
+    /// #668/#857: Expanded state for milestone sub-headers in the Pipeline
+    /// New section (Done is a flat list post-#728 and never keys into this
+    /// map).  Key: `(lifecycle_key, repo_key, milestone_key)`.
+    /// Default for an untouched key: false (collapsed) — #857 milestones-
+    /// first view.  Persists across rebuilds once a user toggles a key.
     pipeline_milestone_expanded: std::collections::HashMap<(String, String, String), bool>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
@@ -4395,6 +4400,17 @@ impl CoordApp {
         result
     }
 
+    /// #857: Whether a board milestone group has any in-flight (dispatched,
+    /// not-yet-done) work — the sole exception to "collapsed by default".
+    /// Shared by the render path (`rebuild_board_sidebar`) and the click
+    /// toggle handlers (`events.rs`) so a first click always inverts the
+    /// same default the row was actually painted with.
+    fn board_milestone_has_inflight(group_issues: &[(usize, &IssueGroup)]) -> bool {
+        group_issues
+            .iter()
+            .any(|(_, g)| g.lifecycle_section() == "in-flight")
+    }
+
     /// #410: Group a repo's issues by milestone only (no status sub-grouping).
     ///
     /// Returns `Vec<(milestone_key, display_title, issues)>` where:
@@ -4613,11 +4629,12 @@ impl CoordApp {
                 {
                     let mi = milestone_idx as u16;
 
-                    let m_has_inflight = group_issues
-                        .iter()
-                        .any(|(_, g)| g.lifecycle_section() == "in-flight");
+                    let m_has_inflight = Self::board_milestone_has_inflight(group_issues);
 
-                    // Expand state: default to expanded when in-flight, else collapsed.
+                    // #857: default to collapsed (milestones-first view) so the
+                    // long tail doesn't bury the user in issue rows on open;
+                    // in-flight milestones stay expanded by default so active
+                    // work remains visible without an extra click.
                     let m_is_exp = *self
                         .board_milestone_expanded
                         .get(&(repo.clone(), m_key.clone()))

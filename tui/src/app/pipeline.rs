@@ -2082,6 +2082,12 @@ impl CoordApp {
                             for (mi, (mil_key, mil_display, mil_issue_idxs)) in
                                 milestones.iter().enumerate()
                             {
+                                // #857: milestones-first view — an untouched
+                                // milestone key defaults to collapsed so the
+                                // New section opens showing just milestone
+                                // headers; once toggled, the choice persists
+                                // across rebuilds (handled by the `.get(...)`
+                                // lookup below finding the stored value).
                                 let is_mil_expanded = self
                                     .pipeline_milestone_expanded
                                     .get(&(
@@ -2090,7 +2096,7 @@ impl CoordApp {
                                         mil_key.clone(),
                                     ))
                                     .copied()
-                                    .unwrap_or(true);
+                                    .unwrap_or(false);
                                 let mil_color = if mil_key == "no-milestone" {
                                     Color::rgb(100, 100, 120) // dim for unassigned
                                 } else {
