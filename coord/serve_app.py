@@ -796,6 +796,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         reset=bool(body.get("reset")),
                         dry_run=bool(body.get("dry_run")),
                         config_path=config.path,
+                        orphan_worktrees=False,  # fleet sweep is local-only
                     )
             except SystemExit as e:  # click commands sys.exit() on some paths
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
