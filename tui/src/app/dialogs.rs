@@ -3717,6 +3717,22 @@ impl CoordApp {
             // #815: capture is_closed before calling mutable methods that
             // require &mut self and would end the borrow of pipeline_issues.
             let is_closed = pi.is_closed;
+            // #869: New's milestone sub-header defaults to collapsed (#857),
+            // so a jump into New would land on a hidden row just like the
+            // pre-#815-fix Done case did.  Resolve the target's
+            // (lifecycle_key, repo_key, milestone_key) bucket now — before
+            // the rebuild below reads `pipeline_milestone_expanded` to decide
+            // each header's expanded state — so we can force it open.
+            let lc_key = self.pipeline_lifecycle_section(pi);
+            let repo_key = Self::pipeline_repo_key(pi).to_string();
+            let mil_key = match self.pipeline_issue_milestone(pi) {
+                Some((n, _)) => n.to_string(),
+                None => "no-milestone".to_string(),
+            };
+            if lc_key == "new" {
+                self.pipeline_milestone_expanded
+                    .insert((lc_key.to_string(), repo_key, mil_key), true);
+            }
             self.active_view = SidebarView::Pipeline;
             self.rebuild_pipeline_sidebar(Some((repo_slug, issue_number)));
             self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();

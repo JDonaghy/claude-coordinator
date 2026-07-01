@@ -835,11 +835,29 @@ impl CoordApp {
         result
     }
 
+    /// Resolve the milestone `(number, title)` for a single pipeline issue by
+    /// looking it up in `self.data.open_issues` (matched by `coord_repo` +
+    /// `number`).  Returns `None` when the issue has no `coord_repo`, isn't
+    /// found in `open_issues`, or has no milestone assigned — callers map
+    /// that to the `"no-milestone"` bucket.  Shared by
+    /// `pipeline_milestones_for_issues` (group rendering) and #869's
+    /// jump-to-pipeline reveal logic (which needs the bucket for a single
+    /// issue, not a whole group).
+    pub(crate) fn pipeline_issue_milestone(&self, issue: &PipelineIssue) -> Option<(i64, String)> {
+        let oi = issue.coord_repo.as_ref().and_then(|repo_name| {
+            self.data
+                .open_issues
+                .iter()
+                .find(|oi| oi.repo_name == *repo_name && oi.number == issue.number)
+        })?;
+        let num = oi.milestone_number?;
+        Some((num, oi.milestone_title.clone().unwrap_or_default()))
+    }
+
     /// #668: Group a slice of `pipeline_issues` indices by milestone.
     ///
-    /// Looks up milestone data from `self.data.open_issues` (matched by
-    /// `coord_repo` + `number`).  Issues without an `open_issues` record, or
-    /// whose record has no milestone, fall into the `"no-milestone"` bucket.
+    /// Looks up milestone data via `pipeline_issue_milestone`.  Issues
+    /// without a resolvable milestone fall into the `"no-milestone"` bucket.
     ///
     /// Returns `Vec<(milestone_key, display_title, Vec<usize>)>` sorted:
     /// named milestones by number ASC, `"No milestone"` last.
@@ -854,22 +872,8 @@ impl CoordApp {
 
         for &idx in issue_idxs {
             let issue = &self.pipeline_issues[idx];
-            // Lookup milestone from open_issues by (coord_repo, number).
-            let (mil_num, mil_title) = issue
-                .coord_repo
-                .as_ref()
-                .and_then(|repo_name| {
-                    self.data
-                        .open_issues
-                        .iter()
-                        .find(|oi| oi.repo_name == *repo_name && oi.number == issue.number)
-                })
-                .map(|oi| (oi.milestone_number, oi.milestone_title.clone()))
-                .unwrap_or((None, None));
-
-            match mil_num {
-                Some(n) => {
-                    let title = mil_title.unwrap_or_default();
+            match self.pipeline_issue_milestone(issue) {
+                Some((n, title)) => {
                     let key = n.to_string();
                     let sort_key = (n, title.clone());
                     milestone_map

@@ -21541,6 +21541,77 @@
         );
     }
 
+    // ── #869: Jump Board→Pipeline — collapsed milestone group ─────────────────
+
+    /// #869: Jumping to a New-lifecycle issue whose milestone sub-header is
+    /// collapsed (the #857 default) must expand that milestone group so the
+    /// selected row is actually visible — mirroring the #815 Done-expand
+    /// special case, generalized to New's milestone tier.
+    #[test]
+    fn tuidriver_jump_to_pipeline_expands_collapsed_milestone_group() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // One open, untouched (no assignment) issue with a milestone — lands
+        // in the "new" lifecycle section, milestone-grouped per #668, and
+        // that milestone sub-header defaults to collapsed per #857.
+        let mut app = make_test_app(BoardData {
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 7,
+                title: "Jump test issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: Some(3),
+                milestone_title: Some("Sprint 1".to_string()),
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "Jump test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+
+        // Sanity: the milestone sub-header defaults to collapsed, so the
+        // issue's leaf row is NOT part of the rendered rows yet. Confirm via
+        // the pipeline_milestone_expanded map — untouched key ⇒ absent.
+        assert!(
+            !app
+                .pipeline_milestone_expanded
+                .contains_key(&("new".to_string(), "myrepo".to_string(), "3".to_string())),
+            "#869: milestone key must be untouched (collapsed by #857 default) before the jump"
+        );
+
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 7);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Press 'p' — should jump to Pipeline, expand the milestone group,
+        // and reveal issue #7.
+        driver.press(quadraui::Key::Char('p'));
+
+        let pipeline_screen = driver.screen();
+        assert!(
+            pipeline_screen.contains("Sprint 1"),
+            "#869: the milestone sub-header must be visible after the jump:\n{pipeline_screen}"
+        );
+        assert!(
+            pipeline_screen.contains("Jump test issue") || pipeline_screen.contains("#7"),
+            "#869: issue #7 must be visible in the Pipeline after jumping, even though its \
+             milestone group defaulted to collapsed:\n{pipeline_screen}"
+        );
+    }
+
     /// #815: Pressing `p` (or calling `jump_board_to_pipeline`) when the
     /// selected Board issue is not in `pipeline_issues` must push a toast
     /// and leave the active view unchanged.
