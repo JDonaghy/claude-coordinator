@@ -1,0 +1,403 @@
+"""Shared OpenAPI 3 builder for the three hand-rolled Starlette apps (#757).
+
+``coord/agent_app.py`` (7433), ``coord/serve_app.py`` (7435), and
+``coord/dashboard/server.py`` (7434) each declare a plain list of Starlette
+``Route`` objects with no machine-readable contract. This module gives every
+app a way to serve ``GET /openapi.json`` + a browsable ``GET /docs`` page
+(Swagger UI) built from the *same* Python types that already define the wire
+contract, mirroring the #750 codegen approach (introspect
+``dataclasses.fields()`` / ``typing.get_type_hints()`` rather than
+hand-writing a parallel schema):
+
+- :func:`dataclass_schema` walks a dataclass (recursively, for nested
+  dataclass fields) into a JSON Schema, registering it under
+  ``components/schemas`` and returning a ``$ref``. This is what fully
+  specifies ``POST /assign`` (``AssignmentSpec`` request / ``AgentAssignment``
+  response) on the agent app.
+- :func:`sqlite_table_schema` builds a JSON Schema straight from
+  ``PRAGMA table_info`` for a live (migrated) SQLite connection — because, per
+  ``scripts/gen_board_fixture.py``, the daemon's ``/board`` wire schema *is*
+  the SQLite DDL (``coord/db.py``), not a dataclass. This fully specifies
+  ``GET /board`` on the daemon app.
+- :func:`build_spec` assembles the OpenAPI 3.0.3 document.
+- :func:`openapi_and_docs_routes` returns the two ``Route`` objects
+  (``/openapi.json`` serving the spec, ``/docs`` serving a Swagger UI page)
+  every ``build_app()`` appends to its route list.
+- :func:`declared_routes` / :func:`spec_routes` extract ``(method, path)``
+  sets from, respectively, the real Starlette route table and the generated
+  spec, so a test can assert they're identical and the spec can't silently
+  drift from the actual routes (the #757 acceptance criterion).
+
+This is the intended input for #750's codegen: once a surface's OpenAPI
+``components/schemas`` are populated here, the TS/Rust generators can point
+at ``GET /openapi.json`` instead of (or in addition to) introspecting the
+Python dataclasses directly.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import sqlite3
+import types as _types
+import typing
+from typing import Any
+
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+from starlette.routing import BaseRoute, Route
+
+OPENAPI_VERSION = "3.0.3"
+
+
+# ── dataclass → JSON Schema ──────────────────────────────────────────────────
+
+def _scalar_schema(tp: object) -> dict[str, Any] | None:
+    if tp is str:
+        return {"type": "string"}
+    if tp is bool:
+        return {"type": "boolean"}
+    if tp is int:
+        return {"type": "integer"}
+    if tp is float:
+        return {"type": "number"}
+    return None
+
+
+def json_schema_for(tp: object, components: dict[str, Any]) -> dict[str, Any]:
+    """Map a resolved Python type (``typing.get_type_hints`` output) to a
+    JSON Schema fragment, registering any nested dataclass into
+    ``components`` and returning a ``$ref`` for it.
+
+    Mirrors ``scripts/codegen.py``'s ``ts_type()`` structurally, just
+    targeting JSON Schema (OpenAPI 3.0's dialect — ``nullable: true`` rather
+    than a ``"null"`` member of a ``type`` array) instead of TypeScript.
+    """
+    if tp is type(None):
+        return {"type": "null"}
+    if tp is typing.Any:
+        return {}
+    if isinstance(tp, type):
+        scalar = _scalar_schema(tp)
+        if scalar is not None:
+            return scalar
+        if dataclasses.is_dataclass(tp):
+            return dataclass_schema(tp, components)
+        if tp is dict:
+            return {"type": "object"}
+        if tp is list:
+            return {"type": "array", "items": {}}
+
+    origin = typing.get_origin(tp)
+    args = typing.get_args(tp)
+
+    if origin in (list, typing.List):  # noqa: UP006
+        (inner,) = args
+        return {"type": "array", "items": json_schema_for(inner, components)}
+    if origin in (dict, typing.Dict):  # noqa: UP006
+        if len(args) == 2:
+            return {
+                "type": "object",
+                "additionalProperties": json_schema_for(args[1], components),
+            }
+        return {"type": "object"}
+    if origin is typing.Union or origin is _types.UnionType:
+        non_none = [a for a in args if a is not type(None)]
+        nullable = len(non_none) != len(args)
+        if len(non_none) == 1:
+            schema = dict(json_schema_for(non_none[0], components))
+        else:
+            schema = {"anyOf": [json_schema_for(a, components) for a in non_none]}
+        if nullable:
+            schema["nullable"] = True
+        return schema
+
+    raise TypeError(
+        f"coord/openapi.py: no JSON Schema mapping for Python type {tp!r} — "
+        "add one to json_schema_for()."
+    )
+
+
+def dataclass_schema(cls: type, components: dict[str, Any]) -> dict[str, Any]:
+    """Register *cls* (a dataclass) into ``components`` and return a ``$ref``.
+
+    Idempotent — a dataclass already registered is not re-walked, so cyclic /
+    repeated references (e.g. several endpoints sharing ``Assignment``) are
+    safe.
+    """
+    name = cls.__name__
+    ref = {"$ref": f"#/components/schemas/{name}"}
+    if name in components:
+        return ref
+
+    # Reserve the slot before recursing so a self-referential dataclass
+    # doesn't recurse forever.
+    components[name] = {}
+    hints = typing.get_type_hints(cls)
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for f in dataclasses.fields(cls):
+        properties[f.name] = json_schema_for(hints[f.name], components)
+        if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:  # type: ignore[misc]
+            required.append(f.name)
+    schema: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    components[name] = schema
+    return ref
+
+
+# ── SQLite table → JSON Schema (the /board wire schema IS the DDL) ──────────
+
+# Per-column overrides for JSON-encoded TEXT columns (decoded to a native
+# object/array before hitting the wire — see coord/dao.py:_JSON_COLUMNS).
+# Anything JSON-decoded but not listed here still gets a properties entry,
+# just typed as "any" ({}) rather than a precise array/object shape.
+_JSON_COLUMN_SHAPES: dict[tuple[str, str], dict[str, Any]] = {
+    ("assignments", "files_allowed"): {"type": "array", "items": {"type": "string"}},
+    ("assignments", "files_forbidden"): {"type": "array", "items": {"type": "string"}},
+    ("assignments", "required_gates"): {"type": "array", "items": {"type": "string"}},
+    ("assignments", "smoke_tests"): {"type": "array", "items": {"type": "string"}},
+    ("assignments", "plan"): {"type": "object"},
+    ("assignments", "test_plan"): {"type": "object"},
+    ("proposals", "files_likely"): {"type": "array", "items": {"type": "string"}},
+    ("proposals", "required_gates"): {"type": "array", "items": {"type": "string"}},
+    ("issues", "labels"): {"type": "array", "items": {"type": "string"}},
+    ("machines", "capabilities"): {"type": "array", "items": {"type": "string"}},
+    ("machines", "repos"): {"type": "array", "items": {"type": "string"}},
+}
+
+_SQLITE_AFFINITY_TO_SCHEMA: dict[str, dict[str, Any]] = {
+    "INTEGER": {"type": "integer"},
+    "REAL": {"type": "number"},
+    "TEXT": {"type": "string"},
+    "BLOB": {"type": "string"},
+}
+
+
+def sqlite_table_schema(
+    conn: sqlite3.Connection,
+    table: str,
+    *,
+    drop: frozenset[str] = frozenset(),
+    json_columns: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Build an ``object`` JSON Schema straight from ``PRAGMA table_info``.
+
+    *drop* — columns the projection omits (e.g. ``assignments.briefing``,
+    see ``coord/dao.py:_DROP_COLUMNS``).
+    *json_columns* — columns decoded from a JSON-TEXT column to a native
+    value (see ``coord/dao.py:_JSON_COLUMNS``); typed via
+    :data:`_JSON_COLUMN_SHAPES` when known, else left as "any".
+
+    Every column is nullable unless SQLite's ``PRAGMA table_info`` reports
+    ``notnull=1`` — SQLite's own affinity typing is loose, and several
+    columns (e.g. ``finished_at`` while an assignment is running) are
+    legitimately absent until a later write.
+    """
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for _cid, name, decl_type, notnull, _dflt, _pk in conn.execute(
+        f"PRAGMA table_info({table})"  # noqa: S608 — table name is a literal, not user input
+    ):
+        if name in drop:
+            continue
+        if name in json_columns:
+            schema = dict(_JSON_COLUMN_SHAPES.get((table, name), {}))
+        else:
+            affinity = (decl_type or "TEXT").split("(")[0].upper()
+            schema = dict(_SQLITE_AFFINITY_TO_SCHEMA.get(affinity, {"type": "string"}))
+        if notnull:
+            required.append(name)
+        elif schema:
+            schema["nullable"] = True
+        properties[name] = schema
+    out: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        out["required"] = required
+    return out
+
+
+# ── spec assembly ─────────────────────────────────────────────────────────
+
+def build_spec(
+    *,
+    title: str,
+    version: str,
+    description: str = "",
+    paths: dict[str, Any],
+    components: dict[str, Any] | None = None,
+    servers: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Assemble a minimal OpenAPI 3.0.3 document."""
+    spec: dict[str, Any] = {
+        "openapi": OPENAPI_VERSION,
+        "info": {"title": title, "version": version, "description": description},
+        "paths": paths,
+    }
+    if servers:
+        spec["servers"] = servers
+    if components:
+        spec["components"] = {"schemas": components}
+    return spec
+
+
+def openapi_and_docs_routes(
+    spec: dict[str, Any],
+    *,
+    openapi_path: str = "/openapi.json",
+    docs_path: str = "/docs",
+) -> list[BaseRoute]:
+    """Return the ``[GET /openapi.json, GET /docs]`` routes every app appends.
+
+    ``/docs`` is a small Swagger UI page (CDN-hosted ``swagger-ui-dist``,
+    pinned version) pointed at ``/openapi.json`` — no new Python dependency,
+    consistent with how e.g. FastAPI's default docs page works.
+    """
+
+    async def openapi_json(_request: Request) -> JSONResponse:
+        return JSONResponse(spec)
+
+    title = spec.get("info", {}).get("title", "API")
+    docs_html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>{title} — docs</title>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    window.onload = () => {{
+      window.ui = SwaggerUIBundle({{
+        url: "{openapi_path}",
+        dom_id: "#swagger-ui",
+      }});
+    }};
+  </script>
+</body>
+</html>"""
+
+    async def docs(_request: Request) -> HTMLResponse:
+        return HTMLResponse(docs_html)
+
+    return [
+        Route(openapi_path, openapi_json, methods=["GET"], include_in_schema=False),
+        Route(docs_path, docs, methods=["GET"], include_in_schema=False),
+    ]
+
+
+# ── validate a JSON value against a generated schema (#748 tie-in) ─────────
+
+_JSON_TYPE_CHECK: dict[str, type | tuple[type, ...]] = {
+    "string": str,
+    # bool is an int subclass in Python — exclude it from the integer/number
+    # check so a JSON `true` doesn't pass as a number.
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def validate_json_schema(
+    instance: Any, schema: dict[str, Any], components: dict[str, Any], *, path: str = "$"
+) -> list[str]:
+    """Validate *instance* against a schema produced by this module.
+
+    Not a general-purpose JSON Schema validator (no external dependency is
+    pulled in for it) — just enough of the dialect this module itself emits
+    (``type``, ``nullable``, ``properties``/``required``, ``items``,
+    ``additionalProperties``, ``$ref``, ``anyOf``) to prove the #757 specs
+    actually describe a real payload, e.g. the #748 golden ``/board``
+    fixture. Returns a list of human-readable error strings; empty means
+    valid.
+    """
+    if "$ref" in schema:
+        name = schema["$ref"].rsplit("/", 1)[-1]
+        target = components.get(name)
+        if target is None:
+            return [f"{path}: unresolvable $ref {schema['$ref']!r}"]
+        return validate_json_schema(instance, target, components, path=path)
+
+    if "anyOf" in schema:
+        errors_per_branch = [
+            validate_json_schema(instance, branch, components, path=path)
+            for branch in schema["anyOf"]
+        ]
+        if any(not errs for errs in errors_per_branch):
+            return []
+        return [f"{path}: matched none of {len(schema['anyOf'])} anyOf branches"]
+
+    if instance is None:
+        if schema.get("nullable") or schema.get("type") == "null" or not schema:
+            return []
+        return [f"{path}: null but schema is not nullable ({schema.get('type')!r})"]
+
+    json_type = schema.get("type")
+    if json_type is None:
+        return []  # untyped ("any") schema — nothing to check
+
+    py_type = _JSON_TYPE_CHECK.get(json_type)
+    if py_type is not None and not isinstance(instance, py_type):
+        return [f"{path}: expected {json_type}, got {type(instance).__name__}"]
+
+    errors: list[str] = []
+    if json_type == "object" and isinstance(instance, dict):
+        properties = schema.get("properties", {})
+        for req in schema.get("required", ()):
+            if req not in instance:
+                errors.append(f"{path}: missing required property {req!r}")
+        for key, value in instance.items():
+            prop_schema = properties.get(key)
+            if prop_schema is not None:
+                errors.extend(
+                    validate_json_schema(value, prop_schema, components, path=f"{path}.{key}")
+                )
+            else:
+                addl = schema.get("additionalProperties")
+                if isinstance(addl, dict):
+                    errors.extend(
+                        validate_json_schema(value, addl, components, path=f"{path}.{key}")
+                    )
+    elif json_type == "array" and isinstance(instance, list):
+        items_schema = schema.get("items")
+        if items_schema:
+            for i, item in enumerate(instance):
+                errors.extend(
+                    validate_json_schema(item, items_schema, components, path=f"{path}[{i}]")
+                )
+    return errors
+
+
+# ── route-inventory drift check ──────────────────────────────────────────────
+
+def declared_routes(routes: list[BaseRoute]) -> set[tuple[str, str]]:
+    """``{(METHOD, path), ...}`` for every plain ``Route`` in *routes*.
+
+    Skips non-``Route`` entries (``Mount``/``StaticFiles`` — not a single
+    documentable JSON endpoint) and anything with ``include_in_schema=False``
+    (the meta ``/openapi.json`` and ``/docs`` routes themselves), and drops
+    the implicit ``HEAD``/``OPTIONS`` methods Starlette adds to every
+    ``GET``/any route.
+    """
+    out: set[tuple[str, str]] = set()
+    for route in routes:
+        if not isinstance(route, Route) or not route.include_in_schema:
+            continue
+        for method in route.methods or ["GET"]:
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            out.add((method, route.path))
+    return out
+
+
+def spec_routes(spec: dict[str, Any]) -> set[tuple[str, str]]:
+    """``{(METHOD, path), ...}`` declared in an OpenAPI document's ``paths``."""
+    out: set[tuple[str, str]] = set()
+    for path, methods in spec.get("paths", {}).items():
+        for method in methods:
+            out.add((method.upper(), path))
+    return out
