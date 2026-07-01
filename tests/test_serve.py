@@ -1410,6 +1410,138 @@ def test_diagnose_routes_to_daemon_when_service_set(coord_db, monkeypatch):
     assert "DAEMON DIAGNOSE OUTPUT" in out.output
 
 
+def test_serve_test_plan_runs_callback_and_captures_output(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    # #851: POST /test-plan runs `coord test-plan` on the daemon with the
+    # recursion guard set, and relays the captured CLI output + exit code.
+    # Mirrors test_serve_diagnose_runs_callback_and_captures_output.
+    import os
+    import click
+    from coord.cli import test_plan_cmd
+
+    def fake_callback(**kwargs):
+        assert os.environ.get("COORD_TEST_PLAN_ON_DAEMON") == "1"  # guard set
+        click.echo(
+            f"test-planned assignment_id={kwargs['assignment_id']} "
+            f"refresh={kwargs['refresh']} model={kwargs['model']}"
+        )
+
+    monkeypatch.setattr(test_plan_cmd, "callback", fake_callback)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/test-plan",
+            json={"assignment_id": "abc123", "refresh": True, "model": "haiku"},
+        )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["exit_code"] == 0 and out["error"] is None
+    assert (
+        "test-planned assignment_id=abc123 refresh=True model=haiku" in out["output"]
+    )
+    assert os.environ.get("COORD_TEST_PLAN_ON_DAEMON") is None  # restored after
+
+
+def test_test_plan_routes_to_daemon_when_service_set(coord_db, tmp_path, monkeypatch):
+    # #851: `coord test-plan` on a thin client POSTs to /test-plan and relays
+    # the output, instead of reporting "not found" against its empty local
+    # DB (generate_plan queries the local DB directly and has no daemon-
+    # routing of its own). Mirrors test_diagnose_routes_to_daemon_when_service_set.
+    from coord import client as cc
+    from coord import test_orchestrator
+    from click.testing import CliRunner
+    from coord.cli import main
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("generate_plan must not run locally on a thin client")
+
+    monkeypatch.setattr(test_orchestrator, "generate_plan", _boom, raising=False)
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"output": "DAEMON TEST-PLAN OUTPUT\n", "exit_code": 0},
+    )
+    cfg = tmp_path / "coordinator.yml"
+    cfg.write_text("repos:\n  - name: api\n    github: acme/api\nmachines: []\n")
+    out = CliRunner().invoke(
+        main,
+        ["test-plan", "abc123", "--refresh", "--model", "sonnet", "--config", str(cfg)],
+    )
+    assert out.exit_code == 0, out.output
+    assert captured["path"] == "/test-plan"
+    assert captured["payload"] == {
+        "assignment_id": "abc123", "refresh": True, "model": "sonnet",
+    }
+    assert "DAEMON TEST-PLAN OUTPUT" in out.output
+
+
+def test_log_falls_back_to_daemon_board_machine_name(coord_db, tmp_path, monkeypatch):
+    # #851: `coord log` on a thin client (or any machine that isn't the
+    # dispatcher) has no local dispatched-ledger record for a valid remote
+    # assignment id and no local log file. Before this fix that fell through
+    # to "no log found" and made a healthy id look broken; now it asks the
+    # daemon board for the assignment's own machine_name so the operator
+    # doesn't have to guess --machine.
+    from unittest.mock import patch
+
+    from coord import agent as agent_mod
+    from coord import client as cc
+    from click.testing import CliRunner
+    from coord.cli import main
+
+    cfg = tmp_path / "coordinator.yml"
+    cfg.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tailnet\n"
+        "    repos: [api]\n"
+        "  - name: server\n"
+        "    host: server.tailnet\n"
+        "    repos: [api]\n"
+    )
+
+    # No local log for this assignment on this machine.
+    monkeypatch.setattr(agent_mod, "DEFAULT_STATE_DIR", tmp_path / "state")
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    monkeypatch.setattr(
+        cc,
+        "fetch_board_payload",
+        lambda svc, **kw: {
+            "assignments": [
+                {
+                    "assignment_id": "remote-only",
+                    "machine_name": "server",
+                    "repo_name": "api",
+                    "status": "done",
+                },
+            ]
+        },
+    )
+
+    with patch(
+        "coord.network.fetch_log",
+        return_value=(200, b"remote log content via daemon board\n"),
+    ):
+        result = CliRunner().invoke(
+            main, ["log", "remote-only", "--config", str(cfg)]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "remote log content via daemon board" in result.output
+
+
 def test_diagnose_cli_never_calls_save_board(valid_config_path: Path, coord_db, monkeypatch):
     # Regression (quadraui #366): the diagnose command must persist ONLY through
     # the issue_store seam (finalize→post_completion, recover→post_result,

@@ -813,6 +813,53 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         result = await run_in_threadpool(_run)
         return JSONResponse(result)
 
+    async def post_test_plan(request: Request) -> Response:
+        # #851: the assignment row + cached test_plan live in THIS (canonical)
+        # DB, so a thin client's `coord test-plan` routes the whole command
+        # here instead of reporting "not found" against an empty local board.
+        # Run it in a threadpool since it shells out to git/gh and may invoke
+        # `claude -p`. Mirrors post_diagnose.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+        def _run() -> dict:
+            import contextlib  # noqa: PLC0415
+            import io  # noqa: PLC0415
+            import os  # noqa: PLC0415
+
+            from coord.cli import test_plan_cmd  # noqa: PLC0415
+
+            buf = io.StringIO()
+            code = 0
+            err = None
+            prev = os.environ.get("COORD_TEST_PLAN_ON_DAEMON")
+            os.environ["COORD_TEST_PLAN_ON_DAEMON"] = "1"  # guard against re-routing
+            try:
+                with contextlib.redirect_stdout(buf):
+                    test_plan_cmd.callback(
+                        assignment_id=body.get("assignment_id"),
+                        refresh=bool(body.get("refresh")),
+                        model=body.get("model") or "haiku",
+                        config_path=config.path,
+                    )
+            except SystemExit as e:  # click commands sys.exit() on some paths
+                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                code = 1
+            finally:
+                if prev is None:
+                    os.environ.pop("COORD_TEST_PLAN_ON_DAEMON", None)
+                else:
+                    os.environ["COORD_TEST_PLAN_ON_DAEMON"] = prev
+            return {"output": buf.getvalue(), "exit_code": code, "error": err}
+
+        result = await run_in_threadpool(_run)
+        return JSONResponse(result)
+
     async def post_housekeeping(request: Request) -> Response:
         # #762: archive stale terminal board rows on the canonical DB.  The CLI
         # (`coord housekeeping`) routes here because the DB lives on the daemon;
@@ -1040,6 +1087,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/merge", post_merge, methods=["POST"]),
         Route("/reconcile-merges", post_reconcile_merges, methods=["POST"]),
         Route("/diagnose", post_diagnose, methods=["POST"]),
+        Route("/test-plan", post_test_plan, methods=["POST"]),
         Route("/housekeeping", post_housekeeping, methods=["POST"]),
     ]
     # #762: gzip the /board projection (markdown-heavy JSON compresses ~9×), so a

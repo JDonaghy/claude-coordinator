@@ -75,11 +75,62 @@ def log(
                     None,
                 )
 
+        # #851: the local dispatched ledger only knows about assignments
+        # DISPATCHED FROM this machine — a thin client (or any machine that
+        # wasn't the dispatcher) has no record for it, even when the id is
+        # perfectly valid on the daemon board. Before falling through to the
+        # local log path (which would report "no log found" and make a
+        # healthy id look broken), check whether a log already exists here,
+        # and otherwise ask the daemon board for the assignment's own
+        # machine_name instead of requiring the operator to guess --machine.
+        if target_machine is None:
+            from coord.agent import DEFAULT_STATE_DIR
+
+            local_log_path = DEFAULT_STATE_DIR / "logs" / f"{assignment_id}.log"
+            if not local_log_path.exists():
+                target_machine = _resolve_log_machine_via_daemon(
+                    assignment_id, config_path
+                )
+
     if target_machine is None:
         _log_local(assignment_id, follow, raw=raw)
         return
 
     _log_remote(target_machine, assignment_id, follow, raw=raw)
+
+
+def _resolve_log_machine_via_daemon(assignment_id: str, config_path: Path):
+    """#851: fall back to the assignment's own ``machine_name`` (read from the
+    daemon board) when the local dispatched ledger has no record and no local
+    log exists — the #584-class thin-client routing gap `coord test-plan` has
+    too. Returns ``None`` (silently — the caller's existing "no log found"
+    error is the right message in that case) when no board_service is
+    configured, the daemon is unreachable, or the id doesn't resolve there
+    either."""
+    from coord.client import fetch_board_payload, resolve_board_service
+
+    svc = resolve_board_service()
+    if svc is None:
+        return None
+    try:
+        payload = fetch_board_payload(svc)
+    except Exception:  # noqa: BLE001 — best-effort; fall through to local error
+        return None
+    row = next(
+        (
+            a
+            for a in payload.get("assignments", [])
+            if a.get("assignment_id") == assignment_id
+        ),
+        None,
+    )
+    if row is None:
+        return None
+    machine_name = row.get("machine_name")
+    if not machine_name:
+        return None
+    cfg = _load_config(config_path)
+    return next((m for m in cfg.machines if m.name == machine_name), None)
 
 
 def _emit_log_text(text: str, *, raw: bool) -> None:

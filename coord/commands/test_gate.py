@@ -12,6 +12,7 @@ is unchanged. Not fixed in this PR — pure refactor, no functional change.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -630,6 +631,28 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
     )
 
 
+def _test_plan_via_daemon(svc, params: dict) -> None:
+    """#851: run ``coord test-plan`` on the daemon host (the assignment + its
+    cached ``test_plan`` live in the daemon's canonical DB, not a thin
+    client's empty local one) and relay its output.  Mirrors
+    ``_diagnose_via_daemon`` in ``coord/commands/status.py``."""
+    from coord.client import post_record  # noqa: PLC0415
+
+    try:
+        resp = post_record(svc, "/test-plan", params, timeout=120.0)
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"error: test-plan via daemon failed: {exc}", err=True)
+        sys.exit(1)
+    output = resp.get("output") or ""
+    if output:
+        click.echo(output, nl=False)
+    if resp.get("error"):
+        click.echo(f"error: {resp['error']}", err=True)
+    code = resp.get("exit_code") or 0
+    if code:
+        sys.exit(int(code))
+
+
 @click.command(
     "test-plan",
     help=(
@@ -668,6 +691,23 @@ def test_plan_cmd(
     config_path: Path,
 ) -> None:
     """Generate or display the smoke test plan for ASSIGNMENT_ID."""
+    # #851: the assignment row (and its cached test_plan) live in the
+    # daemon's canonical DB. `generate_plan` queries the local DB directly,
+    # so on a thin client (empty local DB) it always reports "not found"
+    # even for a perfectly valid id — the same #584-class gap `diagnose` /
+    # `merge` / `reconcile-merges` already had. Route the whole command to
+    # the daemon, mirroring that pattern. COORD_TEST_PLAN_ON_DAEMON guards
+    # the daemon against re-routing to itself.
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    svc = resolve_board_service()
+    if svc is not None and not os.environ.get("COORD_TEST_PLAN_ON_DAEMON"):
+        _test_plan_via_daemon(
+            svc,
+            {"assignment_id": assignment_id, "refresh": refresh, "model": model},
+        )
+        return
+
     from coord.state import get_test_plan, set_test_plan
     from coord.test_orchestrator import find_local_repo_path, generate_plan
 
