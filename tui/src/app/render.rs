@@ -2999,9 +2999,20 @@ impl CoordApp {
                                 let cached = {
                                     let mut cache = self.log_items_cache.borrow_mut();
                                     let c = cache.as_mut().unwrap();
+                                    // #852: defense in depth — `lines` and
+                                    // `line_times` are meant to stay the same
+                                    // length, but any desync must never
+                                    // index-panic here (this is the unguarded
+                                    // render path — a panic takes down the whole
+                                    // TUI). `parse_sse_log_more` already tolerates
+                                    // a shorter `times` slice via `.get(i)`.
+                                    let new_lines =
+                                        sse.lines.get(old_count..).unwrap_or(&[]);
+                                    let new_times =
+                                        sse.line_times.get(old_count..).unwrap_or(&[]);
                                     let new_items = parse_sse_log_more(
-                                        &sse.lines[old_count..],
-                                        &sse.line_times[old_count..],
+                                        new_lines,
+                                        new_times,
                                         wrap_width,
                                         &mut c.parse_state,
                                     );
