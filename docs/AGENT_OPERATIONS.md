@@ -295,6 +295,27 @@ To target one machine:
 coord agent update --machine precision
 ```
 
+**`coord agent update` restarts only the agent (`coord-agent`, 7433) — NOT
+the `coord-serve` daemon (7435).** On the daemon host (dellserver) both
+services run from the same `~/.coord-venv`, so `coord agent update` upgrades
+the on-disk code for both, but the already-running `coord-serve` process keeps
+executing the *old* code in memory until it is restarted. So whenever a release
+changes coordinator/daemon Python (`serve_app.py`, the `/board` handlers, etc.),
+the rollout has a **second, separate step** — restart the daemon on its host:
+
+```bash
+# same XDG_RUNTIME_DIR / #404 caveat as the agent (an execv self-restart under
+# systemd leaves the stale PID); an explicit systemctl restart is what takes.
+ssh dellserver 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-serve'
+# verify: back up on the new version + board reachable
+ssh dellserver 'systemctl --user is-active coord-serve'
+coord status            # thin clients should reconnect to the daemon
+```
+
+Skip this and the fix ships to the fleet but the daemon silently keeps serving
+the old behaviour — the failure mode that stranded #850 (a `serve_app.py` fix)
+even though every agent already reported the new version.
+
 ## Upgrade via the raw `/update` endpoint (reliable fallback)
 
 `coord agent update` is a thin wrapper over the agent's `POST /update`
