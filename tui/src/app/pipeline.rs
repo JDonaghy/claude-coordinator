@@ -195,6 +195,27 @@ pub(crate) struct PendingFixCapPreflight {
     pub(crate) force: bool,
 }
 
+/// #863 review fix: the exact target a Fix launch resolves to when it's the
+/// follow-through from a completed cap preflight, carried straight from the
+/// [`PendingFixCapPreflight`] that just cleared — NOT re-derived from
+/// whatever is currently selected in the UI.
+///
+/// Without this, an operator who changes the Pipeline selection (or clicks a
+/// different issue's Fix action) while the preflight subprocess is still
+/// running gets the follow-through launch silently misdirected to the
+/// NEW selection instead of the issue that was actually preflighted — and on
+/// the confirmed `--force` path, that could apply `--force` to a different
+/// issue's fix-eligible work without ever showing that issue's own cap
+/// confirm. Passed to `launch_interactive_session_on_machine_inner` as
+/// `Some(..)` only on the follow-through call; every other caller passes
+/// `None` and resolves from the live selection as before.
+pub(crate) struct FixPreflightTarget {
+    pub(crate) coord_repo: String,
+    pub(crate) repo_slug: String,
+    pub(crate) issue_num: u64,
+    pub(crate) work_aid: String,
+}
+
 /// #863: the iteration cap was hit — awaiting the operator's one-key confirm
 /// to re-dispatch the SAME Fix with `--force` (#862's override).  Raised by
 /// the `PendingFixCapPreflight` completion handler; consumed by

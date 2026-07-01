@@ -1999,27 +1999,64 @@ impl CoordApp {
         reattach_aid: Option<String>,
         force: bool,
     ) {
-        self.launch_interactive_session_on_machine_inner(mode, machine, reattach_aid, force, false)
+        self.launch_interactive_session_on_machine_inner(mode, machine, reattach_aid, force, None)
+    }
+
+    /// #863 review fix: resolve the `(coord_repo, (repo_slug, issue_num))`
+    /// pair an interactive launch should target — the PINNED preflight
+    /// target when one is given, otherwise the live UI selection.
+    ///
+    /// Extracted out of `launch_interactive_session_on_machine_inner` so the
+    /// pinning behaviour is directly unit-testable without having to drive a
+    /// real terminal spawn (which would type a live `coord assign` command
+    /// line into a real shell — not something a unit test should risk).
+    pub(crate) fn resolve_launch_repo_and_key(
+        &self,
+        pinned_target: Option<&FixPreflightTarget>,
+    ) -> Option<(String, (String, u64))> {
+        match pinned_target {
+            Some(t) => Some((t.coord_repo.clone(), (t.repo_slug.clone(), t.issue_num))),
+            None => self.selected_issue_repo_and_key(),
+        }
+    }
+
+    /// #863 review fix: resolve the work_aid a Fix launch should carry — the
+    /// PINNED preflight target's aid when one is given (the exact id the cap
+    /// preflight just checked), otherwise derived from the live selection
+    /// (a request-changes review, falling back to a test-failed work row,
+    /// per Leg 3 / #517 / #581). See [`resolve_launch_repo_and_key`] for why
+    /// this is a separate testable method rather than inlined.
+    pub(crate) fn resolve_fix_work_aid(&self, pinned_target: Option<&FixPreflightTarget>) -> Option<String> {
+        pinned_target
+            .map(|t| t.work_aid.clone())
+            .or_else(|| self.selected_request_changes_review_aid())
+            .or_else(|| self.selected_test_failed_work_aid())
     }
 
     /// #863: `launch_interactive_session_on_machine`'s actual body, plus
-    /// `after_preflight` — true ONLY when this call is the follow-through from
-    /// the `dispatch_fix_cap_preflight` completion handler in
+    /// `pinned_target` — `Some(..)` ONLY when this call is the follow-through
+    /// from the `dispatch_fix_cap_preflight` completion handler in
     /// `run_periodic_work`.  That handler must skip the cap-preflight gate
-    /// below (it just ran the preflight); every other caller goes through the
-    /// public wrapper above with `after_preflight = false` so a FRESH Fix
-    /// dispatch always gets gated.  Without this distinction, a clean
+    /// below (it just ran the preflight) AND resolve the repo/issue/work_aid
+    /// from the preflighted target rather than the live UI selection (#863
+    /// review fix — see [`FixPreflightTarget`]).  Every other caller goes
+    /// through the public wrapper above with `pinned_target = None` so a
+    /// FRESH Fix dispatch always gets gated and resolves from the current
+    /// selection as before.  Without the `Some` distinction, a clean
     /// (non-forced) preflight success would re-enter the gate on the
-    /// follow-through call and preflight forever.
+    /// follow-through call and preflight forever; without pinning, an
+    /// operator who changes the selection while the preflight runs would get
+    /// the launch silently misdirected (see `FixPreflightTarget` doc).
     pub(crate) fn launch_interactive_session_on_machine_inner(
         &mut self,
         mode: InteractiveLaunchMode,
         machine: String,
         reattach_aid: Option<String>,
         force: bool,
-        after_preflight: bool,
+        pinned_target: Option<FixPreflightTarget>,
     ) {
-        let Some((repo, issue_key)) = self.selected_issue_repo_and_key() else {
+        let after_preflight = pinned_target.is_some();
+        let Some((repo, issue_key)) = self.resolve_launch_repo_and_key(pinned_target.as_ref()) else {
             self.pipeline_status = Some((
                 "Cannot resolve repo for this issue — interactive session not launched".to_string(),
                 Instant::now(),
@@ -2058,10 +2095,15 @@ impl CoordApp {
             // Leg 3 (#517): Fix carries the request-changes REVIEW id, OR the
             // test-failed WORK id (#581).  Prefer a request-changes review; fall
             // back to a test-failed work row (the backend accepts either).
-            InteractiveLaunchMode::Fix => match self
-                .selected_request_changes_review_aid()
-                .or_else(|| self.selected_test_failed_work_aid())
-            {
+            //
+            // #863 review fix: on the preflight follow-through, use the
+            // PINNED work_aid straight from `FixPreflightTarget` — that's the
+            // exact id the cap preflight just checked. Re-deriving from the
+            // live selection here would defeat the repo/issue pinning above:
+            // the terminal would open in the pinned issue's cwd while the
+            // command line carried a work_aid resolved from whatever is
+            // CURRENTLY selected.
+            InteractiveLaunchMode::Fix => match self.resolve_fix_work_aid(pinned_target.as_ref()) {
                 Some(aid) => Some(aid),
                 None => {
                     self.push_toast(
@@ -2389,6 +2431,19 @@ impl CoordApp {
     /// BEFORE its `--dry-run` early-return, and never touches a TTY on that
     /// path, so it's safe to run as an ordinary background subprocess (no
     /// embedded PTY needed) purely to see whether the cap blocks it.
+    ///
+    /// #863 review fix: refuses to dispatch a SECOND preflight while one is
+    /// already in flight — `pending_fix_cap_preflight` holds exactly one
+    /// target, so a second call here (e.g. the operator navigates to a
+    /// different issue and clicks Fix again before the first preflight's
+    /// subprocess has returned) would silently overwrite it. The first
+    /// preflight's eventual result would then fail to match
+    /// `pending_fix_cap_preflight` (now pointing at the second target) and
+    /// get dropped on the floor — no launch, no toast, no force-confirm, for
+    /// an issue the operator is still waiting on. `confirm_fix_force_past_cap`
+    /// re-enters this function too, but only ever after the prior preflight
+    /// already cleared `pending_fix_cap_preflight` to `None`, so it's
+    /// unaffected by this guard.
     pub(crate) fn dispatch_fix_cap_preflight(
         &mut self,
         coord_repo: String,
@@ -2398,6 +2453,27 @@ impl CoordApp {
         work_aid: String,
         force: bool,
     ) {
+        if let Some(existing) = &self.pending_fix_cap_preflight {
+            self.push_toast(
+                "Fix preflight already running",
+                &format!(
+                    "Still checking the iteration cap for {} #{} — wait for it to finish \
+                     before starting another Fix.",
+                    existing.coord_repo, existing.issue_num,
+                ),
+                ToastSeverity::Warning,
+            );
+            return;
+        }
+        // #863 review fix: surface SOME visible feedback while the preflight
+        // subprocess is in flight — previously nothing indicated a Fix click
+        // had done anything until the (headless, background) command
+        // finished, which read as "Fix did nothing" for however long the
+        // subprocess takes.
+        self.pipeline_status = Some((
+            format!("Checking iteration cap for {} #{} …", coord_repo, issue_num),
+            Instant::now(),
+        ));
         let issue_str = issue_num.to_string();
         let mut argv: Vec<String> = vec![
             "assign".to_string(),
