@@ -1226,13 +1226,25 @@ def _dispatch_fix_of(
     next_iteration = (work.review_iteration or 0) + 1
     max_iter = cfg.pipeline.max_review_iterations
     if next_iteration > max_iter:
-        click.echo(
-            f"error: max_review_iterations ({max_iter}) reached for "
-            f"work {work.assignment_id}; not dispatching another fix. "
-            "Resolve manually or bump pipeline.max_review_iterations.",
-            err=True,
-        )
-        sys.exit(2)
+        if force:
+            # #855-follow-up: intractable stories (e.g. vimcode#515) legitimately
+            # need more than the cap.  --force is the operator's explicit "I know,
+            # keep going" override so a hard stop isn't the only exit.
+            click.echo(
+                f"warning: max_review_iterations ({max_iter}) reached for "
+                f"work {work.assignment_id}; dispatching iteration "
+                f"{next_iteration} anyway (--force).",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"error: max_review_iterations ({max_iter}) reached for "
+                f"work {work.assignment_id}; not dispatching another fix. "
+                "Re-run with --force to override for this dispatch, or bump "
+                "pipeline.max_review_iterations in coordinator.yml.",
+                err=True,
+            )
+            sys.exit(2)
 
     # Findings: reuse the SAME loader the claude -p fix path uses (DB
     # cache → log → agent).  Local-only ⇒ no machine_host.  Fall back to
