@@ -3441,12 +3441,23 @@ impl CoordApp {
                                     let milestone_idx = path[0] as usize;
                                     let cache = self.board_issues_cache.clone();
                                     let milestones = self.board_milestones_for_repo(&cache, &repo);
-                                    if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
+                                    if let Some((m_key, _, group_issues)) =
+                                        milestones.get(milestone_idx)
+                                    {
                                         let m_key = m_key.clone();
+                                        // #857: first click on an untouched key must
+                                        // invert the default it was actually painted
+                                        // with (in-flight ⇒ expanded), not a hardcoded
+                                        // `true` — else a non-in-flight (collapsed)
+                                        // milestone's first click would insert `true`
+                                        // and immediately negate it back to `false`,
+                                        // silently no-op'ing the click.
+                                        let default_expanded =
+                                            Self::board_milestone_has_inflight(group_issues);
                                         let entry = self
                                             .board_milestone_expanded
                                             .entry((repo, m_key))
-                                            .or_insert(true);
+                                            .or_insert(default_expanded);
                                         *entry = !*entry;
                                         self.rebuild_board_sidebar();
                                     }
@@ -3473,12 +3484,23 @@ impl CoordApp {
                                     let milestone_idx = path[0] as usize;
                                     let cache = self.board_issues_cache.clone();
                                     let milestones = self.board_milestones_for_repo(&cache, &repo);
-                                    if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
+                                    if let Some((m_key, _, group_issues)) =
+                                        milestones.get(milestone_idx)
+                                    {
                                         let m_key = m_key.clone();
+                                        // #857: first click on an untouched key must
+                                        // invert the default it was actually painted
+                                        // with (in-flight ⇒ expanded), not a hardcoded
+                                        // `true` — else a non-in-flight (collapsed)
+                                        // milestone's first click would insert `true`
+                                        // and immediately negate it back to `false`,
+                                        // silently no-op'ing the click.
+                                        let default_expanded =
+                                            Self::board_milestone_has_inflight(group_issues);
                                         let entry = self
                                             .board_milestone_expanded
                                             .entry((repo, m_key))
-                                            .or_insert(true);
+                                            .or_insert(default_expanded);
                                         *entry = !*entry;
                                         self.rebuild_board_sidebar();
                                     }
@@ -3517,12 +3539,19 @@ impl CoordApp {
                                 let cache = self.board_issues_cache.clone();
                                 let milestones = self.board_milestones_for_repo(&cache, &repo);
                                 let milestone_idx = path[0] as usize;
-                                if let Some((m_key, _, _)) = milestones.get(milestone_idx) {
+                                if let Some((m_key, _, group_issues)) =
+                                    milestones.get(milestone_idx)
+                                {
                                     let m_key = m_key.clone();
+                                    // #857: match the painted default (see the
+                                    // RowSelected/RowActivated arms above) so a
+                                    // chevron click never silently no-ops.
+                                    let default_expanded =
+                                        Self::board_milestone_has_inflight(group_issues);
                                     let entry = self
                                         .board_milestone_expanded
                                         .entry((repo, m_key))
-                                        .or_insert(true);
+                                        .or_insert(default_expanded);
                                     *entry = !*entry;
                                     self.rebuild_board_sidebar();
                                 }
@@ -3633,6 +3662,10 @@ impl CoordApp {
                                             .pipeline_milestones_for_issues(repo_issue_idxs);
                                         if let Some((mil_key, _, _)) = milestones.get(mi) {
                                             let mil_key = mil_key.clone();
+                                            // #857: default is collapsed (New has no
+                                            // in-flight concept — those issues are
+                                            // pre-dispatch by definition), matching
+                                            // the render-path default above.
                                             let entry = self
                                                 .pipeline_milestone_expanded
                                                 .entry((
@@ -3640,7 +3673,7 @@ impl CoordApp {
                                                     repo_key,
                                                     mil_key,
                                                 ))
-                                                .or_insert(true);
+                                                .or_insert(false);
                                             *entry = !*entry;
                                             self.rebuild_pipeline_sidebar(None);
                                         }

@@ -14928,6 +14928,132 @@
         assert_eq!(milestones[1].0, "no-milestone", "No milestone sorted last");
     }
 
+    // ── #857: Board milestones default collapsed (except in-flight) ─────────
+
+    /// Helper: one repo with two milestones — one backlog-only (no
+    /// assignments, so NOT in-flight) and one with a running assignment
+    /// (in-flight). Distinct issue numbers/titles avoid substring collisions
+    /// in screen-content assertions.
+    fn make_board_milestone_app() -> CoordApp {
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 111,
+            title: "NonInflightIssue".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: Some(1),
+            milestone_title: Some("v1.0".to_string()),
+        });
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 222,
+            title: "InflightIssue".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: Some(2),
+            milestone_title: Some("v2.0".to_string()),
+        });
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 222, "repo-a", Some("work")));
+        app.rebuild_board_sidebar();
+        app
+    }
+
+    #[test]
+    fn tuidriver_board_milestones_collapsed_except_inflight() {
+        // #857 design decision (a): an untouched milestone key defaults to
+        // collapsed, EXCEPT a milestone with in-flight work, which stays
+        // expanded so active work remains visible without an extra click.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_board_milestone_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen = driver.screen();
+
+        assert!(
+            driver.screen_contains("v1.0"),
+            "collapsed milestone header 'v1.0' must still be visible:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("v2.0"),
+            "in-flight milestone header 'v2.0' must be visible:\n{screen}"
+        );
+        assert!(
+            !driver.screen_contains("NonInflightIssue"),
+            "issue under the non-in-flight (collapsed-by-default) milestone must NOT be on screen:\n{screen}"
+        );
+        // Note: the in-flight issue's title comes from the *assignment*
+        // (`issues_by_repo` seeds `IssueGroup.issue_title` from the
+        // assignment when one exists — see mod.rs `issues_by_repo`), so it
+        // renders as "Issue 222" (from `make_assignment_typed`), not the
+        // `OpenIssue.title` set above. The issue number is the stable,
+        // assignment-independent identifier to assert on.
+        assert!(
+            driver.screen_contains("#222"),
+            "issue under the in-flight (expanded-by-default) milestone must be on screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_board_milestone_click_expands_collapsed_milestone() {
+        // #857: clicking a collapsed (non-in-flight) milestone header must
+        // expand it and reveal its issue — full event round-trip. Unlike
+        // Pipeline, a Board milestone header toggles on a plain row click
+        // (`SidebarEvent::RowSelected`), not just the chevron — see the
+        // `path.len() == 1` arm in events.rs — so clicking directly on the
+        // text found by `find()` is sufficient.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_board_milestone_app();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen_before = driver.screen();
+        assert!(
+            !driver.screen_contains("NonInflightIssue"),
+            "sanity: must start collapsed:\n{screen_before}"
+        );
+
+        let (x, y) = driver
+            .find("v1.0")
+            .unwrap_or_else(|| panic!("'v1.0' milestone header not found:\n{screen_before}"));
+        driver.click(x, y);
+
+        let screen_after = driver.screen();
+        assert!(
+            driver.screen_contains("NonInflightIssue"),
+            "clicking the collapsed milestone header must expand it and reveal its issue:\n{screen_after}"
+        );
+    }
+
+    #[test]
+    fn board_milestone_expanded_choice_persists_across_rebuild() {
+        // #857: an explicit user choice (either direction) must survive the
+        // next `rebuild_board_sidebar` — the default-collapsed change must
+        // only affect *untouched* keys, never force-collapse (or force-
+        // expand) a key the user already decided on. Mirrors the equivalent
+        // Pipeline persistence tests above.
+        let mut app = make_board_milestone_app();
+        // milestone_number 1 → key "1" per board_milestones_for_repo.
+        app.board_milestone_expanded
+            .insert(("repo-a".to_string(), "1".to_string()), true);
+
+        app.rebuild_board_sidebar();
+
+        let expanded = app
+            .board_milestone_expanded
+            .get(&("repo-a".to_string(), "1".to_string()))
+            .copied()
+            .unwrap_or(false);
+        assert!(
+            expanded,
+            "an explicit user expand choice must persist across rebuild even though \
+             the untouched-key default for a non-in-flight milestone is now collapsed",
+        );
+    }
+
     // ── #668: Pipeline milestone grouping ────────────────────────────────────
 
     /// Helper: build an App with two pipeline issues in different milestones
@@ -15246,6 +15372,118 @@
         assert!(
             !collapsed,
             "milestone collapse state must persist across rebuild",
+        );
+    }
+
+    // ── #857: Pipeline New milestones default collapsed ─────────────────────
+
+    #[test]
+    fn pipeline_milestone_expanded_choice_persists_across_default_flip() {
+        // #857 changed the untouched-key default to collapsed (false), but a
+        // user who explicitly expanded a milestone must never be force-
+        // collapsed back on the next rebuild — same rule as #815 Part 2 for
+        // the Done section. Mirrors the "collapsed" persistence test above,
+        // but for the opposite (expanded) choice.
+        let mut app = make_pipeline_milestone_app();
+        app.pipeline_milestone_expanded
+            .insert(("new".to_string(), "api".to_string(), "1".to_string()), true);
+
+        app.rebuild_pipeline_sidebar(None);
+
+        let expanded = app
+            .pipeline_milestone_expanded
+            .get(&("new".to_string(), "api".to_string(), "1".to_string()))
+            .copied()
+            .unwrap_or(false);
+        assert!(
+            expanded,
+            "an explicit user expand choice must survive the rebuild even though \
+             the untouched-key default is now collapsed",
+        );
+    }
+
+    #[test]
+    fn tuidriver_pipeline_new_milestones_collapsed_by_default() {
+        // #857: on a freshly built app (no prior toggles), the Pipeline New
+        // section must render its milestone headers collapsed — the issue
+        // rows beneath them must not be on screen — while the milestone
+        // headers themselves (with counts) remain visible.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_milestone_app();
+        app.active_view = SidebarView::Pipeline;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen = driver.screen();
+
+        assert!(
+            driver.screen_contains("v1.0"),
+            "milestone header 'v1.0' must be visible (collapsed, not hidden):\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("v2.0"),
+            "milestone header 'v2.0' must be visible (collapsed, not hidden):\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("No milestone"),
+            "'No milestone' header must be visible (collapsed, not hidden):\n{screen}"
+        );
+        assert!(
+            !driver.screen_contains("Milestone v1 issue"),
+            "issue row under a collapsed milestone must NOT be on screen:\n{screen}"
+        );
+        assert!(
+            !driver.screen_contains("Milestone v2 issue"),
+            "issue row under a collapsed milestone must NOT be on screen:\n{screen}"
+        );
+        assert!(
+            !driver.screen_contains("No milestone issue"),
+            "issue row under a collapsed milestone must NOT be on screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_pipeline_new_milestone_chevron_click_expands_and_persists() {
+        // #857: clicking a collapsed milestone header's chevron must expand
+        // it and reveal its issues (full event round-trip through
+        // `handle` → `Reaction::Redraw` → `render_frame`), and the toggle
+        // must persist across the next sidebar rebuild.
+        //
+        // Pipeline milestone headers only toggle on a *chevron* hit — a
+        // plain click on the row body emits `RowSelected`, which the
+        // Pipeline handler in events.rs uses only to blur the search filter
+        // (see `pipeline_milestones_for_issues` callers in events.rs). The
+        // chevron is painted 2 cells before the label
+        // (`indent * 2 cells + 1-char chevron + 1 space`), so clicking 2
+        // columns to the left of the text found by `find()` lands on it —
+        // this mirrors quadraui's own chevron-vs-body hit-test contract
+        // (`quadraui::compose::sidebar_system` `TreeViewHit::Chevron`).
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_milestone_app();
+        app.active_view = SidebarView::Pipeline;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen_before = driver.screen();
+        assert!(
+            !driver.screen_contains("#10"),
+            "sanity: must start collapsed:\n{screen_before}"
+        );
+
+        let (label_x, label_y) = driver
+            .find("v1.0")
+            .unwrap_or_else(|| panic!("'v1.0' milestone header not found:\n{screen_before}"));
+        let chevron_x = (label_x - 2.0).max(0.0);
+        driver.click(chevron_x, label_y);
+
+        // Assert on the issue number rather than the full title text — the
+        // narrow detail-pane column truncates long titles (`trunc(..., 20)`
+        // in pipeline.rs), so "Milestone v1 issue" isn't reliably intact on
+        // screen even once the row is visible.
+        let screen_after = driver.screen();
+        assert!(
+            driver.screen_contains("#10"),
+            "clicking the milestone chevron must expand it and reveal its issue:\n{screen_after}"
         );
     }
 
