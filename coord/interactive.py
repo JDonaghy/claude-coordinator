@@ -657,9 +657,32 @@ def _launch_via_tmux(
             # Session creation failed (name collision, tmux daemon error, …).
             return None  # signal caller to fall back to PTY relay
 
-        # Inject briefing (best-effort; a failure here is non-fatal).
+        # Inject briefing (best-effort; a failure here is non-fatal to the
+        # session itself, but MUST be visible to the operator — #865 review
+        # follow-up: the previous code discarded this return value, so an
+        # exhausted verify+retry only produced a ``logging.error`` call.
+        # With no ``logging.basicConfig`` anywhere in the repo, that falls
+        # through to Python's "handler of last resort" — one stderr line
+        # that the very next statement (tmux attach-session, below) blows
+        # away by switching the terminal to the tmux alt-screen before the
+        # operator can read it. Print a message to the operator's OWN
+        # terminal (not logging) and pause for an explicit acknowledgment
+        # BEFORE attaching, so the failure can't be missed.
         if briefing.strip():
-            _inject_briefing_into_tmux_session(session_name, briefing, host=host)
+            injected = _inject_briefing_into_tmux_session(session_name, briefing, host=host)
+            if not injected:
+                print(
+                    "\n"
+                    "!!! coord: briefing injection could not be verified after "
+                    "multiple attempts.\n"
+                    "!!! The input box in the session below may be EMPTY — "
+                    "paste the briefing yourself if so.\n",
+                    file=sys.stderr,
+                )
+                try:
+                    input("Press Enter to attach to the session... ")
+                except (EOFError, KeyboardInterrupt):
+                    pass
 
     # Attach.  ``subprocess.run`` (not ``os.execvp``) is intentional: we
     # need this process to continue after the operator detaches so that

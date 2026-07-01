@@ -61,6 +61,32 @@ class TestParseProgress:
         assert "missing system dep" in p.stuck
         assert any("STUCK" in w for w in p.warnings)
 
+    def test_extracts_pty_relay_unverified_briefing_stuck_line(self, tmp_path: Path) -> None:
+        """#865 review follow-up: the remote PTY relay path
+        (``AgentServer.assign``'s interactive branch, ``coord/agent.py``)
+        used to log an exhausted verify+retry only as a raw ``# pty: ...``
+        comment, which ``parse_progress`` never picks up (no STATUS:/STUCK:
+        line) — so it was invisible to ``coord status`` / the dashboard /
+        the board. It now also emits a STUCK: line in the same format
+        other workers use; this locks that format in so a future edit to
+        the message can't silently drift out of STUCK_RE's reach."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "some claude TUI output\n"
+            "\n"
+            "STUCK: briefing injection unverified after 3 attempt(s) — the "
+            "briefing may not have landed in the input box; the operator "
+            "should check the session and paste the briefing manually if "
+            "it's empty\n"
+            "\n"
+            "# pty: briefing injection unverified after 3 attempt(s) — the "
+            "briefing may not have landed in the input box\n"
+        )
+        p = parse_progress(str(log))
+        assert p.stuck is not None
+        assert "briefing injection unverified" in p.stuck
+        assert any("STUCK" in w for w in p.warnings)
+
     def test_detects_consecutive_low_confidence(self, tmp_path: Path) -> None:
         log = tmp_path / "test.log"
         log.write_text(

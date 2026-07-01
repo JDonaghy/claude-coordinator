@@ -2946,6 +2946,23 @@ class AgentServer:
 
             if not landed and not write_failed and fingerprint:
                 try:
+                    # #865 (review follow-up): a bare "# pty: ..." comment is
+                    # only visible to someone who manually tails this exact
+                    # log — it does NOT match the STATUS:/STUCK: convention
+                    # coord.progress actually scans for (see
+                    # coord/progress.py's STUCK_RE), so an exhausted retry on
+                    # the remote PTY relay path was invisible to `coord
+                    # status`, the dashboard, and the board. Emit a STUCK:
+                    # line so this surfaces the same way any other worker
+                    # stall does, in addition to the raw comment for anyone
+                    # reading the log directly.
+                    log_fh.write(
+                        "\nSTUCK: briefing injection unverified after "
+                        f"{_PTY_INJECT_MAX_ATTEMPTS} attempt(s) — the "
+                        "briefing may not have landed in the input box; "
+                        "the operator should check the session and paste "
+                        "the briefing manually if it's empty\n"
+                    )
                     log_fh.write(
                         f"\n# pty: briefing injection unverified after "
                         f"{_PTY_INJECT_MAX_ATTEMPTS} attempt(s) — the "
