@@ -639,6 +639,14 @@ fn should_suppress_command_failed_toast(
     }
 }
 
+/// #863: true when `label` is the `coord assign --interactive --fix-of
+/// <work_aid> [--force] … --dry-run` cap-preflight command for `work_aid` —
+/// used by `run_periodic_work` to match a completed `CommandResult` back to
+/// the in-flight `PendingFixCapPreflight` it belongs to.
+fn is_fix_cap_preflight_label(label: &str, work_aid: &str) -> bool {
+    label.contains("--fix-of") && label.contains(work_aid) && label.contains("--dry-run")
+}
+
 /// #532: Classify a key press while the artifact-pull dialog is open.
 ///
 /// Pure function so tests can exhaustively drive every key path without
@@ -2407,6 +2415,20 @@ pub struct CoordApp {
     /// [`PendingMerge`].
     pending_merge: Option<PendingMerge>,
 
+    // ── #863: force-past-iteration-cap for the interactive Fix action ──────
+    /// While `Some`, a headless `coord assign --fix-of --dry-run` preflight
+    /// (spawned via `command_runner`) is in flight to detect a
+    /// `pipeline.max_review_iterations` cap refusal BEFORE the human-attended
+    /// terminal opens.  Consumed by the `run_periodic_work` completion
+    /// handler, matched against the completed `CommandResult` by
+    /// `work_aid`.  See [`PendingFixCapPreflight`].
+    pending_fix_cap_preflight: Option<PendingFixCapPreflight>,
+    /// When `Some`, an inline confirm prompt is up asking whether to
+    /// re-dispatch the same Fix with `--force` (#862) after the preflight
+    /// reported the iteration cap was hit.  Enter confirms; Esc/n dismisses.
+    /// See [`PendingFixForceConfirm`].
+    pending_fix_force_confirm: Option<PendingFixForceConfirm>,
+
     // ── #638: Kanban view ────────────────────────────────────────────────────
     kanban_model: BoardModel,
     kanban_layout: std::cell::RefCell<Option<BoardLayout>>,
@@ -2775,6 +2797,9 @@ impl CoordApp {
             armed_for_test_verdict: std::collections::HashMap::new(),
             pending_test_fix: None,
             pending_merge: None,
+            // #863: force-past-iteration-cap preflight + confirm.
+            pending_fix_cap_preflight: None,
+            pending_fix_force_confirm: None,
             // #638: Kanban view — empty until rebuild_board_sidebar populates it.
             kanban_model: BoardModel {
                 id: WidgetId::new("kanban:coord"),

@@ -192,6 +192,7 @@ impl CoordApp {
             || self.pending_rework.is_some()
             || self.pending_test_fix.is_some()
             || self.pending_merge.is_some()
+            || self.pending_fix_force_confirm.is_some()
             || self.artifact_pull_dialog.is_some()
             || self.pty_panic_dialog.is_some()
         {

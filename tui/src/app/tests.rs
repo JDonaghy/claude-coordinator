@@ -416,6 +416,9 @@
             armed_for_test_verdict: std::collections::HashMap::new(),
             pending_test_fix: None,
             pending_merge: None,
+            // #863
+            pending_fix_cap_preflight: None,
+            pending_fix_force_confirm: None,
             // #638
             kanban_model: BoardModel {
                 id: WidgetId::new("kanban:coord"),
@@ -1441,6 +1444,201 @@
         app.confirm_rework();
         // Dialog must stay open (pending_rework still set).
         assert!(app.pending_rework.is_some(), "dialog should remain open when findings are empty");
+    }
+
+    // ── #863: force-past-iteration-cap for the interactive Fix action ────────
+
+    /// Build a pipeline app with one machine ("m1") capable of repo "api",
+    /// one test-FAILED work assignment for issue 42 (so `confirm_test_fix`'s
+    /// Fix path resolves a work_aid via `selected_test_failed_work_aid`), and
+    /// a matching `pipeline_issues` row (so `confirm_test_fix`'s row lookup
+    /// succeeds) — the minimal fixture needed to drive the Fix action all the
+    /// way into `dispatch_fix_cap_preflight` without a live daemon.
+    fn make_fix_cap_preflight_app() -> CoordApp {
+        let failed_work = Assignment {
+            branch: Some("issue-42-fix".to_string()),
+            test_state: Some("failed".to_string()),
+            ..make_assignment_typed("done", 42, "api", Some("work"))
+        };
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            machines: vec![Machine {
+                name: "m1".to_string(),
+                host: String::new(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["api".to_string()],
+                version: None,
+                worktree_bytes: 0,
+            }],
+            assignments: vec![failed_work],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Add cool thing".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app
+    }
+
+    /// #863 end-to-end: driving the Fix action (test-fail front door) when
+    /// `pipeline.max_review_iterations` has been hit must NOT open a dead
+    /// interactive terminal — it must detect the cap refusal via a headless
+    /// `--dry-run` preflight (recorded through `CommandRunner::new_for_test`,
+    /// so no real `coord` subprocess runs) and raise the force-confirm
+    /// prompt.  Confirming it must re-dispatch the SAME `--fix-of` preflight
+    /// with `--force` appended — the argv coord-tui's assign of the real
+    /// (embedded-PTY) launch mirrors once this second preflight also clears.
+    #[test]
+    fn fix_cap_preflight_detects_cap_then_confirm_appends_force() {
+        let mut app = make_fix_cap_preflight_app();
+        app.pending_test_fix = Some(PendingTestFix {
+            coord_repo: "api".to_string(),
+            repo_slug: "acme/api".to_string(),
+            issue_num: 42,
+        });
+        // Queue the cap-refusal BEFORE confirming — `new_for_test`'s no_spawn
+        // path resolves synchronously at spawn time, so the canned result
+        // must already be queued when `dispatch_fix_cap_preflight` spawns.
+        app.command_runner.push_canned_result(
+            2,
+            "error: max_review_iterations (5) reached for work id-42-done; \
+             not dispatching another fix. Re-run with --force to override \
+             for this dispatch, or bump pipeline.max_review_iterations in \
+             coordinator.yml.",
+        );
+
+        app.confirm_test_fix();
+
+        // The Fix action must NOT have opened a terminal — it's still
+        // gated on the preflight.
+        assert!(
+            app.detail_terminal_sessions.is_empty(),
+            "no interactive terminal should open before the preflight resolves"
+        );
+        assert_eq!(
+            app.command_runner.spawned_calls.len(),
+            1,
+            "exactly one (non-forced) preflight dry-run must be dispatched, got: {:?}",
+            app.command_runner.spawned_calls,
+        );
+        let first_call = &app.command_runner.spawned_calls[0];
+        assert_eq!(
+            first_call,
+            &vec![
+                "assign".to_string(),
+                "--interactive".to_string(),
+                "--fix-of".to_string(),
+                "id-42-done".to_string(),
+                "m1".to_string(),
+                "api".to_string(),
+                "42".to_string(),
+                "--dry-run".to_string(),
+            ],
+            "preflight argv must NOT contain --force on the first attempt",
+        );
+        assert!(
+            app.pending_fix_cap_preflight.is_some(),
+            "preflight must be in flight immediately after confirm_test_fix"
+        );
+
+        // Drain the (already-resolved) preflight result.
+        app.run_periodic_work();
+
+        assert!(
+            app.pending_fix_cap_preflight.is_none(),
+            "preflight must be cleared once its result is processed"
+        );
+        let confirm = app
+            .pending_fix_force_confirm
+            .as_ref()
+            .expect("cap refusal must raise the force-confirm prompt");
+        assert_eq!(confirm.issue_num, 42);
+        assert_eq!(confirm.coord_repo, "api");
+        assert_eq!(confirm.machine, "m1");
+        assert_eq!(confirm.work_aid, "id-42-done");
+        assert_eq!(
+            confirm.max_iterations,
+            Some(5),
+            "cap must be parsed from the preflight stderr for the prompt text"
+        );
+
+        // Confirm past the cap — must re-dispatch the SAME preflight, now
+        // with --force, recorded as a SECOND spawned_calls entry.
+        app.confirm_fix_force_past_cap();
+
+        assert!(
+            app.pending_fix_force_confirm.is_none(),
+            "confirming must consume the force-confirm prompt"
+        );
+        assert_eq!(
+            app.command_runner.spawned_calls.len(),
+            2,
+            "confirming must record a second spawned call, got: {:?}",
+            app.command_runner.spawned_calls,
+        );
+        let second_call = &app.command_runner.spawned_calls[1];
+        assert!(
+            second_call.contains(&"--force".to_string()),
+            "confirmed re-dispatch must include --force, got: {:?}",
+            second_call,
+        );
+        assert!(
+            second_call.contains(&"--fix-of".to_string())
+                && second_call.contains(&"id-42-done".to_string()),
+            "confirmed re-dispatch must still target the same --fix-of aid, got: {:?}",
+            second_call,
+        );
+    }
+
+    /// #863 TuiDriver black-box: once the force-confirm prompt is up, the
+    /// operator must see WHY (the cap number) via the SAME render path
+    /// `find`/`click` use in every other TuiDriver test.  (The dialog's
+    /// button ROW is a fixed-width quadraui slot too narrow for either
+    /// button's full label at any body length — a pre-existing rasteriser
+    /// limit shared by every two-button horizontal confirm in this file, not
+    /// specific to this dialog — so the button affordance is asserted
+    /// structurally below instead of via `find` on the truncated glyphs.)
+    #[test]
+    fn fix_force_confirm_dialog_renders_on_screen() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_app_default();
+        app.pending_fix_force_confirm = Some(PendingFixForceConfirm {
+            coord_repo: "api".to_string(),
+            repo_slug: "acme/api".to_string(),
+            issue_num: 42,
+            machine: "m1".to_string(),
+            work_aid: "id-42-done".to_string(),
+            max_iterations: Some(5),
+        });
+
+        // Structural check: the dialog itself carries the right title, the
+        // cap number in its body, and a "force" confirm button.
+        let dlg = app.build_prompt_dialog().expect("force-confirm dialog built");
+        let body = dialog_body_text(&dlg).join("\n");
+        assert!(body.contains('5'), "cap number (5) must appear in the dialog body:\n{body}");
+        assert!(
+            dlg.buttons.iter().any(|b| b.label.contains("Force fix")),
+            "a 'Force fix' button must be offered, got: {:?}",
+            dlg.buttons.iter().map(|b| &b.label).collect::<Vec<_>>(),
+        );
+
+        // Render check: the title text actually paints on screen through the
+        // full ShellAdapter → render_frame path (not just the Dialog struct).
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("Iteration cap reached"),
+            "force-confirm dialog title must render:\n{}",
+            driver.screen(),
+        );
     }
 
     // ── #803: model hint in fix dialogs ──────────────────────────────────────

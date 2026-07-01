@@ -82,6 +82,13 @@ pub struct CommandRunner {
     /// `no_spawn = true` so tests can assert on what commands would have run.
     #[cfg(test)]
     pub(crate) spawned_calls: Vec<Vec<String>>,
+    /// FIFO queue of `(exit_code, stderr)` overrides for the NEXT `do_spawn`
+    /// calls in `no_spawn` mode — lets a test simulate a failing command
+    /// (e.g. a `max_review_iterations` cap refusal) instead of the default
+    /// zero-exit success.  Popped one-per-spawn; once empty, `do_spawn` falls
+    /// back to the default success result.  See [`Self::push_canned_result`].
+    #[cfg(test)]
+    canned_results: VecDeque<(i32, String)>,
 }
 
 /// Search for `coordinator.yml` in three places, in order:
@@ -148,6 +155,8 @@ impl CommandRunner {
             no_spawn: false,
             #[cfg(test)]
             spawned_calls: Vec::new(),
+            #[cfg(test)]
+            canned_results: VecDeque::new(),
         }
     }
 
@@ -166,7 +175,17 @@ impl CommandRunner {
             config_path: None,
             no_spawn: true,
             spawned_calls: Vec::new(),
+            canned_results: VecDeque::new(),
         }
+    }
+
+    /// Queue a `(exit_code, stderr)` override for the NEXT `no_spawn` command
+    /// dispatched — e.g. simulating a `coord assign --fix-of --dry-run`
+    /// preflight hitting `pipeline.max_review_iterations` (#863) without a
+    /// real `coord` subprocess.  Only meaningful after [`Self::new_for_test`].
+    #[cfg(test)]
+    pub(crate) fn push_canned_result(&mut self, exit_code: i32, stderr: &str) {
+        self.canned_results.push_back((exit_code, stderr.to_string()));
     }
 
     /// Internal: unconditionally start `coord <argv>` in a background thread
@@ -188,12 +207,24 @@ impl CommandRunner {
         if self.no_spawn {
             #[cfg(test)]
             self.spawned_calls.push(argv.clone());
+            // #863: consume a queued (exit_code, stderr) override if the test
+            // pushed one via `push_canned_result`; otherwise the usual
+            // zero-exit success (unconditional call in non-test builds since
+            // `no_spawn` can only be true via `new_for_test`, which is itself
+            // `#[cfg(test)]`).
+            #[cfg(test)]
+            let (exit_code, stderr) = self
+                .canned_results
+                .pop_front()
+                .unwrap_or((0, String::new()));
+            #[cfg(not(test))]
+            let (exit_code, stderr) = (0, String::new());
             let (tx, rx) = mpsc::channel();
             let _ = tx.send(CommandResult {
                 label: label.clone(),
-                exit_code: 0,
+                exit_code,
                 duration: Duration::default(),
-                stderr: String::new(),
+                stderr,
                 stdout: String::new(),
             });
             self.state = CommandState::Running {
